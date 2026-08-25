@@ -56,6 +56,7 @@ use crate::tool_local::PendingVfork;
 use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
+use crate::types::SigWrapper;
 
 // Preserve the historical Detcore ABI while hiding the host's configured CPU
 // count. This represents one virtual CPU in a fixed 128-bit kernel mask.
@@ -440,6 +441,10 @@ fn waitid_poll_decision(child_pid: libc::pid_t, signaled: bool) -> WaitidPollDec
     } else {
         WaitidPollDecision::Retry
     }
+}
+
+fn signal_is_blocked(mask: &libc::sigset_t, signal: SigWrapper) -> bool {
+    unsafe { libc::sigismember(mask, signal.0 as libc::c_int) == 1 }
 }
 
 fn snapshot_process_group(pid: Pid) -> Result<libc::pid_t, Errno> {
@@ -1273,6 +1278,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_oldset(Some(old_mask_addr))
             .with_sigsetsize(std::mem::size_of::<u64>());
         guest.inject_with_retry(block_signals).await?;
+        let guest_signal_mask: libc::sigset_t = guest.memory().read_value(old_mask_addr)?;
 
         let poll_call = call.with_options(call.options() | libc::WNOHANG);
         let result: Result<i64, Error> = loop {
@@ -1286,7 +1292,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             // Do not return on Signaled yet. Linux lets an already-waitable child
             // status win over an interrupt, so the zero-timeout kernel probe below
             // remains authoritative when readiness and a signal coincide.
-            let signaled = resource_request(guest, rsrc.clone()).await == ResumeStatus::Signaled;
+            let signaled = match resource_request(guest, rsrc.clone()).await {
+                ResumeStatus::Normal => false,
+                ResumeStatus::Signaled(Some(signals)) => signals
+                    .into_iter()
+                    .any(|signal| !signal_is_blocked(&guest_signal_mask, signal)),
+                ResumeStatus::Signaled(None) => true,
+            };
 
             if let Err(error) = guest.memory().write_value(info, &empty_info) {
                 break Err(error.into());

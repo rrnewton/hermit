@@ -29,9 +29,23 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
-const MAX_RETRIES: usize = 20_000;
-const BACKSTOP: Duration = Duration::from_secs(60);
+const MAX_WAITID_RETRIES: usize = 20_000;
+const WATCHDOG_BACKSTOP: Duration = Duration::from_secs(60);
+const MAX_STDERR_EVENTS_PER_WATCHDOG_TICK: usize = 256;
 const MAX_DIAGNOSTIC_LINES: usize = 2_000;
+
+#[derive(Clone, Copy)]
+struct WatchdogLimits {
+    max_waitid_retries: usize,
+    backstop: Duration,
+    max_stderr_events_per_tick: usize,
+}
+
+const WATCHDOG_LIMITS: WatchdogLimits = WatchdogLimits {
+    max_waitid_retries: MAX_WAITID_RETRIES,
+    backstop: WATCHDOG_BACKSTOP,
+    max_stderr_events_per_tick: MAX_STDERR_EVENTS_PER_WATCHDOG_TICK,
+};
 
 static WAITID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 
@@ -45,6 +59,13 @@ struct GuestRun {
 enum StderrEvent {
     Line(String),
     Error(String),
+    Eof,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum DrainOutcome {
+    QueueEmpty,
+    BudgetExhausted,
     Eof,
 }
 
@@ -86,7 +107,100 @@ fn kill_process_group(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
+#[derive(Default)]
+struct StderrState {
+    retries: usize,
+    lines: Vec<String>,
+    eof: bool,
+    truncated: bool,
+}
+
+fn observe_stderr_event(event: StderrEvent, state: &mut StderrState) -> Result<(), String> {
+    match event {
+        StderrEvent::Line(line) => {
+            if line.contains("Retry #") && line.contains("waitid") {
+                state.retries += 1;
+            }
+            if state.lines.len() < MAX_DIAGNOSTIC_LINES {
+                state.lines.push(line);
+            } else {
+                state.truncated = true;
+            }
+            Ok(())
+        }
+        StderrEvent::Error(error) => {
+            state.eof = true;
+            Err(format!("failed while draining hermit stderr: {error}"))
+        }
+        StderrEvent::Eof => {
+            state.eof = true;
+            Ok(())
+        }
+    }
+}
+
+fn drain_stderr_batch(
+    receive: &mpsc::Receiver<StderrEvent>,
+    state: &mut StderrState,
+    max_events: usize,
+) -> Result<DrainOutcome, String> {
+    assert!(max_events > 0, "stderr drain budget must be nonzero");
+    for _ in 0..max_events {
+        match receive.try_recv() {
+            Ok(event) => {
+                observe_stderr_event(event, state)?;
+                if state.eof {
+                    return Ok(DrainOutcome::Eof);
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => return Ok(DrainOutcome::QueueEmpty),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                state.eof = true;
+                return Ok(DrainOutcome::Eof);
+            }
+        }
+    }
+    Ok(DrainOutcome::BudgetExhausted)
+}
+
+fn watchdog_limit_failure(
+    state: &StderrState,
+    elapsed: Duration,
+    process_exited: bool,
+    limits: WatchdogLimits,
+) -> Option<String> {
+    if state.retries > limits.max_waitid_retries {
+        return Some(format!(
+            "waitid watchdog retry limit exceeded: observed {} retries (limit {}); \
+             process_exited={process_exited}, stderr_eof={}",
+            state.retries, limits.max_waitid_retries, state.eof,
+        ));
+    }
+    if elapsed >= limits.backstop {
+        return Some(format!(
+            "waitid watchdog wall-clock deadline exceeded: elapsed {}ms reached limit {}ms; \
+             process_exited={process_exited}, stderr_eof={}, retries={}; stderr draining is \
+             capped at {} events per watchdog tick",
+            elapsed.as_millis(),
+            limits.backstop.as_millis(),
+            state.eof,
+            state.retries,
+            limits.max_stderr_events_per_tick,
+        ));
+    }
+    None
+}
+
 fn run_bounded(args: &[&str], trace_retries: bool, verify_report: Option<&Path>) -> GuestRun {
+    run_bounded_with_limits(args, trace_retries, verify_report, WATCHDOG_LIMITS)
+}
+
+fn run_bounded_with_limits(
+    args: &[&str],
+    trace_retries: bool,
+    verify_report: Option<&Path>,
+    limits: WatchdogLimits,
+) -> GuestRun {
     let build_root = waitid_guest()
         .parent()
         .expect("waitid guest should have a parent");
@@ -143,71 +257,67 @@ fn run_bounded(args: &[&str], trace_retries: bool, verify_report: Option<&Path>)
     });
 
     let started = Instant::now();
-    let mut retries = 0usize;
-    let mut stderr_lines = Vec::new();
-    let mut stderr_eof = false;
+    let mut stderr_state = StderrState::default();
     let mut status = None;
     let mut failure = None;
 
-    while status.is_none() || !stderr_eof {
-        while let Ok(event) = receive.try_recv() {
-            match event {
-                StderrEvent::Line(line) => {
-                    if line.contains("Retry #") && line.contains("waitid") {
-                        retries += 1;
-                    }
-                    if stderr_lines.len() < MAX_DIAGNOSTIC_LINES {
-                        stderr_lines.push(line);
-                    }
-                }
-                StderrEvent::Error(error) => {
-                    failure = Some(format!("failed while draining hermit stderr: {error}"));
-                    stderr_eof = true;
-                }
-                StderrEvent::Eof => stderr_eof = true,
-            }
-        }
-
-        if retries > MAX_RETRIES {
-            failure = Some(format!(
-                "waitid retried more than {MAX_RETRIES} times without returning; a blocking \
-                 waiter was left runnable instead of allowing logical time to reach its signal"
-            ));
-        }
-        if started.elapsed() >= BACKSTOP {
-            failure = Some(format!(
-                "BACKSTOP: hermit did not finish within {}s after {retries} waitid retries; \
-                 this deadline is enforced by the host test thread, independently of stderr \
-                 activity",
-                BACKSTOP.as_secs(),
-            ));
-        }
-        if failure.is_some() {
-            kill_process_group(&mut child);
-            break;
-        }
+    while status.is_none() || !stderr_state.eof {
         if status.is_none() {
             status = child.try_wait().expect("failed to poll hermit");
         }
-        if status.is_some() && stderr_eof {
+        if status.is_some() && stderr_state.eof {
             break;
         }
-        match receive.recv_timeout(Duration::from_millis(10)) {
-            Ok(StderrEvent::Line(line)) => {
-                if line.contains("Retry #") && line.contains("waitid") {
-                    retries += 1;
-                }
-                if stderr_lines.len() < MAX_DIAGNOSTIC_LINES {
-                    stderr_lines.push(line);
-                }
-            }
-            Ok(StderrEvent::Error(error)) => {
-                failure = Some(format!("failed while draining hermit stderr: {error}"));
-            }
-            Ok(StderrEvent::Eof) => stderr_eof = true,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => stderr_eof = true,
+        if failure.is_none() {
+            failure =
+                watchdog_limit_failure(&stderr_state, started.elapsed(), status.is_some(), limits);
         }
+        if failure.is_some() {
+            break;
+        }
+
+        let drain_outcome = match drain_stderr_batch(
+            &receive,
+            &mut stderr_state,
+            limits.max_stderr_events_per_tick,
+        ) {
+            Ok(outcome) => outcome,
+            Err(reason) => {
+                failure = Some(reason);
+                break;
+            }
+        };
+
+        if failure.is_none() {
+            failure =
+                watchdog_limit_failure(&stderr_state, started.elapsed(), status.is_some(), limits);
+        }
+        if failure.is_some() {
+            break;
+        }
+        if status.is_some() && stderr_state.eof {
+            break;
+        }
+        if drain_outcome == DrainOutcome::BudgetExhausted {
+            // A live producer may keep stderr permanently nonempty. Start the
+            // next watchdog tick immediately so its limits and child-status
+            // poll cannot be starved by diagnostic traffic.
+            continue;
+        }
+
+        match receive.recv_timeout(Duration::from_millis(10)) {
+            Ok(event) => {
+                if let Err(reason) = observe_stderr_event(event, &mut stderr_state) {
+                    failure = Some(reason);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => stderr_state.eof = true,
+        }
+    }
+
+    if failure.is_some() {
+        kill_process_group(&mut child);
     }
 
     // Always reap the process here. Keeping this unconditional makes the
@@ -216,7 +326,13 @@ fn run_bounded(args: &[&str], trace_retries: bool, verify_report: Option<&Path>)
     status.get_or_insert(waited_status);
     reader.join().expect("stderr reader panicked");
     let stdout = fs::read_to_string(&stdout_path).expect("failed to read guest stdout");
-    let stderr = stderr_lines.join("\n");
+    let mut stderr = stderr_state.lines.join("\n");
+    if stderr_state.truncated {
+        stderr.push_str(&format!(
+            "\n[waitid watchdog retained the first {MAX_DIAGNOSTIC_LINES} stderr lines; \
+             later lines were drained but omitted]"
+        ));
+    }
     if let Some(reason) = failure {
         panic!("{reason}\nguest stdout:\n{stdout}\nhermit stderr:\n{stderr}");
     }
@@ -225,8 +341,73 @@ fn run_bounded(args: &[&str], trace_retries: bool, verify_report: Option<&Path>)
         status: status.expect("hermit status should be collected"),
         stdout,
         stderr,
-        retries,
+        retries: stderr_state.retries,
     }
+}
+
+#[test]
+fn retry_watchdog_fires_and_reports_before_stderr_backlog_drains() {
+    let (send, receive) = mpsc::channel();
+    send.send(StderrEvent::Line("Retry #1 for waitid".into()))
+        .unwrap();
+    send.send(StderrEvent::Line("Retry #2 for waitid".into()))
+        .unwrap();
+    let mut state = StderrState::default();
+    let limits = WatchdogLimits {
+        max_waitid_retries: 0,
+        backstop: Duration::from_secs(60),
+        max_stderr_events_per_tick: 1,
+    };
+
+    assert_eq!(
+        drain_stderr_batch(&receive, &mut state, limits.max_stderr_events_per_tick).unwrap(),
+        DrainOutcome::BudgetExhausted
+    );
+    let failure = watchdog_limit_failure(&state, Duration::ZERO, false, limits)
+        .expect("the deliberately tiny retry limit must fire");
+    assert!(
+        failure.contains("waitid watchdog retry limit exceeded")
+            && failure.contains("observed 1 retries (limit 0)"),
+        "the failure must name the bounded condition and measured values: {failure}"
+    );
+    assert!(
+        receive.try_recv().is_ok(),
+        "the watchdog must evaluate its limit while stderr is still backlogged"
+    );
+    drop(send);
+}
+
+#[test]
+fn deadline_watchdog_fires_and_reports_before_stderr_backlog_drains() {
+    let (send, receive) = mpsc::channel();
+    send.send(StderrEvent::Line("diagnostic one".into()))
+        .unwrap();
+    send.send(StderrEvent::Line("diagnostic two".into()))
+        .unwrap();
+    let mut state = StderrState::default();
+    let limits = WatchdogLimits {
+        max_waitid_retries: usize::MAX,
+        backstop: Duration::ZERO,
+        max_stderr_events_per_tick: 1,
+    };
+
+    assert_eq!(
+        drain_stderr_batch(&receive, &mut state, limits.max_stderr_events_per_tick).unwrap(),
+        DrainOutcome::BudgetExhausted
+    );
+    let failure = watchdog_limit_failure(&state, Duration::ZERO, false, limits)
+        .expect("the deliberately zero wall-clock deadline must fire");
+    assert!(
+        failure.contains("waitid watchdog wall-clock deadline exceeded")
+            && failure.contains("limit 0ms")
+            && failure.contains("capped at 1 events per watchdog tick"),
+        "the failure must name the deadline and the fairness bound: {failure}"
+    );
+    assert!(
+        receive.try_recv().is_ok(),
+        "the deadline must be evaluated while stderr is still backlogged"
+    );
+    drop(send);
 }
 
 #[test]
@@ -251,8 +432,107 @@ fn waitid_interrupted_by_a_signal_returns_instead_of_spinning() {
         run.stdout,
     );
     assert!(
-        run.retries <= MAX_RETRIES,
+        run.retries <= MAX_WAITID_RETRIES,
         "waitid returned correctly but performed {} retries",
+        run.retries,
+    );
+}
+
+#[test]
+fn waitid_live_sibling_signal_interrupts_without_spinning() {
+    let limits = WatchdogLimits {
+        max_waitid_retries: 2_000,
+        backstop: Duration::from_secs(5),
+        max_stderr_events_per_tick: 64,
+    };
+    let run = run_bounded_with_limits(&["--live-sibling-signal"], true, None, limits);
+    assert!(
+        run.status.success(),
+        "hermit exited with {}\nguest stdout:\n{}\nhermit stderr:\n{}",
+        run.status,
+        run.stdout,
+        run.stderr,
+    );
+    assert!(
+        run.stdout
+            .contains("waitid-live-sibling rc=-1 errno=4 handler=1 mask-preserved=1 sender-live=1"),
+        "a live sibling signal did not interrupt waitid with its handler run\n\
+         guest stdout:\n{}",
+        run.stdout,
+    );
+    assert!(
+        run.stdout.contains("waitid-live-sibling-done"),
+        "the guest did not clean up both live children\nguest stdout:\n{}",
+        run.stdout,
+    );
+    assert!(
+        run.retries <= limits.max_waitid_retries,
+        "waitid returned correctly but performed {} retries",
+        run.retries,
+    );
+}
+
+#[test]
+fn waitid_live_sibling_signal_honors_sa_restart_and_preserves_mask() {
+    let limits = WatchdogLimits {
+        max_waitid_retries: 4_000,
+        backstop: Duration::from_secs(8),
+        max_stderr_events_per_tick: 64,
+    };
+    let run = run_bounded_with_limits(&["--live-sibling-signal-restart"], true, None, limits);
+    assert!(
+        run.status.success(),
+        "hermit exited with {}\nguest stdout:\n{}\nhermit stderr:\n{}",
+        run.status,
+        run.stdout,
+        run.stderr,
+    );
+    assert!(
+        run.stdout.contains(
+            "waitid-live-sibling-restart rc=0 errno=0 handler=1 pid-match=1 code=1 status=29 mask-preserved=1 sender-live=1"
+        ),
+        "a live sibling signal did not preserve SA_RESTART, child identity, and the guest mask\n\
+         guest stdout:\n{}",
+        run.stdout,
+    );
+    assert!(
+        run.stdout.contains("waitid-live-sibling-done"),
+        "the guest did not clean up the live signaler\nguest stdout:\n{}",
+        run.stdout,
+    );
+    assert!(
+        run.retries <= limits.max_waitid_retries,
+        "restarted waitid performed {} retries",
+        run.retries,
+    );
+}
+
+#[test]
+fn waitid_keeps_a_guest_blocked_sibling_signal_pending() {
+    let limits = WatchdogLimits {
+        max_waitid_retries: 4_000,
+        backstop: Duration::from_secs(8),
+        max_stderr_events_per_tick: 64,
+    };
+    let run = run_bounded_with_limits(&["--live-sibling-signal-blocked"], true, None, limits);
+    assert!(
+        run.status.success(),
+        "hermit exited with {}\nguest stdout:\n{}\nhermit stderr:\n{}",
+        run.status,
+        run.stdout,
+        run.stderr,
+    );
+    assert!(
+        run.stdout.contains(
+            "waitid-live-sibling-blocked rc=0 errno=0 handler=0 pid-match=1 code=1 status=29 mask-preserved=1 sender-live=1"
+        ),
+        "a guest-blocked sibling signal incorrectly interrupted waitid or changed the mask\n\
+         guest stdout:\n{}",
+        run.stdout,
+    );
+    assert!(
+        run.retries <= limits.max_waitid_retries,
+        "blocked-signal waitid performed {} retries",
         run.retries,
     );
 }
@@ -274,7 +554,7 @@ fn waitid_honors_sa_restart_after_running_the_handler() {
         run.stdout,
     );
     assert!(
-        run.retries <= MAX_RETRIES,
+        run.retries <= MAX_WAITID_RETRIES,
         "restarted waitid performed {} retries",
         run.retries,
     );
@@ -314,10 +594,24 @@ fn waitid_ready_child_path_is_ptrace_l2() {
         report["comparison"]["log_scope"], "info",
         "verify report: {report}"
     );
-    assert!(
-        report["compared_log_messages"]["left"]
-            .as_u64()
-            .is_some_and(|count| count > 0),
-        "verify report compared no INFO evidence: {report}"
+    assert_eq!(
+        report["comparison"]["compare_logs"], true,
+        "verify report: {report}"
     );
+    assert_eq!(
+        report["comparison"]["compare_io_buffers"], true,
+        "verify report: {report}"
+    );
+    assert_eq!(
+        report["comparison"]["record_envelope"], "all_records_v1",
+        "verify report: {report}"
+    );
+    for side in ["left", "right"] {
+        assert!(
+            report["compared_log_messages"][side]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "verify report compared no INFO evidence on {side}: {report}"
+        );
+    }
 }

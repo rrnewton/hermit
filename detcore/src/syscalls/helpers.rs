@@ -291,7 +291,10 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         loop {
             if resources.poll_attempt > 0
-                && resource_request(guest, resources.clone()).await == ResumeStatus::Signaled
+                && matches!(
+                    resource_request(guest, resources.clone()).await,
+                    ResumeStatus::Signaled(_)
+                )
             {
                 break if written_total > 0 {
                     Ok(written_total as i64)
@@ -1226,7 +1229,10 @@ where
     let mut rsrc = rsrc.clone();
 
     loop {
-        if resource_request(guest, rsrc.clone()).await == ResumeStatus::Signaled {
+        if matches!(
+            resource_request(guest, rsrc.clone()).await,
+            ResumeStatus::Signaled(_)
+        ) {
             let errno = call.signal_interrupt_errno();
             tracing::trace!(
                 "retry_nonblocking_syscall: interrupted by signal before retrying {}: {:?}",

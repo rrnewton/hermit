@@ -283,6 +283,11 @@ pub enum ResourceID {
     /// invoking the signal handler as the next thing to run.
     InboundSignal(SigWrapper),
 
+    /// A scheduler notification that one or more guest-generated signals are
+    /// physically pending for a thread parked in waitid polling. Kept as one
+    /// resource because scheduler requests currently admit one resource only.
+    WaitidSignals(Vec<SigWrapper>),
+
     /// Relinquish the current scheduler turn without changing the thread's
     /// persistent priority.
     SchedYield,
