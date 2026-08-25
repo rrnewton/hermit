@@ -2393,6 +2393,10 @@ fn write_plan_after_scorecard_check(
             cmd,
             deps: preparation_deps,
             env: BTreeMap::new(),
+            // `None` preserves the existing GLOBAL eager-exit behaviour, which is what
+            // this graph had before the runner learned about fail-fast families.
+            // Scoping the pressure graph into families is a separate decision.
+            fail_fast_family: None,
             hint: ResourceHint {
                 resources: BTreeMap::from([("cargo_writer".into(), 1)]),
                 rss_baseline_bytes: Some(1_073_741_824),
@@ -2560,6 +2564,10 @@ fn write_plan_after_scorecard_check(
                 cmd,
                 deps,
                 env: BTreeMap::new(),
+                // `None` preserves the existing GLOBAL eager-exit behaviour, which is what
+                // this graph had before the runner learned about fail-fast families.
+                // Scoping the pressure graph into families is a separate decision.
+                fail_fast_family: None,
                 hint: ResourceHint {
                     resources,
                     rss_baseline_bytes: Some(memory / 3),
@@ -2595,6 +2603,10 @@ fn write_plan_after_scorecard_check(
         cmd: "true".into(),
         deps: cell_tags,
         env: BTreeMap::new(),
+        // `None` preserves the existing GLOBAL eager-exit behaviour, which is what
+        // this graph had before the runner learned about fail-fast families.
+        // Scoping the pressure graph into families is a separate decision.
+        fail_fast_family: None,
         hint: ResourceHint {
             rss_baseline_bytes: Some(268_435_456),
             hard_mem_max_bytes: Some(1_073_741_824),
