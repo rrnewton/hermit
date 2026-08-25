@@ -1312,11 +1312,21 @@ fn render_scorecard(derived: &Derived) -> String {
         "# Compatibility scorecard\n\n\
 This table is derived from the manifest, not from a separately maintained parent-workspace CSV. \
 `./ci/compat-envelope/scorecard.rs check` verifies it.\n\n\
-**Green** means the cell is in `ci/expected-e2e-plan.json` and is therefore required to pass by \
-ordinary validation. **Red** is every \
+**Green** means the cell is SELECTED: it is listed in `ci/expected-e2e-plan.json` and is therefore \
+required to pass by ordinary validation. **Red** is every \
 other test/mode/backend cell: measured failure, unavailable, or not yet run all remain red until \
 the cell is promoted into the regression plan and passes. Manifest-disabled combinations are red, \
 not omitted: a cell that cannot run is not green.\n\n\
+**Green does not mean measured, and it does not mean passing.** Selection, measurement, and result \
+are three separate facts, and the Green column below reports only the first of them. A green cell \
+that has never been executed once is the ordinary case, not an anomaly: green is a statement about \
+what the plan REQUIRES, not about what has been OBSERVED. Whether a result was ever seen is a \
+per-cell `measurement` field in `ci/compat-envelope/cells.json`, independent of colour and reading \
+`never-measured`, `measured-and-passed`, or `diverged`; a cell can be green and `never-measured`, \
+or red and `measured-and-passed`, and both combinations are present in the tracked file today. To \
+count what has actually run, count that field -- do not count this table. Conflating the three has \
+repeatedly produced project-status reports that quoted the Green total as a number of passing \
+tests, which it has never been.\n\n\
 Every selected `verify` cell, and every seed in a selected `chaos` cell, runs the same backend \
 twice. The manifest runner adds `--verify-strict` when the selected Hermit binary supports it, and \
 accepts a result only when the typed report says `verified=true`, `verdict=matched`, \
@@ -1771,9 +1781,21 @@ fn encoded_cells(cells: &TrackedCells) -> Result<String, String> {
 
 fn check_tracked(root: &Path) -> Result<Derived, String> {
     let derived = derive(root)?;
+    // ORDER MATTERS, AND IT IS THE FIX FOR A MISDIRECTING FAILURE. `tracked_from` runs FIRST
+    // because it is the only step that can name a SEMANTIC cause -- a green cell regressing to
+    // red, or a tracked cell disappearing. `compare_file(SCORECARD)` can only ever say "stale;
+    // run `update`". Both files derive from the plan, so a plan edit makes BOTH fail at once;
+    // with the comparison first, the operator was told to run `update`, and `update` then
+    // refused the green regression. Measured 2026-08-25: dropping one green cell from
+    // ci/expected-e2e-plan.json produced `check` -> "SCORECARD.md is stale; run update" and
+    // `update` -> "refusing to move 1 green cell(s) to red". Following the instruction the tool
+    // itself printed could not clear it; the real remedy, --allow-green-removal, was named
+    // nowhere in the message the operator actually saw. Deleting a cell already reported its own
+    // cause correctly, because that path has no SCORECARD.md difference to mask it -- which is
+    // why this looked intermittent rather than ordered.
+    let mut cells = tracked_from(&derived, load_existing(root)?, false, false)?;
     let expected_scorecard = render_scorecard(&derived);
     compare_file(&root.join(SCORECARD), &expected_scorecard)?;
-    let mut cells = tracked_from(&derived, load_existing(root)?, false, false)?;
     // The WRITE path applies this before serialising (see `update_tracked`), so the READ path
     // must too or the two derive different bytes from the same inputs and `check` reports a
     // staleness that `update` cannot clear. Measured 2026-08-25: `update` was a fixed point --
