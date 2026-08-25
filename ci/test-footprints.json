@@ -499,12 +499,13 @@
       ]
     },
     {
-      "_why": "Legacy DBT parity fixtures are outside Cargo targets.",
+      "_why": "Backend-parity fixtures and driver contract suites are outside Cargo targets.",
       "e2e_backends": [
         "dbt"
       ],
       "nodes": [
         "check.backend_parity_mutation",
+        "check.backend_parity_suites",
         "e2e.manifest_backend_parity_c",
         "test.dbt_parity"
       ],

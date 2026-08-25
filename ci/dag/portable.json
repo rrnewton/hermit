@@ -58,6 +58,15 @@
                "hard_mem_max_bytes": 536870912, "classification": "light"}
     },
     {
+      "group": "check", "job": "backend_parity_suites",
+      "desc": "Backend-parity driver contracts, including the L2 evidence-tier gate",
+      "description": "EXECUTION GAP CLOSED 2026-08-25 (task three_backend_parity_suites). These three self-contained Python suites were inventoried as driver-owned but had no DAG node: inventory established ownership, not execution, and neither the backend-parity mutation node nor running run_matrix.py as the DBT parity program imports them. Before wiring, all three were run directly at bc9d1782acf0 and passed: verify-tier evidence (50 runtime checks), scorecard-header compatibility (73), and atomic run-matrix output (19). The suite guards typed-verdict-only L2 claims, non-vacuous compared-log counts, operand-derived parity and schema compatibility, and whole-or-nothing result artifacts. It has no Hermit build, guest, or backend prerequisite.",
+      "cmd": "python3 tests/backend-parity/test_verify_tier_evidence.py && python3 tests/backend-parity/test_scorecard_header_compat.py && python3 tests/backend-parity/test_run_matrix_output_skew.py",
+      "timeout": 60,
+      "hint": {"est_duration_s": 8, "rss_baseline_bytes": 134217728,
+               "hard_mem_max_bytes": 536870912, "classification": "light"}
+    },
+    {
       "group": "check", "job": "portability_paths",
       "desc": "Reject developer-specific paths in build/run files",
       "cmd": "./scripts/check-portable-paths.sh",
