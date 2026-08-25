@@ -622,6 +622,17 @@ impl Refusal {
 /// and "the guest ran and failed" alike. Substituting today's observed value
 /// without deciding what the test MEANS reintroduces that, one number later.
 fn assert_hermit_refusal_contains(output: &Output, refusal: Refusal, expected: &[&str]) {
+    // ⚠️ FAILURE FIRST, AND SEPARATELY FROM WHICH FAILURE. The equality below is
+    // only as good as the constant it reads: if a `Refusal` code ever became 0,
+    // `assert_eq!(code, Some(0))` would stop demanding a failure and start
+    // demanding a SUCCESS, and all sixteen call sites would invert and still
+    // pass. This line cannot be satisfied by any success, whatever the constants
+    // say, so the two assertions fail independently rather than together.
+    assert!(
+        !output.status.success(),
+        "expected {} but the command SUCCEEDED: {output:?}",
+        refusal.describe()
+    );
     assert_eq!(
         output.status.code(),
         Some(refusal.code()),
@@ -2399,13 +2410,27 @@ fn run_kvm_preserves_closed_standard_input() {
     ];
     let output = hermit_with_closed_stdin(&args);
 
-    // A hermit-internal refusal: stdin was closed before the guest could be set
-    // up, so no guest ran. Not routed through `assert_hermit_refusal_contains`
-    // only because this test additionally pins stdout.
+    // ⚠️ THE GUEST RAN, SO THIS IS THE GUEST'S OWN STATUS AND NOT A `Refusal`.
+    // `/bin/cat` starts, finds stdin closed, prints its own diagnostic
+    // ("/bin/cat: -: Bad file descriptor") and exits 1 of its own accord. That
+    // the closed descriptor is PRESERVED INTO THE GUEST is the whole subject of
+    // this test, so a hermit-internal code here would assert the opposite of
+    // what the test exists to check.
+    //
+    // This assertion was briefly changed to `HERMIT_INTERNAL_FAILURE_EXIT` on
+    // the theory that no guest was launched. It was wrong, and the reason it
+    // looked right is worth keeping: from a checkout under /tmp the case fails
+    // earlier, with "failed to resolve KVM guest working directory", and that
+    // unrelated failure hides the real exit status. Verify this one from a
+    // checkout OUTSIDE /tmp or the evidence is not about this test.
+    //
+    // So this is a deliberate bare literal, like the guest arm of
+    // `a_guest_side_fault_is_not_reported_as_a_hermit_internal_failure`: it must
+    // NOT track a hermit constant, because it is not hermit's number.
     assert_eq!(
         output.status.code(),
-        Some(HERMIT_INTERNAL_FAILURE_EXIT),
-        "unexpected output: {output:?}"
+        Some(1),
+        "expected the guest's own exit status to survive a closed stdin: {output:?}"
     );
     assert_eq!(stdout(&output), "");
     assert!(
