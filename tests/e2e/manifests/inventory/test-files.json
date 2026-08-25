@@ -3409,6 +3409,12 @@
       "why": "tests/c/exec_clock_continuity.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this self-re-execing guest and asserts that guest virtual time is strictly monotonic ACROSS the execve boundary, comparing pre-exec and post-exec CLOCK_REALTIME samples handed through argv; it remains a guest fixture because a generic manifest cannot express the exec-boundary hand-off contract or the cross-image ordering assertion."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/fork_child_getrandom.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/fork_child_getrandom.c is owned by hermit-cli/tests/cli.rs: The no-namespace integration test forks two sequential child processes, requires their getrandom streams to be distinct, and verifies the complete invocation twice so changing host TIDs cannot change either child's bytes. It remains a fixture because the generic manifest has no no-namespace execution mode."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/chaos/thread_interleaving.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/*.yaml",

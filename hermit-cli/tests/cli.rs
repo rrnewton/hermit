@@ -33,6 +33,7 @@ static DBT_SELF_SIGQUEUE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_INERT_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
 static EXEC_CLOCK_CONTINUITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static FORK_CHILD_GETRANDOM_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 // This lock only serializes independent child processes; a failed assertion carries no
@@ -137,7 +138,42 @@ fn stdio_lseek_identity_guest() -> &'static Path {
             .expect("failed to compile stdio-lseek fixture");
         assert!(
             output.status.success(),
-            "stdio-lseek fixture compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            "stdio-lseek fixture compilation failed:
+stdout:
+{}
+stderr:
+{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+// TODO-HUMAN-REVIEW(PR-1052): Review no-namespace fork-child RNG coverage.
+fn fork_child_getrandom_guest() -> &'static Path {
+    FORK_CHILD_GETRANDOM_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("fork-child-getrandom");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create fork-child-getrandom guest directory");
+        let guest = build_root.join("fork_child_getrandom");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/fork_child_getrandom.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile fork-child-getrandom guest");
+        assert!(
+            output.status.success(),
+            "fork-child-getrandom guest compilation failed:
+stdout:
+{}
+stderr:
+{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -2691,6 +2727,31 @@ fn no_namespace_preserves_affinity_for_run_and_verify() {
         stderr(&output).contains("Determinism verified"),
         "no-namespace verify did not complete:\n{}",
         stderr(&output),
+    );
+}
+
+#[test]
+fn no_namespace_fork_children_have_deterministic_distinct_rng_streams() {
+    let _guard = hermit_run_guard();
+    let guest = fork_child_getrandom_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let args = [
+        "run",
+        "--no-namespace",
+        "--verify",
+        "--pin-threads",
+        "--max-timeslice=disabled",
+        "--",
+        guest,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+
+    let stderr = String::from_utf8(output.stderr).expect("hermit stderr should be UTF-8");
+    assert!(
+        stderr.contains("Determinism verified"),
+        "missing verification success marker:\n{stderr}"
     );
 }
 
