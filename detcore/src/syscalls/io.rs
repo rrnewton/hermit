@@ -1446,8 +1446,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.cfg.virtualize_metadata
             && guest
                 .thread_state()
-                .with_detfd(fd, |detfd| detfd.is_sock_diag())
+                .with_detfd(fd, |detfd| detfd.is_sock_diag() || detfd.is_netlink_route())
                 .unwrap_or(false)
+    }
+
+    /// Whether this descriptor is specifically a `NETLINK_ROUTE` socket, which
+    /// needs the link-counter sanitizer rather than the sock-diag one.
+    fn netlink_route_reply_fd<G: Guest<Self>>(&self, guest: &mut G, fd: RawFd) -> bool {
+        guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.is_netlink_route())
+            .unwrap_or(false)
     }
 
     /// Read an `iovec` array out of guest memory as plain `(address, capacity)`
@@ -1489,6 +1498,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     fn sanitize_sock_diag_segments<G: Guest<Self>>(
         &self,
         guest: &mut G,
+        fd: RawFd,
         segments: &[(usize, usize)],
         received: usize,
     ) -> Result<(), Error> {
@@ -1514,7 +1524,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             remaining -= take;
         }
 
-        if !crate::sock_diag::sanitize_sock_diag_inodes(&mut buffer) {
+        // NETLINK_ROUTE and NETLINK_SOCK_DIAG replies need different
+        // sanitizers: one zeroes live interface counters, the other determinizes
+        // socket inode numbers. The descriptor decides which, so a guest holding
+        // both kinds of socket gets each handled correctly.
+        let modified = if self.netlink_route_reply_fd(guest, fd) {
+            crate::netlink_route::sanitize_route_link_stats(&mut buffer)
+        } else {
+            crate::sock_diag::sanitize_sock_diag_inodes(&mut buffer)
+        };
+        if !modified {
             return Ok(());
         }
 
@@ -1543,7 +1562,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let len = call.len();
         let result = self.handle_socket_receive(guest, call, fd, true).await?;
         let received = usize::try_from(result).unwrap_or(0);
-        self.sanitize_sock_diag_segments(guest, &[(base, len)], received)?;
+        self.sanitize_sock_diag_segments(guest, fd, &[(base, len)], received)?;
         Ok(result)
     }
 
@@ -1553,11 +1572,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Read,
     ) -> Result<i64, Error> {
+        let fd = call.fd();
         let base = call.buf().map(|address| address.as_raw()).unwrap_or(0);
         let len = call.len();
         let result = self.handle_read(guest, call).await?;
         let received = usize::try_from(result).unwrap_or(0);
-        self.sanitize_sock_diag_segments(guest, &[(base, len)], received)?;
+        self.sanitize_sock_diag_segments(guest, fd, &[(base, len)], received)?;
         Ok(result)
     }
 
@@ -1586,7 +1606,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let result = self.handle_socket_receive(guest, call, fd, true).await?;
         let received = usize::try_from(result).unwrap_or(0);
-        self.sanitize_sock_diag_segments(guest, &segments, received)?;
+        self.sanitize_sock_diag_segments(guest, fd, &segments, received)?;
         Ok(result)
     }
 
@@ -1596,11 +1616,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Readv,
     ) -> Result<i64, Error> {
+        let fd = call.fd();
         let iov = call.iov().map(|address| address.as_raw()).unwrap_or(0);
         let segments = Self::read_iov_segments(guest, iov, call.len())?;
         let result = self.handle_readv(guest, call).await?;
         let received = usize::try_from(result).unwrap_or(0);
-        self.sanitize_sock_diag_segments(guest, &segments, received)?;
+        self.sanitize_sock_diag_segments(guest, fd, &segments, received)?;
         Ok(result)
     }
 
@@ -1615,6 +1636,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Recvmmsg,
     ) -> Result<i64, Error> {
+        let fd = call.fd();
         let Some(messages_address) = call.mmsg() else {
             return self.handle_recvmmsg(guest, call).await;
         };
@@ -1669,7 +1691,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             headers.iter().map(|h| h.msg_len as usize).collect()
         };
         for (index, segments) in geometry.iter().enumerate().take(delivered) {
-            self.sanitize_sock_diag_segments(guest, segments, counts[index])?;
+            self.sanitize_sock_diag_segments(guest, fd, segments, counts[index])?;
         }
         Ok(result)
     }

@@ -3100,10 +3100,23 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// replies (see `crate::sock_diag`). Best-effort: if the descriptor lookup
     /// fails the reply is simply left unsanitized.
     fn mark_sock_diag_fd<G: Guest<Self>>(&self, guest: &mut G, fd: RawFd, call: &syscalls::Socket) {
-        if call.family() == libc::AF_NETLINK && call.protocol() == libc::NETLINK_SOCK_DIAG {
+        if call.family() != libc::AF_NETLINK {
+            return;
+        }
+        if call.protocol() == libc::NETLINK_SOCK_DIAG {
             let _ = guest
                 .thread_state()
                 .with_detfd(fd, |detfd| detfd.set_sock_diag());
+        }
+        // TODO-HUMAN-REVIEW(PR-2478)
+        // NETLINK_ROUTE link dumps carry live interface counters. They were
+        // invisible until IO-buffer hashing went on by default, because the
+        // reply's LENGTH and return value are identical between runs and only
+        // the payload bytes move.
+        if call.protocol() == libc::NETLINK_ROUTE {
+            let _ = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.set_netlink_route());
         }
     }
 

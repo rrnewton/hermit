@@ -50,6 +50,7 @@ mod io_buffers;
 mod ivar;
 pub mod logdiff;
 mod memory;
+pub mod netlink_route;
 mod procfs;
 mod procmaps;
 mod record_or_replay;
