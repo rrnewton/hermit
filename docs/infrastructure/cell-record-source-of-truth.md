@@ -74,11 +74,17 @@ backfill target, and reading its sparseness as missing data is a misreading.
 
 ## Where the records actually live, and the unexplained split
 
-| Producer | Raw output | Durable/tracked record | Repo |
-|---|---|---|---|
-| validate | `ignored/validate/artifacts/`, `ignored/validate/runs/` (774 run records) | `ledger/hermit`, `ledger/reverie` (2 shards) | **parent** `dev-hermit` |
-| pressure test | `ignored/compat-envelope/<run>/` (10 run dirs) | `ci/compat-envelope/cells.json` | **hermit** |
-| `bin/hermit-repeat` | `ignored/hermit-repeat/` (51 dirs) | **none** | parent |
+| Producer | Raw output (all untracked) | Durable record | Repo | Version controlled |
+|---|---|---|---|---|
+| validate | `ignored/validate/artifacts/`, `ignored/validate/runs/` (774 run records) | `ledger/<product>/<host>/<YYYY-MM>.jsonl` — 3 shard files, 1,959 rows | **parent** `dev-hermit` | **YES** |
+| pressure test | `ignored/compat-envelope/<run>/` (10 run dirs) | `ci/compat-envelope/cells.json` | **hermit** | **YES** |
+| `bin/hermit-repeat` | `ignored/hermit-repeat/` (51 dirs) | **none** | parent | n/a — nothing is kept |
+
+**Both durable records are version controlled.** This is worth stating
+explicitly because the phrase "the ledger lives in the parent" invites the
+reading that it is scratch state, and it is not: `ledger/` is tracked in the
+`dev-hermit` git repository, as are `ci-hub/validate/flaky-cells.json` and
+`bin/hermit-repeat`. The asymmetry is **which repository**, not whether.
 
 **The split is unexplained.** Validate's raw output and its ledger live in the
 parent; the pressure test's raw output and its tracked table live in hermit.
@@ -86,10 +92,11 @@ No document states why, and the two halves have different properties as a
 result:
 
 - A pressure result committed to `cells.json` **moves the hermit SHA**, so it
-  changes the thing being measured. A validate result written to the parent
+  changes the thing being measured. A validate result committed to the parent
   ledger does not.
 - Conversely, the parent ledger is not visible from a hermit checkout, so a
-  hermit-side reader cannot see validate history at all.
+  hermit-side reader cannot see validate history at all — not because it is
+  untracked, but because it is tracked in a *different* repository.
 
 Whichever way the redesign goes, the split should be a **stated decision** with
 its consequence named, rather than an accident of where each tool was written.
@@ -191,9 +198,9 @@ considered:
 | C | the parent, beside the existing ledger | **Yes** |
 
 **Recommendation: option C.** It follows the grain of what already works. The
-parent already holds the only durable series in the system — `ledger/hermit` and
-`ledger/reverie`, sharded per repository, fed by 774 run records — with a
-spool/union model already built for concurrent writers. A per-cell series is the
+parent already holds the only durable series in the system — the version
+controlled `ledger/`, sharded by product, host and month across 3 files holding
+1,959 rows — with a spool/union model already built for concurrent writers. A per-cell series is the
 same shape of data with a different key, so it reuses the sharding, the
 concurrency story, and the "does not perturb the measured tree" property for
 free.
