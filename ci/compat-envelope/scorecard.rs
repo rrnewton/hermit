@@ -1588,7 +1588,43 @@ fn load_existing(root: &Path) -> Result<Option<TrackedCells>, String> {
 }
 
 fn encoded_cells(cells: &TrackedCells) -> Result<String, String> {
-    let mut text = serde_json::to_string_pretty(cells)
+    // ⚠️ THE NORMALISATION HAPPENS HERE, AT THE SINGLE WRITE CHOKE POINT, AND
+    // NOT ONLY AT INGEST. `update` carries already-tracked rows forward without
+    // re-reading their results, so an ingest-only fix would clean new rows and
+    // leave every historical one — the 78 that have been failing
+    // `check-portable-paths.sh` since 2026-08-11 are exactly those. Doing it on
+    // encode also means `check_tracked` compares against the normalised form,
+    // so the tracked file and the checker cannot disagree.
+    //
+    // ⚠️ NORMALISE THE TYPED VALUE, NEVER A ROUND-TRIP THROUGH `serde_json::Value`.
+    //
+    // `Value`'s map is a BTreeMap unless the `preserve_order` feature is on, so
+    // `to_value(cells)` -> mutate -> `to_string_pretty(&value)` SORTS EVERY KEY
+    // and rewrites all 68k lines of this tracked file for no semantic reason.
+    // Measured when I did exactly that: 34268 insertions / 34268 deletions,
+    // against 78 real path lines.
+    //
+    // ⚠️ AND NOTHING CATCHES IT. Key order carries no meaning, so the round-trip
+    // is semantically identical: the self-test passes, `check` passes, every
+    // consumer still parses, and `update` is still idempotent. The ONLY symptom
+    // is the size of the diff. Anyone reaching for a JSON walker here because
+    // the typed traversal below looks tedious will get a clean-looking green run
+    // and a 34k-line review. Keep the traversal typed.
+    let mut normalised = cells.clone();
+    for cell in &mut normalised.cells {
+        for observation in &mut cell.observations {
+            observation.invocations = observation
+                .invocations
+                .iter()
+                .cloned()
+                .map(|mut invocation| {
+                    normalise_invocation_root(&mut invocation);
+                    invocation
+                })
+                .collect();
+        }
+    }
+    let mut text = serde_json::to_string_pretty(&normalised)
         .map_err(|e| format!("cannot serialize tracked cells: {e}"))?;
     text.push('\n');
     Ok(text)
@@ -2513,8 +2549,11 @@ fn read_result_candidates(
             if line.trim().is_empty() {
                 continue;
             }
-            let row: ResultRow = serde_json::from_str(line)
+            let mut row: ResultRow = serde_json::from_str(line)
                 .map_err(|e| format!("invalid JSON at {}:{}: {e}", path.display(), index + 1))?;
+            // Before ANY use, including the provenance checks below, so every
+            // downstream consumer and the tracked file agree on one spelling.
+            normalise_recorded_root(&mut row);
             if row.schema != CELL_RESULT_SCHEMA {
                 return Err(format!(
                     "{}:{} has result schema {}, expected {}",
@@ -2732,6 +2771,144 @@ fn literal_shell_command(
     );
     words.extend(argv.iter().map(|arg| recorded_shell_quote(arg)));
     words.join(" ")
+}
+
+/// The worktree a result was produced in, rewritten to [`RECORDED_ROOT`] on
+/// ingest so a receipt does not carry the machine that produced it.
+///
+/// WHY THIS EXISTS. `cells.json` is TRACKED, so whatever a row records lands in
+/// the repository. The runner writes absolute paths — `argv[0]`, `cwd`, the
+/// `HOME=`/`XDG_CONFIG_HOME=`/`E2E_FIXTURE_DIR=` env values, and the derived
+/// `shell_command`. The same scorecard command run from two different worktrees
+/// therefore produced two different committed files, and
+/// `scripts/check-portable-paths.sh` failed on the difference: 78 of its 80
+/// violations were one worktree's absolute paths sitting in this file.
+///
+/// That is a determinism defect in a determinism project — a tool embedding its
+/// environment in its own result, the same class as a host-global counter
+/// leaking into guest state. Cleaning `cells.json` by hand does not fix it and
+/// is worse than leaving it, because the next run regenerates the paths while
+/// the next reader believes it was fixed.
+///
+/// ⚠️ THE PREFIX IS THE ROW'S OWN `cwd`, NOT THE GENERATOR'S ROOT. Rows are
+/// aggregated from other worktrees, so stripping the *running* root would
+/// normalise only the rows that happened to be local and silently leave every
+/// imported one — which is precisely the half-fix that would still regenerate.
+///
+/// `shell_command` is RECOMPUTED rather than substituted into. It is derived by
+/// [`literal_shell_command`], which shell-quotes its inputs; rewriting inside
+/// the finished string would desynchronise it from the inputs it is checked
+/// against and trip the `shell_command != literal_shell_command(..)` guard.
+const RECORDED_ROOT: &str = "/repo";
+
+fn rewrite_recorded_root(value: &mut String, root: &str) {
+    if value.contains(root) {
+        *value = value.replace(root, RECORDED_ROOT);
+    }
+}
+
+fn rewrite_recorded_root_json(value: &mut JsonValue, root: &str) {
+    match value {
+        JsonValue::String(text) => rewrite_recorded_root(text, root),
+        JsonValue::Array(items) => items
+            .iter_mut()
+            .for_each(|item| rewrite_recorded_root_json(item, root)),
+        JsonValue::Object(fields) => fields
+            .iter_mut()
+            .for_each(|(_, field)| rewrite_recorded_root_json(field, root)),
+        _ => {}
+    }
+}
+
+/// Rewrite one attempt in place, then rebuild its `shell_command` from its own
+/// rewritten fields so `attempt_shell_command_is_invalid` still agrees.
+fn normalise_attempt_root(attempt: &mut JsonValue, root: &str) {
+    rewrite_recorded_root_json(attempt, root);
+    let (Some(cwd), Some(argv), Some(env)) = (
+        attempt
+            .get("cwd")
+            .and_then(JsonValue::as_str)
+            .map(str::to_owned),
+        attempt
+            .get("argv")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok()),
+        attempt
+            .get("env")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<BTreeMap<String, String>>(v).ok()),
+    ) else {
+        return;
+    };
+    if let Some(object) = attempt.as_object_mut() {
+        object.insert(
+            "shell_command".into(),
+            JsonValue::String(literal_shell_command(&cwd, &env, &argv)),
+        );
+    }
+}
+
+/// Rewrite one recorded invocation in place against its OWN `cwd`.
+///
+/// `shell_command` is REBUILT from the rewritten fields rather than substituted
+/// into: it is derived by [`literal_shell_command`], which shell-quotes its
+/// inputs, so editing the finished string would desynchronise it from the
+/// inputs it is validated against.
+fn normalise_invocation_root(invocation: &mut ObservedInvocation) {
+    let root = invocation.cwd.clone();
+    if !root.starts_with('/') || root == RECORDED_ROOT {
+        return;
+    }
+    for argument in invocation
+        .argv
+        .iter_mut()
+        .chain(invocation.guest_argv.iter_mut())
+    {
+        rewrite_recorded_root(argument, &root);
+    }
+    for value in invocation.env.values_mut() {
+        rewrite_recorded_root(value, &root);
+    }
+    invocation.cwd = RECORDED_ROOT.to_string();
+    invocation.shell_command =
+        literal_shell_command(&invocation.cwd, &invocation.env, &invocation.argv);
+    for attempt in &mut invocation.attempts {
+        for argument in attempt.argv.iter_mut().chain(attempt.guest_argv.iter_mut()) {
+            rewrite_recorded_root(argument, &root);
+        }
+        for value in attempt.env.values_mut() {
+            rewrite_recorded_root(value, &root);
+        }
+        attempt.cwd = RECORDED_ROOT.to_string();
+        attempt.shell_command =
+            literal_shell_command(&attempt.cwd, &attempt.env, &attempt.argv);
+    }
+}
+
+fn normalise_recorded_root(row: &mut ResultRow) {
+    let root = row.cwd.clone();
+    // An empty, relative, or already-normalised root has nothing to strip.
+    // Guarding on `starts_with('/')` also means a row written by a future
+    // producer that already records `/repo` passes through untouched.
+    if root.is_empty() || root == RECORDED_ROOT || !root.starts_with('/') {
+        return;
+    }
+    for argument in row
+        .argv
+        .iter_mut()
+        .chain(row.guest_argv.iter_mut())
+        .chain(row.effective_args.iter_mut())
+    {
+        rewrite_recorded_root(argument, &root);
+    }
+    for value in row.env.values_mut() {
+        rewrite_recorded_root(value, &root);
+    }
+    for attempt in row.attempts.iter_mut() {
+        normalise_attempt_root(attempt, &root);
+    }
+    row.cwd = RECORDED_ROOT.to_string();
+    row.shell_command = literal_shell_command(&row.cwd, &row.env, &row.argv);
 }
 
 fn recorded_shell_quote(value: &str) -> String {
@@ -3804,8 +3981,81 @@ fn self_test() -> Result<(), String> {
         return Err("writer boundary allowed an observation writer to add a cell".into());
     }
 
+    // ── PATH-INDEPENDENCE BRACKET ──────────────────────────────────────────
+    // The encoded artifact must not name the worktree that produced it, and it
+    // must not name the worktree ENCODING it either. Both legs are required:
+    // the second is the one that hid, because `update` carries tracked rows
+    // forward without re-ingesting, so a foreign worktree's path survives every
+    // regeneration until something rewrites it on the way out.
+    //
+    // NEGATIVE LEG FIRST, so this cannot become a guard that never fires: the
+    // fixture below is built WITH a foreign absolute root, and the assertions
+    // fail if that root reaches the encoded bytes.
+    let foreign_root = "/home/example/checkouts/hermit-42";
+    let foreign_env: BTreeMap<String, String> =
+        [("HOME".to_string(), format!("{foreign_root}/home"))]
+            .into_iter()
+            .collect();
+    let mut fixture = ObservedInvocation {
+        hermit_sha: "fixture-sha".into(),
+        run_id: "fixture-run".into(),
+        result: ObservedResult::Pass,
+        argv: vec![format!("{foreign_root}/target/debug/hermit"), "run".into()],
+        guest_argv: vec!["/bin/true".into()],
+        env: foreign_env.clone(),
+        cwd: foreign_root.into(),
+        shell_command: "stale - must be REBUILT, not substituted into".into(),
+        attempts: vec![ObservedAttemptInvocation {
+            index: "1".into(),
+            outcome: "pass".into(),
+            status: Some(0),
+            signal: None,
+            timed_out: false,
+            argv: vec![format!("{foreign_root}/target/debug/hermit")],
+            guest_argv: vec!["/bin/true".into()],
+            env: foreign_env,
+            cwd: foreign_root.into(),
+            shell_command: "stale".into(),
+        }],
+    };
+    normalise_invocation_root(&mut fixture);
+    let encoded = serde_json::to_string(&fixture)
+        .map_err(|e| format!("path-independence fixture will not serialize: {e}"))?;
+    if encoded.contains(foreign_root) {
+        return Err(format!(
+            "encoded cells still name the producing worktree {foreign_root}"
+        ));
+    }
+    if !encoded.contains(RECORDED_ROOT) {
+        return Err(format!(
+            "encoded cells dropped the {RECORDED_ROOT} placeholder instead of rewriting to it"
+        ));
+    }
+    // The rewrite must leave `shell_command` derivable from its own siblings at
+    // BOTH levels, or the invocation guards reject every row it touched.
+    if fixture.shell_command != literal_shell_command(&fixture.cwd, &fixture.env, &fixture.argv) {
+        return Err(
+            "path normalisation desynchronised shell_command from its own cwd/env/argv".into(),
+        );
+    }
+    let Some(attempt) = fixture.attempts.first() else {
+        return Err("path-independence fixture lost its attempts".into());
+    };
+    if attempt.shell_command != literal_shell_command(&attempt.cwd, &attempt.env, &attempt.argv) {
+        return Err("path normalisation desynchronised a nested attempt's shell_command".into());
+    }
+    // Idempotence: regenerating an already-normalised file must be a no-op, or
+    // `check_tracked` would report drift on every second run.
+    let once = fixture.clone();
+    normalise_invocation_root(&mut fixture);
+    if fixture != once {
+        return Err(
+            "path normalisation is not idempotent; a second encode would report drift".into(),
+        );
+    }
+
     println!(
-        "compatibility scorecard self-test: provenance, distinct-evidence, result, selected-chaos, ratchet, observation-range, batch-equivalence, green-admission, validate-observation, source-identity, writer-boundary, and infrastructure-refusal brackets pass"
+        "compatibility scorecard self-test: provenance, distinct-evidence, result, selected-chaos, ratchet, observation-range, batch-equivalence, green-admission, validate-observation, source-identity, writer-boundary, path-independence, and infrastructure-refusal brackets pass"
     );
     Ok(())
 }
