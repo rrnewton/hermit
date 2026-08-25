@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -567,6 +568,37 @@ static int test_pending_sigsuspend(void) {
   return 0;
 }
 
+static int test_sigsuspend_invalid_arguments(void) {
+  const void* invalid_mask = (const void*)(uintptr_t)1;
+
+  errno = 0;
+  const long invalid_size = syscall(SYS_rt_sigsuspend, invalid_mask, 7UL);
+  const int invalid_size_errno = errno;
+  if (invalid_size != -1 || invalid_size_errno != EINVAL) {
+    fprintf(
+        stderr,
+        "rt_sigsuspend invalid size result=%ld errno=%d, expected EINVAL\n",
+        invalid_size,
+        invalid_size_errno);
+    return 1;
+  }
+
+  errno = 0;
+  const long invalid_pointer = syscall(SYS_rt_sigsuspend, invalid_mask, 8UL);
+  const int invalid_pointer_errno = errno;
+  if (invalid_pointer != -1 || invalid_pointer_errno != EFAULT) {
+    fprintf(
+        stderr,
+        "rt_sigsuspend invalid pointer result=%ld errno=%d, expected EFAULT\n",
+        invalid_pointer,
+        invalid_pointer_errno);
+    return 1;
+  }
+
+  puts("rt_sigsuspend invalid size=EINVAL invalid pointer=EFAULT");
+  return 0;
+}
+
 static int test_blocking_sigsuspend_without_signal(void) {
   sigset_t wait_mask;
   sigfillset(&wait_mask);
@@ -882,6 +914,9 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "pending-sigsuspend") == 0) {
     return test_pending_sigsuspend();
+  }
+  if (strcmp(argv[1], "sigsuspend-invalid-arguments") == 0) {
+    return test_sigsuspend_invalid_arguments();
   }
   if (strcmp(argv[1], "blocking-sigsuspend-no-signal") == 0) {
     return test_blocking_sigsuspend_without_signal();
