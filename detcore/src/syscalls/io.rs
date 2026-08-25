@@ -1387,8 +1387,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Recvmsg,
     ) -> Result<i64, Error> {
         // NETLINK_SOCK_DIAG replies carry host-assigned socket identities in
-        // their msg_iov payload (not msg_control). Determinize them before the
-        // binary reply reaches the guest.
+        // their msg_iov payload (not msg_control). Canonicalize the supported
+        // fields before the binary reply reaches the guest.
         // The predicate is shared with the read/readv/recvfrom/recvmmsg paths so
         // the five receive syscalls cannot drift apart again.
         if self.sock_diag_reply_fd(guest, call.sockfd()) {
@@ -1435,8 +1435,8 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1064)
-    /// Whether replies received on `fd` must have their socket identities
-    /// determinized.
+    /// Whether replies received on `fd` must have their supported socket
+    /// identities canonicalized.
     ///
     /// This is the single predicate every receive path consults. It exists as
     /// one function because the flag used to be tested inline in `recvmsg`
@@ -1482,8 +1482,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             .collect())
     }
 
-    /// Zero the host-assigned socket identities in a `NETLINK_SOCK_DIAG` reply
-    /// that the kernel has already written into guest memory.
+    /// Canonicalize host-assigned identities in a `NETLINK_SOCK_DIAG` reply that
+    /// the kernel has already written into guest memory.
     ///
     /// `segments` describes the destination buffers as `(address, capacity)` in
     /// the order the kernel filled them; `received` is the syscall's return
@@ -1526,8 +1526,8 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         // NETLINK_ROUTE and NETLINK_SOCK_DIAG replies need different
         // sanitizers: one zeroes live interface counters, the other determinizes
-        // socket inode/cookie identities. The descriptor decides which, so a
-        // guest holding both kinds of socket gets each handled correctly.
+        // supported socket identities. The descriptor decides which, so a guest
+        // holding both kinds of socket gets each handled correctly.
         let modified = if self.netlink_route_reply_fd(guest, fd) {
             crate::netlink_route::sanitize_route_link_stats(&mut buffer)
         } else {
