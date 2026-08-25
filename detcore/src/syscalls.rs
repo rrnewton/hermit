@@ -8,7 +8,7 @@
 
 //! This module just aggregates submodules.
 
-mod files;
+pub(crate) mod files;
 pub mod helpers;
 mod io;
 mod memory;

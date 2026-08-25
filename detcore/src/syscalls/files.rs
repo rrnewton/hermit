@@ -199,7 +199,43 @@ fn copy_timer_slack_output<M: MemoryAccess>(
 /// immediately or enters the scheduler's `InternalIOPolling` retry path. Two pages is the
 /// pressure-mode capacity on supported x86-64 Linux hosts and, unlike 64 KiB, never requires an
 /// unprivileged capacity increase while the soft limit is active.
-const DETERMINISTIC_PIPE_CAPACITY_BYTES: i32 = 8 * 1024;
+pub(crate) const DETERMINISTIC_PIPE_CAPACITY_BYTES: i32 = 8 * 1024;
+
+/// What a guest's own `F_SETPIPE_SZ` must be answered with.
+///
+/// ⚠️ THE CREATION-TIME PIN WAS ESCAPABLE IN ONE SYSCALL. Detcore pins every
+/// pipe to `DETERMINISTIC_PIPE_CAPACITY_BYTES` at `pipe2` time, and that works —
+/// `F_GETPIPE_SZ` reports 8192 because the kernel object genuinely is that size.
+/// But a guest could then call `F_SETPIPE_SZ` itself and the request went
+/// straight to the host through `handle_fcntl`'s catch-all, so:
+///
+///   host ceiling 1048576 (measured here) -> success, guest gets a 1 MiB pipe
+///   host ceiling   65536 (common hardened) -> EPERM, guest keeps 8192
+///
+/// Same binary, same `--strict`, and BOTH the return value and the resulting
+/// capacity decided by `/proc/sys/fs/pipe-max-size`. That is a determinism leak
+/// by this project's own definition, and it sits under a cell that counts green.
+///
+/// ⚠️ BOTH ANSWERS BELOW ARE SHAPES LINUX ITSELF PRODUCES — this determinizes
+/// WHICH one happens, it does not invent a new contract:
+///   * above the ceiling, unprivileged: `EPERM`. Exactly what Linux returns when
+///     the request exceeds `pipe-max-size`; the only change is that the ceiling
+///     is now one Detcore controls instead of one the host does.
+///   * at or below it: the pinned capacity. Linux rounds a request up to at
+///     least a page and returns the size it applied, and 8192 is >= any request
+///     that reaches this arm, so returning it is a truthful "this is your
+///     capacity now" — and it leaves the pin intact.
+///
+/// A negative request is `EINVAL`, as on Linux.
+fn pipe_capacity_request(requested: i32) -> Result<i64, Errno> {
+    if requested < 0 {
+        return Err(Errno::EINVAL);
+    }
+    if requested > DETERMINISTIC_PIPE_CAPACITY_BYTES {
+        return Err(Errno::EPERM);
+    }
+    Ok(i64::from(DETERMINISTIC_PIPE_CAPACITY_BYTES))
+}
 
 /// Why the pin failed, and which descriptors Linux had already created when it did.
 ///
@@ -2580,6 +2616,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 })?;
                 Ok(result)
             }
+            // NEVER FORWARDED. Answering locally is the point: forwarding is
+            // what let the host's `pipe-max-size` decide the guest's capacity.
+            F_SETPIPE_SZ(requested) => match pipe_capacity_request(requested) {
+                Ok(capacity) => Ok(capacity),
+                Err(errno) => Err(Error::Errno(errno)),
+            },
             _ => {
                 trace!(
                     "[detcore-finishme]: fcntl unhandled cases: {:?}",
@@ -4135,6 +4177,50 @@ mod test {
     use reverie::syscalls::Whence;
 
     use super::DETERMINISTIC_PIPE_CAPACITY_BYTES;
+
+    #[test]
+    fn a_guest_cannot_grow_a_pipe_past_the_pinned_capacity() {
+        // The escape this fixes: before, this request went to the host and
+        // succeeded wherever `pipe-max-size` allowed it.
+        assert_eq!(
+            super::pipe_capacity_request(1 << 20),
+            Err(Errno::EPERM),
+            "a request above the pinned capacity must be refused, not forwarded"
+        );
+        assert_eq!(super::pipe_capacity_request(2 << 20), Err(Errno::EPERM));
+    }
+
+    #[test]
+    fn a_request_at_or_below_the_pin_reports_the_pinned_capacity() {
+        for requested in [0, 1, 4096, DETERMINISTIC_PIPE_CAPACITY_BYTES] {
+            assert_eq!(
+                super::pipe_capacity_request(requested),
+                Ok(i64::from(DETERMINISTIC_PIPE_CAPACITY_BYTES)),
+                "Linux rounds up and returns the size it applied; the pin is unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn a_negative_capacity_is_einval_as_on_linux() {
+        assert_eq!(super::pipe_capacity_request(-1), Err(Errno::EINVAL));
+    }
+
+    /// ⚠️ THE DETERMINISM PROPERTY ITSELF, stated as a test rather than as prose:
+    /// the answer is a pure function of the pinned constant. Nothing in this
+    /// path reads `/proc/sys/fs/pipe-max-size`, so two hosts with different
+    /// ceilings cannot give the guest different answers — which is exactly what
+    /// they did before.
+    #[test]
+    fn the_answer_depends_only_on_the_pinned_capacity() {
+        let boundary = DETERMINISTIC_PIPE_CAPACITY_BYTES;
+        assert!(super::pipe_capacity_request(boundary).is_ok());
+        assert_eq!(
+            super::pipe_capacity_request(boundary + 1),
+            Err(Errno::EPERM)
+        );
+    }
+
     use super::Errno;
     use super::TimerSlackBinding;
     use super::UNIX_AUTOBIND_NAME_LEN;

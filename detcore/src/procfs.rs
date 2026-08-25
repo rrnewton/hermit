@@ -59,6 +59,10 @@ enum ProcfsKind {
     Fdinfo,
     AioNr,
     AioMaxNr,
+    /// `/proc/sys/fs/pipe-max-size`: the host's unprivileged ceiling on
+    /// `F_SETPIPE_SZ`. Host-global and host-tunable, so a guest that reads it
+    /// reads the host.
+    PipeMaxSize,
     NumaMaps,
     SmapsRollup,
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -458,6 +462,9 @@ impl ProcfsFile {
             "/proc/sys/fs/aio-nr" => ProcfsKind::AioNr,
             "/proc/sys/fs/aio-max-nr" => ProcfsKind::AioMaxNr,
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-2232): Review the deterministic pipe-capacity ceiling.
+            "/proc/sys/fs/pipe-max-size" => ProcfsKind::PipeMaxSize,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-927): Review host-global PTY count normalization.
             "/proc/sys/kernel/pty/nr" => ProcfsKind::PtyNr,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -704,6 +711,7 @@ impl ProcfsFile {
             ProcfsKind::Fdinfo => sanitize_fdinfo(&contents, fdinfo_identity),
             ProcfsKind::AioNr => sanitize_aio_nr(&contents),
             ProcfsKind::AioMaxNr => sanitize_aio_nr(&contents),
+            ProcfsKind::PipeMaxSize => sanitize_pipe_max_size(&contents),
             ProcfsKind::NumaMaps => sanitize_numa_maps(&contents),
             ProcfsKind::SmapsRollup => sanitize_smaps_rollup(&contents),
             ProcfsKind::ArchStatus => sanitize_arch_status(&contents),
@@ -1830,6 +1838,32 @@ fn sanitize_swaps(contents: &[u8]) -> Vec<u8> {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-933): Review the /proc/sys/fs/aio-nr policy.
+/// Report the ceiling Detcore actually enforces, not the host's.
+///
+/// ⚠️ THE HOST VALUE IS A DETERMINISM LEAK EVEN THOUGH IT IS ONLY A NUMBER.
+/// Measured on this host it reads 1048576; the common hardened value is 65536.
+/// A guest that sizes a buffer, picks a chunk size, or branches on this reads a
+/// different number per host and behaves differently on each — with the same
+/// binary and the same `--strict`.
+///
+/// It reports `DETERMINISTIC_PIPE_CAPACITY_BYTES` because that is the honest
+/// answer once `F_SETPIPE_SZ` is bounded by the same constant: the largest pipe
+/// a guest can actually obtain IS the pinned capacity, so any larger ceiling
+/// would be advertising a size the guest cannot get. The two must move together;
+/// see `pipe_capacity_request` in `syscalls/files.rs`.
+fn sanitize_pipe_max_size(contents: &[u8]) -> Vec<u8> {
+    let Ok(value) = std::str::from_utf8(contents) else {
+        return Vec::new();
+    };
+    value.trim().parse::<u64>().ok().map_or_else(Vec::new, |_| {
+        format!(
+            "{}\n",
+            crate::syscalls::files::DETERMINISTIC_PIPE_CAPACITY_BYTES
+        )
+        .into_bytes()
+    })
+}
+
 fn sanitize_aio_nr(contents: &[u8]) -> Vec<u8> {
     let Ok(value) = std::str::from_utf8(contents) else {
         return Vec::new();
