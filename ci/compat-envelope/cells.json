@@ -28007,9 +28007,11 @@
       "test": "c-programs/ipc-determinism",
       "mode": "chaos",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "not-applicable",
-      "not_applicable_reason": "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle",
+      "enabled": true,
+      "status": "red",
+      "ci_disabled_reason": {
+        "reason": "Measured 2026-08-25 by agent(hermit-007). 32 seeds under --chaos --strict gave 32 of 32 passes and 0 failures, but only 6 distinct observation classes against this cell's own assert.min_distinct of 16. The other two cells in this ratchet met their oracles - thread-sync-determinism 14 distinct, thread-contention 32. Reconcile the 16 before enabling - either diversity regressed from the 32 classes the description records, or the threshold does not describe what the harness hashes, which is status plus stdout."
+      },
       "observations": [],
       "measurement": "never-measured"
     },
@@ -50341,9 +50343,8 @@
       "test": "c-programs/thread-sync-determinism",
       "mode": "chaos",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "not-applicable",
-      "not_applicable_reason": "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle",
+      "enabled": true,
+      "status": "green",
       "observations": [],
       "measurement": "never-measured"
     },
@@ -57369,9 +57370,8 @@
       "test": "determinism-stress-c/thread-contention",
       "mode": "chaos",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "not-applicable",
-      "not_applicable_reason": "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle",
+      "enabled": true,
+      "status": "green",
       "observations": [],
       "measurement": "never-measured"
     },
