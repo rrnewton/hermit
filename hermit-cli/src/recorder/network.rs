@@ -45,7 +45,6 @@ fn read_bytes<M: MemoryAccess>(
     Ok(bytes)
 }
 
-
 /// Capture `poll`'s guest-visible outputs, INCLUDING on the error path.
 ///
 /// This mirrors [`capture_ppoll_event`]; see that function for the full

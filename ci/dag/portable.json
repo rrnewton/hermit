@@ -84,6 +84,14 @@
                "hard_mem_max_bytes": 1073741824, "classification": "light"}
     },
     {
+      "group": "lint", "job": "rustfmt",
+      "desc": "Rustfmt (cargo fmt --all -- --check)",
+      "cmd": "cargo fmt --all -- --check",
+      "timeout": 120,
+      "hint": {"est_duration_s": 20, "rss_baseline_bytes": 268435456,
+               "hard_mem_max_bytes": 1073741824, "classification": "light"}
+    },
+      {
       "group": "setup", "job": "nextest",
       "desc": "cargo-nextest available",
       "cmd": "cargo nextest show-config version >/dev/null 2>&1 || if command -v with-proxy >/dev/null 2>&1; then with-proxy cargo install cargo-nextest --locked --version 0.9.100; else cargo install cargo-nextest --locked --version 0.9.100; fi",
@@ -331,15 +339,7 @@
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
                "classification": "latency-bound"}
     },
-    {
-      "group": "lint", "job": "rustfmt",
-      "desc": "Rustfmt (cargo fmt --all -- --check)",
-      "cmd": "cargo fmt --all -- --check",
-      "timeout": 120,
-      "hint": {"est_duration_s": 20, "rss_baseline_bytes": 268435456,
-               "hard_mem_max_bytes": 1073741824, "classification": "light"}
-    },
-    {
+        {
       "group": "lint", "job": "clippy",
       "desc": "Clippy (cargo clippy --workspace --all-targets -D warnings)",
       "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> clippy's build phase defaulted to nproc). rss_baseline=measured_peak@j8=4.0GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=5.5GiB (was 8GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv. CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 mirrors the leading CARGO_BUILD_JOBS=8 prefix. See doc.rustdoc for the shared derivation; jobs_flag is empty because appending '-j 8' here would land after '--' and reach rustc, which has no -j.",
