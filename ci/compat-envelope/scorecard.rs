@@ -774,6 +774,54 @@ this regression plan. These same-backend results do not establish cross-backend 
         "| **Total** | **{green_total}** | **{}** | **{total}** |\n\n",
         total - green_total
     ));
+    // DENOMINATOR PROVENANCE. Emitted from the derived population, never
+    // hand-written, so it cannot go stale and cannot be forgotten.
+    //
+    // ⚠️ WHY THIS EXISTS. A percentage is meaningless without the population it
+    // was taken over, and this table's population CHANGES: adding a backend or
+    // a mode to the manifest grows it, removing one shrinks it. Both move the
+    // percentage while nothing about the product moves. Worked example with
+    // real numbers at the time of writing: dropping `dbt` would remove 1035
+    // cells, ALL OF THEM RED, taking the total from 5520 to 4485 and RAISING
+    // reported green from 5.07% to 6.24% -- a 23% relative improvement with
+    // nothing improved. Restoring it later would move the number back DOWN,
+    // which reads as a regression when it is a restoration of honesty.
+    //
+    // Recording the composition beside the number makes any such change show up
+    // as a diff hunk in this generated file, so a new percentage cannot be
+    // quoted without the reason it moved sitting next to it.
+    let percent = if total == 0 {
+        0.0
+    } else {
+        100.0 * green_total as f64 / total as f64
+    };
+    let modes: BTreeSet<&str> = derived
+        .population
+        .iter()
+        .map(|id| id.mode.as_str())
+        .collect();
+    out.push_str(&format!(
+        "## Denominator, and why the percentage is not comparable across changes to it\n\n\
+Green is **{green_total} of {total}**, which is **{percent:.2}%** — over THIS population and no \
+other. The population is every combination the manifest declares, and it is composed of:\n\n\
+- backends: {}\n\
+- modes: {}\n\n\
+⚠️ **Adding or removing a backend or mode changes this denominator and therefore the percentage, \
+without anything about the product changing.** Removing a backend whose cells are mostly red \
+RAISES the reported figure; adding honest red cells LOWERS it. Neither is progress. Before \
+comparing this percentage against an earlier one, diff the two lists above: if they differ, the \
+numbers are not comparable and the difference is not a result.\n\n",
+        ordered
+            .iter()
+            .map(|b| format!("`{b}`"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        modes
+            .iter()
+            .map(|m| format!("`{m}`"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    ));
     out.push_str(
         "The mode view makes the current order of work explicit: expand `verify` first, then \
 `replay`, then `chaos`. Each backend cell is `green / total`; an em dash means that mode does \

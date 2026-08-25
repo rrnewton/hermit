@@ -16,6 +16,15 @@ Every selected `verify` cell, and every seed in a selected `chaos` cell, runs th
 | `native` | 0 | 345 | 345 |
 | **Total** | **279** | **5241** | **5520** |
 
+## Denominator, and why the percentage is not comparable across changes to it
+
+Green is **279 of 5520**, which is **5.05%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
+
+- backends: `ptrace`, `dbt`, `kvm`, `sabre`, `liteinst`, `native`
+- modes: `chaos`, `naked`, `replay`, `verify`
+
+⚠️ **Adding or removing a backend or mode changes this denominator and therefore the percentage, without anything about the product changing.** Removing a backend whose cells are mostly red RAISES the reported figure; adding honest red cells LOWERS it. Neither is progress. Before comparing this percentage against an earlier one, diff the two lists above: if they differ, the numbers are not comparable and the difference is not a result.
+
 The mode view makes the current order of work explicit: expand `verify` first, then `replay`, then `chaos`. Each backend cell is `green / total`; an em dash means that mode does not exist for that backend.
 
 | Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `native` | Green | Red | Total |
