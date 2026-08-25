@@ -631,6 +631,12 @@
       "why": "tests/backend-parity/fixtures/signalfd_create.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/socket_epoll_ordering.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false)",
+      "why": "tests/backend-parity/fixtures/socket_epoll_ordering.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI because no backend has ever been measured for this cell -- the registration it was ported from disabled the non-ptrace backends with a host-toolchain excuse rather than a measurement"
+    },
+    {
       "disposition": "guest-fixture",
       "path": "tests/backend-parity/fixtures/sigprocmask_state.c",
       "runner": "tests/backend-parity/run_matrix.py",
