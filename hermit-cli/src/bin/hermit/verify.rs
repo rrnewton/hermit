@@ -400,7 +400,8 @@ impl ComparisonSpec {
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
     /// The two runs matched on every compared dimension (stdout, stderr, exit
-    /// status, and — unless disabled — the internal DETLOG event stream).
+    /// status, and — unless disabled — the internal DETLOG event stream) and
+    /// every completed backend-specific invariant such as the DBT branch clock.
     Matched,
     /// The two runs diverged; verification failed.
     Diverged,
@@ -437,6 +438,27 @@ impl ComparedLogCounts {
     }
 }
 
+/// The typed whole-process DBT counted-branch clocks compared for one verdict.
+///
+/// This is absent for non-DBT verification and for `no_result`: neither case
+/// performed a complete two-run DBT clock comparison. Equal values document a
+/// checked invariant on a match; unequal values name the backend-specific
+/// dimension that made the verdict diverge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DbtCountedBranchComparison {
+    /// Whole-process counted branches from run 1.
+    pub left: u64,
+    /// Whole-process counted branches from run 2.
+    pub right: u64,
+}
+
+impl DbtCountedBranchComparison {
+    /// Whether both completed runs reported the same counted-branch clock.
+    pub fn matched(self) -> bool {
+        self.left == self.right
+    }
+}
+
 /// The full outcome of comparing two runs: the verification [`Verdict`] plus the
 /// guest exit status, so a caller never has to infer either one from the other.
 #[derive(Debug, Clone)]
@@ -444,13 +466,18 @@ pub struct VerificationOutcome {
     pub verdict: Verdict,
     /// Exit status of the second (replay / repeat) run, propagated verbatim.
     pub guest_status: ExitStatus,
-    /// The exact comparison that produced [`Self::verdict`], carried so a
-    /// consumer never has to assume which comparison a "matched" rests on.
+    /// The exact common output/log comparison used for [`Self::verdict`],
+    /// carried so a consumer never has to assume which comparison a "matched"
+    /// rests on. Backend-specific dimensions are carried separately below.
     pub comparison: ComparisonSpec,
     /// How many log messages the comparison actually compared, or `None` when
     /// the log comparison was not run at all (output-only fallback). `None` and
     /// `Some(0/0)` are both "no log evidence" and neither can support parity.
     pub compared_log_messages: Option<ComparedLogCounts>,
+    /// Typed whole-process DBT branch clocks, when that backend completed both
+    /// runs and produced readable statistics. `None` for non-DBT runs and when
+    /// verification did not reach a verdict.
+    pub dbt_counted_branches: Option<DbtCountedBranchComparison>,
     /// Scheduler turn at the first log divergence, when a preceding COMMIT
     /// identified the turn.
     pub first_divergent_scheduler_turn: Option<u64>,
@@ -494,9 +521,15 @@ impl VerificationOutcome {
     pub fn into_exit_status(self) -> Result<ExitStatus, Error> {
         match self.verdict {
             Verdict::Matched => Ok(self.guest_status),
-            Verdict::Diverged => Err(Error::msg(
-                "Mismatch between run 1 and run 2 outputs (logs retained).",
-            )),
+            Verdict::Diverged => match self.dbt_counted_branches {
+                Some(branches) if !branches.matched() => Err(Error::msg(format!(
+                    "DBT verification failed: counted-branch clocks differed between runs ({} != {}); logs retained",
+                    branches.left, branches.right
+                ))),
+                _ => Err(Error::msg(
+                    "Verification found a mismatch between run 1 and run 2 (logs retained).",
+                )),
+            },
             // Reached when the comparator refused (a truncated log) and nothing
             // else was observed to differ. Still an error, so the historical
             // nonzero process exit is unchanged -- but it must not be reported
@@ -532,8 +565,9 @@ pub struct VerificationReport {
     pub bitwise_parity: bool,
     /// The verdict as a stable string ("matched" / "diverged").
     pub verdict: Verdict,
-    /// The comparison that produced the verdict. Without this a bitwise-parity
-    /// consumer cannot distinguish a stripped match from a bitwise one. `null`
+    /// The common output/log comparison used for the verdict. Without this a
+    /// bitwise-parity consumer cannot distinguish a stripped match from a bitwise one.
+    /// Backend-specific dimensions are carried separately below. `null`
     /// when no verdict was reached (see [`Verdict::NoResult`]).
     pub comparison: Option<ComparisonSpec>,
     /// How many messages in [`ComparisonSpec::log_scope`] were actually compared.
@@ -541,6 +575,11 @@ pub struct VerificationReport {
     /// not proof that the configured comparison had data, so this count is what makes
     /// [`Self::bitwise_parity`] falsifiable.
     pub compared_log_messages: Option<ComparedLogCounts>,
+    /// Typed whole-process DBT counted-branch clocks. Omitted for non-DBT
+    /// verification and for `no_result`; unequal values identify a branch-clock
+    /// divergence that can exist even when the canonical log comparison matched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dbt_counted_branches: Option<DbtCountedBranchComparison>,
     /// The guest's exit code, if it exited normally.
     pub guest_exit_code: Option<i32>,
     /// The guest's terminating signal number, if it was killed by a signal.
@@ -571,6 +610,7 @@ impl VerificationReport {
             verdict: Verdict::NoResult,
             comparison: None,
             compared_log_messages: None,
+            dbt_counted_branches: None,
             guest_exit_code: None,
             guest_signal: None,
             first_divergent_scheduler_turn: None,
@@ -603,6 +643,11 @@ impl From<&VerificationOutcome> for VerificationReport {
             verdict: outcome.verdict,
             comparison: Some(outcome.comparison),
             compared_log_messages: outcome.compared_log_messages,
+            dbt_counted_branches: if outcome.verdict == Verdict::NoResult {
+                None
+            } else {
+                outcome.dbt_counted_branches
+            },
             guest_exit_code: outcome.guest_status.code(),
             guest_signal: outcome.guest_status.signal(),
             first_divergent_scheduler_turn: outcome.first_divergent_scheduler_turn,
@@ -1003,6 +1048,7 @@ fn compare_two_runs_with_unsupported_scan(
             guest_status: out2.status,
             comparison: spec,
             compared_log_messages,
+            dbt_counted_branches: None,
             first_divergent_scheduler_turn,
             first_divergent_virtual_nanoseconds,
             first_divergent_record,
@@ -1014,6 +1060,7 @@ fn compare_two_runs_with_unsupported_scan(
             guest_status: out2.status,
             comparison: spec,
             compared_log_messages,
+            dbt_counted_branches: None,
             first_divergent_scheduler_turn,
             first_divergent_virtual_nanoseconds,
             first_divergent_record,
@@ -2030,6 +2077,10 @@ mod tests {
         assert_eq!(now["bitwise_parity"], serde_json::json!(false));
         assert_eq!(now["comparison"], serde_json::Value::Null);
         assert_eq!(now["compared_log_messages"], serde_json::Value::Null);
+        assert!(
+            now.get("dbt_counted_branches").is_none(),
+            "no-result must not claim that a DBT branch-clock comparison completed"
+        );
     }
 
     /// The positive side of FINDING 1: the pending stamp is not a dead end --
@@ -2068,6 +2119,10 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["verified"], serde_json::json!(true));
         assert_eq!(parsed["verdict"], serde_json::json!("matched"));
+        assert!(
+            parsed.get("dbt_counted_branches").is_none(),
+            "non-DBT reports must preserve the pre-field JSON shape"
+        );
         assert_eq!(
             parsed["first_divergent_scheduler_turn"],
             serde_json::Value::Null
@@ -2208,6 +2263,7 @@ mod tests {
             guest_status: ExitStatus::Exited(0),
             comparison: full,
             compared_log_messages: Some(ComparedLogCounts { left: 9, right: 9 }),
+            dbt_counted_branches: None,
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
