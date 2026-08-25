@@ -1525,6 +1525,57 @@ defect wearing the costume of an empty input. This is the same family as check 1
 (a comparison over nothing is not agreement): in both, the mechanism ran, the
 exit code was clean, and the thing being asked about was never examined.
 
+### 19. A guard whose cases all share one SHAPE tests the shape, not the property
+
+A test file can be thorough, well named, and green, and still be blind to the
+only input that matters — because every case in it is the same shape as every
+other. The guard then measures that shape, not the property it claims, and
+nothing in the file says so. Coverage counts do not reveal it: eight cases of one
+shape look like eight cases.
+
+**Measured on [hermit#2592](https://github.com/rrnewton/hermit/pull/2592).**
+`ci/run-node-args-test.sh` had five reasoned refusals, a usage check and a
+single-node edit — a careful file. **Every case passed a SINGLE node tag.** But
+`ci-portable.yml` invokes the script with a comma-joined multi-node selection:
+`preflight_nodes` is 11 tags and 251 bytes. That went into a scratch filename,
+`"<lane>." + sel + ".effective.json"` cost 275 bytes against a `NAME_MAX` of 255,
+and the write died with `OSError: [Errno 36] File name too long`. The whole
+preflight job reddened while every single-node case stayed green.
+
+The property is *any valid selection writes its scratch DAG*. The shape tested
+was *one tag*. Those are not the same claim, and the file could not tell you
+which one it was making.
+
+**The remedy is a case of each shape the property must span, taken from the real
+producer rather than written down.** #2592's fix reads the selection out of
+`ci/portable-shards.json` instead of hardcoding 251 bytes, so the case cannot
+drift from what CI actually passes. A hardcoded long string would have been a
+third shape invented by the test author; the shard file is the shape production
+uses.
+
+⚠️ **The sibling failure is a guard whose cases all assert the same DIRECTION.**
+A file where every case says "this must be refused" passes just as well against
+an implementation that refuses *everything*. On
+[hermit#2551](https://github.com/rrnewton/hermit/pull/2551) the tier-evidence
+suite asserted refusal in eighteen cases; it needed one case asserting that a
+genuine measured record still certifies, or a predicate that rejected all input
+would have been green. Same for a diagnostic that names a conjunct: four cases
+require the name and two require SILENCE, because without the second pair the
+check passes by printing on every row.
+
+So ask two questions of any guard before trusting it:
+
+- **What shape is every case?** If they are all one shape, name the shapes the
+  property must hold across and add the missing ones. Prefer reading the real
+  input from its producer over composing one.
+- **What direction is every case?** If they all assert refusal, add the case that
+  must be accepted; if they all assert acceptance, add the one that must be
+  refused. A guard that cannot be shown to pass *and* fail is measuring nothing.
+
+This is check 12's cousin. Check 12 catches a comparison over an empty set —
+agreement asserted about nothing. This catches a comparison over a set that is
+non-empty but uniform: many observations of one case, reported as many cases.
+
 ## Verdict vocabulary
 
 | verdict | meaning | action |
