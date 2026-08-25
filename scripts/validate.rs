@@ -1503,12 +1503,27 @@ fn self_test() -> Result<(), String> {
     {
         let root = repo_root();
         for lane in ["portable", "privileged"] {
-            let base = validate_plan::lane_config(&root, lane)?;
+            let mut base = validate_plan::lane_config(&root, lane)?;
+            base.default_jobs_env =
+                format!("VALIDATE_CARRY_{}_JOBS", lane.to_ascii_uppercase());
             // POSITIVE: a real lane's own config must carry, and must be grantable.
             let steps = validate_plan::lane_nodes(&root, lane, "", "gate.manifest")?;
             let carried = validate_plan::config_from_base(&base, steps, "bracket");
             validate_plan::assert_config_carried(&base, &carried)
                 .map_err(|e| format!("carry bracket: lane {lane} did not carry its config: {e}"))?;
+            let mut missing_jobs_env = carried.clone();
+            missing_jobs_env.default_jobs_env.clear();
+            let jobs_env_error =
+                validate_plan::assert_config_carried(&base, &missing_jobs_env)
+                    .err()
+                    .ok_or_else(|| {
+                        format!("carry bracket: lane {lane} accepted a dropped default_jobs_env")
+                    })?;
+            if !jobs_env_error.contains("default_jobs_env") {
+                return Err(format!(
+                    "carry bracket: lane {lane} dropped jobs env but named {jobs_env_error}"
+                ));
+            }
             if base.resource_caps.is_empty() {
                 return Err(format!("carry bracket: lane {lane} declares no resource_caps; \
                                     the bracket would be vacuous"));
@@ -2363,9 +2378,11 @@ fn super_plan_bracket() -> Result<(), String> {
             timeout: 0,
             cpu_timeout: 0,
             jobs_flag: None,
+            jobs_env: None,
             skip_reason: None,
             write_domains: None,
             write_domain_guarantee: None,
+            explains: Vec::new(),
         }],
         "caps-audit negative bracket",
     );
@@ -4273,11 +4290,13 @@ fn step_with_caps(
         timeout,
         cpu_timeout,
         jobs_flag: None,
+        jobs_env: None,
         skip_reason: None,
         // Undeclared, as these nodes were before the runner grew the fields. See
         // validate_plan::node for why this is not `Some(vec![])`.
         write_domains: None,
         write_domain_guarantee: None,
+        explains: Vec::new(),
     }
 }
 

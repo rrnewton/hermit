@@ -22,24 +22,14 @@
 #
 # CHECK 1 -- the retired spellings are at zero in forward-looking files.
 #
-# CHECK 2 -- the ONE surviving old-prefix constant still agrees with the pin.
-# SAFE_CI_DAG_RUNNER_JOBS_ENV was added after the rename and kept the old prefix,
-# so it is the single legitimate occurrence and check 1 allows it. It is also the
-# most fragile thing here: it is the channel through which a DAG node's declared
-# build width reaches Cargo, and the moment agent-utils normalises it to
-# DAGRUN_JOBS_ENV, hermit's export is read by nothing, no error is raised, and
-# every build quietly falls back to the ambient 8. The width fix would revert
-# itself in silence. Check 2 makes that a loud failure instead.
-
+# CHECK 2 -- the Python and Rust runner constants agree with each other and with
+# the Hermit export. A rename in only one place would silently leave one engine or
+# every Hermit launch on the ambient width, so agreement is a three-way invariant.
 set -euo pipefail
 
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 readonly ROOT_DIR
 cd "$ROOT_DIR"
-
-# The one spelling that is still correct, because the pinned agent-utils still
-# reads it. Check 2 is what proves that claim rather than assuming it.
-readonly LIVE_CONSTANT='SAFE_CI_DAG_RUNNER_JOBS_ENV'
 
 # The retired surface is the crate/executable/profile-store name in either
 # spelling, plus the whole retired SAFE_CI_ environment prefix. The prefix is in
@@ -74,10 +64,7 @@ offenders=()
 while IFS= read -r path; do
     is_excluded "$path" && continue
     [[ -f $path ]] || continue
-    # Drop the permitted constant before looking for the retired spellings, so a
-    # line carrying only SAFE_CI_DAG_RUNNER_JOBS_ENV does not trip the scan.
-    hits=$(sed "s/${LIVE_CONSTANT}//g" -- "$path" \
-        | grep -nE "$RETIRED_RE" || true)
+    hits=$(grep -nE "$RETIRED_RE" -- "$path" || true)
     if [[ -n $hits ]]; then
         while IFS= read -r line; do
             offenders+=("$path:$line")
@@ -92,30 +79,33 @@ if ((${#offenders[@]} > 0)); then
     echo >&2
     printf '    %s\n' "${offenders[@]}" >&2
     echo >&2
-    echo "  Rename them to the dagrun spelling. The only permitted occurrence is the" >&2
-    echo "  constant ${LIVE_CONSTANT}, which the pinned agent-utils still reads." >&2
+    echo "  Rename them to the dagrun spelling; no forward-looking old-prefix occurrence is permitted." >&2
     status=1
 fi
 
 # ---------------------------------------------------------------- check 2
 readonly MODEL_PY='agent-utils/py/dagrun/model.py'
+readonly MODEL_RS='agent-utils/rs/dagrun/src/model.rs'
 readonly EXPORTER='ci/configure-build-jobs.sh'
 
-if [[ ! -f $MODEL_PY ]]; then
+if [[ ! -f $MODEL_PY || ! -f $MODEL_RS ]]; then
     # Distinguish this from a real naming failure. An unpopulated submodule
     # produces the same "missing" shape for an entirely different reason, and
     # confusing the two has already cost a diagnosis cycle.
-    echo "check-dagrun-naming: $MODEL_PY is absent -- the agent-utils submodule is not" >&2
+    echo "check-dagrun-naming: $MODEL_PY or $MODEL_RS is absent -- the agent-utils submodule is not" >&2
     echo "  populated, so the constant-agreement check cannot run. This is a checkout" >&2
     echo "  problem, NOT a naming problem. Run: git submodule update --init agent-utils" >&2
     exit 2
 fi
 
-pinned=$(sed -n 's/^JOBS_ENV_ENV[[:space:]]*=[[:space:]]*"\([A-Z_]*\)".*/\1/p' "$MODEL_PY")
+pinned_py=$(sed -n 's/^JOBS_ENV_ENV[[:space:]]*=[[:space:]]*"\([A-Z_]*\)".*/\1/p' "$MODEL_PY")
+pinned_rs=$(sed -n 's/^pub const JOBS_ENV_ENV: &str = "\([A-Z_]*\)";/\1/p' "$MODEL_RS")
 exported=$(sed -n 's/^[[:space:]]*export[[:space:]]\{1,\}\([A-Z_]*\)=CARGO_BUILD_JOBS.*/\1/p' "$EXPORTER")
 
-if [[ -z $pinned ]]; then
-    echo "check-dagrun-naming: could not read JOBS_ENV_ENV from $MODEL_PY." >&2
+if [[ -z $pinned_py || -z $pinned_rs ]]; then
+    echo "check-dagrun-naming: could not read JOBS_ENV_ENV from both runner models." >&2
+    echo "  Python: ${pinned_py:-<missing>} ($MODEL_PY)" >&2
+    echo "  Rust:   ${pinned_rs:-<missing>} ($MODEL_RS)" >&2
     echo "  The runner's width channel has been restructured; re-derive it and update" >&2
     echo "  both this gate and $EXPORTER together." >&2
     status=1
@@ -123,19 +113,20 @@ elif [[ -z $exported ]]; then
     echo "check-dagrun-naming: $EXPORTER no longer exports a width-channel variable" >&2
     echo "  set to CARGO_BUILD_JOBS. A DAG node's declared width can no longer reach Cargo." >&2
     status=1
-elif [[ $pinned != "$exported" ]]; then
+elif [[ $pinned_py != "$pinned_rs" || $pinned_py != "$exported" ]]; then
     echo "check-dagrun-naming: the build-width channel is broken." >&2
+    echo "  $MODEL_PY reads:   $pinned_py" >&2
+    echo "  $MODEL_RS reads:   $pinned_rs" >&2
     echo "  $EXPORTER exports: $exported" >&2
-    echo "  $MODEL_PY reads:   $pinned" >&2
     echo >&2
-    echo "  These must be the same string. They are not, so the per-node build width is" >&2
-    echo "  being exported into a variable nothing reads, and every step has silently" >&2
-    echo "  fallen back to the ambient default. Rename the export to match the pin." >&2
+    echo "  These must be the same string. They are not, so a per-node width can be" >&2
+    echo "  exported into a variable one or both engines do not read, silently leaving" >&2
+    echo "  that engine on the ambient default. Rename all three together." >&2
     status=1
 fi
 
 if ((status == 0)); then
-    echo "check-dagrun-naming: OK (retired spellings at zero; width channel = $pinned)"
+    echo "check-dagrun-naming: OK (retired spellings at zero; width channel = $pinned_py)"
 fi
 
 exit "$status"

@@ -285,6 +285,7 @@ pub fn node(
         timeout,
         cpu_timeout,
         jobs_flag: None,
+        jobs_env: None,
         skip_reason: None,
         // `None` means "this step declares nothing", which is what every node here
         // meant before the runner grew these fields. `Some(vec![])` would be the
@@ -294,6 +295,7 @@ pub fn node(
         // declaration is accepted rather than silently treated as a guarantee.
         write_domains: None,
         write_domain_guarantee: None,
+        explains: Vec::new(),
     }
 }
 
@@ -724,6 +726,9 @@ pub fn assert_config_carried(base: &DagConfig, derived: &DagConfig) -> Result<()
     }
     if base.default_jobs_flag != derived.default_jobs_flag {
         bad.push(format!("default_jobs_flag {:?} != {:?}", base.default_jobs_flag, derived.default_jobs_flag));
+    }
+    if base.default_jobs_env != derived.default_jobs_env {
+        bad.push(format!("default_jobs_env {:?} != {:?}", base.default_jobs_env, derived.default_jobs_env));
     }
     if base.default_step_mem_cap_bytes != derived.default_step_mem_cap_bytes {
         bad.push(format!("default_step_mem_cap_bytes {:?} != {:?}", base.default_step_mem_cap_bytes, derived.default_step_mem_cap_bytes));

@@ -2405,6 +2405,7 @@ fn write_plan_after_scorecard_check(
             timeout: wall,
             cpu_timeout: wall * 2,
             jobs_flag: None,
+            jobs_env: None,
             skip_reason: None,
             // Undeclared. These cells already serialize their cargo writes through
             // the `cargo_writer` resource cap above, and restating that as a write
@@ -2412,6 +2413,7 @@ fn write_plan_after_scorecard_check(
             // the pressure DAG measuring what it measured before.
             write_domains: None,
             write_domain_guarantee: None,
+            explains: Vec::new(),
         });
         preparation_tags.insert(test, tag);
     }
@@ -2570,9 +2572,11 @@ fn write_plan_after_scorecard_check(
                 timeout: wall,
                 cpu_timeout: wall * 2,
                 jobs_flag: None,
+                jobs_env: None,
                 skip_reason: None,
                 write_domains: None,
                 write_domain_guarantee: None,
+                explains: Vec::new(),
             });
             cell_tags.push(tag);
         }
@@ -2602,9 +2606,11 @@ fn write_plan_after_scorecard_check(
         timeout: 120,
         cpu_timeout: 120,
         jobs_flag: None,
+        jobs_env: None,
         skip_reason: None,
         write_domains: None,
         write_domain_guarantee: None,
+        explains: Vec::new(),
     });
 
     let max_timeout = steps.iter().map(|step| step.timeout).max().unwrap_or(120);

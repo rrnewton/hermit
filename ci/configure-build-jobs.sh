@@ -61,8 +61,8 @@ if [[ $build_job_context == launcher ]]; then
     # so the runner had no way to hand a step its width, and this line's ambient 8 was
     # the only value Cargo ever saw. Measured on the 2026-08-24 clean full run.
     #
-    # $SAFE_CI_DAG_RUNNER_JOBS_ENV names the environment variable through which the
-    # runner delivers a step's width (agent-utils 612adb1). The runner applies it as a
+    # $DAGRUN_JOBS_ENV names the environment variable through which the
+    # runner delivers a step's width (agent-utils 3b9c272). The runner applies it as a
     # per-step overlay ON TOP of this ambient value, so a step that declares a width
     # gets it and a step that declares none still gets 8.
     #
@@ -71,7 +71,7 @@ if [[ $build_job_context == launcher ]]; then
     # node in the DAG. Picking a fresh global number was rejected -- the historical 284
     # inference "raced the native linker" (see the header), and a sweep on a loaded box
     # is not evidence for a production default.
-    export SAFE_CI_DAG_RUNNER_JOBS_ENV=CARGO_BUILD_JOBS
+    export DAGRUN_JOBS_ENV=CARGO_BUILD_JOBS
     return 0
 fi
 
