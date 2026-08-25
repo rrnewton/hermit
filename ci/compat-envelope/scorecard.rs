@@ -2581,12 +2581,38 @@ fn validate_row_result(row: &ResultRow) -> Result<ObservedResult, String> {
 /// N=0 read as "the run was all green", which is wrong precisely when a cell
 /// diverged and the comparator could not say where -- the case that needs
 /// attention most.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct ValidateFold {
     /// Rows that carried at least one of the four divergence coordinates.
     located: usize,
     /// Rows that diverged and carried none of them.
     unlocated: usize,
+    /// Rows whose outcome was an infrastructure `ERROR` and which located
+    /// nothing. NEITHER A PASS NOR A FAILURE, and counted separately for that
+    /// reason: nothing was compared, so there is no product behaviour to record,
+    /// and folding one as an observation would assert a measurement that never
+    /// happened. Counting it is what keeps the run from reading all-green.
+    ///
+    /// ⚠️ NAMED, NOT JUST COUNTED, following `apply_pressure_summary` -- the sibling
+    /// writer already prints every row it drops with its cell and reason, on the
+    /// grounds that "a fold that drops rows silently is worse than one that refuses
+    /// everything, because the caller cannot then tell a thin batch from a broken
+    /// one". A bare count says something did not run without saying WHAT, which
+    /// leaves the reader unable to re-run it -- a weaker version of the same defect.
+    errored: Vec<String>,
+}
+
+impl ValidateFold {
+    /// Whether this fold may be reported as an all-green run.
+    ///
+    /// ⚠️ A FUNCTION RATHER THAN AN INLINE CONDITION, SO THE BRACKET CALLS THE REAL
+    /// DECISION. A test that restates the condition keeps passing while the summary
+    /// regresses, because the copy and the original drift independently. That is the
+    /// same trap as asserting against an expression that merely looks like the
+    /// function under test. The summary and the self-test both go through here.
+    fn reads_all_green(&self) -> bool {
+        self.located == 0 && self.unlocated == 0 && self.errored.is_empty()
+    }
 }
 
 /// Fold VALIDATE rows into the tracked observations under the `validate`
@@ -2635,8 +2661,9 @@ fn apply_validate_results(
             // anything diverged, and folding a no-op for it would leave an
             // only-ever-green cell holding an empty observation --
             // indistinguishable from one that was measured and located nothing.
-            // An ERROR is an infrastructure state that `validate_row_result`
-            // refuses outright, and it is skipped here exactly as before.
+            // An ERROR -- or ANY other non-PASS, non-FAIL outcome -- that located
+            // nothing is NO LONGER skipped as it was before: the branch below counts
+            // and names it. Only a PASS is skipped silently now.
             //
             // ⚠️ A **FAIL** THAT LOCATED NOTHING IS A DIFFERENT FACT AND IS NOW
             // RECORDED. Skipping it as well is what made the two states this
@@ -2648,7 +2675,40 @@ fn apply_validate_results(
             // from this writer. The two need OPPOSITE follow-ups -- run the cell
             // versus teach the comparator to localise -- so they must not read
             // the same.
-            if located_nothing && row.outcome != "FAIL" {
+            // ⚠️ AN `ERROR` THAT LOCATED NOTHING IS A THIRD STATE AND MUST RENDER
+            // AS ITSELF. It reached `continue` before `validate_row_result` was
+            // ever called, so the refusal below was NOT COMPUTED AND DISCARDED --
+            // it was never reached. That is an ordering defect, not a wiring one,
+            // which is why the fix is a branch here rather than consulting a value
+            // that already existed.
+            //
+            // It is also the TYPICAL error shape: an infrastructure failure means
+            // nothing was compared, so there is no coordinate to carry. The refusal
+            // was therefore unreachable for exactly the rows most likely to hit it,
+            // and a batch of them folded to zero located and zero unlocated -- which
+            // printed the all-green sentence over a run in which nothing ran.
+            //
+            // ⚠️ IT MUST NOT BECOME A FAILURE EITHER. Letting it fall through to
+            // `validate_row_result` would return Err and fail the whole fold, which
+            // manufactures an emergency out of a setup condition -- the inverse
+            // defect, and the one that cost real time on a false main-red. So it is
+            // counted, reported, and NOT stored: there is no product behaviour to
+            // record.
+            //
+            // An `ERROR` that DID locate a position is a different row and keeps its
+            // hard refusal below. Infrastructure failed but a divergence position was
+            // reported: that is self-contradictory input, and refusing it loudly is
+            // right.
+            if located_nothing && row.outcome != "PASS" && row.outcome != "FAIL" {
+                fold.errored.push(format!("{} (outcome={})", display_id(id), row.outcome));
+                continue;
+            }
+            // Only a PASS reaches here with nothing located: the branch above took
+            // every other non-FAIL outcome, and a FAIL that located nothing MUST fall
+            // through to be recorded as DivergedUnlocated. Writing this as a bare
+            // `if located_nothing` swallowed the FAIL case and undid #2624 -- caught
+            // by that change's own bracket.
+            if located_nothing && row.outcome == "PASS" {
                 continue;
             }
             let result = validate_row_result(row)?;
@@ -2783,11 +2843,31 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
         fold.unlocated,
         ObservationProvenance::Validate.as_str()
     );
-    // THREE OUTCOMES, NOT TWO. This used to print the all-green sentence
+    // FOUR OUTCOMES, NOT TWO. This used to print the all-green sentence
     // whenever the located count was zero, which said "expected result for an
     // all-green run" over a batch whose cells had diverged without a locatable
     // position -- the one outcome that most needs to be read as a finding.
-    if fold.located == 0 && fold.unlocated == 0 {
+    //
+    // ⚠️ AND `errored` MUST BE IN THE ALL-GREEN CONDITION BELOW. Without it a batch
+    // in which EVERY row was an infrastructure failure folds to zero located and
+    // zero unlocated and prints the all-green sentence -- the identical collapse,
+    // one outcome over, in the line a human actually acts on. An all-green summary
+    // is what stops anyone looking, so this is the worst place for it to happen.
+    if !fold.errored.is_empty() {
+        println!(
+            "  ⚠️ {} row(s) DETERMINED NOTHING -- an infrastructure ERROR, or another \
+             non-PASS non-FAIL outcome, with no divergence coordinate. \
+             NOTHING WAS COMPARED for them, so this run is NOT all-green -- and it is \
+             NOT a product failure either. No observation was stored, because there \
+             is no product behaviour to store. Re-run these cells; do not read this \
+             as a result.",
+            fold.errored.len()
+        );
+        for cell in &fold.errored {
+            println!("    determined nothing: {cell}");
+        }
+    }
+    if fold.reads_all_green() {
         println!(
             "  no row diverged. That is the expected result for an all-green run \
              and is NOT evidence that the field is unpopulated."
@@ -4360,6 +4440,133 @@ fn self_test() -> Result<(), String> {
         );
     }
 
+    // ⚠️ THE THIRD STATE: AN `ERROR` THAT LOCATED NOTHING. Three brackets, because
+    // the requirement has three halves and a fix that satisfies one by breaking
+    // another is the shape this whole guard exists to refuse:
+    //   1. a run containing such a row must NOT read all-green;
+    //   2. a genuinely clean run must STILL read all-green;
+    //   3. a real failure must STILL read red.
+    // The summary is derived from these counts by a pure condition, so the counts
+    // and the condition together are the testable surface.
+    let mut errored = TrackedCells {
+        schema: SCHEMA,
+        projection: None,
+        cells: vec![bare_cell(&unlocated_id)],
+    };
+    let errored_fold = apply_validate_results(
+        &mut errored,
+        &coordinate_less_row(&unlocated_id, "ERROR"),
+        "sha-1",
+        "tree-1",
+        &depth_fixture,
+    )
+    .map_err(|e| {
+        format!(
+            "a coordinate-less ERROR failed the fold outright: {e}. It must be reported, \
+             not turned into an emergency"
+        )
+    })?;
+    refresh_measurement(&mut errored);
+    // 1. NOT all-green. This is the exact condition `observe_results` uses.
+    if errored_fold.reads_all_green() {
+        return Err(
+            "a run whose only row was an infrastructure ERROR still reads as an all-green \
+             run; an all-green summary is what stops anyone looking"
+                .into(),
+        );
+    }
+    if errored_fold.errored.len() != 1 {
+        return Err(format!(
+            "a coordinate-less ERROR was counted as {} errored; it must be counted as itself",
+            errored_fold.errored.len()
+        ));
+    }
+    // ...and NOT as a product result in either direction.
+    if errored_fold.located != 0 || errored_fold.unlocated != 0 {
+        return Err(format!(
+            "an infrastructure ERROR was folded as a divergence: {} located / {} unlocated. \
+             Nothing was compared, so there is no product behaviour to record",
+            errored_fold.located, errored_fold.unlocated
+        ));
+    }
+    if !errored.cells[0].observations.is_empty() {
+        return Err(
+            "an infrastructure ERROR stored an observation; a cell nothing compared must not \
+             gain a measurement"
+                .into(),
+        );
+    }
+    // 2. A genuinely clean run STILL reads all-green. The inverse defect -- making
+    // every quiet run look suspicious -- is the one that cost real time on a false
+    // main-red, so it is bracketed rather than assumed.
+    if !passed_fold.reads_all_green() {
+        return Err(
+            "a genuinely clean run stopped reading as all-green; manufacturing emergencies \
+             is the inverse defect, not a safer one"
+                .into(),
+        );
+    }
+    // 3. A real failure STILL reads red: the located-FAIL fold is unchanged, and a
+    // diverged cell must not be quietly demoted into the new third state.
+    if !unlocated_fold.errored.is_empty() {
+        return Err(format!(
+            "a FAIL that located nothing was miscounted as {} errored; a comparator gap and \
+             an infrastructure failure need opposite follow-ups",
+            unlocated_fold.errored.len()
+        ));
+    }
+    if errored.cells[0].measurement == unlocated.cells[0].measurement {
+        return Err(
+            "a cell whose run ERRORED reads the same as one that was compared and diverged \
+             without a locatable position"
+                .into(),
+        );
+    }
+
+    // ⚠️ THE CLASS, NOT THE INSTANCE. Recognising the third state by the single
+    // string "ERROR" left every other non-PASS, non-FAIL outcome falling through to
+    // the silent skip -- the exact behaviour this change exists to remove. Found by
+    // agent(hermit-dbg) on review, who measured TIMEOUT, NO_RESULT, SKIP and the
+    // lowercase spellings all folding to reads_all_green=true.
+    //
+    // NO_RESULT is bracketed specifically because it is NOT hypothetical in this
+    // tree and because it NAMES the very state at issue: nothing was compared. If
+    // this bracket ever passes for the wrong reason, prefer adding outcomes to it
+    // over narrowing the branch it guards.
+    for outcome in ["NO_RESULT", "TIMEOUT", "SKIP"] {
+        let mut other = TrackedCells {
+            schema: SCHEMA,
+            projection: None,
+            cells: vec![bare_cell(&unlocated_id)],
+        };
+        let other_fold = apply_validate_results(
+            &mut other,
+            &coordinate_less_row(&unlocated_id, outcome),
+            "sha-1",
+            "tree-1",
+            &depth_fixture,
+        )
+        .map_err(|e| format!("a coordinate-less {outcome} failed the fold outright: {e}"))?;
+        if other_fold.reads_all_green() {
+            return Err(format!(
+                "a run whose only row was a coordinate-less {outcome} reads as an all-green \
+                 run; the third state must be recognised by CLASS, not by one outcome string"
+            ));
+        }
+        if other_fold.errored.len() != 1 || !other_fold.errored[0].contains(outcome) {
+            return Err(format!(
+                "a coordinate-less {outcome} was not counted and named as determining \
+                 nothing: {:?}",
+                other_fold.errored
+            ));
+        }
+        if !other.cells[0].observations.is_empty() {
+            return Err(format!(
+                "a coordinate-less {outcome} stored an observation; nothing was compared"
+            ));
+        }
+    }
+
     let next_source = pressure_summary(
         "sha-2",
         "tree-2",
@@ -5124,7 +5331,7 @@ fn self_test() -> Result<(), String> {
     }
 
     println!(
-        "compatibility scorecard self-test: provenance, distinct-evidence, result, selected-chaos, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, batch-equivalence, green-admission, validate-observation, source-identity, writer-boundary, projection, path-independence, and infrastructure-refusal brackets pass"
+        "compatibility scorecard self-test: provenance, distinct-evidence, result, selected-chaos, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, source-identity, writer-boundary, projection, path-independence, and infrastructure-refusal brackets pass"
     );
     Ok(())
 }
