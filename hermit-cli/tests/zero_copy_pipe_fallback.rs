@@ -27,7 +27,7 @@ fn command_output(mut command: Command, label: &str) -> Output {
 }
 
 #[test]
-fn zero_copy_pipe_syscalls_allow_explicit_compatibility_passthrough() {
+fn zero_copy_pipe_syscalls_fail_closed_by_default_and_allow_compatibility_opt_out() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
@@ -50,24 +50,29 @@ fn zero_copy_pipe_syscalls_allow_explicit_compatibility_passthrough() {
             .arg(&guest);
         command_output(compile, &format!("{syscall} guest compilation"));
 
-        let mut verify = Command::new("timeout");
-        verify
+        let mut default = Command::new("timeout");
+        default
             .args(["--kill-after", "5s", "90s"])
             .arg(env!("CARGO_BIN_EXE_hermit"))
             .args([
                 "--log=info",
                 "run",
                 "--backend=ptrace",
-                "--strict",
                 "--verify",
-                "--panic-on-unsupported-syscalls",
                 "--base-env=minimal",
                 "--",
             ])
             .arg(&guest);
-        let verify_output = command_output(verify, &format!("{syscall} strict verification"));
-        let stdout = String::from_utf8_lossy(&verify_output.stdout);
-        let stderr = String::from_utf8_lossy(&verify_output.stderr);
+        let default_output = command_output(
+            default,
+            &format!("{syscall} default fail-closed verification"),
+        );
+        let stdout = String::from_utf8_lossy(&default_output.stdout);
+        let stderr = String::from_utf8_lossy(&default_output.stderr);
+        assert!(
+            stdout.contains(&format!("{syscall} deterministically unavailable")),
+            "{syscall} default run did not expose deterministic ENOSYS\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
         assert!(
             stdout.contains("Determinism verified") || stderr.contains("Determinism verified"),
             "{syscall} omitted Hermit's determinism marker\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -81,15 +86,21 @@ fn zero_copy_pipe_syscalls_allow_explicit_compatibility_passthrough() {
                 "--log=off",
                 "run",
                 "--backend=ptrace",
-                "--base-env=minimal",
                 "--allow-unsupported-syscalls",
+                "--base-env=minimal",
                 "--",
             ])
             .arg(&guest)
             .arg("passthrough");
-        command_output(
+        let compatibility_output = command_output(
             compatibility,
-            &format!("{syscall} explicit compatibility run"),
+            &format!("{syscall} opted-in compatibility passthrough"),
+        );
+        let compatibility_stdout = String::from_utf8_lossy(&compatibility_output.stdout);
+        assert_eq!(
+            compatibility_stdout.as_ref(),
+            format!("{syscall} legacy passthrough preserved\n"),
+            "{syscall} compatibility opt-out did not reach the host syscall",
         );
     }
 }
