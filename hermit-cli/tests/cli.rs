@@ -3745,3 +3745,41 @@ fn a_guest_side_fault_is_not_reported_as_a_hermit_internal_failure() {
         "a guest exiting 1 still exits 1"
     );
 }
+
+/// `hermit record` must classify a container-child failure the same way
+/// `hermit run` does.
+///
+/// ⚠️ THIS IS THE CALL SITE THE FIX ORIGINALLY MISSED. `record` -- every
+/// spelling -- calls `RunGuarded::run_guarded` directly at six sites in
+/// `record_start.rs` and never goes through `with_container`, so the
+/// `.context(..)??` discard survived there and BOTH container-child classes
+/// surfaced as `class=cli-error`. A wrong machine-readable class is worse than
+/// none, because a gate believes it.
+#[test]
+fn record_classifies_a_container_child_failure_the_same_way_run_does() {
+    let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create a recording dir");
+    let case = |fault: &str| -> String {
+        let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+            .env("HERMIT_TEST_CONTAINER_CHILD_FAULT", fault)
+            .env("HERMIT_DATA_DIR", data_dir.path())
+            .args(["record", "--", "/bin/true"])
+            .output()
+            .expect("failed to run the fault-injected recording");
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+
+    let segv = case("segv");
+    assert!(
+        segv.contains("HERMIT_INTERNAL_FAILURE class=container-child-exit"),
+        "a record-path container child that exited with an unchosen status must be \
+         classified as such, not as a CLI error\nstderr:\n{segv}"
+    );
+
+    let panicked = case("panic");
+    assert!(
+        panicked.contains("HERMIT_INTERNAL_FAILURE class=container-child-panic"),
+        "a record-path CAUGHT container-child panic must be classified as a panic, not \
+         as a CLI error\nstderr:\n{panicked}"
+    );
+}
