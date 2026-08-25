@@ -66,6 +66,13 @@
     {
       "backend": "ptrace",
       "category": "backend-parity-c",
+      "lane": "privileged",
+      "mode": "verify",
+      "test": "backend-parity-c/cpuid-probe"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
       "lane": "portable",
       "mode": "verify",
       "test": "backend-parity-c/cwd-roundtrip"
@@ -1884,6 +1891,13 @@
       "test": "system-utils/openssl-x509"
     },
     {
+      "test": "system-utils/overflow-gid-resolves",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "backend": "ptrace"
+    },
+    {
       "backend": "ptrace",
       "category": "system-utils",
       "lane": "portable",
@@ -1973,13 +1987,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "system-utils/uuidgen-random"
-    },
-    {
-      "backend": "ptrace",
-      "category": "backend-parity-c",
-      "lane": "privileged",
-      "mode": "verify",
-      "test": "backend-parity-c/cpuid-probe"
     }
   ],
   "schema": 1
