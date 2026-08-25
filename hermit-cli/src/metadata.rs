@@ -86,6 +86,38 @@ impl RecordVersion {
 // above exists to prevent. The version must go FORWARD once more.
 pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x10e);
 
+/// The highest RECORD_VERSION this project has ever shipped.
+///
+/// RECORD_VERSION must never move BACKWARD onto it. This is a COMPILE-TIME
+/// assertion rather than a test on purpose: it is decidable from two constants,
+/// so it should break the build rather than a test run, and it cannot be
+/// skipped, filtered or left unrun.
+///
+/// WHY IT EXISTS AT ALL. The rejection set in `record_version_requires_an_exact_match`
+/// used to be a list of specific versions, and `!compatible_with(0x10a)` was
+/// catching a backward move BY ACCIDENT. Replacing that list with a window derived
+/// from RECORD_VERSION fixes its silent narrowing but cannot catch a regression,
+/// because a derived window re-derives from whatever the constant currently says.
+/// Dropping the list without this floor would have traded a stale check for a
+/// weaker one.
+///
+/// The failure it guards is near, not hypothetical: a long-stale branch that bumped
+/// 0x109 -> 0x10a while main advanced to 0x10e regresses the constant the moment its
+/// conflict is resolved by taking the branch side. The build would then stamp the
+/// current schema with a label an older reader already claims, and the exact-match
+/// gate would accept a stream whose shape it does not know -- the desynchronization
+/// the version exists to prevent.
+///
+/// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x10e;
+
+const _: () = assert!(
+    RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
+    "RECORD_VERSION is BELOW HIGHEST_SHIPPED_RECORD_VERSION. A recording made by this \
+     build would carry a label an older reader already claims. If this fired during a \
+     rebase, the version constant was resolved BACKWARD -- merge it forward."
+);
+
 /// Metadata associated with the recording. This is serialized as a JSON file.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Metadata {
@@ -324,10 +356,35 @@ mod tests {
     #[test]
     fn record_version_requires_an_exact_match() {
         assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
-        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x10a)));
-        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x10c)));
-        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x105)));
-        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x110)));
+
+        // DERIVED FROM THE COMPATIBILITY RULE, NOT ENUMERATED.
+        //
+        // This assertion used to be a list of specific versions -- 0x10a, 0x10c,
+        // 0x105, 0x110. A list SILENTLY NARROWS every time RECORD_VERSION
+        // advances: the named values drift away from the boundary that matters,
+        // and the test keeps passing while checking less and less. It cannot
+        // fail for the reason its name gives once the value has moved past the
+        // range someone happened to write down.
+        //
+        // `compatible_with` is exact equality, so the property to assert is
+        // "every OTHER version is refused". Re-deriving the cases from
+        // RECORD_VERSION itself means the window travels with the constant and
+        // cannot go stale.
+        let current = RECORD_VERSION.0;
+        for delta in 1..=16u32 {
+            let older = RecordVersion(current - delta);
+            assert!(
+                !RECORD_VERSION.compatible_with(&older),
+                "recorder at {current:#x} must refuse a recording made at {:#x}",
+                older.0
+            );
+            let newer = RecordVersion(current + delta);
+            assert!(
+                !RECORD_VERSION.compatible_with(&newer),
+                "recorder at {current:#x} must refuse a recording made at {:#x}",
+                newer.0
+            );
+        }
     }
 
     #[test]
