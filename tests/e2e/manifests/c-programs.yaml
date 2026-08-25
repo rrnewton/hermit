@@ -3802,7 +3802,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -3810,7 +3810,6 @@ test:
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -9841,7 +9840,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -9849,7 +9848,6 @@ test:
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
