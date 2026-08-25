@@ -116,6 +116,128 @@ pub const GUEST_PROGRAM_NOT_FOUND_EXIT: i32 = 127;
 /// `timeout` convention that 125 itself came from, so the three sit in one
 /// scheme rather than being three unrelated numbers.
 pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
+
+// ⚠️ THE VALUES THEMSELVES ARE PINNED, NOT ONLY THEIR NAMES.
+//
+// Naming a constant makes every consumer agree with the definition; it does not
+// make the definition right. Once `tests/cli.rs` asserts `Some(THE_CONSTANT)`
+// everywhere, the whole suite is self-consistent and completely unanchored -- a
+// one-character edit here would move all sixteen assertions with it and nothing
+// would fail. That is the exact shape of the defect this scheme exists to close,
+// displaced one level up, and it is why these are compile-time assertions rather
+// than a comment: a deliberate edit "would be noticed" is the argument that
+// already failed once, when hermit#2558 moved 1 -> 125 and sixteen copies went
+// stale.
+//
+// WHY EACH VALUE AND NOT ANOTHER. GNU `env`, `chroot` and `timeout` reserve 125
+// for "the wrapper itself failed", 127 for "command not found" and 126 for
+// "found but not executable". Borrowing the whole scheme rather than one number
+// is what keeps the three answers distinguishable from each other.
+//
+// ⚠️ THE EXIT-CODE ALLOCATION FOR THE `hermit` BINARY. ONE TABLE, HERE.
+//
+// Five separate exit-code defects were found in one evening and every one of
+// them came from a value being chosen, copied or rewritten somewhere that could
+// not see the others. This is the single place the space is allocated; anything
+// that emits or rewrites a hermit exit status is a consumer OF this table and
+// must not invent its own reading of it.
+//
+//   0          success.
+//   1 ..= 122  THE GUEST'S OWN STATUS, passed through untouched. `1` is the
+//              commonest of these, which is why hermit must never use it.
+//              (The range stops at 122 because 123 is reserved below; a guest
+//              may still CHOOSE any value, see the caveat at the end.)
+//   123        DO NOT USE. dev-hermit's `bin/safehermit` LOG BYTE CAP kill.
+//              It moved here FROM 125 so it would stop colliding with the line
+//              below; taking 123 back would undo that.
+//   124        DO NOT USE. GNU `timeout`'s deadline, and dev-hermit's
+//              `bin/safehermit` WALL DEADLINE kill. `tests/cli.rs` asserts
+//              `assert_ne!(code, Some(124))` on the awk-mincore probe.
+//   125        HERMIT_INTERNAL_FAILURE_EXIT -- hermit itself failed, no guest
+//              ran. Sole meaning as of 2026-08-25: `bin/safehermit` previously
+//              also emitted 125 for its byte-cap kill, so a run through that
+//              wrapper produced one number for two faults with opposite
+//              remedies. SAFEHERMIT MOVED, NOT HERMIT, because that wrapper is
+//              the only layer that knows which happened -- it relays hermit's
+//              status otherwise -- and because 125/126/127 is one GNU scheme
+//              that cannot be broken up. Tracked as `hermit_s_125_collides`.
+//   126        GUEST_PROGRAM_NOT_EXECUTABLE_EXIT.
+//   127        GUEST_PROGRAM_NOT_FOUND_EXIT -- the ABSOLUTE-PATH form. The
+//              bare-name-on-guest-PATH form currently exits 125 instead, which
+//              is an inconsistency tracked as `hermit_reports_a_missing`, not a
+//              second meaning for 127.
+//   128 + N    killed by signal N (shell convention). Hermit does not emit these
+//              deliberately; a wrapper reporting a signal death must use them
+//              rather than borrow a code that already means something.
+//
+// ⚠️ NO CODE IS EXCLUSIVELY HERMIT'S. Every value in 0..=255 is a legal guest
+// status, so a guest may return 125 or 127 of its own accord and this table
+// cannot stop it. The table removes GUARANTEED collisions, not possible ones.
+// The only unambiguous discriminator is the `HERMIT_INTERNAL_FAILURE` marker on
+// stderr, present exactly when hermit itself failed. Any consumer deciding on
+// `$?` alone is guessing, and should say so.
+//
+// ⚠️ DO NOT CLAMP INTO THIS RANGE. `scripts/hermit-code-coverage.rs` used
+// `clamp(1, 125)` and so rewrote 127 and 126 into 125 -- turning "your program is
+// missing" into "hermit broke" and pointing the reader at the wrong project.
+// Truncating a status does not lose information here, it MANUFACTURES a false
+// attribution, because the ceiling is itself a meaning.
+//
+// ⚠️ WHAT EACH VALUE MUST NOT COLLIDE WITH -- AND 125 ALREADY DOES.
+//
+//   0    success. Never a failure code; see the nonzero pin below.
+//   1    the commonest guest exit status. Sharing it is the collision
+//        hermit#2558 introduced 125 to escape, so 125 must never drift back.
+//   124  GNU `timeout`'s "deadline fired", and dev-hermit's `bin/safehermit`
+//        uses it for its WALL DEADLINE kill. `tests/cli.rs` asserts
+//        `assert_ne!(code, Some(124))` on the awk-mincore probe for that reason.
+//   126  hermit's own GUEST_PROGRAM_NOT_EXECUTABLE_EXIT.
+//   127  hermit's own GUEST_PROGRAM_NOT_FOUND_EXIT -- already in use for the
+//        ABSOLUTE-PATH form of a missing guest program. Note the bare-name form
+//        resolved against the guest PATH exits 125 instead, which is an
+//        inconsistency filed separately, not a licence to reuse 127.
+//
+//   125  ⚠️ NOT FREE. dev-hermit's `bin/safehermit` exits 125 to mean "the LOG
+//        BYTE CAP fired: safehermit killed the run through its cgroup"
+//        (`demos/lib/demo_common.py`'s SAFEHERMIT_EXIT_REASON). Any hermit run
+//        launched through that wrapper -- which is how the demos and the repeat
+//        harness run it -- can therefore produce 125 for two unrelated reasons:
+//        hermit refused, or the wrapper killed it for log volume. They demand
+//        opposite responses (fix the invocation vs raise the cap), and `$?`
+//        cannot tell them apart. This is a LIVE ambiguity, not a hypothetical:
+//        demo 5 has been observed reporting `exited with status 125` when the
+//        cap fired. It is recorded here rather than resolved because changing
+//        either value is a cross-repository decision.
+//
+//        The discriminator meanwhile is the same one that separates hermit's 125
+//        from a guest's own 125: the `HERMIT_INTERNAL_FAILURE` marker on stderr,
+//        present only when hermit itself failed. safehermit writes its verdict
+//        to its `--sh-report` file instead. Read one of those, never the number
+//        alone.
+//
+// ⚠️ 0 IS THE DANGEROUS DRIFT, NOT 126 OR 127. Every one of these is asserted as
+// `assert_eq!(code, Some(CONST))`. At 0 those assertions would stop demanding a
+// FAILURE and start demanding a SUCCESS, and would still pass -- sixteen tests
+// silently inverted. `tests/cli.rs` also asserts `!status.success()` beside the
+// code for that reason; this pin is the second of the two locks.
+const _: () = assert!(
+    HERMIT_INTERNAL_FAILURE_EXIT == 125,
+    "125 is the GNU wrapper-failed convention; 1 is the commonest guest status and 0 is success"
+);
+const _: () = assert!(
+    GUEST_PROGRAM_NOT_FOUND_EXIT == 127,
+    "127 is the GNU command-not-found convention and must stay distinct from 125 and 126"
+);
+const _: () = assert!(
+    GUEST_PROGRAM_NOT_EXECUTABLE_EXIT == 126,
+    "126 is the GNU found-but-not-executable convention and must stay distinct from 125 and 127"
+);
+const _: () = assert!(
+    HERMIT_INTERNAL_FAILURE_EXIT != 0
+        && GUEST_PROGRAM_NOT_FOUND_EXIT != 0
+        && GUEST_PROGRAM_NOT_EXECUTABLE_EXIT != 0,
+    "a failure code of 0 would invert every assert_eq!(code, Some(CONST)) into demanding success"
+);
 mod record;
 mod record_replay_path;
 mod recorder;

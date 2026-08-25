@@ -622,6 +622,17 @@ impl Refusal {
 /// and "the guest ran and failed" alike. Substituting today's observed value
 /// without deciding what the test MEANS reintroduces that, one number later.
 fn assert_hermit_refusal_contains(output: &Output, refusal: Refusal, expected: &[&str]) {
+    // ⚠️ FAILURE FIRST, AND SEPARATELY FROM WHICH FAILURE. The equality below is
+    // only as good as the constant it reads: if a `Refusal` code ever became 0,
+    // `assert_eq!(code, Some(0))` would stop demanding a failure and start
+    // demanding a SUCCESS, and all sixteen call sites would invert and still
+    // pass. This line cannot be satisfied by any success, whatever the constants
+    // say, so the two assertions fail independently rather than together.
+    assert!(
+        !output.status.success(),
+        "expected {} but the command SUCCEEDED: {output:?}",
+        refusal.describe()
+    );
     assert_eq!(
         output.status.code(),
         Some(refusal.code()),

@@ -1014,12 +1014,48 @@ fn render_region_map(
     output.push('\n');
 }
 
+/// Propagate the child's status WITHOUT rewriting what it means.
+///
+/// ⚠️ THIS USED TO BE `code().unwrap_or(1).clamp(1, 125)`, AND THE CEILING WAS
+/// NOT A NEUTRAL BOUND. 125 is `HERMIT_INTERNAL_FAILURE_EXIT` — "hermit itself
+/// failed, no guest ran". Clamping to it did not merely truncate a number, it
+/// MANUFACTURED THAT CLAIM: a guest program that was missing (127) or not
+/// executable (126) came out as 125 and sent the reader to investigate hermit
+/// for a fault in their own command line. A collision leaves you unable to tell;
+/// this told you something untrue, which is worse, and it was invisible because
+/// the rewritten value is a perfectly plausible one.
+///
+/// The floor did the mirror thing. A signal-killed child has no exit code at
+/// all, and `unwrap_or(1)` reported it as 1 — the commonest ordinary guest
+/// failure, and precisely the collision hermit#2558 introduced 125 to escape.
+///
+/// So: pass a real status through unchanged, and give "died on a signal" the
+/// shell's own spelling rather than borrowing a code that already means
+/// something else.
 fn exit_code(status: ExitStatus) -> ExitCode {
     if status.success() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(status.code().unwrap_or(1).clamp(1, 125) as u8)
+        return ExitCode::SUCCESS;
     }
+    match status.code() {
+        // Unchanged. 125/126/127 are load-bearing here — see
+        // `HERMIT_INTERNAL_FAILURE_EXIT` and the guest-fault codes beside it.
+        // A `u8` cast is lossless: a Unix wait status carries 0..=255.
+        Some(code) => ExitCode::from(code as u8),
+        // No exit code exists. 128+N is the shell convention for "killed by
+        // signal N", and it cannot be confused with a status the child chose.
+        // FAILURE rather than a made-up number when even the signal is
+        // unavailable: an unknown failure must not impersonate a known one.
+        None => match signal_of(&status) {
+            Some(signal) => ExitCode::from(128u8.saturating_add(signal)),
+            None => ExitCode::FAILURE,
+        },
+    }
+}
+
+/// The signal that killed the child, as a `u8`, or `None`.
+fn signal_of(status: &ExitStatus) -> Option<u8> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal().and_then(|s| u8::try_from(s).ok())
 }
 
 fn run() -> Result<ExitCode, String> {
