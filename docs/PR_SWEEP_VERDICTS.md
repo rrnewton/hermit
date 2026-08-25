@@ -1838,18 +1838,65 @@ Same defect — a token counted in a context that does not mean what the count i
 being used to mean.
 
 **The check is one word: whole-line.** A binding is a complete line in a fixed
-grammar, so match it as one and compare the count against the loose one:
+grammar, and a mention is not. Two greps show you the gap:
 
 ```console
-grep -cE '^APPROVED-AT: (claude|codex) [0-9a-f]{40}$' bodies.txt   # bindings
 grep -ci 'APPROVED-AT'                                bodies.txt   # mentions
+grep -cE '^APPROVED-AT: (claude|codex) [0-9a-f]{40}$' bodies.txt   # NOT the bindings
 ```
 
 ⚠️ **When those two numbers differ, the gap is the finding, not noise.** It is
 where people are arguing about a verdict that does not exist yet. On #2176 the
 gap was 3 versus 0.
 
-Three consequences worth keeping:
+⚠️ **BUT NEITHER NUMBER IS THE BINDING COUNT, AND THE SECOND ONE IS LABELLED
+ABOVE AS WHAT IT IS NOT.** This is the correction the check earned on itself.
+The first draft of this section presented that anchored pattern as `# bindings`.
+Three independent reviewers blocked on it, and they were right: **a pattern
+stricter than the parser reports false absence** — the exact direction the third
+bullet below warns about, committed by the recipe printed next to the warning.
+
+`ci-hub/health/approval_binding.py` normalises before it matches. It strips
+block-level prefixes (`#{1,6} `, `> `, `- `) and wrapping emphasis or backticks
+**to a fixpoint**, then applies `^APPROVED-AT:\s*(claude|codex)\s+[0-9a-f]{40}$`
+**case-insensitively**. Measured against `strip_decoration` + `parse_marker` at
+`origin/main`, with a plain line and a prose mention as controls in both
+directions:
+
+| line, all naming the same head        | the grep | the parser |
+| ------------------------------------- | -------- | ---------- |
+| `APPROVED-AT: claude <sha>` (control)  | match    | **binds**  |
+| `**APPROVED-AT: claude <sha>**`        | —        | **binds**  |
+| `` `APPROVED-AT: claude <sha>` ``      | —        | **binds**  |
+| `## APPROVED-AT: claude <sha>`         | —        | **binds**  |
+| `- APPROVED-AT: claude <sha>`          | —        | **binds**  |
+| `> APPROVED-AT: claude <sha>`          | —        | **binds**  |
+| `APPROVED-AT:  claude <sha>` (2 spaces)| —        | **binds**  |
+| `APPROVED-AT: CLAUDE <sha>`            | —        | **binds**  |
+| `CODEX-LANE APPROVED-AT: codex <sha>`  | —        | —          |
+| prose quoting the line (control)       | —        | —          |
+
+**Seven real bindings missed, by four distinct mechanisms** — decoration, block
+prefix, inner whitespace, and case. A reader following the old recipe on
+[hermit#2608](https://github.com/rrnewton/hermit/pull/2608) got **0** on a head
+that carries a valid exact-head claude approval, and would have concluded no lane
+had approved.
+
+**So the fix is not a better regex — it is not restating the grammar at all:**
+
+```console
+ci-hub/health/approval_binding.py --repo rrnewton/hermit --pr <n>   # bindings
+```
+
+⚠️ **A second copy of a grammar is check 14, and this document was the second
+copy.** The parser's own header says a lander had duplicated this parsing, that
+there were two parsers for one grammar, and that *"they had already drifted"*.
+Writing the pattern into a checklist made a third. Policy may differ between a
+board and a lander; the grammar may not. Keep the greps for the loose-versus-
+strict *contrast* that exposes the mention/binding gap, and get the binding count
+from the parser.
+
+Four consequences worth keeping:
 
 - **A quotation is not a retraction and not a re-assertion.** Deciding which
   requires reading, so a counter must not guess; it reports the whole-line count
@@ -1857,7 +1904,12 @@ Three consequences worth keeping:
 - **This applies to absence too.** "Zero refusals" from a loose grep is as
   unsound as "three approvals" — a refusal written in a variant the pattern does
   not match is counted as absent, which reads as permission. Absence claims need
-  the stricter instrument, not the looser one.
+  the *authoritative* instrument, not merely a stricter one: strictness beyond
+  the parser manufactures absence rather than proving it.
+- **A tightening needs a control that must still match.** The old recipe's
+  defect is invisible without one — every row above except the first two is a
+  silent miss, and only the plain control distinguishes "this pattern is precise"
+  from "this pattern matches nothing".
 - **Say which instrument produced the number.** "2 of 185" means nothing without
   "whole-line match on raw comment text, not through the parser". A count is a
   measurement and carries its method or it carries nothing.
