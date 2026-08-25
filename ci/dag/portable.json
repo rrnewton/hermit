@@ -184,14 +184,14 @@
     {
       "group": "e2e", "job": "manifest_backend_parity_c",
       "desc": "Portable manifest bucket: backend-parity-c",
-      "description": "MEASURED 2026-08-23: recent 20-way validation runs rotated an identical empty early-Run1 no_result across unrelated ptrace cells, while each affected cell passed in another run. A focused run at eight workers completed all 79 selected strict rows in 175.9s with 79 canonical matches and no no_result, leaving a measured 424.1s margin to the unchanged 600s hang bound. This node reserves all 8 manifest_guest slots plus the exclusive hermit_guest slot and passes the same width to the harness. Tradeoff: blocking validation no longer exercises the former 20-way manifest pressure; every cell and the strict comparator remain enabled and unchanged.",
+      "description": "WORKER WIDTH measured 2026-08-23: recent 20-way validation runs rotated an identical empty early-Run1 no_result across unrelated ptrace cells, while each affected cell passed in another run. A focused run at eight workers completed all 79 selected strict rows in 175.9s with 79 canonical matches and no no_result, leaving a measured 424.1s margin to the unchanged 600s hang bound. This node reserves all 8 manifest_guest slots plus the exclusive hermit_guest slot and passes the same width to the harness. Tradeoff: blocking validation no longer exercises the former 20-way manifest pressure; every cell and the strict comparator remain enabled and unchanged. MEMORY measured 2026-08-25 at Hermit 16f70d9994 with the complete current-main artifact and width 8 under ambient load 49-64: three uncapped cgroup peaks were 2856333312, 3168403456, and 2857349120 bytes; three stricter 4-GiB-cap repetitions completed all 85 cells with peaks up to 3465289728 bytes and no cgroup kill. The 4-GiB baseline rounds above the observed high-water mark; the 6-GiB hard cap preserves another 2.5 GiB of runaway headroom without reserving the former unmeasured 32 GiB.",
       "manifest": {"lane": "portable", "category": "backend-parity-c"},
       "cmd": "./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --jobs 8",
       "jobs_flag": "",
       "deps": ["build.e2e_artifact", "build.manifest_guests", "e2e.metadata"],
       "timeout": 600,
       "hint": {"resources": {"hermit_guest": 1, "manifest_guest": 8}, "est_duration_s": 180,
-               "rss_baseline_bytes": 17179869184, "hard_mem_max_bytes": 34359738368,
+               "rss_baseline_bytes": 4294967296, "hard_mem_max_bytes": 6442450944,
                "classification": "latency-bound", "preferred_inner_jobs": 8}
     },
     {
@@ -218,14 +218,14 @@
     {
       "group": "e2e", "job": "manifest_c_programs",
       "desc": "Portable manifest bucket: c-programs",
-      "description": "MEASURED 2026-08-23: recent 20-way validation runs rotated an identical empty early-Run1 no_result across unrelated ptrace cells, while each affected cell passed in another run. A focused run at eight workers completed all 127 selected strict rows in 264.3s with 127 canonical matches and no no_result, leaving a measured 335.7s margin to the unchanged 600s hang bound. This node reserves all 8 manifest_guest slots plus the exclusive hermit_guest slot and passes the same width to the harness. Tradeoff: blocking validation no longer exercises the former 20-way manifest pressure; every cell and the strict comparator remain enabled and unchanged.",
+      "description": "WORKER WIDTH measured 2026-08-23: recent 20-way validation runs rotated an identical empty early-Run1 no_result across unrelated ptrace cells, while each affected cell passed in another run. A focused run at eight workers completed all 127 selected strict rows in 264.3s with 127 canonical matches and no no_result, leaving a measured 335.7s margin to the unchanged 600s hang bound. This node reserves all 8 manifest_guest slots plus the exclusive hermit_guest slot and passes the same width to the harness. Tradeoff: blocking validation no longer exercises the former 20-way manifest pressure; every cell and the strict comparator remain enabled and unchanged. MEMORY measured 2026-08-25 at Hermit 16f70d9994 with the complete current-main artifact and width 8 under ambient load 40-107: five uncapped cgroup peaks were 2855145472-2894295040 bytes; three stricter 4-GiB-cap repetitions completed all 128 cells with peaks up to 3025047552 bytes and no cgroup kill. The 4-GiB baseline rounds above the observed high-water mark; the 6-GiB hard cap preserves nearly 3 GiB of runaway headroom without reserving the former unmeasured 32 GiB.",
       "manifest": {"lane": "portable", "category": "c-programs"},
       "cmd": "./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category c-programs --ci-only --allow-empty --prebuilt --jobs 8",
       "jobs_flag": "",
       "deps": ["build.e2e_artifact", "build.manifest_guests", "e2e.metadata"],
       "timeout": 600,
       "hint": {"resources": {"hermit_guest": 1, "manifest_guest": 8}, "est_duration_s": 300,
-               "rss_baseline_bytes": 17179869184, "hard_mem_max_bytes": 34359738368,
+               "rss_baseline_bytes": 4294967296, "hard_mem_max_bytes": 6442450944,
                "classification": "latency-bound", "preferred_inner_jobs": 8}
     },
     {
