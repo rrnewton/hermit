@@ -558,7 +558,7 @@ pub struct Scheduler {
 
     /// Cross-task signals physically queued while their sole target was parked
     /// in waitid polling. Applied at step2, where run-queue mutation is safe.
-    pending_waitid_signals: BTreeMap<DetTid, Vec<Signal>>,
+    pending_waitid_signals: BTreeMap<DetTid, Vec<SigWrapper>>,
 
     /// Child-TID futexes whose kernel clear may still be racing a guest join.
     cleared_child_tids: HashMap<FutexID, DetTid>,
@@ -2591,7 +2591,10 @@ impl Scheduler {
                 if is_internal_io_polling {
                     assert!(self.run_queue.remove_tid(dettid));
                     let mut rsrcs = Resources::new(dettid);
-                    rsrcs.insert(ResourceID::InboundSignal(SigWrapper(signal)), Permission::W);
+                    rsrcs.insert(
+                        ResourceID::InboundSignal(SigWrapper::from(signal)),
+                        Permission::W,
+                    );
                     self.force_unblock_thread(dettid, rsrcs);
                 }
                 // TODO(T137242449): other runnable requests could be reprioritized to run
@@ -2599,7 +2602,10 @@ impl Scheduler {
             }
             ThreadStatus::NotRunning => {
                 let mut rsrcs = Resources::new(dettid);
-                rsrcs.insert(ResourceID::InboundSignal(SigWrapper(signal)), Permission::W);
+                rsrcs.insert(
+                    ResourceID::InboundSignal(SigWrapper::from(signal)),
+                    Permission::W,
+                );
                 self.force_unblock_thread(dettid, rsrcs);
             }
         }
@@ -2660,7 +2666,7 @@ impl Scheduler {
     /// Record an unambiguous cross-task signal that was physically queued while
     /// its target was parked in waitid. The request rewrite is deferred to step2
     /// so an asynchronous backend cannot mutate beneath a tentative selection.
-    pub(crate) fn notify_signal_pending(&mut self, dettid: DetTid, signal: Signal) {
+    pub(crate) fn notify_signal_pending(&mut self, dettid: DetTid, signal: SigWrapper) {
         if self.waitid_signal_request(dettid).is_some() {
             let signals = self.pending_waitid_signals.entry(dettid).or_default();
             if !signals.contains(&signal) {
@@ -3622,11 +3628,11 @@ impl Scheduler {
             // that the scheduler itself synthesizes deterministically (timers via
             // `fire_alarm`) are never SIGCHLD and are unaffected.
             ResourceID::WaitidSignals(_) => Ok(()),
-            ResourceID::InboundSignal(SigWrapper(sig)) => {
+            ResourceID::InboundSignal(sig) => {
                 // `sigchld_ready` marks a parent step2e has already re-admitted;
                 // grant it now rather than deferring it a second time.
                 let already_readmitted = self.blocked.sigchld_ready.remove(&dettid);
-                if *sig == Signal::SIGCHLD
+                if sig.signal() == Some(Signal::SIGCHLD)
                     && !already_readmitted
                     && self.run_queue.has_runnable_besides(dettid)
                 {
@@ -4255,18 +4261,16 @@ impl Scheduler {
                             "run_queue.contains_tid disagreed with remove_tid for {dettid}"
                         );
                     }
-                    signals.sort_by_key(|signal| *signal as libc::c_int);
+                    signals.sort_by_key(SigWrapper::raw);
                     signals.dedup();
-                    let signals = signals.into_iter().map(SigWrapper).collect();
                     let mut resources = Resources::new(dettid);
                     resources.insert(ResourceID::WaitidSignals(signals), Permission::W);
                     self.force_unblock_thread(dettid, resources);
                 }
                 Some(WaitidSignalRequest::Pending(existing)) => {
-                    signals.extend(existing.into_iter().map(|signal| signal.0));
-                    signals.sort_by_key(|signal| *signal as libc::c_int);
+                    signals.extend(existing);
+                    signals.sort_by_key(SigWrapper::raw);
                     signals.dedup();
-                    let signals = signals.into_iter().map(SigWrapper).collect();
                     // One resource, always. `step4_resource_block` and
                     // `blocking_request_is_ready` both assert a request carries
                     // exactly one, so this must replace the request rather than
@@ -5794,7 +5798,7 @@ mod test {
         let op_id = ExternalOpId::new(waiter, 291);
         let mut signal = Resources::new(waiter);
         signal.insert(
-            ResourceID::InboundSignal(SigWrapper(Signal::SIGUSR1)),
+            ResourceID::InboundSignal(SigWrapper::from(Signal::SIGUSR1)),
             Permission::RW,
         );
         scheduler
@@ -5823,7 +5827,7 @@ mod test {
         let op_id = ExternalOpId::new(waiter, 291);
         let mut signal = Resources::new(waiter);
         signal.insert(
-            ResourceID::InboundSignal(SigWrapper(Signal::SIGUSR1)),
+            ResourceID::InboundSignal(SigWrapper::from(Signal::SIGUSR1)),
             Permission::RW,
         );
         scheduler.blocked.external_io_blockers.insert(waiter, op_id);
@@ -5925,7 +5929,7 @@ mod test {
         scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(polling));
         scheduler.runqueue_push_back(target);
 
-        scheduler.notify_signal_pending(target, Signal::SIGUSR1);
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
 
         assert!(scheduler.pending_waitid_signals.is_empty());
         assert!(scheduler.run_queue.contains_tid(target));
@@ -5949,13 +5953,13 @@ mod test {
         // with waitid.
         let mut inbound = Resources::new(target);
         inbound.insert(
-            ResourceID::InboundSignal(SigWrapper(Signal::SIGUSR1)),
+            ResourceID::InboundSignal(SigWrapper::from(Signal::SIGUSR1)),
             Permission::W,
         );
         scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(inbound));
         scheduler.runqueue_push_back(target);
 
-        scheduler.notify_signal_pending(target, Signal::SIGUSR2);
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR2));
         scheduler.drain_pending_waitid_signals();
 
         let resources = scheduler
@@ -6004,7 +6008,7 @@ mod test {
         assert!(scheduler.run_queue.contains_tid(target));
         assert!(!scheduler.blocked.child_waiters.contains_key(&target));
 
-        scheduler.notify_signal_pending(target, Signal::SIGUSR1);
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
         scheduler.drain_pending_waitid_signals();
 
         let occurrences = scheduler
@@ -6045,7 +6049,7 @@ mod test {
             .insert(target, (parent, spec));
         assert!(!scheduler.run_queue.contains_tid(target));
 
-        scheduler.notify_signal_pending(target, Signal::SIGUSR1);
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
         assert_eq!(scheduler.pending_waitid_signals[&target].len(), 1);
 
         scheduler.drain_pending_waitid_signals();
@@ -6060,7 +6064,7 @@ mod test {
         );
         assert_eq!(
             scheduler.inbound_signals(target),
-            vec![SigWrapper(Signal::SIGUSR1)],
+            vec![SigWrapper::from(Signal::SIGUSR1)],
             "the resume must name the signal that woke it"
         );
     }
@@ -6076,23 +6080,26 @@ mod test {
         scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(polling));
         scheduler.runqueue_push_back(target);
 
-        scheduler.notify_signal_pending(target, Signal::SIGUSR2);
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR2));
 
         assert_eq!(scheduler.pending_waitid_signals[&target].len(), 1);
         scheduler.drain_pending_waitid_signals();
         assert!(scheduler.run_queue.contains_tid(target));
         assert_eq!(
             scheduler.inbound_signals(target),
-            vec![SigWrapper(Signal::SIGUSR2)]
+            vec![SigWrapper::from(Signal::SIGUSR2)]
         );
 
         // A later signal must merge into the already-materialized waitid wakeup.
-        scheduler.notify_signal_pending(target, Signal::SIGUSR1);
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
         assert_eq!(scheduler.pending_waitid_signals[&target].len(), 1);
         scheduler.drain_pending_waitid_signals();
         assert_eq!(
             scheduler.inbound_signals(target),
-            vec![SigWrapper(Signal::SIGUSR1), SigWrapper(Signal::SIGUSR2)]
+            vec![
+                SigWrapper::from(Signal::SIGUSR1),
+                SigWrapper::from(Signal::SIGUSR2)
+            ]
         );
     }
 
