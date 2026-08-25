@@ -48,7 +48,11 @@
 //!
 //! # THREE OUTCOMES, NOT TWO
 //!
-//! - exit 0 -- every git dependency is pinned at exactly one revision
+//! - exit 0 -- every REVISION-PINNED git dependency is pinned at exactly one
+//!   revision. ⚠️ NOT the same as "every dependency is pinned": a branch- or
+//!   tag-tracked dependency is pinned at NO revision, and exit 0 with an
+//!   approved floating exception means uniformity was checked over a set that
+//!   excludes it. The summary line says so rather than leaving it to a footnote.
 //! - exit 1 -- REFUSE: a dependency is split, or floats without an approved
 //!   exception, or carries an exception that no longer applies. Every divergent
 //!   occurrence is named by file and line.
@@ -258,13 +262,18 @@ fn run() -> Result<ExitCode, String> {
     let clean = split.is_empty() && floating.is_empty() && stale.is_empty();
     if clean {
         println!(
-            "check-git-pin-uniformity.rs: OK -- every git dependency is pinned at exactly one revision"
+            "check-git-pin-uniformity.rs: OK -- every REVISION-PINNED git dependency is pinned at exactly one revision"
         );
         if !excepted.is_empty() {
             println!(
-                "  {} approved floating exception(s): {}",
+                "  ⚠️ {} dependency/ies are NOT PINNED AT ALL and were excluded from that \
+                 statement, by approved exception: {}",
                 excepted.len(),
                 excepted.join(", ")
+            );
+            println!(
+                "  A BRANCH IS NOT A PIN -- it moves under you. Uniformity cannot be \
+                 asserted over a dependency that names one."
             );
         }
         return Ok(ExitCode::SUCCESS);
