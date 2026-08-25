@@ -2574,6 +2574,21 @@ fn validate_row_result(row: &ResultRow) -> Result<ObservedResult, String> {
     }
 }
 
+/// What a validate fold recorded, SPLIT BY WHETHER THE ROW LOCATED ANYTHING.
+///
+/// Two counts rather than one because the caller's summary line is the only
+/// thing most readers see. A single "merged N divergence position(s)" makes
+/// N=0 read as "the run was all green", which is wrong precisely when a cell
+/// diverged and the comparator could not say where -- the case that needs
+/// attention most.
+#[derive(Clone, Copy, Debug, Default)]
+struct ValidateFold {
+    /// Rows that carried at least one of the four divergence coordinates.
+    located: usize,
+    /// Rows that diverged and carried none of them.
+    unlocated: usize,
+}
+
 /// Fold VALIDATE rows into the tracked observations under the `validate`
 /// provenance.
 ///
@@ -2594,8 +2609,8 @@ fn apply_validate_results(
     hermit_sha: &str,
     detcore_tree: &str,
     depth: &BTreeMap<String, SourceDepth>,
-) -> Result<usize, String> {
-    let mut updated = 0usize;
+) -> Result<ValidateFold, String> {
+    let mut fold = ValidateFold::default();
     for (id, candidates) in rows {
         let Some(index) = tracked.cells.iter().position(|cell| &cell.id == id) else {
             continue;
@@ -2612,15 +2627,28 @@ fn apply_validate_results(
                 detcore_tree: detcore_tree.to_string(),
                 depth: depth.clone(),
             });
-            // Nothing to record. Skipping rather than folding a no-op keeps a
-            // cell that has only ever passed free of an empty observation,
-            // which would otherwise be indistinguishable from one that was
-            // measured and located nothing.
-            if row.first_divergent_scheduler_turn.is_none()
+            let located_nothing = row.first_divergent_scheduler_turn.is_none()
                 && row.first_divergent_virtual_nanoseconds.is_none()
                 && row.first_divergent_record.is_none()
-                && row.first_divergent_syscall.is_none()
-            {
+                && row.first_divergent_syscall.is_none();
+            // A PASS that located nothing has nothing to say about WHERE
+            // anything diverged, and folding a no-op for it would leave an
+            // only-ever-green cell holding an empty observation --
+            // indistinguishable from one that was measured and located nothing.
+            // An ERROR is an infrastructure state that `validate_row_result`
+            // refuses outright, and it is skipped here exactly as before.
+            //
+            // ⚠️ A **FAIL** THAT LOCATED NOTHING IS A DIFFERENT FACT AND IS NOW
+            // RECORDED. Skipping it as well is what made the two states this
+            // whole field exists to separate collapse into one: measured on main
+            // at 4e168f2aa5, folding a single FAIL row whose four coordinates
+            // were all null left the cell reading `never-measured` with zero
+            // observations, identical to a cell nothing had ever run on.
+            // `DivergedUnlocated` was already derivable and simply unreachable
+            // from this writer. The two need OPPOSITE follow-ups -- run the cell
+            // versus teach the comparator to localise -- so they must not read
+            // the same.
+            if located_nothing && row.outcome != "FAIL" {
                 continue;
             }
             let result = validate_row_result(row)?;
@@ -2643,12 +2671,12 @@ fn apply_validate_results(
                     )
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            // A row that located a divergence but recorded no attempt is
-            // self-contradictory: something ran to produce that position. The
+            // A row that reports a divergence but recorded no attempt is
+            // self-contradictory: something ran to produce that verdict. The
             // pressure path refuses the same shape.
             if attempt_invocations.is_empty() {
                 return Err(format!(
-                    "{} located a divergence but recorded no attempt",
+                    "{} reports a divergence but recorded no attempt",
                     display_id(id)
                 ));
             }
@@ -2708,10 +2736,14 @@ fn apply_validate_results(
                     .cmp(&right.detcore_tree)
                     .then(left.provenance.cmp(&right.provenance))
             });
-            updated += 1;
+            if located_nothing {
+                fold.unlocated += 1;
+            } else {
+                fold.located += 1;
+            }
         }
     }
-    Ok(updated)
+    Ok(fold)
 }
 
 fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
@@ -2739,20 +2771,34 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
     }
     let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
     let before = tracked.clone();
-    let updated = apply_validate_results(&mut tracked, &rows, &head, &detcore_tree, &depth)?;
+    let fold = apply_validate_results(&mut tracked, &rows, &head, &detcore_tree, &depth)?;
     refresh_measurement(&mut tracked);
     enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
     fs::write(root.join(CELLS), encoded_cells(&tracked)?)
         .map_err(|e| format!("cannot write {CELLS}: {e}"))?;
     println!(
-        "compatibility scorecard: merged {} {} divergence position(s) at {head}",
-        updated,
+        "compatibility scorecard: merged {} located and {} unlocated {} divergence \
+         observation(s) at {head}",
+        fold.located,
+        fold.unlocated,
         ObservationProvenance::Validate.as_str()
     );
-    if updated == 0 {
+    // THREE OUTCOMES, NOT TWO. This used to print the all-green sentence
+    // whenever the located count was zero, which said "expected result for an
+    // all-green run" over a batch whose cells had diverged without a locatable
+    // position -- the one outcome that most needs to be read as a finding.
+    if fold.located == 0 && fold.unlocated == 0 {
         println!(
-            "  no row located a divergence. That is the expected result for an \
-             all-green run and is NOT evidence that the field is unpopulated."
+            "  no row diverged. That is the expected result for an all-green run \
+             and is NOT evidence that the field is unpopulated."
+        );
+    } else if fold.unlocated > 0 {
+        println!(
+            "  {} row(s) DIVERGED but located nothing on any of the four coordinate axes. \
+             Those cells now read `{}`, which is a comparator gap and is NOT the same \
+             finding as a cell that was never compared.",
+            fold.unlocated,
+            MeasurementState::DivergedUnlocated.as_str()
         );
     }
     Ok(())
@@ -3821,15 +3867,25 @@ fn self_test() -> Result<(), String> {
             green_removal_reason: None,
         }],
     };
-    let pressure_row = |result: &str, turn, virtual_nanoseconds| PressureSummaryRow {
+    // ⚠️ THE FIXTURE CARRIES ALL FOUR COORDINATES, NOT TWO. It used to hardcode
+    // `first_divergent_record` and `first_divergent_syscall` to None, so the
+    // pressure bracket below could only ever demonstrate that TWO of the four
+    // survive this fold -- and the pressure fold is the one that produced the
+    // only located observation the tracked corpus has.
+    //
+    // The other two are derived from `turn` by DIFFERENT factors so each axis's
+    // asserted range below is distinct (turn 10..30, record 50..150, syscall
+    // 5..15). Four different keyspaces, so a fold that read one coordinate off
+    // another's value fails the bracket instead of passing by coincidence.
+    let pressure_row = |result: &str, turn: Option<u64>, virtual_nanoseconds| PressureSummaryRow {
         cell: id.clone(),
         repetition: None,
         result: result.into(),
         verification: Some(PressureVerification {
             first_divergent_scheduler_turn: turn,
             first_divergent_virtual_nanoseconds: virtual_nanoseconds,
-            first_divergent_record: None,
-            first_divergent_syscall: None,
+            first_divergent_record: turn.map(|turn| turn * 5),
+            first_divergent_syscall: turn.map(|turn| turn / 2),
         }),
         evidence_errors: Vec::new(),
         invocation: Some(PressureInvocation {
@@ -3938,6 +3994,21 @@ fn self_test() -> Result<(), String> {
                 latest: 1000,
                 samples: 3,
             })
+        // The third and fourth coordinates, asserted on the SAME three located
+        // runs as the two above. Their ranges are deliberately disjoint from the
+        // turn range, so this cannot pass by reading one axis off another.
+        || observation.first_divergent_record.range()
+!= Some(ObservedRange {
+                earliest: 50,
+                latest: 150,
+                samples: 3,
+            })
+        || observation.first_divergent_syscall.range()
+!= Some(ObservedRange {
+                earliest: 5,
+                latest: 15,
+                samples: 3,
+            })
         || observation.provenance != ObservationProvenance::PressureTest
         || observation.results
             != BTreeSet::from([
@@ -4018,7 +4089,7 @@ fn self_test() -> Result<(), String> {
         vec![ResultCandidate {
             evidence_identity: "validate-bracket".into(),
             path: PathBuf::from("fixture/results.jsonl"),
-            row: validate_row,
+            row: validate_row.clone(),
         }],
     )]);
     apply_validate_results(&mut observed, &rows, "sha-1", "tree-1", &depth_fixture)
@@ -4079,6 +4150,214 @@ fn self_test() -> Result<(), String> {
         || from_validate.results != BTreeSet::from([ObservedResult::DeterminismFailure])
     {
         return Err("validate observation did not record its own bounds and result".into());
+    }
+
+    // ⚠️ READ THE COORDINATES BACK OUT OF STORAGE, NOT OUT OF THE STRUCT THAT
+    // JUST WROTE THEM. Every assertion above this point inspects the in-memory
+    // fold, and an in-memory assertion cannot see the write at all: a
+    // `#[serde(skip)]`, a `skip_serializing_if` that answers wrongly, a reader
+    // that stops accepting the key -- each of those loses the value SILENTLY
+    // while every bracket above still passes.
+    //
+    // `first_divergent_syscall` is named explicitly because it is the one
+    // coordinate the tracked corpus has never carried: 0 of 2 observations in
+    // ci/compat-envelope/cells.json hold it, and the single located observation
+    // there holds the other three. Measured at 4e168f2aa5, both folds DO put it
+    // on disk, so that gap is a property of the corpus rather than of the
+    // pipeline -- and this bracket is what keeps it that way.
+    //
+    // Encoded with the same function the writers use and parsed with the same
+    // reader `load_existing` uses, so the only thing this can pass on is bytes
+    // that really round-trip.
+    let mut stored_form = observed.clone();
+    refresh_measurement(&mut stored_form);
+    let encoded = encoded_cells(&stored_form)
+        .map_err(|e| format!("storage round-trip bracket could not encode the cells: {e}"))?;
+    let reloaded: TrackedCells = serde_json::from_str(&encoded).map_err(|e| {
+        format!("storage round-trip bracket could not re-read the encoded cells: {e}")
+    })?;
+    for provenance in [
+        ObservationProvenance::PressureTest,
+        ObservationProvenance::Validate,
+    ] {
+        let find = |cells: &TrackedCells| {
+            cells.cells[0]
+                .observations
+                .iter()
+                .find(|observation| {
+                    observation.provenance == provenance && observation.detcore_tree == "tree-1"
+                })
+                .cloned()
+        };
+        let live = find(&stored_form).ok_or_else(|| {
+            format!(
+                "storage round-trip bracket has no {} observation to check",
+                provenance.as_str()
+            )
+        })?;
+        let stored = find(&reloaded).ok_or_else(|| {
+            format!(
+                "the {} observation did not survive the write at all",
+                provenance.as_str()
+            )
+        })?;
+        // NON-VACUITY FIRST. Comparing two empty coordinates for equality would
+        // pass forever while proving nothing, which is the exact shape of a
+        // silent instrument. Require the value to be PRESENT on disk before
+        // asking whether it matches.
+        if stored.first_divergent_syscall.is_empty() {
+            return Err(format!(
+                "the {} observation reached storage carrying no first_divergent_syscall: the \
+                 coordinate is computed and then dropped before anything durable records it",
+                provenance.as_str()
+            ));
+        }
+        if stored.first_divergent_record.is_empty()
+            || stored.first_divergent_scheduler_turn.is_empty()
+            || stored.first_divergent_virtual_nanoseconds.is_empty()
+        {
+            return Err(format!(
+                "the {} observation reached storage missing one of the other three coordinates",
+                provenance.as_str()
+            ));
+        }
+        if stored != live {
+            return Err(format!(
+                "the {} observation changed across the storage round trip: syscall on disk {:?}, \
+                 in memory {:?}",
+                provenance.as_str(),
+                stored.first_divergent_syscall.range(),
+                live.first_divergent_syscall.range()
+            ));
+        }
+    }
+    if reloaded.cells != stored_form.cells {
+        return Err("the tracked cells did not survive their own encoding unchanged".into());
+    }
+
+    // ⚠️ THE FOUR REASONS A CELL CAN LACK A DIVERGENCE COORDINATE MUST STAY
+    // TELLABLE APART. Two of them look identical in every field except
+    // `measurement`, and they need OPPOSITE follow-ups:
+    //
+    //   never-measured      nothing ever compared this cell   -> run it
+    //   diverged-unlocated  it was compared, it DID diverge,
+    //                       and no axis could say where       -> fix the comparator
+    //
+    // Trading a missing coordinate for a misleading state is a worse outcome
+    // than the missing coordinate, so this bracket folds one row of each shape
+    // and requires the two to disagree.
+    let unlocated_id = CellId {
+        lane: "portable".into(),
+        category: "fixture".into(),
+        test: "fixture/unlocated".into(),
+        mode: "verify".into(),
+        backend: "ptrace".into(),
+    };
+    let bare_cell = |id: &CellId| TrackedCell {
+        id: id.clone(),
+        enabled: true,
+        status: CellStatus::Red,
+        ci_disabled_reason: None,
+        not_applicable_reason: None,
+        last_tested: None,
+        observations: Vec::new(),
+        measurement: MeasurementState::NeverMeasured,
+        green_removal_reason: None,
+    };
+    let coordinate_less_row = |id: &CellId, outcome: &str| {
+        let mut row = validate_row.clone();
+        row.run_id = format!("fixture-coordinate-less-{outcome}");
+        row.test = id.test.clone();
+        row.category = id.category.clone();
+        row.lane = id.lane.clone();
+        row.mode = id.mode.clone();
+        row.backend = Some(id.backend.clone());
+        row.outcome = outcome.to_string();
+        row.first_divergent_scheduler_turn = None;
+        row.first_divergent_virtual_nanoseconds = None;
+        row.first_divergent_record = None;
+        row.first_divergent_syscall = None;
+        row.attempts = vec![serde_json::json!({
+            "index": "1",
+            "outcome": outcome,
+            "status": if outcome == "PASS" { 0 } else { 1 },
+            "signal": null,
+            "timed_out": false,
+            "argv": ["hermit", "run"],
+            "guest_argv": ["fixture"],
+            "env": {"LC_ALL": "C"},
+            "cwd": "/repo",
+            "shell_command": "cd /repo && env LC_ALL=C hermit run",
+        })];
+        BTreeMap::from([(
+            id.clone(),
+            vec![ResultCandidate {
+                evidence_identity: format!("coordinate-less-{outcome}"),
+                path: PathBuf::from("fixture/results.jsonl"),
+                row,
+            }],
+        )])
+    };
+    let mut unlocated = TrackedCells {
+        schema: SCHEMA,
+        projection: None,
+        cells: vec![bare_cell(&unlocated_id)],
+    };
+    let unlocated_fold = apply_validate_results(
+        &mut unlocated,
+        &coordinate_less_row(&unlocated_id, "FAIL"),
+        "sha-1",
+        "tree-1",
+        &depth_fixture,
+    )
+    .map_err(|e| format!("diverged-unlocated bracket failed: {e}"))?;
+    refresh_measurement(&mut unlocated);
+    if unlocated_fold.located != 0 || unlocated_fold.unlocated != 1 {
+        return Err(format!(
+            "a divergence that located nothing was counted as {} located / {} unlocated",
+            unlocated_fold.located, unlocated_fold.unlocated
+        ));
+    }
+    if unlocated.cells[0].measurement != MeasurementState::DivergedUnlocated {
+        return Err(format!(
+            "a cell that was compared and diverged without a locatable position reads `{}`, \
+             which is indistinguishable from a cell nothing ever ran on",
+            unlocated.cells[0].measurement.as_str()
+        ));
+    }
+    // And the property the old unconditional skip was protecting: a PASS
+    // carries no coordinate either, and must NOT leave an empty observation
+    // behind, or an only-ever-green cell starts reading as one that was
+    // measured and located nothing.
+    let mut passed = TrackedCells {
+        schema: SCHEMA,
+        projection: None,
+        cells: vec![bare_cell(&unlocated_id)],
+    };
+    let passed_fold = apply_validate_results(
+        &mut passed,
+        &coordinate_less_row(&unlocated_id, "PASS"),
+        "sha-1",
+        "tree-1",
+        &depth_fixture,
+    )
+    .map_err(|e| format!("coordinate-less PASS bracket failed: {e}"))?;
+    refresh_measurement(&mut passed);
+    if passed_fold.located != 0
+        || passed_fold.unlocated != 0
+        || !passed.cells[0].observations.is_empty()
+    {
+        return Err("a coordinate-less PASS left an observation behind".into());
+    }
+    if passed.cells[0].last_tested.is_none() {
+        return Err("a coordinate-less PASS was not stamped as tested".into());
+    }
+    if unlocated.cells[0].measurement == passed.cells[0].measurement {
+        return Err(
+            "a diverged-unlocated cell and an untouched-by-observation cell read the same \
+             measurement"
+                .into(),
+        );
     }
 
     let next_source = pressure_summary(
@@ -4845,7 +5124,7 @@ fn self_test() -> Result<(), String> {
     }
 
     println!(
-        "compatibility scorecard self-test: provenance, distinct-evidence, result, selected-chaos, ratchet, observation-range, batch-equivalence, green-admission, validate-observation, source-identity, writer-boundary, projection, path-independence, and infrastructure-refusal brackets pass"
+        "compatibility scorecard self-test: provenance, distinct-evidence, result, selected-chaos, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, batch-equivalence, green-admission, validate-observation, source-identity, writer-boundary, projection, path-independence, and infrastructure-refusal brackets pass"
     );
     Ok(())
 }
