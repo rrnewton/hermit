@@ -29,6 +29,16 @@ use super::global_opts::GlobalOpts;
 use super::record_envelope::RecordEnvelope;
 use super::record_envelope::RecordEnvelopePolicy;
 
+pub(crate) fn describe_exit_status(status: ExitStatus) -> String {
+    match status {
+        ExitStatus::Exited(code) => format!("exited with code {code}"),
+        ExitStatus::Signaled(signal, core_dumped) => {
+            let core = if core_dumped { " (core dumped)" } else { "" };
+            format!("terminated by signal {} ({signal:?}){core}", signal as i32)
+        }
+    }
+}
+
 pub(crate) struct ComparedRun<'a> {
     pub output: &'a Output,
     pub log: TempPath,
@@ -1129,6 +1139,14 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn exit_status_diagnostic_reports_guest_exit_code() {
+        assert_eq!(
+            describe_exit_status(ExitStatus::Exited(23)),
+            "exited with code 23"
+        );
+    }
 
     fn output(status: i32, stdout: &[u8], stderr: &[u8]) -> Output {
         Output {

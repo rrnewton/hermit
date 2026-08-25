@@ -62,6 +62,7 @@ use super::verify::ComparisonOptions;
 use super::verify::LogCompareStrictness;
 use super::verify::announce_verification_outcome;
 use super::verify::compare_two_runs;
+use super::verify::describe_exit_status;
 use super::verify::retain_verification_logs;
 use super::verify::temp_log_files_in;
 use super::verify::validate_log_level;
@@ -3268,15 +3269,16 @@ impl RunOpts {
         }
 
         if !self.verify_allow.satisfies(out1.status) {
+            let status = describe_exit_status(out1.status);
             eprintln!(
-                "First run errored during --verify, not continuing to a second. Stdout:\n{}\nStderr:\n{}",
+                "First run errored during --verify, not continuing to a second.\nExit status: {status}\nStdout:\n{}\nStderr:\n{}",
                 String::from_utf8_lossy(&out1.stdout),
                 String::from_utf8_lossy(&out1.stderr),
             );
             if self.keep_logs {
                 retain_verification_logs([("run 1", log1_path)])?;
             }
-            return Err(Error::msg("First run during --verify exited in error"));
+            return Err(Error::msg(format!("First run during --verify {status}")));
         }
 
         eprintln!(":: {}", "Run2...".yellow().bold());

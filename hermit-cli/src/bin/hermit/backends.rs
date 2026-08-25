@@ -84,6 +84,8 @@ use super::verify::announce_verification_outcome;
 #[cfg(feature = "dbt")]
 use super::verify::compare_two_runs;
 #[cfg(feature = "dbt")]
+use super::verify::describe_exit_status;
+#[cfg(feature = "dbt")]
 use super::verify::retain_verification_logs;
 #[cfg(feature = "dbt")]
 use super::verify::temp_log_files_in;
@@ -968,15 +970,16 @@ pub(super) fn run_dbt(
     }
     if !verify_allow.satisfies(process_status(first_raw.status)) {
         let first = dbt_verification_output(first_raw);
+        let status = describe_exit_status(first.status);
         eprintln!(
-            "First run errored during --verify, not continuing to a second. Stdout:\n{}\nStderr:\n{}",
+            "First run errored during --verify, not continuing to a second.\nExit status: {status}\nStdout:\n{}\nStderr:\n{}",
             String::from_utf8_lossy(&first.stdout),
             String::from_utf8_lossy(&first.stderr),
         );
         if keep_logs {
             retain_verification_logs([("run 1", log1_path)])?;
         }
-        return Err(Error::msg("First run during --verify exited in error"));
+        return Err(Error::msg(format!("First run during --verify {status}")));
     }
     let first_stats = match stats1.finish() {
         Ok(stats) => stats,
