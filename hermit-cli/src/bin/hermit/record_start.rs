@@ -235,7 +235,8 @@ pub struct StartOpts {
     /// With --verify, write the verification verdict as a single JSON line to
     /// this path: `{"verified":bool,"bitwise_parity":bool,
     /// "verdict":"matched"|"diverged","comparison":{"strictness":
-    /// "stripped"|"canonical","compare_logs":bool,"log_scope":
+    /// "stripped"|"canonical","compare_logs":bool,"compare_io_buffers":bool,
+    /// "log_scope":
     /// "deterministic"|"info"|"full_trace","record_envelope":
     /// "all_records_v1","strip_lines":bool,
     /// "canonicalize_addresses":bool,"full_trace":bool,"exact_remainder":bool,
@@ -260,8 +261,9 @@ pub struct StartOpts {
     /// true only under the `canonical` (`BitwiseInfoV1`) policy — a full-INFO
     /// comparison inside a named canonical record envelope that strips only the
     /// real wall-clock prefix, canonicalizes host addresses to first-appearance
-    /// ordinals, and compares everything else exactly (see --verify-strict) —
-    /// rather than a stripped or opaque filtered match.
+    /// ordinals, includes syscall output-buffer hashes, and compares everything
+    /// else exactly (see --verify-strict) — rather than a stripped, content-blind,
+    /// or opaque filtered match.
     #[clap(long, requires = "verify", value_name = "PATH")]
     verify_json: Option<PathBuf>,
 

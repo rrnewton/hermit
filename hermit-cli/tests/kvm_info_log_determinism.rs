@@ -14,16 +14,16 @@
 //! value inside a message body therefore makes two runs of the same guest differ
 //! on that line alone, with no guest cause.
 //!
-//! This is currently invisible through `--verify` itself, because the KVM path
-//! takes an output-only fallback (`compare_logs: false`, reported as
-//! `bitwise_parity: false`) and never compares the internal stream. This test
-//! compares it directly so the defect cannot hide behind that fallback.
+//! The KVM `--verify` path compares this stream directly. These tests guard both
+//! prerequisites for that verdict: repeated input must match, and a changed
+//! syscall-buffer hash in the retained stream must make verification fail.
 
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::Output;
 use std::sync::Mutex;
 
 use tempfile::NamedTempFile;
@@ -33,11 +33,63 @@ static KVM_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 const LIFECYCLE_TIMING_EVENT: &str = "reverie-kvm lifecycle phase timings";
 
-fn compile_guest(name: &str, extra_args: &[&str]) -> PathBuf {
+const IO_BUFFER_MUTATOR_SOURCE: &str = r#"
+typedef unsigned long usize;
+
+static inline long syscall1(long number, long arg1) {
+  register long rax __asm__("rax") = number;
+  register long rdi __asm__("rdi") = arg1;
+  __asm__ volatile("syscall"
+                   : "+a"(rax)
+                   : "D"(rdi)
+                   : "rcx", "r11", "memory");
+  return rax;
+}
+
+static inline long syscall4(long number, long arg1, long arg2, long arg3,
+                            long arg4) {
+  register long rax __asm__("rax") = number;
+  register long rdi __asm__("rdi") = arg1;
+  register long rsi __asm__("rsi") = arg2;
+  register long rdx __asm__("rdx") = arg3;
+  register long r10 __asm__("r10") = arg4;
+  __asm__ volatile("syscall"
+                   : "+a"(rax)
+                   : "D"(rdi), "S"(rsi), "d"(rdx), "r"(r10)
+                   : "rcx", "r11", "memory");
+  return rax;
+}
+
+__attribute__((noreturn)) void _start(void) {
+  static const char path[] = "@STATE_PATH@";
+  static const char replacement[16] = {
+      66, 66, 66, 66, 66, 66, 66, 66,
+      66, 66, 66, 66, 66, 66, 66, 66,
+  };
+  char observed[16];
+  long result = 0;
+  long fd = syscall4(257, -100, (long)path, 2 | 02000000, 0);
+  if (fd < 0) {
+    result = 65;
+  } else if (syscall4(17, fd, (long)observed, sizeof(observed), 0) !=
+             (long)sizeof(observed)) {
+    result = 66;
+  } else if (syscall4(18, fd, (long)replacement, sizeof(replacement), 0) !=
+             (long)sizeof(replacement)) {
+    result = 67;
+  } else if (syscall1(74, fd) != 0 || syscall1(3, fd) != 0) {
+    result = 68;
+  }
+  syscall1(231, result);
+  __builtin_unreachable();
+}
+"#;
+
+fn compile_source_guest(name: &str, source_text: &str, extra_args: &[&str]) -> PathBuf {
     let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kvm-info-log-determinism");
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
     let source = build_root.join(format!("{name}.c"));
-    fs::write(&source, "int main(void) { return 0; }\n").expect("failed to write guest source");
+    fs::write(&source, source_text).expect("failed to write guest source");
     let binary = build_root.join(name);
     let output = Command::new("cc")
         .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
@@ -53,6 +105,10 @@ fn compile_guest(name: &str, extra_args: &[&str]) -> PathBuf {
         String::from_utf8_lossy(&output.stderr),
     );
     binary
+}
+
+fn compile_guest(name: &str, extra_args: &[&str]) -> PathBuf {
+    compile_source_guest(name, "int main(void) { return 0; }\n", extra_args)
 }
 
 fn run_kvm_log(binary: &Path, log_level: &str, extra_run_flags: &[&str]) -> String {
@@ -128,6 +184,166 @@ fn compare_canonical_info(left: &str, right: &str) -> detcore::logdiff::LogDiffS
     };
     detcore::logdiff::try_log_diff_detailed(left_input.path(), right_input.path(), &options)
         .expect("failed to compare canonical KVM INFO streams")
+}
+
+fn strip_ansi_sgr(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut remaining = input;
+    while let Some(start) = remaining.find("\x1b[") {
+        output.push_str(&remaining[..start]);
+        let escape = &remaining[start + 2..];
+        let Some(end) = escape.find("m") else {
+            output.push_str(&remaining[start..]);
+            return output;
+        };
+        remaining = &escape[end + 1..];
+    }
+    output.push_str(remaining);
+    output
+}
+
+fn run_kvm_verify(
+    binary: &Path,
+    state_path: &Path,
+    initial: &[u8; 16],
+    label: &str,
+    extra_run_flags: &[&str],
+) -> (Output, serde_json::Value) {
+    fs::write(state_path, initial).expect("failed to seed io-buffer state");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kvm-info-log-determinism");
+    let report_path = build_root.join(format!("{label}.json"));
+    let log_dir = build_root.join(format!("{label}-logs"));
+    let _ = fs::remove_file(&report_path);
+    let _ = fs::remove_dir_all(&log_dir);
+    fs::create_dir_all(&log_dir).expect("failed to create verification log directory");
+
+    let output = Command::new("timeout")
+        .args(["--kill-after", "10s", "90s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log", "info", "--backend", "kvm"])
+        .args([
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--keep-logs",
+            "--verify-log-dir",
+        ])
+        .arg(&log_dir)
+        .args(extra_run_flags)
+        .arg("--verify-json")
+        .arg(&report_path)
+        .arg("--tmp=/tmp")
+        .arg("--")
+        .arg(binary)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to verify io-buffer guest under KVM: {error}"));
+    let report = serde_json::from_slice(&fs::read(&report_path).unwrap_or_else(|error| {
+        panic!(
+            "KVM verification did not write {}: {error}; stderr:\n{}",
+            report_path.display(),
+            String::from_utf8_lossy(&output.stderr),
+        )
+    }))
+    .expect("KVM verification report was not valid JSON");
+    (output, report)
+}
+
+#[test]
+fn kvm_verify_compares_retained_io_buffer_hashes() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("SKIP kvm_verify_compares_retained_io_buffer_hashes: /dev/kvm is not present");
+        return;
+    }
+    let _guard = KVM_RUN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let state_path = Path::new("/tmp").join(format!(
+        "hermit-kvm-iobuf-verification-{}",
+        std::process::id()
+    ));
+    let source = IO_BUFFER_MUTATOR_SOURCE.replace(
+        "@STATE_PATH@",
+        state_path.to_str().expect("state path was not UTF-8"),
+    );
+    let binary = compile_source_guest(
+        "io-buffer-mutator",
+        &source,
+        &[
+            "-nostdlib",
+            "-static",
+            "-Wl,-e,_start",
+            "-fno-pie",
+            "-no-pie",
+        ],
+    );
+
+    const A_HASH: &str = "991204fba2b6216d476282d375ab88d20e6108d109aecded97ef424ddd114706";
+    const B_HASH: &str = "900dfeb7f1b5e344209e2abce56c333dafe606fb3bf59f68ab2b0e2ef8a0662b";
+    let (mutation, mutation_report) =
+        run_kvm_verify(&binary, &state_path, b"AAAAAAAAAAAAAAAA", "mutation", &[]);
+    let mutation_stderr = strip_ansi_sgr(&String::from_utf8_lossy(&mutation.stderr));
+    assert!(
+        !mutation.status.success(),
+        "A-to-B mutation was accepted by KVM verification:\n{mutation_stderr}"
+    );
+    assert_eq!(mutation_report["verified"], false);
+    assert_eq!(mutation_report["verdict"], "diverged");
+    assert_eq!(mutation_report["comparison"]["compare_logs"], true);
+    assert_eq!(mutation_report["comparison"]["compare_io_buffers"], true);
+    assert!(
+        mutation_report["compared_log_messages"]["left"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    for marker in ["[iobuf]", "pread64", A_HASH, B_HASH] {
+        assert!(
+            mutation_stderr.contains(marker),
+            "KVM mutation failure did not name {marker:?}:\n{mutation_stderr}"
+        );
+    }
+
+    let (opt_out, opt_out_report) = run_kvm_verify(
+        &binary,
+        &state_path,
+        b"AAAAAAAAAAAAAAAA",
+        "opt-out",
+        &["--no-detlog-io-buffers"],
+    );
+    let opt_out_stderr = String::from_utf8_lossy(&opt_out.stderr);
+    assert!(
+        opt_out.status.success(),
+        "the explicit io-buffer opt-out should retain its weaker matched verdict:\n{opt_out_stderr}"
+    );
+    assert_eq!(opt_out_report["verified"], true);
+    assert_eq!(opt_out_report["verdict"], "matched");
+    assert_eq!(opt_out_report["bitwise_parity"], false);
+    assert_eq!(opt_out_report["comparison"]["compare_logs"], true);
+    assert_eq!(opt_out_report["comparison"]["compare_io_buffers"], false);
+    assert!(
+        opt_out_stderr.contains("output-buffer CONTENT was not compared"),
+        "the weaker KVM match must name its missing observation:\n{opt_out_stderr}"
+    );
+
+    let (stable, stable_report) =
+        run_kvm_verify(&binary, &state_path, b"BBBBBBBBBBBBBBBB", "stable", &[]);
+    let stable_stderr = String::from_utf8_lossy(&stable.stderr);
+    assert!(
+        stable.status.success(),
+        "identical B-to-B input failed KVM verification:\n{stable_stderr}"
+    );
+    assert_eq!(stable_report["verified"], true);
+    assert_eq!(stable_report["verdict"], "matched");
+    assert_eq!(stable_report["bitwise_parity"], true);
+    assert_eq!(stable_report["comparison"]["compare_logs"], true);
+    assert!(
+        stable_report["compared_log_messages"]["left"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+
+    let _ = fs::remove_file(state_path);
 }
 
 #[test]
