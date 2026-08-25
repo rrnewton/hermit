@@ -58,6 +58,11 @@ enum ProcfsKind {
     ArchStatus,
     CpuidleCounter,
     Smaps,
+    /// `/proc/*/maps`. Its per-mapping line carries a DEVICE and an INODE for
+    /// the backing file -- the same two fields `determinize_stat` sanitizes --
+    /// so leaving it raw lets a guest read two different identities for one
+    /// file depending on which route it asks through.
+    Maps,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-951): Review key-user resource normalization.
     KeyUsers,
@@ -362,7 +367,7 @@ pub(crate) struct ProcfsFile {
 }
 
 /// Guest-visible values used to normalize one procfs snapshot.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ProcfsSnapshotContext {
     pub(crate) virtual_uptime_seconds: u64,
     pub(crate) virtual_realtime_seconds: i64,
@@ -371,6 +376,18 @@ pub(crate) struct ProcfsSnapshotContext {
     pub(crate) virtual_ppid: i32,
     pub(crate) virtual_pty_count: usize,
     pub(crate) fdinfo_identity: Option<(u64, i32, u64)>,
+    /// Raw `(device, inode)` -> determinized `(device, inode)` for every backed
+    /// mapping in a `maps`/`smaps` snapshot.
+    ///
+    /// ⚠️ BUILT BY THE CALLER, NEVER HERE. The sanitizers in this module are
+    /// pure functions of content and have no guest handle, so they cannot reach
+    /// the global `InodePool`/`DevicePool`. Minting an identity locally would
+    /// make the maps column stable and STILL DISAGREE with `stat` -- determin-
+    /// istic, reproducible and wrong. The caller determinizes through the same
+    /// `determinize_inode`/`determinize_device` that `determinize_stat` uses,
+    /// exactly as `fdinfo_identity` above is built, and this table is only a
+    /// lookup for rendering.
+    pub(crate) mapping_identities: BTreeMap<(u64, u64), (u64, u64)>,
     pub(crate) random_uuid: Option<[u8; 16]>,
 }
 
@@ -450,6 +467,7 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-949): Review per-mapping memory accounting normalization.
             other if is_process_file_path(other, "smaps") => ProcfsKind::Smaps,
+            other if is_process_file_path(other, "maps") => ProcfsKind::Maps,
             "/proc/key-users" => ProcfsKind::KeyUsers,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-903): Review host pressure accounting normalization.
@@ -553,6 +571,12 @@ impl ProcfsFile {
     }
 
     /// Returns true until the underlying procfs content has been captured.
+    /// True when this snapshot contains `maps`-format mapping headers whose
+    /// device and inode columns must be determinized by the caller.
+    pub(crate) fn needs_mapping_identities(&self) -> bool {
+        matches!(self.kind, ProcfsKind::Maps | ProcfsKind::Smaps)
+    }
+
     pub(crate) fn needs_snapshot(&self) -> bool {
         self.contents.is_none()
     }
@@ -592,7 +616,9 @@ impl ProcfsFile {
             virtual_pty_count,
             fdinfo_identity,
             random_uuid,
+            mapping_identities,
         } = context;
+        let mapping_identities = &mapping_identities;
         self.contents = Some(match &self.kind {
             ProcfsKind::Stat => sanitize_stat(&contents, Some((virtual_pid, virtual_ppid))),
             ProcfsKind::Status => {
@@ -646,7 +672,8 @@ impl ProcfsFile {
             ProcfsKind::ArchStatus => sanitize_arch_status(&contents),
             ProcfsKind::Swaps => sanitize_swaps(&contents),
             ProcfsKind::CpuidleCounter => sanitize_cpuidle_counter(&contents),
-            ProcfsKind::Smaps => sanitize_smaps(&contents),
+            ProcfsKind::Smaps => sanitize_smaps(&contents, mapping_identities),
+            ProcfsKind::Maps => sanitize_maps(&contents, mapping_identities),
             ProcfsKind::KeyUsers => sanitize_key_users(&contents),
             ProcfsKind::Pressure => sanitize_pressure(&contents),
             ProcfsKind::Buddyinfo => sanitize_buddyinfo(&contents),
@@ -2523,7 +2550,7 @@ fn sanitize_arch_status(contents: &[u8]) -> Vec<u8> {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-949): Review the /proc/self/smaps accounting field policy.
-fn sanitize_smaps(contents: &[u8]) -> Vec<u8> {
+fn sanitize_smaps(contents: &[u8], table: &BTreeMap<(u64, u64), (u64, u64)>) -> Vec<u8> {
     const ACCOUNTING_FIELDS: &[&str] = &[
         "Rss",
         "Pss",
@@ -2552,7 +2579,9 @@ fn sanitize_smaps(contents: &[u8]) -> Vec<u8> {
 
         if is_smaps_mapping_header(body) {
             mapping_count += 1;
-            normalized.extend_from_slice(body.as_bytes());
+            // Was passed through verbatim, which left smaps carrying the same
+            // raw device and inode as maps while appearing sanitized.
+            normalized.extend_from_slice(rewrite_mapping_header(body, table).as_bytes());
         } else {
             if mapping_count == 0 {
                 return contents.to_vec();
@@ -2598,6 +2627,95 @@ fn sanitize_smaps(contents: &[u8]) -> Vec<u8> {
     } else {
         normalized
     }
+}
+
+/// Parse the DEVICE and INODE from a `maps`/`smaps` mapping header line.
+///
+/// Layout: `addr-addr perms offset MAJ:MIN INODE [pathname]`, with the device
+/// in hex `major:minor` and the inode in decimal. Returns `None` for anything
+/// that is not a backed mapping -- anonymous mappings carry `00:00 0`, and
+/// there is nothing to determinize about a file that does not exist.
+pub(crate) fn mapping_header_identity(line: &str) -> Option<(u64, u64)> {
+    let mut fields = line.split_whitespace();
+    let _range = fields.next()?;
+    let _perms = fields.next()?;
+    let _offset = fields.next()?;
+    let (major, minor) = fields.next()?.split_once(':')?;
+    let major = u32::from_str_radix(major, 16).ok()?;
+    let minor = u32::from_str_radix(minor, 16).ok()?;
+    let inode: u64 = fields.next()?.parse().ok()?;
+    if inode == 0 {
+        return None;
+    }
+    Some((libc::makedev(major, minor), inode))
+}
+
+/// Rewrite the device and inode of one mapping header from the caller-supplied
+/// table, preserving every other byte of the line including its column padding.
+///
+/// A raw pair absent from the table is left ALONE rather than guessed at: the
+/// table is built from this same snapshot, so a miss means the pair was not
+/// determinizable (an anonymous mapping), and inventing a value here is the
+/// precise failure this design exists to avoid.
+fn rewrite_mapping_header(line: &str, table: &BTreeMap<(u64, u64), (u64, u64)>) -> String {
+    let Some(raw) = mapping_header_identity(line) else {
+        return line.to_string();
+    };
+    let Some((det_dev, det_inode)) = table.get(&raw).copied() else {
+        return line.to_string();
+    };
+    let mut out = String::with_capacity(line.len());
+    let mut remaining = line;
+    // Copy the first three fields (range, perms, offset) verbatim, whitespace
+    // included, then substitute the fourth and fifth.
+    for _ in 0..3 {
+        let field_end = match remaining.find(char::is_whitespace) {
+            Some(index) => index,
+            None => return line.to_string(),
+        };
+        let gap_end = remaining[field_end..]
+            .find(|c: char| !c.is_whitespace())
+            .map_or(remaining.len(), |offset| field_end + offset);
+        out.push_str(&remaining[..gap_end]);
+        remaining = &remaining[gap_end..];
+    }
+    let dev_end = match remaining.find(char::is_whitespace) {
+        Some(index) => index,
+        None => return line.to_string(),
+    };
+    let dev_gap = remaining[dev_end..]
+        .find(|c: char| !c.is_whitespace())
+        .map_or(remaining.len(), |offset| dev_end + offset);
+    out.push_str(&format!(
+        "{:02x}:{:02x}",
+        libc::major(det_dev),
+        libc::minor(det_dev)
+    ));
+    out.push_str(&remaining[dev_end..dev_gap]);
+    remaining = &remaining[dev_gap..];
+    let inode_end = remaining
+        .find(char::is_whitespace)
+        .unwrap_or(remaining.len());
+    out.push_str(&det_inode.to_string());
+    out.push_str(&remaining[inode_end..]);
+    out
+}
+
+/// `/proc/*/maps`: rewrite only the device and inode columns.
+fn sanitize_maps(contents: &[u8], table: &BTreeMap<(u64, u64), (u64, u64)>) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        out.push_str(&rewrite_mapping_header(body, table));
+        if has_newline {
+            out.push('\n');
+        }
+    }
+    out.into_bytes()
 }
 
 fn is_smaps_mapping_header(line: &str) -> bool {
@@ -3634,7 +3752,93 @@ mod tests {
             );
         }
         assert!(ProcfsFile::from_path(Path::new("/proc/self/task/nope/schedstat")).is_none());
-        assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
+        // `/proc/self/maps` USED TO BE ASSERTED UNRECOGNIZED HERE, which is how
+        // the defect was codified: the file carries a device and an inode for
+        // every backed mapping, the same two fields `determinize_stat`
+        // sanitizes, so leaving it unrecognized let a guest read two different
+        // identities for one file depending on the route it asked through.
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/self/maps"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Maps
+        );
+        // Sibling names must NOT collide with it: `numa_maps` and `smaps` are
+        // their own kinds and `is_process_file_path` compares the final
+        // component exactly, which this pins.
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/self/smaps"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Smaps
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/self/numa_maps"))
+                .unwrap()
+                .kind,
+            ProcfsKind::NumaMaps
+        );
+        for path in ["/proc/self/maps", "/proc/123/maps", "/proc/123/task/456/maps"] {
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(path)).unwrap().kind,
+                ProcfsKind::Maps
+            );
+        }
+    }
+
+    /// BOTH COLUMNS, not just the inode. `determinize_stat` sanitizes `st_dev`
+    /// as well, so a fix that rewrote only the inode would remove the reported
+    /// symptom and leave the device disagreeing -- the same defect, harder to
+    /// see. This asserts the device is rewritten too.
+    #[test]
+    fn maps_rewrites_both_the_device_and_the_inode() {
+        let raw = b"7f0000000000-7f0000001000 r-xp 00000000 08:02 1234567 /lib/libc.so.6\n"
+            as &[u8];
+        let table = BTreeMap::from([(
+            (libc::makedev(0x08, 0x02), 1_234_567u64),
+            (libc::makedev(0x00, 0x2a), 99u64),
+        )]);
+        let out = String::from_utf8(sanitize_maps(raw, &table)).unwrap();
+        assert!(out.contains(" 00:2a 99 "), "both columns rewritten: {out}");
+        assert!(!out.contains("08:02"), "raw device must not survive: {out}");
+        assert!(!out.contains("1234567"), "raw inode must not survive: {out}");
+        assert!(out.ends_with("/lib/libc.so.6\n"), "pathname preserved: {out}");
+    }
+
+    /// An anonymous mapping has `00:00 0` and no file to identify. It must pass
+    /// through untouched rather than be assigned an invented identity.
+    #[test]
+    fn maps_leaves_anonymous_mappings_alone() {
+        let raw = b"7ffd00000000-7ffd00021000 rw-p 00000000 00:00 0 [stack]\n" as &[u8];
+        assert_eq!(mapping_header_identity(std::str::from_utf8(raw).unwrap().trim_end()), None);
+        assert_eq!(sanitize_maps(raw, &BTreeMap::new()), raw.to_vec());
+    }
+
+    /// A pair absent from the caller's table is left ALONE. The table is built
+    /// from this same snapshot, so a miss means the pair was not determinizable
+    /// -- inventing a value here is exactly the failure this design avoids.
+    #[test]
+    fn maps_never_invents_an_identity_for_an_untabled_mapping() {
+        let raw = b"7f0000000000-7f0000001000 r-xp 00000000 08:02 1234567 /lib/libc.so.6\n"
+            as &[u8];
+        assert_eq!(sanitize_maps(raw, &BTreeMap::new()), raw.to_vec());
+    }
+
+    /// smaps repeats the maps header before each accounting block, and used to
+    /// copy it through verbatim -- carrying the same raw identity while looking
+    /// sanitized. It must go through the same rewriter.
+    #[test]
+    fn smaps_header_is_rewritten_like_maps() {
+        let raw = b"7f0000000000-7f0000001000 r-xp 00000000 08:02 1234567 /lib/libc.so.6\n\
+Size:                  4 kB\n\
+Rss:                   4 kB\n" as &[u8];
+        let table = BTreeMap::from([(
+            (libc::makedev(0x08, 0x02), 1_234_567u64),
+            (libc::makedev(0x00, 0x2a), 99u64),
+        )]);
+        let out = String::from_utf8(sanitize_smaps(raw, &table)).unwrap();
+        assert!(out.contains(" 00:2a 99 "), "smaps header rewritten: {out}");
+        assert!(!out.contains("1234567"), "raw inode must not survive smaps: {out}");
     }
 
     #[test]
@@ -4516,7 +4720,7 @@ ProtectionKey:         0\n\
 VmFlags: rd ex mr mw me ac\n";
 
         assert_eq!(
-            sanitize_smaps(contents),
+            sanitize_smaps(contents, &BTreeMap::new()),
             b"71000000-71001000 r-xp 00000000 00:00 0\n\
 Size:                  4 kB\n\
 KernelPageSize:        4 kB\n\
@@ -4534,13 +4738,13 @@ VmFlags: rd ex mr mw me ac\n"
     #[test]
     fn smaps_leaves_unknown_or_malformed_formats_untouched() {
         let invalid_counter = b"71000000-71001000 r-xp 00000000 00:00 0\nPss: many kB\n";
-        assert_eq!(sanitize_smaps(invalid_counter), invalid_counter);
+        assert_eq!(sanitize_smaps(invalid_counter, &BTreeMap::new()), invalid_counter);
 
         let unknown_field = b"71000000-71001000 r-xp 00000000 00:00 0\nMystery: 1 kB\n";
-        assert_eq!(sanitize_smaps(unknown_field), unknown_field);
+        assert_eq!(sanitize_smaps(unknown_field, &BTreeMap::new()), unknown_field);
 
         let invalid_header = b"not-a-range r-xp 00000000 00:00 0\nPss: 3 kB\n";
-        assert_eq!(sanitize_smaps(invalid_header), invalid_header);
+        assert_eq!(sanitize_smaps(invalid_header, &BTreeMap::new()), invalid_header);
     }
 
     #[test]
