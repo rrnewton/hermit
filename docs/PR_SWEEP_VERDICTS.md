@@ -541,6 +541,52 @@ this stops you lifting a correct line away from the thing that makes it correct.
 Record the coupling in the disposition. "Extract the test" is not a disposition;
 "extract the test **once the emission-site question is settled**" is.
 
+### 12. A comparison over nothing is not agreement
+
+Checks 1 to 11 ask whether a change is present. This one asks whether the
+EVIDENCE a change relies on can fail at all.
+
+**A zero-record comparison reads as agreement having observed nothing.** Two runs
+that each produced no records compare equal. Nothing in the verdict distinguishes
+"these agreed" from "there was nothing to disagree about", and the second is not
+a result.
+
+This is the shape behind most of what tonight's sweeps actually found, across
+parts of the system that share no code:
+
+- **Heap DETLOG under DBT.** The kernel labels `[heap]` only for
+  `[mm->start_brk, mm->brk)`. Under DBT the guest's heap is an unlabelled
+  anonymous mapping, so the heap comparison had no records to compare and
+  reported agreement. Nothing was wrong and nothing had been checked.
+- **`no_result` as a verdict.** `--verify-json` pre-writes
+  `verdict: "no_result"` at invocation. A run that dies before comparison leaves
+  exactly that, and it reads as an outcome rather than as "never reached
+  comparison".
+- **Backend-parity fixtures that returned 0 unconditionally.** A fixture counted
+  its checks, printed the tally, and exited 0 whatever the tally reached. Under
+  `--verify` both runs lower the number identically, the comparison matches, and
+  the cell stays green having verified nothing.
+- **A test that skipped silently.** An integration test returned early when its
+  backend artifacts were absent, reporting `ok` in 0.00s having executed nothing.
+
+**The check.** For any claim a pull request makes about evidence, ask what the
+evidence looks like when the mechanism is ABSENT rather than merely broken. If
+absent and correct produce the same output, the evidence cannot support the
+claim.
+
+Three ways to make it able to fail, in decreasing order of strength:
+
+1. **Count what was compared, and refuse zero.** A comparison that comes back
+   empty should say so rather than pass.
+2. **Assert the mechanism is reachable.** A positive control — one record you
+   know must be present — turns a silent zero into a failure.
+3. **Say what was skipped, out loud.** If a check cannot run, it must print why.
+   A skip that prints nothing is indistinguishable from a pass.
+
+⚠️ AND THIS APPLIES TO THE SWEEP'S OWN CHECKS. A symbol grep that matches nothing
+on both sides (check 6) is the same defect wearing sweep clothing: it reports no
+difference because it looked at nothing. Check 6 exists because that happened.
+
 ## Verdict vocabulary
 
 | verdict | meaning | action |
