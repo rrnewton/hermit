@@ -3798,11 +3798,13 @@ fn bucket_runs_nothing(bucket: &BucketCells) -> bool {
 /// The `(lane, category)` a manifest bucket node runs, read off the node's OWN
 /// command — the thing that actually selects the cells.
 ///
-/// `None` when the command is not a manifest bucket run, or when it carries any
-/// token this function does not model. THE WHITELIST IS THE POINT: an unmodelled
-/// `--mode`, `--backend`, `--test`, `--include-occasional`, `--results` or
-/// anything else means the cell set cannot be proven equal to the bucket
-/// accounting, so the node is not a candidate and simply runs.
+/// `None` when the command is not a manifest bucket run, when either output path
+/// is missing or duplicated, or when it carries any token this function does not
+/// model. THE WHITELIST IS THE POINT: `--results` and `--junit` are accepted only
+/// as one value-bearing pair because they change storage, never selection. An
+/// unmodelled or selection-affecting `--mode`, `--backend`, `--test`,
+/// `--include-occasional`, or anything else means the cell set cannot be proven
+/// equal to the bucket accounting, so the node is not a candidate and simply runs.
 ///
 /// `--ci-only` is REQUIRED because the accounting is queried with `--ci-only`;
 /// a node selecting a wider population must not be matched against a narrower
@@ -3812,6 +3814,8 @@ fn manifest_bucket_of(cmd: &str) -> Option<(String, String)> {
     let tokens: Vec<&str> = tail.split_whitespace().collect();
     let mut lane: Option<String> = None;
     let mut category: Option<String> = None;
+    let mut results = false;
+    let mut junit = false;
     let mut ci_only = false;
     let mut i = 0;
     while i < tokens.len() {
@@ -3830,7 +3834,24 @@ fn manifest_bucket_of(cmd: &str) -> Option<(String, String)> {
                 category = Some((*tokens.get(i + 1)?).to_string());
                 i += 2;
             }
+            "--results" => {
+                if results || tokens.get(i + 1)?.starts_with("--") {
+                    return None;
+                }
+                results = true;
+                i += 2;
+            }
+            "--junit" => {
+                if junit || tokens.get(i + 1)?.starts_with("--") {
+                    return None;
+                }
+                junit = true;
+                i += 2;
+            }
             "--ci-only" => {
+                if ci_only {
+                    return None;
+                }
                 ci_only = true;
                 i += 1;
             }
@@ -3840,7 +3861,7 @@ fn manifest_bucket_of(cmd: &str) -> Option<(String, String)> {
             _ => return None,
         }
     }
-    if !ci_only {
+    if !ci_only || !results || !junit {
         return None;
     }
     Some((lane?, category?))
@@ -5670,10 +5691,11 @@ fn possible_missing_artifact_nodes<'a>(
 /// Two-sided bracket for withholding a manifest bucket NODE whose entire cell
 /// population is withheld.
 ///
-/// Inert: planted counts and planted command strings; it reads no manifest,
-/// runs no probe, and does not depend on which machine runs it. The
-/// load-bearing case is UN-WITHHOLDING: give the same bucket one runnable cell
-/// back and the node must run again, with no code change anywhere. That is the
+/// Local and side-effect-free: it combines planted capability verdicts with the
+/// checked-in manifests and production plan construction, but runs no probe or
+/// scheduler and does not depend on which machine runs it. The load-bearing case
+/// is UN-WITHHOLDING: give the same bucket one runnable cell back and the node
+/// must run again, with no code change anywhere. That is the
 /// difference between a computed decision and a hard-coded list of nodes that
 /// would silently swallow a cell added later.
 fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
@@ -5736,24 +5758,40 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
     // THE NODE-TO-BUCKET BINDING, from the node's own command. A command with
     // any selection token this function does not model must NOT be matched
     // against the bucket accounting.
-    let shipped = "./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run \
-                   --lane privileged --category backend-parity-c --ci-only --allow-empty --prebuilt";
-    if manifest_bucket_of(shipped)
+    let mut transformed =
+        validate_plan::lane_nodes(root, "privileged", "privileged-", "gate.manifest")?;
+    let withheld_tag = "privileged-e2e.manifest_backend_parity_c";
+    let shipped = transformed
+        .iter()
+        .find(|step| step.tag() == withheld_tag)
+        .ok_or("node vacuity: transformed lane lost privileged backend-parity-c bucket")?
+        .cmd
+        .clone();
+    if manifest_bucket_of(&shipped)
         != Some(("privileged".to_string(), "backend-parity-c".to_string()))
     {
         return Err(format!(
             "node vacuity: the shipped bucket command must bind to its bucket; got {:?}",
-            manifest_bucket_of(shipped)
+            manifest_bucket_of(&shipped)
         ));
     }
     let unmodelled = [
         // A narrower selection than the accounting was taken with.
-        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --mode verify",
-        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --backend ptrace",
-        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --test backend-parity-c/cpuid-probe",
+        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --mode verify --results r --junit j",
+        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --backend ptrace --results r --junit j",
+        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --test backend-parity-c/cpuid-probe --results r --junit j",
         // A WIDER selection than the accounting was taken with.
-        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --include-occasional",
-        "target/debug/test-harness run --lane privileged --category backend-parity-c",
+        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --include-occasional --results r --junit j",
+        "target/debug/test-harness run --lane privileged --category backend-parity-c --results r --junit j",
+        // Output paths are required exactly once, and each must have a value.
+        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --junit j",
+        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --results r",
+        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --results r1 --results r2 --junit j",
+        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --results r --junit j1 --junit j2",
+        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --results --junit j",
+        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --results r --junit",
+        // Unknown tokens remain fail-closed even with the required output pair.
+        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --future-selector value --results r --junit j",
         // Not a bucket run at all.
         "target/debug/test-harness validate",
         "target/debug/test-harness build --lane privileged --ci-only --allow-empty",
@@ -5794,6 +5832,68 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
         return Err(
             "node vacuity: no bucket may be withheld when no capability is absent".into(),
         );
+    }
+
+    // INTEGRATION: exercise the production transformed command, checked-in
+    // bucket accounting, withholding mutation, and scorecard edge handling
+    // together. This catches drift between the command producer and parser.
+    attach_compatibility_scorecard(&mut transformed, &["privileged"])?;
+    let scorecard_tag = "scorecard.compatibility";
+    let before: BTreeMap<String, Vec<String>> = transformed
+        .iter()
+        .map(|step| (step.tag(), step.deps.clone()))
+        .collect();
+    if !before
+        .get(scorecard_tag)
+        .is_some_and(|deps| deps.iter().any(|dep| dep == withheld_tag))
+    {
+        return Err(
+            "node vacuity: actual compatibility scorecard did not depend on the transformed \
+             host-inapplicable bucket"
+                .into(),
+        );
+    }
+    let mut expected = before.clone();
+    if expected.remove(withheld_tag).is_none() {
+        return Err("node vacuity: transformed plan lost the expected bucket".into());
+    }
+    let scorecard_deps = expected
+        .get_mut(scorecard_tag)
+        .ok_or("node vacuity: transformed plan lost the compatibility scorecard")?;
+    let scorecard_deps_before = scorecard_deps.len();
+    scorecard_deps.retain(|dep| dep != withheld_tag);
+    if scorecard_deps.len() + 1 != scorecard_deps_before {
+        return Err("node vacuity: expected exactly one scorecard edge to the bucket".into());
+    }
+    let mut actual_plan = Plan {
+        cfg: DagConfig {
+            steps: transformed,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    withhold_vacuous_manifest_nodes(root, &mut actual_plan, &absent)?;
+    let after: BTreeMap<String, Vec<String>> = actual_plan
+        .cfg
+        .steps
+        .iter()
+        .map(|step| (step.tag(), step.deps.clone()))
+        .collect();
+    if after != expected {
+        return Err(format!(
+            "node vacuity: actual withholding changed more than the bucket and its scorecard \
+             edge: expected={expected:?} actual={after:?}"
+        ));
+    }
+    if actual_plan.host_inapplicable.len() != 1
+        || actual_plan.host_inapplicable[0].tag != withheld_tag
+        || actual_plan.host_inapplicable[0].capability
+            != validate_plan::HostCapability::CpuidFaulting
+    {
+        return Err(format!(
+            "node vacuity: actual transformed plan did not withhold exactly {withheld_tag}: {:?}",
+            actual_plan.host_inapplicable
+        ));
     }
 
     // THE RETAINED DEPENDENT. A result consumer keeps running with the edge
@@ -5851,37 +5951,11 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
         return Err("node vacuity: with nothing withheld, no dependency edge may change".into());
     }
 
-    // NON-VACUITY — the shipped privileged DAG really does contain a manifest
-    // bucket node this mechanism can bind, so the brackets above are about
-    // something that exists.
-    let path = root.join("ci").join("dag").join("privileged.json");
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("node vacuity: cannot read {}: {e}", path.display()))?;
-    let raw: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("node vacuity: invalid DAG: {e}"))?;
-    let bound: Vec<String> = raw
-        .get("steps")
-        .and_then(serde_json::Value::as_array)
-        .map(|steps| {
-            steps
-                .iter()
-                .filter_map(|s| s.get("cmd").and_then(serde_json::Value::as_str))
-                .filter_map(manifest_bucket_of)
-                .map(|(lane, category)| format!("{lane}/{category}"))
-                .collect()
-        })
-        .unwrap_or_default();
-    if !bound.contains(&"privileged/backend-parity-c".to_string()) {
-        return Err(format!(
-            "node vacuity: ci/dag/privileged.json must contain a bindable manifest bucket node \
-             for privileged/backend-parity-c; bound {bound:?}"
-        ));
-    }
     println!(
         "  node vacuity: 2 withheld / 7 not-withheld (3 un-withholding, 3 nothing-withheld, \
-         1 empty-bucket), 1 command bound / 8 refused, accounting parser 1 good / 3 malformed, \
-         dependents 1 edge-dropped / 1 refusal / 1 inert, shipped DAG binds {}",
-        bound.join(", ")
+         1 empty-bucket), 1 transformed command bound / 15 refused, accounting parser 1 good / \
+         3 malformed, dependents 1 edge-dropped / 1 refusal / 1 inert, actual plan 1 bucket \
+         withheld / 1 scorecard edge dropped / 0 other changes"
     );
     Ok(())
 }
