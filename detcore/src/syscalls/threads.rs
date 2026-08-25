@@ -1588,6 +1588,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         let blocked_mask_addr = stack.push(blocked_mask);
         let old_mask_addr = stack.reserve::<libc::sigset_t>();
         let _mask_guard = stack.commit()?;
+        // `reserve` leaves the slot uninitialized and the kernel fills only
+        // `sigsetsize` (8) of a 128-byte `libc::sigset_t`, so reading the whole
+        // value below would take ~120 bytes of whatever was on the guest stack.
+        // Zero it first: the read then depends only on what the kernel wrote.
+        let zeroed_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        guest.memory().write_value(old_mask_addr, &zeroed_mask)?;
         let block_signals = syscalls::RtSigprocmask::new()
             .with_how(libc::SIG_SETMASK)
             .with_set(Some(blocked_mask_addr))

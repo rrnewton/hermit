@@ -2629,21 +2629,32 @@ impl Scheduler {
         if legacy_polling || waiting_on_child {
             return Some(WaitidSignalRequest::Parked);
         }
-        // Signals already materialized on the request. `InboundSignal` counts
-        // alongside `WaitidSignals`: both are consumed together by
-        // `inbound_signals`, so a later notification must merge with either.
-        // Recognizing only the latter made the observed set depend on which
-        // path delivered first.
-        let materialized: Vec<SigWrapper> = resources
+        // Signals already materialized on this request by an earlier drain.
+        //
+        // Deliberately matches `WaitidSignals` ONLY. An earlier revision also
+        // matched `InboundSignal`, intending to make the observed set
+        // independent of which path delivered first. That was wrong and it
+        // crashed: the drain then produced a request holding BOTH resources,
+        // and `step4_resource_block` / `blocking_request_is_ready` assert a
+        // request carries exactly one resource, so the scheduler daemon
+        // panicked and the container hung. It reproduced on a guest with no
+        // `waitid` in it at all -- two sibling threads `pthread_kill`ing a
+        // third is enough, because `{InboundSignal}` with `poll_attempt: 0` is
+        // exactly what `signal_guest` installs.
+        //
+        // Merging the two would require either teaching both assertions to
+        // accept the pair, or folding the signal into `WaitidSignals` and
+        // dropping the `InboundSignal` key -- which discards the SIGCHLD
+        // deferral its grant path performs. Neither belongs in this change.
+        resources
             .resources
             .keys()
-            .flat_map(|resource| match resource {
-                ResourceID::WaitidSignals(signals) => signals.clone(),
-                ResourceID::InboundSignal(signal) => vec![*signal],
-                _ => Vec::new(),
+            .find_map(|resource| match resource {
+                ResourceID::WaitidSignals(signals) => {
+                    Some(WaitidSignalRequest::Pending(signals.clone()))
+                }
+                _ => None,
             })
-            .collect();
-        (!materialized.is_empty()).then_some(WaitidSignalRequest::Pending(materialized))
     }
 
     /// Record an unambiguous cross-task signal that was physically queued while
@@ -4255,21 +4266,17 @@ impl Scheduler {
                     signals.extend(existing.into_iter().map(|signal| signal.0));
                     signals.sort_by_key(|signal| *signal as libc::c_int);
                     signals.dedup();
-                    let signals: Vec<SigWrapper> = signals.into_iter().map(SigWrapper).collect();
-                    // Rewrite in place. Building a fresh `Resources` here would
-                    // discard everything else the request carries -- notably an
-                    // `InboundSignal`, whose grant path has SIGCHLD deferral
-                    // logic that a bare `WaitidSignals` does not reproduce.
+                    let signals = signals.into_iter().map(SigWrapper).collect();
+                    // One resource, always. `step4_resource_block` and
+                    // `blocking_request_is_ready` both assert a request carries
+                    // exactly one, so this must replace the request rather than
+                    // add to it. Only a request whose sole resource is already
+                    // `WaitidSignals` reaches here, so nothing is discarded.
+                    let mut resources = Resources::new(dettid);
+                    resources.insert(ResourceID::WaitidSignals(signals), Permission::W);
                     let Some(next_turn) = self.next_turns.get_mut(&dettid) else {
                         continue;
                     };
-                    let Some(Ok(mut resources)) = next_turn.req.try_read() else {
-                        continue;
-                    };
-                    resources
-                        .resources
-                        .retain(|resource, _| !matches!(resource, ResourceID::WaitidSignals(_)));
-                    resources.insert(ResourceID::WaitidSignals(signals), Permission::W);
                     next_turn.req = Ivar::full(Ok(resources));
                 }
                 None => {}
@@ -5941,6 +5948,46 @@ mod test {
     /// `cfg!(debug_assertions)`, so debug builds panic with "Invariant
     /// violation! Tried to add ... already present" while RELEASE builds
     /// silently enqueue the thread twice and select it twice.
+    /// `step4_resource_block` and `blocking_request_is_ready` both assert that a
+    /// request carries exactly one resource. The drain must never violate that.
+    ///
+    /// An earlier revision merged a pending signal into a request that already
+    /// held an `InboundSignal`, producing a two-resource request. The scheduler
+    /// daemon then panicked and the container hung — on a guest containing no
+    /// `waitid` at all, because `{InboundSignal}` is exactly what `signal_guest`
+    /// installs for an ordinary cross-thread signal.
+    #[test]
+    fn drain_never_builds_a_multi_resource_request() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let target = DetTid::from_raw(100);
+        register_known_thread(&mut scheduler, target);
+        // The shape that crashed: an ordinary delivered signal, nothing to do
+        // with waitid.
+        let mut inbound = Resources::new(target);
+        inbound.insert(
+            ResourceID::InboundSignal(SigWrapper(Signal::SIGUSR1)),
+            Permission::W,
+        );
+        scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(inbound));
+        scheduler.runqueue_push_back(target);
+
+        scheduler.notify_signal_pending(target, Signal::SIGUSR2);
+        scheduler.drain_pending_waitid_signals();
+
+        let resources = scheduler
+            .next_turns
+            .get(&target)
+            .and_then(|next_turn| next_turn.req.try_read())
+            .and_then(Result::ok)
+            .expect("the target should still hold a request");
+        assert!(
+            resources.resources.len() <= 1,
+            "the drain produced a {}-resource request, which step4 asserts against: {:?}",
+            resources.resources.len(),
+            resources.resources,
+        );
+    }
+
     #[test]
     fn pending_signal_does_not_double_queue_a_runnable_child_waiter() {
         let mut scheduler = Scheduler::new(&Config::default());
