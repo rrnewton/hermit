@@ -5942,6 +5942,42 @@ mod test {
             scheduler.ready_child_wait(
                 parent,
                 ChildWaitSpec {
+                    selector: ChildWaitSelector::ProcessGroup(DetPid::from_raw(78)),
+                    owner: Some(owner_a),
+                    exit_class: ChildWaitExitClass::Sigchld,
+                },
+            ),
+            None,
+            "a different process group must not match"
+        );
+        assert_eq!(
+            scheduler.ready_child_wait(
+                parent,
+                ChildWaitSpec {
+                    selector: ChildWaitSelector::Exact(normal),
+                    owner: Some(owner_b),
+                    exit_class: ChildWaitExitClass::Sigchld,
+                },
+            ),
+            None,
+            "__WNOTHREAD must exclude a child created by another task"
+        );
+        assert_eq!(
+            scheduler.ready_child_wait(
+                parent,
+                ChildWaitSpec {
+                    selector: ChildWaitSelector::Exact(clone_child),
+                    owner: Some(owner_b),
+                    exit_class: ChildWaitExitClass::Sigchld,
+                },
+            ),
+            None,
+            "a clone child must not enter the ordinary SIGCHLD population"
+        );
+        assert_eq!(
+            scheduler.ready_child_wait(
+                parent,
+                ChildWaitSpec {
                     selector: ChildWaitSelector::ProcessGroup(group),
                     owner: Some(owner_b),
                     exit_class: ChildWaitExitClass::Clone,
