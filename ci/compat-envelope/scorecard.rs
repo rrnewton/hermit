@@ -1598,7 +1598,18 @@ fn check_tracked(root: &Path) -> Result<Derived, String> {
     let derived = derive(root)?;
     let expected_scorecard = render_scorecard(&derived);
     compare_file(&root.join(SCORECARD), &expected_scorecard)?;
-    let cells = tracked_from(&derived, load_existing(root)?, false, false)?;
+    // Derive EXACTLY what `update` writes, or this reports stale against a file
+    // that is already correct.
+    //
+    // `update_tracked` calls `refresh_measurement` after `tracked_from` and
+    // before encoding. Omitting it here made the two paths compute different
+    // bytes from the same inputs, so the gate failed on a tree where
+    // `update` produced an empty diff -- the checker was comparing against a
+    // rendering the updater never emits. The removal flags stay hard-coded
+    // `false`: a CHECK must not authorise a removal, and they are not what
+    // diverged.
+    let mut cells = tracked_from(&derived, load_existing(root)?, false, false)?;
+    refresh_measurement(&mut cells);
     compare_file(&root.join(CELLS), &encoded_cells(&cells)?)?;
     Ok(derived)
 }
