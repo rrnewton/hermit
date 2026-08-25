@@ -488,11 +488,7 @@
                 }
               ]
             }
-          ],
-          "first_divergent_scheduler_turn": null,
-          "first_divergent_virtual_nanoseconds": null,
-          "first_divergent_record": null,
-          "first_divergent_syscall": null
+          ]
         }
       ],
       "measurement": "measured-and-passed"
@@ -49611,21 +49607,26 @@
             }
           ],
           "first_divergent_scheduler_turn": {
-            "earliest": 68,
-            "latest": 69,
-            "samples": 2
+            "legacy_bounds": {
+              "earliest": 68,
+              "latest": 69,
+              "samples": 2
+            }
           },
           "first_divergent_virtual_nanoseconds": {
-            "earliest": 1767225600051317250,
-            "latest": 1767225600052354000,
-            "samples": 2
+            "legacy_bounds": {
+              "earliest": 1767225600051317250,
+              "latest": 1767225600052354000,
+              "samples": 2
+            }
           },
           "first_divergent_record": {
-            "earliest": 93,
-            "latest": 94,
-            "samples": 2
-          },
-          "first_divergent_syscall": null
+            "legacy_bounds": {
+              "earliest": 93,
+              "latest": 94,
+              "samples": 2
+            }
+          }
         }
       ],
       "measurement": "diverged"
