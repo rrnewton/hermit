@@ -55,7 +55,7 @@ use super::container::with_container;
 use super::global_opts::GlobalOpts;
 use super::record_envelope::RecordEnvelope;
 use super::tracing::BoundedWriter;
-use super::tracing::init_file_tracing;
+use super::tracing::init_sync_file_tracing;
 use super::tracing::log_max_bytes;
 use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
@@ -3686,7 +3686,12 @@ impl RunOpts {
         // apply to the path that produces them: a livelocked run here could
         // still fill the disk.
         let limit = log_max_bytes().map_err(Error::msg)?;
-        let _guard = init_file_tracing(Some(level), BoundedWriter::new(log_file, limit));
+        // SYNCHRONOUS, so a fatal diagnostic in the tail survives the run that
+        // emitted it. The non-blocking appender loses whatever has not drained
+        // when a fail-closed guest dies, which is precisely the line naming the
+        // cause -- measured 0 of 18 runs versus 4 of 4. See
+        // `init_sync_file_tracing`.
+        let _guard = init_sync_file_tracing(Some(level), BoundedWriter::new(log_file, limit));
 
         let command = self.guest_command()?;
 
