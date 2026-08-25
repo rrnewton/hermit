@@ -57,6 +57,12 @@ Commands:
       they never mix with pressure-test bounds. Explicit and opt-in: ordinary
       validation does not run this and changes no tracked file. Never changes
       which cells are green.
+  project-observations --series-root DIR --refreshed-at STAMP
+      Re-derive the divergence-position projection from the series store, which
+      is the authority for it. REFUSES to drop measured evidence when the source
+      supplied no rows: reading nothing is what an unpopulated series looks
+      like, not a finding that a cell has no evidence. An unreachable root is
+      refused outright rather than read as empty.
   verify-results --results DIR [--lanes portable,privileged]
       Check the tracked files, then require a fresh PASS row at HEAD for every
       selected regression cell in the named lanes. The default is both lanes.
@@ -102,7 +108,44 @@ struct CellId {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct TrackedCells {
     schema: u64,
+    /// How the `observations` below relate to the series store. See
+    /// [`ObservationProjection`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    projection: Option<ObservationProjection>,
     cells: Vec<TrackedCell>,
+}
+
+/// Declares that `observations` are a DERIVED PROJECTION, not the source of
+/// truth, and records how stale that projection is.
+///
+/// ⚠️ WHY THE DEMOTION IS RECORDED IN THE FILE RATHER THAN JUST BELIEVED. Once
+/// the series store is the authority, `cells.json` is a cache -- and a cache
+/// that does not say when it was refreshed is indistinguishable from current
+/// data. `last_tested` remains the per-cell staleness marker; this is the
+/// per-file one, and it names the source so a reader can go and check.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ObservationProjection {
+    /// Where the authoritative rows live. Recorded so a stale projection can be
+    /// re-derived without anyone having to remember.
+    source: String,
+    /// When this projection was last refreshed from that source.
+    refreshed_at: String,
+    /// How many series rows the refresh actually read.
+    ///
+    /// ⚠️ ZERO IS A REAL AND DIFFERENT ANSWER FROM ABSENT. A refresh that read
+    /// zero rows has not established that a cell has no evidence -- it has
+    /// established that the source had nothing to say, which is what happens
+    /// when the producer has not run yet. Recording the count is what lets a
+    /// reader tell "projected from 800 rows" from "projected from nothing".
+    rows_read: u64,
+    /// True when observations below predate the series store and are therefore
+    /// still authoritative rather than derived.
+    ///
+    /// This is the honest state today: step 4 has not emitted a row yet, so the
+    /// series is empty and every observation here is pre-series evidence.
+    #[serde(default)]
+    pre_series_corpus: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -485,6 +528,84 @@ struct ObservedRange {
     /// `samples == 1` is the honest way to say "one observation, so these
     /// bounds are a point, not a range".
     samples: u64,
+}
+
+/// Refuse a projection refresh that would erase evidence it did not replace.
+///
+/// ⚠️ THIS IS THE WHOLE POINT OF LANDING THE GUARD BEFORE THE DATA. Once
+/// `cells.json` is a projection, the natural implementation is "read the series,
+/// write what it says". With an empty or unreachable series that writes NOTHING,
+/// and the three real divergence coordinates currently on main -- the only
+/// located evidence in the file -- disappear. The resulting row is
+/// indistinguishable from a cell nobody ever measured, which is precisely the
+/// failure `deny_unknown_fields` was load-bearing against one step earlier: a
+/// silent default that reads as absence of evidence.
+///
+/// So a refresh may only DROP an observation when the source actually supplied
+/// rows to replace it. Zero rows read is not a statement that a cell has no
+/// evidence; it is a statement that the source had nothing to say.
+fn enforce_projection_preserves_evidence(
+    before: &TrackedCells,
+    after: &TrackedCells,
+    rows_read: u64,
+) -> Result<(), String> {
+    if rows_read > 0 {
+        return Ok(());
+    }
+    let index = |cells: &TrackedCells| -> BTreeMap<CellId, TrackedCell> {
+        cells
+            .cells
+            .iter()
+            .map(|cell| (cell.id.clone(), cell.clone()))
+            .collect()
+    };
+    let (old, new) = (index(before), index(after));
+    for (id, old_cell) in &old {
+        let had = located_evidence(old_cell);
+        if had == 0 {
+            continue;
+        }
+        let has = new.get(id).map_or(0, located_evidence);
+        if has < had {
+            return Err(format!(
+                "projection refused: it read 0 series rows yet would drop measured \
+                 evidence from {}/{}/{} ({had} located coordinate(s) down to {has}). \
+                 Reading nothing is not the same as establishing that a cell has no \
+                 evidence -- it is what an unpopulated or not-yet-written series \
+                 looks like. Populate the series (plan step 4) or leave the \
+                 pre-series corpus alone.",
+                id.test, id.mode, id.backend
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// How many located divergence positions a cell holds, across every
+/// observation and all four coordinates.
+///
+/// ⚠️ COUNTED IN POSITIONS, NOT OBSERVATIONS. The first version of the guard
+/// above compared `observations.len()`, and an end-to-end run against the real
+/// `cells.json` walked straight through it: the naive projection does not
+/// delete observations, it BLANKS THE COORDINATES INSIDE THEM. The vector
+/// length never moves, so a count-based guard sees a clean refresh while all
+/// three located coordinates on main disappear. The quantity that can vanish is
+/// the quantity that has to be counted.
+fn located_evidence(cell: &TrackedCell) -> usize {
+    cell.observations
+        .iter()
+        .map(|observation| {
+            [
+                &observation.first_divergent_scheduler_turn,
+                &observation.first_divergent_virtual_nanoseconds,
+                &observation.first_divergent_record,
+                &observation.first_divergent_syscall,
+            ]
+            .into_iter()
+            .filter(|positions| !positions.is_empty())
+            .count()
+        })
+        .sum()
 }
 
 /// Every located position for one coordinate, ONE ENTRY PER RUN THAT LOCATED IT.
@@ -934,6 +1055,36 @@ fn run() -> Result<(), String> {
                 &summary.ok_or("update-observations requires --summary FILE")?,
             )?;
         }
+        "project-observations" => {
+            let mut series_root = None;
+            let mut refreshed_at = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--series-root" => {
+                        series_root = Some(PathBuf::from(
+                            args.next().ok_or("--series-root requires a directory")?,
+                        ));
+                    }
+                    "--refreshed-at" => {
+                        refreshed_at =
+                            Some(args.next().ok_or("--refreshed-at requires a timestamp")?);
+                    }
+                    _ => {
+                        return Err(format!(
+                            "unknown project-observations option `{arg}`\n\n{USAGE}"
+                        ));
+                    }
+                }
+            }
+            project_observations(
+                &root,
+                &series_root.ok_or("project-observations requires --series-root DIR")?,
+                // Supplied rather than read from the clock, so the same inputs
+                // produce the same file. A refresh timestamp the tool invents is
+                // a diff on every run that says nothing changed.
+                &refreshed_at.ok_or("project-observations requires --refreshed-at STAMP")?,
+            )?;
+        }
         "verify-results" => {
             let mut result_root = None;
             let mut lanes = BTreeSet::from(["portable".to_string(), "privileged".to_string()]);
@@ -1367,6 +1518,7 @@ fn tracked_from(
     allow_cell_removal: bool,
 ) -> Result<TrackedCells, String> {
     let mut previous = BTreeMap::new();
+    let previous_projection = existing.as_ref().and_then(|file| file.projection.clone());
     if let Some(existing) = existing {
         if !(1..=SCHEMA).contains(&existing.schema) {
             return Err(format!(
@@ -1412,6 +1564,7 @@ fn tracked_from(
         ));
     }
 
+
     let cells = derived
         .population
         .iter()
@@ -1445,6 +1598,14 @@ fn tracked_from(
         .collect();
     Ok(TrackedCells {
         schema: SCHEMA,
+        // ⚠️ CARRIED FORWARD, NOT RESET. `update` is the ratchet authority; the
+        // projection block belongs to the observation writers. Rebuilding it as
+        // `None` here silently deleted it on every ordinary derivation, so the
+        // file stopped saying when it was last projected and a stale projection
+        // became indistinguishable from a fresh one -- the same failure the
+        // block exists to prevent. Found by running `update` after
+        // `project-observations`, not by reading this function.
+        projection: previous_projection,
         cells,
     })
 }
@@ -1484,6 +1645,20 @@ fn enforce_writer_boundary(
             .collect()
     };
     let (old, new) = (index(before), index(after));
+
+    // ⚠️ THE PROJECTION BLOCK IS OBSERVATION-AUTHORITY STATE, so `update` may
+    // not silently drop it. It did exactly that before this check existed:
+    // `tracked_from` rebuilt the file with `projection: None`, so every
+    // ordinary derivation deleted the record of when the observations were last
+    // projected, and a stale projection became indistinguishable from a fresh
+    // one. Found by running `update` after `project-observations` and looking
+    // at the file, which is the only way it shows up.
+    if writer == Writer::Update && before.projection.is_some() && after.projection.is_none() {
+        return Err(
+            "writer boundary violated: `update` dropped the observation projection block.              That block records when the observations were last derived from the series;              deleting it makes a stale projection read as a current one"
+                .into(),
+        );
+    }
 
     // ⚠️ THE DERIVED FIELD MUST NEVER DISAGREE WITH THE EVIDENCE IT SUMMARISES,
     // and this is checked for EVERY writer rather than split between them.
@@ -2427,6 +2602,168 @@ fn update_observations(root: &Path, summary_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Re-derive the observation projection from the series store.
+///
+/// ⚠️ WHAT THIS DOES AND DOES NOT CLAIM TODAY. The series store is the
+/// authority for divergence positions; `cells.json` holds a projection of it so
+/// readers and the ratchet do not need the parent repository. Plan step 4 --
+/// the producer that writes series rows -- HAS NOT LANDED, so on current main
+/// every invocation of this reads zero rows and every observation in the file
+/// is still pre-series evidence. That is why the refusal below is the part that
+/// matters right now: it is the thing standing between an empty source and the
+/// only located divergence coordinates the repository has.
+fn project_observations(
+    root: &Path,
+    series_root: &Path,
+    refreshed_at: &str,
+) -> Result<(), String> {
+    check_tracked(root)?;
+    let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
+    let before = tracked.clone();
+
+    let (rows, skipped) = read_series_rows(series_root)?;
+    let mut by_cell: BTreeMap<String, Vec<&SeriesRow>> = BTreeMap::new();
+    for row in &rows {
+        by_cell.entry(row.cell.clone()).or_default().push(row);
+    }
+
+    let mut projected = 0usize;
+    for cell in &mut tracked.cells {
+        let Some(cell_rows) = by_cell.get(&display_id(&cell.id)) else {
+            continue;
+        };
+        for observation in &mut cell.observations {
+            // ⚠️ ALL FOUR COORDINATES OR NONE. Projecting a subset leaves one
+            // observation holding series-derived bounds beside pre-series ones
+            // with nothing in the row saying which is which -- two authorities
+            // in one record, which is the arrangement this whole step exists to
+            // end. Caught by inventorying the checked-in file: it carries
+            // `first_divergent_record` bounds that a two-coordinate projection
+            // would have silently left behind as stale.
+            observation.first_divergent_scheduler_turn = ObservedPositions::default();
+            observation.first_divergent_virtual_nanoseconds = ObservedPositions::default();
+            observation.first_divergent_record = ObservedPositions::default();
+            observation.first_divergent_syscall = ObservedPositions::default();
+            for row in cell_rows {
+                observation
+                    .first_divergent_scheduler_turn
+                    .record(row.first_divergent_scheduler_turn);
+                observation
+                    .first_divergent_virtual_nanoseconds
+                    .record(row.first_divergent_virtual_nanoseconds);
+                observation
+                    .first_divergent_record
+                    .record(row.first_divergent_record);
+                observation
+                    .first_divergent_syscall
+                    .record(row.first_divergent_syscall);
+            }
+        }
+        projected += 1;
+    }
+
+    let rows_read = rows.len() as u64;
+    tracked.projection = Some(ObservationProjection {
+        source: series_root.display().to_string(),
+        refreshed_at: refreshed_at.to_string(),
+        rows_read,
+        pre_series_corpus: rows_read == 0,
+    });
+    refresh_measurement(&mut tracked);
+
+    // The guard runs BEFORE the write, not after. A projection that has already
+    // hit the disk is a projection someone has to notice and revert.
+    enforce_projection_preserves_evidence(&before, &tracked, rows_read)?;
+    enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
+    fs::write(root.join(CELLS), encoded_cells(&tracked)?)
+        .map_err(|e| format!("cannot write {CELLS}: {e}"))?;
+
+    println!(
+        "compatibility scorecard: projected {projected} cell(s) from {rows_read} series row(s) \
+         under {}",
+        series_root.display()
+    );
+    if rows_read == 0 {
+        println!(
+            "  note: the series is EMPTY, so every observation here remains PRE-SERIES \
+             evidence rather than a projection. This is the expected state until plan step 4 \
+             lands a producer."
+        );
+    }
+    for line in &skipped {
+        println!("  skipped {line}");
+    }
+    Ok(())
+}
+
+/// One divergence-position row as the series store carries it.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SeriesRow {
+    cell: String,
+    #[serde(default)]
+    first_divergent_scheduler_turn: Option<u64>,
+    #[serde(default)]
+    first_divergent_virtual_nanoseconds: Option<u64>,
+    #[serde(default)]
+    first_divergent_record: Option<u64>,
+    #[serde(default)]
+    first_divergent_syscall: Option<u64>,
+}
+
+/// Read every series shard under `series_root`.
+///
+/// A line that does not parse is NAMED AND SKIPPED rather than aborting the
+/// refresh or vanishing: one malformed row should not deny the projection every
+/// other row supports, and a row that disappears without a word is how a thin
+/// projection gets mistaken for a complete one.
+fn read_series_rows(series_root: &Path) -> Result<(Vec<SeriesRow>, Vec<String>), String> {
+    if !series_root.exists() {
+        return Err(format!(
+            "series root {} does not exist. An unreachable source is REFUSED rather than \
+             treated as an empty one -- those are different facts, and only one of them is \
+             a statement about the cells.",
+            series_root.display()
+        ));
+    }
+    let mut shards: Vec<PathBuf> = Vec::new();
+    collect_shards(series_root, &mut shards)?;
+    shards.sort();
+    let mut rows = Vec::new();
+    let mut skipped = Vec::new();
+    for shard in shards {
+        let text = fs::read_to_string(&shard)
+            .map_err(|e| format!("cannot read series shard {}: {e}", shard.display()))?;
+        for (index, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<SeriesRow>(line) {
+                Ok(row) => rows.push(row),
+                Err(why) => {
+                    skipped.push(format!("{}:{}: {why}", shard.display(), index + 1));
+                }
+            }
+        }
+    }
+    Ok((rows, skipped))
+}
+
+fn collect_shards(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries =
+        fs::read_dir(dir).map_err(|e| format!("cannot list {}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("cannot list {}: {e}", dir.display()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_shards(&path, out)?;
+        } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
 fn verify_results(root: &Path, result_root: &Path, lanes: &BTreeSet<String>) -> Result<(), String> {
     let derived = derive(root)?;
     let head = git_head(root)?;
@@ -2983,6 +3320,7 @@ fn self_test() -> Result<(), String> {
     }
     let old_green = TrackedCells {
         schema: SCHEMA,
+        projection: None,
         cells: vec![TrackedCell {
             id: id.clone(),
             enabled: true,
@@ -3005,6 +3343,7 @@ fn self_test() -> Result<(), String> {
     }
     let intentional = TrackedCells {
         schema: SCHEMA,
+        projection: None,
         cells: vec![TrackedCell {
             id: id.clone(),
             enabled: true,
@@ -3020,6 +3359,7 @@ fn self_test() -> Result<(), String> {
 
     let mut observed = TrackedCells {
         schema: SCHEMA,
+        projection: None,
         cells: vec![TrackedCell {
             id: id.clone(),
             enabled: false,
@@ -3563,14 +3903,17 @@ fn self_test() -> Result<(), String> {
     };
     let with_evidence = TrackedCells {
         schema: SCHEMA,
+        projection: None,
         cells: vec![boundary_cell(vec![sample.clone()], CellStatus::Red)],
     };
     let evidence_dropped = TrackedCells {
         schema: SCHEMA,
+        projection: None,
         cells: vec![boundary_cell(Vec::new(), CellStatus::Red)],
     };
     let ratchet_moved = TrackedCells {
         schema: SCHEMA,
+        projection: None,
         cells: vec![boundary_cell(vec![sample.clone()], CellStatus::Green)],
     };
     if enforce_writer_boundary(&with_evidence, &evidence_dropped, Writer::Update).is_ok() {
@@ -3756,6 +4099,7 @@ fn self_test() -> Result<(), String> {
     lying.measurement = MeasurementState::MeasuredAndPassed;
     let lying_cells = TrackedCells {
         schema: SCHEMA,
+        projection: None,
         cells: vec![lying],
     };
     for writer in [Writer::Update, Writer::Observations] {
@@ -3772,6 +4116,7 @@ fn self_test() -> Result<(), String> {
     // than refusing everything.
     let honest = TrackedCells {
         schema: SCHEMA,
+        projection: None,
         cells: vec![boundary_cell(
             vec![diverged_observation(true)],
             CellStatus::Red,
@@ -3790,8 +4135,9 @@ fn self_test() -> Result<(), String> {
     }
     let population_grown = TrackedCells {
         schema: SCHEMA,
+        projection: None,
         cells: vec![
-            boundary_cell(vec![sample], CellStatus::Red),
+            boundary_cell(vec![sample.clone()], CellStatus::Red),
             TrackedCell {
                 id: CellId {
                     lane: "portable".into(),
@@ -3813,8 +4159,164 @@ fn self_test() -> Result<(), String> {
         return Err("writer boundary allowed an observation writer to add a cell".into());
     }
 
+    // --- projection bracket -------------------------------------------------
+    // Observations are a DERIVED PROJECTION of the series store as of plan step
+    // 8. The failure that demotion invites is specific: read the series, write
+    // what it says, and when the series is empty write nothing -- silently
+    // erasing the only located divergence coordinates in the file and leaving
+    // rows indistinguishable from cells nobody ever measured.
+    //
+    // ⚠️ ASSERTED BY BEHAVIOUR, NOT BY READING THE TYPE. The guard is called
+    // with the same before/after pair the real path builds, so a future edit
+    // that reorders the write ahead of the check fails here.
+    // ⚠️ THE FIXTURE MUST CARRY A LOCATED POSITION, not merely an observation.
+    // The guard counts coordinates, so a sample with empty `ObservedPositions`
+    // gives it nothing to protect and every case below passes vacuously.
+    let mut located = sample.clone();
+    located.first_divergent_scheduler_turn.record(Some(68));
+    let with_located = TrackedCells {
+        schema: SCHEMA,
+        projection: None,
+        cells: vec![boundary_cell(vec![located.clone()], CellStatus::Red)],
+    };
+    // The real erasure mode: the observation SURVIVES and its coordinates are
+    // blanked. A guard comparing observation counts cannot see this, which is
+    // how the first version of it passed the unit case and then walked straight
+    // through an end-to-end run against the checked-in file.
+    let coordinates_blanked = TrackedCells {
+        schema: SCHEMA,
+        projection: None,
+        cells: vec![boundary_cell(vec![sample.clone()], CellStatus::Red)],
+    };
+    match enforce_projection_preserves_evidence(&with_located, &coordinates_blanked, 0) {
+        Ok(()) => {
+            return Err(
+                "projection blanked located coordinates while keeping the observation, and the                  guard did not see it. This is the erasure mode the naive implementation                  actually produces"
+                    .into(),
+            );
+        }
+        Err(why) => {
+            if !why.contains("fixture/boundary") {
+                return Err(format!(
+                    "coordinate-blanking refusal does not name the cell: {why}"
+                ));
+            }
+        }
+    }
+    match enforce_projection_preserves_evidence(&with_located, &evidence_dropped, 0) {
+        Ok(()) => {
+            return Err(
+                "projection dropped measured evidence after reading ZERO series rows. An empty \
+                 source is not a finding that a cell has no evidence"
+                    .into(),
+            );
+        }
+        Err(why) => {
+            // The refusal must NAME the cell it protected. "projection refused"
+            // with no subject sends the reader back to diff the whole file.
+            if !why.contains("fixture/boundary") {
+                return Err(format!(
+                    "projection refusal does not name the cell whose evidence it protected: {why}"
+                ));
+            }
+        }
+    }
+    // Rows actually read means the source spoke, so replacement is legitimate --
+    // otherwise the guard would freeze the projection permanently and step 4
+    // could never correct a stale bound.
+    if enforce_projection_preserves_evidence(&with_located, &evidence_dropped, 1).is_err() {
+        return Err(
+            "projection guard refused a replacement the series actually supplied rows for; it \
+             would freeze the projection against every future correction"
+                .into(),
+        );
+    }
+    // Adding evidence is never the erasure case, whatever the row count.
+    if enforce_projection_preserves_evidence(&evidence_dropped, &with_located, 0).is_err() {
+        return Err("projection guard refused a refresh that ADDED evidence".into());
+    }
+    // `update` is the ratchet authority and must leave the projection block
+    // alone. Asserted in BOTH directions: the boundary refuses the drop, and
+    // the derivation actually carries it forward -- a refusal alone would just
+    // make every ordinary `update` fail.
+    let stamped = TrackedCells {
+        schema: SCHEMA,
+        projection: Some(ObservationProjection {
+            source: "fixture-series".into(),
+            refreshed_at: "fixture-stamp".into(),
+            rows_read: 7,
+            pre_series_corpus: false,
+        }),
+        cells: vec![boundary_cell(vec![sample.clone()], CellStatus::Red)],
+    };
+    let projection_dropped = TrackedCells {
+        projection: None,
+        ..stamped.clone()
+    };
+    if enforce_writer_boundary(&stamped, &projection_dropped, Writer::Update).is_ok() {
+        return Err(
+            "writer boundary allowed `update` to delete the projection block, which is what              turns a stale projection into one nobody can tell from a fresh one"
+                .into(),
+        );
+    }
+    if enforce_writer_boundary(&stamped, &stamped, Writer::Update).is_err() {
+        return Err("writer boundary refused an `update` that preserved the projection".into());
+    }
+    // ⚠️ AND THE DERIVATION ITSELF, not only the guard that polices it. The
+    // boundary check above passes even when `tracked_from` rebuilds the file
+    // with `projection: None`, because it is never handed the two versions to
+    // compare unless a projection already exists in the checked-in file -- and
+    // none does until plan step 4 lands. So the reintroduced bug would sit
+    // undetected in CI for as long as the series stays empty. This calls the
+    // derivation directly, which is the only version of this assertion that can
+    // fail today.
+    let boundary_id = stamped.cells[0].id.clone();
+    let derived_fixture = Derived {
+        population: BTreeSet::from([boundary_id.clone()]),
+        enabled: BTreeSet::from([boundary_id.clone()]),
+        ci_disabled_reasons: BTreeMap::new(),
+        selected: BTreeSet::from([boundary_id.clone()]),
+        green: BTreeSet::new(),
+    };
+    let rederived = tracked_from(&derived_fixture, Some(stamped.clone()), false, false)?;
+    if rederived.projection != stamped.projection {
+        return Err(format!(
+            "`update` did not carry the projection block forward: {:?} became {:?}. Every              ordinary derivation would then delete the record of when the observations were              last projected",
+            stamped.projection, rederived.projection
+        ));
+    }
+    // An unreachable source and an empty one are different facts. Only the
+    // second is a statement about the cells, so the first is refused outright
+    // rather than folded into "zero rows".
+    if read_series_rows(Path::new("/nonexistent/series/root")).is_ok() {
+        return Err("an unreachable series root was read as an empty series".into());
+    }
+    // A legacy file with no `projection` key must still load -- the demotion is
+    // additive, and a hard requirement would strand every checked-in scorecard.
+    let legacy: TrackedCells = serde_json::from_str(r#"{"schema":6,"cells":[]}"#)
+        .map_err(|e| format!("legacy scorecard without a projection block no longer loads: {e}"))?;
+    if legacy.projection.is_some() {
+        return Err("absent projection block deserialized as present".into());
+    }
+    // ⚠️ THE SAME LOAD-BEARING REFUSAL AS THE OBSERVED-POSITIONS SCHEMA. Without
+    // `deny_unknown_fields` a projection block carrying a misspelled or future
+    // key matches with every field defaulted: rows_read 0, pre_series_corpus
+    // false, refreshed_at empty -- a projection that claims to be current while
+    // having read nothing. That is tonight's defect class living in the schema.
+    if serde_json::from_str::<ObservationProjection>(
+        r#"{"source":"s","refreshed_at":"t","rows_read":3,"row_count":9}"#,
+    )
+    .is_ok()
+    {
+        return Err(
+            "ObservationProjection accepted an unknown field; a typo would silently default \
+             rows_read to 0 and read as a projection nobody can distinguish from a fresh one"
+                .into(),
+        );
+    }
+
     println!(
-        "compatibility scorecard self-test: provenance, distinct-evidence, result, selected-chaos, ratchet, observation-range, batch-equivalence, green-admission, validate-observation, source-identity, writer-boundary, and infrastructure-refusal brackets pass"
+        "compatibility scorecard self-test: provenance, distinct-evidence, result, selected-chaos, ratchet, observation-range, batch-equivalence, green-admission, validate-observation, source-identity, writer-boundary, projection, and infrastructure-refusal brackets pass"
     );
     Ok(())
 }
