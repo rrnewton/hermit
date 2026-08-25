@@ -1311,7 +1311,14 @@ fn write_output(output: &Output) -> Result<(), Error> {
 
 #[cfg(feature = "dbt")]
 fn output_status(output: &Output) -> ExitStatus {
-    ExitStatus::Exited(output.status.code().unwrap_or(1))
+    // ⚠️ SAME SIGNAL-LOSING CONVERSION `process_status` ALREADY FIXED, MISSED HERE.
+    // `std::process::ExitStatus::code()` is `None` for a process killed by a
+    // signal, so `code().unwrap_or(1)` reported every signalled death as a
+    // normal `Exited(1)`: a guest killed by SIGSEGV came back as "exited
+    // normally with status 1", and WIFSIGNALED/WTERMSIG/WCOREDUMP were all lost.
+    // `ExitStatus::from_raw` decodes exited-versus-signalled and the core-dump
+    // flag the same way the ptrace backend does.
+    ExitStatus::from_raw(output.status.into_raw())
 }
 
 fn sabre_artifact(variable: &str, description: &str, executable: bool) -> Result<OsString, Error> {
@@ -2014,6 +2021,50 @@ mod tests {
 
         assert!(resolved.is_absolute());
         assert_eq!(resolved, fs::canonicalize(file.path()).unwrap());
+    }
+
+    /// A guest killed by a signal must report as SIGNALLED, not as a normal exit.
+    ///
+    /// ⚠️ THIS IS THE TEST THAT WAS MISSING, WHICH IS WHY ONE SITE GOT FIXED AND
+    /// ITS SIBLING DID NOT. `process_status` was converted to `from_raw`;
+    /// `output_status` kept `code().unwrap_or(1)` and nothing noticed, because no
+    /// test asserted the signalled case for either. Asserting it here binds BOTH.
+    #[cfg(feature = "dbt")]
+    #[test]
+    fn a_signalled_guest_is_not_reported_as_a_normal_exit() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        // raw wait status for "killed by SIGSEGV" (11), no core dump.
+        let raw = 11i32;
+        let native = std::process::ExitStatus::from_raw(raw);
+        assert!(native.code().is_none(), "SIGSEGV death has no exit code");
+
+        let converted = process_status(native);
+        assert!(
+            !matches!(converted, ExitStatus::Exited(_)),
+            "a signalled guest must not read as a normal exit, got {converted:?}"
+        );
+
+        // ⚠️ CALL `output_status` ITSELF, not an expression that looks like it.
+        // My first version compared `process_status(..)` against an inline
+        // `ExitStatus::from_raw(..)` and never invoked `output_status` at all --
+        // so reverting `output_status` to the buggy form left this test GREEN.
+        // Caught by mutating BOTH sites instead of one.
+        let output = Output {
+            status: native,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        let from_output = output_status(&output);
+        assert!(
+            !matches!(from_output, ExitStatus::Exited(_)),
+            "output_status must not report a signalled guest as a normal exit, got {from_output:?}"
+        );
+        assert_eq!(
+            converted, from_output,
+            "output_status and process_status must agree; they diverged once and \
+             only one of them was fixed"
+        );
     }
 
     /// A real spawn failure -- drrun absent or not executable -- must still say
