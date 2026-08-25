@@ -45,9 +45,15 @@ run_local() {
     env -u CI -u GITHUB_ACTIONS "$@"
 }
 
+# ⚠️ EVERY REFUSAL CHECK ASSERTS ITS REASON, NOT ONLY ITS EXIT CODE. Exit 2 is
+# ALSO what run-node.sh returns for an unknown lane, an unwritable perf dir, and
+# "dagrun not found" — so a code-only assertion passes on a box where nothing
+# works at all, which is a refusal test that cannot fail for the reason it names.
+# The reason string is the only part that distinguishes the guard from the
+# environment.
 expect_refusal() {
-    local what=$1
-    shift
+    local what=$1 reason=$2
+    shift 2
     local output status
     output=$(run_local "$@" 2>&1)
     status=$?
@@ -55,19 +61,40 @@ expect_refusal() {
         fail "$what: expected exit 2, got $status. Output: $output"
         return
     fi
-    printf 'run-node-args-test: ok — %s refused (exit 2)\n' "$what"
+    if [[ $output != *"$reason"* ]]; then
+        fail "$what: exited 2 but for the wrong reason — no '$reason' in the output.
+  This is what an environment failure (missing dagrun, bad lane) looks like.
+  Output: $output"
+        return
+    fi
+    printf 'run-node-args-test: ok — %s refused with its own reason\n' "$what"
 }
 
 expect_refusal "a trailing argument with no '--'" \
+    "unexpected argument '-E'" \
     "$RUN_NODE" "$LANE" "$NODE" -E 'test(=nothing)'
 expect_refusal "'--' with a multi-node selection" \
+    "requires exactly one node tag" \
     "$RUN_NODE" "$LANE" "$NODE,lint.rustfmt" -- --some-flag
 expect_refusal "'--' with nothing after it" \
+    "'--' given with nothing after it" \
     "$RUN_NODE" "$LANE" "$NODE" --
 expect_refusal "'--' under \$CI" \
+    "refused in CI" \
     env CI=1 "$RUN_NODE" "$LANE" "$NODE" -- --some-flag
 expect_refusal "'--' under \$GITHUB_ACTIONS" \
+    "refused in CI" \
     env GITHUB_ACTIONS=true "$RUN_NODE" "$LANE" "$NODE" -- --some-flag
+
+# Positive control for the whole file: the trailing-argument refusal must also
+# still print usage, so the operator is told the supported form rather than only
+# that they were wrong.
+usage_output=$(run_local "$RUN_NODE" "$LANE" "$NODE" -E 'test(=nothing)' 2>&1)
+if [[ $usage_output != *"usage: ci/run-node.sh <lane> <group.job>"* ]]; then
+    fail "the trailing-argument refusal did not print usage. Output: $usage_output"
+else
+    printf 'run-node-args-test: ok — the refusal prints the supported form\n'
+fi
 
 # The append case. RUN_NODE_PRINT_ONLY stops before execution, so this asserts
 # the edited command itself rather than a node's outcome.
@@ -140,4 +167,4 @@ if ((failures > 0)); then
     printf 'run-node-args-test: %d check(s) FAILED\n' "$failures" >&2
     exit 1
 fi
-printf 'run-node-args-test: OK — 5 refusals, 1 single-node edit, no DAG-wide drift\n'
+printf 'run-node-args-test: OK — 5 reasoned refusals, 1 usage check, 1 single-node edit, no DAG-wide drift\n'
