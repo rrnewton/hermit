@@ -5701,7 +5701,7 @@ test:
         ci_disabled_reason:
           liteinst:
             result: timeout
-            evidence: "task requalify_pr_2333_liteinst; /home/newton/liteinst-pr2333-requal-20260825"
+            evidence: "task requalify_pr_2333_liteinst (run 20260825); artifacts retained on the requalifying host, referenced by task id rather than by an absolute path"
             reason: Exact-current-main qualification with a staged, positively activated LiteInst runtime timed out opening the tracee pidfd in 21 of 21 isolated and paired-load runs before producing a terminal comparison; retain this executable cell as red and requalify after the LiteInst startup failure is fixed.
         backends_enabled:
           - ptrace
@@ -5774,7 +5774,7 @@ test:
         ci_disabled_reason:
           liteinst:
             result: timeout
-            evidence: "task requalify_pr_2333_liteinst; /home/newton/liteinst-pr2333-requal-20260825"
+            evidence: "task requalify_pr_2333_liteinst (run 20260825); artifacts retained on the requalifying host, referenced by task id rather than by an absolute path"
             reason: Exact-current-main qualification with a staged, positively activated LiteInst runtime timed out opening the tracee pidfd in 21 of 21 isolated and paired-load runs before producing a terminal comparison; retain this executable cell as red and requalify after the LiteInst startup failure is fixed.
         backends_enabled:
           - ptrace
