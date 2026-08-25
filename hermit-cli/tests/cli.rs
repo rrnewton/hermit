@@ -3850,19 +3850,40 @@ fn record_classifies_a_container_child_failure_the_same_way_run_does() {
         ("with --verify-with-gdbex", &["--verify-with-gdbex", "quit"]),
     ];
 
+    // ⚠️ EVERY SPELLING IS DRIVEN AND EVERY FAILURE IS COLLECTED, RATHER THAN
+    // ASSERTED ONE AT A TIME. An `assert!` inside this loop aborts at the FIRST
+    // failing spelling, so a run in which one call site regressed could never
+    // show that the other three were unaffected -- and "each spelling reaches
+    // one site and no other" is precisely the property this test is here to
+    // carry. Collecting turns one revert into a one-line proof of the mapping:
+    // exactly one spelling fails and the report names the three that did not.
+    let mut failures: Vec<String> = Vec::new();
     for (name, extra) in spellings {
         let segv = case("segv", extra);
-        assert!(
-            segv.contains("HERMIT_INTERNAL_FAILURE class=container-child-exit"),
-            "a record-path container child that exited with an unchosen status must be \
-             classified as such, not as a CLI error -- spelling: {name}\nstderr:\n{segv}"
-        );
+        if !segv.contains("HERMIT_INTERNAL_FAILURE class=container-child-exit") {
+            failures.push(format!(
+                "  [{name}] a record-path container child that exited with an unchosen \
+                 status was not classified as such\n    stderr: {}",
+                segv.replace('\n', " | ")
+            ));
+        }
 
         let panicked = case("panic", extra);
-        assert!(
-            panicked.contains("HERMIT_INTERNAL_FAILURE class=container-child-panic"),
-            "a record-path CAUGHT container-child panic must be classified as a panic, \
-             not as a CLI error -- spelling: {name}\nstderr:\n{panicked}"
-        );
+        if !panicked.contains("HERMIT_INTERNAL_FAILURE class=container-child-panic") {
+            failures.push(format!(
+                "  [{name}] a record-path CAUGHT container-child panic was not classified \
+                 as a panic\n    stderr: {}",
+                panicked.replace('\n', " | ")
+            ));
+        }
     }
+    assert!(
+        failures.is_empty(),
+        "{} of {} record spelling/fault combinations misclassified a container-child \
+         failure. The combinations NOT listed here passed in this same run, which is what \
+         makes this a mapping rather than an aggregate:\n{}",
+        failures.len(),
+        spellings.len() * 2,
+        failures.join("\n")
+    );
 }
