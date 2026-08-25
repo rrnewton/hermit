@@ -178,6 +178,54 @@ for left, right, why in (
     check(f"{why} counts are refused the bitwise tier",
           got and got["tier"] != "bitwise", repr(got))
 
+print("case NAMED REFUSAL — a rejection nobody can see is not a check")
+# ⚠️ THE TIER ALONE CANNOT CARRY THIS. Degrading a self-contradictory record to
+# `guest` files it under the same label as an honest output-only run: same row,
+# different facts. So a record that CLAIMS bitwise_parity and is refused must say
+# which conjunct refused it.
+#
+# The shape is the KVM comparator reporting `matched` while `compare_logs` was
+# false -- a verdict disagreeing with its own evidence.
+
+
+def refusal_for(rec) -> str:
+    import contextlib
+    import io
+
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        tier_of(rec)
+    return buf.getvalue()
+
+
+msg = refusal_for(record(bitwise=True, strictness="canonical", compare_logs=False,
+                         left=348, right=348))
+check("a parity claim over an uncompared log stream is REFUSED BY NAME",
+      "REFUSED the bitwise tier" in msg, repr(msg))
+check("the refusal names compare_logs as the conjunct that refused it",
+      "compare_logs" in msg and "not compared" in msg, repr(msg))
+
+msg = refusal_for(record(bitwise=True, strictness="stripped", left=348, right=348))
+check("a parity claim under a stripped comparator names the comparator",
+      "not canonical" in msg, repr(msg))
+
+msg = refusal_for(record(bitwise=True, strictness="canonical", verdict="diverged",
+                         left=348, right=348))
+check("a parity claim on a diverged verdict names the verdict",
+      "not 'matched'" in msg, repr(msg))
+
+msg = refusal_for(record(bitwise=True, strictness="canonical", left=239, right=240))
+check("a parity claim with unequal counts names the counts",
+      "equal positive integers" in msg, repr(msg))
+
+# The other half of the contract, and the reason this is not just noise.
+msg = refusal_for(record(bitwise=False, strictness="stripped", left=239, right=239))
+check("an ordinary stripped run claiming nothing stays SILENT",
+      msg == "", repr(msg))
+msg = refusal_for(record(bitwise=True, strictness="canonical", left=348, right=348))
+check("a record that EARNS the tier stays silent",
+      msg == "", repr(msg))
+
 print("case REAL RECORD — the shape a genuine measured L2 run actually produced")
 # ⚠️ THE CONTROL FOR EVERY NEGATIVE ABOVE.  A predicate that rejects everything
 # is not a stricter predicate, it is a broken one, so the tightening has to be
@@ -200,6 +248,44 @@ check("the measured ptrace record reports bitwise_parity 1",
       got and got["bitwise_parity"] == "1", repr(got))
 check("the measured ptrace record carries its 266/266 counts",
       got and got["compared_log_messages"] == "266|266", repr(got))
+
+print("case NO_RESULT INTERACTION — the typed reasons and these conjuncts must agree")
+# ⚠️ TWO CONSTRAINTS ON VERDICT SHAPE LANDED SEPARATELY, so they are pinned
+# together here: if they ever disagree, one starts refusing the other silently.
+#
+# `NoResultReason` distinguishes `not_run` -- stamped BEFORE verification, so its
+# survival means the invocation died before reaching a comparison -- from
+# `first_run_rejected`, where the guest ran and its exit status was rejected.
+# Those need opposite responses, which is why the untyped `no_result` was not
+# enough.
+#
+# These conjuncts sit strictly DOWNSTREAM of the `no_result` gate, so they can
+# never reclassify either reason. Verified in both directions rather than assumed.
+for reason, why in (
+    ({"kind": "not_run"}, "not_run"),
+    ({"kind": "first_run_rejected", "exit_code": 1, "signal": None,
+      "stdout_bytes": 0, "stderr_bytes": 0}, "first_run_rejected"),
+):
+    got = tier_of({"verified": False, "bitwise_parity": False, "verdict": "no_result",
+                   "no_result_reason": reason, "comparison": None,
+                   "compared_log_messages": None})
+    check(f"a typed no_result ({why}) still yields None, untouched by these conjuncts",
+          got is None, repr(got))
+
+# The positive interaction, and the reason this pairing is worth having: the
+# pre-stamped record is `verdict=no_result` with every field null. A path that
+# flips the verdict without filling the comparison would previously have carried
+# `bitwise_parity: true` straight to the top tier.
+got = tier_of({"verified": True, "bitwise_parity": True, "verdict": "matched",
+               "no_result_reason": {"kind": "not_run"}, "comparison": None,
+               "compared_log_messages": None})
+check("a partially updated pre-stamp claiming parity is refused the bitwise tier",
+      got and got["tier"] != "bitwise", repr(got))
+check("and it is refused BY NAME, not silently",
+      "REFUSED the bitwise tier" in refusal_for(
+          {"verified": True, "bitwise_parity": True, "verdict": "matched",
+           "no_result_reason": {"kind": "not_run"}, "comparison": None,
+           "compared_log_messages": None}), "silent")
 
 print("case LADDER — the rungs this change deliberately did NOT touch")
 # Pinned so a future collapse to {gap, bitwise} is a visible test failure rather
