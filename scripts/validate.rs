@@ -8980,33 +8980,44 @@ fn canonical_validate_lock_admission(
     parent: Option<&Path>,
     commit: &str,
     host: &str,
-) -> bool {
+) -> Result<(), String> {
     let status = if env_flag("HERMIT_VALIDATE_STOP_TEST_MODE", "1") {
         let Ok(fixture) = std::env::var("VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON") else {
-            return false;
+            return Err("stop-test mode is on but no planted authority status was supplied".into());
         };
         fixture.into_bytes()
     } else {
-        let Some(parent) = parent else { return false };
+        let Some(parent) = parent else {
+            return Err("no dev-hermit parent was detected".into());
+        };
         let ci_hub = parent.join("ci-hub/ci-hub");
         if !ci_hub.is_file() {
-            return false;
+            return Err(format!(
+                "the canonical launcher is missing at {}",
+                ci_hub.display()
+            ));
         }
-        let Ok(output) = Command::new(ci_hub)
+        let Ok(output) = Command::new(&ci_hub)
             .args(["validate-lock", "authority-status", "--json"])
             .output()
         else {
-            return false;
+            return Err(format!("could not execute {}", ci_hub.display()));
         };
         if !output.status.success() {
-            return false;
+            return Err(format!(
+                "`ci-hub validate-lock authority-status --json` exited {}",
+                output
+                    .status
+                    .code()
+                    .map_or_else(|| "by signal".into(), |c| c.to_string())
+            ));
         }
         output.stdout
     };
     let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .ok()
         .map(|id| id.trim().to_string());
-    canonical_validate_lock_status_admits(
+    canonical_validate_lock_status_reason(
         &status,
         commit,
         host,
@@ -9026,52 +9037,164 @@ fn canonical_validate_lock_status_admits(
     boot_id: Option<&str>,
     identity_in_ancestry: impl FnOnce(i32, u64) -> bool,
 ) -> bool {
+    canonical_validate_lock_status_reason(status, commit, host, boot_id, identity_in_ancestry)
+        .is_ok()
+}
+
+/// The single implementation of the admission decision, reporting WHICH
+/// conjunct failed.
+///
+/// ⚠️ SIXTEEN DISTINCT WAYS TO BE REFUSED USED TO COLLAPSE INTO ONE `false`,
+/// and the front door then printed one sentence naming all three of exact
+/// commit, exact host and live owner ancestry without saying which had failed
+/// or what the values were. That is undiagnosable from the outside: the owner
+/// hit it from his own checkout and could not tell that his HEAD simply was not
+/// the commit his lock was taken for. Measured 2026-08-25 -- checkout HEAD
+/// `b120fe5d7653`, lock target `1d558d48b438`.
+///
+/// The refusal was CORRECT. Validating `b120fe5d` while the receipt says
+/// `1d558d48` would record a result against a commit it was not measured on,
+/// which is the exact defect the target binding exists to prevent. So nothing
+/// here is relaxed and no caller is exempted -- `..._admits` is derived from
+/// this function, so the decision cannot drift from the explanation. Only the
+/// diagnosis is added.
+fn canonical_validate_lock_status_reason(
+    status: &[u8],
+    commit: &str,
+    host: &str,
+    boot_id: Option<&str>,
+    identity_in_ancestry: impl FnOnce(i32, u64) -> bool,
+) -> Result<(), String> {
     fn object_string<'a>(
         object: &'a serde_json::Map<String, serde_json::Value>,
         key: &str,
     ) -> Option<&'a str> {
         object.get(key).and_then(serde_json::Value::as_str)
     }
+    fn shown(value: Option<&str>) -> String {
+        value.map_or_else(|| "<absent>".to_string(), |text| format!("{text:?}"))
+    }
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(status) else {
-        return false;
+        return Err("the authority response is not valid JSON".into());
     };
     let Some(holder) = value.get("holder").and_then(serde_json::Value::as_object) else {
-        return false;
+        return Err(format!(
+            "no lock is held: the authority reports state {} (reason {}), so there \
+             is no holder to bind to",
+            shown(value.get("state").and_then(serde_json::Value::as_str)),
+            shown(value.get("reason_code").and_then(serde_json::Value::as_str)),
+        ));
     };
     let Some(owner) = value.get("owner").and_then(serde_json::Value::as_object) else {
-        return false;
+        return Err("the authority reports a holder but no owner record".into());
     };
     if value.get("schema_version").and_then(serde_json::Value::as_i64) != Some(1)
-        || value.get("admissible").and_then(serde_json::Value::as_bool) != Some(true)
-        || value.get("state").and_then(serde_json::Value::as_str) != Some("held")
-        || !value.get("reason_code").is_some_and(serde_json::Value::is_null)
-        || value.get("canonical_anchor_held").and_then(serde_json::Value::as_bool) != Some(true)
-        || !matches!(
-            value.get("cleanup_state").and_then(serde_json::Value::as_str),
-            Some("none" | "active-bound")
-        )
-        || object_string(holder, "kind") != Some("validate")
-        || object_string(holder, "target") != Some(commit)
-        || object_string(holder, "host") != Some(host)
-        || object_string(owner, "host") != Some(host)
-        || object_string(owner, "liveness") != Some("alive")
     {
-        return false;
+        return Err("the authority response is not schema_version 1".into());
+    }
+    if value.get("admissible").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err("the authority itself reports admissible=false".into());
+    }
+    if value.get("state").and_then(serde_json::Value::as_str) != Some("held") {
+        return Err(format!(
+            "the lock state is {}, not \"held\"",
+            shown(value.get("state").and_then(serde_json::Value::as_str))
+        ));
+    }
+    if !value
+        .get("reason_code")
+        .is_some_and(serde_json::Value::is_null)
+    {
+        return Err(format!(
+            "the authority attached reason_code {}",
+            shown(value.get("reason_code").and_then(serde_json::Value::as_str))
+        ));
+    }
+    if value
+        .get("canonical_anchor_held")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err("the canonical anchor is not held".into());
+    }
+    if !matches!(
+        value
+            .get("cleanup_state")
+            .and_then(serde_json::Value::as_str),
+        Some("none" | "active-bound")
+    ) {
+        return Err(format!(
+            "cleanup_state is {}, which is neither \"none\" nor \"active-bound\"",
+            shown(
+                value
+                    .get("cleanup_state")
+                    .and_then(serde_json::Value::as_str)
+            )
+        ));
+    }
+    if object_string(holder, "kind") != Some("validate") {
+        return Err(format!(
+            "the held lock is kind {}, not \"validate\"",
+            shown(object_string(holder, "kind"))
+        ));
+    }
+    if object_string(holder, "target") != Some(commit) {
+        return Err(format!(
+            "COMMIT MISMATCH: this checkout is at {commit}, but the lock was taken \
+             for target {}. Validating here would measure {commit} and record it \
+             against the lock's target, so it is refused. Check out the lock's \
+             target, or take a lock for this commit.",
+            shown(object_string(holder, "target"))
+        ));
+    }
+    if object_string(holder, "host") != Some(host) {
+        return Err(format!(
+            "HOST MISMATCH: this host is {host:?}, the lock holder's host is {}",
+            shown(object_string(holder, "host"))
+        ));
+    }
+    if object_string(owner, "host") != Some(host) {
+        return Err(format!(
+            "HOST MISMATCH: this host is {host:?}, the lock owner's host is {}",
+            shown(object_string(owner, "host"))
+        ));
+    }
+    if object_string(owner, "liveness") != Some("alive") {
+        return Err(format!(
+            "the lock owner's liveness is {}, not \"alive\"",
+            shown(object_string(owner, "liveness"))
+        ));
     }
     let Some(pid64) = owner.get("pid").and_then(serde_json::Value::as_i64) else {
-        return false;
+        return Err("the lock owner record carries no integer pid".into());
     };
     let Some(start_ticks) = owner.get("start_ticks").and_then(serde_json::Value::as_u64) else {
-        return false;
+        return Err("the lock owner record carries no start_ticks".into());
     };
-    let Ok(pid) = i32::try_from(pid64) else { return false };
+    let Ok(pid) = i32::try_from(pid64) else {
+        return Err(format!("the lock owner pid {pid64} is out of range"));
+    };
     if pid <= 1 || start_ticks == 0 {
-        return false;
+        return Err(format!(
+            "the lock owner identity is degenerate (pid {pid}, start_ticks {start_ticks})"
+        ));
     }
     if boot_id != object_string(owner, "boot_id") {
-        return false;
+        return Err(format!(
+            "BOOT MISMATCH: this boot is {}, the lock was taken under boot {}. The lock did not \
+             survive a reboot.",
+            shown(boot_id),
+            shown(object_string(owner, "boot_id"))
+        ));
     }
-    identity_in_ancestry(pid, start_ticks)
+    if !identity_in_ancestry(pid, start_ticks) {
+        return Err(format!(
+            "ANCESTRY: this process is not a descendant of the lock owner (pid {pid}, start_ticks \
+             {start_ticks}). A naked run is refused here even when a lock is held by someone else \
+             -- enter through ci-hub so the run is a child of the lock owner."
+        ));
+    }
+    Ok(())
 }
 
 /// Inert two-sided bracket for the front door and the canonical authority
@@ -10974,7 +11097,14 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         let commit = git_sha();
         let host = short_hostname();
         let ci_hub_launcher_available = parent.join("ci-hub/ci-hub").is_file();
-        let admitted = canonical_validate_lock_admission(Some(parent), &commit, &host);
+        let admission = canonical_validate_lock_admission(Some(parent), &commit, &host);
+        // NAME THE CONJUNCT THAT FAILED. The decision is unchanged -- it is still
+        // exactly `admission.is_ok()` -- but a refusal that lists three
+        // possibilities and identifies none is undiagnosable from outside, and
+        // that is what left the owner unable to see that his checkout simply was
+        // not at the commit his lock was taken for.
+        let admitted = admission.is_ok();
+        let why = admission.err();
         if let Some(refusal) = product_front_door_refusal(
             parent,
             &root,
@@ -10984,18 +11114,28 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             admitted,
         ) {
             eprintln!("{refusal}");
+            if let Some(reason) = &why {
+                eprintln!("\nWhy this run was not admitted:\n  {reason}");
+            }
+            let mut detail = vec![match &why {
+                Some(reason) => format!(
+                    "the dev-hermit boundary was detected and admission was not established: \
+                     {reason}"
+                ),
+                None => "the dev-hermit boundary was detected, but exact-commit, exact-host, \
+                         live validate-lock owner ancestry was not established"
+                    .to_string(),
+            }];
+            detail.push(
+                "repair ci-hub if needed, then use its validate-run entry point; environment \
+                 markers cannot authorize product work"
+                    .into(),
+            );
             return RunSummary::refused(
                 4,
                 &profile_name,
                 "the dev-hermit product front door",
-                vec![
-                    "the dev-hermit boundary was detected, but exact-commit, exact-host, live \
-                     validate-lock owner ancestry was not established"
-                        .into(),
-                    "repair ci-hub if needed, then use its validate-run entry point; environment \
-                     markers cannot authorize product work"
-                        .into(),
-                ],
+                detail,
             );
         }
     }
@@ -11725,7 +11865,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let commit_anchored = commit != "unknown" && !dirty_now;
     // Observed, not inferred: did the pin gate actually run and pass in THIS run?
     let pin_gate_passed = outcomes.iter().any(|o| o.tag == PIN_GATE_TAG && o.ok);
-    let lock_admitted = canonical_validate_lock_admission(parent.as_deref(), &commit, &host);
+    let lock_admitted =
+        canonical_validate_lock_admission(parent.as_deref(), &commit, &host).is_ok();
     let ctx = LedgerCtx {
         started_at,
         host: host.clone(),
@@ -12287,7 +12428,7 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     let wall = started.elapsed().as_secs_f64();
     let ledger = ledger_path(root);
     let host = short_hostname();
-    let lock_admitted = canonical_validate_lock_admission(parent, &commit, &host);
+    let lock_admitted = canonical_validate_lock_admission(parent, &commit, &host).is_ok();
     let ctx = LedgerCtx {
         started_at,
         host,
