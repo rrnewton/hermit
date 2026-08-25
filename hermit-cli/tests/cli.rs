@@ -478,8 +478,48 @@ fn run_rejects_unknown_backends_during_argument_parsing() {
     }
 }
 
+/// True when this binary cannot exercise the DBT backend, having said so.
+///
+/// ⚠️ KEYED ON THE COMPILE-TIME FEATURE, NEVER ON THE RUN'S OUTCOME. Skipping
+/// because a `--backend dbt` invocation failed would be the opposite defect and
+/// strictly worse than the reds it removes: it would convert every genuine DBT
+/// regression into silence. `cfg!(feature = "dbt")` is a fact about how this
+/// test binary was compiled, decided before any guest runs, so a broken but
+/// PRESENT backend still fails exactly as it did before.
+///
+/// `default = []` in hermit-cli/Cargo.toml, so a plain `cargo test` excludes
+/// DBT and these 18 tests failed on EVERY default build -- not merely on hosts
+/// lacking DynamoRIO. Validate is unaffected: it builds
+/// `--features third-party-backends`, which includes `dbt`.
+///
+/// Setting `HERMIT_REQUIRE_DBT` turns the skip back into a failure, so a CI job
+/// that intends to cover DBT cannot silently stop covering it. That mirrors
+/// `sabre_examples.rs`, which panics when an explicitly configured artifact is
+/// missing and only skips when the default path is absent.
+fn dbt_unavailable(test: &str) -> bool {
+    if cfg!(feature = "dbt") {
+        return false;
+    }
+    assert!(
+        std::env::var_os("HERMIT_REQUIRE_DBT").is_none(),
+        "HERMIT_REQUIRE_DBT is set, but this test binary was built WITHOUT the \
+         `dbt` feature, so {test} cannot exercise the backend it claims to cover. \
+         Rebuild with --features dbt (or third-party-backends), or unset \
+         HERMIT_REQUIRE_DBT to allow skipping."
+    );
+    eprintln!(
+        "skipping {test}: built without the `dbt` feature (hermit-cli default = []); \
+         an absent backend is not a product failure. Build with --features dbt or \
+         --features third-party-backends to exercise it."
+    );
+    true
+}
+
 #[test]
 fn run_dbt_executes_integrated_backend() {
+    if dbt_unavailable("run_dbt_executes_integrated_backend") {
+        return;
+    }
     let args = ["run", "--backend", "dbt", "--", "/bin/true"];
     let output = hermit(&args);
     assert_success(&output, &args);
@@ -487,6 +527,9 @@ fn run_dbt_executes_integrated_backend() {
 
 #[test]
 fn run_dbt_uses_the_requested_guest_environment() {
+    if dbt_unavailable("run_dbt_uses_the_requested_guest_environment") {
+        return;
+    }
     let args = [
         "run",
         "--backend",
@@ -519,6 +562,9 @@ fn run_dbt_uses_the_requested_guest_environment() {
 
 #[test]
 fn run_dbt_verifies_simple_env_shebang() {
+    if dbt_unavailable("run_dbt_verifies_simple_env_shebang") {
+        return;
+    }
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("failed to create DBT env-shebang test directory");
     let script = directory.path().join("env-echo");
@@ -617,6 +663,11 @@ fn run_ptrace_fails_closed_by_default_on_unsupported_syscall() {
 // TODO-HUMAN-REVIEW(PR-644): Review DBT normal aggregation and strict failure coverage.
 #[test]
 fn run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls() {
+    if dbt_unavailable(
+        "run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls",
+    ) {
+        return;
+    }
     let program = dbt_unsupported_syscall_guest()
         .to_str()
         .expect("DBT unsupported-syscall guest path should be UTF-8");
@@ -797,6 +848,9 @@ fn run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls()
 // TODO-HUMAN-REVIEW(PR-644): Review strict DBT teardown with a blocked stdin source.
 #[test]
 fn run_dbt_strict_returns_with_blocked_stdin_source() {
+    if dbt_unavailable("run_dbt_strict_returns_with_blocked_stdin_source") {
+        return;
+    }
     let program = dbt_unsupported_syscall_guest()
         .to_str()
         .expect("DBT unsupported-syscall guest path should be UTF-8");
@@ -928,6 +982,9 @@ fn run_liteinst_rejects_an_inert_dso_before_activation_claim() {
 // TODO-HUMAN-REVIEW(#679): validate the dedicated DBT diagnostic channel.
 #[test]
 fn run_dbt_keeps_diagnostics_out_of_guest_stderr() {
+    if dbt_unavailable("run_dbt_keeps_diagnostics_out_of_guest_stderr") {
+        return;
+    }
     let script = r#"set -euo pipefail; output=$(/bin/sh -c 'printf guest-stderr >&2' 2>&1); test "$output" = guest-stderr; printf 'isolated=%s\n' "$output""#;
     let args = [
         "run",
@@ -953,6 +1010,9 @@ fn run_dbt_keeps_diagnostics_out_of_guest_stderr() {
 
 #[test]
 fn run_dbt_forwards_detcore_info_logs() {
+    if dbt_unavailable("run_dbt_forwards_detcore_info_logs") {
+        return;
+    }
     let args = [
         "--log",
         "INFO",
@@ -975,6 +1035,9 @@ fn run_dbt_forwards_detcore_info_logs() {
 
 #[test]
 fn run_dbt_uses_the_normalized_backend_config() {
+    if dbt_unavailable("run_dbt_uses_the_normalized_backend_config") {
+        return;
+    }
     let args = [
         "--log",
         "DEBUG",
@@ -1006,6 +1069,9 @@ fn run_dbt_uses_the_normalized_backend_config() {
 // TODO-HUMAN-REVIEW(PR-1038): Review DBT queued self-signal verification.
 #[test]
 fn run_dbt_verifies_queued_self_signals() {
+    if dbt_unavailable("run_dbt_verifies_queued_self_signals") {
+        return;
+    }
     let program = dbt_self_sigqueue_guest()
         .to_str()
         .expect("DBT self-sigqueue guest path should be UTF-8");
@@ -1033,6 +1099,9 @@ fn run_dbt_verifies_queued_self_signals() {
 // TODO-HUMAN-REVIEW(#543): validate the explicit application-mmap DBT regression.
 #[test]
 fn run_dbt_verifies_application_mmap() {
+    if dbt_unavailable("run_dbt_verifies_application_mmap") {
+        return;
+    }
     let program = dbt_mmap_guest()
         .to_str()
         .expect("DBT mmap guest path should be UTF-8");
@@ -1049,6 +1118,9 @@ fn run_dbt_verifies_application_mmap() {
 
 #[test]
 fn run_dbt_verifies_process_wait_lifecycle() {
+    if dbt_unavailable("run_dbt_verifies_process_wait_lifecycle") {
+        return;
+    }
     let program = dbt_wait_guest()
         .to_str()
         .expect("DBT wait guest path should be UTF-8");
@@ -1079,6 +1151,9 @@ fn run_dbt_verifies_process_wait_lifecycle() {
 // TODO-HUMAN-REVIEW(PR-723): Review DBT PID virtualization L2 coverage.
 #[test]
 fn run_dbt_virtualizes_process_identities() {
+    if dbt_unavailable("run_dbt_virtualizes_process_identities") {
+        return;
+    }
     let program = dbt_pid_guest()
         .to_str()
         .expect("DBT PID guest path should be UTF-8");
@@ -1123,6 +1198,9 @@ fn run_dbt_virtualizes_process_identities() {
 // TODO-HUMAN-REVIEW(PR-1065): Review DBT self-prlimit L2 coverage.
 #[test]
 fn run_dbt_verifies_self_prlimit() {
+    if dbt_unavailable("run_dbt_verifies_self_prlimit") {
+        return;
+    }
     let program = dbt_prlimit_self_guest()
         .to_str()
         .expect("DBT self-prlimit guest path should be UTF-8");
@@ -1148,6 +1226,9 @@ fn run_dbt_verifies_self_prlimit() {
 
 #[test]
 fn run_dbt_verifies_shell_process_lifecycle() {
+    if dbt_unavailable("run_dbt_verifies_shell_process_lifecycle") {
+        return;
+    }
     let args = [
         "run",
         "--backend",
@@ -1174,6 +1255,9 @@ fn run_dbt_verifies_shell_process_lifecycle() {
 // TODO-HUMAN-REVIEW(#689): Confirm the split-write case protects partial-read semantics.
 #[test]
 fn run_dbt_verifies_pipe_backpressure() {
+    if dbt_unavailable("run_dbt_verifies_pipe_backpressure") {
+        return;
+    }
     let args = [
         "run",
         "--backend",
@@ -1197,6 +1281,9 @@ fn run_dbt_verifies_pipe_backpressure() {
 
 #[test]
 fn run_dbt_recovers_after_failed_exec() {
+    if dbt_unavailable("run_dbt_recovers_after_failed_exec") {
+        return;
+    }
     let program = dbt_exec_failure_guest()
         .to_str()
         .expect("DBT exec-failure guest path should be UTF-8");
@@ -1221,6 +1308,9 @@ fn run_dbt_recovers_after_failed_exec() {
 }
 #[test]
 fn run_dbt_rejects_unfollowed_execveat() {
+    if dbt_unavailable("run_dbt_rejects_unfollowed_execveat") {
+        return;
+    }
     let program = dbt_execveat_guest()
         .to_str()
         .expect("DBT execveat guest path should be UTF-8");
@@ -2205,6 +2295,9 @@ fn namespace_only_rejects_every_explicit_backend() {
 
 #[test]
 fn backend_accepted_in_global_position() {
+    if dbt_unavailable("backend_accepted_in_global_position") {
+        return;
+    }
     // The global-position `--backend` (before the subcommand) must be threaded
     // through to `run` and reach the integrated DBT backend.
     let dbt_args = ["--backend", "dbt", "run", "--", "/bin/true"];
