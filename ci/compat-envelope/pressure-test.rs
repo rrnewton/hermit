@@ -4483,7 +4483,9 @@ fn display_id(cell: &CellId) -> String {
 }
 
 fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
-    const STEP_TIMEOUT_SECONDS: i64 = 5;
+    const CONTROL_STEP_TIMEOUT_SECONDS: i64 = 5;
+    const CELL_WALL_TIMEOUT_SECONDS: i64 = 30;
+    const CELL_CPU_TIMEOUT_SECONDS: i64 = 5;
     const CELL_COUNT: usize = 20;
     const MANIFEST_GUEST_CAP: usize = 4;
 
@@ -4500,8 +4502,8 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
         "job": "shared",
         "cmd": format!("printf 'build\\n' >> {}", shell_quote(&build_count.to_string_lossy())),
         "deps": [],
-        "timeout": STEP_TIMEOUT_SECONDS,
-        "cpu_timeout": STEP_TIMEOUT_SECONDS,
+        "timeout": CONTROL_STEP_TIMEOUT_SECONDS,
+        "cpu_timeout": CONTROL_STEP_TIMEOUT_SECONDS,
         "hint": {"hard_mem_max_bytes": 67108864}
     })];
     let mut cell_tags = Vec::new();
@@ -4510,6 +4512,13 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
         cell_tags.push(tag.clone());
         let output = executed.join(format!("{number:02}"));
         let status = if matches!(number, 3 | 17) { 1 } else { 0 };
+        // The sleep keeps multiple cells resident so this exercises the
+        // manifest_guest cap. Wall latency is not the invariant: a loaded host
+        // has delayed these 50 ms fixtures for more than 11 seconds before they
+        // still completed. This nested scheduler is unboxed today, so its CPU
+        // budget is declared but not enforced; the 30-second wall budget is the
+        // effective finite guard while leaving headroom for those observed
+        // dispatch stalls.
         steps.push(json!({
             "group": "cell",
             "job": format!("run-{number:02}"),
@@ -4518,8 +4527,8 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
                 shell_quote(&output.to_string_lossy())
             ),
             "deps": ["build.shared"],
-            "timeout": STEP_TIMEOUT_SECONDS,
-            "cpu_timeout": STEP_TIMEOUT_SECONDS,
+            "timeout": CELL_WALL_TIMEOUT_SECONDS,
+            "cpu_timeout": CELL_CPU_TIMEOUT_SECONDS,
             "hint": {
                 "resources": {"manifest_guest": 1},
                 "hard_mem_max_bytes": 67108864
@@ -4531,8 +4540,8 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
         "job": "summarize",
         "cmd": "true",
         "deps": cell_tags,
-        "timeout": STEP_TIMEOUT_SECONDS,
-        "cpu_timeout": STEP_TIMEOUT_SECONDS,
+        "timeout": CONTROL_STEP_TIMEOUT_SECONDS,
+        "cpu_timeout": CONTROL_STEP_TIMEOUT_SECONDS,
         "hint": {"hard_mem_max_bytes": 67108864}
     }));
     let dag = dag_from_json(
@@ -4555,9 +4564,10 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
     // every resource-capped cell wave, and the summary, then retain one step
     // budget for scheduler/process bookkeeping instead of relying on the
     // fixture's current 50 ms commands.
-    let declared_critical_path_seconds =
-        STEP_TIMEOUT_SECONDS * i64::try_from(cell_waves + 2).unwrap();
-    let run_timeout_seconds = declared_critical_path_seconds + STEP_TIMEOUT_SECONDS;
+    let declared_critical_path_seconds = CONTROL_STEP_TIMEOUT_SECONDS * 2
+        + CELL_WALL_TIMEOUT_SECONDS * i64::try_from(cell_waves).unwrap();
+    let run_timeout_seconds =
+        declared_critical_path_seconds + CONTROL_STEP_TIMEOUT_SECONDS;
     let execution = with_execution_root(scratch, || {
         execute_typed_dag(
             &dag,
