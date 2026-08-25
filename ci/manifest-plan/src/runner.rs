@@ -663,9 +663,30 @@ struct SabrePathRecord {
 pub struct CellResult {
     pub schema: u64,
     pub run_id: String,
+    /// HEAD of the CHECKOUT the harness ran in. NOT the provenance of the
+    /// binary that produced this measurement, despite the name.
+    ///
+    /// The harness cannot learn a binary's provenance from a path, and
+    /// `hermit_bin` defaults to `target/debug/hermit` -- whatever file happens
+    /// to be there. During any rebase-and-rerun loop the checkout moves and the
+    /// binary does not, so this names a commit that never built the artifact.
+    /// Read [`CellResult::binary_build_sha`] for that; read this only as "where
+    /// the harness was standing".
     pub hermit_sha: String,
+    /// Dirtiness of that same CHECKOUT at run time -- again not a statement
+    /// about the binary, which may have been built from a different tree in a
+    /// different state.
     pub source_tree_dirty: bool,
     pub binary_sha256: Option<String>,
+    /// What the BINARY says about its own origin: the commit it was compiled
+    /// from, with a `-dirty` suffix when that tree was dirty.
+    ///
+    /// `binary_sha256` proves WHICH file ran; this says WHERE THAT FILE CAME
+    /// FROM. Together they are a complete attribution, and neither substitutes
+    /// for the other. `None` means the binary could not be asked or did not
+    /// answer recognisably -- deliberately distinct from a value, so "not
+    /// established" never reads as agreement.
+    pub binary_build_sha: Option<String>,
     pub test_sha256: String,
     pub test: String,
     pub category: String,
@@ -743,6 +764,9 @@ pub struct RunContext {
     pub run_id: String,
     pub source_sha: String,
     pub source_dirty: bool,
+    /// Provenance the hermit binary reports about itself, probed once per run.
+    /// See [`CellResult::binary_build_sha`].
+    pub binary_build_sha: Option<String>,
     pub prebuilt: bool,
     pub keep_logs: bool,
     pub run_verify_strict: bool,
@@ -775,6 +799,10 @@ impl RunContext {
         let hermit_bin = std::env::var_os("HERMIT_BIN")
             .map(PathBuf::from)
             .unwrap_or_else(|| root.join("target/debug/hermit"));
+        // Ask the binary where it came from, the same way this function already
+        // asks it what flags it supports. `source_sha` above describes the
+        // checkout; only the binary can describe the binary.
+        let binary_build_sha = probe_binary_build_sha(&hermit_bin);
         // Published main still exposes the legacy `--verify-strict` spelling;
         // the canonical-only cutover removes it and makes bare `--verify`
         // canonical.  Detect the running binary rather than keying behavior to
@@ -807,6 +835,7 @@ impl RunContext {
             run_id,
             source_sha,
             source_dirty,
+            binary_build_sha,
             prebuilt,
             keep_logs: std::env::var("E2E_KEEP_VERIFY_LOGS").as_deref() == Ok("1"),
             run_verify_strict,
@@ -1770,6 +1799,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
         hermit_sha: context.source_sha.clone(),
+        binary_build_sha: context.binary_build_sha.clone(),
         source_tree_dirty: context.source_dirty,
         binary_sha256: binary_sha,
         test_sha256: test_sha,
@@ -1834,6 +1864,7 @@ pub fn infrastructure_error_result(
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
         hermit_sha: context.source_sha.clone(),
+        binary_build_sha: context.binary_build_sha.clone(),
         source_tree_dirty: context.source_dirty,
         binary_sha256: fs::read(&context.hermit_bin)
             .ok()
@@ -1890,6 +1921,7 @@ pub fn host_inapplicable_result(
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
         hermit_sha: context.source_sha.clone(),
+        binary_build_sha: context.binary_build_sha.clone(),
         source_tree_dirty: context.source_dirty,
         binary_sha256: None,
         test_sha256: test_digest(&context.root, &cell.test).unwrap_or_default(),
@@ -2402,6 +2434,46 @@ fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Ask the hermit binary which commit it was built from.
+///
+/// `hermit --version` prints `hermit <version> (<date>, g<sha12>[-dirty])`.
+/// That revision is stamped in at compile time by `hermit-cli/build.rs`, whose
+/// own documentation says it exists "so a released binary can be traced back to
+/// a commit". It is the only provenance available that describes the artifact
+/// rather than the directory the harness is standing in, and it is strictly
+/// richer than the checkout HEAD: it carries the dirtiness of the tree the
+/// binary was BUILT from, and degrades to `unknown` rather than to a plausible
+/// wrong answer.
+///
+/// Returns the token without its `g` prefix, for example `351cd3603f7e-dirty`.
+/// `None` means the binary could not be run, exited nonzero, or printed nothing
+/// recognisable. That is deliberately a distinct outcome from any value: a
+/// provenance that could not be established must not read as one that matched.
+fn probe_binary_build_sha(program: &Path) -> Option<String> {
+    let output = Command::new(program).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_binary_build_sha(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The parsing half of [`probe_binary_build_sha`], separated from the
+/// subprocess so every outcome -- including every way of failing to establish a
+/// provenance -- is reachable in a test without a built binary on disk.
+fn parse_binary_build_sha(version_output: &str) -> Option<String> {
+    version_output.split_whitespace().find_map(|word| {
+        let word = word.trim_matches(|c: char| c == '(' || c == ')' || c == ',');
+        let rest = word.strip_prefix('g')?;
+        let sha = rest.strip_suffix("-dirty").unwrap_or(rest);
+        // `build.rs` emits the literal `unknown` when it cannot reach git. Keep
+        // it: the binary saying "I do not know" is information, and folding it
+        // into `None` would merge it with "I could not ask".
+        let recognised =
+            sha == "unknown" || (sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit()));
+        recognised.then(|| rest.to_owned())
+    })
+}
+
 fn command_help_contains(program: &Path, args: &[&str], needle: &str) -> bool {
     Command::new(program)
         .args(args)
@@ -2519,6 +2591,7 @@ mod tests {
             build_root: root.join("build"),
             run_id: "fixture".into(),
             source_sha: "0".repeat(40),
+            binary_build_sha: None,
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
@@ -2560,6 +2633,7 @@ mod tests {
             build_root: root.join("build"),
             run_id: "fixture".into(),
             source_sha: "0".repeat(40),
+            binary_build_sha: None,
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
@@ -2616,6 +2690,7 @@ mod tests {
             build_root: root.join("build"),
             run_id: "fixture".into(),
             source_sha: "0".repeat(40),
+            binary_build_sha: None,
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
@@ -2775,6 +2850,7 @@ backends_disabled:
             build_root: PathBuf::from("/repo/build"),
             run_id: "fixture".into(),
             source_sha: "0".repeat(40),
+            binary_build_sha: None,
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
@@ -2821,6 +2897,7 @@ backends_disabled:
             build_root: PathBuf::from("/repo/build"),
             run_id: "fixture".into(),
             source_sha: "0".repeat(40),
+            binary_build_sha: None,
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
@@ -3032,6 +3109,7 @@ backends_disabled:
             build_root: PathBuf::from("/repo/build"),
             run_id: "fixture".into(),
             source_sha: "0".repeat(40),
+            binary_build_sha: None,
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
@@ -3111,6 +3189,7 @@ backends_disabled:
             build_root: PathBuf::from("/repo/build"),
             run_id: "fixture".into(),
             source_sha: "0".repeat(40),
+            binary_build_sha: None,
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
@@ -3755,6 +3834,7 @@ backends_disabled:
             build_root: root.join("build"),
             run_id: "fixture".into(),
             source_sha: "0".repeat(40),
+            binary_build_sha: None,
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
@@ -3819,6 +3899,7 @@ backends_disabled:
             build_root,
             run_id: "fixture".into(),
             source_sha: "0".repeat(40),
+            binary_build_sha: None,
             source_dirty: false,
             prebuilt: true,
             keep_logs: false,
@@ -3845,5 +3926,81 @@ backends_disabled:
         fs::set_permissions(source.join("program"), fs::Permissions::from_mode(0o755)).unwrap();
         assert!(prepare_test(&context, &cell, &cell_dir).is_ok());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The binary's own revision is read out of `--version`, including the
+    /// dirty marker, which the checkout HEAD cannot supply because it describes
+    /// a different tree at a different time.
+    #[test]
+    fn binary_build_sha_is_read_from_the_version_line() {
+        assert_eq!(
+            parse_binary_build_sha("hermit 0.2.0 (2026-08-25, g351cd3603f7e-dirty)").as_deref(),
+            Some("351cd3603f7e-dirty"),
+            "a dirty build must keep saying so; that is the fact the checkout cannot supply"
+        );
+        assert_eq!(
+            parse_binary_build_sha("hermit 0.2.0 (2026-08-24, g3d85028b3bca)").as_deref(),
+            Some("3d85028b3bca")
+        );
+        // 40-hex is equally acceptable; the width is not the contract.
+        assert_eq!(
+            parse_binary_build_sha(
+                "hermit 0.2.0 (2026-08-24, g351cd3603f7e537297067e07a20c5ccf7a23c0e0)"
+            )
+            .as_deref(),
+            Some("351cd3603f7e537297067e07a20c5ccf7a23c0e0")
+        );
+    }
+
+    /// "I do not know" is a value the binary can state, and it must survive as
+    /// one rather than collapsing into "I could not ask".
+    #[test]
+    fn an_unknown_revision_is_preserved_not_dropped() {
+        assert_eq!(
+            parse_binary_build_sha("hermit 0.2.0 (2026-08-24, gunknown)").as_deref(),
+            Some("unknown")
+        );
+    }
+
+    /// Nothing recognisable must yield `None`, never a guess. A provenance that
+    /// could not be established must not be reported as one that matched.
+    #[test]
+    fn unrecognisable_version_output_establishes_nothing() {
+        for text in [
+            "",
+            "hermit 0.1",
+            "hermit 0.2.0",
+            // The Buck build derives its version elsewhere and prints no g-token.
+            "fbsource: rABC123, fbpkg: hermit:42",
+            // A g-word that is not a revision.
+            "hermit 0.2.0 (2026-08-24, gzzzz)",
+            "some general text with git in it",
+        ] {
+            assert_eq!(
+                parse_binary_build_sha(text),
+                None,
+                "must not invent a provenance from {text:?}"
+            );
+        }
+    }
+
+    /// The two fields answer different questions and must be independently
+    /// settable, because in practice they disagree: the checkout moves during a
+    /// rebase-and-rerun loop while the binary on disk does not.
+    #[test]
+    fn checkout_sha_and_binary_provenance_are_separate_facts() {
+        let checkout = "affda5d9840baeb60c5f5aa9c7b0ff5560e81ef3";
+        let built_from = parse_binary_build_sha("hermit 0.2.0 (2026-08-25, g351cd3603f7e-dirty)")
+            .expect("version line parses");
+        assert_ne!(
+            checkout,
+            built_from.trim_end_matches("-dirty"),
+            "the case this field exists for: the harness stood at one commit and ran a \
+             binary built from another"
+        );
+        assert!(
+            !checkout.contains("-dirty") && built_from.ends_with("-dirty"),
+            "and the checkout cannot express the build tree's dirtiness at all"
+        );
     }
 }
