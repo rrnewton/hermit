@@ -170,6 +170,29 @@ CLIPPY_WAIVERS=(
     -A clippy::type_complexity
 )
 
+# ⚠️ CLIPPY ITSELF IS A PREREQUISITE, AND ITS ABSENCE IS NOT A COMPILE FAILURE.
+# This gate compiles every rust-script with `cargo clippy`. When the component is
+# not installed for the active toolchain, cargo answers
+# "'cargo-clippy' is not installed for the toolchain 'nightly-...'" for EVERY
+# script, and the loop below reported all fifteen as "does not compile" -- a
+# claim about the code, when nothing had been compiled at all. That is exactly
+# the confusion the submodule branch further down was written to end, and it
+# recurred here for a different missing prerequisite: measured on GitHub run
+# 32814930018, where the preflight job installed rustfmt but not clippy.
+#
+# Checked ONCE, before the loop, because the answer cannot differ per script.
+# Fails CLOSED for the same reason the submodule branch does: a toolchain
+# without clippy has not established that these scripts are clean.
+if ! cargo clippy -V >"$tmp/clippy.err" 2>&1; then
+    echo "check-script-sigpipe.sh: REFUSED — \`cargo clippy\` is unavailable in this" >&2
+    echo "  toolchain, so NOT ONE script has been compiled." >&2
+    echo "  THIS IS NOT A COMPILE FAILURE and says nothing about any script." >&2
+    echo "  Install the component and re-run this gate:" >&2
+    echo "      rustup component add clippy" >&2
+    cat "$tmp/clippy.err" >&2
+    exit 2
+fi
+
 broken=()
 for source in "${entrypoints[@]}"; do
     package="$(rust-script --package "$source" 2>"$tmp/pkg.err" | tail -n1)"

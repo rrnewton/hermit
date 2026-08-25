@@ -260,8 +260,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y liblzma-dev
+      # check.script_sigpipe compiles every tracked rust-script with `cargo
+      # clippy`, so clippy is a prerequisite of THIS job and not only of the jobs
+      # that lint Hermit itself. Installing rustfmt alone made cargo answer
+      # "'cargo-clippy' is not installed" for all fifteen scripts, which the gate
+      # then reported as fifteen compile failures -- run 32814930018. Every other
+      # job in this workflow already installs both.
       - name: Rust components
-        run: rustup component add rustfmt
+        run: rustup component add clippy rustfmt
       # check.script_sigpipe compiles every tracked rust-script entrypoint, and
       # scripts/check-script-sigpipe.sh refuses without the interpreter. No
       # runner image ships it (see the strict-compat shard's note below), so the
