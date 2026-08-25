@@ -194,12 +194,24 @@ git -C <repository> cat-file -e origin/main:<required-path>
 git -C <repository> show origin/main:<required-path>
 ```
 
-For #2410, the description named four replacement paths in `dev-hermit` and
-said they had migrated first. All four were absent from current
-`dev-hermit/main`. That one check independently invalidated the deletion even
-before the new Hermit workflow caller was considered. A prerequisite verified
-when the draft was written can disappear, be renamed, or never land at all;
-re-read it at the landing tip.
+Two drafts have already failed this check:
+
+- [Hermit #2410](https://github.com/rrnewton/hermit/pull/2410) named four
+  replacement paths in `dev-hermit` and said they had migrated first. All four
+  were absent from current `dev-hermit/main`. That independently invalidated
+  the deletion even before the new Hermit workflow caller was considered.
+- [Hermit #2162](https://github.com/rrnewton/hermit/pull/2162) named coordinated
+  Reverie and LiteInst heads as part of a five-repository warnings program.
+  After fetching both repositories, neither named SHA was an ancestor of its
+  current `main`. The mechanisms had also diverged: LiteInst carried the
+  eight-root warning policy under different history, while Reverie carried none
+  of those source-level warning attributes. The stale coordination claim could
+  no longer authorize landing the Hermit snapshot; its remaining Python policy
+  was parked for an owner decision instead.
+
+A prerequisite verified when the draft was written can disappear, be renamed,
+land under different history, or never land at all. Re-read it at the landing
+tip, and compare the mechanism when ancestry differs.
 
 ### 6. A symbol absent from BOTH sides means the check cannot speak
 
