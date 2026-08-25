@@ -18,7 +18,7 @@ Every selected `verify` cell, and every seed in a selected `chaos` cell, runs th
 
 ## Denominator, and why the percentage is not comparable across changes to it
 
-Green is **280 of 5520**, which is **5.07%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
+Green is **279 of 5520**, which is **5.05%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
 
 - backends: `ptrace`, `dbt`, `kvm`, `sabre`, `liteinst`, `native`
 - modes: `chaos`, `naked`, `replay`, `verify`
