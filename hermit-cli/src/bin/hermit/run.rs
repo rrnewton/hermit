@@ -1999,37 +1999,88 @@ pub(super) fn is_elf_file(path: &Path) -> Result<bool, Error> {
     }
 }
 
+/// The guest program itself could not be started — a GUEST-SIDE fact.
+///
+/// ⚠️ THIS IS NOT A HERMIT FAILURE AND MUST NOT BE REPORTED AS ONE. Hermit worked
+/// correctly; the path it was given does not name something it can execute. The
+/// distinction matters because every gate and harness on this project decides
+/// pass/fail from `$?`, and "hermit is broken" and "you gave me a typo" demand
+/// completely different responses from a caller.
+///
+/// The conventional codes are not invented here: GNU `env`, `chroot` and
+/// `timeout` — the same convention hermit's 125 came from — reserve 127 for
+/// "command not found" and 126 for "found but not executable".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestProgramFault {
+    /// Nothing usable at that path: 127.
+    NotFound,
+    /// It exists but cannot be executed as given: 126.
+    NotExecutable,
+}
+
+impl GuestProgramFault {
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Self::NotFound => 127,
+            Self::NotExecutable => 126,
+        }
+    }
+
+    pub fn class(self) -> &'static str {
+        match self {
+            Self::NotFound => "guest-program-not-found",
+            Self::NotExecutable => "guest-program-not-executable",
+        }
+    }
+}
+
+impl std::fmt::Display for GuestProgramFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotFound => "guest program not found",
+            Self::NotExecutable => "guest program not executable",
+        })
+    }
+}
+
+impl std::error::Error for GuestProgramFault {}
+
 fn validate_executable(
     path: &Path,
     requested: &Path,
     guest_root: Option<&Path>,
 ) -> Result<(), Error> {
-    let metadata = fs::metadata(path).with_context(|| {
-        format!(
-            "Program {} does not exist or is not accessible. Check the path and any --mount or \
-             --bind target.",
-            requested.display()
-        )
-    })?;
+    let metadata = fs::metadata(path)
+        .with_context(|| {
+            format!(
+                "Program {} does not exist or is not accessible. Check the path and any --mount \
+                 or --bind target.",
+                requested.display()
+            )
+        })
+        .map_err(|error| error.context(GuestProgramFault::NotFound))?;
     if metadata.is_dir() {
-        anyhow::bail!(
+        return Err(anyhow::anyhow!(
             "Program {} is a directory; provide the path to an executable file",
             requested.display()
-        );
+        )
+        .context(GuestProgramFault::NotExecutable));
     }
     if !metadata.is_file() {
-        anyhow::bail!(
+        return Err(anyhow::anyhow!(
             "Program {} is not a regular executable file",
             requested.display()
-        );
+        )
+        .context(GuestProgramFault::NotExecutable));
     }
     if metadata.permissions().mode() & 0o111 == 0 {
-        anyhow::bail!(
+        return Err(anyhow::anyhow!(
             "Program {} is not executable. Add execute permission (for example, `chmod +x {}`) \
              or select another file.",
             requested.display(),
             requested.display()
-        );
+        )
+        .context(GuestProgramFault::NotExecutable));
     }
 
     if let Some(interpreter) = shebang_interpreter(path) {
