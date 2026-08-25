@@ -1415,9 +1415,35 @@ land on no information at all.
 | hermit#2588 | `UNKNOWN/UNKNOWN` at t+0, +20, +40, +60, +85, +110, +135s |
 
 ⚠️ **And then hermit#2588 MERGED — at 17:41:08Z, merge commit `7ee6853ede0d` —
-while `mergeable` still read `UNKNOWN`, which it still reads on the merged pull
-request.** So the field is not merely slow. It can stay `UNKNOWN` through a
-successful merge and afterwards. A lander that waits for `MERGEABLE` before
+while `mergeable` had read `UNKNOWN` right up to that point.** So the field is not
+merely slow. It can stay `UNKNOWN` through a successful merge.
+
+> **Correction, and the reasoning matters more than the fix.** This paragraph
+> originally also said the field *"still reads `UNKNOWN` on the merged pull
+> request"*, and treated that as part of the evidence. It is not evidence.
+> **A closed pull request has no mergeability left to compute, so GitHub returns
+> `null` for every one of them.** Measured: 12 of 12 most-recently-merged PRs in
+> this repository read `mergeable=null, mergeable_state=unknown`. An observation
+> that appears in *every* case distinguishes nothing — it would look identical
+> whether or not the claim being made were true, so it cannot support the claim.
+> The reading was correct and the inference from it was empty.
+>
+> The diagnostic evidence is the row above it: the poll sequence taken **while the
+> pull request was still open** — `UNKNOWN` at t+0, +20, +40, +60, +85, +110 and
+> +135s, and then a clean merge. That sequence could have come out otherwise, and
+> that is what makes it evidence.
+>
+> This is the same error as a string already present at the merge base being cited
+> as proof a change added it, and as counting a population without splitting it by
+> whether the rule applies. In all three the observation is real and the inference
+> is unsupported, because the observation was never capable of coming out the
+> other way. **Before citing a measurement, ask what it would have looked like if
+> the claim were false. If the answer is "the same", it is not evidence.**
+>
+> A second instance was offered during review — hermit#2587 *"also merged while
+> `UNKNOWN`"* — and it was the same mistake, by the reviewer rather than the
+> author. Recorded because the error survived one round of review by being
+> repeated in it. A lander that waits for `MERGEABLE` before
 acting would have waited forever on a head that merged cleanly; a lander that
 read `UNKNOWN` as `CONFLICTING` would have reported a conflict that did not
 exist.
