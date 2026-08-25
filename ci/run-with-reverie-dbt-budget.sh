@@ -25,7 +25,16 @@ fi
 # --print-pin is deliberately offline: the separate latest-main gate owns the
 # network authority, while this check prevents a pin bump from silently reusing
 # an earlier revision's clamp and measured threshold.
-# CALIBRATED FOR b0c3cfe4 BY DBT RECIPE IDENTITY. The f4152f8f evidence below
+# CALIBRATED FOR a16e3c46 BY DBT RECIPE IDENTITY. CARRY TO a16e3c46 (2026-08-25):
+# b0c3cfe4..a16e3c46 is rrnewton/reverie#490, a reverie-kvm-only change (KVM SIGCHLD
+# auto-reap). `git diff b0c3cfe4 a16e3c46 -- reverie-dbt` is EMPTY, and all three
+# recipe inputs are byte-identical by git object id:
+#     reverie-dbt/vendor/dynamorio  de352475846e -> de352475846e
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+#     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
+# so the measured effective-job-seconds budget carries unchanged. This is the same
+# no-argument-required shape as the b0c3cfe4 carry below, not a weaker one.
+# The earlier b0c3cfe4 evidence below
 # established the prior carry. CARRY TO b0c3cfe4 (2026-08-25): f4152f8f..b0c3cfe4
 # changes only reverie-memory/src/local.rs. reverie-dbt/build.rs remains blob
 # 0ff8ae24b974 and reverie-dbt/vendor/dynamorio remains de352475846e, so every
@@ -56,7 +65,7 @@ fi
 #     MAX_BUILD_SECONDS = ceil(MAX_BUILD_EFFECTIVE_JOB_SECONDS / EFFECTIVE_BUILD_JOBS)
 # so the budget already scales with width and must not be "topped up" by hand. If
 # it is ever too tight, re-measure the job-seconds; do not raise the elapsed bound.
-expected_pin=b0c3cfe4c0797445dedda93774db552edf96f62b
+expected_pin=a16e3c466a15c3746a5ef23a76d1f74e11aba935
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
