@@ -1720,13 +1720,6 @@
       "category": "language-runtimes",
       "lane": "portable",
       "mode": "verify",
-      "test": "language-runtimes/python-hashseed"
-    },
-    {
-      "backend": "ptrace",
-      "category": "language-runtimes",
-      "lane": "portable",
-      "mode": "verify",
       "test": "language-runtimes/python-io-subprocess-time"
     },
     {

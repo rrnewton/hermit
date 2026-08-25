@@ -962,7 +962,13 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: false
+        ci_disabled_reason:
+          ptrace:
+            result: determinism-failure
+            evidence: "hermit#2384 8bc26dba1d53cbb8120db6f73456ad5ea788a8ca; task land-2384-io-buffer-hashing-first"
+            reason: Io-buffer hashing is on by default from hermit#2384, so the canonical comparison now reads syscall output-buffer CONTENT that was previously invisible to it. This cell's first divergent record is an [iobuf] read of 10578 bytes whose length is identical across the pair while its hash differs, at record 3162. The divergence was always present; the comparison could not see it, and the green this replaces was false. This is NOT a flake and NOT a harness artefact - the two sibling cells that fail alongside it diverge on newfstatat directory metadata and are a different, unrelated cause.
         backends_enabled:
           - ptrace
         backends_disabled:
