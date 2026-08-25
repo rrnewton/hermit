@@ -562,6 +562,14 @@ pub struct CellResult {
     /// Syscalls completed before diverging. Same first-attempt rule.
     pub first_divergent_syscall: Option<u64>,
     pub reason: Option<String>,
+    /// Where this cell's retained evidence lives.
+    ///
+    /// Carried on the result rather than recomputed by readers: the directory
+    /// is `<result_root>/runs/<run_id>/<slug>` and the slug is built in exactly
+    /// one place (`run_cell`). A consumer that rebuilds it from `test`, `mode`
+    /// and `backend` becomes a second definition that goes stale silently, and
+    /// a path that points at nothing is worse than no path at all.
+    pub artifact_dir: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1253,18 +1261,28 @@ fn execute_process(
     }
 }
 
-pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult, String> {
+/// The one definition of where a cell's retained evidence lives.
+///
+/// Was duplicated verbatim in `run_cell` and `infrastructure_error_result`.
+/// Two copies of a path formula is how a log line ends up pointing at a
+/// directory that does not exist, so surfacing the path made collapsing them a
+/// prerequisite rather than a tidy-up.
+fn cell_artifact_dir(context: &RunContext, cell: &SelectedCell) -> PathBuf {
     let slug = format!(
         "{}-{}-{}",
         cell.id.test.replace('/', "-"),
         cell.id.mode,
         cell.id.backend.as_deref().unwrap_or("none")
     );
-    let dir = context
+    context
         .result_root
         .join("runs")
         .join(&context.run_id)
-        .join(slug);
+        .join(slug)
+}
+
+pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult, String> {
+    let dir = cell_artifact_dir(context, cell);
     let started = Instant::now();
     let binary_before = fs::read(&context.hermit_bin)
         .ok()
@@ -1455,6 +1473,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         reason = Some("Hermit binary changed while the cell was executing".into());
     }
     Ok(CellResult {
+        artifact_dir: dir.display().to_string(),
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
         hermit_sha: context.source_sha.clone(),
@@ -1516,18 +1535,9 @@ pub fn infrastructure_error_result(
     cell: &SelectedCell,
     reason: String,
 ) -> CellResult {
-    let slug = format!(
-        "{}-{}-{}",
-        cell.id.test.replace('/', "-"),
-        cell.id.mode,
-        cell.id.backend.as_deref().unwrap_or("none")
-    );
-    let dir = context
-        .result_root
-        .join("runs")
-        .join(&context.run_id)
-        .join(slug);
+    let dir = cell_artifact_dir(context, cell);
     CellResult {
+        artifact_dir: dir.display().to_string(),
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
         hermit_sha: context.source_sha.clone(),
