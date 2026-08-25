@@ -126,6 +126,46 @@ if [[ ! -f $dag ]]; then
     exit 2
 fi
 
+# ⚠️ CARRY THE LANE'S CPU BUDGET, WHICH THIS ENTRYPOINT WAS SILENTLY DROPPING.
+#
+# Shipped lane nodes declare `cpu_timeout` on 0 of 56 (portable) and 0 of 9
+# (privileged), so the budget comes entirely from the caller. scripts/validate.rs
+# supplies one — `scripts/lib/validate_plan.rs` sets the DAG-level default to
+# LANE_DEFAULT_CPU_TIMEOUT_S and calls it "the one DELIBERATE divergence". This
+# script never did, so the runner's own fallback applied instead:
+# DEFAULT_SMALL_CPU_TIMEOUT = 10 s (agent-utils/py/dagrun/model.py:47).
+#
+# The 10 s is a FALLBACK FOR A STEP THAT DECLARES NOTHING, not a limit anybody
+# chose for these nodes, and it only bites HERE:
+#   * `scripts/validate.rs --show-plan` prints cpu_s = 7200 for every lane node;
+#   * in CI this script passes --allow-cgroup-failure, and with no cgroup
+#     `cpu.stat` is unreadable so the CPU guard DOES NOT RUN AT ALL
+#     (agent-utils/py/dagrun/scheduler.py, cpu_guard docstring);
+#   * a local run boxes fail-closed, so the guard runs — against 10 s.
+# Measured 2026-08-25: `e2e.metadata` FAIL "12s, CPU-TIMEOUT >10s cpu" while
+# `target/debug/test-harness validate` alone exits 0 with "PASS: 13 YAML
+# manifests, 305 required cells"; `check.check_outcome_consumers` likewise at
+# 11.3 s CPU with both its scripts exiting 0. A targeted runner that reddens work
+# the lane passes is worse than no targeted runner.
+#
+# The DAG document format REFUSES `default_step_cpu_timeout` at the top level on
+# purpose (agent-utils/py/dagrun/io.py, UNCARRIED_CONFIG_KEYS: it is caller
+# policy, and a key the parser ignores reads exactly like one that took effect).
+# So apply it the way the format DOES carry — per step, on the steps that declare
+# nothing, leaving any declared budget alone, exactly as `effective_cpu_timeout`
+# would. The number is READ FROM validate_plan.rs rather than copied, so this
+# entrypoint cannot drift from the lane it is supposed to mirror; if that
+# constant is renamed or removed, this fails closed instead of using a stale one.
+lane_cpu_timeout=$(sed -n 's/^const LANE_DEFAULT_CPU_TIMEOUT_S: i64 = \([0-9]\{1,\}\);$/\1/p' \
+    "$ROOT_DIR/scripts/lib/validate_plan.rs")
+if [[ ! $lane_cpu_timeout =~ ^[0-9]+$ ]]; then
+    echo "run-node.sh: could not read LANE_DEFAULT_CPU_TIMEOUT_S from scripts/lib/validate_plan.rs." >&2
+    echo "            That constant is the lane's per-node CPU budget; without it this entrypoint" >&2
+    echo "            would silently fall back to the runner's 10 s default and redden nodes the" >&2
+    echo "            lane passes. Refusing rather than guessing." >&2
+    exit 2
+fi
+
 # One test inside one node: run the node's own boxing and limits over an edited
 # command. Refused in CI, refused for a multi-node selection, and never silent.
 if ((${#append[@]} > 0)); then
@@ -138,38 +178,64 @@ if ((${#append[@]} > 0)); then
         echo "run-node.sh: '--' requires exactly one node tag, got '$sel'." >&2
         exit 2
     fi
+fi
+
+quoted=""
+if ((${#append[@]} > 0)); then
     quoted=$(printf ' %q' "${append[@]}")
-    scratch_dir="$ROOT_DIR/ignored/ci/run-node"
-    mkdir -p "$scratch_dir" || {
-        echo "run-node.sh: could not create scratch dir: $scratch_dir" >&2
-        exit 2
-    }
-    scratch_dag="$scratch_dir/${lane}.${sel}.edited.json"
-    RUN_NODE_TAG="$sel" RUN_NODE_APPEND="$quoted" \
-        python3 -c '
+fi
+
+scratch_dir="$ROOT_DIR/ignored/ci/run-node"
+mkdir -p "$scratch_dir" || {
+    echo "run-node.sh: could not create scratch dir: $scratch_dir" >&2
+    exit 2
+}
+scratch_dag="$scratch_dir/${lane}.${sel}.effective.json"
+RUN_NODE_TAG="$sel" RUN_NODE_APPEND="$quoted" RUN_NODE_CPU_TIMEOUT="$lane_cpu_timeout" \
+    python3 -c '
 import json, os, sys
 
 source, destination = sys.argv[1], sys.argv[2]
 tag = os.environ["RUN_NODE_TAG"]
 extra = os.environ["RUN_NODE_APPEND"]
+budget = int(os.environ["RUN_NODE_CPU_TIMEOUT"])
 dag = json.load(open(source))
+
 def step_tag(step):
     return "{}.{}".format(step.get("group", ""), step.get("job", ""))
 
-hits = [s for s in dag["steps"] if step_tag(s) == tag]
-if len(hits) != 1:
-    sys.exit(f"run-node.sh: {len(hits)} step(s) match tag {tag!r} in {source}")
-hits[0]["cmd"] += extra
+# A step that declares its own cpu_timeout keeps it, exactly as
+# effective_cpu_timeout would; only the undeclared ones take the lane default.
+stamped = 0
+for step in dag["steps"]:
+    if not step.get("cpu_timeout"):
+        step["cpu_timeout"] = budget
+        stamped += 1
+
+edited = ""
+if extra:
+    hits = [s for s in dag["steps"] if step_tag(s) == tag]
+    if len(hits) != 1:
+        sys.exit(f"run-node.sh: {len(hits)} step(s) match tag {tag!r} in {source}")
+    hits[0]["cmd"] += extra
+    edited = hits[0]["cmd"]
+
 json.dump(dag, open(destination, "w"), indent=2)
-print(hits[0]["cmd"])
-' "$dag" "$scratch_dag" >"$scratch_dir/.cmd" || exit 2
-    dag="$scratch_dag"
+print(stamped)
+print(edited)
+' "$dag" "$scratch_dag" >"$scratch_dir/.state" || exit 2
+dag="$scratch_dag"
+stamped=$(sed -n 1p "$scratch_dir/.state")
+edited_cmd=$(sed -n 2p "$scratch_dir/.state")
+echo "run-node.sh: carried the lane CPU budget onto $stamped undeclared step(s): ${lane_cpu_timeout}s (LANE_DEFAULT_CPU_TIMEOUT_S)" >&2
+
+if [[ -n $quoted ]]; then
     echo "run-node.sh: ⚠️  EDITED NODE COMMAND — iteration evidence only, NOT the tracked node." >&2
     echo "run-node.sh: scratch DAG: $scratch_dag" >&2
-    echo "run-node.sh: $sel now runs: $(cat "$scratch_dir/.cmd")" >&2
+    echo "run-node.sh: $sel now runs: $edited_cmd" >&2
     if [[ -n ${RUN_NODE_PRINT_ONLY:-} ]]; then
         echo "run-node.sh: RUN_NODE_PRINT_ONLY set — the edited command above was NOT executed." >&2
-        cat "$scratch_dir/.cmd"
+        printf '%s\n' "$edited_cmd"
         exit 0
     fi
 fi
