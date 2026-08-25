@@ -1123,12 +1123,51 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                         result.reason.as_deref().unwrap_or("infrastructure error")
                     );
                 }
+                // A FAILURE MUST SAY ENOUGH TO BE CLASSIFIED, NOT JUST COUNTED.
+                //
+                // This line was `FAIL <cell> (verify/ptrace)` and nothing else,
+                // while `CellResult` already carried the divergence coordinates
+                // and the reason. So a bucket failure could not be sorted into a
+                // divergence class -- let alone located -- without re-running the
+                // cell, and this class is INTERMITTENT: the c-programs bucket was
+                // measured at 3 of 6 runs on the modern harness, so the
+                // re-roll is not reliably available. Every observation was
+                // costing a reproduction that might not come.
+                //
+                // PASS lines are deliberately untouched: they are the overwhelming
+                // majority and carry nothing worth saying.
+                let located = if result.outcome == "PASS" {
+                    String::new()
+                } else {
+                    let coords = [
+                        ("turn", result.first_divergent_scheduler_turn),
+                        ("vns", result.first_divergent_virtual_nanoseconds),
+                        ("rec", result.first_divergent_record),
+                        ("sys", result.first_divergent_syscall),
+                    ]
+                    .iter()
+                    .filter_map(|(k, v)| v.map(|v| format!("{k}={v}")))
+                    .collect::<Vec<_>>();
+                    // Absent coordinates are OMITTED rather than printed as
+                    // null: a cell that failed without ever reaching comparison
+                    // has no location, and an empty bracket would suggest the
+                    // lookup failed instead of that there is nothing to locate.
+                    let mut suffix = String::new();
+                    if !coords.is_empty() {
+                        suffix.push_str(&format!(" [{}]", coords.join(" ")));
+                    }
+                    if let Some(reason) = result.reason.as_deref() {
+                        suffix.push_str(&format!(" {reason}"));
+                    }
+                    suffix
+                };
                 println!(
-                    "{} {} ({}/{})",
+                    "{} {} ({}/{}){}",
                     result.outcome,
                     result.test,
                     result.mode,
-                    result.backend.as_deref().unwrap_or("native")
+                    result.backend.as_deref().unwrap_or("native"),
+                    located
                 );
                 failed |= result.outcome != "PASS";
             }
