@@ -14,20 +14,20 @@ Every selected `verify` cell, and every seed in a selected `chaos` cell, runs th
 | `dbt` | 0 | 61 | 1010 | 1071 |
 | `kvm` | 1 | 21 | 1049 | 1071 |
 | `sabre` | 57 | 86 | 928 | 1071 |
-| `liteinst` | 3 | 50 | 1018 | 1071 |
+| `liteinst` | 5 | 48 | 1018 | 1071 |
 | `native` | 0 | 33 | 324 | 357 |
-| **Total** | **301** | **373** | **5038** | **5712** |
+| **Total** | **303** | **371** | **5038** | **5712** |
 
 ## Denominator, and why the percentage is not comparable across changes to it
 
-Green is **301 of 5712**, which is **5.27%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
+Green is **303 of 5712**, which is **5.30%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
 
 - backends: `ptrace`, `dbt`, `kvm`, `sabre`, `liteinst`, `native`
 - modes: `chaos`, `naked`, `replay`, `verify`
 
-⚠️ **5038 of those 5712 cells are NOT APPLICABLE** — their backend is not enabled for their mode, so they were never asked to run and cannot pass or fail. Over the 674 cells that CAN run, green is **44.66%**.
+⚠️ **5038 of those 5712 cells are NOT APPLICABLE** — their backend is not enabled for their mode, so they were never asked to run and cannot pass or fail. Over the 674 cells that CAN run, green is **44.96%**.
 
-⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same 301 green cells measured against a smaller denominator. Nothing was fixed to produce it; it is what the first figure always meant once the cells that cannot run are excluded. Quote both or neither, and never compare one against the other as though something moved.
+⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same 303 green cells measured against a smaller denominator. Nothing was fixed to produce it; it is what the first figure always meant once the cells that cannot run are excluded. Quote both or neither, and never compare one against the other as though something moved.
 
 ⚠️ **Adding or removing a backend or mode changes this denominator and therefore the percentage, without anything about the product changing.** Removing a backend whose cells are mostly red RAISES the reported figure; adding honest red cells LOWERS it. Neither is progress. Before comparing this percentage against an earlier one, diff the two lists above: if they differ, the numbers are not comparable and the difference is not a result.
 
@@ -35,11 +35,11 @@ The mode view makes the current order of work explicit: expand `verify` first, t
 
 | Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `native` | Green | Red | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `verify` | 234 / 357 | 0 / 357 | 1 / 357 | 57 / 357 | 3 / 357 | — | 295 | 1490 | 1785 |
+| `verify` | 234 / 357 | 0 / 357 | 1 / 357 | 57 / 357 | 5 / 357 | — | 297 | 1488 | 1785 |
 | `replay` | 1 / 357 | 0 / 357 | 0 / 357 | 0 / 357 | 0 / 357 | — | 1 | 1784 | 1785 |
 | `chaos` | 5 / 357 | 0 / 357 | 0 / 357 | 0 / 357 | 0 / 357 | — | 5 | 1780 | 1785 |
 | `naked` | — | — | — | — | — | 0 / 357 | 0 | 357 | 357 |
-| **Total** | | | | | | | **301** | **5411** | **5712** |
+| **Total** | | | | | | | **303** | **5409** | **5712** |
 
 ## Cross-backend parity
 
@@ -65,4 +65,4 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | `system-utils` | 31 / 34 | 1 / 34 | 0 / 34 | 32 | 102 |
 | `util-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |
 
-Ordinary full validation executes 303 selected regression cells: the 301 green compatibility cells above (including 5 chaos-mode race-exposure checks), and 2 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
+Ordinary full validation executes 305 selected regression cells: the 303 green compatibility cells above (including 5 chaos-mode race-exposure checks), and 2 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
