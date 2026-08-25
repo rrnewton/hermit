@@ -19,6 +19,7 @@ use std::process::Command;
 use std::process::Output;
 use std::process::Stdio;
 use std::sync::Mutex;
+use std::sync::MutexGuard;
 use std::sync::OnceLock;
 
 static DBT_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -32,6 +33,14 @@ static DBT_SELF_SIGQUEUE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_INERT_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
 static EXEC_CLOCK_CONTINUITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
+
+// This lock only serializes independent child processes; a failed assertion carries no
+// protected state invariant and must not poison unrelated tests.
+fn hermit_run_guard() -> MutexGuard<'static, ()> {
+    HERMIT_RUN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn hermit(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_hermit"))
@@ -2082,9 +2091,7 @@ fn run_kvm_random_device_lseek_matches_linux() {
     if !Path::new("/dev/kvm").exists() {
         return;
     }
-    let _guard = HERMIT_RUN_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = hermit_run_guard();
     let compiler = ["cc", "gcc", "clang"]
         .into_iter()
         .find(|program| {
@@ -2357,7 +2364,7 @@ fn sabre_rpc_socket_is_hidden_from_proc_environ() {
         return;
     }
 
-    let _guard = HERMIT_RUN_LOCK.lock().unwrap();
+    let _guard = hermit_run_guard();
     let args = [
         "run",
         "--backend",
@@ -2417,7 +2424,7 @@ fn sabre_rpc_socket_ignores_host_tmpdir_hidden_by_container_tmp() {
         Path::new(env!("CARGO_TARGET_TMPDIR")).join("sabre-nested-host-tmpdir-verify.json");
     let _ = fs::remove_file(&verify_report);
 
-    let _guard = HERMIT_RUN_LOCK.lock().unwrap();
+    let _guard = hermit_run_guard();
     let args = [
         "--log=info",
         "run",
@@ -2547,7 +2554,7 @@ fn no_namespace_rejects_container_only_options() {
 
 #[test]
 fn no_namespace_runs_without_container_setup() {
-    let _guard = HERMIT_RUN_LOCK.lock().unwrap();
+    let _guard = hermit_run_guard();
     let args = [
         "run",
         "--no-namespace",
@@ -2573,7 +2580,7 @@ fn no_namespace_runs_without_container_setup() {
 
 #[test]
 fn no_namespace_preserves_affinity_for_run_and_verify() {
-    let _guard = HERMIT_RUN_LOCK.lock().unwrap();
+    let _guard = hermit_run_guard();
 
     let run_args = [
         "run",
@@ -2594,12 +2601,16 @@ fn no_namespace_preserves_affinity_for_run_and_verify() {
         "--pin-threads",
         "--max-timeslice=disabled",
         "--",
-        "/bin/sh",
-        "-c",
-        "test $(nproc) -eq 1",
+        "/usr/bin/nproc",
     ];
     let output = hermit(&verify_args);
     assert_success(&output, &verify_args);
+    assert_eq!(stdout(&output), "1\n");
+    assert!(
+        stderr(&output).contains("Determinism verified"),
+        "no-namespace verify did not complete:\n{}",
+        stderr(&output),
+    );
 }
 
 #[test]
