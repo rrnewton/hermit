@@ -199,7 +199,25 @@ fn copy_timer_slack_output<M: MemoryAccess>(
 /// immediately or enters the scheduler's `InternalIOPolling` retry path. Two pages is the
 /// pressure-mode capacity on supported x86-64 Linux hosts and, unlike 64 KiB, never requires an
 /// unprivileged capacity increase while the soft limit is active.
-const DETERMINISTIC_PIPE_CAPACITY_BYTES: i32 = 8 * 1024;
+///
+/// This is also the ceiling the guest is allowed to raise a pipe to, and the
+/// value `/proc/sys/fs/pipe-max-size` reports. Those three must be ONE constant:
+/// a pinned capacity, an advertised maximum and an enforced maximum that can
+/// drift apart are three copies of one rule, and a duplicated rule drifts in
+/// N-1 places while each copy looks right on its own.
+pub(crate) const DETERMINISTIC_PIPE_CAPACITY_BYTES: i32 = 8 * 1024;
+
+/// Whether a guest's `F_SETPIPE_SZ` request must be refused as a growth past
+/// the deterministic ceiling.
+///
+/// Separated from the handler so the BOUNDARY is testable without a guest. The
+/// boundary is the whole content of this rule: a request for exactly the pinned
+/// capacity must be allowed, or hermit's own pin value becomes unreachable to a
+/// guest that reads `/proc/sys/fs/pipe-max-size` and asks for precisely what it
+/// was told.
+pub(crate) fn pipe_capacity_request_exceeds_ceiling(requested: i32) -> bool {
+    requested > DETERMINISTIC_PIPE_CAPACITY_BYTES
+}
 
 /// Why the pin failed, and which descriptors Linux had already created when it did.
 ///
@@ -2580,6 +2598,37 @@ impl<T: RecordOrReplay> Detcore<T> {
                 })?;
                 Ok(result)
             }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-2568): Review refusing guest pipe growth.
+            // Raising a pipe above the pinned capacity is the ONE syscall that
+            // defeats the pin, and whether it succeeds is decided by the host's
+            // `/proc/sys/fs/pipe-max-size`. On a default host (1 MiB ceiling)
+            // the guest gets a 1048576-byte pipe; on a hardened host (64 KiB)
+            // the identical guest gets EPERM and keeps 8192. Same binary, same
+            // `--strict`, guest-visible return value and pipe capacity decided
+            // by a host sysctl -- a determinism leak by this project's own
+            // definition, and it survived because the capacity pin was applied
+            // at creation and never defended afterwards.
+            //
+            // Refuse deterministically instead of asking Linux. EPERM is the
+            // errno Linux itself returns when that ceiling binds, so the guest
+            // sees a shape it must already handle rather than a novel one, and
+            // it is the answer the hardened host would have given.
+            //
+            // SHRINKING IS DELIBERATELY LEFT ALONE. It is always permitted for
+            // an unprivileged process, it is process-local with no host-derived
+            // input, and `tests/backend-parity/fixtures/pipe_capacity.c` locks
+            // it as a guest-visible contract: that fixture shrinks to one page
+            // and requires the value to round-trip. Clamping every
+            // `F_SETPIPE_SZ` to the pinned capacity would break that contract
+            // while fixing nothing that is actually nondeterministic.
+            F_SETPIPE_SZ(requested) if pipe_capacity_request_exceeds_ceiling(requested) => {
+                trace!(
+                    "[detcore] refusing F_SETPIPE_SZ({}) above the deterministic pipe ceiling {}",
+                    requested, DETERMINISTIC_PIPE_CAPACITY_BYTES
+                );
+                Err(Errno::EPERM.into())
+            }
             _ => {
                 trace!(
                     "[detcore-finishme]: fcntl unhandled cases: {:?}",
@@ -4135,6 +4184,52 @@ mod test {
     use reverie::syscalls::Whence;
 
     use super::DETERMINISTIC_PIPE_CAPACITY_BYTES;
+    use super::pipe_capacity_request_exceeds_ceiling;
+
+    /// The ceiling is inclusive. A guest that reads the advertised
+    /// `pipe-max-size` and asks for exactly that must be allowed to have it;
+    /// refusing at the boundary would advertise a size that cannot be set.
+    #[test]
+    fn the_pipe_ceiling_admits_exactly_the_pinned_capacity() {
+        assert!(!pipe_capacity_request_exceeds_ceiling(
+            DETERMINISTIC_PIPE_CAPACITY_BYTES
+        ));
+        assert!(!pipe_capacity_request_exceeds_ceiling(
+            DETERMINISTIC_PIPE_CAPACITY_BYTES - 1
+        ));
+        assert!(pipe_capacity_request_exceeds_ceiling(
+            DETERMINISTIC_PIPE_CAPACITY_BYTES + 1
+        ));
+    }
+
+    /// Shrinking stays legal. `tests/backend-parity/fixtures/pipe_capacity.c`
+    /// shrinks to one page and requires the value to round-trip, so a blanket
+    /// clamp to the pinned capacity would break a guest-visible contract this
+    /// repository already locked.
+    #[test]
+    fn shrinking_is_never_refused_by_the_ceiling() {
+        for requested in [1, 4096, DETERMINISTIC_PIPE_CAPACITY_BYTES / 2] {
+            assert!(
+                !pipe_capacity_request_exceeds_ceiling(requested),
+                "shrink to {requested} must remain permitted"
+            );
+        }
+    }
+
+    /// The host's own ceiling is the value this change exists to stop
+    /// consulting: 1048576 on a default host, 65536 on a hardened one. Both are
+    /// refused now, so the guest-visible answer no longer depends on which host
+    /// it is.
+    #[test]
+    fn host_ceilings_are_refused_identically_on_any_host() {
+        for host_ceiling in [65536, 1048576] {
+            assert!(
+                pipe_capacity_request_exceeds_ceiling(host_ceiling),
+                "{host_ceiling} must be refused regardless of the host sysctl"
+            );
+        }
+    }
+
     use super::Errno;
     use super::TimerSlackBinding;
     use super::UNIX_AUTOBIND_NAME_LEN;
