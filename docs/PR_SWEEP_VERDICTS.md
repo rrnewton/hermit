@@ -1396,6 +1396,59 @@ placed in the BUILD cannot be forgotten or enumerated wrong, whereas the same
 guarantee in a test can be both. A diagnostic cannot be moved into the build, so
 here the remedy is the checklist above rather than a stronger mechanism.
 
+## `mergeable` is THREE-VALUED, and the third value is not an answer
+
+`gh pr view --json mergeable` returns `MERGEABLE`, `CONFLICTING`, or **`UNKNOWN`**
+(the REST field is `null`). GitHub computes mergeability *lazily*: the query does
+not read a stored verdict so much as ask for one to be produced, so the first
+read after a push is expected to be `UNKNOWN` and says nothing about the head.
+
+**Both ways of collapsing the third value are wrong.** Treat `UNKNOWN` as
+"cannot merge" and you block a head that is fine. Treat it as "can merge" and you
+land on no information at all.
+
+**Measured 2026-08-25, two heads polled at the same moment:**
+
+| PR | observed |
+| --- | --- |
+| hermit#2587 | `UNKNOWN/UNKNOWN` at t+0s, `MERGEABLE/CLEAN` by t+20s |
+| hermit#2588 | `UNKNOWN/UNKNOWN` at t+0, +20, +40, +60, +85, +110, +135s |
+
+⚠️ **And then hermit#2588 MERGED — at 17:41:08Z, merge commit `7ee6853ede0d` —
+while `mergeable` still read `UNKNOWN`, which it still reads on the merged pull
+request.** So the field is not merely slow. It can stay `UNKNOWN` through a
+successful merge and afterwards. A lander that waits for `MERGEABLE` before
+acting would have waited forever on a head that merged cleanly; a lander that
+read `UNKNOWN` as `CONFLICTING` would have reported a conflict that did not
+exist.
+
+Do not poll it unboundedly and do not infer from it. When it matters, **answer
+the question locally instead** — this needs no API and works from a
+proxy-blocked box:
+
+```console
+git fetch -q <remote> refs/heads/<branch>:h refs/heads/main:m
+git merge-tree --write-tree m h >/dev/null && echo MERGES-CLEAN || echo CONFLICTS
+```
+
+That computes the same thing GitHub is computing, from objects you already have,
+with an exit status you can read directly. `mergeable` is then a convenience to
+be believed when it says `MERGEABLE` or `CONFLICTING`, and ignored when it does
+not.
+
+⚠️ **It also goes BACKWARDS, so a good reading is not durable either.**
+hermit#2587 read `MERGEABLE/CLEAN` at t+20s and `UNKNOWN/UNKNOWN` again a few
+minutes later, because `main` had advanced (`1417d7ce`) and invalidated the
+computation. On a repository where main churns roughly one commit every two and
+a half minutes, a `MERGEABLE` you fetched a minute ago describes a base that no
+longer exists. The local check does not have this problem: run at that same
+moment against the same two refs it returned MERGES-CLEAN, definitively, in one
+command. Cross-checked exactly this way while writing this section.
+
+Related: `mergeStateStatus` carries the same third value (`UNKNOWN`) and the same
+caveat. And note the separate trap in the other direction — a head does not need
+rebasing to be mergeable; see the two-commits-behind case below.
+
 ## Landing a two-lane head: the ordering
 
 ⚠️ **Deliberately not a numbered check.** Numbered additions collide by
