@@ -16,6 +16,7 @@
     "check.backend_parity_suites",
     "check.portability_paths",
     "check.dagrun_naming",
+    "check.run_node_args",
     "check.check_outcome_consumers",
     "check.script_sigpipe",
     "lint.rustfmt"
