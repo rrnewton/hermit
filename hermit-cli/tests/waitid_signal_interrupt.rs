@@ -219,10 +219,7 @@ fn run_bounded_with_limits(
         // kernel restart, so guest exit alone cannot distinguish old from new.
         // INFO exposes each guest-visible wait4 entry while the narrower TRACE
         // filter retains the bounded retry diagnostics.
-        command.env(
-            "RUST_LOG",
-            "detcore=info,detcore::syscalls::threads=trace",
-        );
+        command.env("RUST_LOG", "detcore=info,detcore::syscalls::threads=trace");
     } else if trace_retries {
         command.env("RUST_LOG", "detcore::syscalls::threads=trace");
     } else {
@@ -553,12 +550,7 @@ fn wait4_keeps_a_guest_blocked_sibling_signal_pending() {
         backstop: Duration::from_secs(8),
         max_stderr_events_per_tick: 64,
     };
-    let run = run_bounded_with_limits(
-        &["--wait4-live-sibling-signal-blocked"],
-        true,
-        None,
-        limits,
-    );
+    let run = run_bounded_with_limits(&["--wait4-live-sibling-signal-blocked"], true, None, limits);
     assert!(
         run.status.success(),
         "hermit exited with {}\nguest stdout:\n{}\nhermit stderr:\n{}",
