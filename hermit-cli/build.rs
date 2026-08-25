@@ -32,6 +32,23 @@ fn main() {
     println!("cargo:rustc-env=HERMIT_BUILD_GIT_SHA={sha}");
     println!("cargo:rustc-env=HERMIT_BUILD_DATE={date}");
 
+    // EMBED THE REVERIE PIN THIS BINARY WAS BUILT AGAINST.
+    //
+    // The staged LiteInst/DBT runtimes are built separately and can be
+    // ARBITRARILY STALE relative to the pin the tree declares, with nothing
+    // reporting it. A cell then measures whichever `.so` happens to be on disk
+    // and publishes a verdict about the pin it believes it is testing.
+    //
+    // Embedding the pin here is what lets the loader compare, at the moment it
+    // resolves a staged runtime, the revision the runtime was built from against
+    // the revision this binary was built from. Provenance recorded beside the
+    // artifact is not enough on its own -- `sabre.revision` has been written for
+    // some time and is read by nothing, which is provenance rather than
+    // authority.
+    let reverie_pin = build_support::reverie_pin();
+    println!("cargo:rustc-env=HERMIT_REVERIE_PIN={reverie_pin}");
+    println!("cargo:rerun-if-changed=../detcore/Cargo.toml");
+
     // Re-run when the checked-out revision or index moves. Arbitrary tracked
     // worktree files are intentionally not added as explicit watches: avoiding
     // one Cargo dependency per file keeps incremental builds fast, and staging

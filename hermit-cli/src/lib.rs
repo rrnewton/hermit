@@ -496,7 +496,62 @@ fn dbt_runtime_unavailable_reason() -> Option<String> {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#688): Review LiteInst runtime discovery.
+/// Refuse a staged LiteInst runtime that was not built from the pin this binary
+/// was built from.
+///
+/// ⚠️ THE STAGED RUNTIME CAN BE ARBITRARILY STALE AND NOTHING REPORTED IT. Two
+/// independent causes, both silent: `hermit-install/build.rs` did not list the
+/// pin-carrying manifests among its rerun triggers, so a pin bump left the
+/// script "fresh"; and staging only runs under `PROFILE == release`, while the
+/// e2e harness runs `target/debug/hermit`, so the ordinary loop never restaged.
+/// The first is fixed at the trigger list. THIS is the guard for the second and
+/// for any third cause nobody has found: it does not care WHY the artifact is
+/// stale, only that it is.
+///
+/// A verdict produced against a stale runtime is a measurement of the old binary
+/// published as a statement about the new pin. That is worse than a failure,
+/// because it is a green.
+fn liteinst_runtime_pin_matches(path: &Path) -> io::Result<()> {
+    let expected = env!("HERMIT_REVERIE_PIN");
+    if expected == "unknown" {
+        // The build could not read the pin. Say nothing rather than assert a
+        // match we cannot establish.
+        return Ok(());
+    }
+    let marker = path.with_extension("so.revision");
+    let staged = match fs::read_to_string(&marker) {
+        Ok(text) => text.trim().to_owned(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "the staged LiteInst runtime {} records no Reverie revision, so it cannot be \
+                     shown to match the pin this binary was built from ({expected}). It was staged \
+                     by a build that predates revision recording, which is exactly the case where a \
+                     stale runtime went unnoticed. Restage it with `cargo build --release -p \
+                     hermit-install` -- staging is release-only.",
+                    path.display()
+                ),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    if staged != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "the staged LiteInst runtime {} was built from Reverie {staged}, but this binary \
+                 was built from {expected}. Running it would measure the OLD runtime and report a \
+                 verdict about the NEW pin. Restage with `cargo build --release -p hermit-install`.",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_liteinst_runtime_library(path: &Path) -> io::Result<PathBuf> {
+    liteinst_runtime_pin_matches(path)?;
     let bytes = fs::read(path).map_err(|error| {
         io::Error::new(
             error.kind(),
