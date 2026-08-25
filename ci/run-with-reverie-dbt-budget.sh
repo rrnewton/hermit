@@ -71,15 +71,49 @@ expected_pin=b0c3cfe4c0797445dedda93774db552edf96f62b
 recorded_pin=$(
     "$ROOT_DIR/ci/run-reverie-pin-check.sh" --repo "$ROOT_DIR" --print-pin
 )
+
+# ⚠️ A REFUSAL EXITS 75 (EX_TEMPFAIL), NOT 2, AND THE DIFFERENCE IS THE WHOLE
+# POINT OF THIS BLOCK.
+#
+# `scripts/validate.rs` defines NO_RESULT_EXIT_CODE = 75 as "the only nonzero
+# code that is not a product failure" -- a completed node saying it COULD NOT
+# DETERMINE ITS CONDITION. That is exactly what this wrapper is when it declines:
+# it never invoked the command, so it has measured nothing and has no verdict to
+# offer about the tree.
+#
+# Every layer above already distinguishes 75 and needs no change:
+#     ledger_gate_result   75 -> "no_result", not "fail"
+#     ledger_run_results   no_results>0 -> run result "no_result", NEVER "pass"
+#     print_cost_table     renders "NO_RESULT", a distinct status from ok/FAIL
+#
+# THIS DOES NOT MAKE A REFUSAL QUIETER, and it cannot restore a false green.
+# ci-hub/lib/qualifying_receipt.rs refuses a receipt on `result != "pass"` AND
+# separately on `executed_tests == 0`; a declining wrapper trips both. no_result
+# is strictly LESS green than fail, not more.
+#
+# WHAT IT STOPS BEING CONFUSED WITH, measured on this repository:
+#     a genuine compile failure exits 101 -- cargo's code, passed through by the
+#     `exec` below, verified: wrapping `exit 0|2|101` returns 0|2|101 unchanged
+#     a refusal exited 2, a code nothing else on these 17 nodes produces
+# Both were recorded as gate result "fail" with a bare `exit N` reason, so a node
+# that compiled nothing was indistinguishable in the ledger from one that compiled
+# and broke. The 2026-08-25 red at 323a87d1da5f was read as two failing builds by
+# three separate reports; it was this wrapper declining, because that branch
+# declared pin f4152f8f while its wrapper still expected 13cf8bcb.
+#
+# The `$# == 0` usage error above deliberately KEEPS exit 2: a caller that passed
+# no command is a caller bug, not a node that declined, and it should stay loud.
+DECLINED_EXIT_CODE=75
+
 if [[ ! $recorded_pin =~ ^[0-9a-f]{40}$ ]]; then
     echo "run-with-reverie-dbt-budget.sh: --print-pin did not yield a 40-hex revision; got ${#recorded_pin} char(s): ${recorded_pin:0:80}" >&2
-    echo "run-with-reverie-dbt-budget.sh: NOT RUNNING '$*' against an unidentified Reverie pin" >&2
-    exit 2
+    echo "run-with-reverie-dbt-budget.sh: DECLINED (no_result, exit $DECLINED_EXIT_CODE): NOT RUNNING '$*' against an unidentified Reverie pin. Nothing was built or tested, so this node has no verdict about the tree." >&2
+    exit "$DECLINED_EXIT_CODE"
 fi
 if [[ $recorded_pin != "$expected_pin" ]]; then
     echo "run-with-reverie-dbt-budget.sh: no calibrated budget for Reverie pin $recorded_pin (expected $expected_pin)" >&2
-    echo "run-with-reverie-dbt-budget.sh: NOT RUNNING '$*'. To recalibrate, confirm reverie-dbt/vendor/dynamorio and reverie-dbt/build.rs are unchanged and CMAKE/CMAKE_GENERATOR select the same tooling between the pins, then update expected_pin here." >&2
-    exit 2
+    echo "run-with-reverie-dbt-budget.sh: DECLINED (no_result, exit $DECLINED_EXIT_CODE): NOT RUNNING '$*'. Nothing was built or tested, so this node has no verdict about the tree -- it is NOT a build failure. To recalibrate, confirm reverie-dbt/vendor/dynamorio and reverie-dbt/build.rs are unchanged and CMAKE/CMAKE_GENERATOR select the same tooling between the pins, then update expected_pin here." >&2
+    exit "$DECLINED_EXIT_CODE"
 fi
 REVERIE_DBT_BUDGET_BOUND_PIN=$recorded_pin
 export REVERIE_DBT_BUDGET_BOUND_PIN
