@@ -876,6 +876,51 @@ ownership**; this one says **the main diff is not the change**. Both are cases
 where the view you reach for first is the wrong one, and both fail silently.
 
 
+### 16. Split the population by whether the rule APPLIES, before counting violations
+
+**Counting a population without splitting it by whether the rule applies is the
+same error as counting green cells without asking whether they were measured.**
+Both produce a large, alarming, technically-true number about a set that was
+never obliged to satisfy the thing you counted.
+
+**Measured 2026-08-25.** Asking whether the required adversarial-review set is
+enforced, over the 30 most recently merged pull requests:
+
+| reading | count | what it looked like |
+| --- | ---: | --- |
+| no `APPROVED-AT` line anywhere | 27 of 30 | "90% of landings bypass review" |
+| …of those, **not triggered** at all | 28 of 30 | the protocol working exactly as designed |
+| genuinely triggered | **2** | the only rows the rule speaks to |
+
+`post-facto-human-review` applies to a specific trigger set. Twenty-eight of
+those merges were never required to carry an adversarial review, so their
+absence of one is compliance, not evasion. The real denominator was **2**, and
+the alarming 27 was an artefact of counting a rule's violations across rows the
+rule does not govern.
+
+**And the second half of the same mistake: measure the property, not the token
+that usually spells it.** That scan keyed on the literal string `APPROVED-AT:`.
+hermit#2370 does not use it — it carries a full adversarial review ending
+`**approve** — bound to exact head 19ab6f8b4287…`, which *is* the head that
+merged. It was properly reviewed and the scan called it unreviewed. One of the
+two remaining rows was a false positive, leaving exactly one real instance.
+
+```console
+# WRONG — counts the token, over every row
+gh api ... | grep -c 'APPROVED-AT:'
+
+# RIGHT — restrict to rows the rule governs, then match the property
+#   1. filter to triggered PRs (the post-facto-human-review label)
+#   2. accept ANY verdict bound to the exact head, however spelled
+#   3. compare the bound sha against the sha that MERGED, not against the branch
+```
+
+This is the same shape as check 13 (an absent symbol may be a rename) and
+check 12 (a comparison over nothing is not agreement). In all three the
+mechanism was present and the *predicate* was wrong — a name, an empty set, a
+spelling. A check whose predicate is a string will keep exiting 0 while
+measuring something nobody asked about.
+
 ## Verdict vocabulary
 
 | verdict | meaning | action |
