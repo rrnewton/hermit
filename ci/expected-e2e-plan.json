@@ -12,6 +12,13 @@
       "category": "applications",
       "lane": "portable",
       "mode": "verify",
+      "test": "applications/git-repository-workflow"
+    },
+    {
+      "backend": "ptrace",
+      "category": "applications",
+      "lane": "portable",
+      "mode": "verify",
       "test": "applications/timed-progress-bar"
     },
     {
@@ -1556,6 +1563,41 @@
     },
     {
       "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress/order-violation"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress/process-chains"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress/thread-contention"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "chaos",
+      "test": "determinism-stress/thread-interleaving"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress/thread-output"
+    },
+    {
+      "backend": "ptrace",
       "category": "determinism-stress-c",
       "lane": "portable",
       "mode": "verify",
@@ -1602,41 +1644,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "determinism-stress-c/thread-contention"
-    },
-    {
-      "backend": "ptrace",
-      "category": "determinism-stress",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "determinism-stress/order-violation"
-    },
-    {
-      "backend": "ptrace",
-      "category": "determinism-stress",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "determinism-stress/process-chains"
-    },
-    {
-      "backend": "ptrace",
-      "category": "determinism-stress",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "determinism-stress/thread-contention"
-    },
-    {
-      "backend": "ptrace",
-      "category": "determinism-stress",
-      "lane": "portable",
-      "mode": "chaos",
-      "test": "determinism-stress/thread-interleaving"
-    },
-    {
-      "backend": "ptrace",
-      "category": "determinism-stress",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "determinism-stress/thread-output"
     },
     {
       "backend": "ptrace",

@@ -1598,7 +1598,16 @@ fn check_tracked(root: &Path) -> Result<Derived, String> {
     let derived = derive(root)?;
     let expected_scorecard = render_scorecard(&derived);
     compare_file(&root.join(SCORECARD), &expected_scorecard)?;
-    let cells = tracked_from(&derived, load_existing(root)?, false, false)?;
+    let mut cells = tracked_from(&derived, load_existing(root)?, false, false)?;
+    // The WRITE path applies this before serialising (see `update_tracked`), so the READ path
+    // must too or the two derive different bytes from the same inputs and `check` reports a
+    // staleness that `update` cannot clear. Measured 2026-08-25: `update` was a fixed point --
+    // three consecutive runs left cells.json byte-identical and exited 0 -- while `check`
+    // exited 2 every time telling the operator to run `update`. That made gate.manifest
+    // UNSATISFIABLE, and because the gate truncates the lane it took 58 nodes with it on every
+    // run. The asymmetry only became reachable once observations were non-empty for the first
+    // time, which is why it appeared tonight rather than when it was introduced.
+    refresh_measurement(&mut cells);
     compare_file(&root.join(CELLS), &encoded_cells(&cells)?)?;
     Ok(derived)
 }
