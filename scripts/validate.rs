@@ -1868,6 +1868,27 @@ cleared-caps refusal names {} starved step(s)",
         if manifest_consumers.is_empty() {
             return Err("full-plan bracket: no manifest consumers were inspected".into());
         }
+        let manifest_tags = manifest_consumers
+            .iter()
+            .map(|step| step.tag())
+            .collect::<BTreeSet<_>>();
+        let scorecard_deps = full
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "scorecard.compatibility")
+            .ok_or("full-plan bracket: compatibility scorecard disappeared")?
+            .deps
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if scorecard_deps != manifest_tags {
+            return Err(format!(
+                "full-plan bracket: compatibility scorecard does not depend on every manifest result node: expected={manifest_tags:?}, actual={scorecard_deps:?}"
+            ));
+        }
+        let mut results_paths = BTreeSet::new();
+        let mut junit_paths = BTreeSet::new();
         let mut spelling_probe = (*manifest_consumers[0]).clone();
         spelling_probe.cmd = "changed invocation text".into();
         if validation_step_identity(&spelling_probe) != ValidationStepIdentity::ManifestRun {
@@ -1876,6 +1897,42 @@ cleared-caps refusal names {} starved step(s)",
             );
         }
         for consumer in manifest_consumers {
+            let lane = if consumer.cmd.contains("--lane portable ") {
+                "portable"
+            } else if consumer.cmd.contains("--lane privileged ") {
+                "privileged"
+            } else {
+                return Err(format!(
+                    "full-plan bracket: {} manifest consumer has no exact lane selector: {}",
+                    consumer.tag(), consumer.cmd
+                ));
+            };
+            let result_path = format!(
+                "\"$E2E_RESULT_ROOT/{lane}/{}/results.jsonl\"",
+                consumer.job
+            );
+            let junit_path = format!(
+                "\"$E2E_RESULT_ROOT/{lane}/{}/junit.xml\"",
+                consumer.job
+            );
+            if consumer.cmd.matches("--results").count() != 1
+                || !consumer.cmd.contains(&format!("--results {result_path}"))
+                || !results_paths.insert(result_path)
+            {
+                return Err(format!(
+                    "full-plan bracket: {} does not have one unique result path: {}",
+                    consumer.tag(), consumer.cmd
+                ));
+            }
+            if consumer.cmd.matches("--junit").count() != 1
+                || !consumer.cmd.contains(&format!("--junit {junit_path}"))
+                || !junit_paths.insert(junit_path)
+            {
+                return Err(format!(
+                    "full-plan bracket: {} does not have one unique JUnit path: {}",
+                    consumer.tag(), consumer.cmd
+                ));
+            }
             if !consumer.cmd.starts_with("./ci/run-with-hermit-e2e-artifact.sh ") {
                 return Err(format!(
                     "full-plan bracket: {} still consumes a mutable Hermit path: {}",
