@@ -953,9 +953,25 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Emit the `[heap]` record from the observed program break, for backends
     /// where the kernel does not label the guest's heap.
     ///
-    /// Reports the enclosing anonymous mapping so the record carries the real
-    /// procfs columns and is textually comparable with the labelled record
-    /// another backend produces for the same guest.
+    /// Reports `[start_brk, brk)` -- the range Detcore observed -- taking the
+    /// non-address columns from the enclosing anonymous mapping, so the record
+    /// is textually comparable with the labelled record another backend
+    /// produces for the same guest.
+    ///
+    /// ⚠️ THE EXTENT IS THE OBSERVED BREAK, NOT THE MAPPING THAT CONTAINS IT,
+    /// and the two are not the same region. The selector below admits any
+    /// anonymous mapping with `address.0 <= start && end <= address.1`, which
+    /// is a SUPERSET by construction. Reporting that mapping instead would make
+    /// the comparability claim above true only when the arena happens to
+    /// coincide with the break, and would fold non-heap bytes into the digest.
+    /// On the backend this path exists for, the premise is that the LOADER owns
+    /// the break, so those extra bytes are loader arena -- the least
+    /// reproducible region in the process. A silently empty record would become
+    /// a loudly divergent one, for a reason that is not the guest's heap.
+    ///
+    /// The labelled path above hashes its mapping directly, which is correct
+    /// there because the kernel defines `[heap]` as exactly `[start_brk, brk)`.
+    /// Both paths therefore report the same quantity.
     fn detlog_brk_heap<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), reverie::Error> {
         let Some((start, end)) = guest
             .thread_state()
@@ -978,8 +994,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         detlog!(
             "[memory][dtid {}] {}->{}",
             dettid,
-            procmaps::display_as(&mmap, "[heap]"),
-            procmaps::compute_hash(guest, &mmap)?
+            procmaps::display_range_as(&mmap, start, end, "[heap]"),
+            procmaps::compute_hash_range(guest, start, end)?
         );
         Ok(())
     }
