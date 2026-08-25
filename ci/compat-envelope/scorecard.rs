@@ -130,6 +130,17 @@ struct TrackedCell {
     /// pressure test repeats a cell at one tree and measures flakiness, while
     /// validate runs it once per commit and supplies the regression signal.
     observations: Vec<Observation>,
+    /// What the evidence above says, in one word, readable without opening
+    /// another file. DERIVED -- see [`MeasurementState`] and
+    /// [`derive_measurement`]. Defaulted for the pre-field corpus; every write
+    /// recomputes it and the writer boundary refuses a stored value that
+    /// disagrees with the derivation.
+    #[serde(default = "default_measurement")]
+    measurement: MeasurementState,
+}
+
+fn default_measurement() -> MeasurementState {
+    MeasurementState::NeverMeasured
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -176,6 +187,106 @@ impl ObservationProvenance {
             Self::PressureTest => "pressure-test",
             Self::Validate => "validate",
         }
+    }
+}
+
+/// What the row's evidence actually says, readable WITHOUT opening another file.
+///
+/// ⚠️ THIS EXISTS BECAUSE AN EMPTY FIELD HAD FIVE MEANINGS. `last_tested`'s own
+/// doc already warns that absence "means NO WRITER RECORDED ONE, not that the
+/// cell was never exercised", and `render_evidence_coverage` was added to "state
+/// the coverage out loud every time the table is printed". That is a mitigation
+/// at the PRINTER: a consumer reading `cells.json` directly still could not tell
+/// a never-measured cell from a measured-and-passed one, because both have an
+/// empty `observations` and both may lack `last_tested`. Anything downstream
+/// then had to guess, and a guess that reads "never measured" as "passed" turns
+/// absence of evidence into evidence.
+///
+/// DERIVED, NEVER ASSERTED. `derive_measurement` computes this from the
+/// evidence already on the row, and `enforce_writer_boundary` refuses any write
+/// where the stored value disagrees. So it is a cache that cannot lie rather
+/// than a second source of truth that can drift from the first.
+///
+/// The vocabulary is deliberately IDENTICAL to `ci-hub/series/series.py`'s
+/// `measurement_state`, so the scorecard and the series store cannot describe
+/// the same cell with different words.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum MeasurementState {
+    /// No observation of any kind. NOT the same as passing.
+    NeverMeasured,
+    /// Measured, and every recorded result was a pass.
+    MeasuredAndPassed,
+    /// Measured, nothing passed, but nothing diverged either -- every result was
+    /// a crash, timeout or OOM. ⚠️ A NON-VERDICT IS NOT A DIVERGENCE: reading
+    /// one as a product failure is how an infrastructure hiccup becomes a false
+    /// regression.
+    MeasuredNoVerdict,
+    /// A real divergence, whose position could not be established. A LEGITIMATE
+    /// answer, not an error: refusing it would force a writer to invent a
+    /// coordinate it does not have.
+    DivergedUnlocated,
+    /// A real divergence with at least one located coordinate.
+    Diverged,
+}
+
+impl MeasurementState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NeverMeasured => "never-measured",
+            Self::MeasuredAndPassed => "measured-and-passed",
+            Self::MeasuredNoVerdict => "measured-no-verdict",
+            Self::DivergedUnlocated => "diverged-unlocated",
+            Self::Diverged => "diverged",
+        }
+    }
+}
+
+/// Compute the one correct [`MeasurementState`] for a row from its own evidence.
+///
+/// A divergence is a determinism/parity/replay failure. Crash, timeout and OOM
+/// are measured NON-VERDICTS and deliberately do not count as divergence.
+fn derive_measurement(cell: &TrackedCell) -> MeasurementState {
+    if cell.observations.is_empty() {
+        return MeasurementState::NeverMeasured;
+    }
+    let mut diverged = false;
+    let mut passed = false;
+    let mut located = false;
+    for observation in &cell.observations {
+        for result in &observation.results {
+            match result {
+                ObservedResult::Pass => passed = true,
+                ObservedResult::DeterminismFailure
+                | ObservedResult::ParityFailure
+                | ObservedResult::ReplayFailure => diverged = true,
+                ObservedResult::CrashError | ObservedResult::Timeout | ObservedResult::Oom => {}
+            }
+        }
+        located |= observation.first_divergent_record.is_some()
+            || observation.first_divergent_syscall.is_some()
+            || observation.first_divergent_scheduler_turn.is_some()
+            || observation.first_divergent_virtual_nanoseconds.is_some();
+    }
+    if diverged {
+        return if located {
+            MeasurementState::Diverged
+        } else {
+            MeasurementState::DivergedUnlocated
+        };
+    }
+    if passed {
+        MeasurementState::MeasuredAndPassed
+    } else {
+        MeasurementState::MeasuredNoVerdict
+    }
+}
+
+/// Set every row's `measurement` to its derived value. Called before the writer
+/// boundary so the guard checks a value the writer actually intended.
+fn refresh_measurement(cells: &mut TrackedCells) {
+    for cell in &mut cells.cells {
+        cell.measurement = derive_measurement(cell);
     }
 }
 
@@ -1213,6 +1324,7 @@ fn tracked_from(
                 ci_disabled_reason,
                 last_tested,
                 observations,
+                measurement: MeasurementState::NeverMeasured,
             }
         })
         .collect();
@@ -1257,6 +1369,31 @@ fn enforce_writer_boundary(
             .collect()
     };
     let (old, new) = (index(before), index(after));
+
+    // ⚠️ THE DERIVED FIELD MUST NEVER DISAGREE WITH THE EVIDENCE IT SUMMARISES,
+    // and this is checked for EVERY writer rather than split between them.
+    // `measurement` is a cache of `derive_measurement`, so a row whose stored
+    // value differs from its own observations is a row that lies to any consumer
+    // reading it instead of recomputing -- which is the entire reason the field
+    // exists. Checking it here, at the one boundary both writers already pass
+    // through, is what makes it impossible to write a disagreeing value at all
+    // rather than merely discouraged.
+    for (id, cell) in &new {
+        let derived = derive_measurement(cell);
+        if cell.measurement != derived {
+            return Err(format!(
+                "writer boundary violated: {}/{}/{} stores measurement `{}` but its \
+                 own evidence derives `{}`. `measurement` is derived from \
+                 `observations`; it is never set independently.",
+                id.test,
+                id.mode,
+                id.backend,
+                cell.measurement.as_str(),
+                derived.as_str()
+            ));
+        }
+    }
+
     match writer {
         Writer::Update => {
             // `update` legitimately adds and removes cells when the manifest
@@ -1374,12 +1511,13 @@ fn update_tracked(
 ) -> Result<(), String> {
     let derived = derive(root)?;
     let existing = load_existing(root)?;
-    let cells = tracked_from(
+    let mut cells = tracked_from(
         &derived,
         existing.clone(),
         allow_green_removal,
         allow_cell_removal,
     )?;
+    refresh_measurement(&mut cells);
     if let Some(before) = existing.as_ref() {
         enforce_writer_boundary(before, &cells, Writer::Update)?;
     }
@@ -2133,6 +2271,7 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
     let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
     let before = tracked.clone();
     let updated = apply_validate_results(&mut tracked, &rows, &head, &detcore_tree, &depth)?;
+    refresh_measurement(&mut tracked);
     enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
     fs::write(root.join(CELLS), encoded_cells(&tracked)?)
         .map_err(|e| format!("cannot write {CELLS}: {e}"))?;
@@ -2177,6 +2316,7 @@ fn update_observations(root: &Path, summary_path: &Path) -> Result<(), String> {
     let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
     let before = tracked.clone();
     let outcome = apply_pressure_summary(&mut tracked, &summary, &head, &detcore_tree, &depth)?;
+    refresh_measurement(&mut tracked);
     enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
     fs::write(root.join(CELLS), encoded_cells(&tracked)?)
         .map_err(|e| format!("cannot write {CELLS}: {e}"))?;
@@ -2759,6 +2899,7 @@ fn self_test() -> Result<(), String> {
             ci_disabled_reason: None,
             last_tested: None,
             observations: Vec::new(),
+            measurement: MeasurementState::NeverMeasured,
         }],
     };
     let regressed = Derived {
@@ -2780,6 +2921,7 @@ fn self_test() -> Result<(), String> {
             ci_disabled_reason: None,
             last_tested: None,
             observations: Vec::new(),
+            measurement: MeasurementState::NeverMeasured,
         }],
     };
     tracked_from(&regressed, Some(intentional), true, false)
@@ -2794,6 +2936,7 @@ fn self_test() -> Result<(), String> {
             ci_disabled_reason: None,
             last_tested: None,
             observations: Vec::new(),
+            measurement: MeasurementState::NeverMeasured,
         }],
     };
     let pressure_row = |result: &str, turn, virtual_nanoseconds| PressureSummaryRow {
@@ -3292,19 +3435,28 @@ fn self_test() -> Result<(), String> {
     // The two authorities in this file must not touch each other's fields. A
     // guard that is never exercised is a guard nobody knows is broken, so each
     // direction is asserted to REFUSE, and the legal no-op is asserted to pass.
-    let boundary_cell = |observations: Vec<Observation>, status: CellStatus| TrackedCell {
-        id: CellId {
-            lane: "portable".into(),
-            category: "fixture".into(),
-            test: "fixture/boundary".into(),
-            mode: "verify".into(),
-            backend: "ptrace".into(),
-        },
-        enabled: true,
-        status,
-        ci_disabled_reason: None,
-        last_tested: None,
-        observations,
+    let boundary_cell = |observations: Vec<Observation>, status: CellStatus| {
+        let mut cell = TrackedCell {
+            id: CellId {
+                lane: "portable".into(),
+                category: "fixture".into(),
+                test: "fixture/boundary".into(),
+                mode: "verify".into(),
+                backend: "ptrace".into(),
+            },
+            enabled: true,
+            status,
+            ci_disabled_reason: None,
+            last_tested: None,
+            measurement: MeasurementState::NeverMeasured,
+            observations,
+        };
+        // ⚠️ DERIVE IT HERE RATHER THAN HARDCODING, or this helper builds rows
+        // that contradict themselves and every boundary case below fails for
+        // the wrong reason -- a refusal about `measurement` while the test is
+        // asserting something about `status`. Caught exactly that way.
+        cell.measurement = derive_measurement(&cell);
+        cell
     };
     let sample = Observation {
         detcore_tree: "tree".into(),
@@ -3343,6 +3495,107 @@ fn self_test() -> Result<(), String> {
                 .into(),
         );
     }
+    // ---- step 6: `measurement` is derived, and cannot be written to disagree ----
+    //
+    // ⚠️ EVERY ONE OF THESE IS A REFUSAL OR A DERIVATION, DEMONSTRATED. A field
+    // whose guard is never seen refusing is indistinguishable from a field
+    // nobody checks, which is the exact failure this scorecard keeps finding
+    // elsewhere.
+    let diverged_observation = |located: bool| {
+        let mut observation = sample.clone();
+        observation
+            .results
+            .insert(ObservedResult::DeterminismFailure);
+        if located {
+            observation.first_divergent_record = Some(ObservedRange { earliest: 98, latest: 98, samples: 1 });
+        }
+        observation
+    };
+    let passed_observation = || {
+        let mut observation = sample.clone();
+        observation.results.insert(ObservedResult::Pass);
+        observation
+    };
+    let crashed_observation = || {
+        let mut observation = sample.clone();
+        observation.results.insert(ObservedResult::CrashError);
+        observation
+    };
+
+    // The five states are distinguishable FROM THE ROW, which is the whole point.
+    for (label, observations, expected) in [
+        ("never-measured", Vec::new(), MeasurementState::NeverMeasured),
+        (
+            "measured-and-passed",
+            vec![passed_observation()],
+            MeasurementState::MeasuredAndPassed,
+        ),
+        (
+            "measured-no-verdict",
+            vec![crashed_observation()],
+            MeasurementState::MeasuredNoVerdict,
+        ),
+        (
+            "diverged-unlocated",
+            vec![diverged_observation(false)],
+            MeasurementState::DivergedUnlocated,
+        ),
+        (
+            "diverged",
+            vec![diverged_observation(true)],
+            MeasurementState::Diverged,
+        ),
+    ] {
+        let cell = boundary_cell(observations, CellStatus::Red);
+        if cell.measurement != expected {
+            return Err(format!(
+                "measurement derivation: expected `{}` for the {label} case, got `{}`",
+                expected.as_str(),
+                cell.measurement.as_str()
+            ));
+        }
+    }
+
+    // ⚠️ A CRASH IS NOT A DIVERGENCE. Reading a non-verdict as a product failure
+    // is how an infrastructure hiccup becomes a false regression, so this is
+    // asserted separately rather than left implicit in the table above.
+    let crashed = boundary_cell(vec![crashed_observation()], CellStatus::Red);
+    if crashed.measurement == MeasurementState::Diverged
+        || crashed.measurement == MeasurementState::DivergedUnlocated
+    {
+        return Err("measurement counted a crash as a divergence".into());
+    }
+
+    // THE REFUSAL: a stored value that disagrees with the row's own evidence.
+    let mut lying = boundary_cell(vec![diverged_observation(true)], CellStatus::Red);
+    lying.measurement = MeasurementState::MeasuredAndPassed;
+    let lying_cells = TrackedCells {
+        schema: SCHEMA,
+        cells: vec![lying],
+    };
+    for writer in [Writer::Update, Writer::Observations] {
+        if enforce_writer_boundary(&lying_cells, &lying_cells, writer).is_ok() {
+            return Err(
+                "writer boundary allowed a `measurement` that contradicts the row's own \
+                 observations"
+                    .into(),
+            );
+        }
+    }
+
+    // And the honest row still passes, so the check above discriminates rather
+    // than refusing everything.
+    let honest = TrackedCells {
+        schema: SCHEMA,
+        cells: vec![boundary_cell(
+            vec![diverged_observation(true)],
+            CellStatus::Red,
+        )],
+    };
+    if enforce_writer_boundary(&honest, &honest, Writer::Observations).is_err() {
+        return Err("writer boundary refused a row whose measurement matches its evidence".into());
+    }
+
     if enforce_writer_boundary(&with_evidence, &ratchet_moved, Writer::Update).is_err() {
         return Err(
             "writer boundary refused `update` for changing `status`, which is the field \
@@ -3367,6 +3620,7 @@ fn self_test() -> Result<(), String> {
                 ci_disabled_reason: None,
                 last_tested: None,
                 observations: Vec::new(),
+                measurement: MeasurementState::NeverMeasured,
             },
         ],
     };
