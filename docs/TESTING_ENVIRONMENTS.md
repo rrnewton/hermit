@@ -108,6 +108,28 @@ compression packages). The OS name printed at startup must accompany results;
 install missing utilities rather than interpreting `command not found` as a
 Hermit determinism regression.
 
+## Named measurement hosts
+
+Measurements recorded in tracked source carry a HOST, because a number without
+one cannot be audited or re-taken. But `scripts/check-portable-paths.sh` rejects
+a literal hostname anywhere in a tracked build or run file — including comments —
+so a measurement comment cannot name its host directly. This section is the
+indirection: **docs are outside the gate's scope, so the names live here and
+gated files refer to these labels.**
+
+| label | host | role |
+| --- | --- | --- |
+| `PRIMARY-DEV-HOST` | `devbig014` | the shared dev box most agent measurement is taken on |
+| `KVM-MEASUREMENT-HOST` | `devbig030` | used for the KVM repeatability measurements below |
+
+⚠️ REFER TO A LABEL, DO NOT SPELL THE HOSTNAME. A comment in a gated file should
+say "measured on `PRIMARY-DEV-HOST` (see docs/TESTING_ENVIRONMENTS.md)". That
+keeps the measurement attributable — the label resolves to exactly one machine —
+without putting a developer-specific name where the gate correctly refuses one.
+Twice in one hour on 2026-08-25 a literal host or home path in a comment took
+`main` red on that gate, both from the project's own landings, and in each case
+the author's intent was only to record where a number came from.
+
 ## Capability axes
 
 These axes are orthogonal. A host can satisfy some and not others, and each
