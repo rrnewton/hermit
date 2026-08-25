@@ -91,6 +91,33 @@ const CHECKER_PREFIXES: &[&str] = &[
     "ci/test-",
 ];
 
+/// This checker's own tracked path.
+const SELF_PATH: &str = "scripts/check-checker-scheduling.rs";
+
+/// Whether a reached script's BODY may be read as a source of invocations.
+///
+/// ⚠️ THIS FILE IS REACHED BUT IS NOT AN INVOCATION SOURCE, AND THE DISTINCTION IS
+/// LOAD-BEARING. `ALLOWLIST` names every allowlisted checker as a string literal,
+/// and each of those entries is a DECLARATION THAT THE PATH IS NOT SCHEDULED --
+/// the exact opposite of an invocation. Feeding this file's text back into the
+/// fixpoint therefore marks every allowlisted checker as reached and reports it
+/// as a stale allowlist entry.
+///
+/// It is self-defeating rather than merely wrong: the bug appears only once this
+/// checker is itself added to the `lint-checks` recipe, which is what makes it
+/// reachable, which is what makes it read its own body. Measured 2026-08-25 on
+/// this branch rebased onto main: with the recipe line present, 5 of 5 allowlist
+/// entries reported STALE and `make lint-checks` exited 1; with the line removed
+/// and nothing else changed, 0 did. A gate that cannot be scheduled without
+/// breaking itself is not a gate.
+///
+/// The exclusion is by path rather than by content: a heuristic that tried to
+/// tell a declaration from an invocation inside arbitrary Rust would be the kind
+/// of guess this checker exists to avoid.
+fn expands_frontier(path: &str) -> bool {
+    path != SELF_PATH
+}
+
 fn tracked_files() -> Vec<String> {
     let out = Command::new("git")
         .args(["ls-files"])
@@ -165,6 +192,14 @@ fn main() {
         !checkers.is_empty(),
         "discovered no checker entrypoints; the naming convention or this filter moved"
     );
+    // A rename must not silently re-enable the self-reference described on
+    // `expands_frontier`. If SELF_PATH stops naming a tracked file the exclusion
+    // matches nothing, every allowlist entry reads as stale again, and the only
+    // symptom is a confident wrong answer.
+    assert!(
+        tracked.iter().any(|p| p == SELF_PATH),
+        "SELF_PATH ({SELF_PATH}) is not tracked; update it to this file's path"
+    );
 
     // Seed the reachable set from the two things that actually schedule work.
     let mut seed = String::new();
@@ -205,8 +240,10 @@ fn main() {
             let base = s.rsplit('/').next().unwrap();
             if text.contains(base) {
                 reached.insert(s.clone());
-                if let Ok(body) = std::fs::read_to_string(s) {
-                    frontier.push(strip_comments(&body, s));
+                if expands_frontier(s) {
+                    if let Ok(body) = std::fs::read_to_string(s) {
+                        frontier.push(strip_comments(&body, s));
+                    }
                 }
             }
         }
@@ -225,7 +262,7 @@ fn main() {
     let mut stale: Vec<&str> = ALLOWLIST
         .iter()
         .map(|(p, _)| *p)
-        .filter(|p| reached.contains(&p.to_string()) || !Path::new(p).exists())
+        .filter(|p| reached.contains(*p) || !Path::new(p).exists())
         .collect();
     stale.sort();
 
@@ -319,7 +356,15 @@ fn self_test() {
     assert!(recipe.contains("check-x.sh"), "recipe line missing");
     assert!(!recipe.contains("clippy"), "lint-cargo leaked into the lint-checks recipe");
 
-    println!("PASS: check-checker-scheduling strips comments, keeps invocations, and scopes the recipe");
+    // This checker's own ALLOWLIST must not count as scheduling evidence.
+    assert!(!expands_frontier(SELF_PATH), "this file's body is being read as invocations");
+    assert!(expands_frontier("ci/run-reverie-pin-check.sh"), "a real intermediary stopped expanding");
+    assert!(
+        ALLOWLIST.iter().all(|(p, _)| *p != SELF_PATH),
+        "this checker allowlisting itself would hide the very orphan it reports"
+    );
+
+    println!("PASS: check-checker-scheduling strips comments, keeps invocations, scopes the recipe, and does not read its own allowlist as scheduling");
 }
 
 #[cfg(test)]
@@ -352,6 +397,23 @@ mod tests {
     fn a_makefile_without_the_recipe_is_an_error_not_an_empty_pass() {
         let r = std::panic::catch_unwind(|| lint_checks_recipe("lint:\n\techo hi\n"));
         assert!(r.is_err(), "a missing lint-checks recipe must refuse, not return empty");
+    }
+
+    /// The regression that scheduling this checker introduced: its own ALLOWLIST
+    /// literals were read as invocations, so all five allowlisted checkers
+    /// reported STALE and `make lint-checks` exited 1.
+    #[test]
+    fn this_checkers_own_body_is_not_an_invocation_source() {
+        assert!(!expands_frontier(SELF_PATH));
+        assert!(expands_frontier("scripts/validate.rs"));
+        assert!(expands_frontier("ci/run-reverie-pin-check.sh"));
+    }
+
+    /// Excluding the body must not become excluding the file: it is a checker
+    /// like any other and still has to be scheduled by something.
+    #[test]
+    fn this_checker_does_not_allowlist_itself() {
+        assert!(ALLOWLIST.iter().all(|(p, _)| *p != SELF_PATH));
     }
 
     #[test]
