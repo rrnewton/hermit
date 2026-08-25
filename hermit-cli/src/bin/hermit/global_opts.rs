@@ -112,6 +112,8 @@ impl GlobalOpts {
             let file_writer = handle
                 .try_clone()
                 .expect("cannot duplicate the host log file descriptor");
+            let limit = log_max_bytes().unwrap_or_else(|e| panic!("{e}"));
+            let file_writer = BoundedWriter::new(file_writer, limit);
             Some(init_file_tracing(self.log, file_writer))
         } else if let Some(path) = &self.log_file {
             // An internal caller set the path directly rather than going through

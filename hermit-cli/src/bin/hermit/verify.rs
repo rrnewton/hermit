@@ -994,16 +994,6 @@ fn compare_two_runs_with_unsupported_scan(
         } else {
             Verdict::Diverged
         };
-        if verdict == Verdict::NoResult {
-            eprintln!(
-                ":: {}",
-                "No result: the comparison was refused, so this is neither a match nor a difference."
-                    .red()
-                    .bold()
-            );
-        } else {
-            eprintln!(":: {}", options.failure_message.red().bold());
-        }
         // Divergence is a verification *verdict*, not an I/O error: return it as
         // a value carrying the guest exit status. Callers that want the
         // historical "divergence -> nonzero process exit" behavior use
@@ -1043,10 +1033,15 @@ pub fn announce_verification_outcome(
     success_message: &str,
     failure_message: &str,
 ) {
-    if outcome.verified() {
-        eprintln!(":: {}", success_message.green().bold());
-    } else {
-        eprintln!(":: {}", failure_message.red().bold());
+    match outcome.verdict {
+        Verdict::Matched => eprintln!(":: {}", success_message.green().bold()),
+        Verdict::Diverged => eprintln!(":: {}", failure_message.red().bold()),
+        Verdict::NoResult => eprintln!(
+            ":: {}",
+            "No result: the comparison was refused, so this is neither a match nor a difference."
+                .red()
+                .bold()
+        ),
     }
 }
 
