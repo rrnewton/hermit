@@ -122,6 +122,92 @@ print("case DIVERGED — an unverified record never claims a positive tier")
 got = tier_of(record(verified=False, verdict="diverged"))
 check("tier is 'gap'", got and got["tier"] == "gap", repr(got))
 
+# --------------------------------------------------------------------------
+# Ported from the closed hermit#2303, re-expected against THIS ladder.
+#
+# ⚠️ THE SCENARIOS COME FROM THAT BRANCH; THE EXPECTATIONS DO NOT.  #2303 also
+# collapsed the ladder to {gap, bitwise}, so every one of these cases asserted
+# `gap` there.  Here the same records must land on `stripped` -- verified, and
+# the log stream WAS compared, just not canonically.  Taking that branch's
+# expected values along with its scenarios would have quietly imported the
+# collapse through the test file, which is why they are re-derived rather than
+# copied.  Whether a plain `--verify` match reports as `stripped` or as `gap`
+# changes what a published count MEANS and is an owner ruling, deliberately not
+# settled here.
+#
+# Each case isolates ONE conjunct: every other field is set to the value that
+# would certify bitwise, so a failure names the conjunct that broke.
+
+print("case CONTRADICTION — no boolean pair overrules the terminal verdict")
+got = tier_of(record(verified=True, bitwise=True, strictness="canonical",
+                     verdict="diverged", left=348, right=348))
+check("diverged+parity is refused the bitwise tier",
+      got and got["tier"] != "bitwise", repr(got))
+check("diverged+parity degrades to 'stripped', not upward",
+      got and got["tier"] == "stripped", repr(got))
+check("diverged+parity reports bitwise_parity 0",
+      got and got["bitwise_parity"] == "0", repr(got))
+
+print("case COMPARATOR — canonical is the only bitwise-capable comparator")
+# The conflation the ladder exists to prevent: a Stripped comparison that
+# nonetheless carries bitwise_parity true must NOT read as byte identity.
+got = tier_of(record(bitwise=True, strictness="stripped", left=348, right=348))
+check("parity under a stripped comparator is not bitwise",
+      got and got["tier"] == "stripped", repr(got))
+check("parity under a stripped comparator reports bitwise_parity 0",
+      got and got["bitwise_parity"] == "0", repr(got))
+
+print("case PARITY TYPE — only a real JSON true is parity")
+# bool("0") and bool("false") are both True in Python, so a stringly-typed
+# record certified bitwise under the previous predicate.
+for value, why in (("0", 'string "0"'), ("false", 'string "false"'), (1, "int 1")):
+    got = tier_of(record(bitwise=value, strictness="canonical", left=348, right=348))
+    check(f"bitwise_parity as {why} is not parity",
+          got and got["tier"] != "bitwise", repr(got))
+
+print("case COUNTS — only equal positive integer counts are non-vacuous")
+# `type(x) is int` and not isinstance: bool subclasses int, so true|true would
+# otherwise read as a count.
+for left, right, why in (
+    (-1, -1, "negative"),
+    ("239", "239", "strings"),
+    (True, True, "booleans"),
+    (239, 240, "unequal"),
+):
+    got = tier_of(record(bitwise=True, strictness="canonical", left=left, right=right))
+    check(f"{why} counts are refused the bitwise tier",
+          got and got["tier"] != "bitwise", repr(got))
+
+print("case REAL RECORD — the shape a genuine measured L2 run actually produced")
+# ⚠️ THE CONTROL FOR EVERY NEGATIVE ABOVE.  A predicate that rejects everything
+# is not a stricter predicate, it is a broken one, so the tightening has to be
+# shown NOT to demote real evidence.
+#
+# These are the exact values `ci/compat-envelope/cells.json` records for a ptrace
+# measurement at hermit e69c0a62cecef9aa44e3810ae88c06ad24155048 (debug build):
+# "verified=true, verdict=matched, bitwise_parity=true, strictness=canonical,
+# compare_logs=true, record_envelope=all_records_v1, 266/266 INFO messages
+# compared, exit 0".
+#
+# That the manifest already DECLARES this conjunction is the reason the port is a
+# correction rather than a new policy: the standard was written down, the code
+# simply was not enforcing it.
+got = tier_of(record(verified=True, bitwise=True, verdict="matched",
+                     strictness="canonical", left=266, right=266))
+check("the measured ptrace record still certifies bitwise",
+      got and got["tier"] == "bitwise", repr(got))
+check("the measured ptrace record reports bitwise_parity 1",
+      got and got["bitwise_parity"] == "1", repr(got))
+check("the measured ptrace record carries its 266/266 counts",
+      got and got["compared_log_messages"] == "266|266", repr(got))
+
+print("case LADDER — the rungs this change deliberately did NOT touch")
+# Pinned so a future collapse to {gap, bitwise} is a visible test failure rather
+# than a silent redefinition of every published count.  See hermit#2303.
+check("'stripped' is still a rung", "stripped" in L2_RANK, repr(L2_RANK))
+check("'guest' is still a rung", "guest" in L2_RANK, repr(L2_RANK))
+check("the ladder still has four rungs", len(L2_RANK) == 4, repr(L2_RANK))
+
 print("case NO-RECORD — absent / no_result / malformed fall back, never upward")
 check("absent file yields None", tier_of(None) is None)
 check("no_result yields None",

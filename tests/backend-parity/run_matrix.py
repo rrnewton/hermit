@@ -859,10 +859,41 @@ def verify_tier_from_json(path: Path) -> dict[str, str] | None:
     carries the condition with the value -- strictness, the parity boolean, and
     the counts that make the boolean falsifiable -- so read that instead.
 
-    `bitwise` requires BOTH `bitwise_parity` and a nonzero compared count on both
-    sides.  The count is not redundant: an empty-vs-empty log comparison reports
-    "no difference" under the strictest possible spec, so without it a run that
-    produced no DETLOG at all would certify as bitwise parity.
+    `bitwise` requires a terminal `matched` verdict, `verified=true`,
+    `bitwise_parity=true`, a CANONICAL log comparison, and equal positive integer
+    counts on both sides.  The count is not redundant: an empty-vs-empty log
+    comparison reports "no difference" under the strictest possible spec, so
+    without it a run that produced no DETLOG at all would certify as bitwise
+    parity.
+
+    ⚠️ EVERY CONJUNCT IS LOAD-BEARING, and the weaker form this replaces
+    (`bool(bitwise_parity) and bool(left) and bool(right)`) admitted records that
+    contradict themselves.  Measured against that form:
+
+      * `"bitwise_parity": "0"` certified BITWISE, because `bool("0")` is `True`
+        in Python.  So did the string `"false"`.
+      * `bitwise_parity: true` under `strictness: "stripped"` certified BITWISE
+        -- the exact conflation of "the DETLOG was compared" with "the DETLOG was
+        identical" that the tier ladder above exists to prevent.
+      * `verdict: "diverged"` with `bitwise_parity: true` certified BITWISE.
+      * counts of `-1|-1`, `"239"|"239"`, `true|true`, and `239|240` all
+        certified BITWISE.
+
+    `type(x) is int` rather than `isinstance`: `bool` is a subclass of `int`, so
+    `{"left": true}` would otherwise read as a count.
+
+    NO LIVE PRODUCER IS KNOWN FOR ANY OF THESE.  `verify.rs` declares
+    `pub bitwise_parity: bool` and `#[serde(rename_all = "snake_case")]` on both
+    `Verdict` and `LogCompareStrictness`, so Hermit's own `--verify-json` emits
+    real booleans and the literals `matched`/`canonical`; the string and boolean
+    count cases are unreachable from it, and the rest require a self-contradictory
+    record.  This is a DEFENSIVE parser reading a file off disk -- per `AGENTS.md`
+    an unreadable or truncated comparison must refuse rather than report a match --
+    so it is hardened as defence in depth, not to fix an observed over-tiering.
+
+    Tightening only ever moves a record DOWN the ladder, never up: anything that
+    fails these conjuncts falls to `stripped` or `guest` by the branches below,
+    which are the rungs it already belonged on.
 
     Returns ``None`` when no usable record exists -- notably the DBT backend,
     which accepts `--verify-json` and writes nothing (measured: rc=0, no file).
@@ -878,7 +909,21 @@ def verify_tier_from_json(path: Path) -> dict[str, str] | None:
     left, right = counts.get("left"), counts.get("right")
     compared = f"{left}|{right}" if left is not None and right is not None else ""
     strictness = str(comparison.get("strictness") or "")
-    bitwise = bool(record.get("bitwise_parity")) and bool(left) and bool(right)
+    positive_count = (
+        type(left) is int
+        and type(right) is int
+        and left > 0
+        and right > 0
+        and left == right
+    )
+    bitwise = (
+        record.get("verified") is True
+        and record.get("verdict") == "matched"
+        and record.get("bitwise_parity") is True
+        and strictness == "canonical"
+        and comparison.get("compare_logs") is True
+        and positive_count
+    )
     if not record.get("verified"):
         tier = "gap"
     elif bitwise:
