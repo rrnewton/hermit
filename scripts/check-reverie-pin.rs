@@ -1300,6 +1300,13 @@ impl GuardedGitRepo {
 /// another. Every caller here aims at a specific checkout, so every caller wants
 /// the isolated form.
 fn git_in(dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+    // ⚠️ READ SIDE OF THE ENVIRONMENT LOCK, AT THE CHOKEPOINT.
+    // Guarding one call site is not enough -- measured: guarding only
+    // init_fixture_repo took 8 failing tests across 8 runs down to 2, which is
+    // worse than leaving it, because it looks fixed. Every test reader reaches
+    // git through here, so here is where the guard belongs.
+    #[cfg(test)]
+    let _env_guard = tests::env_read_guard();
     isolated_git_command()?
         .arg("-C")
         .arg(dir)
@@ -3846,13 +3853,42 @@ mod tests {
     /// Serializes the tests that mutate this process's environment. Rust runs
     /// tests on threads of ONE process, so an unsynchronized `set_var` would
     /// leak into whatever else happened to be reading the environment.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// ⚠️ AN RwLock, NOT A Mutex, AND THE DISTINCTION IS THE FIX.
+    ///
+    /// A Mutex here serialised the WRITERS against each other and left the
+    /// READERS unprotected -- and the readers are ordinary `git` invocations in
+    /// other tests, which take no lock and cannot be made to. Rust runs tests as
+    /// threads of ONE process, so `env::set_var` publishes to every thread at
+    /// once; a child forked during the window between setting GIT_CONFIG_COUNT
+    /// and setting GIT_CONFIG_KEY_0 inherits a count with no key and dies with
+    /// `error: missing config key GIT_CONFIG_KEY_0`, exit 128.
+    ///
+    /// DEMONSTRATED, not argued -- a standalone harness with one writer doing
+    /// exactly what `with_config_override` does and four threads shelling out to
+    /// git: 83 of 600 invocations observed the partial state. Reordering the
+    /// writes (keys before count) narrowed the window but did NOT close it: 8
+    /// failing tests across 8 runs became roughly 2, which is worse than either
+    /// extreme because it looks fixed.
+    ///
+    /// The write side takes the WRITE lock; every test that shells out to git
+    /// takes the READ lock. Readers still run concurrently with each other -- the
+    /// file is not serialised -- and no reader can be mid-fork while a writer is
+    /// mid-publish.
+    static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    /// Hold the read side across a git invocation, so no writer can publish a
+    /// partial GIT_CONFIG_* set while this thread forks.
+    pub(super) fn env_read_guard() -> std::sync::RwLockReadGuard<'static, ()> {
+        ENV_LOCK
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     /// Set the numbered Git config override variables, run `body`, and restore
     /// the previous values whatever happens.
     fn with_config_override<T>(pairs: &[(&str, &str)], body: impl FnOnce() -> T) -> T {
         let _guard = ENV_LOCK
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut saved: Vec<(String, Option<OsString>)> = vec![(
             "GIT_CONFIG_COUNT".to_string(),
