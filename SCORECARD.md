@@ -10,24 +10,24 @@ Every selected `verify` cell, and every seed in a selected `chaos` cell, runs th
 
 | Backend | Green | Red | Not applicable | Total |
 | --- | ---: | ---: | ---: | ---: |
-| `ptrace` | 231 | 122 | 703 | 1056 |
-| `dbt` | 0 | 60 | 996 | 1056 |
-| `kvm` | 0 | 23 | 1033 | 1056 |
-| `sabre` | 53 | 89 | 914 | 1056 |
-| `liteinst` | 0 | 51 | 1005 | 1056 |
-| `native` | 0 | 33 | 319 | 352 |
-| **Total** | **284** | **378** | **4970** | **5632** |
+| `ptrace` | 232 | 122 | 705 | 1059 |
+| `dbt` | 0 | 60 | 999 | 1059 |
+| `kvm` | 0 | 23 | 1036 | 1059 |
+| `sabre` | 53 | 89 | 917 | 1059 |
+| `liteinst` | 0 | 51 | 1008 | 1059 |
+| `native` | 0 | 33 | 320 | 353 |
+| **Total** | **285** | **378** | **4985** | **5648** |
 
 ## Denominator, and why the percentage is not comparable across changes to it
 
-Green is **284 of 5632**, which is **5.04%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
+Green is **285 of 5648**, which is **5.05%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
 
 - backends: `ptrace`, `dbt`, `kvm`, `sabre`, `liteinst`, `native`
 - modes: `chaos`, `naked`, `replay`, `verify`
 
-⚠️ **4970 of those 5632 cells are NOT APPLICABLE** — their backend is not enabled for their mode, so they were never asked to run and cannot pass or fail. Over the 662 cells that CAN run, green is **42.90%**.
+⚠️ **4985 of those 5648 cells are NOT APPLICABLE** — their backend is not enabled for their mode, so they were never asked to run and cannot pass or fail. Over the 663 cells that CAN run, green is **42.99%**.
 
-⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same 284 green cells measured against a smaller denominator. Nothing was fixed to produce it; it is what the first figure always meant once the cells that cannot run are excluded. Quote both or neither, and never compare one against the other as though something moved.
+⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same 285 green cells measured against a smaller denominator. Nothing was fixed to produce it; it is what the first figure always meant once the cells that cannot run are excluded. Quote both or neither, and never compare one against the other as though something moved.
 
 ⚠️ **Adding or removing a backend or mode changes this denominator and therefore the percentage, without anything about the product changing.** Removing a backend whose cells are mostly red RAISES the reported figure; adding honest red cells LOWERS it. Neither is progress. Before comparing this percentage against an earlier one, diff the two lists above: if they differ, the numbers are not comparable and the difference is not a result.
 
@@ -35,11 +35,11 @@ The mode view makes the current order of work explicit: expand `verify` first, t
 
 | Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `native` | Green | Red | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `verify` | 228 / 352 | 0 / 352 | 0 / 352 | 53 / 352 | 0 / 352 | — | 281 | 1479 | 1760 |
-| `replay` | 1 / 352 | 0 / 352 | 0 / 352 | 0 / 352 | 0 / 352 | — | 1 | 1759 | 1760 |
-| `chaos` | 2 / 352 | 0 / 352 | 0 / 352 | 0 / 352 | 0 / 352 | — | 2 | 1758 | 1760 |
-| `naked` | — | — | — | — | — | 0 / 352 | 0 | 352 | 352 |
-| **Total** | | | | | | | **284** | **5348** | **5632** |
+| `verify` | 229 / 353 | 0 / 353 | 0 / 353 | 53 / 353 | 0 / 353 | — | 282 | 1483 | 1765 |
+| `replay` | 1 / 353 | 0 / 353 | 0 / 353 | 0 / 353 | 0 / 353 | — | 1 | 1764 | 1765 |
+| `chaos` | 2 / 353 | 0 / 353 | 0 / 353 | 0 / 353 | 0 / 353 | — | 2 | 1763 | 1765 |
+| `naked` | — | — | — | — | — | 0 / 353 | 0 | 353 | 353 |
+| **Total** | | | | | | | **285** | **5363** | **5648** |
 
 ## Cross-backend parity
 
@@ -62,7 +62,7 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | `determinism-stress-c` | 7 / 11 | 0 / 11 | 0 / 11 | 7 | 33 |
 | `language-runtimes` | 17 / 19 | 0 / 19 | 0 / 19 | 17 | 57 |
 | `shared-futex-c` | 0 / 4 | 0 / 4 | 0 / 4 | 0 | 12 |
-| `system-utils` | 29 / 31 | 1 / 31 | 0 / 31 | 30 | 93 |
+| `system-utils` | 30 / 32 | 1 / 32 | 0 / 32 | 31 | 96 |
 | `util-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |
 
-Ordinary full validation executes 286 selected regression cells: the 284 green compatibility cells above (including 2 chaos-mode race-exposure checks), and 2 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
+Ordinary full validation executes 287 selected regression cells: the 285 green compatibility cells above (including 2 chaos-mode race-exposure checks), and 2 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.

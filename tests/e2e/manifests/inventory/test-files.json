@@ -2737,6 +2737,18 @@
       "why": "tests/e2e/system-utils/proc-uptime.sh is owned by target/debug/test-harness via tests/e2e/manifests/*.yaml: Direct schema-v2 program; all modes and backend policy are centralized in the YAML bucket manifests"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/system-utils/procfs_sanitized_paths.c",
+      "runner": "tests/e2e/system-utils/procfs-sanitized-paths.sh",
+      "why": "tests/e2e/system-utils/procfs_sanitized_paths.c is owned by tests/e2e/system-utils/procfs-sanitized-paths.sh: The C guest reads all eighteen procfs paths in one process and asserts sanitizer-specific invariants; the manifest-compatible shell wrapper compiles and owns its lifecycle."
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/e2e/system-utils/procfs-sanitized-paths.sh",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/*.yaml",
+      "why": "tests/e2e/system-utils/procfs-sanitized-paths.sh is owned by target/debug/test-harness via tests/e2e/manifests/*.yaml: Direct schema-v2 program; all modes and backend policy are centralized in the YAML bucket manifests"
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/e2e/system-utils/ps-proc-table.sh",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",

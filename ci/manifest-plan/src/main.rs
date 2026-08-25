@@ -820,7 +820,13 @@ fn validate_mode(
         // `verify` cell runs `--strict --verify` only, which per
         // AGENTS.md "cannot establish L2" -- so a cell justified by a
         // hand-measured `bitwise_parity: true` does not actually ratchet it.
-        "verify" => allowed.push("assert"),
+        "verify" => allowed.extend([
+            "assert",
+            "compare_io_buffers",
+            "compare_io_buffers_disabled_reason",
+            "rcb_time",
+            "rcb_time_disabled_reason",
+        ]),
         _ => {}
     }
     ensure_keys(spec_value, &allowed, &format!("{id}.modes.{mode}"));
@@ -843,6 +849,52 @@ fn validate_mode(
                     ));
                 }
             }
+        }
+        let compare_io_buffers = spec.get("compare_io_buffers").map(|value| {
+            value.as_bool().unwrap_or_else(|| {
+                die(format!(
+                    "{id}: modes.verify.compare_io_buffers must be a boolean"
+                ))
+            })
+        });
+        let disabled_reason = spec.get("compare_io_buffers_disabled_reason").map(|value| {
+            value.as_str().unwrap_or_else(|| {
+                die(format!(
+                    "{id}: modes.verify.compare_io_buffers_disabled_reason must be a string"
+                ))
+            })
+        });
+        match (compare_io_buffers, disabled_reason) {
+            (Some(false), Some(reason)) if !reason.trim().is_empty() => {}
+            (Some(false), _) => die(format!(
+                "{id}: modes.verify.compare_io_buffers=false requires a substantive compare_io_buffers_disabled_reason"
+            )),
+            (None | Some(true), Some(_)) => die(format!(
+                "{id}: modes.verify comparison reason is stale while I/O-buffer comparison is enabled"
+            )),
+            (None | Some(true), None) => {}
+        }
+        let rcb_time = spec.get("rcb_time").map(|value| {
+            value
+                .as_bool()
+                .unwrap_or_else(|| die(format!("{id}: modes.verify.rcb_time must be a boolean")))
+        });
+        let rcb_time_disabled_reason = spec.get("rcb_time_disabled_reason").map(|value| {
+            value.as_str().unwrap_or_else(|| {
+                die(format!(
+                    "{id}: modes.verify.rcb_time_disabled_reason must be a string"
+                ))
+            })
+        });
+        match (rcb_time, rcb_time_disabled_reason) {
+            (Some(false), Some(reason)) if !reason.trim().is_empty() => {}
+            (Some(false), _) => die(format!(
+                "{id}: modes.verify.rcb_time=false requires a substantive rcb_time_disabled_reason"
+            )),
+            (None | Some(true), Some(_)) => die(format!(
+                "{id}: modes.verify RCB-time reason is stale while RCB time is enabled"
+            )),
+            (None | Some(true), None) => {}
         }
     }
     let ci_spec: CiSelectionSpec = parse_schema_value(
@@ -1211,6 +1263,60 @@ mod tests {
     fn rejects_unknown_schema_keys() {
         let value = parse_mode("known = true\nunknown = false\n");
         ensure_keys(&value, &["known"], "test");
+    }
+
+    #[test]
+    #[should_panic(expected = "compare_io_buffers=false requires a substantive")]
+    fn rejects_io_buffer_comparison_relaxation_without_reason() {
+        let spec = parse_mode(
+            r#"
+ci = true
+compare_io_buffers = false
+backends_enabled = ["ptrace"]
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            90,
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "rcb_time=false requires a substantive")]
+    fn rejects_rcb_time_relaxation_without_reason() {
+        let spec = parse_mode(
+            r#"
+ci = true
+rcb_time = false
+backends_enabled = ["ptrace"]
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            90,
+            &spec,
+            &mut Vec::new(),
+        );
     }
 
     #[test]
