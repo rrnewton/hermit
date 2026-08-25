@@ -3,229 +3,194 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Hermetic Infra: tools for reproducible Linux execution.">
-  <title>Hermetic Infra: tools for reproducible Linux execution</title>
+  <meta name="description" content="Sentinel risk intelligence command center for monitoring global risk, emerging signals, and regional exposure.">
+  <meta name="theme-color" content="#070b12">
+  <title>Sentinel — Risk Intelligence</title>
   <link rel="stylesheet" href="site.css">
+  <script src="site.js" defer></script>
 </head>
 <body>
-  <header class="site-header">
-    <a class="wordmark" href="#top" aria-label="Hermetic Infra home">
-      <span class="wordmark-icon" aria-hidden="true">H//I</span>
-      <span>Hermetic Infra</span>
+  <a class="skip-link" href="#main-content">Skip to dashboard</a>
+
+  <header class="command-header" id="top">
+    <a class="brand" href="#overview" aria-label="Sentinel Risk Intelligence overview">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" focusable="false"><path d="M12 2 3.5 6.2v5.5c0 5.2 3.5 9.6 8.5 10.8 5-1.2 8.5-5.6 8.5-10.8V6.2L12 2Z"/><path d="m8.5 12 2.2 2.2 4.8-5"/></svg>
+      </span>
+      <span class="brand-copy"><strong>SENTINEL</strong><small>RISK INTELLIGENCE</small></span>
     </a>
-    <nav aria-label="Main navigation">
-      <a href="#tools">Tools</a>
-      <a href="#compatibility">Compatibility</a>
-      <a href="#frontier">What works</a>
+
+    <nav class="view-nav" aria-label="Dashboard views">
+      <button class="view-link is-active" type="button" data-target="overview" aria-current="page">Overview</button>
+      <button class="view-link" type="button" data-target="intelligence">Intelligence</button>
+      <button class="view-link" type="button" data-target="analysis">Analysis</button>
+      <button class="view-link" type="button" data-target="signals">Signals</button>
     </nav>
+
+    <div class="header-actions">
+      <label class="search-control" for="risk-search">
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6"/></svg>
+        <span class="sr-only">Search intelligence</span>
+        <input id="risk-search" type="search" autocomplete="off" placeholder="Search intelligence">
+      </label>
+      <label class="select-control" for="severity-filter">
+        <span class="sr-only">Filter by severity</span>
+        <select id="severity-filter">
+          <option value="all">All severity</option>
+          <option value="critical">Critical</option>
+          <option value="high">High</option>
+          <option value="medium">Medium</option>
+          <option value="low">Low</option>
+        </select>
+      </label>
+      <button class="icon-button" id="reset-filters" type="button" aria-label="Clear search and reset filters" title="Reset filters">
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
   </header>
 
-  <main id="top">
-    <section class="hero">
-      <div class="hero-copy">
-        <p class="eyebrow">Open infrastructure for controlled execution</p>
-        <h1>Tools for reproducible<br><em>Linux execution.</em></h1>
-        <p class="lede">
-          Hermetic Infra combines deterministic container technology, a typed
-          instrumentation API, and lightweight binary patching. Control time,
-          randomness, and scheduling&mdash;then inspect what actually happened.
-        </p>
-        <div class="actions">
-          <a class="button primary" href="https://github.com/rrnewton/hermit">Explore Hermit</a>
-          <a class="button secondary" href="hermit/index.html">Read the Rust API</a>
-        </div>
+  <main id="main-content" class="dashboard-shell">
+    <div class="dashboard-meta" aria-label="Dashboard status">
+      <div><span class="live-dot" aria-hidden="true"></span><span>Interface monitor online</span></div>
+      <p>Last synchronized <time id="last-updated" datetime="2026-08-24T14:32:00Z">14:32 UTC</time></p>
+      <p class="demo-disclosure">Illustrative static data · No live sources connected</p>
+      <div class="meta-actions">
+        <button class="text-button" id="refresh-dashboard" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 4v5h5M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5"/></svg>
+          Refresh
+        </button>
+        <button class="text-button" id="download-report" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 3v12m0 0 5-5m-5 5-5-5M5 21h14"/></svg>
+          Export
+        </button>
       </div>
-      <div class="hero-visual" aria-label="Reproducible execution diagram">
-        <div class="orbit orbit-outer"><span>observe</span></div>
-        <div class="orbit orbit-middle"><span>schedule</span></div>
-        <div class="orbit orbit-inner"><span>intercept</span></div>
-        <div class="core"><strong>Linux</strong><small>same input<br>same evolution</small></div>
-      </div>
-    </section>
+    </div>
 
-    <section class="score-strip" aria-label="Current compatibility highlights">
-      <div><strong>191/191</strong><span>ptrace strict L2 corpus</span></div>
-      <div><strong>70/89</strong><span>DBT-native Reverie tests</span></div>
-      <div><strong>22/23</strong><span>DBT at ptrace parity</span></div>
-      <div><strong>22/23</strong><span>KVM at ptrace parity</span></div>
-    </section>
-
-    <section id="tools" class="section tools">
-      <div class="section-heading">
-        <p class="eyebrow">The toolchain</p>
-        <h2>Three layers, one boundary.</h2>
-        <p>Use the complete stack or take the layer that fits your system.</p>
-      </div>
-      <div class="card-grid">
-        <article class="tool-card accent-coral">
-          <p class="card-index">01 / execute</p>
-          <h3>Hermit</h3>
-          <p>
-            Deterministic container technology for unmodified x86-64 Linux
-            programs. Hermit controls scheduling, time, random data, CPUID,
-            and selected filesystem observations.
-          </p>
-          <div class="card-links">
-            <a href="https://github.com/rrnewton/hermit">Source <span aria-hidden="true">&nearr;</span></a>
-            <a href="hermit/index.html">API docs <span aria-hidden="true">&rarr;</span></a>
-          </div>
-        </article>
-
-        <article class="tool-card accent-blue">
-          <p class="card-index">02 / instrument</p>
-          <h3>Reverie</h3>
-          <p>
-            A type-safe Rust instrumentation API for Linux. Tools subscribe to
-            typed syscall and processor events, then inspect, modify, suppress,
-            or inject operations across a guest process tree.
-          </p>
-          <div class="card-links">
-            <a href="https://github.com/rrnewton/reverie">Source and guide <span aria-hidden="true">&nearr;</span></a>
-          </div>
-        </article>
-
-        <article class="tool-card accent-gold">
-          <p class="card-index">03 / patch</p>
-          <h3>LiteInst</h3>
-          <p>
-            Online x86-64 instrumentation built around instruction punning.
-            The original C++ system established the technique; LiteInst2 is a
-            policy-free Rust port of its patching core.
-          </p>
-          <div class="card-links stacked">
-            <a href="https://github.com/iu-parfunc/liteinst">Original LiteInst <span aria-hidden="true">&nearr;</span></a>
-            <a href="https://github.com/rrnewton/liteinst2">LiteInst2 Rust port <span aria-hidden="true">&nearr;</span></a>
-            <a href="https://doi.org/10.1145/2908080.2908084">PLDI '16 &mdash; Living on the edge <span aria-hidden="true">&nearr;</span></a>
-            <a href="https://doi.org/10.1145/3062341.3062344">PLDI '17 &mdash; Instruction punning <span aria-hidden="true">&nearr;</span></a>
-          </div>
-        </article>
-      </div>
-    </section>
-
-    <section id="compatibility" class="section compatibility">
-      <div class="section-heading split-heading">
+    <section class="posture-panel panel" id="overview" aria-labelledby="posture-heading">
+      <div class="section-label">
+        <span>01</span>
         <div>
-          <p class="eyebrow">Measured, not implied</p>
-          <h2>Compatibility envelope</h2>
+          <p>Global assessment</p>
+          <h1 id="posture-heading">Executive Risk Posture</h1>
         </div>
-        <p>
-          Backend-local repeatability and ptrace parity answer different
-          questions. These checked-in ratchets keep them separate.
-        </p>
       </div>
 
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th scope="col">Backend</th>
-              <th scope="col">Backend-local / compatibility</th>
-              <th scope="col">Ptrace-parity contracts</th>
-              <th scope="col">Proven maturity</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <th scope="row">ptrace <span class="tag reference">reference</span></th>
-              <td><strong>191/191</strong> strict L2; <strong>139</strong> record/replay</td>
-              <td><strong>23/23</strong> contracts</td>
-              <td><strong>B2.1</strong></td>
-            </tr>
-            <tr>
-              <th scope="row">DBT</th>
-              <td><strong>70/89</strong> Reverie-native tests</td>
-              <td><strong>22/23</strong> contracts</td>
-              <td><strong>B2</strong></td>
-            </tr>
-            <tr>
-              <th scope="row">KVM</th>
-              <td><span class="todo">TODO: publish native-suite denominator</span></td>
-              <td><strong>22/23</strong> contracts</td>
-              <td><strong>B2</strong></td>
-            </tr>
-            <tr>
-              <th scope="row">SaBRe</th>
-              <td><strong>198/198</strong> compatibility rows</td>
-              <td><span class="todo">TODO: add to 23-pair matrix</span></td>
-              <td><strong>B2</strong></td>
-            </tr>
-            <tr>
-              <th scope="row">LiteInst</th>
-              <td><span class="todo">TODO: publish native-suite denominator</span></td>
-              <td><span class="todo">TODO: add to 23-pair matrix</span></td>
-              <td><span class="todo">TODO: not assigned in current snapshot</span></td>
-            </tr>
-            <tr>
-              <th scope="row">e9patch</th>
-              <td><strong>155</strong> classified rows; <span class="todo">pass count TODO</span></td>
-              <td><span class="todo">TODO: add to 23-pair matrix</span></td>
-              <td><span class="todo">TODO: not assigned in current snapshot</span></td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
+      <div class="posture-grid">
+        <div class="risk-summary">
+          <div class="risk-summary-topline">
+            <span class="status-badge status-elevated"><span aria-hidden="true"></span>Elevated</span>
+            <span class="trend trend-up">+8%</span>
+          </div>
+          <div class="risk-score" aria-label="Risk score 72 out of 100">
+            <strong>72</strong><span>/100</span>
+          </div>
+          <div class="segmented-meter" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="72" aria-label="Executive risk score">
+            <span class="is-low"></span><span class="is-low"></span><span class="is-low"></span>
+            <span class="is-medium"></span><span class="is-medium"></span>
+            <span class="is-high"></span><span class="is-high"></span>
+            <span></span><span></span><span></span>
+          </div>
+          <div class="meter-labels" aria-hidden="true"><span>Guarded</span><span>Elevated</span><span>Severe</span></div>
+          <p class="summary-note">Risk concentration is increasing across supply, cyber, and sovereign exposure.</p>
+        </div>
 
-      <div class="evidence-links">
-        <span>Sources:</span>
-        <a href="https://github.com/rrnewton/hermit/blob/main/scripts/validate.rs">compatibility ratchets</a>
-        <a href="https://github.com/rrnewton/hermit/tree/main/tests/backend-parity">parity matrix</a>
-        <a href="https://github.com/rrnewton/hermit/issues/1087">maturity definitions and evidence snapshot</a>
+        <div class="kpi-grid" aria-label="Executive risk metrics">
+          <article class="kpi-card"><p>Critical risks</p><strong>08</strong><span>3 new since last briefing</span></article>
+          <article class="kpi-card"><p>Escalating</p><strong>14</strong><span>+5 in the past 24 hours</span></article>
+          <article class="kpi-card"><p>Monitored entities</p><strong>327</strong><span>Across 18 active regions</span></article>
+          <article class="kpi-card"><p>Mitigation coverage</p><strong>68%</strong><span>12 response actions overdue</span></article>
+        </div>
       </div>
-
-      <div class="maturity-grid" aria-label="Backend maturity levels B1 through B4">
-        <div><strong>B1</strong><span>intercepts a documented syscall subset</span></div>
-        <div><strong>B2</strong><span>Detcore drives a real strict, verified workload</span></div>
-        <div><strong>B3</strong><span>&ge;50% of the full frozen ptrace corpus, after B2.4</span></div>
-        <div><strong>B4</strong><span>100% parity across every supported backend</span></div>
-      </div>
-      <p class="boundary-note">
-        The maturity model is cumulative. The current evidence snapshot proves
-        no B3 or B4 backend; small parity matrices are diagnostics, not a
-        substitute for the full frozen corpus.
-      </p>
     </section>
 
-    <section id="frontier" class="section frontier">
-      <div class="section-heading">
-        <p class="eyebrow">What works now</p>
-        <h2>From a process to a kernel.</h2>
-        <p>Frontier demonstrations extend the same control loop to systems workloads.</p>
-      </div>
-      <div class="frontier-grid">
-        <a class="frontier-card" href="https://github.com/rrnewton/dev-hermit/blob/main/demos/WALKTHROUGH.md#demo-5-boot-once-and-store-the-linux-snapshot">
-          <span class="frontier-number">05</span>
-          <h3>Boot Linux under QEMU</h3>
-          <p>Boot once under Hermit and save a reusable live snapshot with deterministic instruction-derived time.</p>
-          <span class="text-link">Open the walkthrough &nearr;</span>
-        </a>
-        <a class="frontier-card" href="https://github.com/rrnewton/dev-hermit/tree/main/experiments/btrfs_userspace_archeology_demo08_20260728">
-          <span class="frontier-number">btrfs</span>
-          <h3>Exercise filesystem logic</h3>
-          <p>Reproduce a historical btrfs-progs userspace bug with pinned buggy/fixed revisions and byte-stable transcripts.</p>
-          <span class="text-link">Inspect the experiment &nearr;</span>
-        </a>
-        <a class="frontier-card" href="https://github.com/rrnewton/dev-hermit/blob/main/demos/WALKTHROUGH.md#demo-7-read-advance-and-read-again">
-          <span class="frontier-number">07</span>
-          <h3>Read the kernel with drgn</h3>
-          <p>Read a stopped guest task list, advance by a fixed budget, read again, and reproduce the same state diff.</p>
-          <span class="text-link">Open the walkthrough &nearr;</span>
-        </a>
-      </div>
-      <p class="boundary-note wide">
-        Boundary: these are named, reproducible demonstrations&mdash;not a claim
-        that every Linux kernel, device model, filesystem race, or arbitrary
-        binary is already supported. Each linked artifact records its own
-        prerequisites and oracle.
-      </p>
-    </section>
+    <div class="intelligence-grid">
+      <section class="queue-panel panel" id="intelligence" aria-labelledby="queue-heading">
+        <div class="panel-heading">
+          <div><p class="overline">Prioritized review</p><h2 id="queue-heading">Intelligence Queue</h2></div>
+          <span class="result-count" id="queue-result-count" aria-live="polite">16 signals</span>
+        </div>
+
+        <div class="table-scroll">
+          <table class="queue-table">
+            <thead><tr><th scope="col">ID</th><th scope="col">Signal</th><th scope="col">Region</th><th scope="col">Severity</th><th scope="col">Age</th></tr></thead>
+            <tbody id="queue-body"></tbody>
+          </table>
+          <noscript><p class="empty-state">Enable JavaScript to use dashboard filtering and pagination.</p></noscript>
+          <p class="empty-state" id="queue-empty" hidden>No intelligence matches the active filters.</p>
+        </div>
+
+        <div class="queue-footer">
+          <p>Select a signal to update the active briefing.</p>
+          <div class="pager" aria-label="Intelligence queue pages">
+            <button class="icon-button small" id="queue-previous" type="button" aria-label="Previous queue page"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m15 18-6-6 6-6"/></svg></button>
+            <span><strong id="current-page">1</strong> of <span id="total-pages">4</span></span>
+            <button class="icon-button small" id="queue-next" type="button" aria-label="Next queue page"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m9 18 6-6-6-6"/></svg></button>
+          </div>
+        </div>
+
+        <article class="headline-banner" id="active-headline" aria-live="polite">
+          <div class="headline-accent" aria-hidden="true"></div>
+          <div>
+            <p><span id="headline-severity">Critical</span> · Active briefing</p>
+            <h3 id="headline-title">Maritime corridor disruption expands into a second operating zone</h3>
+            <span id="headline-meta">SR-2481 · Eastern Mediterranean · Updated 8 min ago</span>
+          </div>
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m9 18 6-6-6-6"/></svg>
+        </article>
+      </section>
+
+      <section class="matrix-panel panel" id="analysis" aria-labelledby="matrix-heading">
+        <div class="panel-heading compact"><div><p class="overline">Portfolio distribution</p><h2 id="matrix-heading">Impact / Likelihood</h2></div></div>
+        <div class="matrix-tabs" role="tablist" aria-label="Risk matrix view">
+          <button id="matrix-tab-risk" class="matrix-tab is-active" type="button" role="tab" aria-selected="true" aria-controls="matrix-view" data-matrix="risk">Risk matrix</button>
+          <button id="matrix-tab-velocity" class="matrix-tab" type="button" role="tab" aria-selected="false" aria-controls="matrix-view" data-matrix="velocity" tabindex="-1">Velocity</button>
+        </div>
+        <div class="matrix-chart" id="matrix-view" role="tabpanel" aria-labelledby="matrix-tab-risk">
+          <div class="axis-title axis-y">Impact</div><div class="axis-title axis-x">Likelihood</div>
+          <div class="matrix-y-labels" aria-hidden="true"><span>Severe</span><span>Major</span><span>Moderate</span><span>Minor</span><span>Low</span></div>
+          <div class="heatmap" id="heatmap" aria-label="Five by five risk distribution matrix"></div>
+          <div class="matrix-x-labels" aria-hidden="true"><span>Rare</span><span>Unlikely</span><span>Possible</span><span>Likely</span><span>Almost certain</span></div>
+        </div>
+        <div class="matrix-legend" aria-label="Heatmap legend">
+          <span><i class="legend-low"></i>Low</span><span><i class="legend-medium"></i>Moderate</span><span><i class="legend-high"></i>High</span><span><i class="legend-critical"></i>Critical</span>
+        </div>
+        <div class="matrix-summary"><div><strong id="matrix-priority">11</strong><span>priority risks</span></div><p id="matrix-insight">Highest concentration: likely events with major operational impact.</p></div>
+      </section>
+
+      <aside class="right-rail" aria-label="Emerging and regional risk intelligence">
+        <section class="rail-panel panel" id="signals" aria-labelledby="signals-heading">
+          <div class="panel-heading compact"><div><p class="overline">Early warning</p><h2 id="signals-heading">Emerging Signals</h2></div><span class="signal-pulse" title="Feed active"><span class="sr-only">Feed active</span></span></div>
+          <ol class="signal-timeline" id="signal-timeline"></ol>
+          <p class="empty-state" id="timeline-empty" hidden>No emerging signals match.</p>
+        </section>
+
+        <section class="rail-panel panel" aria-labelledby="regions-heading">
+          <div class="panel-heading compact"><div><p class="overline">Concentration</p><h2 id="regions-heading">Regional Exposure</h2></div></div>
+          <div class="region-list" aria-label="Regional exposure percentages">
+            <div class="region-row"><span>Europe</span><div class="region-track"><i style="--exposure: 82%"></i></div><strong>82</strong></div>
+            <div class="region-row"><span>Asia Pacific</span><div class="region-track"><i style="--exposure: 74%"></i></div><strong>74</strong></div>
+            <div class="region-row"><span>Middle East</span><div class="region-track"><i style="--exposure: 61%"></i></div><strong>61</strong></div>
+            <div class="region-row"><span>North America</span><div class="region-track"><i style="--exposure: 46%"></i></div><strong>46</strong></div>
+            <div class="region-row"><span>Latin America</span><div class="region-track"><i style="--exposure: 33%"></i></div><strong>33</strong></div>
+          </div>
+        </section>
+
+        <section class="rail-panel panel" aria-labelledby="recent-heading">
+          <div class="panel-heading compact"><div><p class="overline">Latest changes</p><h2 id="recent-heading">Recent</h2></div></div>
+          <ul class="recent-list" id="recent-list"></ul>
+          <p class="empty-state" id="recent-empty" hidden>No recent updates match.</p>
+        </section>
+      </aside>
+    </div>
   </main>
 
-  <footer>
-    <div>
-      <strong>Hermetic Infra</strong>
-      <span>An initial project sketch for reproducible Linux execution.</span>
-    </div>
-    <a href="https://github.com/rrnewton/hermit/tree/main/docs/site">View this page's source &nearr;</a>
+  <footer class="system-footer">
+    <div class="system-state"><span class="live-dot" aria-hidden="true"></span><strong>System normal</strong><span>All dashboard modules operational</span></div>
+    <nav class="footer-links" aria-label="Dashboard sections and project resources">
+      <div class="source-list"><span>Dashboard sections</span><a href="#intelligence">Intelligence queue</a><a href="#signals">Emerging signals</a><a href="#analysis">Risk matrix</a></div>
+      <div class="source-list"><span>Project</span><a href="hermit/index.html">Rust API docs</a><a href="https://github.com/rrnewton/hermit">GitHub repository</a></div>
+    </nav>
+    <p>Sentinel Risk Intelligence · Illustrative interface</p>
   </footer>
 </body>
 </html>
