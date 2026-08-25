@@ -38,6 +38,23 @@ NO_RESULT_MARKER = "NO-RESULT-CASE:"
 NO_RESULT_EXIT_CODE = 75
 
 
+class ValidateChildRefused(RuntimeError):
+    """The spawned validate REFUSED to start, so the stop path was never exercised.
+
+    This is a could-not-evaluate, not a failure, and the distinction is the whole
+    point of the class. The fixture spawns `scripts/validate.rs full`; when that
+    child refuses -- because another validate holds the per-checkout invocation
+    lock, or because admission declines -- nothing about the signal traps has been
+    observed. Reporting it as an assertion says the stop paths are broken when
+    what actually happened is that they were never reached.
+
+    Measured on main at 4e168f2aa5b9: `AssertionError: validate exited before
+    ready: rc=2` was the whole of check.lint_checks' failure, and the node was red
+    for it. It is collected into `unevaluated` like NoParentAdapter and announced
+    with NO_RESULT_MARKER, which ci/lint-checks-node.sh turns into exit 75.
+    """
+
+
 class NoParentAdapter(RuntimeError):
     """The dev-hermit parent adapter is not reachable from this checkout.
 
@@ -239,13 +256,49 @@ def warm_validate_binary() -> None:
     )
 
 
+# The shapes `scripts/validate.rs` uses to decline before it starts work. Both are
+# rendered by RunSummary::refused, which prefixes "refused by: <what>". Matching
+# the rendered prefix rather than a specific reason keeps this from needing an
+# update every time a new refusal reason is added.
+_REFUSAL_SHAPES = (
+    "refused by:",
+    "validate: REFUSED",
+    "another validate is already running",
+)
+
+
+def _looks_refused(output: str) -> bool:
+    """Did the child DECLINE, as opposed to failing at something?
+
+    Deliberately narrow. Anything not recognised stays an AssertionError, because
+    a crash misreported as a could-not-evaluate is silent, and silence in that
+    direction is what this whole change is against.
+    """
+    return any(shape in output for shape in _REFUSAL_SHAPES)
+
+
 def wait_for_text(log: Path, text: str, process: subprocess.Popen[bytes]) -> None:
     deadline = time.monotonic() + READY_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         if log.exists() and text in log.read_text(errors="replace"):
             return
         if process.poll() is not None:
-            raise AssertionError(f"validate exited before ready: rc={process.returncode}")
+            # ⚠️ SHOW THE OUTPUT HERE TOO. The timeout branch below prints what it
+            # saw; this branch did not, so the ONE case that needs a reason -- the
+            # child died and only the child knows why -- arrived as a bare rc with
+            # its log already deleted with the TemporaryDirectory. That cost the
+            # first diagnosis of this exact failure.
+            seen = log.read_text(errors="replace") if log.exists() else "<log never created>"
+            if _looks_refused(seen):
+                raise ValidateChildRefused(
+                    f"the spawned validate refused to start (rc={process.returncode}); "
+                    f"the stop path was never exercised.\n"
+                    f"--- validate output ({len(seen)} bytes) ---\n{seen[-2000:]}"
+                )
+            raise AssertionError(
+                f"validate exited before ready: rc={process.returncode}\n"
+                f"--- validate output ({len(seen)} bytes) ---\n{seen[-2000:]}"
+            )
         time.sleep(0.05)
     # SHOW WHAT IT ACTUALLY SAW. The bare form of this message cost real time:
     # it names readiness, so it was read as a slow start, when the log underneath
@@ -522,16 +575,29 @@ def run_cleanup_signal_race() -> None:
 
 
 def main() -> None:
-    warm_validate_binary()
-    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        run_signal(sig, expect_record=True)
-    run_signal(signal.SIGKILL, expect_record=False)
-    run_signal(signal.SIGTERM, expect_record=True, prior_failure=True)
-    run_signal(signal.SIGTERM, expect_record=True, lock_proven=True)
-    # The retired shell contract trusted these caller-selected values. Rust must
-    # ignore them: only the canonical authority query can establish admission.
-    run_signal(signal.SIGTERM, expect_record=True, forged_owner=True)
-    run_incomplete_exit()
+    unevaluated: list[str] = []
+    # ⚠️ A REFUSED CHILD MAKES EVERY SIGNAL CASE UNEVALUABLE, NOT FAILED, so the
+    # whole block is bracketed rather than each call. If validate declines to
+    # start, no signal was delivered to anything and nothing about the stop paths
+    # was observed; carrying on to the next case would spawn another child that
+    # will be refused for the same reason. The four steps AFTER this block do not
+    # spawn a validate and are left to run, which is the same judgement the
+    # NoParentAdapter bracket below already makes: skip only what cannot be
+    # evaluated, and keep going.
+    try:
+        warm_validate_binary()
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            run_signal(sig, expect_record=True)
+        run_signal(signal.SIGKILL, expect_record=False)
+        run_signal(signal.SIGTERM, expect_record=True, prior_failure=True)
+        run_signal(signal.SIGTERM, expect_record=True, lock_proven=True)
+        # The retired shell contract trusted these caller-selected values. Rust
+        # must ignore them: only the canonical authority query can establish
+        # admission.
+        run_signal(signal.SIGTERM, expect_record=True, forged_owner=True)
+        run_incomplete_exit()
+    except ValidateChildRefused as exc:
+        unevaluated.append(f"signal stop paths (validate declined to start): {exc}")
     # ⚠️ SKIP ONLY WHAT CANNOT BE EVALUATED, AND KEEP GOING.
     # An earlier version let NoParentAdapter propagate out of main(), which
     # abandoned the four steps below it -- refuse=True, the cleanup race and the
@@ -540,7 +606,6 @@ def main() -> None:
     # refuse=True arm plants its own adapter and never needed a parent. Claiming
     # they ran was false, and abandoning them cost real coverage for a precondition
     # that affects exactly one arm of one case.
-    unevaluated: list[str] = []
     try:
         run_canonical_adapter_contract(refuse=False)
     except NoParentAdapter as exc:
@@ -578,11 +643,27 @@ def main() -> None:
             "Run from a checkout nested under the dev-hermit parent to evaluate them.",
             file=sys.stderr,
         )
+    # ⚠️ THE SUMMARY MUST NAME ONLY WHAT RAN. The adapter arm below already does
+    # this; the signal cases did not, so a refused child printed "TERM/INT/HUP =>
+    # NO-RESULT; KILL => no record; prior failure remains fail; forged owner path
+    # is unadmitted" for four cases that were never reached. That is the same
+    # over-claim #2616 removed one line lower, and re-introducing it here would
+    # have been worse than the assertion it replaced: an assertion at least says
+    # something went wrong.
+    signals_ran = not any(item.startswith("signal stop paths") for item in unevaluated)
+    adapter_unevaluated = any(
+        item.startswith("canonical adapter") for item in unevaluated
+    )
     print(
-        "PASS: TERM/INT/HUP => NO-RESULT; KILL => no record; "
-        "prior failure remains fail; forged owner path is unadmitted; "
+        "PASS: "
+        + (
+            "TERM/INT/HUP => NO-RESULT; KILL => no record; "
+            "prior failure remains fail; forged owner path is unadmitted; "
+            if signals_ran
+            else "signal stop paths NOT EVALUATED (validate declined to start); "
+        )
         + ("canonical adapter REFUSE arm only (accept arm not evaluable here); "
-           if unevaluated else "canonical adapter accept/refuse bracketed; ")
+           if adapter_unevaluated else "canonical adapter accept/refuse bracketed; ")
         + "cleanup is signal-atomic"
     )
 
