@@ -103,14 +103,20 @@ fi
 # unchanged. Confirmed empirically: a build at f4152f8f produces DynamoRIO
 # install key 132d7713..., the key this budget was measured against.
 #
+# CARRY TO b0c3cfe4 (2026-08-25): f4152f8f..b0c3cfe4 changes only
+# reverie-memory/src/local.rs. reverie-dbt/build.rs remains blob
+# 0ff8ae24b974 and reverie-dbt/vendor/dynamorio remains de352475846e, so
+# every repository input to source_recipe_key is byte-identical. The measured
+# effective-job-seconds budget and MAX_PARALLEL_JOBS=16 carry unchanged.
+#
 # ⚠️ THIS BINDING AND THE ONE IN ci/run-with-reverie-dbt-budget.sh MUST MOVE
 # TOGETHER. They are two separate hard-coded revisions guarding one calibration,
 # and updating only the wrapper leaves the whole budget child failing at
 # `return 2` -- which looks identical to the refusal the wrapper was just fixed
 # to stop emitting. ci/run-with-reverie-dbt-budget-test.sh exists because that is
 # exactly what happened; it runs the wrapper end to end and so sees this layer.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != f4152f8fd3a6d234e9ba4946ef3f9fa27aa7f8a7 ]]; then
-    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie f4152f8fd3a6d234e9ba4946ef3f9fa27aa7f8a7 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != b0c3cfe4c0797445dedda93774db552edf96f62b ]]; then
+    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie b0c3cfe4c0797445dedda93774db552edf96f62b (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 2
 fi
 
