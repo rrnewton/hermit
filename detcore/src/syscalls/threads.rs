@@ -1456,11 +1456,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// Every check is a pure function of the guest's own arguments. The one
     /// piece of state consulted is the pid lookup, which asks the scheduler's
-    /// own task table via [`thread_is_live`] -- Detcore state, replayed
+    /// own task table via `thread_is_live` -- Detcore state, replayed
     /// identically -- rather than the host's process table, which would leak
     /// unrelated host processes into a guest-visible answer.
     ///
-    /// Specifically NOT [`crate::tool_global::resolve_kill_targets`], which
+    /// Specifically NOT `tool_global::resolve_kill_targets`, which
     /// models `kill(2)` and so recognises only thread-group leaders; asking it
     /// this question reports ESRCH for a live non-leader thread.
     ///
