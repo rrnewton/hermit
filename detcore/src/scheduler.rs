@@ -2534,7 +2534,39 @@ impl Scheduler {
             dettid, signal
         );
         let pid = Pid::from_raw(dettid.as_raw()); // TODO(T78538674): virtualize pid/tid:
-        signal::kill(pid, signal).expect("signal::kill to go through");
+        match signal::kill(pid, signal) {
+            Ok(()) => {}
+            // ⚠️ ESRCH IS AN EXPECTED OUTCOME HERE, NOT AN ERROR. The target
+            // chose to exit between the moment it was selected and the moment
+            // the signal was sent; that window is inherent and cannot be closed
+            // by locking, because the thread's exit is the guest's decision.
+            // There is no one left to signal and nothing left to wake, so the
+            // correct behaviour is to say so and carry on.
+            //
+            // This is NOT a retry and NOT a widened catch: exactly ESRCH is
+            // absorbed, and every other errno still panics, because a signal
+            // rejected for any other reason means the scheduler's model of the
+            // guest is wrong and continuing would compound it.
+            //
+            // WHY IT MATTERED. Before this, the unconditional `expect` turned
+            // that ordinary race into a panic on the scheduler task -- and a
+            // panicking scheduler does not fail the run, it HANGS it, because
+            // every guest thread is waiting on a task that no longer exists.
+            // Measured 2026-08-25: `hermit run --backend kvm --strict --verify`
+            // on a bash process-substitution pipeline ran 420 s with empty
+            // stdout and never exited. The pipeline's short-lived subshells hit
+            // this window repeatedly. Found only once the 22 `run_kvm_` cli
+            // tests were scheduled; nothing had ever run them.
+            Err(nix::errno::Errno::ESRCH) => {
+                info!(
+                    "[dtid {}] signal {} not delivered: the thread exited before it landed. \
+                     Expected race; nothing to deliver and nothing to wake.",
+                    dettid, signal
+                );
+                return;
+            }
+            Err(errno) => panic!("signal::kill to go through, got {errno}"),
+        }
         self.wake_signaled_guest(dettid, signal);
     }
 
