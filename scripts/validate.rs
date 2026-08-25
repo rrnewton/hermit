@@ -1491,6 +1491,7 @@ fn self_test() -> Result<(), String> {
     typed_libtest_count_bracket()?;
     ledger_gate_origin_bracket()?;
     requalification_plan_bracket(&root)?;
+    no_result_propagation_bracket()?;
     selective_subset_bracket(&root)?;
     self_output_bracket()?;
     // ---- DAG-config carry + ungrantable-resource brackets -------------------
@@ -4279,6 +4280,67 @@ fn step_with_caps(
 
 // --------------------------------------------------------------------------- reporting
 
+/// A completed node uses EX_TEMPFAIL to say that it could not determine its
+/// condition. This is deliberately the only nonzero code that is not a product
+/// failure; every other nonzero remains loud.
+const NO_RESULT_EXIT_CODE: i64 = 75;
+
+fn outcome_is_no_result(outcome: &StepOutcome) -> bool {
+    !outcome.aborted && outcome.returncode == Some(NO_RESULT_EXIT_CODE)
+}
+
+fn outcome_is_failure(outcome: &StepOutcome) -> bool {
+    !outcome.ok && !outcome.aborted && !outcome_is_no_result(outcome)
+}
+
+fn ledger_gate_result(outcome: &StepOutcome) -> &'static str {
+    if outcome.ok {
+        "pass"
+    } else if outcome_is_no_result(outcome) {
+        "no_result"
+    } else {
+        "fail"
+    }
+}
+
+fn ledger_run_results(
+    exit_code: u8,
+    failures: usize,
+    no_results: usize,
+    interrupted: bool,
+) -> (&'static str, &'static str) {
+    let raw = if exit_code == 0 && failures == 0 && no_results == 0 {
+        "pass"
+    } else {
+        "fail"
+    };
+    let result = if failures > 0 {
+        "fail"
+    } else if interrupted
+        || (exit_code == NO_RESULT_EXIT_CODE as u8 && no_results > 0)
+    {
+        "no_result"
+    } else {
+        raw
+    };
+    (raw, result)
+}
+
+fn completed_exit_code(
+    effective_failures: usize,
+    no_results: usize,
+    run_timed_out: bool,
+    unexplained_runner_failure: bool,
+) -> u8 {
+    if effective_failures > 0 || run_timed_out || unexplained_runner_failure {
+        1
+    } else if no_results > 0 {
+        NO_RESULT_EXIT_CODE as u8
+    } else {
+        0
+    }
+}
+
 /// Per-node cost table, built entirely from typed `StepOutcome` fields.
 fn print_cost_table(outcomes: &[StepOutcome], skipped: &[String]) {
     println!("\n=== per-node cost (dagrun) ===");
@@ -4291,6 +4353,8 @@ fn print_cost_table(outcomes: &[StepOutcome], skipped: &[String]) {
             "ok"
         } else if o.aborted {
             "ABORTED"
+        } else if outcome_is_no_result(o) {
+            "NO_RESULT"
         } else {
             "FAIL"
         };
@@ -4345,6 +4409,12 @@ fn compat_summary_with_tables(
     let mut measured_labels: BTreeSet<String> = BTreeSet::new();
     for o in outcomes {
         let Some(label) = o.tag.strip_prefix("compat.") else { continue };
+        if outcome_is_no_result(o) {
+            println!(
+                "  NO_RESULT {label} could not determine its condition; excluded from the measured denominator"
+            );
+            continue;
+        }
         let cat = validate_corpus::category_of(label);
         let e = per_cat.entry(cat).or_insert((0, 0));
         e.1 += 1;
@@ -5755,7 +5825,8 @@ fn run_lane_with_env_retries(
     );
 
     while env_retries < max {
-        let failed: Vec<&StepOutcome> = by_tag.values().filter(|o| !o.ok && !o.aborted).collect();
+        let failed: Vec<&StepOutcome> =
+            by_tag.values().filter(|o| outcome_is_failure(o)).collect();
         if failed.is_empty() {
             break;
         }
@@ -5912,9 +5983,9 @@ fn run_lane_with_env_retries(
 
     // Retries exhausted with an environmental block still standing is a RED, but
     // one whose cause is named. The verdict is unchanged; only its label is.
-    if env_retries == max && by_tag.values().any(|o| !o.ok && !o.aborted) {
+    if env_retries == max && by_tag.values().any(outcome_is_failure) {
         let log = read_log_settled(log_path);
-        for o in by_tag.values().filter(|o| !o.ok && !o.aborted) {
+        for o in by_tag.values().filter(|o| outcome_is_failure(o)) {
             if let Some(class) = validate_runtime::extract_node_detail(&log, &o.tag)
                 .and_then(|d| validate_runtime::environmental_block_class(&d))
             {
@@ -6669,6 +6740,82 @@ fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn no_result_propagation_bracket() -> Result<(), String> {
+    let outcome = |tag: &str, returncode: i64, aborted: bool| StepOutcome {
+        tag: tag.into(),
+        ok: returncode == 0 && !aborted,
+        duration_s: 0.0,
+        summary: String::new(),
+        executed_tests: None,
+        filtered_tests: None,
+        returncode: Some(returncode),
+        reason: String::new(),
+        aborted,
+    };
+
+    let pass = outcome("pass", 0, false);
+    if outcome_is_no_result(&pass)
+        || outcome_is_failure(&pass)
+        || ledger_gate_result(&pass) != "pass"
+        || completed_exit_code(0, 0, false, false) != 0
+        || ledger_run_results(0, 0, 0, false) != ("pass", "pass")
+    {
+        return Err("no-result propagation: exit 0 no longer stays PASS".into());
+    }
+
+    let no_result = outcome("no-result", NO_RESULT_EXIT_CODE, false);
+    if !outcome_is_no_result(&no_result)
+        || outcome_is_failure(&no_result)
+        || ledger_gate_result(&no_result) != "no_result"
+        || completed_exit_code(0, 1, false, false) != NO_RESULT_EXIT_CODE as u8
+        || ledger_run_results(NO_RESULT_EXIT_CODE as u8, 0, 1, false)
+            != ("fail", "no_result")
+    {
+        return Err("no-result propagation: exit 75 did not remain a distinct NO_RESULT".into());
+    }
+
+    for returncode in [-9, 1, 2, 3, 74, 76, 124, 127] {
+        let failure = outcome("failure", returncode, false);
+        if outcome_is_no_result(&failure)
+            || !outcome_is_failure(&failure)
+            || ledger_gate_result(&failure) != "fail"
+            || completed_exit_code(1, 0, false, false) != 1
+            || ledger_run_results(1, 1, 0, false) != ("fail", "fail")
+        {
+            return Err(format!(
+                "no-result propagation: genuine failure exit {returncode} was weakened"
+            ));
+        }
+    }
+
+    if completed_exit_code(1, 1, false, false) != 1
+        || ledger_run_results(1, 1, 1, false) != ("fail", "fail")
+        || ledger_run_results(1, 0, 1, false) != ("fail", "fail")
+        || ledger_run_results(NO_RESULT_EXIT_CODE as u8, 1, 1, false) != ("fail", "fail")
+    {
+        return Err("no-result propagation: a sibling exit 75 hid a genuine failure".into());
+    }
+
+    if completed_exit_code(0, 1, true, false) != 1 {
+        return Err("no-result propagation: a run timeout was weakened to NO_RESULT".into());
+    }
+    if completed_exit_code(0, 1, false, true) != 1 {
+        return Err(
+            "no-result propagation: an unexplained runner failure was weakened to NO_RESULT".into(),
+        );
+    }
+
+    let aborted = outcome("aborted", NO_RESULT_EXIT_CODE, true);
+    if outcome_is_no_result(&aborted) || outcome_is_failure(&aborted) {
+        return Err("no-result propagation: an aborted row acquired a completed verdict".into());
+    }
+
+    println!(
+        "  no-result propagation: 75 stayed distinct; 0 passed; 8 other exits and mixed 75+failure stayed RED"
+    );
+    Ok(())
+}
+
 /// Write one validation record through the single configured authority.
 ///
 /// Every qualification is written HERE, at the single write point, so no
@@ -6694,14 +6841,14 @@ fn write_ledger(
     let (coverage_schema, coverage) = ledger_schema_and_coverage(coverage);
     let ledger_schema = if cell_results.is_some() { 6 } else { coverage_schema };
     let gates_run = outcomes.len();
-    let failures = outcomes.iter().filter(|o| !o.ok && !o.aborted).count();
+    let failures = outcomes.iter().filter(|o| outcome_is_failure(o)).count();
+    let no_results = outcomes.iter().filter(|o| outcome_is_no_result(o)).count();
     // An operator stop learned nothing new about the product. Preserve the raw
     // shell outcome for forensics, but do not mint a FAILED verdict unless a
     // completed gate had already established one before the stop
     // (validate.sh:1473 `interruption_is_no_result`).
-    let raw_result = if exit_code == 0 && failures == 0 { "pass" } else { "fail" };
-    let result =
-        if ctx.interruption.is_some() && failures == 0 { "no_result" } else { raw_result };
+    let (raw_result, result) =
+        ledger_run_results(exit_code, failures, no_results, ctx.interruption.is_some());
     let timed_out = timed_out_nodes(outcomes);
     // Stable per-row identity. Corrections never edit a row; they append a new
     // one carrying `corrects: <this id>`, which is what keeps the shard
@@ -6749,7 +6896,7 @@ fn write_ledger(
             let retried = node_attempts.len().saturating_sub(1);
             serde_json::json!({
                 "name": o.tag,
-                "result": if o.ok { "pass" } else { "fail" },
+                "result": ledger_gate_result(o),
                 "exit_code": o.returncode,
                 "reason": o.reason,
                 "aborted": o.aborted,
@@ -7066,6 +7213,8 @@ fn warn_if_unreadable_ledger(ledger: &Path) {
 enum Verdict {
     Pass,
     Fail,
+    /// A completed gate could not determine its condition.
+    NoResult,
     /// Admission control declined to run: dirty tree, stale base, unplannable
     /// profile, uncapped node, no boxing, no durable log, bad arguments.
     Refused,
@@ -7085,6 +7234,7 @@ impl Verdict {
         match self {
             Verdict::Pass | Verdict::SelfTest | Verdict::CacheHit => "✅",
             Verdict::Fail => "❌",
+            Verdict::NoResult => "⏹",
             Verdict::Refused => "🚫",
             Verdict::Interrupted => "⏹",
             Verdict::PlanOnly => "📋",
@@ -7095,6 +7245,7 @@ impl Verdict {
         match self {
             Verdict::Pass => "PASS",
             Verdict::Fail => "FAIL",
+            Verdict::NoResult => "NO-RESULT",
             Verdict::Refused => "REFUSED",
             Verdict::Interrupted => "INTERRUPTED (no result)",
             Verdict::PlanOnly => "PLAN ONLY (nothing executed)",
@@ -8158,7 +8309,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             ],
         );
         s.nodes_executed = outcomes.len();
-        s.nodes_failed = outcomes.iter().filter(|o| !o.ok && !o.aborted).count();
+        s.nodes_failed = outcomes.iter().filter(|o| outcome_is_failure(o)).count();
         s.nodes_skipped = skipped.len();
         s.wall_s = Some(wall);
         s.jobs = Some(jobs);
@@ -8229,7 +8380,13 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         }
     }
 
-    let failures = outcomes.iter().filter(|o| !o.ok && !o.aborted).count();
+    let failures = outcomes.iter().filter(|o| outcome_is_failure(o)).count();
+    let no_result_nodes: Vec<&str> = outcomes
+        .iter()
+        .filter(|o| outcome_is_no_result(o))
+        .map(|o| o.tag.as_str())
+        .collect();
+    let no_results = no_result_nodes.len();
     // The verdict is the RATCHET, not the raw node count.
     //
     // Three profiles deliberately have a verdict narrower than "every node
@@ -8242,7 +8399,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     //     only the build/preflight spine can fail it.
     let blocking_failures = outcomes
         .iter()
-        .filter(|o| !o.ok && !o.aborted && !plan.nonblocking.contains(&o.tag))
+        .filter(|o| outcome_is_failure(o) && !plan.nonblocking.contains(&o.tag))
         .count();
     // Failures OUTSIDE the measured matrix: the build/prep/gate spine. `compat.*`
     // rows are excluded because the compat ratchet already judges them (and
@@ -8253,8 +8410,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let structural_failures = outcomes
         .iter()
         .filter(|o| {
-            !o.ok
-                && !o.aborted
+            outcome_is_failure(o)
                 && !o.tag.starts_with("compat.")
                 && !plan.nonblocking.contains(&o.tag)
         })
@@ -8266,12 +8422,18 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     } else {
         blocking_failures
     };
-    let mut exit_code: u8 = if effective_failures == 0 { 0 } else { 1 };
     // `ok` from the runner reflects every node, including the nonblocking ones,
-    // so it is only authoritative when nothing is excused.
-    if plan.nonblocking.is_empty() && plan.compat.is_none() && !ok {
-        exit_code = 1;
-    }
+    // so it is only authoritative when nothing is excused. A known exit 75
+    // fully explains why the runner returned non-ok; any other unexplained
+    // non-ok state remains a failure.
+    let unexplained_runner_failure =
+        plan.nonblocking.is_empty() && plan.compat.is_none() && !ok && no_results == 0;
+    let mut exit_code = completed_exit_code(
+        effective_failures,
+        no_results,
+        run_timed_out,
+        unexplained_runner_failure,
+    );
     if envelope_regressed {
         exit_code = 1;
     }
@@ -8405,16 +8567,29 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let excused = failures - blocking_failures;
     if exit_code == 0 {
         detail.push(format!("every blocking gate passed ({} node(s) ran)", outcomes.len()));
+    } else if exit_code == NO_RESULT_EXIT_CODE as u8 {
+        detail.push(format!(
+            "{} gate(s) could not determine their condition: {}",
+            no_results,
+            no_result_nodes.join(", ")
+        ));
     } else {
         let named: Vec<&str> = outcomes
             .iter()
-            .filter(|o| !o.ok && !o.aborted && !plan.nonblocking.contains(&o.tag))
+            .filter(|o| outcome_is_failure(o) && !plan.nonblocking.contains(&o.tag))
             .map(|o| o.tag.as_str())
             .take(8)
             .collect();
         detail.push(format!(
             "{effective_failures} blocking failure(s){}",
             if named.is_empty() { String::new() } else { format!(": {}", named.join(", ")) }
+        ));
+    }
+    if exit_code != NO_RESULT_EXIT_CODE as u8 && no_results > 0 {
+        detail.push(format!(
+            "{} gate(s) reported NO_RESULT but did not hide the genuine failure(s): {}",
+            no_results,
+            no_result_nodes.join(", ")
         ));
     }
     if excused > 0 {
@@ -8480,7 +8655,11 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         ),
     }
     let mut s = RunSummary::new(
-        if exit_code == 0 { Verdict::Pass } else { Verdict::Fail },
+        match exit_code {
+            0 => Verdict::Pass,
+            code if code == NO_RESULT_EXIT_CODE as u8 => Verdict::NoResult,
+            _ => Verdict::Fail,
+        },
         exit_code,
         &plan.profile,
         detail,
