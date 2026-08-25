@@ -1,8 +1,9 @@
 # Deciding whether an open pull request is already landed
 
-Read this before sweeping the open-pull-request queue. Three independent sweeps
-on 2026-08-24/25 each reached a wrong verdict first and were only corrected by a
-second or third check, so the checks below are ordered and none of them is
+Read this before sweeping the open-pull-request queue. Across six sweeps of
+three repositories on 2026-08-24/25, several reached a WRONG VERDICT FIRST and
+were corrected only by a later check — including two that were about to be
+published as closes. The checks below are therefore ordered, and none of them is
 sufficient alone.
 
 **The one outcome that loses something is a wrong "already landed".** Closing a
@@ -109,6 +110,43 @@ Such a change is landed-elsewhere, not absent.
 This runs hermit-ward only. For reverie's or agent-utils' own pull requests the
 authority is that repository's own `main`, and the hazard does not apply.
 
+### 5. Effect, because a correct verdict about the past can be the wrong action
+
+**Checks 1 to 4 all ask what already happened. This one asks what landing would
+DO.** It is the only forward-looking check, and it catches cases the other four
+cannot: the content is genuinely absent, the mechanism is genuinely absent, so
+every earlier check says "pending, land it" — and landing would make current
+behaviour WORSE while reading as progress.
+
+Ask: **has main improved this code since the branch left it?**
+
+```console
+BASE=$(git merge-base origin/main pr1234)
+for f in $(git diff --name-only "$BASE"...pr1234); do
+  printf '%s  main-since-base %s  pr-since-base %s\n' "$f" \
+    "$(git diff --numstat "$BASE" origin/main -- "$f" | awk '{print "+"$1"/-"$2}')" \
+    "$(git diff --numstat "$BASE" pr1234    -- "$f" | awk '{print "+"$1"/-"$2}')"
+done
+git log --oneline "$BASE"..origin/main -- <the-directory-it-touches>
+```
+
+Two signals, both measured:
+
+- **Main moved further than the branch in the same files.** One draft changed
+  `detcore-dbt/src/lib.rs` by +248/-138 while main had moved it +373/-51. The
+  branch DELETES 138 lines that main has since built on. Porting it is a
+  regression wearing the shape of a feature.
+- **A commit on main already does the branch's stated job.** The same draft was
+  titled "route DBT verification through canonical logs"; `a811f33684`
+  "detcore-dbt: route canonical logs through protected evidence" had landed 28
+  hours earlier and more completely — 9 mentions of `canonical` in main's
+  detcore-dbt against the draft's 2.
+
+This check has already reversed a published verdict. A draft classified
+"genuinely pending" from the symbol rule alone was closed by its reviewer
+because porting it would have REGRESSED current accounting. The symbol verdict
+was right about the past fact and wrong as an action.
+
 ## Verdict vocabulary
 
 | verdict | meaning | action |
@@ -117,20 +155,54 @@ authority is that repository's own `main`, and the hazard does not apply.
 | **already landed** | mechanism present on main AND no residual content | close, citing the landing commit |
 | **partial** | mechanism landed, unique content remains | extract the residual; do NOT close |
 | **indeterminate** | rule cannot decide — no extractable symbols, or every symbol pre-existed | human read; do NOT guess |
+| **blocked on a cross-repo dependency** | content and mechanism both absent, but the capability its tests assert has not landed in `reverie` or `agent-utils`, or hermit's pin does not include it | LEAVE OPEN and NAME THE SUCCESSOR; landing it creates a red |
+| **supersede-and-regress** | mechanism landed AND main has moved further in the same files | do NOT port; extract any residual, then close citing the superseding commit |
 
 Docs-only and config-only pull requests add no symbols and land in
 **indeterminate** by construction. That is a correct verdict, not a failure of
 the check, and those rows should be collected for one batched decision rather
 than guessed at individually.
 
+## Three dispositions, not two
+
+A sweep that can only close or land will record the third outcome as nothing,
+and **four supersession chains dead-ended that way in one night** — each one a
+pull request whose real status was known by somebody and written down nowhere.
+
+| disposition | when | what to record |
+|---|---|---|
+| **close** | already landed, or abandoned and unsafe to port | the superseding commit, or why porting is unsafe |
+| **land** | genuinely pending and landing improves main | the usual receipt |
+| **correctly parked, with a NAMED SUCCESSOR** | real work, correctly blocked — a cross-repo dependency, an unlanded capability, a decision it waits on | **WHO or WHAT unblocks it**, by name |
+
+The third is not a failure to decide. It is a decision, and it is only useful if
+the successor is named: "waiting on reverie#430 to land and hermit's pin to
+advance" is a disposition; "still open" is not. A parked pull request with no
+named successor is indistinguishable from a forgotten one, which is exactly how
+the four chains were lost.
+
 ## What sweeps have actually returned
 
-Across `hermit`, `reverie` and `dev-hermit` on 2026-08-24/25, **no sweep found a
-safe close.** dev-hermit reached zero by *merging*; reverie's 23 open pull
-requests classified with zero already-landed; hermit's sweeps found zero
-closable and several land candidates. One near-miss reached the third check
-before being caught.
+**Measured, not assumed: six sweeps across `hermit`, `reverie` and `dev-hermit`
+found ZERO clean already-landed closes.**
+
+A reader arriving at a queue of 88 open pull requests will reasonably assume it
+is full of duplicates. It is not, and this table exists so nobody spends another
+night establishing that:
+
+| repository | outcome |
+|---|---|
+| `dev-hermit` | reached zero by **merging**, not closing |
+| `reverie` | all 23 open classified; **zero** already-landed, 16 genuinely pending, 2 indeterminate |
+| `hermit` | sweeps found **zero** closable; several land candidates |
+
+**Two near-misses, both caught by the residual check (check 3), both PARTIAL
+rather than closable.** One had its mechanism landed, both test files present on
+main, and its target manifest deleted in a format migration — every signal
+saying close — and still carried 173 non-comment lines of a distinct test
+scenario. The other was superseded by a commit 28 hours older and would have
+regressed main, yet still held two standalone C guests absent from main.
 
 The queue is **unlanded work, not duplicates**, and the shortage is **rebases,
-not candidates**. Plan sweeps on that basis: budget for rebasing and landing,
-not for closing.
+not candidates**. Plan sweeps on that basis: budget for rebasing, extracting
+residuals and naming successors, not for closing.
