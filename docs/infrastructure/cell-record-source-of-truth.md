@@ -155,7 +155,8 @@ On `main` the validate side does not populate any of them: the harness in
 `ci/manifest-plan/src/` mentions the coordinates only as literal `null` in a
 `canonical_verdict.rs` test string. The value is computed in
 `hermit-cli/src/bin/hermit/verify.rs` and **dropped one hop before any cell sees
-it**. #2396 adds the wiring (`runner.rs` +218, `canonical_verdict.rs` +126).
+it**. #2396 landed the wiring (`runner.rs` +218, `canonical_verdict.rs` +126), so
+validate CAN now emit one — it just never runs the writer.
 
 ## NOTHING SCHEDULES THE PRODUCER
 
@@ -319,7 +320,7 @@ below.
 
 | Move | Answer | Where |
 |---|---|---|
-| **1. Min/max divergence tracking** | Already built and landed. `ObservedRange { earliest, latest, samples }` across four coordinates. The gap is not the type — it is that only 2 of 5584 cells carry an observation and only ONE carries a range, because nothing invokes the writer. | "NOTHING SCHEDULES THE PRODUCER", and requirement 4 below |
+| **1. Min/max divergence tracking** | **ALREADY ON MAIN — cite it, do not propose it.** `ObservedRange { earliest, latest, samples }` at [`scorecard.rs#L354`](https://github.com/rrnewton/hermit/blob/a841fb24024158be841bd43835269451dfb39e15/ci/compat-envelope/scorecard.rs#L354), across FOUR separate coordinates at [`#L183-L221`](https://github.com/rrnewton/hermit/blob/a841fb24024158be841bd43835269451dfb39e15/ci/compat-envelope/scorecard.rs#L183-L221). It reads as absent only because `min_divergence`/`max_divergence` greps to zero — it lives under the `ObservedRange` type. The gap is not the type: only 2 of 5584 cells carry an observation and only ONE carries a range, because nothing invokes the writer. | "NOTHING SCHEDULES THE PRODUCER", and requirement 6 below |
 | **2. Move records to the dev-hermit parent** | **Recommended: yes, for the SERIES.** Option C — an append-only per-cell series in the parent beside the existing ledger, with `cells.json`'s `observations` demoted to a derived projection in hermit. | "The proposal: a series in the parent, a projection in hermit" |
 | **3. Split validate from pressure-test output** | **Already split, and correctly.** The two provenances are never merged, and the boundary is enforceable in ONE place because it is two commands in one tool. The work is to ENFORCE and DOCUMENT it, not to build it. | "The single most important correction", and Phase 1 |
 
@@ -355,11 +356,25 @@ criteria for the design that follows:
    across trees.** Ranges are already keyed by `(detcore_tree, provenance)`.
 4. **A sample count is mandatory, not optional.** "earliest 80, latest 500" is a
    different claim over two runs than over fifty, and the pair alone cannot
-   distinguish them. #2396 adds `samples` per coordinate for exactly this.
+   distinguish them. `samples` is per coordinate ON MAIN for exactly this reason;
+   this requirement is already satisfied and is listed to stop it being dropped.
 5. **Writing results must not move the SHA being measured**, or the act of
    recording perturbs the experiment. This is the parent-versus-hermit split
    above, and it is the one genuinely open architectural question.
-6. **Absence must stay distinguishable from zero.** An empty field means "never
+6. **THE DIVERGENCE POSITION IS NOT ONE NUMBER, and a schema that models it as
+   one bakes in a wrong answer.** Main carries FOUR independent `ObservedRange`
+   values per observation, each a SEPARATE KEYSPACE:
+   `first_divergent_record`, `first_divergent_scheduler_turn`,
+   `first_divergent_virtual_nanoseconds` and `first_divergent_syscall`
+   ([`scorecard.rs#L183-L221`](https://github.com/rrnewton/hermit/blob/a841fb24024158be841bd43835269451dfb39e15/ci/compat-envelope/scorecard.rs#L183-L221)).
+   One real measured divergence was **record 98, syscall 37, scheduler turn 4** —
+   three different numbers for one event. Bounds on one axis must NEVER be read
+   against another's, they must never be averaged or reduced to a single
+   "position", and a series that stores one scalar per sample cannot be widened
+   back into four later. Any store built from this plan carries four ranges per
+   sample or it is already wrong.
+
+7. **Absence must stay distinguishable from zero.** An empty field means "never
    written", not "never diverged"; `ci_disabled_reason`'s sparseness is correct
    and must not be backfilled into a false denominator.
 
