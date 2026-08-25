@@ -515,9 +515,13 @@ impl StartOpts {
                 strictness,
                 compare_logs: true,
                 diagnostic_full_trace: false,
-                // Recording does not enable the syscall output-buffer hash, so
-                // a replay verdict here is not a content-parity claim either.
-                compare_io_buffers: false,
+                // Recording DOES enable the syscall output-buffer hash, so a
+                // replay verdict here is a content-parity claim. It was not
+                // before: this line and the recorder's own setting were two
+                // independent hard-coded `false`s, and they are now one
+                // constant precisely so they cannot drift apart again. See its
+                // doc on `RECORD_REPLAY_HASHES_IO_BUFFERS`.
+                compare_io_buffers: hermit::RECORD_REPLAY_HASHES_IO_BUFFERS,
                 keep_logs: false,
                 record_envelope: RecordEnvelope::all_records_v1(),
             },

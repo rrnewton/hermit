@@ -246,7 +246,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         detlog_heap: false,
         detlog_stack: false,
         detlog_regs: false,
-        detlog_io_buffers: false,
+        detlog_io_buffers: crate::RECORD_REPLAY_HASHES_IO_BUFFERS,
         detlog_regs_cadence: 1,
         sysinfo_uptime_offset: 120,
         memory: default_config.memory,
