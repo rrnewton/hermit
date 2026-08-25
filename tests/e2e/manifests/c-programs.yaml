@@ -7634,6 +7634,83 @@ test:
           kvm: No custom edge-case arguments have been calibrated for this C guest
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
+  - id: c-programs/session-identity
+    description: Pins observed session and process-group identity for tests/c/session_identity.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    timeout_seconds: 90
+    occasional: false
+    program: tests/c/session_identity.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      # PINS CURRENT BEHAVIOUR; it does not assert the behaviour is correct.
+      # Detcore handles the WRITE side (handle_setsid / handle_setpgid) but has
+      # no handler for getsid/getpgid/getpgrp, which pass through to the kernel.
+      # classify_syscall says so: all three sit in its PASS-THRU arm, described
+      # as "conditionally repeatable under Hermit's fixed-container,
+      # stable-filesystem, and serialization assumptions".
+      # ⚠️ THIS CELL IS THE TEST FOR THAT STATED CONDITION — the stability it
+      # observes comes from the PID and user NAMESPACE, and nothing else checks
+      # that the fixed-container assumption still holds. It is NOT evidence
+      # that the read side is determinized. See the guest source.
+      # There is an open question on whether Hermit should model process
+      # groups and sessions at all; if that is answered by building a model,
+      # these values are expected to change and this cell to be updated.
+      verify:
+        ci:
+          ptrace: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Session and process-group identity is unmodelled on every backend; qualify DBT separately rather than pinning a second passthrough
+          kvm: Session and process-group identity is unmodelled on every backend; qualify KVM separately rather than pinning a second passthrough
+          sabre: Session and process-group identity is unmodelled on every backend; qualify SaBRe separately rather than pinning a second passthrough
+          liteinst: Session and process-group identity is unmodelled on every backend; qualify LiteInst separately rather than pinning a second passthrough
+      naked:
+        ci: false
+        ci_disabled_reason: This cell pins the container's session and process-group values; it makes no claim about native variation, so naked is not selected.
+        backends_enabled: []
+        backends_disabled:
+          native: The native values are per-run host session and group ids; this cell pins the container's values, not native variation
+      replay:
+        ci: false
+        ci_disabled_reason: Record/replay qualification for session identity is a separate question from pinning the values the container reports today.
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification for session identity is separate from pinning the observed values
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        ci_disabled_reason: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle; this guest has none.
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        ci_disabled_reason: No custom edge-case arguments have been calibrated for this guest; the pinned observation needs no extra flags.
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
   - id: c-programs/sigmask-preemption
     description: Strict verification for tests/c/sigmask_preemption.c
     lane: portable
