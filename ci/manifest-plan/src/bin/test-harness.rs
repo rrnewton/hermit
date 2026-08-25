@@ -356,6 +356,15 @@ fn validate(root: &Path, manifests: &ManifestSet) -> ExitCode {
         &["--self-test"],
     );
     run_audit(root, &root.join("tests/manifest-cli.rs"), &["self-test"]);
+    // The DBT budget wrapper gates roughly twenty portable nodes and fails
+    // CLOSED on a pin it is not calibrated for. Nothing else notices: a
+    // truncated node reads like a fast one. This asserts end to end that the
+    // wrapper still REACHES its wrapped command at the recorded pin.
+    run_audit(
+        root,
+        &root.join("ci/run-with-reverie-dbt-budget-test.sh"),
+        &[],
+    );
     run_audit(
         root,
         &root.join("ci/compat-envelope/scorecard.rs"),

@@ -25,15 +25,32 @@ fi
 # --print-pin is deliberately offline: the separate latest-main gate owns the
 # network authority, while this check prevents a pin bump from silently reusing
 # an earlier revision's clamp and measured threshold.
-# CALIBRATED FOR f4152f8f BY DBT RECIPE IDENTITY, the same evidence used
-# for earlier carried calibrations. Between 13cf8bcb and f4152f8f every input
-# included in the native DynamoRIO recipe key is BYTE-IDENTICAL by git object id:
+# CALIBRATED FOR f4152f8f BY DBT RECIPE IDENTITY, the same evidence this budget
+# has been carried on five times before. Between 13cf8bcb and f4152f8f the two
+# repository inputs are BYTE-IDENTICAL by git object id:
 #     reverie-dbt/vendor/dynamorio  de352475846e -> de352475846e
 #     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
-#     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
-# The intervening changes are Rust source and tests outside those recipe-key
-# inputs, so the native build recipe cannot have changed and the measured budget
-# carries.
+# source_recipe_key also hashes the selected CMAKE and CMAKE_GENERATOR.
+# This carry is stronger than the previous four, which each had to argue that some
+# reverie-dbt Rust change was not a recipe input. Here `git diff 13cf8bcb f4152f8f
+# -- reverie-dbt` is EMPTY: the directory is unchanged in its entirety, so there is
+# no such argument to make, and the empirical install-key check below confirms the
+# complete selected recipe.
+#
+# AND IT WAS CONFIRMED EMPIRICALLY AT THE NEW PIN, not only by source comparison.
+# A build at f4152f8f produces the DynamoRIO install key this budget was measured
+# against, in both profiles:
+#     target/{debug,release}/reverie-dbt-native-cache/dynamorio-install-132d7713...
+# Reproduced from a genuinely cold state -- the native cache was deleted and
+# reverie-dbt `cargo clean`ed first, and the rebuild landed on the same key.
+# The recipe key is the thing the measurement is a property of, so an identical key
+# means the measured work is identical.
+#
+# WHAT IS CALIBRATED IS 1050 EFFECTIVE JOB-SECONDS, not an elapsed wall time.
+# ci/configure-build-jobs.sh derives the elapsed bound as
+#     MAX_BUILD_SECONDS = ceil(MAX_BUILD_EFFECTIVE_JOB_SECONDS / EFFECTIVE_BUILD_JOBS)
+# so the budget already scales with width and must not be "topped up" by hand. If
+# it is ever too tight, re-measure the job-seconds; do not raise the elapsed bound.
 expected_pin=f4152f8fd3a6d234e9ba4946ef3f9fa27aa7f8a7
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
@@ -47,7 +64,7 @@ expected_pin=f4152f8fd3a6d234e9ba4946ef3f9fa27aa7f8a7
 # report now goes to stderr -- but a value parsed out of a shared stream should
 # be validated by the consumer rather than trusted to stay clean.
 recorded_pin=$(
-    "$ROOT_DIR/ci/run-reverie-pin-check.sh" --repo "$ROOT_DIR" --print-pin | head -n 1
+    "$ROOT_DIR/ci/run-reverie-pin-check.sh" --repo "$ROOT_DIR" --print-pin
 )
 if [[ ! $recorded_pin =~ ^[0-9a-f]{40}$ ]]; then
     echo "run-with-reverie-dbt-budget.sh: --print-pin did not yield a 40-hex revision; got ${#recorded_pin} char(s): ${recorded_pin:0:80}" >&2
@@ -56,7 +73,7 @@ if [[ ! $recorded_pin =~ ^[0-9a-f]{40}$ ]]; then
 fi
 if [[ $recorded_pin != "$expected_pin" ]]; then
     echo "run-with-reverie-dbt-budget.sh: no calibrated budget for Reverie pin $recorded_pin (expected $expected_pin)" >&2
-    echo "run-with-reverie-dbt-budget.sh: NOT RUNNING '$*'. To recalibrate, confirm reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs and third-party/ are unchanged between the pins, then update expected_pin here." >&2
+    echo "run-with-reverie-dbt-budget.sh: NOT RUNNING '$*'. To recalibrate, confirm reverie-dbt/vendor/dynamorio and reverie-dbt/build.rs are unchanged and CMAKE/CMAKE_GENERATOR select the same tooling between the pins, then update expected_pin here." >&2
     exit 2
 fi
 REVERIE_DBT_BUDGET_BOUND_PIN=$recorded_pin

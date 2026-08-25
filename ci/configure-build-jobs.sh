@@ -93,11 +93,22 @@ fi
 # the repository's recorded pin through the canonical checker and carries it
 # here; a pin bump cannot silently retain the old clamp or threshold.
 # CARRY TO f4152f8f (2026-08-25), on the same recipe-identity evidence as the
-# carries above. 13cf8bcb..f4152f8f leaves every input of the recipe key
-# byte-identical by git object id: reverie-dbt/vendor/dynamorio de352475846e,
-# reverie-dbt/build.rs 0ff8ae24b974, third-party/ fb49c0ba7a9a. The intervening
-# changes are Rust source and tests outside those recipe-key inputs, and the
-# MAX_PARALLEL_JOBS=16 clamp is unchanged, so the measured budget carries.
+# carries above, and stronger than any of them: `git diff 13cf8bcb f4152f8f --
+# reverie-dbt` is EMPTY. Both repository inputs to source_recipe_key are
+# byte-identical by git object id -- reverie-dbt/vendor/dynamorio de352475846e
+# and reverie-dbt/build.rs 0ff8ae24b974. source_recipe_key also hashes the
+# selected CMAKE and CMAKE_GENERATOR; the empirical install-key check below
+# confirms the complete recipe identity. Unlike the previous carries, there is
+# no reverie-dbt Rust change to argue about at all. MAX_PARALLEL_JOBS=16 is
+# unchanged. Confirmed empirically: a build at f4152f8f produces DynamoRIO
+# install key 132d7713..., the key this budget was measured against.
+#
+# ⚠️ THIS BINDING AND THE ONE IN ci/run-with-reverie-dbt-budget.sh MUST MOVE
+# TOGETHER. They are two separate hard-coded revisions guarding one calibration,
+# and updating only the wrapper leaves the whole budget child failing at
+# `return 2` -- which looks identical to the refusal the wrapper was just fixed
+# to stop emitting. ci/run-with-reverie-dbt-budget-test.sh exists because that is
+# exactly what happened; it runs the wrapper end to end and so sees this layer.
 if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != f4152f8fd3a6d234e9ba4946ef3f9fa27aa7f8a7 ]]; then
     echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie f4152f8fd3a6d234e9ba4946ef3f9fa27aa7f8a7 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 2
