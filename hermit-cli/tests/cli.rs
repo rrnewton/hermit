@@ -3902,8 +3902,14 @@ const RECORD_FAULT_SITES: [(&str, &[&str]); 6] = [
     ("record.main.deadline", &["--record-timeout", "600"]),
     ("record_verify.record", &["--verify"]),
     ("record_verify.replay", &["--verify"]),
-    ("record_verify_debug.record", &["--verify-with-gdbex", "quit"]),
-    ("record_verify_debug.replay", &["--verify-with-gdbex", "quit"]),
+    (
+        "record_verify_debug.record",
+        &["--verify-with-gdbex", "quit"],
+    ),
+    (
+        "record_verify_debug.replay",
+        &["--verify-with-gdbex", "quit"],
+    ),
 ];
 
 /// Sites that exist but are deliberately not driven by the `record` table above,

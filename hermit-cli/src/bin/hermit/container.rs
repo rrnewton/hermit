@@ -521,9 +521,9 @@ fn inject_test_fault(site: &str) {
         .ok()
         .as_deref()
     {
-        Some("panic") => panic!(
-            "deliberate container-child panic for fault-injection testing at site {site}"
-        ),
+        Some("panic") => {
+            panic!("deliberate container-child panic for fault-injection testing at site {site}")
+        }
         Some("segv") => {
             // A genuine memory fault, NOT a panic. catch_unwind must not touch this.
             unsafe { std::ptr::null_mut::<u8>().write_volatile(1) };
