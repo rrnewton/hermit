@@ -3580,10 +3580,36 @@ impl RunOpts {
         }
         announce_verification_outcome(&outcome, success_message, failure_message);
 
-        // On divergence, preserve the historical behavior: return the error
-        // (nonzero process exit) without emitting the guest's output or backend
-        // banner.
+        // On divergence, still return the error (nonzero process exit) and skip
+        // the backend banner — but EMIT THE GUEST'S OUTPUT FIRST when both runs
+        // agreed on it.
+        //
+        // ⚠️ THE HISTORICAL BEHAVIOUR DESTROYED THE EVIDENCE IT EXISTED TO
+        // PRESENT. Dropping the output made a diverging run indistinguishable at
+        // the CLI from a run that produced nothing, which is a far more alarming
+        // and completely different failure. Measured 2026-08-25: a KVM
+        // divergence on `awk 'BEGIN { print 42 }'` was investigated, escalated,
+        // and reported to the project owner as "the guest produced no output".
+        // The guest produced `42`; both runs produced `42`; the harness threw it
+        // away. A diagnostic that hides the guest's behaviour misleads precisely
+        // when someone is investigating, and it did.
+        //
+        // WHY EMITTING IS UNAMBIGUOUS HERE, and why this is narrow: the
+        // comparator ALREADY prints a labelled diff of both runs whenever
+        // stdout or stderr differ. So the only case reaching this point with
+        // output to show is the one where BOTH RUNS AGREED — there is no
+        // question of which to print, and nothing is being chosen on the
+        // reader's behalf. Where they disagree the diff above is the report and
+        // this stays silent, exactly as before.
+        //
+        // The exit status is unchanged, so anything keying on the process
+        // result is unaffected; only the diagnostic gains the bytes it was
+        // discarding.
         if !outcome.verified() {
+            if out1.stdout == out2.stdout && out1.stderr == out2.stderr {
+                std::io::stdout().write_all(&out1.stdout)?;
+                std::io::stderr().write_all(&out1.stderr)?;
+            }
             return outcome.into_exit_status();
         }
         let status = outcome.guest_status;
