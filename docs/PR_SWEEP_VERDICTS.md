@@ -915,11 +915,53 @@ gh api ... | grep -c 'APPROVED-AT:'
 #   3. compare the bound sha against the sha that MERGED, not against the branch
 ```
 
+**Second face of the same rule, found independently the same night, in a
+different tool: a linter that keyed on the name of a local variable.** The
+parent's `scripts/lint-rust-error-string-proxies.py` forbids branching on an
+error's `Display` text. It rightly exempts the ordinary Rust idiom
+`x.map_err(|e| e.to_string())?` inside a condition, where the `?` propagates and
+nothing branches on the rendered string. But it decided that exemption with
+`_is_error_name`, which accepts `err`, `error`, and anything ending `_err` or
+`_error` — and rejects `e`, the commonest name in Rust for a bound error. So the
+exemption keyed on **the spelling of a closure binding**. Five byte-equivalent
+snippets, differing only in that name:
+
+| binding | verdict |
+| --- | --- |
+| `\|e\|`, `\|ex\|`, `\|problem\|` | **reported** |
+| `\|err\|`, `\|error\|` | clean |
+
+A pure rename flipped the verdict. This produced all three findings the gate
+held against `ci/manifest-plan/src/runner.rs` — two `if let Some(status) =
+child.try_wait().map_err(|e| e.to_string())?` and one
+`if entry.file_type().map_err(|e| e.to_string())?.is_dir()`. None compares an
+error string; the branches are on `Some`/`None` and on a `bool`. Because the
+parent's scan covers submodule sources, **a clean hermit reddened the parent's
+lint, and the obvious repair — renaming correct variables here — would have put
+the fix in the wrong repository.** The real fix was one function in the parent:
+exempt when the identifier *bound* by the closure is the identifier being
+rendered, whatever it is called.
+
+Two details worth carrying:
+
+- **It survived because both of the rule's own exemption tests spelled the
+  binding `|error|`.** The suite only ever exercised the name the rule happened
+  to accept, so the gap was invisible to the thing built to find it.
+- **Do not fix a token-keyed check by widening the token set.** Accepting "there
+  is a `map_err` somewhere" would have gone green immediately and blinded the
+  gate inside every `map_err` closure. Key on the property: the bound error is
+  the thing being rendered, so `map_err(|e| other.to_string())` still reports.
+
+The two instances differ in a way that matters. hermit-004's kept a token in
+**data** (`APPROVED-AT:` in a pull-request body); this one kept a token in
+**code**, inside the checker itself. Same rule, and the second shows that
+being a program does not protect a check from it.
+
 This is the same shape as check 13 (an absent symbol may be a rename) and
-check 12 (a comparison over nothing is not agreement). In all three the
+check 12 (a comparison over nothing is not agreement). In all four the
 mechanism was present and the *predicate* was wrong — a name, an empty set, a
-spelling. A check whose predicate is a string will keep exiting 0 while
-measuring something nobody asked about.
+spelling, a variable. A check whose predicate is a string will keep exiting 0
+while measuring something nobody asked about.
 
 ## Verdict vocabulary
 
