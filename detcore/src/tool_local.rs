@@ -436,10 +436,26 @@ impl FileMetadata {
         self.file_handles.values().any(DetFd::is_loopback_peer)
     }
 
+    // TODO-HUMAN-REVIEW(#2373)
+    /// True when `vfork` must be refused because some open file description
+    /// either holds a lock or carries a cached claim that may now be wrong.
+    ///
+    /// ⚠️ NEVER-OBSERVED IS DELIBERATELY NOT UNSAFE. The previous form refused
+    /// on `!= Some(None)`, which also caught descriptors Detcore had simply
+    /// never observed. stdin, stdout and stderr are marked unobserved at
+    /// container setup because they predate Detcore, so that form refused
+    /// `vfork` for EVERY guest that reached it -- measured: fds 0, 1 and 2 were
+    /// the sole reason `run_dbt_virtualizes_process_identities` was refused,
+    /// and that guest never calls `flock` at all. A guard that cannot pass is
+    /// not conservative, it is broken.
+    ///
+    /// The hazard is a STALE CACHE: a copied runtime mutating a lock that this
+    /// side still has a claim about. A description Detcore never observed
+    /// carries no claim, so there is nothing about it that can go stale.
     fn has_unsafe_vfork_flock_state(&self) -> bool {
-        self.file_handles
-            .values()
-            .any(|detfd| detfd.known_flock_mode() != Some(None))
+        self.file_handles.values().any(|detfd| {
+            matches!(detfd.known_flock_mode(), Some(Some(_))) || detfd.flock_mode_may_be_stale()
+        })
     }
 
     fn forget_flock_modes(&self) {
@@ -448,6 +464,32 @@ impl FileMetadata {
         }
     }
 
+    // TODO-HUMAN-REVIEW(#2373)
+    /// Fork the file table for `child`.
+    ///
+    /// FORGETTING IS DELIBERATELY *NOT* DONE HERE, and the reason is that this
+    /// fork does not produce a second copy of the cache. `DetFd` holds its
+    /// `OpenFileDescription` behind an `Arc<Mutex<..>>`, so `file_handles
+    /// .clone()` below hands the child the *same* description objects the
+    /// parent holds. That mirrors the kernel, where `fork(2)` duplicates the
+    /// descriptor table while both tables keep pointing at one open file
+    /// description, and an `flock(2)` lock belongs to that description. A
+    /// `flock` through either task therefore mutates the one shared record and
+    /// both sides observe it; there is no second copy that could go stale, so
+    /// invalidating here destroys correct information and buys nothing.
+    ///
+    /// The case that genuinely needs invalidation is a *separately hosted* tool
+    /// state — a real process clone under DBT, where the in-process runtime is
+    /// copied into a new address space and the `Arc` stops being shared. That
+    /// is handled at its own boundary, by
+    /// `reverie_dbt_runtime_process_clone_result`, which calls
+    /// `forget_flock_modes` only on a clone the kernel reported as successful.
+    ///
+    /// Forgetting here as well was not merely redundant, it was harmful: it
+    /// marked every descriptor unknown on any fork, and
+    /// `has_unsafe_vfork_flock_state` refuses `vfork` on unknown as well as on
+    /// held. So any guest that forked and later vforked was refused even when
+    /// it had never called `flock` at all.
     pub(crate) fn fork_for(&self, child: DetTid) -> Self {
         self.forget_flock_modes();
         Self {
@@ -569,9 +611,9 @@ impl FileMetadata {
 
         // These descriptors existed before Detcore began observing the guest,
         // so they may already carry flock state that we cannot query.
-        stdin.forget_flock_mode();
-        stdout.forget_flock_mode();
-        stderr.forget_flock_mode();
+        stdin.mark_flock_mode_unobserved();
+        stdout.mark_flock_mode_unobserved();
+        stderr.mark_flock_mode_unobserved();
 
         self.add_detfd(stdin);
         self.add_detfd(stdout);
