@@ -1,8 +1,16 @@
-# The cell record: where it lives, who writes it, and what is missing
+# Storage redesign: validate and pressure-test records
 
-Status: design analysis, measured 2026-08-24 against hermit `8bc26dba1d`.
-Nothing here is implemented as a consequence of this document; it exists so the
-redesign is argued from the real architecture rather than from recollection.
+Status: proposed plan, measured 2026-08-24 against hermit `8bc26dba1d`.
+
+Part 1 states the architecture as it actually is, measured rather than recalled,
+because an earlier description of it was wrong in a way that changed what kind
+of problem this is. Part 2 is the redesign proposal. Nothing in Part 2 is
+implemented; it is written so the owner can rule on a design rather than on a
+recollection.
+
+---
+
+# Part 1 — The architecture as measured
 
 ## Why this document exists
 
@@ -144,10 +152,14 @@ discarded.
 Everything needed to produce a sample exists. Nothing is responsible for keeping
 the sequence of samples.
 
+---
+
+# Part 2 — The redesign
+
 ## What a solution has to satisfy
 
-Constraints that fall out of the measurements above, offered as requirements
-rather than as a design:
+Constraints that fall out of the measurements above. These are the acceptance
+criteria for the design that follows:
 
 1. **One writer per field, stated.** The `update` / `update-observations` split
    already works; it needs to be written down and enforced, not rebuilt.
@@ -165,6 +177,134 @@ rather than as a design:
 6. **Absence must stay distinguishable from zero.** An empty field means "never
    written", not "never diverged"; `ci_disabled_reason`'s sparseness is correct
    and must not be backfilled into a false denominator.
+
+## The proposal: a series in the parent, a projection in hermit
+
+The single decision that drives everything else is **where the series lives**,
+because requirement 5 conflicts with the current location. Three options were
+considered:
+
+| Option | Series location | Satisfies "recording must not move the measured SHA" |
+|---|---|---|
+| A | `cells.json` in hermit, as today | **No** — every recorded sample moves the hermit SHA |
+| B | a new tracked file in hermit | **No** — same defect, tidier |
+| C | the parent, beside the existing ledger | **Yes** |
+
+**Recommendation: option C.** It follows the grain of what already works. The
+parent already holds the only durable series in the system — `ledger/hermit` and
+`ledger/reverie`, sharded per repository, fed by 774 run records — with a
+spool/union model already built for concurrent writers. A per-cell series is the
+same shape of data with a different key, so it reuses the sharding, the
+concurrency story, and the "does not perturb the measured tree" property for
+free.
+
+**The cost of option C, stated rather than hidden:** a hermit checkout cannot
+see the parent. Someone reading `cells.json` from a bare hermit clone would see
+no history at all. The mitigation is the second half of the proposal.
+
+### The two halves
+
+**The series (parent, authoritative, append-only).** One row per measurement,
+never rewritten:
+
+```
+(cell_id, hermit_sha, detcore_tree, provenance, result,
+ first_divergent_{record,scheduler_turn,virtual_nanoseconds,syscall},
+ depth{hermit,reverie}, run_id, invocation)
+```
+
+Append-only is what makes it a *series* rather than a snapshot: a flake rate is
+`fails / (fails + passes)` over rows, and no existing store can answer that
+because every existing store overwrites.
+
+**The projection (hermit, derived, deliberate).** `cells.json`'s `observations`
+array becomes explicitly a **projection of the series at a stated point**, not
+an independent record. It carries what a reader needs in-repo — the ranges, the
+`samples` count, the `provenance`, and critically the `last_tested`
+`{hermit_sha, detcore_tree, depth}` staleness marker — and it is regenerated
+only when someone deliberately publishes, so it moves the hermit SHA on a human
+decision rather than on every measurement.
+
+This is the part worth noticing: **`last_tested` already exists in #2396.** The
+projection's staleness marker is built. So is `provenance`, so is per-repo
+`depth`, so is `samples`. The redesign is substantially *completing #2396's
+direction*, not replacing it.
+
+### The writer is 60% built and unlanded
+
+The gap is a writer, and most of one already exists on an unlanded branch:
+
+| Piece | State |
+|---|---|
+| `observe-results` command (the append entry point) | written, #2396, unlanded |
+| validate-side wiring so a validate run can emit a divergence position at all | written, #2396, unlanded (`runner.rs` +218, `canonical_verdict.rs` +126) |
+| row-independent fold, so a batch of N cells equals N single-cell runs | written, #2396, unlanded |
+| `samples`, `provenance`, `depth`, `last_tested` | written, #2396, unlanded |
+| the append-only series store itself | **not written** |
+| a third producer path for `hermit-repeat` | **not written** |
+| `flaky-cells.json` derived rather than hand-kept | **not written** |
+
+The honest summary is that this redesign is one unlanded PR plus a store, not a
+rewrite.
+
+### Phases, in dependency order
+
+**Phase 0 — land [#2396](https://github.com/rrnewton/hermit/pull/2396).**
+Everything else builds on its types and its `observe-results` entry point.
+Nothing new should be written until it lands, or the work will be rebased twice.
+*Done when:* it is on main and the four coordinates can be written by something.
+
+**Phase 1 — enforce the writer boundary in code.** Today the
+`update` / `update-observations` split is correct by convention and unenforced.
+Make `update` refuse to modify `observations`, make `update-observations` refuse
+to modify `id`/`enabled`/`status`/`ci_disabled_reason`, and add a self-test that
+fails if either does. This is small, has no dependency on the store, and turns
+the one enforceable boundary into an enforced one.
+*Done when:* a deliberately mis-scoped write fails the self-test.
+
+**Phase 2 — the series store.** Define the row schema above and site it in the
+parent beside the ledger, reusing the shard/spool/union mechanism.
+*Done when:* two concurrent writers can append without loss, proven by test
+rather than asserted.
+
+**Phase 3 — point the producers at it.** Pressure test via `observe-results`;
+validate via the #2396 runner wiring; `hermit-repeat` via a summary emitter in
+the same schema, which is what stops its output directories being dead.
+*Done when:* all three producers append rows and a flake rate can be computed
+for a cell that all three have touched.
+
+**Phase 4 — make `observations` a projection.** Regenerate from the series;
+require `last_tested`; state in the file that it is derived.
+*Done when:* deleting and regenerating `observations` reproduces it exactly from
+the series.
+
+**Phase 5 — derive `flaky-cells.json`.** Compute it from the series and delete
+the hand-maintained list. `flake_class.py` and `validate_runtime.rs:89` keep
+their interface and gain a denominator that is not three weeks old.
+*Done when:* the file is generated and its single hand entry either reproduces
+from measured rows or is dropped as unsupported.
+
+### Deliberate non-goals
+
+- **Do not add a fourth measurer.** Three exist. The whole point is that
+  measurement is not the gap.
+- **Do not turn on `nextest` retries.** Retries hide flakes; this design
+  measures them. Zero retries is the correct setting and should stay.
+- **Do not backfill `ci_disabled_reason`.** Its sparseness is correct — a note
+  exists only where someone tried and failed. Backfilling it would manufacture a
+  denominator that means nothing.
+- **Do not let the projection become writable.** If anything writes
+  `observations` other than the regeneration step, the series stops being
+  authoritative and the two records drift.
+
+### What would reverse this recommendation
+
+If the parent workspace is ever not guaranteed present for a hermit
+checkout that needs history — for example if hermit CI must answer "is this cell
+flaky" from a bare clone with no parent — then option C's visibility cost
+becomes disqualifying and option B is correct despite moving the SHA. That is a
+question about how hermit is consumed, not about this data, and the owner is
+better placed to answer it than the measurements are.
 
 ## Related open work
 
