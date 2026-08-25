@@ -2141,6 +2141,15 @@ fn sabre_rpc_socket_ignores_host_tmpdir_hidden_by_container_tmp() {
         .map(|install| install.join("rsrcs/libdetcore_sabre.so"))
         .unwrap_or_else(|| executable_dir.join("libdetcore_sabre.so"));
     if !loader.is_file() || !plugin.is_file() {
+        // ⚠️ SAY SO. A bare `return` here reports `ok` in 0.00s having executed
+        // nothing, and the reader concludes the namespace fix is verified when
+        // the test never ran. `sabre_examples.rs` already prints its skip for
+        // exactly this reason; matching that rather than inventing a form.
+        eprintln!(
+            "skipping SaBRe RPC TMPDIR check: artifacts are unavailable: loader={}, plugin={}",
+            loader.display(),
+            plugin.display()
+        );
         return;
     }
 
