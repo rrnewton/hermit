@@ -508,9 +508,16 @@ fn memory_records(info: &str) -> Vec<MemoryDigest> {
 ///
 /// SCOPE, stated because it is deliberately narrow and must not be read as more
 /// than it is: this uses a **statically linked** guest. A dynamically linked
-/// guest FAILS this property today, and not marginally — measured on devbig030,
-/// `/bin/echo hello` under KVM has 98 of 113 stack-content hashes differing run
-/// to run, while ptrace has 0 of 193 differing.
+/// guest FAILS this property today, and not marginally — under KVM,
+/// `/bin/echo hello` has 98 of 113 stack-content hashes differing run to run,
+/// while ptrace has 0 of 193 differing.
+///
+/// Those figures and THE HOST THEY WERE MEASURED ON are recorded in
+/// `docs/TESTING_ENVIRONMENTS.md`, under "KVM memory-hash repeatability". They
+/// live there rather than here because a measurement is only auditable with its
+/// provenance, and `scripts/check-portable-paths.sh` correctly refuses a literal
+/// hostname in a `.rs` file. The host was not genericised: that would leave a
+/// sentence reading as evidence while carrying none.
 ///
 /// The cause is known and tracked, not papered over here: the KVM backend never
 /// delivers `rdtsc` to the Reverie `Tool`, so Detcore's existing virtualization
