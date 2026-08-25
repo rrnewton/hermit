@@ -116,7 +116,7 @@ pub enum SchedResponse {
 
     /// The guest was interupted by a signal while waiting on the scheduler, and will now execute
     /// the handler.
-    Signaled(),
+    Signaled(Option<Vec<SigWrapper>>),
     // TODO: Time to exit, or an exit is already under way
     // Exit,
 }
@@ -471,6 +471,22 @@ enum RemovalDisposition {
     ReplaceThenAdmit,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WaitidSignalRequest {
+    /// An in-flight wait that a pending signal should wake: either the legacy
+    /// `waitid` kernel-polling loop or a scheduler-managed child-wait lifecycle
+    /// resource.
+    ///
+    /// Deliberately does NOT distinguish the two. Queue residency is not a
+    /// property of the resource and must be decided at the drain, not inferred
+    /// here: `wake_child_waiters` re-admits a waiter without clearing its
+    /// `WaitChild` request, and `step6_reenqueue` pushes a thread back before it
+    /// issues its next request, so either request can be held by a thread that
+    /// is already in the run queue.
+    Parked,
+    Pending(Vec<SigWrapper>),
+}
+
 /// The state for the deterministic scheduler.
 #[derive(Debug)]
 pub struct Scheduler {
@@ -539,6 +555,10 @@ pub struct Scheduler {
     /// buffered admission for the same raw TID; the explicitly classified exec
     /// replacement preserves exactly one causally paired admission.
     pending_run_queue_removals: BTreeMap<DetTid, RemovalDisposition>,
+
+    /// Cross-task signals physically queued while their sole target was parked
+    /// in waitid polling. Applied at step2, where run-queue mutation is safe.
+    pending_waitid_signals: BTreeMap<DetTid, Vec<Signal>>,
 
     /// Child-TID futexes whose kernel clear may still be racing a guest join.
     cleared_child_tids: HashMap<FutexID, DetTid>,
@@ -1375,6 +1395,7 @@ impl Scheduler {
             vfork_barriers: Default::default(),
             pending_run_queue_admissions: Default::default(),
             pending_run_queue_removals: Default::default(),
+            pending_waitid_signals: Default::default(),
             cleared_child_tids: Default::default(),
             terminal_deadlock: None,
             cancel_killed_thread_rpcs: cfg.cancel_killed_thread_rpcs,
@@ -1529,7 +1550,12 @@ impl Scheduler {
                     if existing
                         .resources
                         .keys()
-                        .any(|r| matches!(r, ResourceID::InboundSignal(_)))
+                        .any(|r| {
+                            matches!(
+                                r,
+                                ResourceID::InboundSignal(_) | ResourceID::WaitidSignals(_)
+                            )
+                        })
             );
             if tolerated {
                 trace!(
@@ -1712,7 +1738,7 @@ impl Scheduler {
                 if request_was_pending && self.cancel_killed_thread_rpcs {
                     // AUTONOMOUS-BOT-IMPLEMENTED
                     // TODO-HUMAN-REVIEW(PR-845): Review killed-thread RPC cancellation.
-                    nextturn.resp.try_put(SchedResponse::Signaled());
+                    nextturn.resp.try_put(SchedResponse::Signaled(None));
                 }
                 self.wake_futex_child_cleartid(
                     FutexID::private(mm, nextturn.child_tid_addr),
@@ -2123,6 +2149,7 @@ impl Scheduler {
         // drain before admissions so a thread killed while an admission was
         // still buffered is not re-enqueued.
         self.drain_pending_run_queue_removals();
+        self.drain_pending_waitid_signals();
         self.drain_pending_run_queue_admissions();
         if self
             .blocked
@@ -2506,6 +2533,23 @@ impl Scheduler {
             "[dtid {}] deliver signal {} physically to guest thread.",
             dettid, signal
         );
+        let pid = Pid::from_raw(dettid.as_raw()); // TODO(T78538674): virtualize pid/tid:
+        signal::kill(pid, signal).expect("signal::kill to go through");
+        self.wake_signaled_guest(dettid, signal);
+    }
+
+    /// Wake a scheduler-parked target after another guest has successfully
+    /// queued a physical signal for it. The signal itself is not sent here;
+    /// this only prevents an internal polling request from hiding a pending
+    /// signal indefinitely.
+    fn wake_signaled_guest(&mut self, dettid: DetTid, signal: Signal) {
+        debug!(
+            "[dtid {}] make pending signal {} visible to the scheduler.",
+            dettid, signal
+        );
+        // `rt_sigsuspend_blockers` joins `external_io_blockers` here per main's
+        // rt_sigsuspend work; both mean the thread is parked outside the
+        // scheduler and must await its own continuation.
         let has_external_blocker = self.blocked.external_io_blockers.contains_key(&dettid)
             || self.blocked.rt_sigsuspend_blockers.contains_key(&dettid);
         let await_external_continuation =
@@ -2520,8 +2564,6 @@ impl Scheduler {
                 "signal_guest: thread should be parked in the scheduler"
             );
         }
-        let pid = Pid::from_raw(dettid.as_raw()); // TODO(T78538674): virtualize pid/tid:
-        signal::kill(pid, signal).expect("signal::kill to go through");
         if await_external_continuation {
             return;
         }
@@ -2559,6 +2601,70 @@ impl Scheduler {
                 let mut rsrcs = Resources::new(dettid);
                 rsrcs.insert(ResourceID::InboundSignal(SigWrapper(signal)), Permission::W);
                 self.force_unblock_thread(dettid, rsrcs);
+            }
+        }
+    }
+
+    /// Classify a request that still represents the same in-flight waitid.
+    /// A signal may arrive before its polling request is rewritten or after a prior
+    /// notification has already materialized its scheduler wakeup.
+    fn waitid_signal_request(&self, dettid: DetTid) -> Option<WaitidSignalRequest> {
+        let resources = self
+            .next_turns
+            .get(&dettid)
+            .and_then(|next_turn| next_turn.req.try_read())
+            .and_then(Result::ok)?;
+        // The two ways to be parked inside wait4/waitid: the legacy kernel
+        // polling loop, and the scheduler-managed child-wait lifecycle resource
+        // added by the typed WaitChild work. Both must be woken; neither implies
+        // anything about run-queue residency, which the drain decides.
+        let waiting_on_child = resources
+            .resources
+            .keys()
+            .any(|resource| matches!(resource, ResourceID::WaitChild { .. }));
+        let legacy_polling = resources.fyi == "waitid"
+            && resources
+                .resources
+                .contains_key(&ResourceID::InternalIOPolling);
+        if legacy_polling || waiting_on_child {
+            return Some(WaitidSignalRequest::Parked);
+        }
+        // Signals already materialized on this request by an earlier drain.
+        //
+        // Deliberately matches `WaitidSignals` ONLY. An earlier revision also
+        // matched `InboundSignal`, intending to make the observed set
+        // independent of which path delivered first. That was wrong and it
+        // crashed: the drain then produced a request holding BOTH resources,
+        // and `step4_resource_block` / `blocking_request_is_ready` assert a
+        // request carries exactly one resource, so the scheduler daemon
+        // panicked and the container hung. It reproduced on a guest with no
+        // `waitid` in it at all -- two sibling threads `pthread_kill`ing a
+        // third is enough, because `{InboundSignal}` with `poll_attempt: 0` is
+        // exactly what `signal_guest` installs.
+        //
+        // Merging the two would require either teaching both assertions to
+        // accept the pair, or folding the signal into `WaitidSignals` and
+        // dropping the `InboundSignal` key -- which discards the SIGCHLD
+        // deferral its grant path performs. Neither belongs in this change.
+        resources
+            .resources
+            .keys()
+            .find_map(|resource| match resource {
+                ResourceID::WaitidSignals(signals) => {
+                    Some(WaitidSignalRequest::Pending(signals.clone()))
+                }
+                _ => None,
+            })
+    }
+
+    /// Record an unambiguous cross-task signal that was physically queued while
+    /// its target was parked in waitid. The request rewrite is deferred to step2
+    /// so an asynchronous backend cannot mutate beneath a tentative selection.
+    pub(crate) fn notify_signal_pending(&mut self, dettid: DetTid, signal: Signal) {
+        if self.waitid_signal_request(dettid).is_some() {
+            let signals = self.pending_waitid_signals.entry(dettid).or_default();
+            if !signals.contains(&signal) {
+                signals.push(signal);
             }
         }
     }
@@ -3515,6 +3621,7 @@ impl Scheduler {
             // work remains, mirroring the `external_io_blockers` policy. Signals
             // that the scheduler itself synthesizes deterministically (timers via
             // `fire_alarm`) are never SIGCHLD and are unaffected.
+            ResourceID::WaitidSignals(_) => Ok(()),
             ResourceID::InboundSignal(SigWrapper(sig)) => {
                 // `sigchld_ready` marks a parent step2e has already re-admitted;
                 // grant it now rather than deferring it a second time.
@@ -3829,11 +3936,11 @@ impl Scheduler {
             "[sched-step5] Guest unblocking (via {}); clear ivars for the next turn on dettid {}",
             &resp, &dtid
         );
-        let sig = self.is_signal_inbound(dtid); // Peek before we clear the ivars.
+        let signals = self.inbound_signals(dtid); // Peek before we clear the ivars.
         let futex_timed_out = self.blocked.timed_out_futex_waiters.remove(&dtid);
         self.clear_nextturn(dtid);
-        let answer = if sig {
-            SchedResponse::Signaled()
+        let answer = if !signals.is_empty() {
+            SchedResponse::Signaled(Some(signals))
         } else if futex_timed_out {
             SchedResponse::Go(Some(SchedValue::TimeOut))
         } else {
@@ -3849,18 +3956,25 @@ impl Scheduler {
         resp.put(answer);
     }
 
-    fn is_signal_inbound(&self, dettid: DetTid) -> bool {
+    fn inbound_signals(&self, dettid: DetTid) -> Vec<SigWrapper> {
         let req = &self.next_turns.get(&dettid).unwrap().req;
-        if let Some(Ok(rsrcs)) = req.try_read() {
-            for rsrc in rsrcs.resources.iter() {
-                if let (ResourceID::InboundSignal(_), _) = rsrc {
-                    return true;
+        let mut signals = Vec::new();
+        if let Some(Ok(resources)) = req.try_read() {
+            for resource in resources.resources.keys() {
+                match resource {
+                    ResourceID::InboundSignal(signal) => signals.push(*signal),
+                    ResourceID::WaitidSignals(batch) => signals.extend(batch.iter().copied()),
+                    _ => {}
                 }
             }
-            false
-        } else {
-            false
         }
+        // A signal can legitimately appear in both an `InboundSignal` and a
+        // merged `WaitidSignals` batch. Sort then dedup so the reported set is a
+        // canonical function of WHICH signals are pending, not of how many
+        // resources happen to carry each one or of the order they arrived in.
+        signals.sort_by_key(|signal| signal.0 as libc::c_int);
+        signals.dedup_by_key(|signal| signal.0 as libc::c_int);
+        signals
     }
 
     /// Clear the thread's nextturn, installing fresh ivars.
@@ -4112,6 +4226,62 @@ impl Scheduler {
         // admission and this `Retire` disposition prevents resurrection.
         self.pending_run_queue_removals
             .insert(dtid, RemovalDisposition::Retire);
+    }
+
+    /// Apply queued waitid-signal notifications at the deterministic run-queue
+    /// mutation point. Re-check the request because a target may have exited or
+    /// completed its wait before this drain.
+    fn drain_pending_waitid_signals(&mut self) {
+        let pending = std::mem::take(&mut self.pending_waitid_signals);
+        for (dettid, mut signals) in pending {
+            match self.waitid_signal_request(dettid) {
+                Some(WaitidSignalRequest::Parked) => {
+                    // Decide run-queue residency HERE, by asking the queue, and
+                    // never by inferring it from which resource the thread
+                    // holds. A thread can hold either park request while already
+                    // queued: `wake_child_waiters` re-admits a waiter without
+                    // clearing its `WaitChild` request, and `step6_reenqueue`
+                    // pushes a completed turn back before the guest issues its
+                    // next request. `force_unblock_thread` ends in
+                    // `runqueue_push_*`, so pushing an already-queued thread
+                    // trips the run-queue invariant under `debug_assertions`
+                    // and, worse, SILENTLY double-enqueues in release — one
+                    // thread selected twice. This mirrors `wake_signaled_guest`,
+                    // which likewise consults `thread_status` before removing.
+                    if self.run_queue.contains_tid(dettid) {
+                        let removed = self.run_queue.remove_tid(dettid);
+                        debug_assert!(
+                            removed,
+                            "run_queue.contains_tid disagreed with remove_tid for {dettid}"
+                        );
+                    }
+                    signals.sort_by_key(|signal| *signal as libc::c_int);
+                    signals.dedup();
+                    let signals = signals.into_iter().map(SigWrapper).collect();
+                    let mut resources = Resources::new(dettid);
+                    resources.insert(ResourceID::WaitidSignals(signals), Permission::W);
+                    self.force_unblock_thread(dettid, resources);
+                }
+                Some(WaitidSignalRequest::Pending(existing)) => {
+                    signals.extend(existing.into_iter().map(|signal| signal.0));
+                    signals.sort_by_key(|signal| *signal as libc::c_int);
+                    signals.dedup();
+                    let signals = signals.into_iter().map(SigWrapper).collect();
+                    // One resource, always. `step4_resource_block` and
+                    // `blocking_request_is_ready` both assert a request carries
+                    // exactly one, so this must replace the request rather than
+                    // add to it. Only a request whose sole resource is already
+                    // `WaitidSignals` reaches here, so nothing is discarded.
+                    let mut resources = Resources::new(dettid);
+                    resources.insert(ResourceID::WaitidSignals(signals), Permission::W);
+                    let Some(next_turn) = self.next_turns.get_mut(&dettid) else {
+                        continue;
+                    };
+                    next_turn.req = Ivar::full(Ok(resources));
+                }
+                None => {}
+            }
+        }
     }
 
     /// Drain removals deferred by [`Scheduler::deschedule_or_defer`] at the same
@@ -5745,6 +5915,188 @@ mod test {
     }
 
     #[test]
+    fn pending_signal_does_not_rewrite_other_internal_pollers() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let target = DetTid::from_raw(100);
+        register_known_thread(&mut scheduler, target);
+        let mut polling = Resources::new(target);
+        polling.insert(ResourceID::InternalIOPolling, Permission::W);
+        polling.fyi("poll");
+        scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(polling));
+        scheduler.runqueue_push_back(target);
+
+        scheduler.notify_signal_pending(target, Signal::SIGUSR1);
+
+        assert!(scheduler.pending_waitid_signals.is_empty());
+        assert!(scheduler.run_queue.contains_tid(target));
+        assert!(scheduler.inbound_signals(target).is_empty());
+    }
+
+    /// `step4_resource_block` and `blocking_request_is_ready` both assert that a
+    /// request carries exactly one resource. The drain must never violate that.
+    ///
+    /// An earlier revision merged a pending signal into a request that already
+    /// held an `InboundSignal`, producing a two-resource request. The scheduler
+    /// daemon then panicked and the container hung — on a guest containing no
+    /// `waitid` at all, because `{InboundSignal}` is exactly what `signal_guest`
+    /// installs for an ordinary cross-thread signal.
+    #[test]
+    fn drain_never_builds_a_multi_resource_request() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let target = DetTid::from_raw(100);
+        register_known_thread(&mut scheduler, target);
+        // The shape that crashed: an ordinary delivered signal, nothing to do
+        // with waitid.
+        let mut inbound = Resources::new(target);
+        inbound.insert(
+            ResourceID::InboundSignal(SigWrapper(Signal::SIGUSR1)),
+            Permission::W,
+        );
+        scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(inbound));
+        scheduler.runqueue_push_back(target);
+
+        scheduler.notify_signal_pending(target, Signal::SIGUSR2);
+        scheduler.drain_pending_waitid_signals();
+
+        let resources = scheduler
+            .next_turns
+            .get(&target)
+            .and_then(|next_turn| next_turn.req.try_read())
+            .and_then(Result::ok)
+            .expect("the target should still hold a request");
+        assert!(
+            resources.resources.len() <= 1,
+            "the drain produced a {}-resource request, which step4 asserts against: {:?}",
+            resources.resources.len(),
+            resources.resources,
+        );
+    }
+
+    /// A thread can hold a `WaitChild` request while ALREADY in the run queue:
+    /// `wake_child_waiters` re-admits a waiter without clearing its request, and
+    /// `step6_reenqueue` pushes a completed turn back before the guest issues
+    /// its next request. An earlier revision inferred "blocked" from the
+    /// resource and skipped the run-queue removal, so the drain pushed a
+    /// second copy of the thread.
+    ///
+    /// That failure is worse than it looks: `RunQueue`'s duplicate check is
+    /// `cfg!(debug_assertions)`, so debug builds panic with "Invariant
+    /// violation! Tried to add ... already present" while RELEASE builds
+    /// silently enqueue the thread twice and select it twice.
+    #[test]
+    fn pending_signal_does_not_double_queue_a_runnable_child_waiter() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let target = DetTid::from_raw(100);
+        let parent = DetPid::from_raw(100);
+        register_known_thread(&mut scheduler, target);
+        let spec = ChildWaitSpec {
+            selector: ChildWaitSelector::Any,
+            owner: None,
+            exit_class: ChildWaitExitClass::Sigchld,
+        };
+        let mut waiting = Resources::new(target);
+        waiting.insert(ResourceID::WaitChild { parent, spec }, Permission::R);
+        waiting.fyi("wait-child-lifecycle");
+        scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(waiting));
+        // The distinguishing state: holds WaitChild AND is runnable, with no
+        // `child_waiters` entry -- exactly what a just-woken waiter looks like.
+        scheduler.runqueue_push_back(target);
+        assert!(scheduler.run_queue.contains_tid(target));
+        assert!(!scheduler.blocked.child_waiters.contains_key(&target));
+
+        scheduler.notify_signal_pending(target, Signal::SIGUSR1);
+        scheduler.drain_pending_waitid_signals();
+
+        let occurrences = scheduler
+            .run_queue
+            .tids()
+            .filter(|tid| **tid == target)
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "the signalled child waiter must appear in the run queue exactly once"
+        );
+    }
+
+    /// A thread parked on a scheduler-managed child wait is blocked in
+    /// `child_waiters`, never in the run queue, so the run-queue removal the
+    /// polling disposition performs does not apply to it. Before this case was
+    /// handled, a signal aimed at such a thread was recorded nowhere and a wait
+    /// on a child that never exits could not be interrupted at all.
+    #[test]
+    fn pending_signal_unblocks_a_managed_child_waiter() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let target = DetTid::from_raw(100);
+        let parent = DetPid::from_raw(100);
+        register_known_thread(&mut scheduler, target);
+        let spec = ChildWaitSpec {
+            selector: ChildWaitSelector::Any,
+            owner: None,
+            exit_class: ChildWaitExitClass::Sigchld,
+        };
+        let mut waiting = Resources::new(target);
+        waiting.insert(ResourceID::WaitChild { parent, spec }, Permission::R);
+        waiting.fyi("wait-child-lifecycle");
+        scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(waiting));
+        // Parked, not runnable: exactly how `WaitChild` leaves a thread.
+        scheduler
+            .blocked
+            .child_waiters
+            .insert(target, (parent, spec));
+        assert!(!scheduler.run_queue.contains_tid(target));
+
+        scheduler.notify_signal_pending(target, Signal::SIGUSR1);
+        assert_eq!(scheduler.pending_waitid_signals[&target].len(), 1);
+
+        scheduler.drain_pending_waitid_signals();
+
+        assert!(
+            scheduler.run_queue.contains_tid(target),
+            "the signalled child waiter must be requeued"
+        );
+        assert!(
+            !scheduler.blocked.child_waiters.contains_key(&target),
+            "its child-wait blocking entry must be cleared"
+        );
+        assert_eq!(
+            scheduler.inbound_signals(target),
+            vec![SigWrapper(Signal::SIGUSR1)],
+            "the resume must name the signal that woke it"
+        );
+    }
+
+    #[test]
+    fn pending_signal_replaces_an_internal_poller_request() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let target = DetTid::from_raw(100);
+        register_known_thread(&mut scheduler, target);
+        let mut polling = Resources::new(target);
+        polling.insert(ResourceID::InternalIOPolling, Permission::W);
+        polling.fyi("waitid");
+        scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(polling));
+        scheduler.runqueue_push_back(target);
+
+        scheduler.notify_signal_pending(target, Signal::SIGUSR2);
+
+        assert_eq!(scheduler.pending_waitid_signals[&target].len(), 1);
+        scheduler.drain_pending_waitid_signals();
+        assert!(scheduler.run_queue.contains_tid(target));
+        assert_eq!(
+            scheduler.inbound_signals(target),
+            vec![SigWrapper(Signal::SIGUSR2)]
+        );
+
+        // A later signal must merge into the already-materialized waitid wakeup.
+        scheduler.notify_signal_pending(target, Signal::SIGUSR1);
+        assert_eq!(scheduler.pending_waitid_signals[&target].len(), 1);
+        scheduler.drain_pending_waitid_signals();
+        assert_eq!(
+            scheduler.inbound_signals(target),
+            vec![SigWrapper(Signal::SIGUSR1), SigWrapper(Signal::SIGUSR2)]
+        );
+    }
+
+    #[test]
     fn logically_kill_thread_unblocks_pending_rpc() {
         let config = Config {
             cancel_killed_thread_rpcs: true,
@@ -5769,7 +6121,7 @@ mod test {
 
         assert!(matches!(
             response.try_read(),
-            Some(SchedResponse::Signaled())
+            Some(SchedResponse::Signaled(None))
         ));
     }
 

@@ -1001,6 +1001,13 @@ impl GlobalTool for GlobalState {
             GlobalRequest::ResolveKillTargets(dpid) => {
                 R::ResolveKillTargets(self.sched.lock().unwrap().process_signal_targets(dpid))
             }
+            GlobalRequest::NotifySignalPending(dettid, SigWrapper(signal)) => {
+                self.sched
+                    .lock()
+                    .unwrap()
+                    .notify_signal_pending(dettid, signal);
+                R::NotifySignalPending(())
+            }
             GlobalRequest::ThreadIsLive(dtid) => {
                 R::ThreadIsLive(self.sched.lock().unwrap().thread_is_live(dtid))
             }
@@ -1222,12 +1229,15 @@ impl GlobalState {
                 );
                 (SchedulerRpcResult::Continue(ResumeStatus::Normal), None)
             }
-            SchedResponse::Signaled() => {
+            SchedResponse::Signaled(signal) => {
                 trace!(
                     "[dtid {}] resources granted but interrupted by signal",
                     dettid,
                 );
-                (SchedulerRpcResult::Continue(ResumeStatus::Signaled), None)
+                (
+                    SchedulerRpcResult::Continue(ResumeStatus::Signaled(signal)),
+                    None,
+                )
             }
         }
     }
@@ -1635,7 +1645,7 @@ impl GlobalState {
                 );
                 answer
             }
-            SchedResponse::Signaled() => Some(SchedValue::Value(nix::errno::Errno::EINTR as u64)),
+            SchedResponse::Signaled(_) => Some(SchedValue::Value(nix::errno::Errno::EINTR as u64)),
         }
     }
 
@@ -2041,6 +2051,8 @@ pub enum GlobalRequest {
     CreateSession(DetPid),
     /// Query live threads before translating process-directed signal delivery.
     ResolveKillTargets(DetPid),
+    /// A successful kill(2) queued a physical signal for this sole target.
+    NotifySignalPending(DetTid, SigWrapper),
     /// Liveness of one tid, leader or not; see [`thread_is_live`].
     ThreadIsLive(DetTid),
     /// Scheduler-owned lifecycle state for a direct child process.
@@ -2106,6 +2118,7 @@ pub enum GlobalResponse {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     ResolveKillTargets(Vec<DetTid>),
+    NotifySignalPending(()),
     ThreadIsLive(bool),
     ExactChildWaitState(ExactChildWaitState),
     // TODO: use void_send_rpc, and remove this bogus response:
@@ -2227,7 +2240,7 @@ where
 #[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
 pub enum ResumeStatus {
     Normal,
-    Signaled,
+    Signaled(Option<Vec<SigWrapper>>),
 }
 
 /// Internal result of a scheduler operation. Terminal results become
@@ -2925,6 +2938,24 @@ where
     let response = send_and_update_time(guest, GlobalRequest::ResolveKillTargets(detpid)).await;
     match response.1 {
         GlobalResponse::ResolveKillTargets(targets) => targets,
+        _ => unreachable!(),
+    }
+}
+
+/// Tell the scheduler that a successful kill(2) left a physical
+/// signal pending for a sole, known target.
+pub async fn notify_signal_pending<G, T>(guest: &mut G, dettid: DetTid, signal: Signal)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(
+        guest,
+        GlobalRequest::NotifySignalPending(dettid, SigWrapper(signal)),
+    )
+    .await;
+    match response.1 {
+        GlobalResponse::NotifySignalPending(()) => {}
         _ => unreachable!(),
     }
 }

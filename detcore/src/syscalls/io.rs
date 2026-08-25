@@ -569,7 +569,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         resources.fyi("pselect6");
 
         loop {
-            if resource_request(guest, resources.clone()).await == ResumeStatus::Signaled {
+            if matches!(
+                resource_request(guest, resources.clone()).await,
+                ResumeStatus::Signaled(_)
+            ) {
                 self.write_pselect6_remaining(guest, call, deadline).await?;
                 return Err(Errno::EINTR.into());
             }
@@ -751,7 +754,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         resources.fyi("select");
 
         loop {
-            if resource_request(guest, resources.clone()).await == ResumeStatus::Signaled {
+            if matches!(
+                resource_request(guest, resources.clone()).await,
+                ResumeStatus::Signaled(_)
+            ) {
                 self.write_select_remaining(guest, call, deadline).await?;
                 return Err(Errno::EINTR.into());
             }

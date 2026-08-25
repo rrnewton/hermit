@@ -66,6 +66,7 @@ use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::ExactChildWaitState;
 use crate::types::LogicalTime;
+use crate::types::SigWrapper;
 
 // Preserve the historical Detcore ABI while hiding the host's configured CPU
 // count. This represents one virtual CPU in a fixed 128-bit kernel mask.
@@ -523,6 +524,26 @@ fn terminal_child_wait_spec(
 
 fn child_wait_can_retry_after_stale(spec: ChildWaitSpec) -> bool {
     !matches!(spec.selector, ChildWaitSelector::Exact(_))
+}
+
+fn signal_is_blocked(mask: &libc::sigset_t, signal: SigWrapper) -> bool {
+    unsafe { libc::sigismember(mask, signal.0 as libc::c_int) == 1 }
+}
+
+/// Decide whether a scheduler resume actually interrupts a wait.
+///
+/// A resume carrying the waking signals is only an interruption if at least one
+/// of them is deliverable under the mask the guest installed before it blocked;
+/// a signal the guest itself blocked stays pending instead. A resume that names
+/// no signals keeps the historical all-signals-interrupt behavior.
+fn resume_interrupts_wait(status: ResumeStatus, guest_signal_mask: &libc::sigset_t) -> bool {
+    match status {
+        ResumeStatus::Normal => false,
+        ResumeStatus::Signaled(Some(signals)) => signals
+            .into_iter()
+            .any(|signal| !signal_is_blocked(guest_signal_mask, signal)),
+        ResumeStatus::Signaled(None) => true,
+    }
 }
 
 fn snapshot_process_group(pid: Pid) -> Result<libc::pid_t, Errno> {
@@ -1304,8 +1325,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             let poll_call = call.with_options(call.options() | WaitPidFlag::WNOHANG);
             let mut pending_signal = false;
             let result: Result<i64, Error> = loop {
-                let signaled =
-                    wait_for_child_lifecycle(guest, spec).await == ResumeStatus::Signaled;
+                // Type adaptation only: `Signaled` now carries the waking signals,
+                // but this wait4 path keeps its existing all-signals-interrupt
+                // behavior. See the waitid loop for the mask-filtered variant.
+                let signaled = matches!(
+                    wait_for_child_lifecycle(guest, spec).await,
+                    ResumeStatus::Signaled(_)
+                );
                 pending_signal |= signaled;
                 let (ready, has_child) = ready_child_wait(guest, spec).await;
                 if let Some(child) = ready {
@@ -1568,6 +1594,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_oldset(Some(old_mask_addr))
             .with_sigsetsize(std::mem::size_of::<u64>());
         guest.inject_with_retry(block_signals).await?;
+        let guest_signal_mask: libc::sigset_t = guest.memory().read_value(old_mask_addr)?;
 
         let poll_call = call.with_options(call.options() | libc::WNOHANG);
         let mut pending_signal = false;
@@ -1583,10 +1610,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             // status win over an interrupt, so the zero-timeout kernel probe below
             // remains authoritative when readiness and a signal coincide.
             let managed_spec = managed_terminal_spec;
+            // Both ways of parking inside waitid -- the scheduler-managed child
+            // wait and the legacy kernel-polling loop -- can now be resumed with
+            // the signals that woke the thread, so both consult the guest mask.
             let signaled = if let Some(spec) = managed_spec {
-                wait_for_child_lifecycle(guest, spec).await == ResumeStatus::Signaled
+                resume_interrupts_wait(
+                    wait_for_child_lifecycle(guest, spec).await,
+                    &guest_signal_mask,
+                )
             } else {
-                resource_request(guest, rsrc.clone()).await == ResumeStatus::Signaled
+                resume_interrupts_wait(
+                    resource_request(guest, rsrc.clone()).await,
+                    &guest_signal_mask,
+                )
             };
             pending_signal |= signaled;
             let (ready, has_child) = if let Some(spec) = managed_spec {
