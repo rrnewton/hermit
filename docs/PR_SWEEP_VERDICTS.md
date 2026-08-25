@@ -1414,8 +1414,12 @@ land on no information at all.
 | hermit#2587 | `UNKNOWN/UNKNOWN` at t+0s, `MERGEABLE/CLEAN` by t+20s |
 | hermit#2588 | `UNKNOWN/UNKNOWN` at t+0, +20, +40, +60, +85, +110, +135s |
 
-⚠️ **And then hermit#2588 MERGED — at 17:41:08Z, merge commit `7ee6853ede0d` —
-while `mergeable` had read `UNKNOWN` right up to that point.** So the field is not
+⚠️ **And then hermit#2588 MERGED — at 17:41:08Z, landing commit `7ee6853ede0d` —
+while `mergeable` had read `UNKNOWN` right up to that point.** (It is a *landing*
+commit, not a merge commit: `7ee6853ede0d` has ONE parent. Merge commits are
+disabled in this repository, which is why every landing rewrites the SHA — see the
+opening of this document. Calling a squash a "merge commit" invites exactly the
+ancestry comparison that section warns against.) So the field is not
 merely slow. It can stay `UNKNOWN` through a successful merge.
 
 > **Correction, and the reasoning matters more than the fix.** This paragraph
@@ -1453,12 +1457,37 @@ the question locally instead** — this needs no API and works from a
 proxy-blocked box:
 
 ```console
-git fetch -q <remote> refs/heads/<branch>:h refs/heads/main:m
-git merge-tree --write-tree m h >/dev/null && echo MERGES-CLEAN || echo CONFLICTS
+# The + is not optional, and the ref namespace is not decoration. See below.
+git fetch -q <remote> \
+  '+refs/heads/<branch>:refs/sweepcheck/h' \
+  '+refs/heads/main:refs/sweepcheck/m'
+git merge-tree --write-tree refs/sweepcheck/m refs/sweepcheck/h >/dev/null \
+  && echo MERGES-CLEAN || echo CONFLICTS
 ```
 
 That computes the same thing GitHub is computing, from objects you already have,
-with an exit status you can read directly. `mergeable` is then a convenience to
+with an exit status you can read directly.
+
+⚠️ **The `+` matters, and its absence broke this recipe in exactly the case the
+section exists for.** As first written the refspec was `refs/heads/<branch>:h`,
+unforced, into a bare local ref. Run it once and it works. Run it again after the
+head has been **rebased** — which is the normal reason to re-check a head, and the
+situation this whole section is about — and git refuses:
+
+```console
+ ! [rejected]        feat       -> h  (non-fast-forward)
+```
+
+Reproduced on a scratch repository: first fetch rc=0, and after a rebase of the
+same branch the identical command exits **1**. A reader following the recipe on a
+rebased head gets a rejection mentioning *non-fast-forward* and can reasonably
+conclude the head conflicts or has been lost, when in fact only their own stale
+local ref is in the way. **A verification recipe that fails under the condition it
+teaches you to verify is the document version of a guard that stops running.**
+
+The `+` forces the update, and `refs/sweepcheck/*` keeps these scratch refs out of
+`refs/heads/` so they cannot be mistaken for branches or picked up by a later
+`git branch` listing. `mergeable` is then a convenience to
 be believed when it says `MERGEABLE` or `CONFLICTING`, and ignored when it does
 not.
 
