@@ -1185,6 +1185,42 @@ pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, St
                 .trim_start_matches("Error: ")
         ));
     }
+    // A runner that cannot start the requested backend and a backend that ran
+    // but produced no canonical comparison are different failures. Keep both
+    // visible as ERROR, but give the pre-guest availability refusal its own
+    // machine-readable kind so sweeps cannot count it as a product failure.
+    // This wording is emitted by Backend::ensure_available before any guest is
+    // created; matching a broader nonzero exit would hide real regressions.
+    // KVM currently bypasses ensure_available, so its availability failures do
+    // not enter this class.
+    let unavailable_prefix = spec
+        .id
+        .backend
+        .as_deref()
+        .map(|backend| format!("Error: backend `{backend}` is unavailable:"));
+    let backend_unavailable = spec.id.mode != "naked"
+        && !launch_refusal
+        && !output.timed_out
+        && !output.status.success()
+        && stdout.is_empty()
+        && unavailable_prefix.as_ref().is_some_and(|prefix| {
+            stderr
+                .lines()
+                .next()
+                .is_some_and(|line| line.starts_with(prefix))
+        });
+    if backend_unavailable {
+        outcome = "ERROR".into();
+        error_kind = Some("backend-unavailable".into());
+        reason = Some(format!(
+            "backend unavailable on this runner, so nothing was measured: {}",
+            stderr
+                .lines()
+                .next()
+                .unwrap_or("Error: unknown backend unavailability")
+                .trim_start_matches("Error: ")
+        ));
+    }
     let mut report_json = None;
     let mut report_sha = None;
     let mut first_divergent_scheduler_turn = None;
@@ -1217,18 +1253,19 @@ pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, St
                         //
                         // Guarded on `launch_refusal` for the same reason the
                         // arm below refuses to reclassify: no guest was ever
-                        // created, so any report present is stale or unrelated
-                        // and its position describes a different execution.
-                        if !launch_refusal {
+                        // created, so any report present cannot describe an
+                        // executed guest's divergence position.
+                        if !launch_refusal && !backend_unavailable {
                             first_divergent_scheduler_turn = report.first_divergent_scheduler_turn;
                             first_divergent_virtual_nanoseconds =
                                 report.first_divergent_virtual_nanoseconds;
                             first_divergent_record = report.first_divergent_record;
                             first_divergent_syscall = report.first_divergent_syscall;
                         }
-                        if launch_refusal {
+                        if launch_refusal || backend_unavailable {
                             // The process never created a guest.  A report at
-                            // this point is stale or otherwise unrelated and
+                            // this point is the invocation's pre-stamped
+                            // no-result record or otherwise unrelated, and
                             // cannot supersede the refusal classification.
                         } else if report.verdict == "no_result"
                             && !output.timed_out
@@ -1269,14 +1306,15 @@ pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, St
                             ));
                         }
                     }
-                    Err(error) => {
+                    Err(error) if !backend_unavailable => {
                         outcome = "ERROR".into();
                         error_kind = Some("incomplete-verification-evidence".into());
                         reason = Some(format!("verification report is unreadable: {error}"));
                     }
+                    Err(_) => {}
                 }
             }
-            Err(_error) if launch_refusal => {}
+            Err(_error) if launch_refusal || backend_unavailable => {}
             Err(error) => {
                 outcome = "ERROR".into();
                 error_kind = Some("incomplete-verification-evidence".into());
@@ -3247,6 +3285,156 @@ backends_disabled:
         let result = execute_spec(&spec, "1").unwrap();
         fs::remove_dir_all(dir).unwrap();
         result
+    }
+
+    /// Build one attempt from a real subprocess, so this exercises the same
+    /// classification path used by an actual manifest sweep.
+    fn attempt_from_script(backend: &str, script: &str, report: Option<&str>) -> AttemptResult {
+        let dir = std::env::temp_dir().join(format!(
+            "hermit-runner-backend-availability-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let verdict = dir.join("verdict.json");
+        let mut argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            script.to_string(),
+            "sh".to_string(),
+        ];
+        argv.push(report.unwrap_or("").to_string());
+        argv.push(verdict.to_string_lossy().into_owned());
+        let spec = CellRunSpec {
+            id: CellId {
+                test: "fixture/backend-availability".into(),
+                mode: "verify".into(),
+                backend: Some(backend.into()),
+            },
+            lane: "portable".into(),
+            category: "fixture".into(),
+            cwd: dir.clone(),
+            env: BTreeMap::new(),
+            argv,
+            guest_argv: vec!["fixture".into()],
+            timeout_seconds: 10,
+            verdict_path: Some(verdict),
+            verification_log_dir: None,
+            sabre_path_evidence: None,
+            cell_dir: dir.clone(),
+        };
+        let result = execute_spec(&spec, "1").unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        result
+    }
+
+    /// A backend this runner could not start and a backend that ran but recorded
+    /// no comparison must stay visible while carrying different error kinds.
+    ///
+    /// The old shared incomplete-verification-evidence kind turned an unstaged
+    /// backend into an apparent product defect. Classifying every nonzero exit
+    /// as unavailable would be the same bug with the sign flipped, so this
+    /// bracket exercises both directions through real subprocesses.
+    #[test]
+    fn an_unavailable_backend_is_not_reported_as_a_silent_one() {
+        let no_result = r#"{"verified":false,"bitwise_parity":false,"verdict":"no_result","comparison":null,"compared_log_messages":null}"#;
+        let unavailable = attempt_from_script(
+            "sabre",
+            "printf %s \"$1\" > \"$2\"; printf '%s\\n' 'Error: backend \x60sabre\x60 is unavailable: \
+             HERMIT_SABRE_BINARY=/nonexistent/sabre is not an executable file' >&2; exit 1",
+            Some(no_result),
+        );
+        let silent = attempt_from_script(
+            "sabre",
+            "printf %s \"$1\" > \"$2\"; exit 0",
+            Some(no_result),
+        );
+
+        assert_eq!(unavailable.outcome, "ERROR");
+        assert_eq!(silent.outcome, "ERROR");
+        assert_eq!(
+            unavailable.error_kind.as_deref(),
+            Some("backend-unavailable"),
+            "an unrunnable backend must carry its own kind: {:?}",
+            unavailable.reason
+        );
+        assert_eq!(
+            silent.error_kind.as_deref(),
+            Some("incomplete-verification-evidence"),
+            "a backend that ran and recorded nothing keeps the evidence kind: {:?}",
+            silent.reason
+        );
+        assert_ne!(unavailable.error_kind, silent.error_kind);
+
+        let unavailable_reason = unavailable.reason.clone().expect("reason");
+        let silent_reason = silent.reason.clone().expect("reason");
+        assert!(
+            unavailable_reason.contains("backend unavailable on this runner")
+                && unavailable_reason.contains("sabre"),
+            "unavailable reason must name the backend and environment: {unavailable_reason}"
+        );
+        assert!(
+            !unavailable_reason.contains("verification report is missing"),
+            "the old wording pointed at a missing file, not the backend: {unavailable_reason}"
+        );
+        assert!(
+            silent_reason.contains("no_result"),
+            "silent reason must still name the producer state: {silent_reason}"
+        );
+        assert_ne!(unavailable_reason, silent_reason);
+    }
+
+    #[test]
+    fn backend_unavailable_requires_the_requested_backend_and_empty_stdout() {
+        let no_result = r#"{"verified":false,"bitwise_parity":false,"verdict":"no_result","comparison":null,"compared_log_messages":null}"#;
+        let wrong_backend = attempt_from_script(
+            "sabre",
+            "printf %s \"$1\" > \"$2\"; \
+             printf '%s\\n' 'Error: backend \x60dbt\x60 is unavailable: no SDK' >&2; exit 7",
+            Some(no_result),
+        );
+        let guest_output = attempt_from_script(
+            "sabre",
+            "printf %s \"$1\" > \"$2\"; printf 'guest-started\\n'; \
+             printf '%s\\n' 'Error: backend \x60sabre\x60 is unavailable: spoofed' >&2; exit 8",
+            Some(no_result),
+        );
+
+        for result in [wrong_backend, guest_output] {
+            assert_eq!(result.outcome, "FAIL", "unexpected result: {result:?}");
+            assert_eq!(result.error_kind, None, "unexpected result: {result:?}");
+            assert!(
+                result
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("exited with status")),
+                "ordinary product failure must keep its process outcome: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_unavailable_survives_an_unreadable_current_report() {
+        let unavailable = attempt_from_script(
+            "sabre",
+            "printf %s \"$1\" > \"$2\"; \
+             printf '%s\\n' 'Error: backend \x60sabre\x60 is unavailable: no staged runtime' >&2; exit 1",
+            Some("{"),
+        );
+
+        assert_eq!(unavailable.outcome, "ERROR");
+        assert_eq!(
+            unavailable.error_kind.as_deref(),
+            Some("backend-unavailable")
+        );
+        assert!(
+            unavailable
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("no staged runtime")),
+            "unreadable evidence must not overwrite the pre-guest refusal: {unavailable:?}"
+        );
     }
 
     #[test]
