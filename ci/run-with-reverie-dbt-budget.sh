@@ -25,7 +25,12 @@ fi
 # --print-pin is deliberately offline: the separate latest-main gate owns the
 # network authority, while this check prevents a pin bump from silently reusing
 # an earlier revision's clamp and measured threshold.
-# CALIBRATED FOR f4152f8f BY DBT RECIPE IDENTITY, the same evidence this budget
+# CALIBRATED FOR b0c3cfe4 BY DBT RECIPE IDENTITY. The f4152f8f evidence below
+# established the prior carry. CARRY TO b0c3cfe4 (2026-08-25): f4152f8f..b0c3cfe4
+# changes only reverie-memory/src/local.rs. reverie-dbt/build.rs remains blob
+# 0ff8ae24b974 and reverie-dbt/vendor/dynamorio remains de352475846e, so every
+# repository input to source_recipe_key is byte-identical and the measured
+# effective-job-seconds budget carries unchanged. The prior calibration
 # has been carried on five times before. Between 13cf8bcb and f4152f8f the two
 # repository inputs are BYTE-IDENTICAL by git object id:
 #     reverie-dbt/vendor/dynamorio  de352475846e -> de352475846e
@@ -51,7 +56,7 @@ fi
 #     MAX_BUILD_SECONDS = ceil(MAX_BUILD_EFFECTIVE_JOB_SECONDS / EFFECTIVE_BUILD_JOBS)
 # so the budget already scales with width and must not be "topped up" by hand. If
 # it is ever too tight, re-measure the job-seconds; do not raise the elapsed bound.
-expected_pin=f4152f8fd3a6d234e9ba4946ef3f9fa27aa7f8a7
+expected_pin=b0c3cfe4c0797445dedda93774db552edf96f62b
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
