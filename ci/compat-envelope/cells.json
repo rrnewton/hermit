@@ -417,7 +417,7 @@
               "run_id": "portable-applications-applications-example-timed-progress-bar-verify-ptrace",
               "result": "pass",
               "argv": [
-                "/home/newton/work/dev-hermit/worktrees/003/hermit/target/release/hermit",
+                "/repo/target/release/hermit",
                 "--log",
                 "info",
                 "run",
@@ -428,22 +428,22 @@
                 "--verify-strict",
                 "--verify",
                 "--verify-json",
-                "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/verify-1.json",
+                "/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/verify-1.json",
                 "--keep-logs",
                 "--verify-log-dir",
-                "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/verify-logs/verify-1",
+                "/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/verify-logs/verify-1",
                 "--env",
                 "LC_ALL=C",
                 "--env",
                 "TZ=UTC",
                 "--env",
-                "HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/home",
+                "HOME=/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/home",
                 "--env",
-                "XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/xdg-config",
+                "XDG_CONFIG_HOME=/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/xdg-config",
                 "--env",
                 "E2E_TMPDIR=/tmp/hermit-e2e",
                 "--env",
-                "E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/fixtures",
+                "E2E_FIXTURE_DIR=/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/fixtures",
                 "--",
                 "./examples/timed-progress-bar.py"
               ],
@@ -451,15 +451,15 @@
                 "./examples/timed-progress-bar.py"
               ],
               "env": {
-                "E2E_FIXTURE_DIR": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/fixtures",
+                "E2E_FIXTURE_DIR": "/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/fixtures",
                 "E2E_TMPDIR": "/tmp/hermit-e2e",
-                "HOME": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/home",
+                "HOME": "/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/home",
                 "LC_ALL": "C",
                 "TZ": "UTC",
-                "XDG_CONFIG_HOME": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/xdg-config"
+                "XDG_CONFIG_HOME": "/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/xdg-config"
               },
-              "cwd": "/home/newton/work/dev-hermit/worktrees/003/hermit",
-              "shell_command": "cd /home/newton/work/dev-hermit/worktrees/003/hermit && env E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/fixtures E2E_TMPDIR=/tmp/hermit-e2e HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/xdg-config /home/newton/work/dev-hermit/worktrees/003/hermit/target/release/hermit --log info run --base-env=minimal --backend ptrace --strict --verify-strict --verify --verify-json /home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/verify-1.json --keep-logs --verify-log-dir /home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/verify-logs/verify-1 --env LC_ALL=C --env TZ=UTC --env HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/home --env XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/xdg-config --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/fixtures -- ./examples/timed-progress-bar.py",
+              "cwd": "/repo",
+              "shell_command": "cd /repo && env E2E_FIXTURE_DIR=/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/fixtures E2E_TMPDIR=/tmp/hermit-e2e HOME=/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/xdg-config /repo/target/release/hermit --log info run --base-env=minimal --backend ptrace --strict --verify-strict --verify --verify-json /repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/verify-1.json --keep-logs --verify-log-dir /repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/verify-logs/verify-1 --env LC_ALL=C --env TZ=UTC --env HOME=/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/home --env XDG_CONFIG_HOME=/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/xdg-config --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/fixtures -- ./examples/timed-progress-bar.py",
               "attempts": [
                 {
                   "index": "1",
@@ -468,7 +468,7 @@
                   "signal": null,
                   "timed_out": false,
                   "argv": [
-                    "/home/newton/work/dev-hermit/worktrees/003/hermit/target/release/hermit",
+                    "/repo/target/release/hermit",
                     "--log",
                     "info",
                     "run",
@@ -479,22 +479,22 @@
                     "--verify-strict",
                     "--verify",
                     "--verify-json",
-                    "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/verify-1.json",
+                    "/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/verify-1.json",
                     "--keep-logs",
                     "--verify-log-dir",
-                    "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/verify-logs/verify-1",
+                    "/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/verify-logs/verify-1",
                     "--env",
                     "LC_ALL=C",
                     "--env",
                     "TZ=UTC",
                     "--env",
-                    "HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/home",
+                    "HOME=/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/home",
                     "--env",
-                    "XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/xdg-config",
+                    "XDG_CONFIG_HOME=/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/xdg-config",
                     "--env",
                     "E2E_TMPDIR=/tmp/hermit-e2e",
                     "--env",
-                    "E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/fixtures",
+                    "E2E_FIXTURE_DIR=/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/fixtures",
                     "--",
                     "./examples/timed-progress-bar.py"
                   ],
@@ -502,15 +502,15 @@
                     "./examples/timed-progress-bar.py"
                   ],
                   "env": {
-                    "E2E_FIXTURE_DIR": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/fixtures",
+                    "E2E_FIXTURE_DIR": "/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/fixtures",
                     "E2E_TMPDIR": "/tmp/hermit-e2e",
-                    "HOME": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/home",
+                    "HOME": "/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/home",
                     "LC_ALL": "C",
                     "TZ": "UTC",
-                    "XDG_CONFIG_HOME": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/xdg-config"
+                    "XDG_CONFIG_HOME": "/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/xdg-config"
                   },
-                  "cwd": "/home/newton/work/dev-hermit/worktrees/003/hermit",
-                  "shell_command": "cd /home/newton/work/dev-hermit/worktrees/003/hermit && env E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/fixtures E2E_TMPDIR=/tmp/hermit-e2e HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/xdg-config /home/newton/work/dev-hermit/worktrees/003/hermit/target/release/hermit --log info run --base-env=minimal --backend ptrace --strict --verify-strict --verify --verify-json /home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/verify-1.json --keep-logs --verify-log-dir /home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/verify-logs/verify-1 --env LC_ALL=C --env TZ=UTC --env HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/home --env XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/xdg-config --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/fixtures -- ./examples/timed-progress-bar.py"
+                  "cwd": "/repo",
+                  "shell_command": "cd /repo && env E2E_FIXTURE_DIR=/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/fixtures E2E_TMPDIR=/tmp/hermit-e2e HOME=/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/xdg-config /repo/target/release/hermit --log info run --base-env=minimal --backend ptrace --strict --verify-strict --verify --verify-json /repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/verify-1.json --keep-logs --verify-log-dir /repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/verify-logs/verify-1 --env LC_ALL=C --env TZ=UTC --env HOME=/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/home --env XDG_CONFIG_HOME=/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/xdg-config --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=/repo/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/fixtures -- ./examples/timed-progress-bar.py"
                 }
               ]
             }
@@ -53817,7 +53817,7 @@
               "run_id": "portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre",
               "result": "determinism-failure",
               "argv": [
-                "/home/newton/work/dev-hermit/worktrees/003/hermit/target/release/hermit",
+                "/repo/target/release/hermit",
                 "--log",
                 "info",
                 "run",
@@ -53828,41 +53828,41 @@
                 "--verify-strict",
                 "--verify",
                 "--verify-json",
-                "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-1.json",
+                "/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-1.json",
                 "--keep-logs",
                 "--verify-log-dir",
-                "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-logs/verify-1",
+                "/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-logs/verify-1",
                 "--env",
                 "LC_ALL=C",
                 "--env",
                 "TZ=UTC",
                 "--env",
-                "HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home",
+                "HOME=/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home",
                 "--env",
-                "XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config",
+                "XDG_CONFIG_HOME=/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config",
                 "--env",
                 "E2E_TMPDIR=/tmp/hermit-e2e",
                 "--env",
-                "E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures",
+                "E2E_FIXTURE_DIR=/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures",
                 "--",
-                "/home/newton/work/dev-hermit/worktrees/003/hermit/tests/e2e/data-handling/sqlite-query-determinism.sh",
+                "/repo/tests/e2e/data-handling/sqlite-query-determinism.sh",
                 "--run"
               ],
               "guest_argv": [
-                "/home/newton/work/dev-hermit/worktrees/003/hermit/tests/e2e/data-handling/sqlite-query-determinism.sh",
+                "/repo/tests/e2e/data-handling/sqlite-query-determinism.sh",
                 "--run"
               ],
               "env": {
-                "E2E_FIXTURE_DIR": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures",
+                "E2E_FIXTURE_DIR": "/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures",
                 "E2E_TMPDIR": "/tmp/hermit-e2e",
-                "HERMIT_SABRE_PATH_EVIDENCE": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/captures/verify-1.sabre-path.jsonl",
-                "HOME": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home",
+                "HERMIT_SABRE_PATH_EVIDENCE": "/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/captures/verify-1.sabre-path.jsonl",
+                "HOME": "/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home",
                 "LC_ALL": "C",
                 "TZ": "UTC",
-                "XDG_CONFIG_HOME": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config"
+                "XDG_CONFIG_HOME": "/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config"
               },
-              "cwd": "/home/newton/work/dev-hermit/worktrees/003/hermit",
-              "shell_command": "cd /home/newton/work/dev-hermit/worktrees/003/hermit && env E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_SABRE_PATH_EVIDENCE=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/captures/verify-1.sabre-path.jsonl HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config /home/newton/work/dev-hermit/worktrees/003/hermit/target/release/hermit --log info run --base-env=minimal --backend sabre --strict --verify-strict --verify --verify-json /home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-1.json --keep-logs --verify-log-dir /home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-logs/verify-1 --env LC_ALL=C --env TZ=UTC --env HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home --env XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures -- /home/newton/work/dev-hermit/worktrees/003/hermit/tests/e2e/data-handling/sqlite-query-determinism.sh --run",
+              "cwd": "/repo",
+              "shell_command": "cd /repo && env E2E_FIXTURE_DIR=/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_SABRE_PATH_EVIDENCE=/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/captures/verify-1.sabre-path.jsonl HOME=/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config /repo/target/release/hermit --log info run --base-env=minimal --backend sabre --strict --verify-strict --verify --verify-json /repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-1.json --keep-logs --verify-log-dir /repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-logs/verify-1 --env LC_ALL=C --env TZ=UTC --env HOME=/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home --env XDG_CONFIG_HOME=/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures -- /repo/tests/e2e/data-handling/sqlite-query-determinism.sh --run",
               "attempts": [
                 {
                   "index": "1",
@@ -53871,7 +53871,7 @@
                   "signal": null,
                   "timed_out": false,
                   "argv": [
-                    "/home/newton/work/dev-hermit/worktrees/003/hermit/target/release/hermit",
+                    "/repo/target/release/hermit",
                     "--log",
                     "info",
                     "run",
@@ -53882,41 +53882,41 @@
                     "--verify-strict",
                     "--verify",
                     "--verify-json",
-                    "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-1.json",
+                    "/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-1.json",
                     "--keep-logs",
                     "--verify-log-dir",
-                    "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-logs/verify-1",
+                    "/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-logs/verify-1",
                     "--env",
                     "LC_ALL=C",
                     "--env",
                     "TZ=UTC",
                     "--env",
-                    "HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home",
+                    "HOME=/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home",
                     "--env",
-                    "XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config",
+                    "XDG_CONFIG_HOME=/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config",
                     "--env",
                     "E2E_TMPDIR=/tmp/hermit-e2e",
                     "--env",
-                    "E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures",
+                    "E2E_FIXTURE_DIR=/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures",
                     "--",
-                    "/home/newton/work/dev-hermit/worktrees/003/hermit/tests/e2e/data-handling/sqlite-query-determinism.sh",
+                    "/repo/tests/e2e/data-handling/sqlite-query-determinism.sh",
                     "--run"
                   ],
                   "guest_argv": [
-                    "/home/newton/work/dev-hermit/worktrees/003/hermit/tests/e2e/data-handling/sqlite-query-determinism.sh",
+                    "/repo/tests/e2e/data-handling/sqlite-query-determinism.sh",
                     "--run"
                   ],
                   "env": {
-                    "E2E_FIXTURE_DIR": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures",
+                    "E2E_FIXTURE_DIR": "/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures",
                     "E2E_TMPDIR": "/tmp/hermit-e2e",
-                    "HERMIT_SABRE_PATH_EVIDENCE": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/captures/verify-1.sabre-path.jsonl",
-                    "HOME": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home",
+                    "HERMIT_SABRE_PATH_EVIDENCE": "/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/captures/verify-1.sabre-path.jsonl",
+                    "HOME": "/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home",
                     "LC_ALL": "C",
                     "TZ": "UTC",
-                    "XDG_CONFIG_HOME": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config"
+                    "XDG_CONFIG_HOME": "/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config"
                   },
-                  "cwd": "/home/newton/work/dev-hermit/worktrees/003/hermit",
-                  "shell_command": "cd /home/newton/work/dev-hermit/worktrees/003/hermit && env E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_SABRE_PATH_EVIDENCE=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/captures/verify-1.sabre-path.jsonl HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config /home/newton/work/dev-hermit/worktrees/003/hermit/target/release/hermit --log info run --base-env=minimal --backend sabre --strict --verify-strict --verify --verify-json /home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-1.json --keep-logs --verify-log-dir /home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-logs/verify-1 --env LC_ALL=C --env TZ=UTC --env HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home --env XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures -- /home/newton/work/dev-hermit/worktrees/003/hermit/tests/e2e/data-handling/sqlite-query-determinism.sh --run"
+                  "cwd": "/repo",
+                  "shell_command": "cd /repo && env E2E_FIXTURE_DIR=/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_SABRE_PATH_EVIDENCE=/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/captures/verify-1.sabre-path.jsonl HOME=/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config /repo/target/release/hermit --log info run --base-env=minimal --backend sabre --strict --verify-strict --verify --verify-json /repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-1.json --keep-logs --verify-log-dir /repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-logs/verify-1 --env LC_ALL=C --env TZ=UTC --env HOME=/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home --env XDG_CONFIG_HOME=/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=/repo/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures -- /repo/tests/e2e/data-handling/sqlite-query-determinism.sh --run"
                 }
               ]
             },
@@ -53925,7 +53925,7 @@
               "run_id": "portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre",
               "result": "determinism-failure",
               "argv": [
-                "/home/newton/work/dev-hermit/worktrees/003/hermit/target/release/hermit",
+                "/repo/target/release/hermit",
                 "--log",
                 "info",
                 "run",
@@ -53936,41 +53936,41 @@
                 "--verify-strict",
                 "--verify",
                 "--verify-json",
-                "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-1.json",
+                "/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-1.json",
                 "--keep-logs",
                 "--verify-log-dir",
-                "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-logs/verify-1",
+                "/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-logs/verify-1",
                 "--env",
                 "LC_ALL=C",
                 "--env",
                 "TZ=UTC",
                 "--env",
-                "HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home",
+                "HOME=/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home",
                 "--env",
-                "XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config",
+                "XDG_CONFIG_HOME=/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config",
                 "--env",
                 "E2E_TMPDIR=/tmp/hermit-e2e",
                 "--env",
-                "E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures",
+                "E2E_FIXTURE_DIR=/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures",
                 "--",
-                "/home/newton/work/dev-hermit/worktrees/003/hermit/tests/e2e/data-handling/sqlite-query-determinism.sh",
+                "/repo/tests/e2e/data-handling/sqlite-query-determinism.sh",
                 "--run"
               ],
               "guest_argv": [
-                "/home/newton/work/dev-hermit/worktrees/003/hermit/tests/e2e/data-handling/sqlite-query-determinism.sh",
+                "/repo/tests/e2e/data-handling/sqlite-query-determinism.sh",
                 "--run"
               ],
               "env": {
-                "E2E_FIXTURE_DIR": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures",
+                "E2E_FIXTURE_DIR": "/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures",
                 "E2E_TMPDIR": "/tmp/hermit-e2e",
-                "HERMIT_SABRE_PATH_EVIDENCE": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/captures/verify-1.sabre-path.jsonl",
-                "HOME": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home",
+                "HERMIT_SABRE_PATH_EVIDENCE": "/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/captures/verify-1.sabre-path.jsonl",
+                "HOME": "/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home",
                 "LC_ALL": "C",
                 "TZ": "UTC",
-                "XDG_CONFIG_HOME": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config"
+                "XDG_CONFIG_HOME": "/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config"
               },
-              "cwd": "/home/newton/work/dev-hermit/worktrees/003/hermit",
-              "shell_command": "cd /home/newton/work/dev-hermit/worktrees/003/hermit && env E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_SABRE_PATH_EVIDENCE=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/captures/verify-1.sabre-path.jsonl HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config /home/newton/work/dev-hermit/worktrees/003/hermit/target/release/hermit --log info run --base-env=minimal --backend sabre --strict --verify-strict --verify --verify-json /home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-1.json --keep-logs --verify-log-dir /home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-logs/verify-1 --env LC_ALL=C --env TZ=UTC --env HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home --env XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures -- /home/newton/work/dev-hermit/worktrees/003/hermit/tests/e2e/data-handling/sqlite-query-determinism.sh --run",
+              "cwd": "/repo",
+              "shell_command": "cd /repo && env E2E_FIXTURE_DIR=/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_SABRE_PATH_EVIDENCE=/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/captures/verify-1.sabre-path.jsonl HOME=/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config /repo/target/release/hermit --log info run --base-env=minimal --backend sabre --strict --verify-strict --verify --verify-json /repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-1.json --keep-logs --verify-log-dir /repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-logs/verify-1 --env LC_ALL=C --env TZ=UTC --env HOME=/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home --env XDG_CONFIG_HOME=/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures -- /repo/tests/e2e/data-handling/sqlite-query-determinism.sh --run",
               "attempts": [
                 {
                   "index": "1",
@@ -53979,7 +53979,7 @@
                   "signal": null,
                   "timed_out": false,
                   "argv": [
-                    "/home/newton/work/dev-hermit/worktrees/003/hermit/target/release/hermit",
+                    "/repo/target/release/hermit",
                     "--log",
                     "info",
                     "run",
@@ -53990,41 +53990,41 @@
                     "--verify-strict",
                     "--verify",
                     "--verify-json",
-                    "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-1.json",
+                    "/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-1.json",
                     "--keep-logs",
                     "--verify-log-dir",
-                    "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-logs/verify-1",
+                    "/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-logs/verify-1",
                     "--env",
                     "LC_ALL=C",
                     "--env",
                     "TZ=UTC",
                     "--env",
-                    "HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home",
+                    "HOME=/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home",
                     "--env",
-                    "XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config",
+                    "XDG_CONFIG_HOME=/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config",
                     "--env",
                     "E2E_TMPDIR=/tmp/hermit-e2e",
                     "--env",
-                    "E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures",
+                    "E2E_FIXTURE_DIR=/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures",
                     "--",
-                    "/home/newton/work/dev-hermit/worktrees/003/hermit/tests/e2e/data-handling/sqlite-query-determinism.sh",
+                    "/repo/tests/e2e/data-handling/sqlite-query-determinism.sh",
                     "--run"
                   ],
                   "guest_argv": [
-                    "/home/newton/work/dev-hermit/worktrees/003/hermit/tests/e2e/data-handling/sqlite-query-determinism.sh",
+                    "/repo/tests/e2e/data-handling/sqlite-query-determinism.sh",
                     "--run"
                   ],
                   "env": {
-                    "E2E_FIXTURE_DIR": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures",
+                    "E2E_FIXTURE_DIR": "/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures",
                     "E2E_TMPDIR": "/tmp/hermit-e2e",
-                    "HERMIT_SABRE_PATH_EVIDENCE": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/captures/verify-1.sabre-path.jsonl",
-                    "HOME": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home",
+                    "HERMIT_SABRE_PATH_EVIDENCE": "/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/captures/verify-1.sabre-path.jsonl",
+                    "HOME": "/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home",
                     "LC_ALL": "C",
                     "TZ": "UTC",
-                    "XDG_CONFIG_HOME": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config"
+                    "XDG_CONFIG_HOME": "/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config"
                   },
-                  "cwd": "/home/newton/work/dev-hermit/worktrees/003/hermit",
-                  "shell_command": "cd /home/newton/work/dev-hermit/worktrees/003/hermit && env E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_SABRE_PATH_EVIDENCE=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/captures/verify-1.sabre-path.jsonl HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config /home/newton/work/dev-hermit/worktrees/003/hermit/target/release/hermit --log info run --base-env=minimal --backend sabre --strict --verify-strict --verify --verify-json /home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-1.json --keep-logs --verify-log-dir /home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-logs/verify-1 --env LC_ALL=C --env TZ=UTC --env HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home --env XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures -- /home/newton/work/dev-hermit/worktrees/003/hermit/tests/e2e/data-handling/sqlite-query-determinism.sh --run"
+                  "cwd": "/repo",
+                  "shell_command": "cd /repo && env E2E_FIXTURE_DIR=/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_SABRE_PATH_EVIDENCE=/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/captures/verify-1.sabre-path.jsonl HOME=/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config /repo/target/release/hermit --log info run --base-env=minimal --backend sabre --strict --verify-strict --verify --verify-json /repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-1.json --keep-logs --verify-log-dir /repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-logs/verify-1 --env LC_ALL=C --env TZ=UTC --env HOME=/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home --env XDG_CONFIG_HOME=/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=/repo/ignored/compat-envelope/pcamp-exact-1/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures -- /repo/tests/e2e/data-handling/sqlite-query-determinism.sh --run"
                 }
               ]
             }
