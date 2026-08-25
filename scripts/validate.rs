@@ -1321,6 +1321,31 @@ fn self_test() -> Result<(), String> {
             return Err("a completed retry must clear every non-run explanation".into());
         }
     }
+    // The ceiling must stay strictly inside the budget the scheduler enforces at
+    // EVERY remainder, not only at the nominal one. 441s is the measured remainder
+    // that refused the strict-compat lane on 2026-08-25 while its gate ceiling was
+    // a fixed 480s; 8s is the largest wall those nodes actually needed.
+    // A 1s remainder admits no ceiling that is both usable and strictly smaller;
+    // the epoch is over and the scheduler refusing is then correct.
+    for remaining in [441_i64, 480, 600, 30, 2] {
+        let ceiling = derived_wall_ceiling(remaining);
+        if ceiling >= remaining {
+            return Err(format!(
+                "derived wall ceiling {ceiling}s does not fit inside a {remaining}s remainder, so \
+                 the scheduler would refuse the lane instead of running it"
+            ));
+        }
+        if ceiling < 1 {
+            return Err(format!("derived wall ceiling {ceiling}s is not a usable budget"));
+        }
+    }
+    if derived_wall_ceiling(441) >= 480 {
+        return Err(
+            "a 441s remainder must lower the 480s gate ceiling; leaving it fixed is what left \
+             193 compat nodes unrun"
+                .into(),
+        );
+    }
     let cold_compat = build_release_hermit_node("gate.manifest", "/tmp/target/release/hermit");
     if cold_compat.hint.preferred_inner_jobs != Some(8)
         || cold_compat.hint.classification != dagrun::model::StepClass::CpuBound
@@ -2905,6 +2930,18 @@ fn default_jobs() -> i64 {
 /// establishing the configured 600 < 660 portion of the nesting ladder.
 fn scope_grace_s(run_timeout_s: i64) -> i64 {
     60.max(run_timeout_s / 10)
+}
+
+/// The wall ceiling every node must fit inside, DERIVED from the seconds left on
+/// the run epoch rather than written beside the nominal budget.
+///
+/// The scheduler refuses any node whose declared wall is `>=` the budget it is
+/// enforcing, and what it enforces is the REMAINDER, not the nominal figure. A
+/// ceiling that is merely smaller than the nominal budget therefore inverts once
+/// preparation has spent enough of the epoch. Keeping one grace band below the
+/// remainder makes that inversion unreachable at any preparation time.
+fn derived_wall_ceiling(remaining_s: i64) -> i64 {
+    (remaining_s - scope_grace_s(remaining_s)).max(1)
 }
 
 fn owns_scope_request(deadline_ns: Option<u64>) -> bool {
@@ -11002,6 +11039,24 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // reproduce a timeout must not accidentally loosen a node that already
     // declared something stricter. They are also how the timeout path is
     // exercised on demand without waiting for a real runaway.
+    // DERIVE every node's ceiling from the budget that will actually be ENFORCED.
+    // The scheduler is handed `remaining_budget_s(deadline)`, not the nominal run
+    // budget, so a ceiling chosen BESIDE the nominal one silently inverts as soon
+    // as preparation has spent part of the epoch: the node budget stops being
+    // smaller than the bound that will cut it, and the scheduler refuses the whole
+    // lane rather than running work it could not attribute.
+    //
+    // Measured 2026-08-25 on the strict-compat lane: the ladder is written
+    // `420 prep < 480 gate < 600 run`, but prep and gate are spent SEQUENTIALLY
+    // from one clock, so the run budget would have to be at least 900s for that to
+    // hold. 159s of the 600s epoch was already gone when the scheduler started,
+    // leaving 441s against a 480s gate ceiling, and all 193 compat nodes reported
+    // nothing. Deriving the ceiling here makes the inversion unreachable instead of
+    // making it fit for one particular preparation time -- the same fixed-versus-
+    // derived defect as a node pinned at 120s losing to a 120.03s measurement.
+    if let Some(remaining) = remaining_budget_s(deadline_ns) {
+        clamp_wall(&mut plan, derived_wall_ceiling(remaining));
+    }
     if let Some(cap) = env_positive("VALIDATE_GATE_TIMEOUT_SECONDS") {
         clamp_wall(&mut plan, cap);
         eprintln!("validate: VALIDATE_GATE_TIMEOUT_SECONDS={cap}: every gate's wall ceiling lowered to at most {cap}s");
