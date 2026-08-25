@@ -187,7 +187,7 @@ pub fn is_determinized_syscall(sysno: Sysno) -> bool {
 
 /// Returns whether `sysno` is a kernel-keyring syscall (`add_key`,
 /// `request_key`, `keyctl`) that Detcore hides behind a deterministic
-/// `CONFIG_KEYS`-absent boundary under strict mode.
+/// `CONFIG_KEYS`-absent boundary under the default fail-closed policy.
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-916): Exposed so the copied-DBT-child policy can preserve
 // the same keyring isolation boundary that the reclassification (PR-848) moved
@@ -197,7 +197,7 @@ pub fn is_kernel_keyring_syscall(sysno: Sysno) -> bool {
 }
 
 /// Returns whether Detcore deterministically refuses `sysno` with a fixed
-/// errno in strict mode without consulting the host.
+/// errno when the fail-closed policy is active, without consulting the host.
 ///
 /// This is the boundary backends that execute guest syscalls outside Detcore's
 /// `handle_syscall_event` dispatcher (the DBT copied-child fast path and the
@@ -1820,12 +1820,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-848): Hide unmodeled shared keyrings and
             // request-key upcalls behind the portable CONFIG_KEYS-absent errno.
-            // TODO-HUMAN-REVIEW(PR-916): Only fail closed under the strict
-            // (panic-on-unsupported) policy. A non-strict run keeps the pre-848
-            // host pass-through so the guest observes a real working keyring;
-            // this restores the enabled rr `keyctl` compatibility test, whose
-            // guest asserts add_key + keyctl(SETPERM) succeed. Under strict mode
-            // the deterministic ENOSYS boundary is preserved.
+            // TODO-HUMAN-REVIEW(PR-916): Fail closed whenever the
+            // panic-on-unsupported policy is active; ordinary runs select that
+            // policy by default. The explicit compatibility opt-out keeps the
+            // pre-848 host pass-through so the guest observes a real working
+            // keyring, restoring the enabled rr `keyctl` compatibility test.
+            // Under fail-closed execution the deterministic ENOSYS boundary is
+            // preserved.
             SyscallClassification::Determinized if is_kernel_keyring_syscall(call.number()) => {
                 if panic_on_unsupported_syscalls {
                     Err(Error::Errno(Errno::ENOSYS))
@@ -1834,11 +1835,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 }
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-855): Strict runs cannot expose unmodeled
-            // pipe-buffer ownership or vmsplice page pinning. Return ENOSYS so
-            // callers use read/write fallbacks, but preserve the legacy normal-
-            // mode pass-through used by the existing rr splice compatibility
-            // test.
+            // TODO-HUMAN-REVIEW(PR-855): Fail-closed runs cannot expose
+            // unmodeled pipe-buffer ownership or vmsplice page pinning. Return
+            // ENOSYS so callers use read/write fallbacks, but preserve host
+            // pass-through under the explicit compatibility opt-out used by the
+            // existing rr splice test.
             SyscallClassification::Determinized if is_zero_copy_pipe_syscall(call.number()) => {
                 if panic_on_unsupported_syscalls {
                     Err(Error::Errno(Errno::ENOSYS))
