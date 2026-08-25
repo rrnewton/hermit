@@ -16,13 +16,20 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# The machine-readable prefix ci/lint-checks-node.sh greps for. Text, not an exit
+# code, because make collapses any nonzero recipe status into its own error.
+NO_RESULT_MARKER = "NO-RESULT-CASE:"
+
 # EX_TEMPFAIL. scripts/validate.rs:5365 reserves 75 as "the only nonzero code that
 # is not a product failure", outcome_is_no_result() classifies it `no_result`, and
 # ci/lint-checks-node.sh already exits 75 for the sibling case (uninitialized
 # submodules).
 #
 # ⚠️ SHARING A CODE NEEDS AN ARGUMENT, not just a precedent -- a code shared by two
-# conditions is a collapsed value when they want different reactions. Here a new code
+# conditions is a collapsed value when they want different reactions. That rule is
+# stated in ci-hub/bin/gh-merge-verified IN THE DEV-HERMIT PARENT REPOSITORY; it is
+# not in this repository, which has no ci-hub/ directory. Naming the repo because a
+# citation a reader cannot resolve from here is worse than no citation. Here a new code
 # is not merely unnecessary, it is UNAVAILABLE: validate.rs recognises exactly one
 # no-result value, so any other number is classified a FAILURE and would reintroduce
 # the false main-red this exists to remove. The two conditions also want the same
@@ -391,8 +398,9 @@ def run_canonical_adapter_contract(*, refuse: bool) -> None:
             if parent is None:
                 raise NoParentAdapter(
                     "the dev-hermit parent adapter "
-                    "(ci-hub/ledger/validate_rows.py) is not on any ancestor of "
-                    f"{ROOT}"
+                    "(ci-hub/ledger/validate_rows.py, in the dev-hermit PARENT "
+                    "repository -- this repository has no ci-hub/ directory) is "
+                    f"not on any ancestor of {ROOT}"
                 )
         raw_shadow = parent / "ignored" / "validate-run-ledger.jsonl"
         raw_before = raw_shadow.read_bytes() if raw_shadow.exists() else None
@@ -524,35 +532,47 @@ def main() -> None:
     # ignore them: only the canonical authority query can establish admission.
     run_signal(signal.SIGTERM, expect_record=True, forged_owner=True)
     run_incomplete_exit()
-    run_canonical_adapter_contract(refuse=False)
+    # ⚠️ SKIP ONLY WHAT CANNOT BE EVALUATED, AND KEEP GOING.
+    # An earlier version let NoParentAdapter propagate out of main(), which
+    # abandoned the four steps below it -- refuse=True, the cleanup race and the
+    # residue assertion -- while printing "Every other assertion in this file ran
+    # and passed". Measured: all four PASS in a parentless tree, because the
+    # refuse=True arm plants its own adapter and never needed a parent. Claiming
+    # they ran was false, and abandoning them cost real coverage for a precondition
+    # that affects exactly one arm of one case.
+    unevaluated: list[str] = []
+    try:
+        run_canonical_adapter_contract(refuse=False)
+    except NoParentAdapter as exc:
+        unevaluated.append(f"canonical adapter contract, accept arm: {exc}")
     run_canonical_adapter_contract(refuse=True)
     run_cleanup_signal_race()
     leaked = [path for path in TEST_ROOTS if path.exists()]
     assert not leaked, f"stop-path test residue: {leaked}"
+    if unevaluated:
+        # Exit 0: everything evaluable here RAN AND PASSED, and saying otherwise
+        # would report a failure that did not happen. The unevaluated arm is
+        # announced on stderr with a machine-readable prefix so the CI node can
+        # report no_result for the run as a whole -- see ci/lint-checks-node.sh.
+        # make() cannot carry a no-result status (any nonzero recipe exit becomes
+        # `make: *** Error N`), so the distinction has to leave this process as
+        # text and be turned back into an exit code one layer out.
+        for item in unevaluated:
+            print(f"{NO_RESULT_MARKER} {item}", file=sys.stderr)
+        print(
+            f"PARTIAL: every evaluable assertion passed; "
+            f"{len(unevaluated)} case(s) could not be evaluated from {ROOT}. "
+            "Run from a checkout nested under the dev-hermit parent to evaluate them.",
+            file=sys.stderr,
+        )
     print(
         "PASS: TERM/INT/HUP => NO-RESULT; KILL => no record; "
-        "prior failure remains fail; forged owner path is unadmitted; canonical adapter "
-        "accept/refuse bracketed; cleanup is signal-atomic"
+        "prior failure remains fail; forged owner path is unadmitted; "
+        + ("canonical adapter REFUSE arm only (accept arm not evaluable here); "
+           if unevaluated else "canonical adapter accept/refuse bracketed; ")
+        + "cleanup is signal-atomic"
     )
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except NoParentAdapter as exc:
-        # Exit 75, not 1: `make lint-checks` and the check.lint_checks DAG node
-        # both treat any nonzero as a failure, and a failure here reads as main
-        # being red. Naming the directory is half the fix -- the old bare
-        # StopIteration named nothing at all.
-        print(
-            f"test_validate_stop_paths: NO RESULT -- {exc}.\n"
-            "  This is a SETUP condition, not a test failure: the canonical-adapter\n"
-            "  contract exercises the REAL parent adapter and there is none reachable\n"
-            f"  from {ROOT}.\n"
-            "  Every other assertion in this file ran and passed; only the two\n"
-            "  canonical-adapter cases were skipped.\n"
-            "  To run them, invoke from a checkout nested under the dev-hermit parent\n"
-            "  (canonically ~/work/dev-hermit/hermit), not from a detached worktree.",
-            file=sys.stderr,
-        )
-        raise SystemExit(NO_RESULT_EXIT_CODE) from None
+    main()

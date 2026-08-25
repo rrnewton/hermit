@@ -102,69 +102,45 @@ case "$verdict" in
         ;;
 esac
 
-# ⚠️ WHY THIS SHARES EXIT 75 WITH THE SUBMODULE CHECK RATHER THAN TAKING A NEW CODE.
-# The house rule is that a new refusal needs a new code OR an explicit argument for
-# sharing one, because "an exit code shared by two conditions is a COLLAPSED VALUE:
-# the caller cannot tell whether ITS ENVIRONMENT is wrong or THE HEAD is, and those
-# want opposite responses" (ci-hub/bin/gh-merge-verified, which split 4 from 8 for
-# exactly that reason). The argument, in two parts:
+# ⚠️ THE PARENT-ADAPTER PRECONDITION IS CLASSIFIED AFTER THE TARGET RUNS, NOT BEFORE.
+# An earlier version exited 75 HERE, before `make lint-checks`, and so skipped every
+# checker in the target -- 17 of them -- for a precondition that affects one arm of
+# one case in one of them. It shipped saying "Every other checker in this target is
+# unaffected and would have run", which was false: none of them ran. That is worse
+# than the false main-red it was fixing, and it landed one day after this node was
+# created precisely so those checkers would be gated by construction.
 #
-#   1. A NEW CODE IS NOT AVAILABLE HERE, and this is the decisive half.
-#      scripts/validate.rs recognises exactly ONE no-result code --
-#      `const NO_RESULT_EXIT_CODE: i64 = 75`, consumed by outcome_is_no_result() and
-#      excluded by outcome_is_failure(). Any other value is classified a FAILURE. So
-#      a second code would reintroduce the false main-red this guard exists to
-#      remove; the code space has one slot and 75 is it.
-#   2. THE TWO CONDITIONS WANT THE SAME REACTION, which is the test gh-merge-verified
-#      applies. Both mean NOTHING WAS EVALUATED, both are fixed by changing where or
-#      how the node is invoked, and a plain re-run afterwards is safe. They differ
-#      only in WHICH environment fix is needed -- and that difference is carried by
-#      the message, which names the missing thing, the path, and the remedy. That is
-#      the right place for it: 75 already means "could not determine", and splitting
-#      by remedy would make a code per remedy.
+# So: run the whole target. scripts/test_validate_stop_paths.py now skips only the
+# arm it cannot evaluate, passes everything else, and announces the skip on stderr
+# with a machine-readable prefix. If the target SUCCEEDED but something announced
+# itself unevaluated, the run as a whole is a no_result: everything that could be
+# checked was checked and passed, and something could not be checked.
 #
-# What would NOT be admissible under the same rule is folding a real lint failure in
-# here. Only conditions that make the checkers UNRUNNABLE belong behind 75.
-
-# SECOND SETUP PRECONDITION, same class and same spelling as the submodule check
-# above: scripts/test_validate_stop_paths.py's canonical-adapter contract exercises
-# the REAL dev-hermit parent adapter, found by walking ROOT.parents for
-# ci-hub/ledger/validate_rows.py. From the canonical layout
-# ~/work/dev-hermit/hermit that resolves; from a detached worktree under /tmp --
-# which is the layout agents are TOLD to land from, so it is the COMMON case --
-# the ancestors are only /tmp and /, and the contract cannot be tested at all.
+# Any real failure still propagates unchanged -- a nonzero from make is a failure,
+# never a no_result, because a no_result must not be able to swallow a red.
 #
-# ⚠️ AND THE COST OF GETTING THIS WRONG IS ASYMMETRIC. Reported as a failure it
-# manufactures a MAIN-RED, which is a standing P0 here, from the DEFAULT working
-# layout -- so the false reading was the common one and the true one the exception.
-# Measured 2026-08-25 on clean main from /tmp: a bare StopIteration with no message
-# and no path, surfaced by make as `Error 1`. Telling a precondition from a finding
-# required reading the test's source.
-#
-# Checked HERE rather than only inside the test because make maps ANY nonzero recipe
-# status to its own error -- `exit 75` from a recipe becomes `make: *** Error 75`,
-# rc=2 -- so a no_result cannot be expressed through the make layer. The node is the
-# outermost place that can still say 75 and have validate.rs classify it no_result.
-if [ ! -f ../ci-hub/ledger/validate_rows.py ] \
-   && ! git rev-parse --show-superproject-working-tree 2>/dev/null | grep -q .; then
-    parent_found=
-    probe=$PWD
-    while [ "$probe" != "/" ]; do
-        probe=$(dirname "$probe")
-        if [ -f "$probe/ci-hub/ledger/validate_rows.py" ]; then parent_found=$probe; break; fi
-    done
-    if [ -z "$parent_found" ]; then
-        echo 'lint-checks: NO RESULT -- the dev-hermit parent adapter is not reachable.' >&2
-        echo '  ci-hub/ledger/validate_rows.py is on no ancestor of' >&2
-        echo "    $PWD" >&2
-        echo '  This is a SETUP condition, not a lint failure: the canonical-adapter' >&2
-        echo '  contract in scripts/test_validate_stop_paths.py exercises the REAL parent' >&2
-        echo '  adapter, and there is none to exercise here. Every other checker in this' >&2
-        echo '  target is unaffected and would have run.' >&2
-        echo '  Run the node from a checkout nested under the dev-hermit parent' >&2
-        echo '  (canonically ~/work/dev-hermit/hermit), not from a detached worktree.' >&2
-        exit 75
-    fi
+# ⚠️ WHY 75 AND NOT A NEW CODE. scripts/validate.rs recognises exactly one no-result
+# value -- NO_RESULT_EXIT_CODE = 75, matched by outcome_is_no_result() and excluded
+# by outcome_is_failure() -- so any other number is classified a FAILURE and would
+# reintroduce the false main-red. The code space has one slot. (The general rule
+# about not collapsing two conditions into one code is stated in
+# ci-hub/bin/gh-merge-verified in the DEV-HERMIT PARENT repository; this repository
+# has no ci-hub/ directory, so that path does not resolve from here.)
+NO_RESULT_MARKER='NO-RESULT-CASE:'
+node_out=$(mktemp) || exit 1
+trap 'rm -f "$node_out"' EXIT
+set +e
+make lint-checks 2>&1 | tee "$node_out"
+make_rc=${PIPESTATUS[0]}
+set -e
+if [ "$make_rc" -ne 0 ]; then
+    exit "$make_rc"
 fi
-
-exec make lint-checks
+if grep -q "$NO_RESULT_MARKER" "$node_out"; then
+    echo "lint-checks: NO RESULT -- the target PASSED, and at least one case could not be" >&2
+    echo '  evaluated from this checkout. Every checker ran; the unevaluable cases are' >&2
+    echo '  listed above, each on a line beginning with the marker below.' >&2
+    grep "$NO_RESULT_MARKER" "$node_out" | sed 's/^/    /' >&2
+    exit 75
+fi
+exit 0
