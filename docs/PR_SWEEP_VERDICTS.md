@@ -269,6 +269,28 @@ support was not included in this build` — that is a MISSING FEATURE FLAG in yo
 binary, not a missing backend on the host, and not a defect in the branch.
 Neither is the pull request's fault, and neither should be recorded against it.
 
+⚠️ **AND IT IS NOT A REASON TO ABSTAIN — IT IS ONE FLAG.** This paragraph
+previously stopped at "nobody's fault", and that half-truth cost a night of
+unnecessary abstentions: several agents, and the coordinator, told each other to
+decline DBT results because a default build reports the backend unavailable.
+
+`third-party-backends = ["dbt", "sabre", "e9patch"]` is declared in
+`hermit-cli/Cargo.toml`, and the workspace manifest documents the invocation:
+
+```console
+cargo build -p hermit --features third-party-backends
+```
+
+**DBT and SaBRe are verifiable on these boxes.** "Not included in this build"
+describes a build default you can change, not a capability the host lacks. Build
+with the flag and measure, rather than parking the verdict — and state which
+binary and which commit produced the number, because a DBT measurement from a
+default build is not a measurement at all.
+
+The genuinely unavailable thing here is narrower and unrelated: `api.github.com`
+for `gh` **writes**. Reads go through `ci-hub/bin/gh-api`, and landings go by
+pushing directly.
+
 This is the only check here about the ENVIRONMENT you are assessing in rather
 than about the branch or about main.
 
