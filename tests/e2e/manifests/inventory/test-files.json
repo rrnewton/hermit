@@ -1340,6 +1340,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/pipe2_errno_precedence.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace; ci=true)",
+      "why": "tests/c/pipe2_errno_precedence.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace; ci=true): regression guest for pipe2 argument-validation precedence, asserting that a bad pipefd pointer with valid flags is EFAULT while bad flags stay EINVAL even when the pointer is also unusable, and asserting the pinned deterministic pipe capacity so removing the F_SETPIPE_SZ pin fails the cell instead of passing it"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/ppoll_readv.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/ppoll_readv.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"

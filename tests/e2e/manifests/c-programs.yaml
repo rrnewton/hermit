@@ -4953,6 +4953,77 @@ test:
           kvm: No custom edge-case arguments have been calibrated for this C guest
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
+  - id: c-programs/pipe2-errno-precedence
+    description: Strict verification for tests/c/pipe2_errno_precedence.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    timeout_seconds: 90
+    occasional: false
+    program: tests/c/pipe2_errno_precedence.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        guest_args:
+          # 8192 is DETERMINISTIC_PIPE_CAPACITY_BYTES. Passing it makes the guest ASSERT the
+          # pin rather than only print F_GETPIPE_SZ. Without the argument, deleting the
+          # F_SETPIPE_SZ call outright still passed every registered cell, because two runs of
+          # an unpinned pipe agree with each other and the errno cases are unaffected -- the
+          # cell could not fail. Omitted natively, where the capacity is the host's.
+          ptrace:
+            - '8192'
+        backends_disabled:
+          dbt: 'MEASURED, NOT ASSUMED: built with --features dbt and run. The guest itself PASSES on DBT -- all four errno-precedence cases and the 8192 capacity assertion -- but DBT cannot reach canonical verify parity for ANY guest on this host: /bin/true under --verify-strict diverges with the same signature (bitwise_parity false, first_divergent_record 7, identical 86/86 record counts). The exclusion is that backend-wide startup divergence, not this cell.'
+          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
+          sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
+          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: This probe asserts kernel errno precedence, not native nondeterminism
+        ci_disabled_reason: 'NOT-EXERCISED (by design): this probe asserts kernel errno precedence and a pinned pipe capacity, both of which exist only under Detcore; native presents no oracle for either.'
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from this errno-precedence assertion
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this errno-precedence assertion and has never been run for this guest.'
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle; this guest is single-threaded and has none.'
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case arguments have been calibrated for this guest beyond the pinned-capacity argument the verify mode already passes.'
   - id: c-programs/ppoll-readv
     description: Strict verification for tests/c/ppoll_readv.c
     lane: portable
