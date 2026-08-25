@@ -66,13 +66,6 @@
     {
       "backend": "ptrace",
       "category": "backend-parity-c",
-      "lane": "privileged",
-      "mode": "verify",
-      "test": "backend-parity-c/cpuid-probe"
-    },
-    {
-      "backend": "ptrace",
-      "category": "backend-parity-c",
       "lane": "portable",
       "mode": "verify",
       "test": "backend-parity-c/cwd-roundtrip"
@@ -1132,6 +1125,13 @@
       "category": "c-programs",
       "lane": "portable",
       "mode": "verify",
+      "test": "c-programs/prctl-option-policy"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
       "test": "c-programs/pread64-nostdlib"
     },
     {
@@ -1210,13 +1210,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/random-sources"
-    },
-    {
-      "backend": "ptrace",
-      "category": "chaos-c",
-      "lane": "portable",
-      "mode": "chaos",
-      "test": "chaos-c/lock-granularity"
     },
     {
       "backend": "ptrace",
@@ -1511,6 +1504,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/writev-determinism"
+    },
+    {
+      "backend": "ptrace",
+      "category": "chaos-c",
+      "lane": "portable",
+      "mode": "chaos",
+      "test": "chaos-c/lock-granularity"
     },
     {
       "backend": "ptrace",
@@ -1966,6 +1966,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "system-utils/uuidgen-random"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "privileged",
+      "mode": "verify",
+      "test": "backend-parity-c/cpuid-probe"
     }
   ],
   "schema": 1
