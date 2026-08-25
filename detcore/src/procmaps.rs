@@ -43,10 +43,21 @@ pub fn display(map: &MemoryMap) -> String {
 /// one another backend produces. Every other column is the mapping's real
 /// procfs data.
 pub fn display_as(map: &MemoryMap, pathname: &str) -> String {
+    display_range_as(map, map.address.0, map.address.1, pathname)
+}
+
+/// Render a mapping's real procfs columns against an EXPLICIT address range.
+///
+/// The two address columns come from `start`/`end`; every other column is the
+/// mapping's real procfs data. Used where the region being reported is a SUBSET
+/// of the mapping that contains it -- the observed program break inside its
+/// enclosing anonymous mapping -- so the record's extent is the region actually
+/// hashed rather than the arena that happens to hold it.
+pub fn display_range_as(map: &MemoryMap, start: u64, end: u64, pathname: &str) -> String {
     format!(
         "{:#x}-{:#x} {:?} {:x} {:x}:{:x} {} {}",
-        map.address.0,
-        map.address.1,
+        start,
+        end,
         map.perms,
         map.offset,
         map.dev.0,
