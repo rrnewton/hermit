@@ -534,10 +534,12 @@ impl StartOpts {
             ComparedRun {
                 output: &recording,
                 log: log1.into_temp_path(),
+                label: "the recording",
             },
             ComparedRun {
                 output: &replay,
                 log: log2.into_temp_path(),
+                label: "the replay",
             },
             ComparisonOptions {
                 verbose: false,
