@@ -149,6 +149,25 @@ fn run() -> Result<ExitCode, String> {
         }
     }
 
+    // ⚠️ SUBMODULES ARE A SECOND PLACE THE SAME DEPENDENCY GETS PINNED, and until
+    // this existed the checker could not see them -- a uniformity checker blind to
+    // one of the things it is meant to keep uniform.
+    //
+    // Found on https://github.com/rrnewton/hermit/pull/2368, which adds a reverie
+    // SUBMODULE tracking `branch = buck2` while hermit already pins reverie by
+    // revision in 46 Cargo entries. Three references, all disagreeing, and the KVM
+    // thread-signal fix in reverie 13cf8bcb was absent from the buck2 branch -- so
+    // a Buck2 build would have compiled against a reverie missing it while the
+    // Cargo build had it. This checker passed that silently.
+    for (path, url, pin) in submodule_pins(&root)? {
+        by_dep
+            .entry(url)
+            .or_default()
+            .entry(pin)
+            .or_default()
+            .push(Occurrence { path, line: 0 });
+    }
+
     if by_dep.is_empty() {
         return Err(format!(
             "scanned {} tracked Cargo metadata file(s) and found NO git dependency pins at all. \
@@ -159,7 +178,8 @@ fn run() -> Result<ExitCode, String> {
     }
 
     println!(
-        "Scope: {} tracked Cargo metadata file(s); {} git dependency/ies pinned. \
+        "Scope: {} tracked Cargo metadata file(s) PLUS tracked submodule gitlinks; \
+         {} git dependency/ies pinned. \
          Untracked, generated and vendored copies are EXCLUDED by design.",
         files.len(),
         by_dep.len()
@@ -258,6 +278,12 @@ fn run() -> Result<ExitCode, String> {
         );
         eprintln!("  A split pin lets a mechanism be HALF PRESENT: the build succeeds, the tests pass,");
         eprintln!("  and the half that actually runs is the wrong one. Nothing else reports this.");
+        eprintln!();
+        eprintln!("  ⚠️ IF A SUBMODULE AND A CARGO PIN DISAGREE, THE FIX IS NOT TO DELETE ONE.");
+        eprintln!("  Removing the submodule, or dropping the Cargo dependency, silences this");
+        eprintln!("  check while changing what one build system compiles. Decide which source");
+        eprintln!("  is AUTHORITATIVE and make the other follow it, so both build systems");
+        eprintln!("  compile the same revision.");
         for (url, pins) in &split {
             eprintln!();
             eprintln!("  {url}");
@@ -272,7 +298,14 @@ fn run() -> Result<ExitCode, String> {
                 };
                 eprintln!("    {label} ({} occurrence(s))", occurrences.len());
                 for occurrence in occurrences {
-                    eprintln!("      {}:{}", occurrence.path.display(), occurrence.line);
+                    // line 0 marks a submodule gitlink, which has no file line. Printing
+                    // "path:0" reads as a file and sends the reader hunting for a line
+                    // that does not exist.
+                    if occurrence.line == 0 {
+                        eprintln!("      {} (SUBMODULE gitlink)", occurrence.path.display());
+                    } else {
+                        eprintln!("      {}:{}", occurrence.path.display(), occurrence.line);
+                    }
                 }
             }
         }
@@ -295,7 +328,14 @@ fn run() -> Result<ExitCode, String> {
                 if let Pin::Floating(what) = pin {
                     eprintln!("    <{what}>");
                     for occurrence in occurrences {
-                        eprintln!("      {}:{}", occurrence.path.display(), occurrence.line);
+                        // line 0 marks a submodule gitlink, which has no file line. Printing
+                        // "path:0" reads as a file and sends the reader hunting for a line
+                        // that does not exist.
+                        if occurrence.line == 0 {
+                            eprintln!("      {} (SUBMODULE gitlink)", occurrence.path.display());
+                        } else {
+                            eprintln!("      {}:{}", occurrence.path.display(), occurrence.line);
+                        }
                     }
                 }
             }
@@ -316,6 +356,72 @@ fn run() -> Result<ExitCode, String> {
         }
     }
     Ok(ExitCode::from(1))
+}
+
+
+/// Every submodule as a pin on its own URL: the recorded gitlink, or a Floating
+/// marker when `.gitmodules` names a branch or tag.
+///
+/// Read from the INDEX (`git ls-files --stage`, mode 160000) and tracked
+/// `.gitmodules`, never from `git submodule status` -- that command reports `-`
+/// for a POPULATED submodule inside a linked worktree and quotes the RECORDED
+/// sha rather than the actual one. Both facts wrong at once; measured while
+/// fixing check-script-sigpipe.sh.
+fn submodule_pins(root: &Path) -> Result<Vec<(PathBuf, String, Pin)>, String> {
+    let output = Command::new("git")
+        .args(["ls-files", "--stage"])
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("could not list the index: {error}"))?;
+    if !output.status.success() {
+        return Err("git ls-files --stage failed".into());
+    }
+    let listing = String::from_utf8(output.stdout)
+        .map_err(|error| format!("git printed non-UTF-8: {error}"))?;
+
+    let modules = std::fs::read_to_string(root.join(".gitmodules")).unwrap_or_default();
+    let mut url_for: BTreeMap<String, String> = BTreeMap::new();
+    let mut float_for: BTreeMap<String, String> = BTreeMap::new();
+    let mut current = String::new();
+    for line in modules.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("path") {
+            if let Some(value) = rest.split('=').nth(1) {
+                current = value.trim().to_string();
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("url") {
+            if let Some(value) = rest.split('=').nth(1) {
+                url_for.insert(current.clone(), normalise(value.trim()));
+            }
+        } else {
+            for key in ["branch", "tag"] {
+                if let Some(rest) = trimmed.strip_prefix(key) {
+                    if let Some(value) = rest.split('=').nth(1) {
+                        float_for.insert(current.clone(), format!("{key}={}", value.trim()));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut pins = Vec::new();
+    for line in listing.lines() {
+        let mut parts = line.split_whitespace();
+        if parts.next() != Some("160000") {
+            continue;
+        }
+        let Some(sha) = parts.next() else { continue };
+        let Some(path) = line.split('\t').nth(1) else { continue };
+        // A gitlink with no .gitmodules entry cannot be attributed to a
+        // dependency, so it is skipped rather than guessed at.
+        let Some(url) = url_for.get(path) else { continue };
+        let pin = match float_for.get(path) {
+            Some(what) => Pin::Floating(what.clone()),
+            None => Pin::Revision(sha.to_string()),
+        };
+        pins.push((PathBuf::from(path), url.clone(), pin));
+    }
+    Ok(pins)
 }
 
 fn plural(count: usize) -> String {
