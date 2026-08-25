@@ -118,7 +118,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x10f);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x10e;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x10f;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
