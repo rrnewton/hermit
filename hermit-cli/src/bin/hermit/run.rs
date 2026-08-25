@@ -60,6 +60,8 @@ use super::tracing::log_max_bytes;
 use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
 use super::verify::LogCompareStrictness;
+use super::verify::NoResultReason;
+use super::verify::VerificationReport;
 use super::verify::announce_verification_outcome;
 use super::verify::compare_two_runs;
 use super::verify::retain_verification_logs;
@@ -67,6 +69,7 @@ use super::verify::temp_log_files_in;
 use super::verify::validate_log_level;
 use super::verify::verification_log_level;
 use super::verify::write_pending_verification_json;
+use super::verify::write_report_json;
 use super::verify::write_verification_json;
 
 const TMP_DIR: &str = "/tmp";
@@ -3356,6 +3359,32 @@ impl RunOpts {
                 String::from_utf8_lossy(&out1.stdout),
                 String::from_utf8_lossy(&out1.stderr),
             );
+            // ⚠️ RECORD THE DISPOSITION HERE, WHERE IT IS KNOWN. `out1.status`
+            // is in hand, yet the pre-stamped `no_result` record was previously
+            // left untouched on this path -- so the artifact reported
+            // `guest_exit_code: null` for a guest whose exit code we had. That
+            // made this refusal byte-identical to a container that never ran the
+            // guest, and 14 rotating e2e failures were undiagnosable as a direct
+            // result. A best-effort write: an unwritable artifact must not
+            // convert a rejected first run into a different error.
+            if let Some(path) = &self.verify_json {
+                let mut report = VerificationReport::no_result();
+                report.no_result_reason = Some(NoResultReason::FirstRunRejected {
+                    exit_code: out1.status.code(),
+                    signal: out1.status.signal(),
+                    stdout_bytes: out1.stdout.len(),
+                    stderr_bytes: out1.stderr.len(),
+                });
+                report.guest_exit_code = out1.status.code();
+                report.guest_signal = out1.status.signal();
+                if let Err(error) = write_report_json(path, &report) {
+                    eprintln!(
+                        "WARNING: could not record the rejected first run in {}: {}",
+                        path.display(),
+                        error
+                    );
+                }
+            }
             if self.keep_logs {
                 retain_verification_logs([("run 1", log1_path)])?;
             }

@@ -570,6 +570,10 @@ pub struct VerificationReport {
     pub bitwise_parity: bool,
     /// The verdict as a stable string ("matched" / "diverged").
     pub verdict: Verdict,
+    /// Why the verdict is [`Verdict::NoResult`]; `None` for a real verdict.
+    /// See [`NoResultReason`] for why an untyped `no_result` was not enough.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_result_reason: Option<NoResultReason>,
     /// The common output/log comparison used for the verdict. Without this a
     /// bitwise-parity consumer cannot distinguish a stripped match from a bitwise one.
     /// Backend-specific dimensions are carried separately below. `null`
@@ -605,6 +609,43 @@ pub struct VerificationReport {
     pub first_divergent_syscall: Option<u64>,
 }
 
+/// WHY a `no_result` record is a `no_result`.
+///
+/// ⚠️ THIS EXISTS BECAUSE `no_result` COLLAPSED CAUSES THAT NEED OPPOSITE
+/// RESPONSES. [`Verdict::NoResult`]'s own doc already lists several ("a run
+/// failed to start, the first run's exit status was rejected, SaBRe captured no
+/// DETLOG, recording failed"), and the artifact recorded none of them. Measured
+/// consequence: a guest that merely exits nonzero (`/bin/false`) and a cell
+/// whose container failed produce BYTE-IDENTICAL artifacts -- 141 bytes of
+/// stderr, `verdict=no_result`, and every field null. So a DESIGNED fail-closed
+/// refusal and an ACCIDENTAL container death were indistinguishable to the
+/// harness, which is why 14 rotating e2e failures could not be diagnosed from
+/// retained evidence at all.
+///
+/// ⚠️ AND THE DISPOSITION WAS KNOWN AND DISCARDED. At the rejected-first-run
+/// site the exit status is in hand; `guest_exit_code` was still written null,
+/// because the pre-stamped record was never updated on that path. Recording the
+/// reason without the disposition would leave the same gap one level up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum NoResultReason {
+    /// Stamped before verification runs. If this survives to the reader, the
+    /// invocation died before it reached any of the cases below -- which is
+    /// itself information, and distinct from "we did not record why".
+    NotRun,
+    /// Run 1 completed and its exit status was rejected by `--verify-allow`.
+    /// The guest ran; its disposition is recorded here rather than inferred.
+    FirstRunRejected {
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+        /// Bytes the guest wrote before it stopped. Zero on BOTH streams is the
+        /// signature that could not previously be told apart from a container
+        /// that never started the guest at all.
+        stdout_bytes: usize,
+        stderr_bytes: usize,
+    },
+}
+
 impl VerificationReport {
     /// The record stamped before verification runs: no verdict has been reached
     /// yet, so nothing may read as verified or as parity.
@@ -613,6 +654,7 @@ impl VerificationReport {
             verified: false,
             bitwise_parity: false,
             verdict: Verdict::NoResult,
+            no_result_reason: Some(NoResultReason::NotRun),
             comparison: None,
             compared_log_messages: None,
             dbt_counted_branches: None,
@@ -646,6 +688,10 @@ impl From<&VerificationOutcome> for VerificationReport {
                     .compared_log_messages
                     .is_some_and(|counts| counts.is_nonzero()),
             verdict: outcome.verdict,
+            // A verdict reached through the outcome path has no refusal to
+            // explain. The rejected-first-run path never builds an outcome, so
+            // it writes its own reason at the site where the status is in hand.
+            no_result_reason: None,
             comparison: Some(outcome.comparison),
             compared_log_messages: outcome.compared_log_messages,
             dbt_counted_branches: if outcome.verdict == Verdict::NoResult {
@@ -707,7 +753,7 @@ fn staging_directory(path: &Path) -> &Path {
     }
 }
 
-fn write_report_json(path: &Path, report: &VerificationReport) -> Result<(), Error> {
+pub fn write_report_json(path: &Path, report: &VerificationReport) -> Result<(), Error> {
     use std::io::Write as _;
 
     let json = serde_json::to_string(report)?;
