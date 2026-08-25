@@ -1214,6 +1214,113 @@ fn self_test() -> Result<(), String> {
     if scope_grace_s(600) != 60 || 600 + scope_grace_s(600) >= 720 {
         return Err("run-timeout scope backstop no longer satisfies 600 < 660 < 720".into());
     }
+    // A node the scheduler NAMED in `not_launched` is accounted for; one it did not
+    // name is a mystery. `not_launched` is neutral: dagrun also uses it when the
+    // outer run budget expires, not only when fail-fast stops admission.
+    {
+        let unreported = vec![
+            "e2e.manifest_applications".to_string(),
+            "test.detcore_misc".to_string(),
+        ];
+        let named: BTreeSet<String> = ["e2e.manifest_applications".to_string()]
+            .into_iter()
+            .collect();
+        let (skipped, unaccounted) = partition_unreported(&unreported, &named);
+        if skipped != vec!["e2e.manifest_applications".to_string()] {
+            return Err(format!(
+                "a node named in not_launched must read as an accounted-for scheduler not-launched result, \
+                 got {skipped:?}"
+            ));
+        }
+        if unaccounted != vec!["test.detcore_misc".to_string()] {
+            return Err(format!(
+                "a node absent from not_launched must stay UNACCOUNTED FOR, got {unaccounted:?}"
+            ));
+        }
+        if skipped.len() + unaccounted.len() != unreported.len() {
+            return Err("partitioning unreported nodes must not drop any of them".into());
+        }
+        // The pre-fix behaviour: with nothing named, every node is still a mystery.
+        let (none_named, all_unaccounted) = partition_unreported(&unreported, &BTreeSet::new());
+        if !none_named.is_empty() || all_unaccounted.len() != 2 {
+            return Err(
+                "an empty not_launched must leave every unreported node unaccounted for".into(),
+            );
+        }
+        // ...UNLESS the lane was refused before launching. A refusal empties all
+        // four scheduler collections on purpose, so without this third state a
+        // refusal would report every planned node as unaccounted for directly below
+        // a refusal that states the reason -- the unaccounted signal failing exactly when loudest.
+        if !scheduler_refused_before_launching(193, 0, 0, 0, 0) {
+            return Err(
+                "a lane that produced no outcome, dependency-skip, fail-fast skip or intentional \
+                 skip must be recognised as refused before launching"
+                    .into(),
+            );
+        }
+        // A lane that ran and merely lost nodes is NOT a refusal, and must keep
+        // reporting them as unaccounted for.
+        if scheduler_refused_before_launching(54, 40, 0, 0, 0)
+            || scheduler_refused_before_launching(54, 0, 7, 0, 0)
+            || scheduler_refused_before_launching(54, 0, 0, 7, 0)
+            || scheduler_refused_before_launching(54, 0, 0, 0, 7)
+        {
+            return Err(
+                "a lane that produced outcomes, skips or not-launched entries is not a pre-flight \
+                 refusal and must not be excused as one"
+                    .into(),
+            );
+        }
+        if scheduler_refused_before_launching(0, 0, 0, 0, 0) {
+            return Err("an empty plan is not a refusal".into());
+        }
+
+        // Explanations describe the latest attempt, not an accumulated history. A
+        // not-launched result followed by a retry refusal must read as refused; a later
+        // completed retry must clear both non-run explanations.
+        let retry_tag = "e2e.manifest_applications".to_string();
+        let planned = vec![retry_tag.clone()];
+        let mut latest_not_launched = BTreeSet::new();
+        let mut latest_refused = BTreeSet::new();
+        update_not_run_explanations(
+            &planned,
+            0,
+            0,
+            std::slice::from_ref(&retry_tag),
+            0,
+            &mut latest_not_launched,
+            &mut latest_refused,
+        );
+        if !latest_not_launched.contains(&retry_tag) || latest_refused.contains(&retry_tag) {
+            return Err("a scheduler not-launched result must be recorded for the latest attempt".into());
+        }
+        update_not_run_explanations(
+            &planned,
+            0,
+            0,
+            &[],
+            0,
+            &mut latest_not_launched,
+            &mut latest_refused,
+        );
+        if latest_not_launched.contains(&retry_tag) || !latest_refused.contains(&retry_tag) {
+            return Err(
+                "a retry refusal must replace the earlier not-launched explanation".into(),
+            );
+        }
+        update_not_run_explanations(
+            &planned,
+            1,
+            0,
+            &[],
+            0,
+            &mut latest_not_launched,
+            &mut latest_refused,
+        );
+        if latest_not_launched.contains(&retry_tag) || latest_refused.contains(&retry_tag) {
+            return Err("a completed retry must clear every non-run explanation".into());
+        }
+    }
     let cold_compat = build_release_hermit_node("gate.manifest", "/tmp/target/release/hermit");
     if cold_compat.hint.preferred_inner_jobs != Some(8)
         || cold_compat.hint.classification != dagrun::model::StepClass::CpuBound
@@ -6441,6 +6548,131 @@ fn remaining_budget_s(deadline_ns: Option<u64>) -> Option<i64> {
 }
 
 /// Planned runnable steps absent from both scheduler result collections.
+/// Whether the scheduler refused the whole lane before starting any node.
+///
+/// Every pre-flight refusal path returns empty outcomes, empty dependency skips, an empty
+/// `not_launched`, AND empty intentional skips -- deliberately, because nothing was left
+/// unlaunched *by a failure*. A planned lane that produced none of the four therefore never
+/// started, and its nodes are explained by the refusal, not unaccounted for.
+fn scheduler_refused_before_launching(
+    planned: usize,
+    outcomes: usize,
+    skipped: usize,
+    not_launched: usize,
+    intentional_skips: usize,
+) -> bool {
+    planned > 0
+        && outcomes == 0
+        && skipped == 0
+        && not_launched == 0
+        && intentional_skips == 0
+}
+
+/// Replace the recorded reason a planned node did not run with the latest scheduler attempt.
+///
+/// A retry is a new attempt: a node that was not launched on attempt one may be refused
+/// before attempt two, or may run on attempt two. Keeping the old reason would describe history
+/// rather than the terminal attempt that makes the lane incomplete.
+fn update_not_run_explanations(
+    planned: &[String],
+    outcomes: usize,
+    skipped: usize,
+    not_launched: &[String],
+    intentional_skips: usize,
+    scheduler_not_launched: &mut BTreeSet<String>,
+    refused: &mut BTreeSet<String>,
+) {
+    for tag in planned {
+        scheduler_not_launched.remove(tag);
+        refused.remove(tag);
+    }
+    if scheduler_refused_before_launching(
+        planned.len(),
+        outcomes,
+        skipped,
+        not_launched.len(),
+        intentional_skips,
+    ) {
+        refused.extend(planned.iter().cloned());
+    } else {
+        scheduler_not_launched.extend(not_launched.iter().cloned());
+    }
+}
+
+/// Split nodes that produced no outcome into the two states they actually occupy:
+/// those the scheduler returned in `not_launched` after admission stopped
+/// (accounted for, without claiming whether fail-fast or the outer budget stopped it),
+/// and those nothing explains.
+///
+/// Both still block a green lane. The distinction is diagnostic, and it is the
+/// whole point: a deliberate skip that reads identically to a vanished node makes
+/// every deliberate skip look like a defect and hides the real ones among them.
+fn partition_unreported(
+    unreported: &[String],
+    not_launched: &BTreeSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    unreported
+        .iter()
+        .cloned()
+        .partition(|tag| not_launched.contains(tag))
+}
+
+fn scheduler_not_launched_message(tags: &[String]) -> String {
+    format!(
+        "validate: {} planned node(s) DID NOT RUN; the scheduler returned them in \
+         not_launched after it stopped admitting work (fail-fast or outer run budget): {}. \
+         They are accounted for, but the lane remains incomplete and cannot be green.",
+        tags.len(),
+        tags.join(", ")
+    )
+}
+
+#[cfg(test)]
+mod scheduler_explanation_tests {
+    use super::*;
+
+    #[test]
+    fn latest_attempt_replaces_the_prior_nonlaunch_reason() {
+        let tag = "e2e.manifest_applications".to_string();
+        let planned = vec![tag.clone()];
+        let mut not_launched = BTreeSet::new();
+        let mut refused = BTreeSet::new();
+
+        update_not_run_explanations(
+            &planned, 0, 0, std::slice::from_ref(&tag), 0, &mut not_launched, &mut refused,
+        );
+        assert!(not_launched.contains(&tag));
+        assert!(!refused.contains(&tag));
+
+        update_not_run_explanations(
+            &planned, 0, 0, &[], 0, &mut not_launched, &mut refused,
+        );
+        assert!(!not_launched.contains(&tag));
+        assert!(refused.contains(&tag));
+
+        update_not_run_explanations(
+            &planned, 1, 0, &[], 0, &mut not_launched, &mut refused,
+        );
+        assert!(!not_launched.contains(&tag));
+        assert!(!refused.contains(&tag));
+    }
+
+    #[test]
+    fn intentional_skip_is_not_a_preflight_refusal() {
+        assert!(!scheduler_refused_before_launching(1, 0, 0, 0, 1));
+        assert!(scheduler_refused_before_launching(1, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn not_launched_diagnostic_does_not_invent_a_specific_cause() {
+        let message = scheduler_not_launched_message(&["test.detcore_misc".to_string()]);
+        assert_eq!(
+            message,
+            "validate: 1 planned node(s) DID NOT RUN; the scheduler returned them in not_launched after it stopped admitting work (fail-fast or outer run budget): test.detcore_misc. They are accounted for, but the lane remains incomplete and cannot be green."
+        );
+    }
+}
+
 fn unreported_non_intentional_steps(
     cfg: &DagConfig,
     by_tag: &BTreeMap<String, StepOutcome>,
@@ -7900,6 +8132,22 @@ fn run_lane_with_env_retries(
         forward_step_profiles(&first, jobs);
     }
     let mut run_timed_out = first.run_timed_out;
+    // Keep the reason attached to the LATEST scheduler attempt for each node. A
+    // retry can replace an earlier fail-fast skip with a pre-flight refusal (or a
+    // real outcome), so accumulating every historical reason would misreport the
+    // terminal state. All reasons remain non-green; this only names them truthfully.
+    let mut latest_not_launched = BTreeSet::new();
+    let mut latest_refused = BTreeSet::new();
+    let first_planned: Vec<String> = cfg.steps.iter().map(|step| step.tag()).collect();
+    update_not_run_explanations(
+        &first_planned,
+        first.outcomes.len(),
+        first.skipped.len(),
+        &first.not_launched,
+        first.intentional_skips.len(),
+        &mut latest_not_launched,
+        &mut latest_refused,
+    );
     let mut order: Vec<String> = first.outcomes.iter().map(|o| o.tag.clone()).collect();
     let mut by_tag: BTreeMap<String, StepOutcome> =
         first.outcomes.iter().map(|o| (o.tag.clone(), o.clone())).collect();
@@ -8073,6 +8321,16 @@ fn run_lane_with_env_retries(
             forward_step_profiles(&again, jobs);
         }
         run_timed_out = run_timed_out || again.run_timed_out;
+        let retry_planned: Vec<String> = retry_cfg.steps.iter().map(|step| step.tag()).collect();
+        update_not_run_explanations(
+            &retry_planned,
+            again.outcomes.len(),
+            again.skipped.len(),
+            &again.not_launched,
+            again.intentional_skips.len(),
+            &mut latest_not_launched,
+            &mut latest_refused,
+        );
         // Compute absent work from THIS retry result before cumulative `by_tag`
         // can make an old outcome look current. `RunResult::not_launched` carries
         // the same fact, but recomputing from the two round-local collections
@@ -8147,12 +8405,33 @@ fn run_lane_with_env_retries(
         unreported_non_intentional_steps(cfg, &by_tag, &skipped).into_iter().collect();
     unreported.extend(latest_unreported);
     let unreported: Vec<String> = unreported.into_iter().collect();
-    if !unreported.is_empty() {
+    // Three terminal explanations, all still non-green. A retry replaces an earlier
+    // explanation for the same tag, so this reports the latest attempt rather than
+    // whichever historical set happened to retain it.
+    let (refused_before_launching, remaining) =
+        partition_unreported(&unreported, &latest_refused);
+    let (scheduler_not_launched, unaccounted) =
+        partition_unreported(&remaining, &latest_not_launched);
+    if !scheduler_not_launched.is_empty() {
+        eprintln!("{}", scheduler_not_launched_message(&scheduler_not_launched));
+    }
+    if !refused_before_launching.is_empty() {
         eprintln!(
-            "validate: ERROR: scheduler returned without an outcome or dependency-skip for {} \
-             non-intentional planned node(s): {}. The lane is incomplete and cannot be green.",
-            unreported.len(),
-            unreported.join(", ")
+            "validate: {} planned node(s) DID NOT RUN because the scheduler REFUSED their latest \
+             attempt before launching anything; the refusal above states the reason. The lane is \
+             incomplete and cannot be green: {}.",
+            refused_before_launching.len(),
+            refused_before_launching.join(", ")
+        );
+    }
+    if !unaccounted.is_empty() {
+        eprintln!(
+            "validate: ERROR: scheduler returned without an outcome, a dependency-skip, or a \
+             scheduler not-launched result for {} non-intentional planned node(s): {}. These are UNACCOUNTED \
+             FOR -- unlike a scheduler not-launched result or a pre-flight refusal, nothing explains why \
+             they did not run. The lane is incomplete and cannot be green.",
+            unaccounted.len(),
+            unaccounted.join(", ")
         );
     }
     // Raw failure policy may still treat an aborted peer as neutral, but execution
