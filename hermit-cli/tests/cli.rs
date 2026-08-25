@@ -10,6 +10,8 @@
 mod liteinst_runtime;
 
 use std::fs;
+use std::io::BufRead;
+use std::io::BufReader;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
@@ -18,9 +20,13 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 
 static DBT_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_EXEC_FAILURE_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -3790,40 +3796,410 @@ fn a_guest_side_fault_is_not_reported_as_a_hermit_internal_failure() {
     );
 }
 
-/// `hermit record` must classify a container-child failure the same way
-/// `hermit run` does.
+/// The REPLAY-stage classification site of `record --verify-with-gdbex`, the
+/// sixth and last of them.
 ///
-/// ⚠️ THIS IS THE CALL SITE THE FIX ORIGINALLY MISSED. `record` -- every
-/// spelling -- calls `RunGuarded::run_guarded` directly at six sites in
-/// `record_start.rs` and never goes through `with_container`, so the
-/// `.context(..)??` discard survived there and BOTH container-child classes
-/// surfaced as `class=cli-error`. A wrong machine-readable class is worse than
-/// none, because a gate believes it.
+/// ⚠️ THIS SITE WAS TWICE DECLARED UNTESTABLE BY THIS BRANCH AND IS NEITHER.
+/// First the claim was that no fault could reach a replay stage at all; then,
+/// after that was disproved, that reaching THIS one wedges the process. Both
+/// were wrong, and `agent(codex-rev-2628)` supplied the missing step each time.
+/// THE HANG THAT BLOCKED THIS TEST WAS THE PROBE'S: killing the replay gdbserver
+/// while leaving GDB ALIVE leaves GDB holding the captured stderr pipe open, so
+/// the reader never sees EOF. Making GDB `quit` after the kill returns promptly
+/// -- rc=125 in about a second.
+///
+/// ⚠️ THAT IS NOT THE SAME AS SAYING HERMIT HAS NO BUG HERE, AND AN EARLIER
+/// VERSION OF THIS COMMENT SAID EXACTLY THAT. `agent(hermit-dbgrev7)` measured
+/// the two cases apart: killing the replay CONTAINER CHILD makes hermit exit in
+/// 0.050s, but killing GDB makes hermit NEVER RETURN -- 188s, killed by hand.
+/// `--verify-with-gdbex` waits forever when GDB dies before completing the
+/// connection, and `--record-timeout` arms the recording only. That defect is
+/// real, is filed, and is out of scope for a test-only change. Correcting the
+/// CAUSE of a hang is not the same as retracting the hang.
+///
+/// ⚠️ SO `--verify-with-gdbex` IS ITSELF THE CONTROL HOOK. The CLI already
+/// accepts GDB commands, GDB runs while the replay container is alive, and GDB
+/// can run Python. No production change, no new injector, and no external
+/// process supervision: the kill is issued from inside the run being tested and
+/// the same `-ex` sequence then shuts GDB down.
+#[test]
+fn record_classifies_a_gdbserver_replay_stage_container_child_failure() {
+    let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create a recording dir");
+    let script = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kill-gdbserver-replay-peer.py");
+    // Finds the OUTER `hermit record` by walking GDB's own ancestry, then kills
+    // that process's non-ancestor children -- the replay container. Written from
+    // inside the run rather than supervised from outside, so the test does not
+    // have to guess a pid or race the fork.
+    fs::write(
+        &script,
+        r#"import os, signal
+
+def parent_of(pid):
+    try:
+        return int(open("/proc/%d/stat" % pid).read().rsplit(")", 1)[-1].split()[1])
+    except (OSError, IndexError, ValueError):
+        return None
+
+def cmdline(pid):
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as handle:
+            return handle.read().replace(b"\0", b" ").decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+ancestors = []
+current = os.getpid()
+for _ in range(30):
+    ancestors.append(current)
+    current = parent_of(current)
+    if current is None or current <= 1:
+        break
+
+outer = None
+for candidate in ancestors:
+    text = cmdline(candidate)
+    if "hermit" in text and " record " in text:
+        outer = candidate
+        break
+
+if outer is not None:
+    known = set(ancestors)
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid in known:
+            continue
+        if parent_of(pid) == outer:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+"#,
+    )
+    .expect("failed to write the gdb kill script");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .env("HERMIT_DATA_DIR", data_dir.path())
+        .args([
+            "record",
+            "--verify-with-gdbex",
+            // `;` is the -ex delimiter: kill the replay container, then shut GDB
+            // down. ⚠️ THE `quit` IS LOAD-BEARING -- without it GDB stays alive
+            // holding this test's stderr pipe and the run never appears to end.
+            &format!("pi exec(open(\"{}\").read());quit", script.display()),
+            "--",
+            "/bin/true",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn the gdbserver verify");
+
+    // ⚠️ A DEADLINE, SO A HANG IS A FAILURE RATHER THAN A STUCK SUITE. This
+    // drives hermit into an error path on purpose and an earlier version of the
+    // probe really did wedge; a test that can stall CI is not an acceptable
+    // price for a covered call site.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut timed_out = false;
+    loop {
+        match child.try_wait().expect("failed to poll hermit") {
+            Some(_) => break,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                timed_out = true;
+                break;
+            }
+            None => thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .expect("failed to collect the gdbserver verify output");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    assert!(
+        !timed_out,
+        "hermit did not exit within 120s after its gdbserver replay container was killed\n\
+         stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("HERMIT_INTERNAL_FAILURE class=container-child-exit"),
+        "a gdbserver-replay container child killed by a signal it did not choose must be \
+         classified as a container-child exit, not as a CLI error\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("status=Signaled(SIGKILL"),
+        "the typed status must survive to the classification\nstderr:\n{stderr}"
+    );
+}
+
+/// The REPLAY-stage classification site of `record --verify`, which the fault
+/// injector cannot reach and which was therefore left unpinned.
+///
+/// ⚠️ THIS EXISTS BECAUSE "UNREACHABLE" WAS WRONG. The sibling test below covers
+/// four of `record`'s six `run_guarded` sites, and its doc comment used to
+/// assert that the remaining two -- the replay stages of `--verify` and
+/// `--verify-with-gdbex` -- could not be reached without teaching
+/// `inject_test_fault` to name a stage. `agent(codex-rev-2628)` disproved that
+/// in review, and the idea is the one this file was missing: THE FAULT DOES NOT
+/// HAVE TO COME FROM INSIDE THE CHILD. Waiting for `:: Replaying...` on stderr
+/// and killing the container child from outside reaches the site, with no
+/// change to production code and no new injector.
+///
+/// ⚠️ AND `SIGKILL` IS WHAT MAKES IT A CONTAINER-CHILD EXIT rather than a
+/// reported error: it is a status the child did not choose and no handler can
+/// intercept, so reverie hands hermit a typed `RunError::ExitStatus` -- exactly
+/// the shape `.classified()` preserves and `.context(..)??` destroyed.
+///
+/// ⚠️ THE `--verify-with-gdbex` REPLAY SITE IS COVERED BY THE TEST ABOVE, AND AN
+/// EARLIER VERSION OF THIS COMMENT BLAMED HERMIT FOR NOT COVERING IT. It said
+/// hermit hangs when that replay container is killed, on the evidence of three
+/// invocations that sat for 25 minutes and an in-suite probe that timed out at
+/// 300s. The hang was real and the attribution was wrong: it was the PROBE
+/// leaving GDB alive holding the captured stderr pipe, so the reader never saw
+/// EOF. Issuing GDB `quit` after the kill returns in about a second. Hermit has
+/// no bug here.
+#[test]
+fn record_classifies_a_replay_stage_container_child_failure() {
+    let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create a recording dir");
+
+    // The direct children of a process, found by scanning `/proc/<pid>/stat`.
+    //
+    // ⚠️ NOT `/proc/<pid>/task/<tid>/children`, WHICH IS EMPTY HERE. That file is
+    // the obvious answer and it is the wrong one: hermit's container child is put
+    // in a NEW PID NAMESPACE, and the kernel omits such a child from the
+    // `children` list of a reader in the parent namespace. Measured at the same
+    // instant, with the child plainly alive: `children` across every task read
+    // `[]` while a ppid scan found it. The first version of this test used
+    // `children`, found nothing on five runs out of five, and reported "no
+    // container child appeared" about a child that was there.
+    fn children_of(pid: u32) -> Vec<u32> {
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        for entry in entries.flatten() {
+            let Some(candidate) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(stat) = fs::read_to_string(format!("/proc/{candidate}/stat")) else {
+                continue;
+            };
+            // `comm` is parenthesised and may itself contain spaces, so the
+            // fields after it are taken from the LAST ')' rather than by
+            // splitting the whole line. ppid is the second field after that.
+            let Some(rest) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
+                continue;
+            };
+            let mut fields = rest.split_whitespace();
+            let (_state, parent) = (fields.next(), fields.next());
+            if parent.and_then(|value| value.parse::<u32>().ok()) == Some(pid) {
+                found.push(candidate);
+            }
+        }
+        found
+    }
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .env("HERMIT_DATA_DIR", data_dir.path())
+        // ⚠️ THE GUEST ARGUMENT BUYS NO HEADROOM AND AN EARLIER COMMENT HERE
+        // CLAIMED IT DID. Guest time is virtualized, so `sleep 1`, `sleep 5` and
+        // `sleep 60` all give the same ~0.4s window and `/bin/true` gives 0.2s --
+        // measured by `agent(hermit-dbgrev7)`. What makes the kill land is the
+        // poll loop below, which waits for the replay container to appear rather
+        // than assuming it is already there; the guest is incidental.
+        .args(["record", "--verify", "--", "/bin/sleep", "5"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn the fault-injected verify");
+    let pid = child.id();
+    let stderr = child.stderr.take().expect("hermit stderr must be piped");
+
+    // ⚠️ A DEADLINE, SO A HANG IS A FAILURE RATHER THAN A STUCK SUITE. This test
+    // drives hermit into an error path on purpose, and hermit really does hang
+    // on a neighbouring one: under `--verify-with-gdbex`, GDB dying before it
+    // connects leaves hermit waiting forever. A test that can wedge CI is not an
+    // acceptable price for a covered call site.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let captured = Arc::new(Mutex::new(String::new()));
+    let reader_captured = Arc::clone(&captured);
+    let reader = thread::spawn(move || {
+        let mut killed = false;
+        for line in BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            {
+                let mut buffer = reader_captured.lock().expect("stderr buffer poisoned");
+                buffer.push_str(&line);
+                buffer.push('\n');
+            }
+            if !killed && line.contains("Replaying...") {
+                // The replay container is forked after the announcement, so poll
+                // rather than assume it is already there.
+                let until = Instant::now() + Duration::from_secs(10);
+                while Instant::now() < until {
+                    if let Some(target) = children_of(pid).first().copied() {
+                        let _ = Command::new("kill")
+                            .args(["-9", &target.to_string()])
+                            .status();
+                        killed = true;
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+        killed
+    });
+
+    let mut timed_out = false;
+    loop {
+        match child.try_wait().expect("failed to poll hermit") {
+            Some(_) => break,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                timed_out = true;
+                break;
+            }
+            None => thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    let _ = child.wait();
+    let killed = reader.join().unwrap_or(false);
+    let stderr = captured.lock().expect("stderr buffer poisoned").clone();
+
+    assert!(
+        !timed_out,
+        "hermit did not exit within 120s after its replay container child was killed; a \
+         hanging error path is a defect, not a slow test\nstderr:\n{stderr}"
+    );
+    // ⚠️ REFUSES RATHER THAN PASSES ON AN UNFIRED PROBE. If the kill never
+    // landed, this test proves nothing and must say so instead of going green.
+    assert!(
+        killed,
+        "no container child was signalled after `Replaying...`, so this test never \
+         exercised the replay stage it exists for\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("HERMIT_INTERNAL_FAILURE class=container-child-exit"),
+        "a replay-stage container child killed by a signal it did not choose must be \
+         classified as a container-child exit, not as a CLI error\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("status=Signaled(SIGKILL"),
+        "the typed status must survive to the classification\nstderr:\n{stderr}"
+    );
+}
+
+/// `hermit record` must classify a container-child failure the same way
+/// `hermit run` does -- IN EVERY SPELLING THAT ENTERS A CONTAINER, not just the
+/// bare one.
+///
+/// ⚠️ THIS IS THE CALL SITE THE FIX ORIGINALLY MISSED. `record` calls
+/// `RunGuarded::run_guarded` directly at six sites in `record_start.rs` and
+/// never goes through `with_container`, so the `.context(..)??` discard survived
+/// there and BOTH container-child classes surfaced as `class=cli-error`. A wrong
+/// machine-readable class is worse than none, because a gate believes it.
+///
+/// ⚠️ AND ONE SPELLING IS NOT SIX. The first version of this test drove only
+/// `record -- prog`, which reaches exactly one of the six sites; adversarial
+/// review pointed out that the other five could be reverted to the old
+/// flattening with this test still green, so the "every spelling" claim in the
+/// paragraph above was not the claim being tested. Four of the six are now
+/// driven, one per entry point that can be reached with the guest's FIRST
+/// container:
+///
+/// | spelling | site |
+/// | --- | --- |
+/// | `record -- prog` | `main`, no deadline |
+/// | `record --record-timeout N -- prog` | `main`, deadline armed |
+/// | `record --verify -- prog` | `record_verify`, record stage |
+/// | `record --verify-with-gdbex ... -- prog` | `record_verify_debug`, record stage |
+///
+/// ⚠️ THE REMAINING TWO ARE THE REPLAY STAGES OF THOSE LAST TWO, AND THIS
+/// INJECTOR CANNOT REACH THEM: `inject_test_fault` is a process-local
+/// environment check with no notion of which stage it is in, so with the
+/// variable set the RECORD stage faults first and the replay stage is never
+/// entered.
+///
+/// ⚠️ THAT IS A LIMIT OF THIS INJECTOR AND NOT OF TESTING, AND AN EARLIER
+/// VERSION OF THIS COMMENT SAID OTHERWISE. It claimed the two sites could not be
+/// reached without a stage-aware injector, and `agent(codex-rev-2628)` disproved
+/// it in review: the fault does not have to come from inside the child.
+/// `record_classifies_a_replay_stage_container_child_failure` above pins `:535`
+/// by killing the container child from outside after `:: Replaying...`, and
+/// `record_classifies_a_gdbserver_replay_stage_container_child_failure` pins
+/// `:660` by killing from inside GDB and then quitting it. All six sites are
+/// covered; this test carries four of them.
 #[test]
 fn record_classifies_a_container_child_failure_the_same_way_run_does() {
     let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("failed to create a recording dir");
-    let case = |fault: &str| -> String {
+    let case = |fault: &str, extra: &[&str]| -> String {
+        let mut args = vec!["record"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--", "/bin/true"]);
         let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
             .env("HERMIT_TEST_CONTAINER_CHILD_FAULT", fault)
             .env("HERMIT_DATA_DIR", data_dir.path())
-            .args(["record", "--", "/bin/true"])
+            .args(&args)
             .output()
-            .expect("failed to run the fault-injected recording");
+            .unwrap_or_else(|error| panic!("failed to run {args:?}: {error}"));
         String::from_utf8_lossy(&output.stderr).into_owned()
     };
 
-    let segv = case("segv");
-    assert!(
-        segv.contains("HERMIT_INTERNAL_FAILURE class=container-child-exit"),
-        "a record-path container child that exited with an unchosen status must be \
-         classified as such, not as a CLI error\nstderr:\n{segv}"
-    );
+    // One entry point per row of the table above. Each is asserted for BOTH
+    // classes, because the two travel different paths out of the child: an
+    // unchosen exit status is observed by reverie, a caught panic is reported
+    // through `SerializableError`'s discriminant.
+    let spellings: [(&str, &[&str]); 4] = [
+        ("bare", &[]),
+        ("with a recording deadline", &["--record-timeout", "600"]),
+        ("with --verify", &["--verify"]),
+        ("with --verify-with-gdbex", &["--verify-with-gdbex", "quit"]),
+    ];
 
-    let panicked = case("panic");
+    // ⚠️ EVERY SPELLING IS DRIVEN AND EVERY FAILURE IS COLLECTED, RATHER THAN
+    // ASSERTED ONE AT A TIME. An `assert!` inside this loop aborts at the FIRST
+    // failing spelling, so a run in which one call site regressed could never
+    // show that the other three were unaffected -- and "each spelling reaches
+    // one site and no other" is precisely the property this test is here to
+    // carry. Collecting turns one revert into a one-line proof of the mapping:
+    // exactly one spelling fails and the report names the three that did not.
+    let mut failures: Vec<String> = Vec::new();
+    for (name, extra) in spellings {
+        let segv = case("segv", extra);
+        if !segv.contains("HERMIT_INTERNAL_FAILURE class=container-child-exit") {
+            failures.push(format!(
+                "  [{name}] a record-path container child that exited with an unchosen \
+                 status was not classified as such\n    stderr: {}",
+                segv.replace('\n', " | ")
+            ));
+        }
+
+        let panicked = case("panic", extra);
+        if !panicked.contains("HERMIT_INTERNAL_FAILURE class=container-child-panic") {
+            failures.push(format!(
+                "  [{name}] a record-path CAUGHT container-child panic was not classified \
+                 as a panic\n    stderr: {}",
+                panicked.replace('\n', " | ")
+            ));
+        }
+    }
     assert!(
-        panicked.contains("HERMIT_INTERNAL_FAILURE class=container-child-panic"),
-        "a record-path CAUGHT container-child panic must be classified as a panic, not \
-         as a CLI error\nstderr:\n{panicked}"
+        failures.is_empty(),
+        "{} of {} record spelling/fault combinations misclassified a container-child \
+         failure. The combinations NOT listed here passed in this same run, which is what \
+         makes this a mapping rather than an aggregate:\n{}",
+        failures.len(),
+        spellings.len() * 2,
+        failures.join("\n")
     );
 }
