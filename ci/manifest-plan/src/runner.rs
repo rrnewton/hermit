@@ -105,6 +105,10 @@ pub struct ModeRecipe {
     pub outcome_classes: Option<u64>,
     #[serde(default)]
     pub args: Vec<String>,
+    pub compare_io_buffers: Option<bool>,
+    pub compare_io_buffers_disabled_reason: Option<String>,
+    pub rcb_time: Option<bool>,
+    pub rcb_time_disabled_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -411,6 +415,68 @@ fn validate_mode(id: &str, mode: &str, recipe: &ModeRecipe) -> Result<(), String
             ));
         }
     }
+    match (
+        mode,
+        recipe.compare_io_buffers,
+        recipe.compare_io_buffers_disabled_reason.as_deref(),
+    ) {
+        ("verify", None | Some(true), None) | ("verify", Some(false), Some(_)) => {}
+        ("verify", Some(false), None) => {
+            return Err(format!(
+                "{id}: verify compare_io_buffers=false requires compare_io_buffers_disabled_reason"
+            ));
+        }
+        ("verify", None | Some(true), Some(_)) => {
+            return Err(format!(
+                "{id}: verify comparison reason is stale while I/O-buffer comparison is enabled"
+            ));
+        }
+        (_, None, None) => {}
+        _ => {
+            return Err(format!(
+                "{id}: compare_io_buffers is supported only by verify mode"
+            ));
+        }
+    }
+    if recipe
+        .compare_io_buffers_disabled_reason
+        .as_deref()
+        .is_some_and(|reason| reason.trim().is_empty())
+    {
+        return Err(format!(
+            "{id}: compare_io_buffers_disabled_reason must be substantive"
+        ));
+    }
+    match (
+        mode,
+        recipe.rcb_time,
+        recipe.rcb_time_disabled_reason.as_deref(),
+    ) {
+        ("verify", None | Some(true), None) | ("verify", Some(false), Some(_)) => {}
+        ("verify", Some(false), None) => {
+            return Err(format!(
+                "{id}: verify rcb_time=false requires rcb_time_disabled_reason"
+            ));
+        }
+        ("verify", None | Some(true), Some(_)) => {
+            return Err(format!(
+                "{id}: verify RCB-time reason is stale while RCB time is enabled"
+            ));
+        }
+        (_, None, None) => {}
+        _ => {
+            return Err(format!("{id}: rcb_time is supported only by verify mode"));
+        }
+    }
+    if recipe
+        .rcb_time_disabled_reason
+        .as_deref()
+        .is_some_and(|reason| reason.trim().is_empty())
+    {
+        return Err(format!(
+            "{id}: rcb_time_disabled_reason must be substantive"
+        ));
+    }
     Ok(())
 }
 
@@ -439,6 +505,30 @@ pub fn validate_mode_workdir(
         ));
     }
     Ok(())
+}
+
+fn cell_relaxations(cell: &SelectedCell) -> Vec<String> {
+    let recipe = &cell.test.modes[&cell.id.mode];
+    let mut relaxations = Vec::new();
+    if recipe.compare_io_buffers == Some(false) {
+        relaxations.push(format!(
+            "--no-detlog-io-buffers: {}",
+            recipe
+                .compare_io_buffers_disabled_reason
+                .as_deref()
+                .unwrap_or("reason missing")
+        ));
+    }
+    if recipe.rcb_time == Some(false) {
+        relaxations.push(format!(
+            "--no-rcb-time: {}",
+            recipe
+                .rcb_time_disabled_reason
+                .as_deref()
+                .unwrap_or("reason missing")
+        ));
+    }
+    relaxations
 }
 
 fn ci_selection(recipe: &ModeRecipe) -> Result<CiSelection, String> {
@@ -888,6 +978,12 @@ pub fn build_spec(
             ];
             if context.run_verify_strict {
                 argv.push("--verify-strict".into());
+            }
+            if mode_recipe.compare_io_buffers == Some(false) {
+                argv.push("--no-detlog-io-buffers".into());
+            }
+            if mode_recipe.rcb_time == Some(false) {
+                argv.push("--no-rcb-time".into());
             }
             argv.extend([
                 "--verify".into(),
@@ -1561,7 +1657,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         env: literal_env,
         cwd: literal_cwd,
         shell_command: literal_shell_command,
-        relaxations: Vec::new(),
+        relaxations: cell_relaxations(cell),
         execution_path,
         diversity: (cell.id.mode == "chaos").then(|| {
             diversity_evidence(
@@ -1623,7 +1719,7 @@ pub fn infrastructure_error_result(
         env: execution_cell_env(context, &dir, cell.id.mode != "naked"),
         cwd: context.root.to_string_lossy().into_owned(),
         shell_command: String::new(),
-        relaxations: Vec::new(),
+        relaxations: cell_relaxations(cell),
         execution_path: None,
         diversity: None,
         attempts: Vec::new(),
@@ -2653,6 +2749,95 @@ backends_disabled:
         assert_eq!(argv[3], ".");
         assert_eq!(argv[4], "missing/path");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verify_relaxations_are_explicit_and_recorded() {
+        let mut test = recipe(true);
+        let mode = test.modes.get_mut("verify").unwrap();
+        mode.compare_io_buffers = Some(false);
+        mode.compare_io_buffers_disabled_reason = Some(
+            "guest assertions validate sanitizer-specific invariants while whole files may vary"
+                .into(),
+        );
+        mode.rcb_time = Some(false);
+        mode.rcb_time_disabled_reason =
+            Some("data-dependent assertion work must not perturb virtual time".into());
+        validate_mode("fixture/test", "verify", mode).unwrap();
+        let cell = SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: test.id.clone(),
+                mode: "verify".into(),
+                backend: Some("ptrace".into()),
+            },
+            test,
+            enabled: true,
+        };
+        let context = RunContext {
+            root: PathBuf::from("/repo"),
+            hermit_bin: PathBuf::from("/repo/hermit"),
+            result_root: PathBuf::from("/repo/results"),
+            build_root: PathBuf::from("/repo/build"),
+            run_id: "fixture".into(),
+            source_sha: "0".repeat(40),
+            source_dirty: false,
+            prebuilt: false,
+            keep_logs: false,
+            run_verify_strict: true,
+            record_verify_strict: true,
+            scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
+            isolated_workdir: None,
+        };
+        let spec = build_spec(
+            &context,
+            &cell,
+            PathBuf::from("/repo/results/cell"),
+            vec!["/bin/true".into()],
+            "1",
+            None,
+        )
+        .unwrap();
+        let separator = spec.argv.iter().position(|arg| arg == "--").unwrap();
+        let relaxation = spec
+            .argv
+            .iter()
+            .position(|arg| arg == "--no-detlog-io-buffers")
+            .unwrap();
+        assert!(relaxation < separator);
+        let no_rcb_time = spec
+            .argv
+            .iter()
+            .position(|arg| arg == "--no-rcb-time")
+            .unwrap();
+        assert!(no_rcb_time < separator);
+        assert_eq!(
+            cell_relaxations(&cell),
+            vec![
+                String::from(
+                    "--no-detlog-io-buffers: guest assertions validate sanitizer-specific invariants while whole files may vary",
+                ),
+                String::from(
+                    "--no-rcb-time: data-dependent assertion work must not perturb virtual time",
+                ),
+            ]
+        );
+
+        let mut missing_reason = recipe(true).modes.remove("verify").unwrap();
+        missing_reason.compare_io_buffers = Some(false);
+        assert!(
+            validate_mode("fixture/test", "verify", &missing_reason)
+                .unwrap_err()
+                .contains("requires compare_io_buffers_disabled_reason")
+        );
+
+        let mut missing_rcb_reason = recipe(true).modes.remove("verify").unwrap();
+        missing_rcb_reason.rcb_time = Some(false);
+        assert!(
+            validate_mode("fixture/test", "verify", &missing_rcb_reason)
+                .unwrap_err()
+                .contains("requires rcb_time_disabled_reason")
+        );
     }
 
     #[test]
