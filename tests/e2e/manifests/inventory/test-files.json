@@ -1340,6 +1340,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/pipe2_errno_precedence.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (ptrace and SaBRe verify; ci=true; DBT enabled-red)",
+      "why": "tests/c/pipe2_errno_precedence.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: canonical ptrace and SaBRe verification assert Linux's flag-before-pointer errno precedence and the fixed 8192-byte Detcore pipe capacity; DBT remains enabled-red because it exposes the host capacity"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/ppoll_readv.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/ppoll_readv.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"

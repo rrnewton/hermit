@@ -4953,6 +4953,86 @@ test:
           kvm: No custom edge-case arguments have been calibrated for this C guest
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
+  - id: c-programs/pipe2-errno-precedence
+    description: Linux pipe2 preserves flag-before-pointer errno precedence while Detcore-created pipes expose the fixed 8192-byte capacity
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    timeout_seconds: 90
+    occasional: false
+    program: tests/c/pipe2_errno_precedence.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
+        ci_disabled_reason:
+          dbt:
+            result: parity-failure
+            evidence: "637b0b19d63facb4cc77174334ed325132b83516; task drain_hermit_2059_to"
+            reason: Exact-head structured verification preserved EFAULT/EINVAL precedence but exposed the host pipe capacity 65536 instead of Detcore's fixed 8192-byte capacity, so Run1 exited status 1 before comparison; this is an exact backend-parity failure, not absent DBT support.
+        backends_enabled:
+          - ptrace
+          - dbt
+          - sabre
+        guest_args:
+          ptrace:
+            - "8192"
+          dbt:
+            - "8192"
+          sabre:
+            - "8192"
+        assert:
+          bitwise_parity: true
+        backends_disabled:
+          kvm: KVM qualification is separate from this ptrace and SaBRe errno-precedence regression
+          liteinst: LiteInst canonical verification remains blocked by guest-visible startup mapping identity
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (by design): this probe asserts Linux errno precedence and Detcore pipe policy, not native nondeterminism.'
+        backends_enabled: []
+        backends_disabled:
+          native: This probe asserts Linux errno precedence and Detcore pipe policy, not native nondeterminism
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is separate from this errno-precedence assertion.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from this errno-precedence assertion
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (by design): this single-threaded errno oracle has no schedule-diversity contract.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: This single-threaded errno oracle has no schedule-diversity contract
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
   - id: c-programs/ppoll-readv
     description: Strict verification for tests/c/ppoll_readv.c
     lane: portable
