@@ -170,6 +170,64 @@ fn file_subscriber<W: Write + Send + 'static>(
     (subscriber, guard)
 }
 
+/// A file subscriber whose writes CANNOT be lost when the process dies.
+///
+/// `file_subscriber` uses `tracing_appender::non_blocking`, which queues to a
+/// background thread and only drains when its guard drops. A run that dies
+/// without unwinding -- which is exactly what a fail-closed guest does -- never
+/// drops the guard, so the QUEUED TAIL IS LOST. The tail is where a fatal
+/// diagnostic lives, so the one line that explains the failure is the one line
+/// reliably discarded.
+///
+/// MEASURED 2026-08-25 on c-programs/dbt-unsupported-syscall under `--verify`:
+///   non-blocking  18 runs, diagnostic present 0 times, logs truncated at a
+///                 RANDOM syscall each run (#5,#6,#10,#11,#16,#23,#27,#31...)
+///                 and random sizes (5,482 / 7,632 / 10,123 / 15,546 bytes)
+///   synchronous    4 runs, diagnostic present 4 times, every run reaching
+///                 syscall #32 and producing an IDENTICAL 16,171-byte log
+/// The randomness was the tell: a deterministic guest under a deterministic
+/// engine cannot genuinely die at a different syscall each time.
+///
+/// COST, measured rather than assumed, on a 477 KB verify log:
+/// synchronous 1.77s versus non-blocking 1.73s -- inside noise, identical
+/// output size. The queue was buying nothing and losing the diagnostic.
+fn sync_file_subscriber<W: Write + Send + 'static>(
+    level: LevelFilter,
+    f: W,
+) -> (impl Subscriber, impl Drop) {
+    let filter = EnvFilter::from_default_env()
+        .add_directive("tokio=debug".parse().expect("correct directive"))
+        .add_directive(level.into());
+
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::sync::Mutex::new(f))
+        .with_ansi(false)
+        .finish();
+
+    /// No drain to wait for: every write already reached the file.
+    struct Flushed;
+    impl Drop for Flushed {
+        fn drop(&mut self) {}
+    }
+
+    (subscriber, Flushed)
+}
+
+/// Initializes SYNCHRONOUS tracing to `f`, for logs whose tail must survive a
+/// crash. See [`sync_file_subscriber`].
+pub fn init_sync_file_tracing<W: Write + Send + 'static>(
+    level: Option<LevelFilter>,
+    f: W,
+) -> impl Drop {
+    let level = level.unwrap_or(DEFAULT_TRACE_LEVEL);
+    let (subscriber, guard) = sync_file_subscriber(level, f);
+    subscriber
+        .try_init()
+        .expect("global tracing subscriber to install");
+    guard
+}
+
 /// Initializes tracing to the given file `f`.
 ///
 /// NOTE: Writes to `f` are unbuffered, so this may be slow.
