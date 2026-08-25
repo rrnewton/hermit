@@ -1,0 +1,438 @@
+diff --git a/ci/manifest-plan/src/runner.rs b/ci/manifest-plan/src/runner.rs
+index 5a8bec2b83..4944a916c9 100644
+--- a/ci/manifest-plan/src/runner.rs
++++ b/ci/manifest-plan/src/runner.rs
+@@ -1238,11 +1238,9 @@ pub fn build_spec(
+                 "--backend".into(),
+                 backend.into(),
+             ];
+-            if required {
+-                argv.insert(4, "--base-env=minimal".into());
+-            }
+             argv.extend(cell.test.modes["custom"].args.clone());
+             if required {
++                require_minimal_base_env(&mut argv)?;
+                 append_lockdown_args(&mut argv, &prepared.mounts);
+             } else if context.isolated_workdir.is_some() {
+                 require_minimal_base_env(&mut argv)?;
+@@ -2481,6 +2479,15 @@ mod tests {
+         }
+     }
+ 
++    fn prepared(argv: &[&str]) -> PreparedTest {
++        let argv = argv.iter().map(|value| (*value).to_string()).collect::<Vec<_>>();
++        PreparedTest {
++            host_argv: argv.clone(),
++            guest_argv: argv,
++            mounts: Vec::new(),
++        }
++    }
++
+     #[test]
+     fn required_and_enabled_are_distinct_populations() {
+         let test = recipe(false);
+@@ -2705,7 +2712,7 @@ backends_disabled:
+ 
+     #[test]
+     fn run_workdir_precedes_the_guest_separator() {
+-        let mut test = recipe(true);
++        let mut test = recipe(false);
+         test.modes.get_mut("verify").unwrap().workdir = Some("/tmp".into());
+         let cell = SelectedCell {
+             category: "fixture".into(),
+@@ -2736,7 +2743,7 @@ backends_disabled:
+             &context,
+             &cell,
+             PathBuf::from("/repo/results/cell"),
+-            vec!["/bin/true".into()],
++            &prepared(&["/bin/true"]),
+             "1",
+             None,
+         )
+@@ -2782,7 +2789,7 @@ backends_disabled:
+             &context,
+             &cell,
+             PathBuf::from("/repo/results/cell"),
+-            vec!["/bin/true".into()],
++            &prepared(&["/bin/true"]),
+             "1",
+             None,
+         )
+@@ -2795,8 +2802,8 @@ backends_disabled:
+             .unwrap();
+         let workdir = spec
+             .argv
+-            .windows(2)
+-            .position(|args| args == ["--workdir", "/test"])
++            .iter()
++            .position(|arg| arg == "--workdir=/test")
+             .unwrap();
+         assert!(mount < separator && workdir < separator);
+         for name in ["PWD", "OLDPWD"] {
+@@ -2807,22 +2814,7 @@ backends_disabled:
+                     .any(|arg| arg.starts_with(&format!("{name}=")))
+             );
+         }
+-        for value in [
+-            "LC_ALL=C",
+-            "TZ=UTC",
+-            "HOME=/repo/results/cell/home",
+-            "XDG_CONFIG_HOME=/repo/results/cell/xdg-config",
+-            "E2E_TMPDIR=/test",
+-        ] {
+-            assert!(spec.argv.iter().any(|arg| arg == value));
+-        }
+-        for name in ["E2E_FIXTURE_DIR", SCHEDULED_JOBS_ENV] {
+-            assert!(
+-                spec.argv
+-                    .iter()
+-                    .any(|arg| arg.starts_with(&format!("{name}=")))
+-            );
+-        }
++        assert!(!spec.argv.iter().any(|arg| arg == "--env"));
+ 
+         let mut replay_test = recipe(true);
+         let replay_mode = replay_test.modes.remove("verify").unwrap();
+@@ -2841,18 +2833,14 @@ backends_disabled:
+             &context,
+             &replay_cell,
+             PathBuf::from("/repo/results/replay"),
+-            vec!["/bin/true".into()],
++            &prepared(&["/bin/true"]),
+             "1",
+             None,
+         )
+         .unwrap();
+         assert!(replay.argv.iter().any(|arg| arg == "--base-env=minimal"));
+-        assert!(
+-            replay
+-                .argv
+-                .iter()
+-                .any(|arg| arg == "--mount=type=tmpfs,target=/test")
+-        );
++        assert!(replay.argv.iter().any(|arg| arg == "--workdir=/test"));
++        assert!(!replay.argv.iter().any(|arg| arg == "--env"));
+ 
+         let mut custom_test = recipe(true);
+         let mut custom_mode = custom_test.modes.remove("verify").unwrap();
+@@ -2872,7 +2860,7 @@ backends_disabled:
+             &context,
+             &custom_cell,
+             PathBuf::from("/repo/results/custom"),
+-            vec!["/bin/true".into()],
++            &prepared(&["/bin/true"]),
+             "1",
+             None,
+         )
+@@ -2889,15 +2877,7 @@ backends_disabled:
+                 .iter()
+                 .any(|arg| arg == "--mount=type=tmpfs,target=/test")
+         );
+-        for value in [
+-            "LC_ALL=C",
+-            "TZ=UTC",
+-            "HOME=/repo/results/custom/home",
+-            "XDG_CONFIG_HOME=/repo/results/custom/xdg-config",
+-            "E2E_TMPDIR=/test",
+-        ] {
+-            assert!(custom.argv.iter().any(|arg| arg == value));
+-        }
++        assert!(!custom.argv.iter().any(|arg| arg == "--env"));
+         let mut naked_test = recipe(true);
+         let naked_mode = naked_test.modes.remove("verify").unwrap();
+         naked_test.modes.insert("naked".into(), naked_mode);
+@@ -2915,7 +2895,7 @@ backends_disabled:
+             &context,
+             &naked_cell,
+             PathBuf::from("/repo/results/naked"),
+-            vec!["/bin/true".into()],
++            &prepared(&["/bin/true"]),
+             "1",
+             None,
+         )
+@@ -2993,7 +2973,7 @@ backends_disabled:
+             &context,
+             &cell,
+             PathBuf::from("/repo/results/cell"),
+-            vec!["/bin/true".into()],
++            &prepared(&["/bin/true"]),
+             "1",
+             None,
+         )
+@@ -3212,6 +3192,8 @@ backends_disabled:
+             keep_logs: false,
+             run_verify_strict: false,
+             record_verify_strict: false,
++            scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
++            isolated_workdir: None,
+         };
+         let prepared = PreparedTest {
+             host_argv: vec!["/host/program".into()],
+@@ -3267,6 +3249,8 @@ backends_disabled:
+             keep_logs: false,
+             run_verify_strict: false,
+             record_verify_strict: false,
++            scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
++            isolated_workdir: None,
+         };
+         let prepared = PreparedTest {
+             host_argv: vec!["/host/program".into()],
+@@ -3283,7 +3267,9 @@ backends_disabled:
+         )
+         .unwrap();
+         assert!(!spec.argv.iter().any(|arg| arg == "--base-env=minimal"));
+-        assert!(!spec.argv.iter().any(|arg| arg == "--env"));
++        assert!(spec.argv.windows(2).any(|window| {
++            window[0] == "--env" && window[1].starts_with(SCHEDULED_JOBS_ENV)
++        }));
+         assert!(!spec.argv.iter().any(|arg| arg == "--workdir=/test"));
+         assert_eq!(spec.guest_argv, vec!["/host/program"]);
+     }
+@@ -3867,6 +3853,8 @@ backends_disabled:
+             keep_logs: false,
+             run_verify_strict: false,
+             record_verify_strict: false,
++            scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
++            isolated_workdir: None,
+         };
+ 
+         let prepared = prepare_test(&context, &cell, &cell_dir).unwrap();
+diff --git a/ci/run-with-hermit-e2e-artifact.sh b/ci/run-with-hermit-e2e-artifact.sh
+index 1eaa456148..fda173fed4 100755
+--- a/ci/run-with-hermit-e2e-artifact.sh
++++ b/ci/run-with-hermit-e2e-artifact.sh
+@@ -79,7 +79,6 @@ printf 'hermit-e2e-artifact: verified bin=%s install=%s\n' \
+     "$HERMIT_BIN" "${HERMIT_INSTALL_DIR:-none}" >&2
+ 
+ if ((private_test_root)); then
+-    unset "$private_test_root_helper_var" "$private_test_root_helper_sha_var"
+     exec "$private_test_root_helper" -- "$@"
+ fi
+ exec "$@"
+diff --git a/hermit-cli/src/bin/hermit/record_start.rs b/hermit-cli/src/bin/hermit/record_start.rs
+index 472db90ba5..eab0942f64 100644
+--- a/hermit-cli/src/bin/hermit/record_start.rs
++++ b/hermit-cli/src/bin/hermit/record_start.rs
+@@ -316,10 +316,11 @@ impl StartOpts {
+     }
+ 
+     fn validate_filesystem_options(&self) -> Result<(), Error> {
+-        if let Some(workdir) = &self.workdir
+-            && !workdir.is_absolute()
+-        {
+-            anyhow::bail!("--workdir must be absolute: {}", workdir.display());
++        if let Some(workdir) = &self.workdir {
++            let workdir = Path::new(workdir);
++            if !workdir.is_absolute() {
++                anyhow::bail!("--workdir must be absolute: {}", workdir.display());
++            }
+         }
+         Ok(())
+     }
+@@ -762,7 +763,7 @@ mod tests {
+     fn record_minimal_environment_omits_pwd_and_records_absolute_workdir() {
+         let mut options = start_options(Vec::new());
+         options.base_env = BaseEnv::Minimal;
+-        options.workdir = Some(PathBuf::from("/test"));
++        options.workdir = Some("/test".into());
+         options.validate_filesystem_options().unwrap();
+         let command = options.guest_command().unwrap();
+         let environment = command.get_captured_envs();
+@@ -787,7 +788,7 @@ mod tests {
+     #[test]
+     fn record_rejects_relative_workdir() {
+         let mut options = start_options(Vec::new());
+-        options.workdir = Some(PathBuf::from("test"));
++        options.workdir = Some("test".into());
+         let error = options.validate_filesystem_options().unwrap_err();
+         assert!(error.to_string().contains("--workdir must be absolute"));
+     }
+diff --git a/hermit-cli/src/bin/hermit/run.rs b/hermit-cli/src/bin/hermit/run.rs
+index e850cf46af..4ea4c29779 100644
+--- a/hermit-cli/src/bin/hermit/run.rs
++++ b/hermit-cli/src/bin/hermit/run.rs
+@@ -514,24 +514,26 @@ pub(super) fn apply_base_environment(
+ }
+ 
+ fn parse_mount(src: &str) -> Result<Mount, String> {
+-    let parsed = Mount::from_str(src).map_err(|error| error.to_string())?;
+     let mount_type = src.split(',').rev().find_map(|item| {
+         let (key, value) = item.trim().split_once('=')?;
+         (key == "type").then_some(value)
+     });
++    if mount_type != Some("bind")
++        && src.split(',').any(|item| {
++            item.trim()
++                .split_once('=')
++                .is_some_and(|(key, _)| key == "bind-propagation")
++        })
++    {
++        return Err("bind-propagation is supported only for bind mounts".into());
++    }
++    let parsed = Mount::from_str(src).map_err(|error| error.to_string())?;
+     let Some(mount_type) = mount_type else {
+         return Ok(parsed);
+     };
+     if mount_type == "bind" {
+         return Ok(parsed);
+     }
+-    if src.split(',').any(|item| {
+-        item.trim()
+-            .split_once('=')
+-            .is_some_and(|(key, _)| key == "bind-propagation")
+-    }) {
+-        return Err("bind-propagation is supported only for bind mounts".into());
+-    }
+ 
+     // reverie-process's Docker-syntax parser applies the default bind
+     // propagation flags to every mount. For a source-less filesystem mount,
+@@ -1038,20 +1040,6 @@ fn backend_values_parse_and_round_trip() {
+     }
+ }
+ 
+-#[test]
+-fn dbt_refuses_filesystem_lockdown_it_cannot_apply() {
+-    let mut options = RunOpts::parse_from([
+-        "fakehermit",
+-        "--backend=dbt",
+-        "--mount=type=tmpfs,target=/test",
+-        "--workdir=/test",
+-        "/bin/true",
+-    ]);
+-    let error = options.validate_args_with_perf_support(true).unwrap_err();
+-    assert!(error.to_string().contains("dbt backend does not implement"));
+-    assert!(error.to_string().contains("refusing to ignore"));
+-}
+-
+ #[test]
+ fn guest_filesystem_paths_must_be_absolute() {
+     let relative_workdir = RunOpts::parse_from(["fakehermit", "--workdir=test", "/bin/true"]);
+@@ -1228,6 +1216,14 @@ fn dbt_rejects_mount_and_workdir_options_it_cannot_apply() {
+         .unwrap_err()
+         .to_string();
+     assert!(error.contains("dbt backend cannot apply --mount"));
++
++    let mut with_tmp =
++        RunOpts::parse_from(["fakehermit", "--backend", "dbt", "--tmp", "/test", "/bin/true"]);
++    let error = with_tmp
++        .validate_args_with_perf_support(true)
++        .unwrap_err()
++        .to_string();
++    assert!(error.contains("dbt backend cannot apply --mount"));
+ }
+ 
+ #[test]
+@@ -2505,17 +2501,6 @@ impl RunOpts {
+ 
+     fn validate_args_with_perf_support(&mut self, perf_supported: bool) -> Result<(), Error> {
+         let backend = self.selected_backend();
+-        if backend == Backend::Dbt
+-            && (self.workdir.is_some()
+-                || !self.mount.is_empty()
+-                || !self.bind.is_empty()
+-                || self.tmp.is_some())
+-        {
+-            anyhow::bail!(
+-                "the dbt backend does not implement guest filesystem isolation for --workdir, \
+-                 --mount, --bind, or --tmp; refusing to ignore the requested lockdown"
+-            );
+-        }
+         if self.skid_margin.is_some()
+             && (self.namespace_only
+                 || !matches!(
+@@ -2541,10 +2526,13 @@ impl RunOpts {
+             );
+         }
+         if backend == Backend::Dbt
+-            && (!self.mount.is_empty() || !self.bind.is_empty() || self.workdir.is_some())
++            && (!self.mount.is_empty()
++                || !self.bind.is_empty()
++                || self.workdir.is_some()
++                || self.tmp.is_some())
+         {
+             anyhow::bail!(
+-                "the dbt backend cannot apply --mount, --bind, or --workdir because its \
++                "the dbt backend cannot apply --mount, --bind, --workdir, or --tmp because its \
+                  DynamoRIO adapter does not enter the guest mount namespace"
+             );
+         }
+diff --git a/scripts/validate.rs b/scripts/validate.rs
+index ccd4620ceb..e5843c2f4b 100755
+--- a/scripts/validate.rs
++++ b/scripts/validate.rs
+@@ -49,7 +49,6 @@
+ //! serde_json = "1"
+ //! sha2 = "0.10"
+ //! libc = "0.2"
+-//! sha2 = "0.10"
+ //! ```
+ 
+ // `serde_json::json!` expands one recursive macro level PER FIELD, and the ledger
+@@ -2224,7 +2223,7 @@ cleared-caps refusal names {} starved step(s)",
+             return Err("private-/test bracket: stale unit authority was accepted".into());
+         }
+         if validate_service_unit_from_cgroup(
+-            "0::/user.slice/user-1000.slice/validate-private-root-test.service/safe-ci-1.scope\n",
++            "0::/user.slice/user-1000.slice/validate-private-root:test.service/safe-ci-1.scope\n",
+         )?
+             != authority.unit
+             || validate_service_unit_from_cgroup("0::/user.slice/session-1.scope\n").is_ok()
+@@ -2233,7 +2232,7 @@ cleared-caps refusal names {} starved step(s)",
+             )
+             .is_ok()
+             || validate_service_unit_from_cgroup(
+-                "0::/validate-private-root-test.service\n0::/duplicate\n",
++                "0::/validate-private-root:test.service\n0::/duplicate\n",
+             )
+             .is_ok()
+         {
+@@ -2538,12 +2537,7 @@ cleared-caps refusal names {} starved step(s)",
+             private_test_root_activation(&sequential_args, false, true),
+             Some(&helper),
+         )?;
+-        let sequential_manifest_runs = std::iter::once(&sequential.cfg)
+-            .chain(sequential.second.iter())
+-            .flat_map(|cfg| cfg.steps.iter())
+-            .filter(|step| validation_step_identity(step) == ValidationStepIdentity::ManifestRun)
+-            .count();
+-        if sequential_marked != sequential_manifest_runs
++        if sequential_marked != 0
+             || sequential.cfg.steps.iter().chain(
+                 sequential
+                     .second
+@@ -2551,18 +2545,14 @@ cleared-caps refusal names {} starved step(s)",
+                     .flat_map(|cfg| cfg.steps.iter()),
+             )
+             .any(|step| {
+-                let is_manifest_run =
+-                    validation_step_identity(step) == ValidationStepIdentity::ManifestRun;
+-                step.env.contains_key(PRIVATE_TEST_ROOT_ENV) != is_manifest_run
+-                    || step.env.contains_key(PRIVATE_TEST_ROOT_HELPER_ENV) != is_manifest_run
+-                    || step
+-                        .env
+-                        .contains_key(PRIVATE_TEST_ROOT_HELPER_SHA256_ENV)
+-                        != is_manifest_run
++                step.env.contains_key(PRIVATE_TEST_ROOT_ENV)
++                    || step.env.contains_key(PRIVATE_TEST_ROOT_HELPER_ENV)
++                    || step.env.contains_key(PRIVATE_TEST_ROOT_HELPER_SHA256_ENV)
+             })
+         {
+             return Err(
+-                "private-/test bracket: sequential full plan was not marked exactly".into(),
++                "private-/test bracket: noncanonical sequential full plan received credentials"
++                    .into(),
+             );
+         }
+         let nested_args = parse_argv(&[
+diff --git a/tests/manifest-cli.rs b/tests/manifest-cli.rs
+index 09710bc161..33528a915a 100755
+--- a/tests/manifest-cli.rs
++++ b/tests/manifest-cli.rs
+@@ -35,6 +35,7 @@
+ //! [dependencies]
+ //! serde = { version = "1", features = ["derive"] }
+ //! serde_yaml = "0.9"
++//! toml = "0.8"
+ //! ```
+ 
+ #[path = "../scripts/lib/rust_script_prelude.rs"]

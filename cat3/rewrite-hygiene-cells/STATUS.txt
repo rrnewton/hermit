@@ -1,0 +1,8 @@
+M  tests/e2e/data-handling/archive-roundtrip.sh
+M  tests/e2e/data-handling/dd-partial-transfers.sh
+M  tests/e2e/data-handling/shell-pipeline.sh
+M  tests/e2e/determinism-stress/process-chains.sh
+M  tests/e2e/determinism-stress/thread-contention.sh
+M  tests/e2e/language-runtimes/cpp-stl-determinism.sh
+M  tests/e2e/system-utils/auxv-loader-dump.sh
+M  tests/e2e/system-utils/ps-proc-table.sh

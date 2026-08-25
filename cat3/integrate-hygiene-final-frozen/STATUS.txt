@@ -1,0 +1,35 @@
+ M .github/workflows/ci-privileged.yml
+ M ci/compat-envelope/README.md
+ M ci/compat-envelope/pressure-test.rs
+MM ci/manifest-plan/src/main.rs
+MM ci/manifest-plan/src/runner.rs
+ M ci/run-dag.sh
+MM ci/run-with-hermit-e2e-artifact.sh
+ M docs/SABRE_COMPATIBILITY.md
+ M hermit-cli/src/bin/hermit/container.rs
+MM hermit-cli/src/bin/hermit/record_start.rs
+MM hermit-cli/src/bin/hermit/run.rs
+ M hermit-cli/src/replay.rs
+MM hermit-cli/tests/cli.rs
+ M scripts/lib/safe_ci_scope.rs
+MM scripts/manifest-to-commands.rs
+MM scripts/validate.rs
+M  tests/e2e/applications/kvm-shell-environment.sh
+M  tests/e2e/data-handling/archive-roundtrip.sh
+M  tests/e2e/data-handling/dd-partial-transfers.sh
+M  tests/e2e/data-handling/shell-pipeline.sh
+M  tests/e2e/determinism-stress/process-chains.sh
+M  tests/e2e/determinism-stress/thread-contention.sh
+M  tests/e2e/language-runtimes/cpp-stl-determinism.sh
+MM tests/e2e/manifests/README.md
+ M tests/e2e/manifests/applications.yaml
+M  tests/e2e/manifests/c-programs.yaml
+M  tests/e2e/manifests/determinism-stress.yaml
+M  tests/e2e/manifests/language-runtimes.yaml
+MM tests/e2e/manifests/system-utils.yaml
+M  tests/e2e/system-utils/auxv-loader-dump.sh
+ M tests/e2e/system-utils/harness-width-contract.sh
+M  tests/e2e/system-utils/procfs-sanitized-paths.sh
+M  tests/e2e/system-utils/ps-proc-table.sh
+MM tests/manifest-cli.rs
+?? ci/run-with-ephemeral-test-root.sh

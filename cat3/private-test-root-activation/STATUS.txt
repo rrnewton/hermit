@@ -1,0 +1,4 @@
+A  ci/private-test-root-test.sh
+M  ci/run-with-hermit-e2e-artifact.sh
+A  ci/run-with-private-test-root.sh
+M  scripts/validate.rs

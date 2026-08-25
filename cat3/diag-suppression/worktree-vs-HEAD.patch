@@ -1,0 +1,7 @@
+diff --git a/agent-utils b/agent-utils
+index 8b0e2c0f25..9bb6b66539 160000
+--- a/agent-utils
++++ b/agent-utils
+@@ -1 +1 @@
+-Subproject commit 8b0e2c0f2555d0e0f57b69d800bf148ab577ba12
++Subproject commit 9bb6b665390a0b3c87c082aa093e7ef0930294e3

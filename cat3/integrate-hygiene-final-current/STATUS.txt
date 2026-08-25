@@ -1,0 +1,24 @@
+M  ci/manifest-plan/src/main.rs
+MM ci/manifest-plan/src/runner.rs
+M  ci/run-with-hermit-e2e-artifact.sh
+M  hermit-cli/src/bin/hermit/record_start.rs
+M  hermit-cli/src/bin/hermit/run.rs
+M  hermit-cli/tests/cli.rs
+M  scripts/manifest-to-commands.rs
+MM scripts/validate.rs
+M  tests/e2e/applications/kvm-shell-environment.sh
+M  tests/e2e/data-handling/archive-roundtrip.sh
+M  tests/e2e/data-handling/dd-partial-transfers.sh
+M  tests/e2e/data-handling/shell-pipeline.sh
+M  tests/e2e/determinism-stress/process-chains.sh
+M  tests/e2e/determinism-stress/thread-contention.sh
+M  tests/e2e/language-runtimes/cpp-stl-determinism.sh
+M  tests/e2e/manifests/README.md
+M  tests/e2e/manifests/c-programs.yaml
+M  tests/e2e/manifests/determinism-stress.yaml
+M  tests/e2e/manifests/language-runtimes.yaml
+MM tests/e2e/manifests/system-utils.yaml
+M  tests/e2e/system-utils/auxv-loader-dump.sh
+ M tests/e2e/system-utils/procfs-sanitized-paths.sh
+M  tests/e2e/system-utils/ps-proc-table.sh
+M  tests/manifest-cli.rs

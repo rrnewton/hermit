@@ -1,0 +1,8 @@
+M  tests/e2e/applications/git-repository-workflow.sh
+M  tests/e2e/applications/kvm-python-examples.sh
+M  tests/e2e/determinism-stress/thread-output.sh
+M  tests/e2e/language-runtimes/python-random.sh
+M  tests/e2e/system-utils/date-nanoseconds.sh
+A  tests/e2e/system-utils/du-tree-summary.sh
+A  tests/e2e/system-utils/find-tree-metadata.sh
+M  tests/e2e/system-utils/random-device.sh

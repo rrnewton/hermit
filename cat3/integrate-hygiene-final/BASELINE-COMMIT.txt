@@ -1,0 +1,4 @@
+fbeec08c3c9894f8d7fdee56a37dc91cc128eefe
+2026-08-25 05:15:33 -0400
+Ryan Newton
+[hermit2, hermit-018, unresolved, devbig014, role=impl] Distinguish unavailable backends from silent runs

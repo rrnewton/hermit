@@ -1,0 +1,4 @@
+8cfb8976899bdb5b7046d0d85e78876bdcacc1ae
+2026-08-25 02:41:26 -0700
+Ryan Newton
+[hermit2, degraded-hermit-004, unresolved, devbig014, role=impl] Stop the pin checker claiming uniformity over a dependency that is not pinned

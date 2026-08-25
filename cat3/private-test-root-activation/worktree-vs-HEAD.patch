@@ -1,0 +1,616 @@
+diff --git a/ci/private-test-root-test.sh b/ci/private-test-root-test.sh
+new file mode 100755
+index 0000000000..98945d5fec
+--- /dev/null
++++ b/ci/private-test-root-test.sh
+@@ -0,0 +1,153 @@
++#!/usr/bin/env bash
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++# All rights reserved.
++#
++# This source code is licensed under the BSD-style license found in the
++# LICENSE file in the root directory of this source tree.
++
++# Focused live bracket for the mount-namespace helper and its canonical wrapper
++# routing. It requires passwordless sudo and a built Hermit binary, but runs no
++# manifest matrix and publishes no validation evidence.
++
++set -euo pipefail
++
++ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
++readonly ROOT_DIR
++readonly HELPER=$ROOT_DIR/ci/run-with-private-test-root.sh
++readonly WRAPPER=$ROOT_DIR/ci/run-with-hermit-e2e-artifact.sh
++readonly MARKER=HERMIT_VALIDATE_PRIVATE_TEST_ROOT
++readonly MARKER_VALUE=canonical-full-manifest-v1
++readonly HERMIT_UNDER_TEST=${HERMIT_BIN_UNDER_TEST:-$ROOT_DIR/target/debug/hermit}
++readonly REGRESSION_ROOT=${PRIVATE_TEST_ROOT_REGRESSION_ROOT:-$ROOT_DIR}
++
++fail() {
++    printf 'private-test-root-test.sh: %s\n' "$*" >&2
++    exit 1
++}
++
++[[ ! -e /test ]] || fail "precondition failed: host /test already exists"
++[[ -x $HERMIT_UNDER_TEST ]] ||
++    fail "Hermit is not built: $HERMIT_UNDER_TEST (set HERMIT_BIN_UNDER_TEST to an executable)"
++
++scratch=$(mktemp -d /tmp/hermit-private-test-root-test.XXXXXX)
++readonly scratch
++cleanup() {
++    status=$?
++    if [[ -e /test ]]; then
++        printf 'private-test-root-test.sh: host /test leaked from the private namespace\n' >&2
++        status=1
++    fi
++    rm -rf -- "$scratch"
++    exit "$status"
++}
++trap cleanup EXIT
++trap 'exit 129' HUP
++trap 'exit 130' INT
++trap 'exit 143' TERM
++
++set +e
++refusal=$(env -u "$MARKER" "$HELPER" -- /bin/true 2>&1)
++refusal_status=$?
++set -e
++[[ $refusal_status == 2 && $refusal == *'refusing outside an admitted top-level full-profile manifest step'* ]] ||
++    fail "helper did not refuse a command without the canonical marker (status=$refusal_status output=$refusal)"
++
++set +e
++wrong_command=$(env "$MARKER=$MARKER_VALUE" "$WRAPPER" /bin/true 2>&1)
++wrong_command_status=$?
++set -e
++[[ $wrong_command_status == 2 && $wrong_command == *'restricted to the final test-harness run'* ]] ||
++    fail "wrapper routed a marked non-harness command (status=$wrong_command_status output=$wrong_command)"
++
++mkdir -p "$scratch/target/debug" "$scratch/artifacts"
++cat >"$scratch/target/debug/test-harness" <<'EOF'
++#!/usr/bin/env bash
++set -euo pipefail
++[[ ${1:-} == run ]] || exit 71
++expect=${2:-}
++[[ -z ${HERMIT_VALIDATE_PRIVATE_TEST_ROOT+x} ]] || exit 72
++[[ -x ${HERMIT_BIN:?} ]] || exit 73
++[[ $PWD == "${EXPECTED_CWD:?}" ]] || exit 74
++[[ $(id -u) == "${EXPECTED_UID:?}" && $(id -g) == "${EXPECTED_GID:?}" ]] || exit 75
++[[ $(readlink /proc/self/ns/pid) == "${EXPECTED_PID_NS:?}" ]] || exit 76
++[[ $(readlink /proc/self/ns/cgroup) == "${EXPECTED_CGROUP_NS:?}" ]] || exit 77
++[[ -c /dev/null && -r /proc/self/status && -d /sys/fs/cgroup ]] || exit 78
++case "$expect" in
++    expect-host)
++        [[ ! -e /test ]] || exit 79
++        printf 'host-path\n'
++        ;;
++    expect-private)
++        [[ -d /test && $(stat -c %a /test) == 1777 ]] || exit 80
++        [[ -z $(find /test -mindepth 1 -print -quit) ]] || exit 81
++        [[ $(readlink /proc/self/ns/mnt) != "${EXPECTED_MOUNT_NS:?}" ]] || exit 82
++        read -r test_target test_fstype < <(findmnt -rn -T /test -o TARGET,FSTYPE)
++        [[ $test_target == /test && $test_fstype == tmpfs ]] || exit 84
++        printf 'private-path\n'
++        ;;
++    *) exit 83 ;;
++esac
++EOF
++chmod +x "$scratch/target/debug/test-harness"
++
++fake_hermit=$scratch/fake-hermit
++printf '#!/usr/bin/env sh\nexit 0\n' >"$fake_hermit"
++chmod +x "$fake_hermit"
++binary_hash=$(sha256sum "$fake_hermit" | cut -d' ' -f1)
++identity=$(printf '%s\n%s\n%s\n' binary-only "$binary_hash" none | sha256sum | cut -d' ' -f1)
++bundle=$scratch/artifacts/$identity
++mkdir "$bundle"
++cp "$fake_hermit" "$bundle/hermit"
++printf '%s\n' binary-only >"$bundle/kind"
++printf '%s\n' "$binary_hash" >"$bundle/hermit.sha256"
++printf '%s\n' "$bundle" >"$scratch/artifact.path"
++
++export EXPECTED_CWD=$scratch
++EXPECTED_UID=$(id -u)
++export EXPECTED_UID
++EXPECTED_GID=$(id -g)
++export EXPECTED_GID
++EXPECTED_PID_NS=$(readlink /proc/self/ns/pid)
++export EXPECTED_PID_NS
++EXPECTED_CGROUP_NS=$(readlink /proc/self/ns/cgroup)
++export EXPECTED_CGROUP_NS
++EXPECTED_MOUNT_NS=$(readlink /proc/self/ns/mnt)
++export EXPECTED_MOUNT_NS
++export HERMIT_E2E_ARTIFACT_POINTER=$scratch/artifact.path
++
++host_route=$(cd "$scratch" && env -u "$MARKER" "$WRAPPER" target/debug/test-harness run expect-host)
++[[ $host_route == host-path ]] || fail "unmarked wrapper did not retain the host path"
++
++set +e
++invalid_marker=$(
++    cd "$scratch" && env "$MARKER=not-canonical" \
++        "$WRAPPER" target/debug/test-harness run expect-private 2>&1
++)
++invalid_status=$?
++set -e
++[[ $invalid_status == 2 && $invalid_marker == *'invalid private-/test marker'* ]] ||
++    fail "wrapper accepted an invalid marker (status=$invalid_status output=$invalid_marker)"
++
++private_route=$(
++    cd "$scratch" && env "$MARKER=$MARKER_VALUE" \
++        "$WRAPPER" target/debug/test-harness run expect-private
++)
++[[ $private_route == private-path ]] || fail "marked wrapper did not enter the private root"
++
++pwd_output=$(env "$MARKER=$MARKER_VALUE" "$HELPER" -- \
++    "$HERMIT_UNDER_TEST" run --strict --base-env=minimal --workdir=/test -- /bin/pwd)
++[[ $pwd_output == /test ]] || fail "Hermit reported an unexpected guest cwd: $pwd_output"
++
++readonly regression=minimal_env_private_workdir_is_empty_for_both_verify_runs
++grep -Fq "fn $regression" "$REGRESSION_ROOT/hermit-cli/tests/cli.rs" ||
++    fail "the required Hermit regression is absent: $regression"
++regression_output=$(env "$MARKER=$MARKER_VALUE" "$HELPER" -- \
++    cargo test --manifest-path "$REGRESSION_ROOT/Cargo.toml" \
++        -p hermit --test cli "$regression" -- --exact --nocapture 2>&1)
++[[ $regression_output == *"test $regression ... ok"* && \
++   $regression_output == *'1 passed; 0 failed'* ]] ||
++    fail "the exact Hermit regression did not execute and pass: $regression_output"
++
++[[ ! -e /test ]] || fail "host /test exists after the private run"
++printf 'PRIVATE-TEST-ROOT refusal=PASS routing=PASS namespaces=PASS marker-leak=PASS hermit-pwd=%s regression=%s\n' \
++    "$pwd_output" "$regression"
+diff --git a/ci/run-with-hermit-e2e-artifact.sh b/ci/run-with-hermit-e2e-artifact.sh
+index 2531f55644..9e65549bd9 100755
+--- a/ci/run-with-hermit-e2e-artifact.sh
++++ b/ci/run-with-hermit-e2e-artifact.sh
+@@ -9,12 +9,27 @@
+ set -euo pipefail
+ 
+ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
++readonly private_test_root_marker=HERMIT_VALIDATE_PRIVATE_TEST_ROOT
++readonly private_test_root_value=canonical-full-manifest-v1
++private_test_root=0
+ require_install=0
+ if [[ ${1:-} == --require-install ]]; then
+     require_install=1
+     shift
+ fi
+ [[ $# -gt 0 ]] || { echo "usage: $0 [--require-install] COMMAND..." >&2; exit 2; }
++if [[ -n ${!private_test_root_marker+x} ]]; then
++    [[ ${!private_test_root_marker} == "$private_test_root_value" ]] || {
++        echo "run-with-hermit-e2e-artifact.sh: invalid private-/test marker" >&2
++        exit 2
++    }
++    [[ ${1:-} == target/debug/test-harness && ${2:-} == run ]] || {
++        echo "run-with-hermit-e2e-artifact.sh: private /test is restricted to the final test-harness run" >&2
++        exit 2
++    }
++    private_test_root=1
++    unset "$private_test_root_marker"
++fi
+ pointer=${HERMIT_E2E_ARTIFACT_POINTER:-$ROOT_DIR/target/ci/hermit-e2e-artifact.path}
+ bundle=$("$ROOT_DIR/ci/verify-hermit-e2e-artifact.sh" "$pointer")
+ export HERMIT_BIN="$bundle/hermit"
+@@ -28,4 +43,9 @@ else
+ fi
+ printf 'hermit-e2e-artifact: verified bin=%s install=%s\n' \
+     "$HERMIT_BIN" "${HERMIT_INSTALL_DIR:-none}" >&2
++
++if ((private_test_root)); then
++    exec env "$private_test_root_marker=$private_test_root_value" \
++        "$ROOT_DIR/ci/run-with-private-test-root.sh" -- "$@"
++fi
+ exec "$@"
+diff --git a/ci/run-with-private-test-root.sh b/ci/run-with-private-test-root.sh
+new file mode 100755
+index 0000000000..46e7acb279
+--- /dev/null
++++ b/ci/run-with-private-test-root.sh
+@@ -0,0 +1,154 @@
++#!/usr/bin/env bash
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++# All rights reserved.
++#
++# This source code is licensed under the BSD-style license found in the
++# LICENSE file in the root directory of this source tree.
++
++# Run one canonical E2E manifest consumer in a private mount namespace whose
++# `/test` starts empty. The host's PID and cgroup namespaces stay unchanged:
++# Hermit's PMU/cgroup access and dagrun's accounting therefore continue to see
++# the same processes. Only the mount namespace is private.
++
++set -euo pipefail
++
++readonly MARKER=HERMIT_VALIDATE_PRIVATE_TEST_ROOT
++readonly MARKER_VALUE=canonical-full-manifest-v1
++
++fail() {
++    printf 'run-with-private-test-root.sh: %s\n' "$*" >&2
++    exit 2
++}
++
++[[ ${!MARKER:-} == "$MARKER_VALUE" ]] ||
++    fail "refusing outside an admitted top-level full-profile manifest step"
++
++if [[ ${1:-} != --inside ]]; then
++    unset "$MARKER"
++    [[ ${1:-} == -- ]] || fail "usage: $0 -- COMMAND..."
++    shift
++    (($# > 0)) || fail "a command is required after --"
++    ((EUID != 0)) || fail "the outer launcher must run as the invoking non-root user"
++
++    for tool in sudo unshare; do
++        command -v "$tool" >/dev/null 2>&1 || fail "required command is unavailable: $tool"
++    done
++    sudo -n true >/dev/null 2>&1 || fail "passwordless sudo is required"
++
++    invoking_uid=$(id -u)
++    readonly invoking_uid
++    invoking_gid=$(id -g)
++    readonly invoking_gid
++    invoking_user=$(id -un)
++    readonly invoking_user
++    readonly invoking_cwd=$PWD
++    readonly invoking_path=$PATH
++    self=$(readlink -f -- "$0")
++    readonly self
++    private_root=$(mktemp -d /tmp/hermit-private-test-root.XXXXXX) ||
++        fail "cannot allocate the private root mountpoint"
++    readonly private_root
++    # shellcheck disable=SC2317 # Called by the EXIT/signal trap below.
++    cleanup() {
++        # The mount lives only in the child's namespace. Its teardown leaves an
++        # empty host directory, so rmdir is both sufficient and fail-safe: this
++        # cleanup can never recursively remove an attacker-chosen path.
++        rmdir -- "$private_root" 2>/dev/null || true
++    }
++    trap cleanup EXIT
++    trap 'exit 129' HUP
++    trap 'exit 130' INT
++    trap 'exit 143' TERM
++
++    status=0
++    env "$MARKER=$MARKER_VALUE" sudo -n --preserve-env -- \
++        unshare --mount --propagation private -- \
++        "$self" --inside "$invoking_uid" "$invoking_gid" "$invoking_user" \
++        "$invoking_cwd" "$invoking_path" "$private_root" -- "$@" || status=$?
++    exit "$status"
++fi
++
++shift
++[[ $# -ge 7 ]] || fail "malformed internal invocation"
++readonly invoking_uid=$1
++readonly invoking_gid=$2
++readonly invoking_user=$3
++readonly invoking_cwd=$4
++readonly invoking_path=$5
++readonly private_root=$6
++shift 6
++[[ ${1:-} == -- ]] || fail "malformed internal command delimiter"
++shift
++(($# > 0)) || fail "missing internal command"
++
++# `sudo` owns the root setup process, so never resolve privileged utilities
++# through an invoking-user PATH. The original path is restored only after all
++# mount work is complete and setpriv is about to drop privileges.
++PATH=/usr/sbin:/usr/bin:/sbin:/bin
++export PATH
++
++((EUID == 0)) || fail "internal mount setup requires root"
++[[ $invoking_uid =~ ^[0-9]+$ && $invoking_gid =~ ^[0-9]+$ ]] ||
++    fail "invoking uid/gid must be numeric"
++[[ $invoking_user != */* && -n $invoking_user ]] || fail "invalid invoking user"
++[[ $invoking_cwd == /* && -d $invoking_cwd ]] ||
++    fail "invoking cwd is not an existing absolute directory: $invoking_cwd"
++[[ $private_root == /tmp/hermit-private-test-root.* && -d $private_root && ! -L $private_root ]] ||
++    fail "unsafe private-root mountpoint: $private_root"
++[[ $(readlink -f -- "$private_root") == "$private_root" ]] ||
++    fail "private-root mountpoint is not canonical: $private_root"
++[[ $(stat -c %u:%a -- "$private_root") == "$invoking_uid:700" ]] ||
++    fail "private-root mountpoint ownership or mode changed before setup"
++
++for tool in mount umount pivot_root setpriv; do
++    command -v "$tool" >/dev/null 2>&1 || fail "required util-linux command is unavailable: $tool"
++done
++
++# Nothing may propagate back into the host namespace. The root is a tiny tmpfs
++# carrying mountpoints and symlinks; every host top-level entry except `/test`
++# is then made visible at the same absolute path. Recursive binds preserve host
++# submounts such as this box's separately mounted `/home/newton`, plus devpts and
++# cgroup2. `/tmp` alone is a plain bind because the temporary new root is itself
++# a submount beneath `/tmp`; recursively cloning that mount would nest the root
++# inside its own `/tmp` view.
++mount --make-rprivate /
++mount -t tmpfs -o mode=0755,nosuid,nodev,size=16M private-test-root "$private_root"
++shopt -s nullglob
++for source in /* /.[!.]* /..?*; do
++    [[ $source == /test ]] && continue
++    target=$private_root$source
++    if [[ -L $source ]]; then
++        ln -s -- "$(readlink -- "$source")" "$target"
++    elif [[ -d $source ]]; then
++        mkdir -p -- "$target"
++        case "$source" in
++            /tmp) mount --bind "$source" "$target" ;;
++            *)
++                mount --rbind "$source" "$target"
++                mount --make-rslave "$target"
++                ;;
++        esac
++    elif [[ -f $source ]]; then
++        : >"$target"
++        mount --bind "$source" "$target"
++    fi
++done
++mkdir -- "$private_root/test"
++mount -t tmpfs -o mode=1777,nosuid,nodev private-test-workdir "$private_root/test"
++mkdir -- "$private_root/.old-root"
++
++cd -- "$private_root"
++pivot_root . .old-root
++cd /
++umount -l /.old-root
++rmdir /.old-root
++cd -- "$invoking_cwd"
++
++# The marker is an admission instruction for this wrapper, never guest or test
++# state. Drop it before the final command, then restore the invoking identity and
++# supplementary groups. No PID or cgroup namespace was created above.
++unset "$MARKER"
++export PATH=$invoking_path
++export USER=$invoking_user
++export LOGNAME=$invoking_user
++exec setpriv --reuid "$invoking_uid" --regid "$invoking_gid" --init-groups -- "$@"
+diff --git a/scripts/validate.rs b/scripts/validate.rs
+index 16b9317488..adbaacfc74 100755
+--- a/scripts/validate.rs
++++ b/scripts/validate.rs
+@@ -145,6 +145,8 @@ const PARENT_ENV: &str = "DEV_HERMIT_PARENT";
+ const OWN_SCOPE_DEADLINE_ENV: &str = "HERMIT_VALIDATE_SCOPE_DEADLINE_MONOTONIC_NS";
+ const NESTED_SCOPE_SELF_TEST_ENV: &str = "HERMIT_VALIDATE_NESTED_SCOPE_SELF_TEST";
+ const SUMMARY_EPILOGUE_SELF_TEST_ENV: &str = "HERMIT_VALIDATE_SUMMARY_EPILOGUE_SELF_TEST";
++const PRIVATE_TEST_ROOT_ENV: &str = "HERMIT_VALIDATE_PRIVATE_TEST_ROOT";
++const PRIVATE_TEST_ROOT_VALUE: &str = "canonical-full-manifest-v1";
+ const NESTED_SCOPE_OUTER: &str = "outer";
+ const NESTED_SCOPE_INNER: &str = "inner";
+ const NESTED_SCOPE_SIGNAL: &str = "signal";
+@@ -611,6 +613,29 @@ fn force_full_policy_allows(force_full: bool, level: Level, focused: Option<&str
+     !force_full || (level == Level::Full && focused.is_none())
+ }
+ 
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++enum PrivateTestRootActivation {
++    Disabled,
++    CanonicalFull,
++}
++
++/// The private `/test` root is intentionally narrower than "an E2E command".
++/// It is canonical validation policy, so it applies only to an admitted,
++/// top-level, complete full profile. Focused and nested invocations remain
++/// diagnostic payloads and must not acquire canonical behavior by inheriting an
++/// environment variable.
++fn private_test_root_activation(
++    args: &Args,
++    nested: bool,
++    lock_admitted: bool,
++) -> PrivateTestRootActivation {
++    if lock_admitted && !nested && args.level == Level::Full && args.focused.is_none() {
++        PrivateTestRootActivation::CanonicalFull
++    } else {
++        PrivateTestRootActivation::Disabled
++    }
++}
++
+ /// The environment marker only routes an invocation that already parsed the
+ /// explicit `--self-test` flag. An inherited or operator-supplied marker must
+ /// never turn an ordinary validation into a small passing probe.
+@@ -899,6 +924,9 @@ fn strict_flag_missing_from(argv: &[String]) -> bool {
+ /// on every invocation (validate.sh:308); here they are a `--self-test` subcommand
+ /// so the cost is not paid on the hot path.
+ fn self_test() -> Result<(), String> {
++    if std::env::var_os(PRIVATE_TEST_ROOT_ENV).is_some() {
++        return Err("private-/test marker leaked from the invoking environment".into());
++    }
+     // Strict-execution bracket for the legacy below-L2 compatibility modes.
+     // `--strict` must be a Hermit option before the first guest `--`; these
+     // modes still use lossy `--verify`, so this does not call them L2. The
+@@ -1400,10 +1428,73 @@ cleared-caps refusal names {} starved step(s)",
+         let tmp = std::env::temp_dir().join(format!("validate-plan-selftest-{}", std::process::id()));
+         let full_args = parse_argv(&["full".into(), "--no-label-pr".into()])
+             .map_err(|rc| format!("full-plan bracket: parser refused positive form rc={rc}"))?;
+-        let full = build_plan(&root, &full_args, &tmp)?;
++        let mut full = build_plan(&root, &full_args, &tmp)?;
+         if full.second.is_some() {
+             return Err("full-plan bracket: default full plan is still sequential".into());
+         }
++        if private_test_root_activation(&full_args, false, true)
++            != PrivateTestRootActivation::CanonicalFull
++            || private_test_root_activation(&full_args, false, false)
++                != PrivateTestRootActivation::Disabled
++            || private_test_root_activation(&full_args, true, true)
++                != PrivateTestRootActivation::Disabled
++        {
++            return Err(
++                "private-/test bracket: admission/top-level policy is not exact".into(),
++            );
++        }
++        let portable_args = parse_argv(&["portable-only".into(), "--no-label-pr".into()])
++            .map_err(|rc| format!("private-/test bracket: portable parser refused rc={rc}"))?;
++        if private_test_root_activation(&portable_args, false, true)
++            != PrivateTestRootActivation::Disabled
++        {
++            return Err("private-/test bracket: portable-only was admitted".into());
++        }
++        let marked = configure_private_test_root(
++            &mut full,
++            PrivateTestRootActivation::CanonicalFull,
++        )?;
++        let mut manifest_runs = 0;
++        for step in full.cfg.steps.iter().chain(
++            full.second
++                .iter()
++                .flat_map(|cfg| cfg.steps.iter()),
++        ) {
++            let has_marker = step.env.get(PRIVATE_TEST_ROOT_ENV).map(String::as_str)
++                == Some(PRIVATE_TEST_ROOT_VALUE);
++            let is_manifest_run =
++                validation_step_identity(step) == ValidationStepIdentity::ManifestRun;
++            if is_manifest_run {
++                manifest_runs += 1;
++            }
++            if has_marker != is_manifest_run {
++                return Err(format!(
++                    "private-/test bracket: marker/identity mismatch on {}",
++                    step.tag()
++                ));
++            }
++        }
++        if marked != manifest_runs || marked == 0 {
++            return Err(format!(
++                "private-/test bracket: marked {marked} of {manifest_runs} manifest runs"
++            ));
++        }
++        let mut forged = full.cfg.steps[0].clone();
++        forged
++            .env
++            .insert(PRIVATE_TEST_ROOT_ENV.into(), PRIVATE_TEST_ROOT_VALUE.into());
++        let mut forged_plan = Plan {
++            cfg: validate_plan::config_from(vec![forged], "forged private-/test marker"),
++            ..Default::default()
++        };
++        if configure_private_test_root(
++            &mut forged_plan,
++            PrivateTestRootActivation::Disabled,
++        )
++        .is_ok()
++        {
++            return Err("private-/test bracket: an input-plan marker was accepted".into());
++        }
+         let manifest_nodes: Vec<String> = full
+             .cfg
+             .steps
+@@ -1625,9 +1716,35 @@ cleared-caps refusal names {} starved step(s)",
+             "--no-label-pr".into(),
+         ])
+         .map_err(|rc| format!("full-plan bracket: sequential diagnostic refused rc={rc}"))?;
+-        if build_plan(&root, &sequential_args, &tmp)?.second.is_none() {
++        let mut sequential = build_plan(&root, &sequential_args, &tmp)?;
++        if sequential.second.is_none() {
+             return Err("full-plan bracket: --sequential-lanes did not preserve the fallback".into());
+         }
++        let sequential_marked = configure_private_test_root(
++            &mut sequential,
++            private_test_root_activation(&sequential_args, false, true),
++        )?;
++        let sequential_manifest_runs = std::iter::once(&sequential.cfg)
++            .chain(sequential.second.iter())
++            .flat_map(|cfg| cfg.steps.iter())
++            .filter(|step| validation_step_identity(step) == ValidationStepIdentity::ManifestRun)
++            .count();
++        if sequential_marked != sequential_manifest_runs
++            || sequential.cfg.steps.iter().chain(
++                sequential
++                    .second
++                    .iter()
++                    .flat_map(|cfg| cfg.steps.iter()),
++            )
++            .any(|step| {
++                step.env.contains_key(PRIVATE_TEST_ROOT_ENV)
++                    != (validation_step_identity(step) == ValidationStepIdentity::ManifestRun)
++            })
++        {
++            return Err(
++                "private-/test bracket: sequential full plan was not marked exactly".into(),
++            );
++        }
+         let nested_args = parse_argv(&[
+             "--portable-strict-compat-only".into(),
+             "--reuse-parent-manifest-gate".into(),
+@@ -2975,6 +3092,49 @@ impl Default for Plan {
+     }
+ }
+ 
++/// Mark exactly the typed manifest-run nodes selected by canonical full
++/// validation. The marker is step-local state consumed by
++/// `ci/run-with-hermit-e2e-artifact.sh`; it is never injected by rewriting a
++/// shell command and never attached to metadata, builders, scorecards, focused
++/// plans, or nested payloads.
++fn configure_private_test_root(
++    plan: &mut Plan,
++    activation: PrivateTestRootActivation,
++) -> Result<usize, String> {
++    let premarked: Vec<String> = std::iter::once(&plan.cfg)
++        .chain(plan.second.iter())
++        .flat_map(|cfg| cfg.steps.iter())
++        .filter(|step| step.env.contains_key(PRIVATE_TEST_ROOT_ENV))
++        .map(Step::tag)
++        .collect();
++    if !premarked.is_empty() {
++        return Err(format!(
++            "private-/test admission marker was supplied by the input plan: {}",
++            premarked.join(", ")
++        ));
++    }
++    if activation == PrivateTestRootActivation::Disabled {
++        return Ok(0);
++    }
++
++    let mut marked = 0;
++    for cfg in std::iter::once(&mut plan.cfg).chain(plan.second.iter_mut()) {
++        for step in &mut cfg.steps {
++            if validation_step_identity(step) == ValidationStepIdentity::ManifestRun {
++                step.env.insert(
++                    PRIVATE_TEST_ROOT_ENV.to_string(),
++                    PRIVATE_TEST_ROOT_VALUE.to_string(),
++                );
++                marked += 1;
++            }
++        }
++    }
++    if marked == 0 {
++        return Err("canonical full plan contains no manifest-run nodes to isolate".into());
++    }
++    Ok(marked)
++}
++
+ fn test_nodes_of(cfg: &DagConfig) -> BTreeSet<String> {
+     cfg.steps
+         .iter()
+@@ -6879,6 +7039,11 @@ fn main() -> ExitCode {
+ 
+ /// The whole invocation, returning what it concluded rather than an exit code.
+ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
++    // This is an output of canonical admission, not a user-facing switch. Drop
++    // any ambient copy before threads or child processes exist; the one allowed
++    // producer below writes it directly into typed Step.env for admitted nodes.
++    unsafe { std::env::remove_var(PRIVATE_TEST_ROOT_ENV) };
++
+     let args = match parse_args() {
+         Ok(a) => a,
+         // `parse_args` returns 0 only for `--help`, whose usage text is the
+@@ -7429,6 +7594,27 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
+         };
+ 
+     let commit = git_sha();
++    let private_test_root_admitted =
++        canonical_validate_lock_admission(parent.as_deref(), &commit, &host);
++    let private_test_root_mode =
++        private_test_root_activation(&args, nesting.nested, private_test_root_admitted);
++    let private_test_root_nodes =
++        match configure_private_test_root(&mut plan, private_test_root_mode) {
++            Ok(marked) => marked,
++            Err(error) => {
++                return RunSummary::refused(
++                    3,
++                    &plan.profile,
++                    "private /test admission",
++                    vec![error],
++                )
++            }
++        };
++    if private_test_root_nodes > 0 {
++        eprintln!(
++            "validate: private empty /test enabled for {private_test_root_nodes} admitted full-profile manifest node(s)"
++        );
++    }
+     let git_depth = match measure_git_depth(&commit) {
+         Ok(depth) => depth,
+         Err(error) => {

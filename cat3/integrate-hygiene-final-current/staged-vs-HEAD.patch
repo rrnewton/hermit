@@ -1,0 +1,4204 @@
+diff --git a/ci/manifest-plan/src/main.rs b/ci/manifest-plan/src/main.rs
+index 204fbff25f..41623cad7a 100644
+--- a/ci/manifest-plan/src/main.rs
++++ b/ci/manifest-plan/src/main.rs
+@@ -635,6 +635,7 @@ fn validate_and_expand(
+             "modes",
+             "slow_reason",
+             "preprocessors",
++            "prepared_fixture_args",
+         ],
+         &id,
+     );
+@@ -724,6 +725,23 @@ fn validate_and_expand(
+             die(format!("{id}: the only supported preprocessor is e9patch"));
+         }
+     }
++    if let Some(fixtures) = test.get("prepared_fixture_args") {
++        let fixtures = string_array(Some(fixtures), &format!("{id}.prepared_fixture_args"));
++        if !program.is_some_and(|program| program.ends_with(".sh")) {
++            die(format!(
++                "{id}: prepared_fixture_args requires a shell program with a --prepare phase"
++            ));
++        }
++        let mut seen = BTreeSet::new();
++        for fixture in fixtures {
++            validate_relative_fixture_path(&fixture, &format!("{id}.prepared_fixture_args"));
++            if !seen.insert(fixture.clone()) {
++                die(format!(
++                    "{id}: duplicate prepared fixture argument: {fixture}"
++                ));
++            }
++        }
++    }
+ 
+     validate_observation(test, &id);
+ 
+@@ -762,6 +780,25 @@ fn validate_and_expand(
+     }
+ }
+ 
++fn validate_relative_fixture_path(path: &str, location: &str) {
++    let path = Path::new(path);
++    if path.as_os_str().is_empty()
++        || path.is_absolute()
++        || path.components().any(|component| {
++            matches!(
++                component,
++                std::path::Component::ParentDir
++                    | std::path::Component::RootDir
++                    | std::path::Component::Prefix(_)
++            )
++        })
++    {
++        die(format!(
++            "{location} must contain non-empty relative paths without `..`"
++        ));
++    }
++}
++
+ fn validate_observation(test: &Value, id: &str) {
+     let observation_value = test
+         .get("observation")
+@@ -1332,6 +1369,23 @@ liteinst = "unsupported"
+         validate_direct(value.get("direct").unwrap(), "bucket/test");
+     }
+ 
++    #[test]
++    fn prepared_fixture_paths_accept_only_relative_descendants() {
++        validate_relative_fixture_path("nested/program", "fixture");
++    }
++
++    #[test]
++    #[should_panic(expected = "non-empty relative paths")]
++    fn prepared_fixture_paths_reject_absolute_paths() {
++        validate_relative_fixture_path("/tmp/program", "fixture");
++    }
++
++    #[test]
++    #[should_panic(expected = "non-empty relative paths")]
++    fn prepared_fixture_paths_reject_parent_traversal() {
++        validate_relative_fixture_path("../program", "fixture");
++    }
++
+     #[test]
+     #[should_panic(expected = "must partition")]
+     fn rejects_incomplete_backend_partition() {
+diff --git a/ci/manifest-plan/src/runner.rs b/ci/manifest-plan/src/runner.rs
+index 6421664da3..a8d0baf793 100644
+--- a/ci/manifest-plan/src/runner.rs
++++ b/ci/manifest-plan/src/runner.rs
+@@ -31,6 +31,8 @@ use crate::ci_selection::CiSelectionSpec;
+ 
+ const BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
+ const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
++const GUEST_FIXTURE_ROOT: &str = "/tmp/hermit-e2e-fixtures";
++const PRIVATE_WORKDIR: &str = "/test";
+ pub const CELL_RESULT_SCHEMA: u64 = 4;
+ 
+ #[derive(Clone, Debug, Deserialize)]
+@@ -59,6 +61,11 @@ pub struct TestRecipe {
+     pub slow_reason: Option<String>,
+     #[serde(default)]
+     pub preprocessors: Vec<String>,
++    /// Executables produced by a shell program's `--prepare` phase. The
++    /// per-cell fixture directory is mounted read-only at a fixed guest path,
++    /// and these relative paths are appended to the wrapper's `--run` argv.
++    #[serde(default)]
++    pub prepared_fixture_args: Vec<String>,
+ }
+ 
+ #[derive(Clone, Debug, Deserialize)]
+@@ -347,6 +354,27 @@ fn validate_document(document: &ManifestDocument, stem: &str, root: &Path) -> Re
+             (Some(_), Some(_)) => return Err(format!("{}: set only program or direct", test.id)),
+             _ => return Err(format!("{}: missing executable program/direct", test.id)),
+         }
++        if !test.prepared_fixture_args.is_empty()
++            && !test
++                .program
++                .as_deref()
++                .is_some_and(|program| program.ends_with(".sh"))
++        {
++            return Err(format!(
++                "{}: prepared_fixture_args requires a shell program with a --prepare phase",
++                test.id
++            ));
++        }
++        let mut prepared_paths = BTreeSet::new();
++        for path in &test.prepared_fixture_args {
++            validate_relative_fixture_path(path, &format!("{}.prepared_fixture_args", test.id))?;
++            if !prepared_paths.insert(path.clone()) {
++                return Err(format!(
++                    "{}: duplicate prepared fixture argument {path}",
++                    test.id
++                ));
++            }
++        }
+         let actual: BTreeSet<_> = test.modes.keys().map(String::as_str).collect();
+         let expected: BTreeSet<_> = MODES.into_iter().collect();
+         if actual != expected {
+@@ -359,6 +387,26 @@ fn validate_document(document: &ManifestDocument, stem: &str, root: &Path) -> Re
+     Ok(())
+ }
+ 
++fn validate_relative_fixture_path(path: &str, location: &str) -> Result<(), String> {
++    let path = Path::new(path);
++    if path.as_os_str().is_empty()
++        || path.is_absolute()
++        || path.components().any(|component| {
++            matches!(
++                component,
++                std::path::Component::ParentDir
++                    | std::path::Component::RootDir
++                    | std::path::Component::Prefix(_)
++            )
++        })
++    {
++        return Err(format!(
++            "{location} must contain non-empty relative paths without `..`"
++        ));
++    }
++    Ok(())
++}
++
+ fn validate_mode(id: &str, mode: &str, recipe: &ModeRecipe) -> Result<(), String> {
+     validate_mode_workdir(
+         id,
+@@ -556,6 +604,19 @@ pub struct CellRunSpec {
+     pub cell_dir: PathBuf,
+ }
+ 
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct GuestMountSpec {
++    pub source: PathBuf,
++    pub target: PathBuf,
++}
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct PreparedTest {
++    pub host_argv: Vec<String>,
++    pub guest_argv: Vec<String>,
++    pub mounts: Vec<GuestMountSpec>,
++}
++
+ #[derive(Clone, Debug, Serialize)]
+ pub struct AttemptResult {
+     pub index: String,
+@@ -776,7 +837,7 @@ pub fn prepare_test(
+     context: &RunContext,
+     cell: &SelectedCell,
+     dir: &Path,
+-) -> Result<Vec<String>, String> {
++) -> Result<PreparedTest, String> {
+     prepare_dirs(&context.root, dir)?;
+     if context.prebuilt && cell.test.program.is_some() {
+         let source = context
+@@ -795,8 +856,14 @@ pub fn prepare_test(
+     }
+     let backend = cell.id.backend.as_deref().unwrap_or("native");
+     let mode = cell.test.modes.get(&cell.id.mode).unwrap();
+-    let guest_args = mode.guest_args.get(backend).cloned().unwrap_or_default();
+-    let mut guest = match (&cell.test.program, &cell.test.direct) {
++    let required = ci_selection(mode)?.selected(backend);
++    let host_guest_args = mode.guest_args.get(backend).cloned().unwrap_or_default();
++    let guest_guest_args = if required {
++        resolve_explicit_checkout_args(&context.root, &host_guest_args)?
++    } else {
++        host_guest_args.clone()
++    };
++    let (mut host_argv, mut guest_argv) = match (&cell.test.program, &cell.test.direct) {
+         (Some(program), None) if program.ends_with(".c") => {
+             let output = dir.join("fixtures/program");
+             if !context.prebuilt {
+@@ -818,7 +885,8 @@ pub fn prepare_test(
+                 run_preparation(context, dir, "cc", &args, cell.test.timeout_seconds)?;
+             }
+             require_executable_program(&output, &dir.join("captures"))?;
+-            vec![output.to_string_lossy().into_owned()]
++            let argv = vec![output.to_string_lossy().into_owned()];
++            (argv.clone(), argv)
+         }
+         (Some(program), None) if program.ends_with(".rs") => {
+             let output = dir.join("fixtures/program");
+@@ -838,7 +906,8 @@ pub fn prepare_test(
+                 run_preparation(context, dir, "rustc", &args, cell.test.timeout_seconds)?;
+             }
+             require_executable_program(&output, &dir.join("captures"))?;
+-            vec![output.to_string_lossy().into_owned()]
++            let argv = vec![output.to_string_lossy().into_owned()];
++            (argv.clone(), argv)
+         }
+         (Some(program), None) if program.ends_with(".sh") => {
+             let path = context.root.join(program).to_string_lossy().into_owned();
+@@ -851,23 +920,78 @@ pub fn prepare_test(
+                     cell.test.timeout_seconds,
+                 )?;
+             }
+-            vec![path, "--run".into()]
++            let argv = vec![path, "--run".into()];
++            (argv.clone(), argv)
+         }
+         (None, Some(DirectCommand::Shell(command))) => {
+             let mut argv = vec!["bash".into(), "-c".into(), command.clone()];
+-            if !guest_args.is_empty() {
++            if !host_guest_args.is_empty() {
+                 argv.push("--".into());
+             }
+-            argv
++            (argv.clone(), argv)
++        }
++        (None, Some(DirectCommand::Argv(argv))) => {
++            let guest = if required {
++                resolve_explicit_checkout_args(&context.root, argv)?
++            } else {
++                argv.clone()
++            };
++            (argv.clone(), guest)
+         }
+-        (None, Some(DirectCommand::Argv(argv))) => argv.clone(),
+         _ => return Err(format!("{} has unsupported program kind", cell.test.id)),
+     };
+-    guest.extend(guest_args);
+-    if context.isolated_workdir.is_some() {
+-        resolve_repo_guest_args(&context.root, &mut guest);
++    let mut mounts = Vec::new();
++    if !cell.test.prepared_fixture_args.is_empty() {
++        let fixture_root = std::path::absolute(dir.join("fixtures")).map_err(|e| e.to_string())?;
++        mounts.push(GuestMountSpec {
++            source: fixture_root.clone(),
++            target: PathBuf::from(GUEST_FIXTURE_ROOT),
++        });
++        for fixture in &cell.test.prepared_fixture_args {
++            let source = fixture_root.join(fixture);
++            require_executable_program(&source, &dir.join("captures"))?;
++            host_argv.push(source.to_string_lossy().into_owned());
++            guest_argv.push(
++                PathBuf::from(GUEST_FIXTURE_ROOT)
++                    .join(fixture)
++                    .to_string_lossy()
++                    .into_owned(),
++            );
++        }
+     }
+-    Ok(guest)
++    host_argv.extend(host_guest_args);
++    guest_argv.extend(guest_guest_args);
++    if context.isolated_workdir.is_some() && !required {
++        resolve_repo_guest_args(&context.root, &mut guest_argv);
++    }
++    Ok(PreparedTest {
++        host_argv,
++        guest_argv,
++        mounts,
++    })
++}
++
++fn resolve_explicit_checkout_args(root: &Path, args: &[String]) -> Result<Vec<String>, String> {
++    args.iter()
++        .map(|argument| {
++            let Some(relative) = argument.strip_prefix("./") else {
++                return Ok(argument.clone());
++            };
++            if Path::new(relative)
++                .components()
++                .any(|component| matches!(component, std::path::Component::ParentDir))
++            {
++                return Err(format!(
++                    "explicit checkout argument must not escape the repository: {argument}"
++                ));
++            }
++            std::path::absolute(root.join(relative))
++                .map(|path| path.to_string_lossy().into_owned())
++                .map_err(|error| {
++                    format!("cannot resolve explicit checkout argument {argument}: {error}")
++                })
++        })
++        .collect()
+ }
+ 
+ fn resolve_repo_guest_args(root: &Path, argv: &mut [String]) {
+@@ -983,12 +1107,19 @@ pub fn build_spec(
+     context: &RunContext,
+     cell: &SelectedCell,
+     dir: PathBuf,
+-    guest_argv: Vec<String>,
++    prepared: &PreparedTest,
+     attempt: &str,
+     seed: Option<i64>,
+ ) -> Result<CellRunSpec, String> {
+     let backend = cell.id.backend.as_deref().unwrap_or("native");
+     let mode_recipe = &cell.test.modes[&cell.id.mode];
++    let required = ci_selection(mode_recipe)?.selected(backend);
++    let isolated = required || context.isolated_workdir.is_some();
++    let guest_argv = if isolated {
++        &prepared.guest_argv
++    } else {
++        &prepared.host_argv
++    };
+     let mut env = execution_cell_env(context, &dir, cell.id.mode != "naked");
+     let sabre_path_evidence = (backend == "sabre").then(|| {
+         dir.join("captures")
+@@ -1006,10 +1137,10 @@ pub fn build_spec(
+     let verdict = dir.join(format!("verify-{attempt}.json"));
+     let mut verification_log_dir = None;
+     let (argv, verdict_path) = match cell.id.mode.as_str() {
+-        "naked" if context.isolated_workdir.is_some() => {
++        "naked" if isolated => {
+             return Err("hermetic validation cannot isolate a naked cell at /test".into());
+         }
+-        "naked" => (guest_argv.clone(), None),
++        "naked" => (prepared.host_argv.clone(), None),
+         "verify" => {
+             let mut argv = vec![
+                 context.hermit_bin.to_string_lossy().into_owned(),
+@@ -1045,17 +1176,27 @@ pub fn build_spec(
+                 ]);
+                 verification_log_dir = Some(logs);
+             }
+-            append_execution_root_args(
+-                &mut argv,
+-                context.isolated_workdir.as_deref(),
+-                mode_recipe.workdir.as_deref(),
+-            );
+-            append_guest_env_args(&mut argv, &env, context.isolated_workdir.is_some());
++            if required {
++                append_lockdown_args(&mut argv, &prepared.mounts);
++            } else {
++                append_execution_root_args(
++                    &mut argv,
++                    context.isolated_workdir.as_deref(),
++                    mode_recipe.workdir.as_deref(),
++                );
++                append_guest_env_args(&mut argv, &env, context.isolated_workdir.is_some());
++            }
+             argv.push("--".into());
+             argv.extend(guest_argv.clone());
+             (argv, Some(verdict))
+         }
+         "replay" => {
++            if required && !prepared.mounts.is_empty() {
++                return Err(format!(
++                    "{}: prepared_fixture_args are not supported by record/replay",
++                    cell.test.id
++                ));
++            }
+             let mut argv = vec![
+                 context.hermit_bin.to_string_lossy().into_owned(),
+                 "--log".into(),
+@@ -1066,8 +1207,8 @@ pub fn build_spec(
+                 "start".into(),
+                 "--strict".into(),
+             ];
+-            if context.isolated_workdir.is_some() {
+-                argv.push("--base-env=minimal".into());
++            if isolated {
++                argv.insert(7, "--base-env=minimal".into());
+             }
+             if context.record_verify_strict {
+                 argv.push("--verify-strict".into());
+@@ -1081,12 +1222,16 @@ pub fn build_spec(
+                 "--record-timeout".into(),
+                 cell.test.timeout_seconds.to_string(),
+             ]);
+-            append_execution_root_args(
+-                &mut argv,
+-                context.isolated_workdir.as_deref(),
+-                mode_recipe.workdir.as_deref(),
+-            );
+-            append_guest_env_args(&mut argv, &env, context.isolated_workdir.is_some());
++            if required {
++                append_record_lockdown_args(&mut argv);
++            } else {
++                append_execution_root_args(
++                    &mut argv,
++                    context.isolated_workdir.as_deref(),
++                    mode_recipe.workdir.as_deref(),
++                );
++                append_guest_env_args(&mut argv, &env, context.isolated_workdir.is_some());
++            }
+             argv.push("--".into());
+             argv.extend(guest_argv.clone());
+             (argv, Some(verdict))
+@@ -1115,12 +1260,16 @@ pub fn build_spec(
+                 "--sched-heuristic=random".into(),
+                 format!("--seed={seed}"),
+             ]);
+-            append_execution_root_args(
+-                &mut argv,
+-                context.isolated_workdir.as_deref(),
+-                mode_recipe.workdir.as_deref(),
+-            );
+-            append_guest_env_args(&mut argv, &env, context.isolated_workdir.is_some());
++            if required {
++                append_lockdown_args(&mut argv, &prepared.mounts);
++            } else {
++                append_execution_root_args(
++                    &mut argv,
++                    context.isolated_workdir.as_deref(),
++                    mode_recipe.workdir.as_deref(),
++                );
++                append_guest_env_args(&mut argv, &env, context.isolated_workdir.is_some());
++            }
+             argv.push("--".into());
+             argv.extend(guest_argv.clone());
+             (argv, Some(verdict))
+@@ -1135,17 +1284,21 @@ pub fn build_spec(
+                 backend.into(),
+             ];
+             argv.extend(cell.test.modes["custom"].args.clone());
+-            if context.isolated_workdir.is_some() {
++            if required {
++                require_minimal_base_env(&mut argv)?;
++                append_lockdown_args(&mut argv, &prepared.mounts);
++            } else if context.isolated_workdir.is_some() {
+                 require_minimal_base_env(&mut argv)?;
+                 append_guest_env_args(&mut argv, &env, true);
++                append_execution_root_args(
++                    &mut argv,
++                    context.isolated_workdir.as_deref(),
++                    mode_recipe.workdir.as_deref(),
++                );
+             } else {
+                 append_scheduled_jobs_env_arg(&mut argv, &env);
++                append_execution_root_args(&mut argv, None, mode_recipe.workdir.as_deref());
+             }
+-            append_execution_root_args(
+-                &mut argv,
+-                context.isolated_workdir.as_deref(),
+-                mode_recipe.workdir.as_deref(),
+-            );
+             argv.push("--".into());
+             argv.extend(guest_argv.clone());
+             (argv, None)
+@@ -1159,7 +1312,7 @@ pub fn build_spec(
+         cwd: context.root.clone(),
+         env,
+         argv,
+-        guest_argv,
++        guest_argv: guest_argv.clone(),
+         timeout_seconds: cell.test.timeout_seconds,
+         verdict_path,
+         verification_log_dir,
+@@ -1533,14 +1686,8 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
+     match cell.id.mode.as_str() {
+         "naked" => {
+             for index in 1..=mode.runs.unwrap_or(3) {
+-                let spec = build_spec(
+-                    context,
+-                    cell,
+-                    dir.clone(),
+-                    guest.clone(),
+-                    &index.to_string(),
+-                    None,
+-                )?;
++                let spec =
++                    build_spec(context, cell, dir.clone(), &guest, &index.to_string(), None)?;
+                 attempts.push(execute_observed(
+                     &spec,
+                     &index.to_string(),
+@@ -1559,14 +1706,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
+             }
+             for seed in seeds {
+                 let index = format!("seed-{seed}");
+-                let spec = build_spec(
+-                    context,
+-                    cell,
+-                    dir.clone(),
+-                    guest.clone(),
+-                    &index,
+-                    Some(*seed),
+-                )?;
++                let spec = build_spec(context, cell, dir.clone(), &guest, &index, Some(*seed))?;
+                 attempts.push(execute_observed(
+                     &spec,
+                     &index,
+@@ -1577,14 +1717,8 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
+         }
+         "custom" => {
+             for index in 1..=mode.assert.as_ref().and_then(|a| a.runs).unwrap_or(1) {
+-                let spec = build_spec(
+-                    context,
+-                    cell,
+-                    dir.clone(),
+-                    guest.clone(),
+-                    &index.to_string(),
+-                    None,
+-                )?;
++                let spec =
++                    build_spec(context, cell, dir.clone(), &guest, &index.to_string(), None)?;
+                 attempts.push(execute_observed(
+                     &spec,
+                     &index.to_string(),
+@@ -1594,7 +1728,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
+             }
+         }
+         _ => {
+-            let spec = build_spec(context, cell, dir.clone(), guest.clone(), "1", None)?;
++            let spec = build_spec(context, cell, dir.clone(), &guest, "1", None)?;
+             attempts.push(execute_observed(&spec, "1", &cell.test.observation, &dir)?);
+         }
+     }
+@@ -1691,7 +1825,13 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
+     let literal_guest_argv = attempts
+         .first()
+         .map(|attempt| attempt.guest_argv.clone())
+-        .unwrap_or_else(|| guest.clone());
++        .unwrap_or_else(|| {
++            if cell.id.mode == "naked" {
++                guest.host_argv.clone()
++            } else {
++                guest.guest_argv.clone()
++            }
++        });
+     let literal_env = attempts
+         .first()
+         .map(|attempt| attempt.env.clone())
+@@ -2162,6 +2302,25 @@ fn shell_quote(value: &str) -> String {
+     }
+ }
+ 
++fn append_lockdown_args(argv: &mut Vec<String>, mounts: &[GuestMountSpec]) {
++    for mount in mounts {
++        argv.push(format!(
++            "--mount=type=bind,source={},target={},readonly",
++            mount.source.display(),
++            mount.target.display()
++        ));
++    }
++    argv.push(format!("--mount=type=tmpfs,target={PRIVATE_WORKDIR}"));
++    argv.push(format!("--workdir={PRIVATE_WORKDIR}"));
++}
++
++fn append_record_lockdown_args(argv: &mut Vec<String>) {
++    // Record/replay stores the cwd in its launch metadata and recreates it in
++    // the replay root. The outer validation mount namespace provides an empty
++    // `/test`, so the required replay cell needs no new mount surface here.
++    argv.push(format!("--workdir={PRIVATE_WORKDIR}"));
++}
++
+ fn append_guest_env_args(argv: &mut Vec<String>, env: &BTreeMap<String, String>, isolated: bool) {
+     // Every forwarded value is harness-authored, never inherited ambient state.
+     // PWD and OLDPWD remain absent; E2E_TMPDIR joins the fresh /test mount while
+@@ -2361,6 +2520,16 @@ mod tests {
+             modes: BTreeMap::from([("verify".into(), mode)]),
+             slow_reason: None,
+             preprocessors: Vec::new(),
++            prepared_fixture_args: Vec::new(),
++        }
++    }
++
++    fn prepared(argv: &[&str]) -> PreparedTest {
++        let argv = argv.iter().map(|value| (*value).to_string()).collect::<Vec<_>>();
++        PreparedTest {
++            host_argv: argv.clone(),
++            guest_argv: argv,
++            mounts: Vec::new(),
+         }
+     }
+ 
+@@ -2588,7 +2757,7 @@ backends_disabled:
+ 
+     #[test]
+     fn run_workdir_precedes_the_guest_separator() {
+-        let mut test = recipe(true);
++        let mut test = recipe(false);
+         test.modes.get_mut("verify").unwrap().workdir = Some("/tmp".into());
+         let cell = SelectedCell {
+             category: "fixture".into(),
+@@ -2619,7 +2788,7 @@ backends_disabled:
+             &context,
+             &cell,
+             PathBuf::from("/repo/results/cell"),
+-            vec!["/bin/true".into()],
++            &prepared(&["/bin/true"]),
+             "1",
+             None,
+         )
+@@ -2665,7 +2834,7 @@ backends_disabled:
+             &context,
+             &cell,
+             PathBuf::from("/repo/results/cell"),
+-            vec!["/bin/true".into()],
++            &prepared(&["/bin/true"]),
+             "1",
+             None,
+         )
+@@ -2678,8 +2847,8 @@ backends_disabled:
+             .unwrap();
+         let workdir = spec
+             .argv
+-            .windows(2)
+-            .position(|args| args == ["--workdir", "/test"])
++            .iter()
++            .position(|arg| arg == "--workdir=/test")
+             .unwrap();
+         assert!(mount < separator && workdir < separator);
+         for name in ["PWD", "OLDPWD"] {
+@@ -2690,22 +2859,7 @@ backends_disabled:
+                     .any(|arg| arg.starts_with(&format!("{name}=")))
+             );
+         }
+-        for value in [
+-            "LC_ALL=C",
+-            "TZ=UTC",
+-            "HOME=/repo/results/cell/home",
+-            "XDG_CONFIG_HOME=/repo/results/cell/xdg-config",
+-            "E2E_TMPDIR=/test",
+-        ] {
+-            assert!(spec.argv.iter().any(|arg| arg == value));
+-        }
+-        for name in ["E2E_FIXTURE_DIR", SCHEDULED_JOBS_ENV] {
+-            assert!(
+-                spec.argv
+-                    .iter()
+-                    .any(|arg| arg.starts_with(&format!("{name}=")))
+-            );
+-        }
++        assert!(!spec.argv.iter().any(|arg| arg == "--env"));
+ 
+         let mut replay_test = recipe(true);
+         let replay_mode = replay_test.modes.remove("verify").unwrap();
+@@ -2724,18 +2878,14 @@ backends_disabled:
+             &context,
+             &replay_cell,
+             PathBuf::from("/repo/results/replay"),
+-            vec!["/bin/true".into()],
++            &prepared(&["/bin/true"]),
+             "1",
+             None,
+         )
+         .unwrap();
+         assert!(replay.argv.iter().any(|arg| arg == "--base-env=minimal"));
+-        assert!(
+-            replay
+-                .argv
+-                .iter()
+-                .any(|arg| arg == "--mount=type=tmpfs,target=/test")
+-        );
++        assert!(replay.argv.iter().any(|arg| arg == "--workdir=/test"));
++        assert!(!replay.argv.iter().any(|arg| arg == "--env"));
+ 
+         let mut custom_test = recipe(true);
+         let mut custom_mode = custom_test.modes.remove("verify").unwrap();
+@@ -2755,7 +2905,7 @@ backends_disabled:
+             &context,
+             &custom_cell,
+             PathBuf::from("/repo/results/custom"),
+-            vec!["/bin/true".into()],
++            &prepared(&["/bin/true"]),
+             "1",
+             None,
+         )
+@@ -2772,15 +2922,7 @@ backends_disabled:
+                 .iter()
+                 .any(|arg| arg == "--mount=type=tmpfs,target=/test")
+         );
+-        for value in [
+-            "LC_ALL=C",
+-            "TZ=UTC",
+-            "HOME=/repo/results/custom/home",
+-            "XDG_CONFIG_HOME=/repo/results/custom/xdg-config",
+-            "E2E_TMPDIR=/test",
+-        ] {
+-            assert!(custom.argv.iter().any(|arg| arg == value));
+-        }
++        assert!(!custom.argv.iter().any(|arg| arg == "--env"));
+         let mut naked_test = recipe(true);
+         let naked_mode = naked_test.modes.remove("verify").unwrap();
+         naked_test.modes.insert("naked".into(), naked_mode);
+@@ -2798,7 +2940,7 @@ backends_disabled:
+             &context,
+             &naked_cell,
+             PathBuf::from("/repo/results/naked"),
+-            vec!["/bin/true".into()],
++            &prepared(&["/bin/true"]),
+             "1",
+             None,
+         )
+@@ -2876,7 +3018,7 @@ backends_disabled:
+             &context,
+             &cell,
+             PathBuf::from("/repo/results/cell"),
+-            vec!["/bin/true".into()],
++            &prepared(&["/bin/true"]),
+             "1",
+             None,
+         )
+@@ -2951,11 +3093,19 @@ backends_disabled:
+             scheduled_worker_capacity: ScheduledWorkerCapacity::new(7),
+             isolated_workdir: None,
+         };
++        let prepared = PreparedTest {
++            host_argv: vec!["/bin/true".into()],
++            guest_argv: vec!["/bin/true".into()],
++            mounts: vec![GuestMountSpec {
++                source: PathBuf::from("/repo/results/cell/fixtures"),
++                target: PathBuf::from(GUEST_FIXTURE_ROOT),
++            }],
++        };
+         let spec = build_spec(
+             &context,
+             &cell,
+             PathBuf::from("/repo/results/cell"),
+-            vec!["/bin/true".into()],
++            &prepared,
+             "1",
+             None,
+         )
+@@ -2973,19 +3123,23 @@ backends_disabled:
+                 .iter()
+                 .any(|arg| arg == "--max-timeslice=disabled")
+         );
+-        for name in [
+-            "LC_ALL",
+-            "TZ",
+-            "HOME",
+-            "XDG_CONFIG_HOME",
+-            "E2E_TMPDIR",
+-            "E2E_FIXTURE_DIR",
+-            "HERMIT_E2E_SCHEDULED_JOBS",
+-        ] {
+-            assert!(spec.argv.windows(2).any(|window| {
+-                window[0] == "--env" && window[1].starts_with(&format!("{name}="))
+-            }));
+-        }
++        assert!(!spec.argv.iter().any(|arg| arg == "--env"));
++        let fixture_mount = spec
++            .argv
++            .iter()
++            .position(|arg| arg.contains("target=/tmp/hermit-e2e-fixtures"))
++            .unwrap();
++        let test_mount = spec
++            .argv
++            .iter()
++            .position(|arg| arg == "--mount=type=tmpfs,target=/test")
++            .unwrap();
++        let workdir = spec
++            .argv
++            .iter()
++            .position(|arg| arg == "--workdir=/test")
++            .unwrap();
++        assert!(fixture_mount < test_mount && test_mount < workdir);
+         for name in ["RUSTUP_HOME", "CARGO_HOME"] {
+             assert!(!spec.env.contains_key(name));
+             assert!(
+@@ -3009,11 +3163,15 @@ backends_disabled:
+             test: replay_test,
+             enabled: true,
+         };
++        let replay_prepared = PreparedTest {
++            mounts: Vec::new(),
++            ..prepared.clone()
++        };
+         let replay = build_spec(
+             &context,
+             &replay_cell,
+             PathBuf::from("/repo/results/replay-cell"),
+-            vec!["/bin/true".into()],
++            &replay_prepared,
+             "1",
+             None,
+         )
+@@ -3022,49 +3180,9 @@ backends_disabled:
+         assert!(replay.argv.windows(2).any(|window| {
+             window[0] == "--verify-json" && window[1] == "/repo/results/replay-cell/verify-1.json"
+         }));
+-        assert!(!replay.argv.iter().any(|arg| arg.starts_with("--base-env")));
+-        for name in [
+-            "LC_ALL",
+-            "TZ",
+-            "HOME",
+-            "XDG_CONFIG_HOME",
+-            "E2E_TMPDIR",
+-            "E2E_FIXTURE_DIR",
+-            "HERMIT_E2E_SCHEDULED_JOBS",
+-        ] {
+-            assert!(replay.argv.windows(2).any(|window| {
+-                window[0] == "--env" && window[1].starts_with(&format!("{name}="))
+-            }));
+-        }
+-
+-        let mut custom_test = recipe(true);
+-        let mut custom_mode = custom_test.modes.remove("verify").unwrap();
+-        custom_mode.args = vec!["--base-env=minimal".into()];
+-        custom_test.modes.insert("custom".into(), custom_mode);
+-        let custom_cell = SelectedCell {
+-            category: "fixture".into(),
+-            id: CellId {
+-                test: custom_test.id.clone(),
+-                mode: "custom".into(),
+-                backend: Some("ptrace".into()),
+-            },
+-            test: custom_test,
+-            enabled: true,
+-        };
+-        let custom = build_spec(
+-            &context,
+-            &custom_cell,
+-            PathBuf::from("/repo/results/custom-cell"),
+-            vec!["/bin/true".into()],
+-            "1",
+-            None,
+-        )
+-        .unwrap();
+-        assert!(
+-            custom.argv.windows(2).any(|window| {
+-                window[0] == "--env" && window[1] == "HERMIT_E2E_SCHEDULED_JOBS=7"
+-            })
+-        );
++        assert!(replay.argv.iter().any(|arg| arg == "--base-env=minimal"));
++        assert!(replay.argv.iter().any(|arg| arg == "--workdir=/test"));
++        assert!(!replay.argv.iter().any(|arg| arg == "--env"));
+     }
+ 
+     #[test]
+@@ -3094,6 +3212,113 @@ backends_disabled:
+         assert!(!guest.contains_key("CARGO_HOME"));
+     }
+ 
++    #[test]
++    fn manual_cells_keep_the_legacy_environment_and_workdir() {
++        let test = recipe(false);
++        let cell = SelectedCell {
++            category: "fixture".into(),
++            id: CellId {
++                test: test.id.clone(),
++                mode: "verify".into(),
++                backend: Some("ptrace".into()),
++            },
++            test,
++            enabled: true,
++        };
++        let context = RunContext {
++            root: PathBuf::from("/repo"),
++            hermit_bin: PathBuf::from("/repo/hermit"),
++            result_root: PathBuf::from("/repo/results"),
++            build_root: PathBuf::from("/repo/build"),
++            run_id: "fixture".into(),
++            source_sha: "0".repeat(40),
++            source_dirty: false,
++            prebuilt: false,
++            keep_logs: false,
++            run_verify_strict: false,
++            record_verify_strict: false,
++            scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
++            isolated_workdir: None,
++        };
++        let prepared = PreparedTest {
++            host_argv: vec!["/host/program".into()],
++            guest_argv: vec!["/guest/program".into()],
++            mounts: vec![GuestMountSpec {
++                source: PathBuf::from("/host/fixtures"),
++                target: PathBuf::from(GUEST_FIXTURE_ROOT),
++            }],
++        };
++        let spec = build_spec(
++            &context,
++            &cell,
++            PathBuf::from("/repo/results/manual"),
++            &prepared,
++            "1",
++            None,
++        )
++        .unwrap();
++        assert!(!spec.argv.iter().any(|arg| arg == "--workdir=/test"));
++        assert!(!spec.argv.iter().any(|arg| arg.contains("target=/test")));
++        assert!(
++            spec.argv
++                .windows(2)
++                .any(|window| { window[0] == "--env" && window[1].starts_with("E2E_TMPDIR=") })
++        );
++        assert_eq!(spec.guest_argv, vec!["/host/program"]);
++    }
++
++    #[test]
++    fn manual_custom_cells_do_not_gain_environment_or_lockdown_flags() {
++        let mut test = recipe(false);
++        let mode = test.modes.remove("verify").unwrap();
++        test.modes.insert("custom".into(), mode);
++        let cell = SelectedCell {
++            category: "fixture".into(),
++            id: CellId {
++                test: test.id.clone(),
++                mode: "custom".into(),
++                backend: Some("ptrace".into()),
++            },
++            test,
++            enabled: true,
++        };
++        let context = RunContext {
++            root: PathBuf::from("/repo"),
++            hermit_bin: PathBuf::from("/repo/hermit"),
++            result_root: PathBuf::from("/repo/results"),
++            build_root: PathBuf::from("/repo/build"),
++            run_id: "fixture".into(),
++            source_sha: "0".repeat(40),
++            source_dirty: false,
++            prebuilt: false,
++            keep_logs: false,
++            run_verify_strict: false,
++            record_verify_strict: false,
++            scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
++            isolated_workdir: None,
++        };
++        let prepared = PreparedTest {
++            host_argv: vec!["/host/program".into()],
++            guest_argv: vec!["/guest/program".into()],
++            mounts: Vec::new(),
++        };
++        let spec = build_spec(
++            &context,
++            &cell,
++            PathBuf::from("/repo/results/manual-custom"),
++            &prepared,
++            "1",
++            None,
++        )
++        .unwrap();
++        assert!(!spec.argv.iter().any(|arg| arg == "--base-env=minimal"));
++        assert!(spec.argv.windows(2).any(|window| {
++            window[0] == "--env" && window[1].starts_with(SCHEDULED_JOBS_ENV)
++        }));
++        assert!(!spec.argv.iter().any(|arg| arg == "--workdir=/test"));
++        assert_eq!(spec.guest_argv, vec!["/host/program"]);
++    }
++
+     #[test]
+     fn recorded_shell_command_replays_literal_environment_and_argv() {
+         let root = std::env::temp_dir().join(format!(
+@@ -3678,4 +3903,92 @@ backends_disabled:
+         assert!(prepare_test(&context, &cell, &cell_dir).is_ok());
+         fs::remove_dir_all(root).unwrap();
+     }
++
++    #[test]
++    fn prepared_fixture_arguments_use_one_readonly_fixed_guest_mount() {
++        let root = std::env::temp_dir().join(format!(
++            "hermit-runner-prepared-fixtures-{}",
++            std::process::id()
++        ));
++        let _ = fs::remove_dir_all(&root);
++        let build_root = root.join("build");
++        let source = build_root.join("fixture-test/fixtures");
++        let cell_dir = root.join("cell");
++        fs::create_dir_all(&source).unwrap();
++        for fixture in ["fork-tree", "pipe-chain"] {
++            fs::write(source.join(fixture), b"fixture").unwrap();
++            fs::set_permissions(source.join(fixture), fs::Permissions::from_mode(0o755)).unwrap();
++        }
++
++        let mut test = recipe(true);
++        test.program = Some("tests/e2e/fixture.sh".into());
++        test.direct = None;
++        test.prepared_fixture_args = vec!["fork-tree".into(), "pipe-chain".into()];
++        let cell = SelectedCell {
++            category: "fixture".into(),
++            id: CellId {
++                test: test.id.clone(),
++                mode: "verify".into(),
++                backend: Some("ptrace".into()),
++            },
++            test,
++            enabled: true,
++        };
++        let context = RunContext {
++            root: root.clone(),
++            hermit_bin: root.join("hermit"),
++            result_root: root.join("results"),
++            build_root,
++            run_id: "fixture".into(),
++            source_sha: "0".repeat(40),
++            source_dirty: false,
++            prebuilt: true,
++            keep_logs: false,
++            run_verify_strict: false,
++            record_verify_strict: false,
++            scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
++            isolated_workdir: None,
++        };
++
++        let prepared = prepare_test(&context, &cell, &cell_dir).unwrap();
++        assert_eq!(prepared.mounts.len(), 1);
++        assert_eq!(prepared.mounts[0].source, cell_dir.join("fixtures"));
++        assert_eq!(prepared.mounts[0].target, Path::new(GUEST_FIXTURE_ROOT));
++        assert_eq!(
++            &prepared.guest_argv[2..],
++            [
++                "/tmp/hermit-e2e-fixtures/fork-tree",
++                "/tmp/hermit-e2e-fixtures/pipe-chain"
++            ]
++        );
++        assert!(prepared.host_argv[2].starts_with(cell_dir.to_str().unwrap()));
++
++        let spec = build_spec(&context, &cell, cell_dir.clone(), &prepared, "1", None).unwrap();
++        assert!(spec.argv.iter().any(|arg| {
++            arg.contains("target=/tmp/hermit-e2e-fixtures") && arg.ends_with(",readonly")
++        }));
++        fs::remove_dir_all(root).unwrap();
++    }
++
++    #[test]
++    fn only_dot_slash_guest_arguments_are_rebased_to_the_checkout() {
++        let root = std::env::temp_dir().join(format!(
++            "hermit-runner-explicit-checkout-argument-{}",
++            std::process::id()
++        ));
++        let _ = fs::remove_dir_all(&root);
++        fs::create_dir_all(&root).unwrap();
++        fs::write(root.join("README.md"), b"fixture").unwrap();
++
++        let resolved = resolve_explicit_checkout_args(
++            &root,
++            &["./README.md".into(), "README.md".into(), "label".into()],
++        )
++        .unwrap();
++        assert_eq!(resolved[0], root.join("README.md").to_string_lossy());
++        assert_eq!(resolved[1], "README.md");
++        assert_eq!(resolved[2], "label");
++        assert!(resolve_explicit_checkout_args(&root, &["./../outside".into()]).is_err());
++        fs::remove_dir_all(root).unwrap();
++    }
+ }
+diff --git a/ci/run-with-hermit-e2e-artifact.sh b/ci/run-with-hermit-e2e-artifact.sh
+index 2531f55644..fda173fed4 100755
+--- a/ci/run-with-hermit-e2e-artifact.sh
++++ b/ci/run-with-hermit-e2e-artifact.sh
+@@ -9,12 +9,61 @@
+ set -euo pipefail
+ 
+ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
++readonly private_test_root_marker=HERMIT_VALIDATE_PRIVATE_TEST_ROOT
++readonly private_test_root_helper_var=HERMIT_VALIDATE_PRIVATE_TEST_ROOT_HELPER
++readonly private_test_root_helper_sha_var=HERMIT_VALIDATE_PRIVATE_TEST_ROOT_HELPER_SHA256
++readonly private_test_root_value=canonical-full-manifest-v1
++private_test_root=0
++private_test_root_helper=
++private_test_root_helper_sha=
+ require_install=0
+ if [[ ${1:-} == --require-install ]]; then
+     require_install=1
+     shift
+ fi
+ [[ $# -gt 0 ]] || { echo "usage: $0 [--require-install] COMMAND..." >&2; exit 2; }
++if [[ -n ${!private_test_root_marker+x} || -n ${!private_test_root_helper_var+x} ||
++      -n ${!private_test_root_helper_sha_var+x} ]]; then
++    [[ -n ${!private_test_root_marker+x} && -n ${!private_test_root_helper_var+x} &&
++       -n ${!private_test_root_helper_sha_var+x} ]] || {
++        echo "run-with-hermit-e2e-artifact.sh: incomplete private-/test helper credentials" >&2
++        exit 2
++    }
++    [[ ${!private_test_root_marker} == "$private_test_root_value" ]] || {
++        echo "run-with-hermit-e2e-artifact.sh: invalid private-/test marker" >&2
++        exit 2
++    }
++    private_test_root_helper=${!private_test_root_helper_var}
++    private_test_root_helper_sha=${!private_test_root_helper_sha_var}
++    [[ $private_test_root_helper_sha =~ ^[0-9a-f]{64}$ ]] || {
++        echo "run-with-hermit-e2e-artifact.sh: private-/test helper digest is invalid" >&2
++        exit 2
++    }
++    private_test_root_helper_expected="/usr/local/libexec/hermit-private-test-root-$private_test_root_helper_sha"
++    [[ $private_test_root_helper == "$private_test_root_helper_expected" &&
++       -f $private_test_root_helper && ! -L $private_test_root_helper &&
++       -x $private_test_root_helper ]] || {
++        echo "run-with-hermit-e2e-artifact.sh: private-/test helper path does not match its digest" >&2
++        exit 2
++    }
++    helper_uid=$(/usr/bin/stat -c %u -- "$private_test_root_helper")
++    helper_mode=$(/usr/bin/stat -c %a -- "$private_test_root_helper")
++    ((helper_uid == 0 && (8#$helper_mode & 0022) == 0 && (8#$helper_mode & 0111) != 0)) || {
++        echo "run-with-hermit-e2e-artifact.sh: private-/test helper ownership or mode is unsafe" >&2
++        exit 2
++    }
++    helper_actual_sha=$(/usr/bin/sha256sum -- "$private_test_root_helper")
++    helper_actual_sha=${helper_actual_sha%% *}
++    [[ $helper_actual_sha == "$private_test_root_helper_sha" ]] || {
++        echo "run-with-hermit-e2e-artifact.sh: private-/test helper digest mismatch" >&2
++        exit 2
++    }
++    [[ ${1:-} == target/debug/test-harness && ${2:-} == run ]] || {
++        echo "run-with-hermit-e2e-artifact.sh: private /test is restricted to the final test-harness run" >&2
++        exit 2
++    }
++    private_test_root=1
++fi
+ pointer=${HERMIT_E2E_ARTIFACT_POINTER:-$ROOT_DIR/target/ci/hermit-e2e-artifact.path}
+ bundle=$("$ROOT_DIR/ci/verify-hermit-e2e-artifact.sh" "$pointer")
+ export HERMIT_BIN="$bundle/hermit"
+@@ -28,4 +77,8 @@ else
+ fi
+ printf 'hermit-e2e-artifact: verified bin=%s install=%s\n' \
+     "$HERMIT_BIN" "${HERMIT_INSTALL_DIR:-none}" >&2
++
++if ((private_test_root)); then
++    exec "$private_test_root_helper" -- "$@"
++fi
+ exec "$@"
+diff --git a/hermit-cli/src/bin/hermit/record_start.rs b/hermit-cli/src/bin/hermit/record_start.rs
+index bd1344f816..eab0942f64 100644
+--- a/hermit-cli/src/bin/hermit/record_start.rs
++++ b/hermit-cli/src/bin/hermit/record_start.rs
+@@ -315,6 +315,16 @@ impl StartOpts {
+         Ok(command)
+     }
+ 
++    fn validate_filesystem_options(&self) -> Result<(), Error> {
++        if let Some(workdir) = &self.workdir {
++            let workdir = Path::new(workdir);
++            if !workdir.is_absolute() {
++                anyhow::bail!("--workdir must be absolute: {}", workdir.display());
++            }
++        }
++        Ok(())
++    }
++
+     // AUTONOMOUS-BOT-IMPLEMENTED
+     // TODO-HUMAN-REVIEW(PR-696): Review /proc magic-link rejection for record overlays.
+     fn resolve_e9patch_record_target(&self) -> Result<PathBuf, Error> {
+@@ -424,6 +434,7 @@ impl StartOpts {
+     }
+ 
+     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
++        self.validate_filesystem_options()?;
+         if self.verify {
+             validate_log_level(global)?;
+             self.record_verify(global)
+@@ -748,6 +759,40 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn record_minimal_environment_omits_pwd_and_records_absolute_workdir() {
++        let mut options = start_options(Vec::new());
++        options.base_env = BaseEnv::Minimal;
++        options.workdir = Some("/test".into());
++        options.validate_filesystem_options().unwrap();
++        let command = options.guest_command().unwrap();
++        let environment = command.get_captured_envs();
++        assert_eq!(command.get_current_dir(), Some(Path::new("/test")));
++        assert!(!environment.contains_key(std::ffi::OsStr::new("PWD")));
++        assert!(!environment.contains_key(std::ffi::OsStr::new("OLDPWD")));
++        assert_eq!(
++            environment
++                .keys()
++                .map(|key| key.to_string_lossy().into_owned())
++                .collect::<std::collections::BTreeSet<String>>(),
++            std::collections::BTreeSet::from([
++                "ASAN_OPTIONS".to_string(),
++                "HOME".to_string(),
++                "HOSTNAME".to_string(),
++                "LSAN_OPTIONS".to_string(),
++                "PATH".to_string(),
++            ])
++        );
++    }
++
++    #[test]
++    fn record_rejects_relative_workdir() {
++        let mut options = start_options(Vec::new());
++        options.workdir = Some("test".into());
++        let error = options.validate_filesystem_options().unwrap_err();
++        assert!(error.to_string().contains("--workdir must be absolute"));
++    }
++
+     // A blocked SIGALRM (e.g. inherited from the parent) would leave the alarm
+     // perpetually pending and silently disable the deadline. Arming must unblock
+     // SIGALRM, and dropping must restore the prior blocked state without
+diff --git a/hermit-cli/src/bin/hermit/run.rs b/hermit-cli/src/bin/hermit/run.rs
+index 58a45b029c..4ea4c29779 100644
+--- a/hermit-cli/src/bin/hermit/run.rs
++++ b/hermit-cli/src/bin/hermit/run.rs
+@@ -207,9 +207,9 @@ pub struct RunOpts {
+     #[clap(long, value_name = "RCBS")]
+     skid_margin: Option<u64>,
+ 
+-    /// Mount a file or directory. This uses the same syntax as Docker's `--mount` option. The
++    /// Mount a file or directory. This uses the same syntax as Docker's `--mount` option. A bind
+     /// source must exist on the host. For simple bind mounts into guest `/tmp`, use `--bind`.
+-    #[clap(long, value_name = "path")]
++    #[clap(long, value_parser = parse_mount, value_name = "path")]
+     mount: Vec<Mount>,
+ 
+     /// Bind-mount a host file or directory into guest `/tmp`. Use `SOURCE` to preserve its path or
+@@ -513,6 +513,45 @@ pub(super) fn apply_base_environment(
+     Ok(())
+ }
+ 
++fn parse_mount(src: &str) -> Result<Mount, String> {
++    let mount_type = src.split(',').rev().find_map(|item| {
++        let (key, value) = item.trim().split_once('=')?;
++        (key == "type").then_some(value)
++    });
++    if mount_type != Some("bind")
++        && src.split(',').any(|item| {
++            item.trim()
++                .split_once('=')
++                .is_some_and(|(key, _)| key == "bind-propagation")
++        })
++    {
++        return Err("bind-propagation is supported only for bind mounts".into());
++    }
++    let parsed = Mount::from_str(src).map_err(|error| error.to_string())?;
++    let Some(mount_type) = mount_type else {
++        return Ok(parsed);
++    };
++    if mount_type == "bind" {
++        return Ok(parsed);
++    }
++
++    // reverie-process's Docker-syntax parser applies the default bind
++    // propagation flags to every mount. For a source-less filesystem mount,
++    // combining MS_REC|MS_PRIVATE with the initial mount turns the operation
++    // into a propagation change and never creates the requested filesystem.
++    // Reconstruct non-bind mounts without those bind-only flags.
++    let target = parsed.get_target().to_path_buf();
++    let source = parsed.get_source().map(Path::to_path_buf);
++    let mut mount = Mount::new(target).fstype(mount_type);
++    if let Some(source) = source {
++        mount = mount.source(source);
++    }
++    if src.split(',').any(|item| item.trim() == "readonly") {
++        mount = mount.readonly();
++    }
++    Ok(mount)
++}
++
+ #[derive(Debug, Default, Clone, Copy, Parser, Eq, PartialEq)]
+ pub enum NetworkingMode {
+     /// Create a local loopback device and allow local, intra-container network communication only.
+@@ -1001,6 +1040,57 @@ fn backend_values_parse_and_round_trip() {
+     }
+ }
+ 
++#[test]
++fn guest_filesystem_paths_must_be_absolute() {
++    let relative_workdir = RunOpts::parse_from(["fakehermit", "--workdir=test", "/bin/true"]);
++    assert!(
++        relative_workdir
++            .validate_mount_sources()
++            .unwrap_err()
++            .to_string()
++            .contains("--workdir must be absolute")
++    );
++
++    let relative_mount =
++        RunOpts::parse_from(["fakehermit", "--mount=type=tmpfs,target=test", "/bin/true"]);
++    assert!(
++        relative_mount
++            .validate_mount_sources()
++            .unwrap_err()
++            .to_string()
++            .contains("--mount target must be absolute")
++    );
++}
++
++#[test]
++fn source_less_filesystem_mounts_do_not_inherit_bind_propagation_flags() {
++    let options =
++        RunOpts::parse_from(["fakehermit", "--mount=type=tmpfs,target=/test", "/bin/true"]);
++    assert_eq!(options.mount, vec![Mount::tmpfs("/test")]);
++
++    let bind = RunOpts::parse_from([
++        "fakehermit",
++        "--mount=type=bind,source=/tmp,target=/test,readonly",
++        "/bin/true",
++    ]);
++    assert_eq!(
++        bind.mount,
++        vec![Mount::bind("/tmp", "/test").readonly().rprivate()]
++    );
++
++    let invalid = RunOpts::try_parse_from([
++        "fakehermit",
++        "--mount=type=tmpfs,target=/test,bind-propagation=rprivate",
++        "/bin/true",
++    ])
++    .unwrap_err();
++    assert!(
++        invalid
++            .to_string()
++            .contains("bind-propagation is supported only for bind mounts")
++    );
++}
++
+ #[test]
+ fn e9patch_preserves_executable_identity_and_uses_ptrace_runtime() {
+     let mut ro = RunOpts::parse_from(["fakehermit", "--backend", "e9patch", "/bin/echo", "hello"]);
+@@ -1126,6 +1216,46 @@ fn dbt_rejects_mount_and_workdir_options_it_cannot_apply() {
+         .unwrap_err()
+         .to_string();
+     assert!(error.contains("dbt backend cannot apply --mount"));
++
++    let mut with_tmp =
++        RunOpts::parse_from(["fakehermit", "--backend", "dbt", "--tmp", "/test", "/bin/true"]);
++    let error = with_tmp
++        .validate_args_with_perf_support(true)
++        .unwrap_err()
++        .to_string();
++    assert!(error.contains("dbt backend cannot apply --mount"));
++}
++
++#[test]
++fn minimal_base_environment_is_exact_before_guest_startup() {
++    let options = RunOpts::parse_from([
++        "fakehermit",
++        "--backend=kvm",
++        "--base-env=minimal",
++        "/bin/true",
++    ]);
++    let environment = options.guest_command().unwrap().get_captured_envs();
++    assert_eq!(
++        environment
++            .keys()
++            .map(|key| key.to_string_lossy().into_owned())
++            .collect::<std::collections::BTreeSet<String>>(),
++        std::collections::BTreeSet::from([
++            "ASAN_OPTIONS".to_string(),
++            "HOME".to_string(),
++            "HOSTNAME".to_string(),
++            "LSAN_OPTIONS".to_string(),
++            "PATH".to_string(),
++        ])
++    );
++    assert_eq!(
++        environment.get(OsStr::new("HOME")),
++        Some(&OsStr::new("/root").to_os_string())
++    );
++    assert_eq!(
++        environment.get(OsStr::new("HOSTNAME")),
++        Some(&OsStr::new("hermetic-container.local").to_os_string())
++    );
+ }
+ 
+ #[test]
+@@ -2396,10 +2526,13 @@ impl RunOpts {
+             );
+         }
+         if backend == Backend::Dbt
+-            && (!self.mount.is_empty() || !self.bind.is_empty() || self.workdir.is_some())
++            && (!self.mount.is_empty()
++                || !self.bind.is_empty()
++                || self.workdir.is_some()
++                || self.tmp.is_some())
+         {
+             anyhow::bail!(
+-                "the dbt backend cannot apply --mount, --bind, or --workdir because its \
++                "the dbt backend cannot apply --mount, --bind, --workdir, or --tmp because its \
+                  DynamoRIO adapter does not enter the guest mount namespace"
+             );
+         }
+@@ -2638,8 +2771,17 @@ impl RunOpts {
+     }
+ 
+     fn validate_mount_sources(&self) -> Result<(), Error> {
++        if let Some(workdir) = &self.workdir
++            && !Path::new(workdir).is_absolute()
++        {
++            anyhow::bail!("--workdir must be absolute: {workdir}");
++        }
+         for bind in &self.bind {
+             let source = Path::new(OsStr::from_bytes(bind.source.to_bytes()));
++            let target = Path::new(OsStr::from_bytes(bind.target.to_bytes()));
++            if !target.is_absolute() {
++                anyhow::bail!("--bind target must be absolute: {}", target.display());
++            }
+             if !source.exists() {
+                 anyhow::bail!(
+                     "--bind source {} does not exist. Create it or correct the source path before \
+@@ -2649,6 +2791,12 @@ impl RunOpts {
+             }
+         }
+         for mount in &self.mount {
++            if !mount.get_target().is_absolute() {
++                anyhow::bail!(
++                    "--mount target must be absolute: {}",
++                    mount.get_target().display()
++                );
++            }
+             if let Some(source) = mount.get_source()
+                 && !source.exists()
+             {
+diff --git a/hermit-cli/tests/cli.rs b/hermit-cli/tests/cli.rs
+index 9b1677c2c3..29ec01d072 100644
+--- a/hermit-cli/tests/cli.rs
++++ b/hermit-cli/tests/cli.rs
+@@ -3061,6 +3061,101 @@ fn run_rejects_a_missing_bind_source_before_mounting() {
+     assert_failure_contains(&output, &["--mount source", "does not exist", "correct"]);
+ }
+ 
++#[test]
++fn minimal_env_private_workdir_is_empty_for_both_verify_runs() {
++    let _guard = HERMIT_RUN_LOCK.lock().unwrap();
++    let test_root = Path::new("/test");
++    if !test_root.is_dir() {
++        eprintln!(
++            "skipping private /test runtime check: the validation E2E mount namespace supplies the mountpoint"
++        );
++        return;
++    }
++    let snapshot = || {
++        let mut entries = fs::read_dir(test_root)
++            .expect("read outer /test")
++            .map(|entry| entry.expect("read /test entry").file_name())
++            .collect::<Vec<_>>();
++        entries.sort();
++        entries
++    };
++    let before = snapshot();
++
++    let build = tempfile::Builder::new()
++        .prefix("lockdown-")
++        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
++        .expect("create lockdown guest build directory beneath the checkout");
++    let source = build.path().join("lockdown.c");
++    let guest = build.path().join("lockdown");
++    fs::write(
++        &source,
++        r#"
++#include <errno.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++int main(void) {
++    char cwd[4096];
++    if (getenv("PWD") != NULL || getenv("OLDPWD") != NULL) {
++        fputs("ambient cwd variable leaked\n", stderr);
++        return 1;
++    }
++    if (getcwd(cwd, sizeof(cwd)) == NULL || strcmp(cwd, "/test") != 0) {
++        perror("getcwd");
++        return 2;
++    }
++    if (access("verify-half-sentinel", F_OK) == 0 || errno != ENOENT) {
++        fputs("verify half inherited cwd contents\n", stderr);
++        return 3;
++    }
++    int fd = open("verify-half-sentinel", O_WRONLY | O_CREAT | O_EXCL, 0600);
++    if (fd < 0 || close(fd) != 0) {
++        perror("sentinel");
++        return 4;
++    }
++    puts("lockdown-ok");
++    return 0;
++}
++"#,
++    )
++    .expect("write lockdown guest source");
++    let compile = Command::new("cc")
++        .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
++        .arg(&source)
++        .arg("-o")
++        .arg(&guest)
++        .output()
++        .expect("compile lockdown guest");
++    assert!(
++        compile.status.success(),
++        "lockdown guest compilation failed:\n{}",
++        String::from_utf8_lossy(&compile.stderr)
++    );
++
++    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
++        .args([
++            "run",
++            "--base-env=minimal",
++            "--mount=type=tmpfs,target=/test",
++            "--workdir=/test",
++            "--strict",
++            "--verify",
++            "--verify-strict",
++            "--max-timeslice=disabled",
++            "--no-virtualize-cpuid",
++            "--",
++        ])
++        .arg(&guest)
++        .output()
++        .expect("run lockdown guest under Hermit");
++    assert_success(&output, &["private-/test-verify"]);
++    assert_eq!(stdout(&output), "lockdown-ok\n");
++    assert_eq!(snapshot(), before, "Hermit changed the outer /test");
++}
++
+ #[test]
+ fn run_reports_denied_ptrace_and_seccomp_capabilities() {
+     for (syscall, expected) in [
+diff --git a/scripts/manifest-to-commands.rs b/scripts/manifest-to-commands.rs
+index 7d4e5174b2..f007f2b1ef 100755
+--- a/scripts/manifest-to-commands.rs
++++ b/scripts/manifest-to-commands.rs
+@@ -32,6 +32,7 @@ mod rust_script_prelude;
+ #[path = "../ci/manifest-plan/src/manifest_value.rs"]
+ mod manifest_value;
+ 
++use std::collections::BTreeSet;
+ use std::fs;
+ use std::path::Path;
+ use std::path::PathBuf;
+@@ -40,15 +41,22 @@ use std::process::ExitCode;
+ use manifest_value::Value;
+ 
+ const MANIFEST_SCHEMA: i64 = 2;
++const GUEST_FIXTURE_ROOT: &str = "/tmp/hermit-e2e-fixtures";
+ const RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=\"$cell/tmp\" E2E_FIXTURE_DIR=\"$cell/fixtures\"";
+ const HERMIT_RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=/tmp/hermit-e2e E2E_FIXTURE_DIR=\"$cell/fixtures\"";
+ const HERMIT_GUEST_ENV_ARGS: &str = "--env LC_ALL=C --env TZ=UTC --env HOME=\"$cell/home\" --env XDG_CONFIG_HOME=\"$cell/xdg-config\" --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=\"$cell/fixtures\"";
+ 
++#[cfg(not(test))]
+ fn fail(message: impl AsRef<str>) -> ! {
+     eprintln!("manifest-to-commands: {}", message.as_ref());
+     std::process::exit(2);
+ }
+ 
++#[cfg(test)]
++fn fail(message: impl AsRef<str>) -> ! {
++    panic!("manifest-to-commands: {}", message.as_ref());
++}
++
+ fn repo_root() -> PathBuf {
+     let script = Path::new(file!());
+     let root = script
+@@ -69,6 +77,21 @@ fn shell_quote(value: &str) -> String {
+     format!("'{}'", value.replace('\'', "'\\''"))
+ }
+ 
++fn render_guest_argument(value: &str) -> String {
++    let Some(relative) = value.strip_prefix("./") else {
++        return shell_quote(value);
++    };
++    if Path::new(relative)
++        .components()
++        .any(|component| matches!(component, std::path::Component::ParentDir))
++    {
++        fail(format!(
++            "explicit checkout argument must not escape the repository: {value}"
++        ));
++    }
++    format!("\"$(pwd)\"/{}", shell_quote(relative))
++}
++
+ fn slug(value: &str) -> String {
+     value
+         .chars()
+@@ -116,7 +139,7 @@ fn test_id(test: &Value, bucket: &str) -> String {
+         .to_owned()
+ }
+ 
+-fn setup_prefix(test: &Value, id: &str) -> (String, String) {
++fn setup_prefix(test: &Value, id: &str) -> (String, String, String) {
+     let cell = format!("ignored/e2e-commands/work/{}", slug(id));
+     let mut commands = vec![
+         format!("cell={}", shell_quote(&cell)),
+@@ -131,19 +154,24 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
+ 
+     let program = test.get("program").and_then(Value::as_str);
+     let direct = test.get("direct");
+-    let guest = match (program, direct) {
++    let (host_guest, lockdown_guest) = match (program, direct) {
+         (Some(_), Some(_)) => fail(format!("{id}: set only one of `program` and `direct`")),
+         (None, None) => fail(format!("{id}: missing `program` or `direct`")),
+-        (None, Some(Value::String(command))) => format!("sh -c {}", shell_quote(command)),
++        (None, Some(Value::String(command))) => {
++            let guest = format!("sh -c {}", shell_quote(command));
++            (guest.clone(), guest)
++        }
+         (None, Some(Value::Array(_))) => {
+             let argv = string_array(direct, &format!("{id}.direct"));
+             if argv.is_empty() {
+                 fail(format!("{id}: direct argv must not be empty"));
+             }
+-            argv.iter()
+-                .map(|argument| shell_quote(argument))
+-                .collect::<Vec<_>>()
+-                .join(" ")
++            let host = argv.iter().map(|argument| shell_quote(argument)).collect::<Vec<_>>();
++            let lockdown = argv
++                .iter()
++                .map(|argument| render_guest_argument(argument))
++                .collect::<Vec<_>>();
++            (host.join(" "), lockdown.join(" "))
+         }
+         (None, Some(_)) => fail(format!(
+             "{id}: direct must be a shell command string or an argv array"
+@@ -152,7 +180,10 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
+             Some("sh") => {
+                 let script = shell_quote(program);
+                 commands.push(format!("{RUN_ENV} {script} --prepare"));
+-                format!("{script} --run")
++                (
++                    format!("{script} --run"),
++                    format!("\"$(pwd)\"/{script} --run"),
++                )
+             }
+             Some("c") => {
+                 let build = test.get("build").and_then(Value::as_table);
+@@ -183,7 +214,10 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
+                     .collect::<Vec<_>>()
+                     .join(" ");
+                 commands.push(format!("${{CC:-cc}} {args} -o \"$cell/guest\""));
+-                "\"$cell/guest\"".to_owned()
++                (
++                    "\"$cell/guest\"".to_owned(),
++                    "\"$(pwd)/$cell/guest\"".to_owned(),
++                )
+             }
+             Some("rs") => {
+                 let build = test.get("build").and_then(Value::as_table);
+@@ -201,13 +235,16 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
+                     .collect::<Vec<_>>()
+                     .join(" ");
+                 commands.push(format!("${{RUSTC:-rustc}} {args} -o \"$cell/guest\""));
+-                "\"$cell/guest\"".to_owned()
++                (
++                    "\"$cell/guest\"".to_owned(),
++                    "\"$(pwd)/$cell/guest\"".to_owned(),
++                )
+             }
+             other => fail(format!("{id}: unsupported program extension {other:?}")),
+         },
+     };
+ 
+-    (commands.join(" && "), guest)
++    (commands.join(" && "), host_guest, lockdown_guest)
+ }
+ 
+ /// Per-backend guest arguments declared by `modes.<mode>.guest_args.<backend>`.
+@@ -233,19 +270,111 @@ fn mode_guest_args(spec: &Value, mode: &str, backend: &str, id: &str) -> Vec<Str
+     )
+ }
+ 
++fn ci_selected(spec: &Value, mode: &str, backend: &str, id: &str) -> bool {
++    let Some(ci) = spec.get("ci") else {
++        return false;
++    };
++    if let Some(selected) = ci.as_bool() {
++        return selected;
++    }
++    let by_backend = ci
++        .as_table()
++        .unwrap_or_else(|| fail(format!("{id}.modes.{mode}.ci must be a boolean or table")));
++    by_backend
++        .get(backend)
++        .and_then(Value::as_bool)
++        .unwrap_or(false)
++}
++
++fn cell_required(spec: &Value, mode: &str, backend: &str, id: &str) -> bool {
++    string_array(
++        spec.get("backends_enabled"),
++        &format!("{id}.modes.{mode}.backends_enabled"),
++    )
++    .iter()
++    .any(|enabled| enabled == backend)
++        && ci_selected(spec, mode, backend, id)
++}
++
+ /// Append the guest's own arguments to an already-quoted guest word.
+-fn guest_with_args(guest: &str, guest_args: &[String]) -> String {
++fn guest_with_args(guest: &str, guest_args: &[String], resolve_checkout: bool) -> String {
+     if guest_args.is_empty() {
+         return guest.to_owned();
+     }
+     let rendered = guest_args
+         .iter()
+-        .map(|arg| shell_quote(arg))
++        .map(|arg| {
++            if resolve_checkout {
++                render_guest_argument(arg)
++            } else {
++                shell_quote(arg)
++            }
++        })
+         .collect::<Vec<_>>()
+         .join(" ");
+     format!("{guest} {rendered}")
+ }
+ 
++fn prepared_fixture_paths(test: &Value, id: &str, native: bool) -> Vec<String> {
++    let fixtures = string_array(
++        test.get("prepared_fixture_args"),
++        &format!("{id}.prepared_fixture_args"),
++    );
++    if !fixtures.is_empty()
++        && !test
++            .get("program")
++            .and_then(Value::as_str)
++            .is_some_and(|program| program.ends_with(".sh"))
++    {
++        fail(format!(
++            "{id}: prepared_fixture_args requires a shell program with a --prepare phase"
++        ));
++    }
++    let mut seen = BTreeSet::new();
++    let mut rendered = Vec::with_capacity(fixtures.len());
++    for path in fixtures {
++        let path = Path::new(&path);
++        if path.as_os_str().is_empty()
++            || path.is_absolute()
++            || path.components().any(|component| {
++                matches!(
++                    component,
++                    std::path::Component::ParentDir
++                        | std::path::Component::RootDir
++                        | std::path::Component::Prefix(_)
++                )
++            })
++        {
++            fail(format!(
++                "{id}.prepared_fixture_args must contain relative paths without `..`"
++            ));
++        }
++        if !seen.insert(path.to_path_buf()) {
++            fail(format!(
++                "{id}: duplicate prepared fixture argument: {}",
++                path.display()
++            ));
++        }
++        rendered.push(if native {
++            format!(
++                "\"$cell/fixtures\"/{}",
++                shell_quote(&path.to_string_lossy())
++            )
++        } else {
++            shell_quote(&format!("{GUEST_FIXTURE_ROOT}/{}", path.display()))
++        });
++    }
++    rendered
++}
++
++fn guest_with_prepared_fixtures(guest: &str, fixtures: &[String]) -> String {
++    if fixtures.is_empty() {
++        guest.to_owned()
++    } else {
++        format!("{guest} {}", fixtures.join(" "))
++    }
++}
++
+ fn hermit_command(
+     mode: &str,
+     backend: &str,
+@@ -254,24 +383,45 @@ fn hermit_command(
+     seed: Option<i64>,
+     extra: &[String],
+     verify_bitwise_parity: bool,
++    required: bool,
++    prepared_fixtures: bool,
+     guest: &str,
+ ) -> String {
+     let _lane = lane;
+     let profile = "";
++    let lockdown = if !required {
++        ""
++    } else if prepared_fixtures {
++        " --mount=type=bind,source=\"$(pwd)/$cell/fixtures\",target=/tmp/hermit-e2e-fixtures,readonly --mount=type=tmpfs,target=/test --workdir=/test"
++    } else {
++        " --mount=type=tmpfs,target=/test --workdir=/test"
++    };
++    let legacy_guest_env = if required {
++        String::new()
++    } else {
++        format!(" {HERMIT_GUEST_ENV_ARGS}")
++    };
+     let command = match mode {
+         "verify" => {
+             let _verify_bitwise_parity = verify_bitwise_parity;
+             format!(
+-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --base-env=minimal --backend {} --strict $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\"{profile} -- {guest}",
++                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --base-env=minimal --backend {} --strict $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\"{profile}{legacy_guest_env}{lockdown} -- {guest}",
++                shell_quote(backend)
++            )
++        }
++        "replay" => {
++            if required && prepared_fixtures {
++                fail("prepared_fixture_args are not supported by record/replay");
++            }
++            let base_env = if required { " --base-env=minimal" } else { "" };
++            let workdir = if required { " --workdir=/test" } else { "" };
++            format!(
++                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log info --backend {} record start{base_env} --strict $record_verify_strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout {timeout}{workdir}{legacy_guest_env} -- {guest}",
+                 shell_quote(backend)
+             )
+         }
+-        "replay" => format!(
+-            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log info --backend {} record start --strict $record_verify_strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout {timeout} {HERMIT_GUEST_ENV_ARGS} -- {guest}",
+-            shell_quote(backend)
+-        ),
+         "chaos" => format!(
+-            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --base-env=minimal --backend {} --strict $run_verify_strict --verify --verify-allow=both --verify-json \"$cell/captures/verify-seed-{}.json\" --chaos --sched-heuristic=random --seed={}{profile} -- {guest}",
++            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --base-env=minimal --backend {} --strict $run_verify_strict --verify --verify-allow=both --verify-json \"$cell/captures/verify-seed-{}.json\" --chaos --sched-heuristic=random --seed={}{profile}{legacy_guest_env}{lockdown} -- {guest}",
+             shell_quote(backend),
+             seed.unwrap_or(0),
+             seed.unwrap_or(0)
+@@ -283,8 +433,9 @@ fn hermit_command(
+                 .collect::<Vec<_>>()
+                 .join(" ");
+             let separator = if extra.is_empty() { "" } else { " " };
++            let base_env = if required { " --base-env=minimal" } else { "" };
+             format!(
+-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --backend {}{separator}{extra} -- {guest}",
++                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run{base_env} --backend {}{separator}{extra}{lockdown} -- {guest}",
+                 shell_quote(backend)
+             )
+         }
+@@ -318,7 +469,10 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
+         .get("modes")
+         .and_then(Value::as_table)
+         .unwrap_or_else(|| fail(format!("{id}: missing `modes`")));
+-    let (setup, guest) = setup_prefix(test, &id);
++    let (setup, host_guest, lockdown_guest) = setup_prefix(test, &id);
++    let native_prepared = prepared_fixture_paths(test, &id, true);
++    let guest_prepared = prepared_fixture_paths(test, &id, false);
++    let has_prepared_fixtures = !guest_prepared.is_empty();
+     let mut mode_names = modes.keys().map(String::as_str).collect::<Vec<_>>();
+     mode_names.sort_unstable();
+     let mut lines = Vec::new();
+@@ -334,7 +488,8 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
+                 continue;
+             }
+             let runs = spec.get("runs").and_then(Value::as_integer).unwrap_or(3);
+-            let run = format!("timeout --kill-after=10s {timeout}s {RUN_ENV} {guest}");
++            let native_guest = guest_with_prepared_fixtures(&host_guest, &native_prepared);
++            let run = format!("timeout --kill-after=10s {timeout}s {RUN_ENV} {native_guest}");
+             lines.push(format!(
+                 "{setup} && {} # {id} mode=naked backend=native",
+                 repeat(&run, runs)
+@@ -370,8 +525,14 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
+         };
+ 
+         for backend in backends {
++            let required = cell_required(spec, mode, &backend, &id);
+             let guest_args = mode_guest_args(spec, mode, &backend, &id);
+-            let guest = guest_with_args(&guest, &guest_args);
++            let guest = if required {
++                guest_with_prepared_fixtures(&lockdown_guest, &guest_prepared)
++            } else {
++                guest_with_prepared_fixtures(&host_guest, &native_prepared)
++            };
++            let guest = guest_with_args(&guest, &guest_args, required);
+             for seed in &seeds {
+                 let seed = (mode == "chaos").then_some(*seed);
+                 let command = hermit_command(
+@@ -382,6 +543,8 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
+                     seed,
+                     &extra,
+                     verify_bitwise_parity,
++                    required,
++                    has_prepared_fixtures,
+                     &guest,
+                 );
+                 // A chaos command already asks Hermit to execute the same seed
+@@ -605,7 +768,7 @@ test:
+         let args = mode_guest_args(spec, "verify", "ptrace", "c-programs/example");
+         assert_eq!(args, vec!["multi", "value with spaces"]);
+         assert_eq!(
+-            guest_with_args("\"$cell/guest\"", &args),
++            guest_with_args("\"$cell/guest\"", &args, true),
+             "\"$cell/guest\" multi 'value with spaces'"
+         );
+     }
+@@ -644,7 +807,61 @@ test:
+         let spec = &tests[0].1["modes"]["verify"];
+         let args = mode_guest_args(spec, "verify", "ptrace", "c-programs/bare");
+         assert!(args.is_empty());
+-        assert_eq!(guest_with_args("\"$cell/guest\"", &args), "\"$cell/guest\"");
++        assert_eq!(
++            guest_with_args("\"$cell/guest\"", &args, true),
++            "\"$cell/guest\""
++        );
++    }
++
++    #[test]
++    fn only_dot_slash_guest_arguments_are_rebased() {
++        assert_eq!(render_guest_argument("./README.md"), "\"$(pwd)\"/README.md");
++        assert_eq!(
++            render_guest_argument("README.md"),
++            "README.md",
++            "a bare token must not be rebased merely because it exists in the checkout"
++        );
++    }
++
++    #[test]
++    fn lockdown_and_checkout_rebasing_apply_only_to_required_backends() {
++        let tests = manifest(
++            r#"
++test:
++  - id: applications/explicit-example
++    direct: [./examples/example.py]
++    modes:
++      verify:
++        ci:
++          ptrace: true
++          liteinst: false
++        backends_enabled: [ptrace, liteinst]
++"#,
++        );
++        let commands = commands_for_test(&tests[0].1, &tests[0].0);
++        let required = commands
++            .iter()
++            .find(|command| command.contains("backend=ptrace"))
++            .unwrap();
++        assert!(required.contains("--mount=type=tmpfs,target=/test --workdir=/test"));
++        assert!(required.contains("-- \"$(pwd)\"/examples/example.py"));
++        assert!(!required.contains("--env LC_ALL"));
++
++        let manual = commands
++            .iter()
++            .find(|command| command.contains("backend=liteinst"))
++            .unwrap();
++        assert!(!manual.contains("--workdir=/test"));
++        assert!(!manual.contains("target=/test"));
++        assert!(manual.contains("--env LC_ALL=C"));
++        assert!(manual.contains("-- ./examples/example.py"));
++        assert!(!manual.contains("\"$(pwd)\"/examples/example.py"));
++    }
++
++    #[test]
++    #[should_panic(expected = "must not escape the repository")]
++    fn dot_slash_guest_arguments_reject_parent_escape() {
++        let _ = render_guest_argument("./../outside");
+     }
+ 
+     /// A backend that is enabled but not named in `guest_args` gets nothing,
+@@ -708,12 +925,16 @@ test:
+             None,
+             &[],
+             false,
++            true,
++            false,
+             "guest",
+         );
+         assert!(replay.contains("--data-dir \"$cell/recording\" --record-timeout 60"));
+         assert!(replay.contains("--strict $record_verify_strict --verify"));
+         assert!(replay.contains("--verify-json \"$cell/captures/verify.json\""));
+-        assert!(replay.contains(HERMIT_GUEST_ENV_ARGS));
++        assert!(replay.contains("record start --base-env=minimal"));
++        assert!(replay.contains("--workdir=/test -- guest"));
++        assert!(!replay.contains("--env"));
+         assert!(!replay.contains("--no-virtualize-cpuid"));
+ 
+         let chaos = hermit_command(
+@@ -724,6 +945,8 @@ test:
+             Some(7),
+             &[],
+             false,
++            true,
++            false,
+             "guest",
+         );
+         assert!(chaos.contains("run --base-env=minimal"));
+@@ -733,6 +956,7 @@ test:
+         assert!(chaos.contains("--log=info"));
+         assert!(!chaos.contains("--no-virtualize-cpuid"));
+         assert!(!chaos.contains("--max-timeslice=disabled"));
++        assert!(chaos.contains("--mount=type=tmpfs,target=/test --workdir=/test"));
+ 
+         let custom = hermit_command(
+             "custom",
+@@ -740,19 +964,101 @@ test:
+             "portable",
+             60,
+             None,
+-            &["--base-env=minimal".to_owned()],
++            &["--summary".to_owned()],
++            false,
++            true,
+             false,
+             "guest",
+         );
+-        assert!(custom.contains("run --backend ptrace --base-env=minimal -- guest"));
++        assert!(custom.contains("run --base-env=minimal --backend ptrace --summary"));
++        assert!(custom.contains("--mount=type=tmpfs,target=/test --workdir=/test -- guest"));
+         assert!(!custom.contains("--strict"));
+         assert!(!custom.contains("--no-virtualize-cpuid"));
+ 
+-        let verify = hermit_command("verify", "ptrace", "portable", 60, None, &[], true, "guest");
++        let verify = hermit_command(
++            "verify",
++            "ptrace",
++            "portable",
++            60,
++            None,
++            &[],
++            true,
++            true,
++            false,
++            "guest",
++        );
+         assert!(verify.contains("run --base-env=minimal"));
+         assert!(verify.contains(
+             "--strict $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\""
+         ));
++        assert!(verify.contains("--mount=type=tmpfs,target=/test --workdir=/test"));
++    }
++
++    #[test]
++    fn generated_prepared_fixture_paths_match_the_runner_contract() {
++        let tests = manifest(
++            r#"
++test:
++  - id: c-programs/prepared
++    program: tests/e2e/prepared.sh
++    prepared_fixture_args: [fork-tree, nested/pipe-chain]
++    modes:
++      naked:
++        backends_enabled: [native]
++      verify:
++        ci: true
++        backends_enabled: [ptrace]
++"#,
++        );
++        let commands = commands_for_test(&tests[0].1, &tests[0].0);
++        let naked = commands
++            .iter()
++            .find(|command| command.contains("mode=naked"))
++            .unwrap();
++        assert!(naked.contains("\"$cell/fixtures\"/fork-tree"));
++        assert!(naked.contains("\"$cell/fixtures\"/nested/pipe-chain"));
++
++        let verify = commands
++            .iter()
++            .find(|command| command.contains("mode=verify"))
++            .unwrap();
++        assert!(verify.contains(
++            "--mount=type=bind,source=\"$(pwd)/$cell/fixtures\",target=/tmp/hermit-e2e-fixtures,readonly"
++        ));
++        assert!(verify.contains("/tmp/hermit-e2e-fixtures/fork-tree"));
++        assert!(verify.contains("/tmp/hermit-e2e-fixtures/nested/pipe-chain"));
++    }
++
++    #[test]
++    fn prepared_fixture_suffixes_are_shell_quoted() {
++        let tests = manifest(
++            r#"
++test:
++  - id: c-programs/prepared
++    program: tests/e2e/prepared.sh
++    prepared_fixture_args: ['nested/$fixture name']
++    modes: {}
++"#,
++        );
++        assert_eq!(
++            prepared_fixture_paths(&tests[0].1, "c-programs/prepared", true),
++            vec!["\"$cell/fixtures\"/'nested/$fixture name'"]
++        );
++    }
++
++    #[test]
++    #[should_panic(expected = "duplicate prepared fixture argument")]
++    fn duplicate_prepared_fixture_paths_are_rejected() {
++        let tests = manifest(
++            r#"
++test:
++  - id: c-programs/prepared
++    program: tests/e2e/prepared.sh
++    prepared_fixture_args: [program, program]
++    modes: {}
++"#,
++        );
++        let _ = prepared_fixture_paths(&tests[0].1, "c-programs/prepared", false);
+     }
+ 
+     #[test]
+diff --git a/scripts/validate.rs b/scripts/validate.rs
+index 8ee6c0bd8d..484b972b0f 100755
+--- a/scripts/validate.rs
++++ b/scripts/validate.rs
+@@ -91,6 +91,9 @@ mod validate_super; // Normalizes and audits extracted Cargo tests/synthetic arg
+ 
+ use std::collections::BTreeMap;
+ use std::collections::BTreeSet;
++use std::io::Read;
++use std::os::unix::fs::MetadataExt;
++use std::os::unix::fs::OpenOptionsExt;
+ use std::os::unix::fs::PermissionsExt;
+ use std::path::Path;
+ use std::path::PathBuf;
+@@ -109,6 +112,7 @@ use dagrun::scheduler::steps_violating_run_timeout;
+ use dagrun::scheduler::BoxedCgroups;
+ use dagrun::scheduler::monotonic_now_ns;
+ use dagrun::scheduler::STEP_STARTED_MONOTONIC_NS_ENV;
++use sha2::Digest;
+ 
+ use validate_plan::CompatMode;
+ use validate_plan::CompatDisposition;
+@@ -153,6 +157,15 @@ const PARENT_ENV: &str = "DEV_HERMIT_PARENT";
+ const OWN_SCOPE_DEADLINE_ENV: &str = "HERMIT_VALIDATE_SCOPE_DEADLINE_MONOTONIC_NS";
+ const NESTED_SCOPE_SELF_TEST_ENV: &str = "HERMIT_VALIDATE_NESTED_SCOPE_SELF_TEST";
+ const SUMMARY_EPILOGUE_SELF_TEST_ENV: &str = "HERMIT_VALIDATE_SUMMARY_EPILOGUE_SELF_TEST";
++const PRIVATE_TEST_ROOT_ENV: &str = "HERMIT_VALIDATE_PRIVATE_TEST_ROOT";
++const PRIVATE_TEST_ROOT_HELPER_ENV: &str = "HERMIT_VALIDATE_PRIVATE_TEST_ROOT_HELPER";
++const PRIVATE_TEST_ROOT_HELPER_SHA256_ENV: &str =
++    "HERMIT_VALIDATE_PRIVATE_TEST_ROOT_HELPER_SHA256";
++const PRIVATE_TEST_ROOT_VALUE: &str = "canonical-full-manifest-v1";
++const PRIVATE_TEST_ROOT_HELPER_DIR: &str = "/usr/local/libexec";
++const PRIVATE_TEST_ROOT_HELPER_PREFIX: &str = "hermit-private-test-root-";
++const PRIVATE_TEST_ROOT_AUTHORITY: &str =
++    "/usr/local/libexec/hermit-private-test-root.current";
+ const NESTED_SCOPE_OUTER: &str = "outer";
+ const NESTED_SCOPE_INNER: &str = "inner";
+ const NESTED_SCOPE_SIGNAL: &str = "signal";
+@@ -302,6 +315,7 @@ struct Args {
+     run_timeout: Option<i64>,
+     merge_lanes: bool,
+     reuse_parent_manifest_gate: bool,
++    private_test_root_eligible: bool,
+     self_test: bool,
+     show_plan: bool,
+ }
+@@ -437,6 +451,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
+         run_timeout: None,
+         merge_lanes: true,
+         reuse_parent_manifest_gate: false,
++        private_test_root_eligible: canonical_full_private_test_root_args(argv),
+         self_test: false,
+         show_plan: false,
+     };
+@@ -636,6 +651,489 @@ fn force_full_policy_allows(force_full: bool, level: Level, focused: Option<&str
+     !force_full || (level == Level::Full && focused.is_none())
+ }
+ 
++/// Keep Hermit's activation decision byte-for-byte aligned with ci-hub's
++/// helper-install allowlist. The private root is available only for an explicit
++/// canonical `full` child with each harmless presentation/cache flag appearing
++/// at most once; every other full-shaped invocation keeps the legacy runner.
++fn canonical_full_private_test_root_args(argv: &[String]) -> bool {
++    if argv.first().map(String::as_str) != Some("full") {
++        return false;
++    }
++    let mut seen = BTreeSet::new();
++    argv[1..].iter().all(|argument| {
++        matches!(argument.as_str(), "--ignore-cache" | "--no-label-pr" | "--verbose")
++            && seen.insert(argument.as_str())
++    })
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++enum PrivateTestRootActivation {
++    Disabled,
++    CanonicalFull,
++}
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++struct PrivateTestRootHelper {
++    path: String,
++    sha256: String,
++}
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++struct PrivateTestRootAuthority {
++    helper_sha256: String,
++    target: String,
++    owner_pid: u32,
++    owner_start_ticks: u64,
++    unit: String,
++}
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++struct ValidateLockAdmission {
++    target: String,
++    owner_pid: u32,
++    owner_start_ticks: u64,
++}
++
++/// The private `/test` root is intentionally narrower than "an E2E command".
++/// It is canonical validation policy, so it applies only to an admitted,
++/// top-level, complete full profile. Focused and nested invocations remain
++/// diagnostic payloads and must not acquire canonical behavior by inheriting an
++/// environment variable.
++fn private_test_root_activation(
++    args: &Args,
++    nested: bool,
++    lock_admitted: bool,
++) -> PrivateTestRootActivation {
++    if lock_admitted
++        && !nested
++        && args.private_test_root_eligible
++        && args.level == Level::Full
++        && args.focused.is_none()
++    {
++        PrivateTestRootActivation::CanonicalFull
++    } else {
++        PrivateTestRootActivation::Disabled
++    }
++}
++
++fn private_test_root_allows_cache(activation: PrivateTestRootActivation) -> bool {
++    activation == PrivateTestRootActivation::Disabled
++}
++
++fn is_lower_hex(value: &str, len: usize) -> bool {
++    value.len() == len
++        && value
++            .bytes()
++            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++}
++
++fn parse_private_test_root_authority(
++    bytes: &[u8],
++) -> Result<PrivateTestRootAuthority, String> {
++    if !bytes.ends_with(b"\n") || bytes[..bytes.len().saturating_sub(1)].contains(&b'\n') {
++        return Err(
++            "private-/test authority must be exactly one compact JSON object plus newline"
++                .into(),
++        );
++    }
++    let object = serde_json::from_slice::<serde_json::Value>(&bytes[..bytes.len() - 1])
++        .map_err(|error| format!("private-/test authority is not valid JSON: {error}"))?;
++    let object = object
++        .as_object()
++        .ok_or_else(|| "private-/test authority must be a JSON object".to_string())?;
++    let schema_version = object
++        .get("schema_version")
++        .and_then(serde_json::Value::as_u64)
++        .ok_or_else(|| "private-/test authority schema_version must be an integer".to_string())?;
++    let helper_sha256 = object
++        .get("helper_sha256")
++        .and_then(serde_json::Value::as_str)
++        .ok_or_else(|| "private-/test authority helper_sha256 must be a string".to_string())?
++        .to_string();
++    let target = object
++        .get("target")
++        .and_then(serde_json::Value::as_str)
++        .ok_or_else(|| "private-/test authority target must be a string".to_string())?
++        .to_string();
++    let owner_pid_u64 = object
++        .get("owner_pid")
++        .and_then(serde_json::Value::as_u64)
++        .ok_or_else(|| "private-/test authority owner_pid must be an integer".to_string())?;
++    let owner_pid = u32::try_from(owner_pid_u64)
++        .map_err(|_| "private-/test authority owner_pid does not fit u32".to_string())?;
++    let owner_start_ticks = object
++        .get("owner_start_ticks")
++        .and_then(serde_json::Value::as_u64)
++        .ok_or_else(|| {
++            "private-/test authority owner_start_ticks must be an integer".to_string()
++        })?;
++    let unit = object
++        .get("unit")
++        .and_then(serde_json::Value::as_str)
++        .ok_or_else(|| "private-/test authority unit must be a string".to_string())?
++        .to_string();
++    if schema_version != 1 {
++        return Err(format!(
++            "private-/test authority schema_version must be 1, got {schema_version}"
++        ));
++    }
++    if !is_lower_hex(&helper_sha256, 64) {
++        return Err(
++            "private-/test authority helper_sha256 must be 64 lowercase hexadecimal bytes"
++                .into(),
++        );
++    }
++    if !is_lower_hex(&target, 40) {
++        return Err(
++            "private-/test authority target must be a 40-byte lowercase commit SHA".into(),
++        );
++    }
++    if owner_pid <= 1 || owner_start_ticks == 0 {
++        return Err(
++            "private-/test authority owner identity must contain pid > 1 and nonzero start ticks"
++                .into(),
++        );
++    }
++    if !is_validate_service_unit(&unit) {
++        return Err(
++            "private-/test authority unit must be an exact validate-*.service identity".into(),
++        );
++    }
++    let expected = format!(
++        "{{\"schema_version\":1,\"helper_sha256\":\"{helper_sha256}\",\"target\":\"{target}\",\"owner_pid\":{owner_pid},\"owner_start_ticks\":{owner_start_ticks},\"unit\":\"{unit}\"}}\n"
++    );
++    if bytes != expected.as_bytes() {
++        return Err(
++            "private-/test authority must use the closed schema, field order, and compact encoding"
++                .into(),
++        );
++    }
++    Ok(PrivateTestRootAuthority {
++        helper_sha256,
++        target,
++        owner_pid,
++        owner_start_ticks,
++        unit,
++    })
++}
++
++fn is_validate_service_unit(unit: &str) -> bool {
++    unit.starts_with("validate-")
++        && unit.ends_with(".service")
++        && unit
++            .bytes()
++            .all(|byte| byte.is_ascii_alphanumeric() || b"_.@:-".contains(&byte))
++}
++
++fn validate_service_unit_from_cgroup(text: &str) -> Result<String, String> {
++    let mut unified = text.lines().filter_map(|line| line.strip_prefix("0::"));
++    let cgroup = unified
++        .next()
++        .filter(|path| path.starts_with('/'))
++        .ok_or_else(|| "validate-lock owner has no canonical unified cgroup path".to_string())?;
++    if unified.next().is_some() {
++        return Err("validate-lock owner has duplicate unified cgroup entries".into());
++    }
++    let units = Path::new(cgroup)
++        .components()
++        .filter_map(|component| match component {
++            std::path::Component::Normal(name) => name.to_str(),
++            _ => None,
++        })
++        .filter(|name| is_validate_service_unit(name))
++        .collect::<Vec<_>>();
++    match units.as_slice() {
++        [unit] => Ok((*unit).to_string()),
++        [] => Err(format!(
++            "validate-lock owner cgroup {cgroup:?} contains no validate-*.service unit"
++        )),
++        _ => Err(format!(
++            "validate-lock owner cgroup {cgroup:?} contains multiple validation units: {units:?}"
++        )),
++    }
++}
++
++fn live_validate_service_unit(admission: &ValidateLockAdmission) -> Result<String, String> {
++    let pid = i32::try_from(admission.owner_pid)
++        .map_err(|_| "validate-lock owner PID does not fit i32".to_string())?;
++    if !validate_runtime::identity_in_ancestry(pid, admission.owner_start_ticks) {
++        return Err("validate-lock owner identity is no longer live in this ancestry".into());
++    }
++    let path = PathBuf::from(format!("/proc/{}/cgroup", admission.owner_pid));
++    let text = std::fs::read_to_string(&path).map_err(|error| {
++        format!(
++            "cannot read validate-lock owner cgroup {}: {error}",
++            path.display()
++        )
++    })?;
++    if !validate_runtime::identity_in_ancestry(pid, admission.owner_start_ticks) {
++        return Err("validate-lock owner identity changed while its cgroup was inspected".into());
++    }
++    validate_service_unit_from_cgroup(&text)
++}
++
++fn require_trusted_private_test_root_directory(path: &Path) -> Result<(), String> {
++    let metadata = path.symlink_metadata().map_err(|error| {
++        format!(
++            "cannot inspect private-/test trusted directory {}: {error}",
++            path.display()
++        )
++    })?;
++    if !metadata.file_type().is_dir()
++        || metadata.uid() != 0
++        || metadata.gid() != 0
++        || metadata.mode() & 0o7777 != 0o755
++    {
++        return Err(format!(
++            "private-/test trusted directory must be a real root:root 0755 directory: {}",
++            path.display()
++        ));
++    }
++    Ok(())
++}
++
++fn open_trusted_private_test_root_file(
++    path: &Path,
++    exact_mode: u32,
++    what: &str,
++) -> Result<std::fs::File, String> {
++    let file = std::fs::OpenOptions::new()
++        .read(true)
++        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
++        .open(path)
++        .map_err(|error| format!("cannot open private-/test {what} {}: {error}", path.display()))?;
++    let metadata = file
++        .metadata()
++        .map_err(|error| format!("cannot inspect private-/test {what} {}: {error}", path.display()))?;
++    if !metadata.file_type().is_file()
++        || metadata.uid() != 0
++        || metadata.gid() != 0
++        || metadata.mode() & 0o7777 != exact_mode
++    {
++        return Err(format!(
++            "private-/test {what} must be a real root:root {:04o} regular file: {}",
++            exact_mode,
++            path.display()
++        ));
++    }
++    Ok(file)
++}
++
++fn private_test_root_authority_matches(
++    authority: &PrivateTestRootAuthority,
++    admission: &ValidateLockAdmission,
++    live_unit: &str,
++) -> Result<(), String> {
++    if authority.target != admission.target
++        || authority.owner_pid != admission.owner_pid
++        || authority.owner_start_ticks != admission.owner_start_ticks
++        || authority.unit != live_unit
++    {
++        return Err(format!(
++            "private-/test authority is not bound to this live validate-lock admission: target {} owner {}@{} unit {}, expected target {} owner {}@{} unit {}",
++            authority.target,
++            authority.owner_pid,
++            authority.owner_start_ticks,
++            authority.unit,
++            admission.target,
++            admission.owner_pid,
++            admission.owner_start_ticks,
++            live_unit,
++        ));
++    }
++    Ok(())
++}
++
++fn load_private_test_root_helper(
++    activation: PrivateTestRootActivation,
++    admission: Option<&ValidateLockAdmission>,
++) -> Result<Option<PrivateTestRootHelper>, String> {
++    if activation == PrivateTestRootActivation::Disabled {
++        return Ok(None);
++    }
++    let admission = admission.ok_or_else(|| {
++        "canonical full validation has no live validate-lock admission to bind private /test"
++            .to_string()
++    })?;
++    for path in ["/", "/usr", "/usr/local", PRIVATE_TEST_ROOT_HELPER_DIR] {
++        require_trusted_private_test_root_directory(Path::new(path))?;
++    }
++    let authority_path = Path::new(PRIVATE_TEST_ROOT_AUTHORITY);
++    let mut authority_file =
++        open_trusted_private_test_root_file(authority_path, 0o444, "authority")?;
++    let mut authority_bytes = Vec::new();
++    authority_file
++        .read_to_end(&mut authority_bytes)
++        .map_err(|error| {
++            format!(
++                "cannot read private-/test authority {}: {error}",
++                authority_path.display()
++            )
++        })?;
++    let authority = parse_private_test_root_authority(&authority_bytes)?;
++    let live_unit = live_validate_service_unit(admission)?;
++    private_test_root_authority_matches(&authority, admission, &live_unit)?;
++
++    let path = Path::new(PRIVATE_TEST_ROOT_HELPER_DIR).join(format!(
++        "{PRIVATE_TEST_ROOT_HELPER_PREFIX}{}",
++        authority.helper_sha256
++    ));
++    let mut file = open_trusted_private_test_root_file(&path, 0o555, "helper")?;
++    let mut hasher = sha2::Sha256::new();
++    let mut buffer = [0_u8; 64 * 1024];
++    loop {
++        let count = file
++            .read(&mut buffer)
++            .map_err(|error| format!("cannot hash private-/test helper {}: {error}", path.display()))?;
++        if count == 0 {
++            break;
++        }
++        hasher.update(&buffer[..count]);
++    }
++    let actual = format!("{:x}", hasher.finalize());
++    if actual != authority.helper_sha256 {
++        return Err(format!(
++            "private-/test helper digest mismatch for {}: expected {}, got {actual}",
++            path.display(),
++            authority.helper_sha256,
++        ));
++    }
++    eprintln!(
++        "validate: private-/test authority VERIFIED: helper={} sha256={} target={} owner={}@{} unit={}",
++        path.display(),
++        authority.helper_sha256,
++        authority.target,
++        authority.owner_pid,
++        authority.owner_start_ticks,
++        authority.unit,
++    );
++    Ok(Some(PrivateTestRootHelper {
++        path: path.to_string_lossy().into_owned(),
++        sha256: authority.helper_sha256,
++    }))
++}
++
++fn activate_private_test_root(
++    plan: &mut Plan,
++    activation: PrivateTestRootActivation,
++    admission: Option<&ValidateLockAdmission>,
++) -> Result<usize, String> {
++    let helper = load_private_test_root_helper(activation, admission)?;
++    let marked = configure_private_test_root(plan, activation, helper.as_ref())?;
++    if marked > 0 {
++        eprintln!(
++            "validate: private empty /test enabled for {marked} admitted full-profile manifest node(s); tree-only cache disabled"
++        );
++    }
++    Ok(marked)
++}
++
++fn reject_ambient_private_test_root_environment(
++    supplied: &[&'static str],
++) -> Result<(), String> {
++    if supplied.is_empty() {
++        Ok(())
++    } else {
++        Err(format!(
++            "private-/test credentials are parent-owned authority, not ambient input; refusing inherited/supplied variable(s): {}",
++            supplied.join(", ")
++        ))
++    }
++}
++
++fn scrub_ambient_private_test_root_environment() -> Vec<&'static str> {
++    let names = [
++        PRIVATE_TEST_ROOT_ENV,
++        PRIVATE_TEST_ROOT_HELPER_ENV,
++        PRIVATE_TEST_ROOT_HELPER_SHA256_ENV,
++    ];
++    let supplied = names
++        .into_iter()
++        .filter(|name| std::env::var_os(name).is_some())
++        .collect::<Vec<_>>();
++    for name in names {
++        unsafe {
++            std::env::remove_var(name);
++        }
++    }
++    supplied
++}
++
++fn require_private_test_root_environment_clear(context: &str) -> Result<(), String> {
++    let names = [
++        PRIVATE_TEST_ROOT_ENV,
++        PRIVATE_TEST_ROOT_HELPER_ENV,
++        PRIVATE_TEST_ROOT_HELPER_SHA256_ENV,
++    ];
++    let live = names
++        .into_iter()
++        .filter(|name| std::env::var_os(name).is_some())
++        .collect::<Vec<_>>();
++    if !live.is_empty() {
++        return Err(format!(
++            "private-/test environment remained process-global {context}: {}",
++            live.join(", ")
++        ));
++    }
++    let output = Command::new("/usr/bin/env")
++        .output()
++        .map_err(|error| format!("cannot inspect child environment {context}: {error}"))?;
++    if !output.status.success() {
++        return Err(format!(
++            "/usr/bin/env failed while inspecting child environment {context}: {}",
++            output.status
++        ));
++    }
++    let child = String::from_utf8_lossy(&output.stdout);
++    let leaked = child.lines().find(|line| {
++        names
++            .iter()
++            .any(|name| line.strip_prefix(name).is_some_and(|rest| rest.starts_with('=')))
++    });
++    if let Some(line) = leaked {
++        return Err(format!(
++            "private-/test environment leaked to a child {context}: {line}"
++        ));
++    }
++    Ok(())
++}
++
++fn ambient_private_test_root_refusal_bracket() -> Result<(), String> {
++    let exe = std::env::current_exe()
++        .map_err(|error| format!("private-/test ambient bracket cannot resolve itself: {error}"))?;
++    let names = [
++        PRIVATE_TEST_ROOT_ENV,
++        PRIVATE_TEST_ROOT_HELPER_ENV,
++        PRIVATE_TEST_ROOT_HELPER_SHA256_ENV,
++    ];
++    for supplied in names {
++        let mut command = Command::new(&exe);
++        command.arg("--self-test");
++        for name in names {
++            command.env_remove(name);
++        }
++        let output = command
++            .env(supplied, "forged-ambient-authority")
++            .output()
++            .map_err(|error| {
++                format!("private-/test ambient bracket cannot launch child: {error}")
++            })?;
++        let stdout = String::from_utf8_lossy(&output.stdout);
++        let stderr = String::from_utf8_lossy(&output.stderr);
++        if output.status.code() != Some(3)
++            || (!stdout.contains("private /test ambient authority")
++                && !stderr.contains("private /test ambient authority"))
++            || (!stdout.contains(supplied) && !stderr.contains(supplied))
++        {
++            return Err(format!(
++                "private-/test ambient bracket did not refuse {supplied} exactly: status={} stdout={stdout:?} stderr={stderr:?}",
++                output.status
++            ));
++        }
++    }
++    Ok(())
++}
++
+ /// The environment marker only routes an invocation that already parsed the
+ /// explicit `--self-test` flag. An inherited or operator-supplied marker must
+ /// never turn an ordinary validation into a small passing probe.
+@@ -761,6 +1259,7 @@ fn run_nested_scope_probe() -> Result<String, String> {
+             let cgroups = safe_ci_scope::resolve_cgroups(
+                 "safe-ci nested self-test outer", false, Some(NESTED_SCOPE_RUNTIME_S), true,
+             ).map_err(|code| format!("outer cgroup setup refused with exit {code}"))?;
++            require_private_test_root_environment_clear("after the forced outer cgroup re-exec")?;
+             let exe = std::env::current_exe()
+                 .map_err(|error| format!("cannot resolve self-test executable: {error}"))?;
+             let exe = exe.to_str()
+@@ -799,6 +1298,7 @@ fn run_nested_scope_probe() -> Result<String, String> {
+             let cgroups = safe_ci_scope::resolve_cgroups(
+                 "safe-ci nested self-test inner", false, None, false,
+             ).map_err(|code| format!("nested cgroup setup refused with exit {code}"))?;
++            require_private_test_root_environment_clear("inside the nested boxed child")?;
+             run_one_nested_scope_probe_step(
+                 cgroups,
+                 nested_scope_probe_step(
+@@ -928,6 +1428,17 @@ fn strict_flag_missing_from(argv: &[String]) -> bool {
+ /// on every invocation (validate.sh:308); here they are a `--self-test` subcommand
+ /// so the cost is not paid on the hot path.
+ fn self_test() -> Result<(), String> {
++    if [
++        PRIVATE_TEST_ROOT_ENV,
++        PRIVATE_TEST_ROOT_HELPER_ENV,
++        PRIVATE_TEST_ROOT_HELPER_SHA256_ENV,
++    ]
++    .iter()
++    .any(|name| std::env::var_os(name).is_some())
++    {
++        return Err("private-/test credentials leaked from the invoking environment".into());
++    }
++
+     // ---- known-fail-closed disposition, as a pure decision table ----
+     //
+     // The property under test is NOT "the listed rows get mentioned". It is that mentioning
+@@ -1052,7 +1563,6 @@ fn self_test() -> Result<(), String> {
+         }
+     }
+ 
+-
+     // Strict-execution bracket for the legacy below-L2 compatibility modes.
+     // `--strict` must be a Hermit option before the first guest `--`; these
+     // modes still use lossy `--verify`, so this does not call them L2. The
+@@ -1503,6 +2013,7 @@ fn self_test() -> Result<(), String> {
+     self_output_bracket()?;
+     product_front_door_bracket()?;
+     product_front_door_process_bracket()?;
++    ambient_private_test_root_refusal_bracket()?;
+     // ---- DAG-config carry + ungrantable-resource brackets -------------------
+     // BOTH directions. A check that refuses everything would pass the negative
+     // case alone, so the positive case (a real lane admits) is load-bearing.
+@@ -1576,10 +2087,230 @@ cleared-caps refusal names {} starved step(s)",
+         let tmp = std::env::temp_dir().join(format!("validate-plan-selftest-{}", std::process::id()));
+         let full_args = parse_argv(&["full".into(), "--no-label-pr".into()])
+             .map_err(|rc| format!("full-plan bracket: parser refused positive form rc={rc}"))?;
+-        let full = build_plan(&root, &full_args, &tmp)?;
++        for allowed in [
++            vec!["full"],
++            vec!["full", "--ignore-cache"],
++            vec!["full", "--no-label-pr", "--verbose"],
++            vec!["full", "--verbose", "--ignore-cache", "--no-label-pr"],
++        ] {
++            let argv = allowed.into_iter().map(str::to_string).collect::<Vec<_>>();
++            if !canonical_full_private_test_root_args(&argv) {
++                return Err(format!(
++                    "private-/test bracket: canonical argv was refused: {argv:?}"
++                ));
++            }
++        }
++        for rejected in [
++            vec!["full", "--ignore-cache", "--ignore-cache"],
++            vec!["full", "--run-timeout", "3600"],
++            vec!["full", "--allow-cgroup-failure"],
++            vec!["portable-only"],
++            Vec::new(),
++        ] {
++            let argv = rejected.into_iter().map(str::to_string).collect::<Vec<_>>();
++            if canonical_full_private_test_root_args(&argv) {
++                return Err(format!(
++                    "private-/test bracket: noncanonical argv was accepted: {argv:?}"
++                ));
++            }
++        }
++        let mut full = build_plan(&root, &full_args, &tmp)?;
+         if full.second.is_some() {
+             return Err("full-plan bracket: default full plan is still sequential".into());
+         }
++        if private_test_root_activation(&full_args, false, true)
++            != PrivateTestRootActivation::CanonicalFull
++            || private_test_root_activation(&full_args, false, false)
++                != PrivateTestRootActivation::Disabled
++            || private_test_root_activation(&full_args, true, true)
++                != PrivateTestRootActivation::Disabled
++        {
++            return Err(
++                "private-/test bracket: admission/top-level policy is not exact".into(),
++            );
++        }
++        let portable_args = parse_argv(&["portable-only".into(), "--no-label-pr".into()])
++            .map_err(|rc| format!("private-/test bracket: portable parser refused rc={rc}"))?;
++        if private_test_root_activation(&portable_args, false, true)
++            != PrivateTestRootActivation::Disabled
++            || private_test_root_allows_cache(PrivateTestRootActivation::CanonicalFull)
++            || !private_test_root_allows_cache(PrivateTestRootActivation::Disabled)
++        {
++            return Err("private-/test bracket: admission or cache policy is not exact".into());
++        }
++        let helper = PrivateTestRootHelper {
++            path: format!(
++                "{PRIVATE_TEST_ROOT_HELPER_DIR}/{PRIVATE_TEST_ROOT_HELPER_PREFIX}{}",
++                "0".repeat(64)
++            ),
++            sha256: "0".repeat(64),
++        };
++        let authority = PrivateTestRootAuthority {
++            helper_sha256: helper.sha256.clone(),
++            target: "1".repeat(40),
++            owner_pid: 42,
++            owner_start_ticks: 1234,
++            unit: "validate-private-root:test.service".into(),
++        };
++        let encoded = format!(
++            "{{\"schema_version\":1,\"helper_sha256\":\"{}\",\"target\":\"{}\",\"owner_pid\":{},\"owner_start_ticks\":{},\"unit\":\"{}\"}}\n",
++            authority.helper_sha256,
++            authority.target,
++            authority.owner_pid,
++            authority.owner_start_ticks,
++            authority.unit,
++        );
++        if parse_private_test_root_authority(encoded.as_bytes())? != authority {
++            return Err("private-/test bracket: exact authority record did not round-trip".into());
++        }
++        for bad in [
++            format!("{}\n", helper.sha256),
++            format!(
++                "{{\"schema_version\":1,\"helper_sha256\":\"{}\",\"target\":\"{}\",\"owner_pid\":{},\"owner_start_ticks\":{}}}\n",
++                authority.helper_sha256,
++                authority.target,
++                authority.owner_pid,
++                authority.owner_start_ticks,
++            ),
++            encoded.trim_end().to_string(),
++            encoded.replace("\"schema_version\":1", "\"schema_version\":1,\"extra\":0"),
++            encoded.replace(
++                "\"schema_version\":1",
++                "\"schema_version\":1,\"schema_version\":1",
++            ),
++            encoded.replace("\"helper_sha256\":\"0", "\"helper_sha256\":\"A"),
++            encoded.replace(
++                "validate-private-root:test.service",
++                "not-a-validate-unit.service",
++            ),
++            encoded.replace("{\"schema_version\"", "{ \"schema_version\""),
++        ] {
++            if parse_private_test_root_authority(bad.as_bytes()).is_ok() {
++                return Err(format!(
++                    "private-/test bracket: malformed or noncanonical authority was accepted: {bad:?}"
++                ));
++            }
++        }
++        let admission = ValidateLockAdmission {
++            target: authority.target.clone(),
++            owner_pid: authority.owner_pid,
++            owner_start_ticks: authority.owner_start_ticks,
++        };
++        private_test_root_authority_matches(&authority, &admission, &authority.unit)?;
++        for mismatch in [
++            ValidateLockAdmission {
++                target: "2".repeat(40),
++                ..admission.clone()
++            },
++            ValidateLockAdmission {
++                owner_pid: admission.owner_pid + 1,
++                ..admission.clone()
++            },
++            ValidateLockAdmission {
++                owner_start_ticks: admission.owner_start_ticks + 1,
++                ..admission.clone()
++            },
++        ] {
++            if private_test_root_authority_matches(&authority, &mismatch, &authority.unit).is_ok() {
++                return Err(
++                    "private-/test bracket: stale target/owner authority was accepted".into(),
++                );
++            }
++        }
++        if private_test_root_authority_matches(
++            &authority,
++            &admission,
++            "validate-stale.service",
++        )
++        .is_ok()
++        {
++            return Err("private-/test bracket: stale unit authority was accepted".into());
++        }
++        if validate_service_unit_from_cgroup(
++            "0::/user.slice/user-1000.slice/validate-private-root:test.service/safe-ci-1.scope\n",
++        )?
++            != authority.unit
++            || validate_service_unit_from_cgroup("0::/user.slice/session-1.scope\n").is_ok()
++            || validate_service_unit_from_cgroup(
++                "0::/validate-one.service/validate-two.service\n",
++            )
++            .is_ok()
++            || validate_service_unit_from_cgroup(
++                "0::/validate-private-root:test.service\n0::/duplicate\n",
++            )
++            .is_ok()
++        {
++            return Err(
++                "private-/test bracket: live validation-unit derivation is not exact".into(),
++            );
++        }
++        if reject_ambient_private_test_root_environment(&[]).is_err()
++            || reject_ambient_private_test_root_environment(&[PRIVATE_TEST_ROOT_ENV]).is_ok()
++            || reject_ambient_private_test_root_environment(&[
++                PRIVATE_TEST_ROOT_HELPER_ENV,
++                PRIVATE_TEST_ROOT_HELPER_SHA256_ENV,
++            ])
++            .is_ok()
++        {
++            return Err("private-/test bracket: ambient authority refusal is not exact".into());
++        }
++        let marked = configure_private_test_root(
++            &mut full,
++            PrivateTestRootActivation::CanonicalFull,
++            Some(&helper),
++        )?;
++        let mut manifest_runs = 0;
++        for step in full.cfg.steps.iter().chain(
++            full.second
++                .iter()
++                .flat_map(|cfg| cfg.steps.iter()),
++        ) {
++            let has_marker = step.env.get(PRIVATE_TEST_ROOT_ENV).map(String::as_str)
++                == Some(PRIVATE_TEST_ROOT_VALUE);
++            let has_helper = step.env.get(PRIVATE_TEST_ROOT_HELPER_ENV).map(String::as_str)
++                == Some(helper.path.as_str());
++            let has_helper_digest = step
++                .env
++                .get(PRIVATE_TEST_ROOT_HELPER_SHA256_ENV)
++                .map(String::as_str)
++                == Some(helper.sha256.as_str());
++            let is_manifest_run =
++                validation_step_identity(step) == ValidationStepIdentity::ManifestRun;
++            if is_manifest_run {
++                manifest_runs += 1;
++            }
++            if has_marker != is_manifest_run
++                || has_helper != is_manifest_run
++                || has_helper_digest != is_manifest_run
++            {
++                return Err(format!(
++                    "private-/test bracket: marker/helper/identity mismatch on {}",
++                    step.tag()
++                ));
++            }
++        }
++        if marked != manifest_runs || marked == 0 {
++            return Err(format!(
++                "private-/test bracket: marked {marked} of {manifest_runs} manifest runs"
++            ));
++        }
++        let mut forged = full.cfg.steps[0].clone();
++        forged
++            .env
++            .insert(PRIVATE_TEST_ROOT_ENV.into(), PRIVATE_TEST_ROOT_VALUE.into());
++        let mut forged_plan = Plan {
++            cfg: validate_plan::config_from(vec![forged], "forged private-/test marker"),
++            ..Default::default()
++        };
++        if configure_private_test_root(
++            &mut forged_plan,
++            PrivateTestRootActivation::Disabled,
++            None,
++        )
++        .is_ok()
++        {
++            return Err("private-/test bracket: an input-plan marker was accepted".into());
++        }
+         let manifest_nodes: Vec<String> = full
+             .cfg
+             .steps
+@@ -1801,9 +2532,33 @@ cleared-caps refusal names {} starved step(s)",
+             "--no-label-pr".into(),
+         ])
+         .map_err(|rc| format!("full-plan bracket: sequential diagnostic refused rc={rc}"))?;
+-        if build_plan(&root, &sequential_args, &tmp)?.second.is_none() {
++        let mut sequential = build_plan(&root, &sequential_args, &tmp)?;
++        if sequential.second.is_none() {
+             return Err("full-plan bracket: --sequential-lanes did not preserve the fallback".into());
+         }
++        let sequential_marked = configure_private_test_root(
++            &mut sequential,
++            private_test_root_activation(&sequential_args, false, true),
++            Some(&helper),
++        )?;
++        if sequential_marked != 0
++            || sequential.cfg.steps.iter().chain(
++                sequential
++                    .second
++                    .iter()
++                    .flat_map(|cfg| cfg.steps.iter()),
++            )
++            .any(|step| {
++                step.env.contains_key(PRIVATE_TEST_ROOT_ENV)
++                    || step.env.contains_key(PRIVATE_TEST_ROOT_HELPER_ENV)
++                    || step.env.contains_key(PRIVATE_TEST_ROOT_HELPER_SHA256_ENV)
++            })
++        {
++            return Err(
++                "private-/test bracket: noncanonical sequential full plan received credentials"
++                    .into(),
++            );
++        }
+         let nested_args = parse_argv(&[
+             "--portable-strict-compat-only".into(),
+             "--reuse-parent-manifest-gate".into(),
+@@ -3427,6 +4182,65 @@ impl Default for Plan {
+     }
+ }
+ 
++/// Mark exactly the typed manifest-run nodes selected by canonical full
++/// validation. The marker is step-local state consumed by
++/// `ci/run-with-hermit-e2e-artifact.sh`; it is never injected by rewriting a
++/// shell command and never attached to metadata, builders, scorecards, focused
++/// plans, or nested payloads.
++fn configure_private_test_root(
++    plan: &mut Plan,
++    activation: PrivateTestRootActivation,
++    helper: Option<&PrivateTestRootHelper>,
++) -> Result<usize, String> {
++    let premarked: Vec<String> = std::iter::once(&plan.cfg)
++        .chain(plan.second.iter())
++        .flat_map(|cfg| cfg.steps.iter())
++        .filter(|step| {
++            step.env.contains_key(PRIVATE_TEST_ROOT_ENV)
++                || step.env.contains_key(PRIVATE_TEST_ROOT_HELPER_ENV)
++                || step.env.contains_key(PRIVATE_TEST_ROOT_HELPER_SHA256_ENV)
++        })
++        .map(Step::tag)
++        .collect();
++    if !premarked.is_empty() {
++        return Err(format!(
++            "private-/test admission credentials were supplied by the input plan: {}",
++            premarked.join(", ")
++        ));
++    }
++    if activation == PrivateTestRootActivation::Disabled {
++        return Ok(0);
++    }
++    let helper = helper.ok_or_else(|| {
++        "canonical full validation was admitted without a trusted private-/test helper".to_string()
++    })?;
++
++    let mut marked = 0;
++    for cfg in std::iter::once(&mut plan.cfg).chain(plan.second.iter_mut()) {
++        for step in &mut cfg.steps {
++            if validation_step_identity(step) == ValidationStepIdentity::ManifestRun {
++                step.env.insert(
++                    PRIVATE_TEST_ROOT_ENV.to_string(),
++                    PRIVATE_TEST_ROOT_VALUE.to_string(),
++                );
++                step.env.insert(
++                    PRIVATE_TEST_ROOT_HELPER_ENV.to_string(),
++                    helper.path.clone(),
++                );
++                step.env.insert(
++                    PRIVATE_TEST_ROOT_HELPER_SHA256_ENV.to_string(),
++                    helper.sha256.clone(),
++                );
++                marked += 1;
++            }
++        }
++    }
++    if marked == 0 {
++        return Err("canonical full plan contains no manifest-run nodes to isolate".into());
++    }
++    Ok(marked)
++}
++
+ fn test_nodes_of(cfg: &DagConfig) -> BTreeSet<String> {
+     cfg.steps
+         .iter()
+@@ -7672,37 +8486,37 @@ fn receipt_evidence(
+ /// Ask the canonical parent lock authority whether this exact run is admitted.
+ /// Production never trusts caller-supplied owner PIDs or sidecar paths. The
+ /// stop-test JSON seam is confined to an intrinsically non-qualifying fixture.
+-fn canonical_validate_lock_admission(
++fn canonical_validate_lock_authority(
+     parent: Option<&Path>,
+     commit: &str,
+     host: &str,
+-) -> bool {
++) -> Option<ValidateLockAdmission> {
+     let status = if env_flag("HERMIT_VALIDATE_STOP_TEST_MODE", "1") {
+         let Ok(fixture) = std::env::var("VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON") else {
+-            return false;
++            return None;
+         };
+         fixture.into_bytes()
+     } else {
+-        let Some(parent) = parent else { return false };
++        let Some(parent) = parent else { return None };
+         let ci_hub = parent.join("ci-hub/ci-hub");
+         if !ci_hub.is_file() {
+-            return false;
++            return None;
+         }
+         let Ok(output) = Command::new(ci_hub)
+             .args(["validate-lock", "authority-status", "--json"])
+             .output()
+         else {
+-            return false;
++            return None;
+         };
+         if !output.status.success() {
+-            return false;
++            return None;
+         }
+         output.stdout
+     };
+     let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+         .ok()
+         .map(|id| id.trim().to_string());
+-    canonical_validate_lock_status_admits(
++    canonical_validate_lock_status(
+         &status,
+         commit,
+         host,
+@@ -7715,13 +8529,13 @@ fn canonical_validate_lock_admission(
+ /// predicate is the real `/proc` ancestry check in production and a planted,
+ /// inert identity in `--self-test`; no caller-supplied environment marker can
+ /// bypass these exact commit, host, boot, PID, and start-time checks.
+-fn canonical_validate_lock_status_admits(
++fn canonical_validate_lock_status(
+     status: &[u8],
+     commit: &str,
+     host: &str,
+     boot_id: Option<&str>,
+     identity_in_ancestry: impl FnOnce(i32, u64) -> bool,
+-) -> bool {
++) -> Option<ValidateLockAdmission> {
+     fn object_string<'a>(
+         object: &'a serde_json::Map<String, serde_json::Value>,
+         key: &str,
+@@ -7729,13 +8543,13 @@ fn canonical_validate_lock_status_admits(
+         object.get(key).and_then(serde_json::Value::as_str)
+     }
+     let Ok(value) = serde_json::from_slice::<serde_json::Value>(status) else {
+-        return false;
++        return None;
+     };
+     let Some(holder) = value.get("holder").and_then(serde_json::Value::as_object) else {
+-        return false;
++        return None;
+     };
+     let Some(owner) = value.get("owner").and_then(serde_json::Value::as_object) else {
+-        return false;
++        return None;
+     };
+     if value.get("schema_version").and_then(serde_json::Value::as_i64) != Some(1)
+         || value.get("admissible").and_then(serde_json::Value::as_bool) != Some(true)
+@@ -7752,22 +8566,47 @@ fn canonical_validate_lock_status_admits(
+         || object_string(owner, "host") != Some(host)
+         || object_string(owner, "liveness") != Some("alive")
+     {
+-        return false;
++        return None;
+     }
+     let Some(pid64) = owner.get("pid").and_then(serde_json::Value::as_i64) else {
+-        return false;
++        return None;
+     };
+     let Some(start_ticks) = owner.get("start_ticks").and_then(serde_json::Value::as_u64) else {
+-        return false;
++        return None;
+     };
+-    let Ok(pid) = i32::try_from(pid64) else { return false };
++    let Ok(pid) = i32::try_from(pid64) else { return None };
+     if pid <= 1 || start_ticks == 0 {
+-        return false;
++        return None;
+     }
+     if boot_id != object_string(owner, "boot_id") {
+-        return false;
++        return None;
+     }
+-    identity_in_ancestry(pid, start_ticks)
++    if !identity_in_ancestry(pid, start_ticks) {
++        return None;
++    }
++    Some(ValidateLockAdmission {
++        target: commit.to_string(),
++        owner_pid: pid as u32,
++        owner_start_ticks: start_ticks,
++    })
++}
++
++fn canonical_validate_lock_status_admits(
++    status: &[u8],
++    commit: &str,
++    host: &str,
++    boot_id: Option<&str>,
++    identity_in_ancestry: impl FnOnce(i32, u64) -> bool,
++) -> bool {
++    canonical_validate_lock_status(status, commit, host, boot_id, identity_in_ancestry).is_some()
++}
++
++fn canonical_validate_lock_admission(
++    parent: Option<&Path>,
++    commit: &str,
++    host: &str,
++) -> bool {
++    canonical_validate_lock_authority(parent, commit, host).is_some()
+ }
+ 
+ /// Inert two-sided bracket for the front door and the canonical authority
+@@ -9383,6 +10222,13 @@ fn main() -> ExitCode {
+ 
+ /// The whole invocation, returning what it concluded rather than an exit code.
+ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
++    // The trusted parent publishes private-/test authority through a fixed,
++    // root-owned file. No caller environment value is a credential. Scrub the
++    // three step-local names before threads or child processes exist, then
++    // refuse the invocation so an inherited/forged value can never become an
++    // alternate authority channel.
++    let ambient_private_test_root = scrub_ambient_private_test_root_environment();
++
+     let args = match parse_args() {
+         Ok(a) => a,
+         // `parse_args` returns 0 only for `--help`, whose usage text is the
+@@ -9398,6 +10244,21 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
+         }
+     };
+ 
++    if let Err(error) =
++        reject_ambient_private_test_root_environment(&ambient_private_test_root)
++    {
++        return RunSummary::refused(
++            3,
++            args.focused
++                .as_ref()
++                .map(Focused::profile)
++                .unwrap_or_else(|| args.level.name().to_string())
++                .as_str(),
++            "private /test ambient authority",
++            vec![error],
++        );
++    }
++
+     if args.self_test && std::env::var_os(SUMMARY_EPILOGUE_SELF_TEST_ENV).is_some() {
+         return RunSummary::refused(
+             3,
+@@ -9862,6 +10723,40 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
+         );
+     }
+ 
++    // Decide the private-/test policy BEFORE consulting the tree-keyed PASS
++    // cache. Canonical runs never reuse that cache: the run-bound root-owned
++    // helper authority is external to the Hermit tree. The outer pre-scope
++    // process deliberately does not read that authority. After the normal
++    // systemd cgroup re-exec, the observed in-scope process validates it and
++    // marks the typed manifest steps before reaching the (disabled) lookup.
++    let commit = git_sha();
++    let host = short_hostname();
++    let private_test_root_admission =
++        canonical_validate_lock_authority(parent.as_deref(), &commit, &host);
++    let private_test_root_mode = private_test_root_activation(
++        &args,
++        nesting.nested,
++        private_test_root_admission.is_some(),
++    );
++    let mut private_test_root_nodes = None;
++    if private_test_root_mode == PrivateTestRootActivation::Disabled || is_in_scope() {
++        match activate_private_test_root(
++            &mut plan,
++            private_test_root_mode,
++            private_test_root_admission.as_ref(),
++        ) {
++            Ok(marked) => private_test_root_nodes = Some(marked),
++            Err(error) => {
++                return RunSummary::refused(
++                    3,
++                    &plan.profile,
++                    "private /test authority",
++                    vec![error],
++                )
++            }
++        }
++    }
++
+     // ---- tree-keyed result cache (validate.sh:620/655) -------------------
+     //
+     // Runs BEFORE boxing and before the durable log, so a hit leaves no partial
+@@ -9874,7 +10769,6 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
+     let ledger = ledger_path(&root);
+     let ledger_rows = validate_history::read_rows(&ledger);
+     let tree = git_tree();
+-    let host = short_hostname();
+     let toolchain = sh("rustc", &["--version"]).unwrap_or_else(|| "unknown".into());
+     let cache = cache_state(&root);
+     let cache_key = validate_history::CacheKey {
+@@ -9888,6 +10782,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
+     if !nesting.nested
+         && !args.ignore_cache
+         && plan.cacheable
++        && private_test_root_allows_cache(private_test_root_mode)
+         && !wt_dirty
+         && !tree_dirty()
+         && plan.selection_mode == "full"
+@@ -9985,7 +10880,25 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
+             }
+         };
+ 
+-    let commit = git_sha();
++    if private_test_root_nodes.is_none() {
++        match activate_private_test_root(
++            &mut plan,
++            private_test_root_mode,
++            private_test_root_admission.as_ref(),
++        ) {
++            Ok(marked) => private_test_root_nodes = Some(marked),
++            Err(error) => {
++                return RunSummary::refused(
++                    3,
++                    &plan.profile,
++                    "private /test authority",
++                    vec![error],
++                )
++            }
++        }
++    }
++    debug_assert!(private_test_root_nodes.is_some());
++
+     let git_depth = match measure_git_depth(&commit) {
+         Ok(depth) => depth,
+         Err(error) => {
+diff --git a/tests/e2e/applications/kvm-shell-environment.sh b/tests/e2e/applications/kvm-shell-environment.sh
+index d8d8b4e950..11e370a302 100755
+--- a/tests/e2e/applications/kvm-shell-environment.sh
++++ b/tests/e2e/applications/kvm-shell-environment.sh
+@@ -9,9 +9,16 @@ set -euo pipefail
+ case ${1:-} in
+     --prepare) exit 0 ;;
+     --run)
+-        test "$LC_ALL" = C
+-        test "$TZ" = UTC
+-        printf 'kvm-shell:%s:%s\n' "$LC_ALL" "$TZ"
++        # Required manifest cells now exercise the CLI's exact minimal base
++        # environment instead of rebuilding the old runner-specific one.
++        [[ -z ${LC_ALL+x} ]]
++        [[ -z ${TZ+x} ]]
++        [[ ${ASAN_OPTIONS:-} == detect_leaks=0 ]]
++        [[ ${HOME:-} == /root ]]
++        [[ ${HOSTNAME:-} == hermetic-container.local ]]
++        [[ ${LSAN_OPTIONS:-} == detect_leaks=0 ]]
++        [[ ${PATH:-} == /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ]]
++        printf 'kvm-shell:minimal\n'
+         ;;
+     *) echo "usage: $0 --prepare|--run" >&2; exit 2 ;;
+ esac
+diff --git a/tests/e2e/data-handling/archive-roundtrip.sh b/tests/e2e/data-handling/archive-roundtrip.sh
+index e8361426fb..3be84af286 100755
+--- a/tests/e2e/data-handling/archive-roundtrip.sh
++++ b/tests/e2e/data-handling/archive-roundtrip.sh
+@@ -9,7 +9,7 @@ set -euo pipefail
+ case ${1:-} in
+     --prepare) exit 0 ;;
+     --run)
+-        work="${E2E_TMPDIR:-/tmp}/archive"
++        work="${E2E_TMPDIR:-.}/archive"
+         rm -rf "$work"
+         mkdir -p "$work/input" "$work/output"
+         printf 'alpha\nbeta\ngamma\n' >"$work/input/payload.txt"
+diff --git a/tests/e2e/data-handling/dd-partial-transfers.sh b/tests/e2e/data-handling/dd-partial-transfers.sh
+index db97095338..71084afa6f 100755
+--- a/tests/e2e/data-handling/dd-partial-transfers.sh
++++ b/tests/e2e/data-handling/dd-partial-transfers.sh
+@@ -21,7 +21,7 @@ set -euo pipefail
+ case ${1:-} in
+     --prepare) exit 0 ;;
+     --run)
+-        work="${E2E_TMPDIR:-/tmp}/dd-partial"
++        work="${E2E_TMPDIR:-.}/dd-partial"
+         rm -rf "$work"; mkdir -p "$work"
+         src="$work/src.bin"
+         # Deterministic, compressible-but-not-uniform 4096-byte payload.
+@@ -35,6 +35,8 @@ case ${1:-} in
+ 
+         # Byte-at-a-time through a pipe: the reader cannot get a full block, so
+         # every transfer is partial.
++        # `cat` is intentionally the pipe writer under test.
++        # shellcheck disable=SC2002
+         piped=$(cat "$src" | dd bs=1 status=none | wc -c | tr -d '[:space:]')
+         printf 'PIPED %s\n' "$piped"
+         if [ "$piped" -ne 4096 ]; then
+diff --git a/tests/e2e/data-handling/shell-pipeline.sh b/tests/e2e/data-handling/shell-pipeline.sh
+index 8013515edd..3511599009 100755
+--- a/tests/e2e/data-handling/shell-pipeline.sh
++++ b/tests/e2e/data-handling/shell-pipeline.sh
+@@ -9,7 +9,7 @@ set -euo pipefail
+ case ${1:-} in
+     --prepare) exit 0 ;;
+     --run)
+-        work="${E2E_TMPDIR:-/tmp}/shell-pipeline"
++        work="${E2E_TMPDIR:-.}/shell-pipeline"
+         rm -rf "$work"
+         mkdir -p "$work"
+         input="$work/words.txt"
+diff --git a/tests/e2e/determinism-stress/process-chains.sh b/tests/e2e/determinism-stress/process-chains.sh
+index b527d355d0..7b925a0c37 100755
+--- a/tests/e2e/determinism-stress/process-chains.sh
++++ b/tests/e2e/determinism-stress/process-chains.sh
+@@ -8,6 +8,8 @@ set -euo pipefail
+ 
+ case ${1:-} in
+     --prepare)
++        : "${E2E_FIXTURE_DIR:?E2E_FIXTURE_DIR must be set during preparation}"
++        mkdir -p -- "$E2E_FIXTURE_DIR"
+         ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)"
+         cc -std=c11 -O2 -g -Wall -Wextra -Werror -pthread \
+             "$ROOT_DIR/tests/e2e/determinism-stress/fork_tree.c" \
+@@ -17,8 +19,28 @@ case ${1:-} in
+             -o "$E2E_FIXTURE_DIR/pipe-chain"
+         ;;
+     --run)
+-        "$E2E_FIXTURE_DIR/fork-tree"
+-        exec "$E2E_FIXTURE_DIR/pipe-chain"
++        shift
++        if (($# == 2)); then
++            fork_tree=$1
++            pipe_chain=$2
++            for fixture in "$fork_tree" "$pipe_chain"; do
++                if [[ $fixture != /* || ! -x $fixture ]]; then
++                    echo "run fixture must be an absolute executable path: $fixture" >&2
++                    exit 2
++                fi
++            done
++        elif (($# == 0)) && [[ -n ${E2E_FIXTURE_DIR:-} ]]; then
++            # Backward-compatible manual/naked entrypoint. Hermetic manifest
++            # runs pass both guest-visible paths explicitly instead of
++            # forwarding this preparation-only environment variable.
++            fork_tree="$E2E_FIXTURE_DIR/fork-tree"
++            pipe_chain="$E2E_FIXTURE_DIR/pipe-chain"
++        else
++            echo "usage: $0 --run [<fork-tree> <pipe-chain>]" >&2
++            exit 2
++        fi
++        "$fork_tree"
++        exec "$pipe_chain"
+         ;;
+-    *) echo "usage: $0 --prepare|--run" >&2; exit 2 ;;
++    *) echo "usage: $0 --prepare|--run [fixture paths]" >&2; exit 2 ;;
+ esac
+diff --git a/tests/e2e/determinism-stress/thread-contention.sh b/tests/e2e/determinism-stress/thread-contention.sh
+index 3a02869dd1..a8535049ce 100755
+--- a/tests/e2e/determinism-stress/thread-contention.sh
++++ b/tests/e2e/determinism-stress/thread-contention.sh
+@@ -8,6 +8,8 @@ set -euo pipefail
+ 
+ case ${1:-} in
+     --prepare)
++        : "${E2E_FIXTURE_DIR:?E2E_FIXTURE_DIR must be set during preparation}"
++        mkdir -p -- "$E2E_FIXTURE_DIR"
+         ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)"
+         cc -std=c11 -O2 -g -Wall -Wextra -Werror -pthread \
+             "$ROOT_DIR/tests/e2e/determinism-stress/thread_contention.c" \
+@@ -20,10 +22,32 @@ case ${1:-} in
+             -o "$E2E_FIXTURE_DIR/mmap-fork-shared"
+         ;;
+     --run)
+-        "$E2E_FIXTURE_DIR/thread-contention" contention
+-        "$E2E_FIXTURE_DIR/thread-contention" epoll
+-        "$E2E_FIXTURE_DIR/thread-stress"
+-        exec "$E2E_FIXTURE_DIR/mmap-fork-shared"
++        shift
++        if (($# == 3)); then
++            thread_contention=$1
++            thread_stress=$2
++            mmap_fork_shared=$3
++            for fixture in "$thread_contention" "$thread_stress" "$mmap_fork_shared"; do
++                if [[ $fixture != /* || ! -x $fixture ]]; then
++                    echo "run fixture must be an absolute executable path: $fixture" >&2
++                    exit 2
++                fi
++            done
++        elif (($# == 0)) && [[ -n ${E2E_FIXTURE_DIR:-} ]]; then
++            # Backward-compatible manual/naked entrypoint. Hermetic manifest
++            # runs pass all guest-visible paths explicitly instead of
++            # forwarding this preparation-only environment variable.
++            thread_contention="$E2E_FIXTURE_DIR/thread-contention"
++            thread_stress="$E2E_FIXTURE_DIR/thread-stress"
++            mmap_fork_shared="$E2E_FIXTURE_DIR/mmap-fork-shared"
++        else
++            echo "usage: $0 --run [<thread-contention> <thread-stress> <mmap-fork-shared>]" >&2
++            exit 2
++        fi
++        "$thread_contention" contention
++        "$thread_contention" epoll
++        "$thread_stress"
++        exec "$mmap_fork_shared"
+         ;;
+-    *) echo "usage: $0 --prepare|--run" >&2; exit 2 ;;
++    *) echo "usage: $0 --prepare|--run [fixture paths]" >&2; exit 2 ;;
+ esac
+diff --git a/tests/e2e/language-runtimes/cpp-stl-determinism.sh b/tests/e2e/language-runtimes/cpp-stl-determinism.sh
+index 5ee96fd53a..3a7e2d869f 100755
+--- a/tests/e2e/language-runtimes/cpp-stl-determinism.sh
++++ b/tests/e2e/language-runtimes/cpp-stl-determinism.sh
+@@ -8,8 +8,9 @@
+ # End-to-end C++ STL determinism fixture.
+ #
+ # C++ has no implicit compile support in the harness (only .c and .rs), so this
+-# shell wrapper compiles a small STL program natively during --prepare into the
+-# persisted E2E_FIXTURE_DIR and execs the prebuilt binary during --run. The
++# shell wrapper compiles a small STL program natively during --prepare. The
++# manifest runner passes that binary's guest-visible path explicitly to --run;
++# E2E_FIXTURE_DIR remains only as a manual/naked compatibility fallback. The
+ # program's only entropy source is std::random_device (OS getrandom/urandom),
+ # which varies every run natively and is determinized by Hermit --strict; every
+ # downstream STL result (std::set / std::map / std::unordered_map / std::sort /
+@@ -128,41 +129,73 @@ int main() {
+     }
+     std::string payload = oss.str();
+ 
+-    // File I/O: write the payload to E2E_TMPDIR and read it back as bytes.
+-    // Hermit runs the guest with a fresh isolated /tmp per repeat, so create
+-    // the directory first; otherwise the ofstream below fails silently.
++    // File I/O: write the payload to E2E_TMPDIR, or to the private cwd when
++    // the hermetic runner deliberately omits that legacy variable.
+     const char* tmp = std::getenv("E2E_TMPDIR");
+-    std::string dir = tmp ? tmp : "/tmp";
++    std::string dir = tmp ? tmp : ".";
+     std::filesystem::create_directories(dir);
+     std::string path = dir + "/hermit-cpp-stl.txt";
+     {
+         std::ofstream out(path, std::ios::binary | std::ios::trunc);
++        if (!out) {
++            std::fprintf(stderr, "cannot open %s for writing\n", path.c_str());
++            return 1;
++        }
+         out << payload;
++        if (!out) {
++            std::fprintf(stderr, "cannot write %s\n", path.c_str());
++            return 1;
++        }
+     }
+     std::string readback;
+     {
+         std::ifstream in(path, std::ios::binary);
++        if (!in) {
++            std::fprintf(stderr, "cannot open %s for reading\n", path.c_str());
++            return 1;
++        }
+         std::ostringstream buf;
+         buf << in.rdbuf();
++        if (in.bad()) {
++            std::fprintf(stderr, "cannot read %s\n", path.c_str());
++            return 1;
++        }
+         readback = buf.str();
+     }
+ 
++    const bool roundtrip = readback == payload;
++
+     std::printf(
+         "CPPSTL uniq=%zu map=%zu sorted0=%d sortedN=%d epoch_s=%lld "
+         "bytes=%zu payload_fnv=%016llx roundtrip=%d\n",
+         uniq.size(), freq.size(), sorted_nums.front(), sorted_nums.back(),
+         epoch_s, readback.size(),
+         static_cast<unsigned long long>(fnv1a(payload)),
+-        static_cast<int>(readback == payload));
+-    return 0;
++        static_cast<int>(roundtrip));
++    return roundtrip ? 0 : 1;
+ }
+ CPP
+         c++ -std=c++17 -O2 -g -Wall -Wextra -Werror \
+             "$src" -o "$E2E_FIXTURE_DIR/program"
+         ;;
+     --run)
+-        : "${E2E_FIXTURE_DIR:?E2E_FIXTURE_DIR must be set}"
+-        exec "$E2E_FIXTURE_DIR/program"
++        shift
++        if (($# == 1)); then
++            program=$1
++            if [[ $program != /* || ! -x $program ]]; then
++                echo "run fixture must be an absolute executable path: $program" >&2
++                exit 2
++            fi
++        elif (($# == 0)) && [[ -n ${E2E_FIXTURE_DIR:-} ]]; then
++            # Backward-compatible manual/naked entrypoint. Hermetic manifest
++            # runs pass the guest-visible binary path explicitly instead of
++            # forwarding this preparation-only environment variable.
++            program="$E2E_FIXTURE_DIR/program"
++        else
++            echo "usage: $0 --run [<program>]" >&2
++            exit 2
++        fi
++        exec "$program"
+         ;;
+     *)
+         echo "usage: $0 --prepare|--run" >&2
+diff --git a/tests/e2e/manifests/README.md b/tests/e2e/manifests/README.md
+index 1157e85629..1e31fd0006 100644
+--- a/tests/e2e/manifests/README.md
++++ b/tests/e2e/manifests/README.md
+@@ -60,6 +60,19 @@ command. Program extensions select the runner:
+ - `.c`: compile implicitly with `cc` plus optional `build.cflags`;
+ - `.rs`: compile implicitly with `rustc` plus optional `build.rustflags`.
+ 
++A shell program whose `--prepare` phase builds executables for `--run` declares
++their fixture-relative paths in `prepared_fixture_args`. The harness exposes
++that one per-cell fixture directory read-only at
++`/tmp/hermit-e2e-fixtures` and passes fixed absolute guest paths; absolute paths,
++`..`, duplicates, and non-shell use are rejected.
++
++Every required non-native invocation uses `--base-env=minimal` and begins in
++`/test`. Ordinary `run` modes mount a fresh tmpfs there for each invocation;
++the two halves of `--verify` therefore cannot exchange files. Tests may use the
++empty cwd as scratch space, but must receive intentional inputs through an
++explicit argument rather than inherited `PWD`, `OLDPWD`, `HOME`, or checkout
++cwd state.
++
+ `MODE` is always the outer axis. Every entry declares exactly these five
+ tables: `verify`, `chaos`, `replay`, `naked`, and `custom`. Each table has a
+ `backends_enabled` list and a `backends_disabled` table. The two must form a
+diff --git a/tests/e2e/manifests/c-programs.yaml b/tests/e2e/manifests/c-programs.yaml
+index 58b64b3d85..f67fa5acf9 100644
+--- a/tests/e2e/manifests/c-programs.yaml
++++ b/tests/e2e/manifests/c-programs.yaml
+@@ -6611,9 +6611,9 @@ test:
+           - sabre
+         guest_args:
+           ptrace:
+-            - README.md
++            - ./README.md
+           sabre:
+-            - README.md
++            - ./README.md
+         backends_disabled:
+           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
+diff --git a/tests/e2e/manifests/determinism-stress.yaml b/tests/e2e/manifests/determinism-stress.yaml
+index e247ad58e4..30c5015eab 100644
+--- a/tests/e2e/manifests/determinism-stress.yaml
++++ b/tests/e2e/manifests/determinism-stress.yaml
+@@ -131,6 +131,10 @@ test:
+     timeout_seconds: 120
+     occasional: false
+     program: tests/e2e/determinism-stress/thread-contention.sh
++    prepared_fixture_args:
++      - thread-contention
++      - thread-stress
++      - mmap-fork-shared
+     observation:
+       status: true
+       stdout: true
+@@ -194,6 +198,9 @@ test:
+     timeout_seconds: 120
+     occasional: false
+     program: tests/e2e/determinism-stress/process-chains.sh
++    prepared_fixture_args:
++      - fork-tree
++      - pipe-chain
+     observation:
+       status: true
+       stdout: true
+diff --git a/tests/e2e/manifests/language-runtimes.yaml b/tests/e2e/manifests/language-runtimes.yaml
+index 5dac3baf44..67c1c0d2cf 100644
+--- a/tests/e2e/manifests/language-runtimes.yaml
++++ b/tests/e2e/manifests/language-runtimes.yaml
+@@ -135,6 +135,8 @@ test:
+     timeout_seconds: 90
+     occasional: false
+     program: tests/e2e/language-runtimes/cpp-stl-determinism.sh
++    prepared_fixture_args:
++      - program
+     observation:
+       status: true
+       stdout: true
+diff --git a/tests/e2e/manifests/system-utils.yaml b/tests/e2e/manifests/system-utils.yaml
+index 4c83db8fe1..83c1ccfce6 100644
+--- a/tests/e2e/manifests/system-utils.yaml
++++ b/tests/e2e/manifests/system-utils.yaml
+@@ -65,7 +65,6 @@ test:
+       custom:
+         ci: true
+         args:
+-          - --base-env=minimal
+           - --no-virtualize-cpuid
+           - --max-timeslice=disabled
+         assert:
+@@ -1289,7 +1288,7 @@ test:
+       - /usr/bin/du
+       - -sb
+       - --
+-      - tests/e2e
++      - ./tests/e2e
+     observation:
+       status: true
+       stdout: true
+@@ -1350,7 +1349,7 @@ test:
+     occasional: false
+     direct:
+       - /usr/bin/find
+-      - tests/e2e
++      - ./tests/e2e
+       - -mindepth
+       - '1'
+       - -maxdepth
+diff --git a/tests/e2e/system-utils/auxv-loader-dump.sh b/tests/e2e/system-utils/auxv-loader-dump.sh
+index e73d82a77e..b3bfd9aeb6 100755
+--- a/tests/e2e/system-utils/auxv-loader-dump.sh
++++ b/tests/e2e/system-utils/auxv-loader-dump.sh
+@@ -22,6 +22,7 @@ set -euo pipefail
+ case ${1:-} in
+     --prepare) exit 0 ;;
+     --run)
++        E2E_TMPDIR=${E2E_TMPDIR:-.}
+         # /bin/true is the smallest real dynamically-linked binary; the work
+         # under test is the loader's, not the program's.
+         work="${E2E_TMPDIR:-/tmp}"
+diff --git a/tests/e2e/system-utils/ps-proc-table.sh b/tests/e2e/system-utils/ps-proc-table.sh
+index 150e2a98b6..109642021a 100755
+--- a/tests/e2e/system-utils/ps-proc-table.sh
++++ b/tests/e2e/system-utils/ps-proc-table.sh
+@@ -22,6 +22,7 @@ set -euo pipefail
+ case ${1:-} in
+     --prepare) exit 0 ;;
+     --run)
++        E2E_TMPDIR=${E2E_TMPDIR:-.}
+         # Walk the whole table. Sorted so the report does not depend on the
+         # order /proc happens to enumerate, which is a separate contract.
+         work="${E2E_TMPDIR:-/tmp}"
+diff --git a/tests/manifest-cli.rs b/tests/manifest-cli.rs
+index 54373eec41..33528a915a 100755
+--- a/tests/manifest-cli.rs
++++ b/tests/manifest-cli.rs
+@@ -35,6 +35,7 @@
+ //! [dependencies]
+ //! serde = { version = "1", features = ["derive"] }
+ //! serde_yaml = "0.9"
++//! toml = "0.8"
+ //! ```
+ 
+ #[path = "../scripts/lib/rust_script_prelude.rs"]
+@@ -53,6 +54,7 @@ use std::process::ExitCode;
+ use manifest_value::Value;
+ 
+ const MANIFEST_SCHEMA: i64 = 2;
++const GUEST_FIXTURE_ROOT: &str = "/tmp/hermit-e2e-fixtures";
+ const RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=\"$cell/tmp\" E2E_FIXTURE_DIR=\"$cell/fixtures\"";
+ const HERMIT_RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=/tmp/hermit-e2e E2E_FIXTURE_DIR=\"$cell/fixtures\"";
+ const HERMIT_GUEST_ENV_ARGS: &str = "--env LC_ALL=C --env TZ=UTC --env HOME=\"$cell/home\" --env XDG_CONFIG_HOME=\"$cell/xdg-config\" --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=\"$cell/fixtures\"";
+@@ -82,6 +84,21 @@ fn shell_quote(value: &str) -> String {
+     format!("'{}'", value.replace('\'', "'\\''"))
+ }
+ 
++fn render_guest_argument(value: &str) -> String {
++    let Some(relative) = value.strip_prefix("./") else {
++        return shell_quote(value);
++    };
++    if Path::new(relative)
++        .components()
++        .any(|component| matches!(component, std::path::Component::ParentDir))
++    {
++        fail(format!(
++            "explicit checkout argument must not escape the repository: {value}"
++        ));
++    }
++    format!("\"$(pwd)\"/{}", shell_quote(relative))
++}
++
+ fn slug(value: &str) -> String {
+     value
+         .chars()
+@@ -145,7 +162,7 @@ fn test_id(test: &Value, bucket: &str) -> String {
+ 
+ /// Build the shell setup prefix (compile/prepare the guest) and return the
+ /// guest invocation string. Identical contract to `manifest-to-commands.rs`.
+-fn setup_prefix(test: &Value, id: &str) -> (String, String) {
++fn setup_prefix(test: &Value, id: &str) -> (String, String, String) {
+     let cell = format!("ignored/e2e-commands/work/{}", slug(id));
+     let mut commands = vec![
+         format!("cell={}", shell_quote(&cell)),
+@@ -160,19 +177,24 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
+ 
+     let program = test.get("program").and_then(Value::as_str);
+     let direct = test.get("direct");
+-    let guest = match (program, direct) {
++    let (host_guest, lockdown_guest) = match (program, direct) {
+         (Some(_), Some(_)) => fail(format!("{id}: set only one of `program` and `direct`")),
+         (None, None) => fail(format!("{id}: missing `program` or `direct`")),
+-        (None, Some(Value::String(command))) => format!("sh -c {}", shell_quote(command)),
++        (None, Some(Value::String(command))) => {
++            let guest = format!("sh -c {}", shell_quote(command));
++            (guest.clone(), guest)
++        }
+         (None, Some(Value::Array(_))) => {
+             let argv = string_array(direct, &format!("{id}.direct"));
+             if argv.is_empty() {
+                 fail(format!("{id}: direct argv must not be empty"));
+             }
+-            argv.iter()
+-                .map(|argument| shell_quote(argument))
+-                .collect::<Vec<_>>()
+-                .join(" ")
++            let host = argv.iter().map(|argument| shell_quote(argument)).collect::<Vec<_>>();
++            let lockdown = argv
++                .iter()
++                .map(|argument| render_guest_argument(argument))
++                .collect::<Vec<_>>();
++            (host.join(" "), lockdown.join(" "))
+         }
+         (None, Some(_)) => fail(format!(
+             "{id}: direct must be a shell command string or an argv array"
+@@ -181,7 +203,10 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
+             Some("sh") => {
+                 let script = shell_quote(program);
+                 commands.push(format!("{RUN_ENV} {script} --prepare"));
+-                format!("{script} --run")
++                (
++                    format!("{script} --run"),
++                    format!("\"$(pwd)\"/{script} --run"),
++                )
+             }
+             Some("c") => {
+                 let build = test.get("build").and_then(Value::as_table);
+@@ -212,7 +237,10 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
+                     .collect::<Vec<_>>()
+                     .join(" ");
+                 commands.push(format!("${{CC:-cc}} {args} -o \"$cell/guest\""));
+-                "\"$cell/guest\"".to_owned()
++                (
++                    "\"$cell/guest\"".to_owned(),
++                    "\"$(pwd)/$cell/guest\"".to_owned(),
++                )
+             }
+             Some("rs") => {
+                 let build = test.get("build").and_then(Value::as_table);
+@@ -230,13 +258,130 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
+                     .collect::<Vec<_>>()
+                     .join(" ");
+                 commands.push(format!("${{RUSTC:-rustc}} {args} -o \"$cell/guest\""));
+-                "\"$cell/guest\"".to_owned()
++                (
++                    "\"$cell/guest\"".to_owned(),
++                    "\"$(pwd)/$cell/guest\"".to_owned(),
++                )
+             }
+             other => fail(format!("{id}: unsupported program extension {other:?}")),
+         },
+     };
+ 
+-    (commands.join(" && "), guest)
++    (commands.join(" && "), host_guest, lockdown_guest)
++}
++
++fn prepared_fixture_paths(test: &Value, id: &str, native: bool) -> Vec<String> {
++    let fixtures = string_array(
++        test.get("prepared_fixture_args"),
++        &format!("{id}.prepared_fixture_args"),
++    );
++    if !fixtures.is_empty()
++        && !test
++            .get("program")
++            .and_then(Value::as_str)
++            .is_some_and(|program| program.ends_with(".sh"))
++    {
++        fail(format!(
++            "{id}: prepared_fixture_args requires a shell program with a --prepare phase"
++        ));
++    }
++    let mut seen = BTreeSet::new();
++    let mut rendered = Vec::with_capacity(fixtures.len());
++    for path in fixtures {
++        let path = Path::new(&path);
++        if path.as_os_str().is_empty()
++            || path.is_absolute()
++            || path.components().any(|component| {
++                matches!(
++                    component,
++                    std::path::Component::ParentDir
++                        | std::path::Component::RootDir
++                        | std::path::Component::Prefix(_)
++                )
++            })
++        {
++            fail(format!(
++                "{id}.prepared_fixture_args must contain relative paths without `..`"
++            ));
++        }
++        if !seen.insert(path.to_path_buf()) {
++            fail(format!(
++                "{id}: duplicate prepared fixture argument: {}",
++                path.display()
++            ));
++        }
++        rendered.push(if native {
++            format!(
++                "\"$cell/fixtures\"/{}",
++                shell_quote(&path.to_string_lossy())
++            )
++        } else {
++            shell_quote(&format!("{GUEST_FIXTURE_ROOT}/{}", path.display()))
++        });
++    }
++    rendered
++}
++
++fn guest_with_prepared_fixtures(guest: &str, fixtures: &[String]) -> String {
++    if fixtures.is_empty() {
++        guest.to_owned()
++    } else {
++        format!("{guest} {}", fixtures.join(" "))
++    }
++}
++
++fn mode_guest_args(spec: &Value, mode: &str, backend: &str, id: &str) -> Vec<String> {
++    let Some(by_backend) = spec.get("guest_args") else {
++        return Vec::new();
++    };
++    let by_backend = by_backend
++        .as_table()
++        .unwrap_or_else(|| fail(format!("{id}.modes.{mode}.guest_args must be a table")));
++    string_array(
++        by_backend.get(backend),
++        &format!("{id}.modes.{mode}.guest_args.{backend}"),
++    )
++}
++
++fn ci_selected(spec: &Value, mode: &str, backend: &str, id: &str) -> bool {
++    let Some(ci) = spec.get("ci") else {
++        return false;
++    };
++    if let Some(selected) = ci.as_bool() {
++        return selected;
++    }
++    let by_backend = ci
++        .as_table()
++        .unwrap_or_else(|| fail(format!("{id}.modes.{mode}.ci must be a boolean or table")));
++    by_backend
++        .get(backend)
++        .and_then(Value::as_bool)
++        .unwrap_or(false)
++}
++
++fn cell_required(spec: &Value, mode: &str, backend: &str, id: &str) -> bool {
++    mode_backends(spec, mode, id)
++        .iter()
++        .any(|enabled| enabled == backend)
++        && ci_selected(spec, mode, backend, id)
++}
++
++fn guest_with_args(guest: &str, guest_args: &[String], resolve_checkout: bool) -> String {
++    if guest_args.is_empty() {
++        return guest.to_owned();
++    }
++    let rendered = guest_args
++        .iter()
++        .map(|argument| {
++            if resolve_checkout {
++                render_guest_argument(argument)
++            } else {
++                shell_quote(argument)
++            }
++        })
++        .collect::<Vec<_>>()
++        .join(" ");
++    format!("{guest} {rendered}")
+ }
+ 
+ /// Assemble the Hermit invocation for one (mode, backend) cell. `log` overrides
+@@ -253,11 +398,25 @@ fn hermit_command(
+     verify_bitwise_parity: bool,
+     log: &str,
+     extra: &[String],
++    required: bool,
++    prepared_fixtures: bool,
+     guest: &str,
+ ) -> String {
+     let _lane = lane;
+     let profile: Vec<String> = Vec::new();
+     let be = shell_quote(backend);
++    let lockdown = if !required {
++        ""
++    } else if prepared_fixtures {
++        " --mount=type=bind,source=\"$(pwd)/$cell/fixtures\",target=/tmp/hermit-e2e-fixtures,readonly --mount=type=tmpfs,target=/test --workdir=/test"
++    } else {
++        " --mount=type=tmpfs,target=/test --workdir=/test"
++    };
++    let legacy_guest_env = if required {
++        String::new()
++    } else {
++        format!(" {HERMIT_GUEST_ENV_ARGS}")
++    };
+     let run_extra_joined = {
+         let mut all: Vec<String> = profile;
+         all.extend(extra.iter().map(|x| shell_quote(x)));
+@@ -284,18 +443,25 @@ fn hermit_command(
+         "verify" => {
+             let _verify_bitwise_parity = verify_bitwise_parity;
+             format!(
+-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --base-env=minimal --backend {be} --strict $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\"{run_extra_joined} -- {guest}"
++                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --base-env=minimal --backend {be} --strict $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\"{run_extra_joined}{legacy_guest_env}{lockdown} -- {guest}"
++            )
++        }
++        "replay" => {
++            if required && prepared_fixtures {
++                fail("prepared_fixture_args are not supported by record/replay");
++            }
++            let base_env = if required { " --base-env=minimal" } else { "" };
++            let workdir = if required { " --workdir=/test" } else { "" };
++            format!(
++                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log {log} --backend {be} record start{base_env} --strict $record_verify_strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout {timeout}{workdir}{legacy_guest_env}{extra_joined} -- {guest}"
+             )
+         }
+-        "replay" => format!(
+-            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log {log} --backend {be} record start --strict $record_verify_strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout {timeout} {HERMIT_GUEST_ENV_ARGS}{extra_joined} -- {guest}"
+-        ),
+         "chaos" => {
+             let seed = seed.unwrap_or_else(|| {
+                 fail("internal error: chaos command construction requires a declared seed")
+             });
+             format!(
+-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --base-env=minimal --backend {be} --strict $run_verify_strict --verify --verify-allow=both --verify-json \"$cell/captures/verify-seed-{seed}.json\" --chaos --sched-heuristic=random --seed={seed}{run_extra_joined} -- {guest}"
++                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --base-env=minimal --backend {be} --strict $run_verify_strict --verify --verify-allow=both --verify-json \"$cell/captures/verify-seed-{seed}.json\" --chaos --sched-heuristic=random --seed={seed}{run_extra_joined}{legacy_guest_env}{lockdown} -- {guest}"
+             )
+         }
+         "custom" => {
+@@ -307,8 +473,9 @@ fn hermit_command(
+                 .collect::<Vec<_>>()
+                 .join(" ");
+             let sep = if margs.is_empty() { "" } else { " " };
++            let base_env = if required { " --base-env=minimal" } else { "" };
+             format!(
+-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --backend {be}{sep}{margs} -- {guest}"
++                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run{base_env} --backend {be}{sep}{margs}{lockdown} -- {guest}"
+             )
+         }
+         other => fail(format!("unsupported mode `{other}`")),
+@@ -376,10 +543,7 @@ fn load_manifests(root: &Path) -> Manifests {
+     Manifests { tests }
+ }
+ 
+-fn modes_table<'a>(
+-    test: &'a Value,
+-    id: &str,
+-) -> &'a std::collections::BTreeMap<String, Value> {
++fn modes_table<'a>(test: &'a Value, id: &str) -> &'a std::collections::BTreeMap<String, Value> {
+     test.get("modes")
+         .and_then(Value::as_table)
+         .unwrap_or_else(|| fail(format!("{id}: missing `modes`")))
+@@ -638,20 +802,25 @@ fn resolve_cell(test: &Value, id: &str, args: &Args) -> (String, String, String,
+ 
+ fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, String) {
+     let (mode, backend, lane, timeout) = resolve_cell(test, id, args);
+-    let (setup, guest) = setup_prefix(test, id);
++    let (setup, host_guest, lockdown_guest) = setup_prefix(test, id);
++    let native_prepared = prepared_fixture_paths(test, id, true);
++    let guest_prepared = prepared_fixture_paths(test, id, false);
++    let has_prepared_fixtures = !guest_prepared.is_empty();
++    let modes = modes_table(test, id);
++    let spec = &modes[&mode];
++    let required = mode != "naked" && cell_required(spec, &mode, &backend, id);
++    let guest_args = mode_guest_args(spec, &mode, &backend, id);
+     let log = args
+         .flag("log")
+         .map(str::to_owned)
+         .unwrap_or_else(|| default_log(&mode).to_owned());
+     let mode_args = if mode == "custom" {
+-        let modes = modes_table(test, id);
+-        string_array(modes[&mode].get("args"), &format!("{id}.modes.custom.args"))
++        string_array(spec.get("args"), &format!("{id}.modes.custom.args"))
+     } else {
+         Vec::new()
+     };
+     let verify_bitwise_parity = if mode == "verify" {
+-        modes_table(test, id)[&mode]
+-            .get("assert")
++        spec.get("assert")
+             .and_then(Value::as_table)
+             .and_then(|assert| assert.get("bitwise_parity"))
+             .and_then(Value::as_bool)
+@@ -660,14 +829,21 @@ fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, S
+         false
+     };
+     let seed = if mode == "chaos" {
+-        let modes = modes_table(test, id);
+-        Some(first_chaos_seed(&modes[&mode], id).unwrap_or_else(|error| fail(error)))
++        Some(first_chaos_seed(spec, id).unwrap_or_else(|error| fail(error)))
+     } else {
+         None
+     };
+     let run = if mode == "naked" {
++        let guest = guest_with_prepared_fixtures(&host_guest, &native_prepared);
++        let guest = guest_with_args(&guest, &guest_args, false);
+         format!("timeout --kill-after=10s {timeout}s {RUN_ENV} {guest}")
+     } else {
++        let guest = if required {
++            guest_with_prepared_fixtures(&lockdown_guest, &guest_prepared)
++        } else {
++            guest_with_prepared_fixtures(&host_guest, &native_prepared)
++        };
++        let guest = guest_with_args(&guest, &guest_args, required);
+         hermit_command(
+             &mode,
+             &backend,
+@@ -678,6 +854,8 @@ fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, S
+             verify_bitwise_parity,
+             &log,
+             &args.passthrough,
++            required,
++            has_prepared_fixtures,
+             &guest,
+         )
+     };
+@@ -696,12 +874,16 @@ fn self_test() -> ExitCode {
+         false,
+         "info",
+         &[],
++        true,
++        false,
+         "guest",
+     );
+     assert!(replay.contains("--data-dir \"$cell/recording\" --record-timeout 60"));
+     assert!(replay.contains("--strict $record_verify_strict --verify"));
+     assert!(replay.contains("--verify-json \"$cell/captures/verify.json\""));
+-    assert!(replay.contains(HERMIT_GUEST_ENV_ARGS));
++    assert!(replay.contains("record start --base-env=minimal"));
++    assert!(replay.contains("--workdir=/test -- guest"));
++    assert!(!replay.contains("--env"));
+     assert!(!replay.contains("--no-virtualize-cpuid"));
+ 
+     let chaos = hermit_command(
+@@ -714,6 +896,8 @@ fn self_test() -> ExitCode {
+         false,
+         "info",
+         &[],
++        true,
++        false,
+         "guest",
+     );
+     assert!(chaos.contains("run --base-env=minimal"));
+@@ -723,6 +907,7 @@ fn self_test() -> ExitCode {
+     assert!(chaos.contains("--log=info"));
+     assert!(!chaos.contains("--no-virtualize-cpuid"));
+     assert!(!chaos.contains("--max-timeslice=disabled"));
++    assert!(chaos.contains("--mount=type=tmpfs,target=/test --workdir=/test"));
+     let seeded_chaos: Value = "seeds: [7, 9]".parse().unwrap();
+     let no_seed_chaos = Value::Table(Default::default());
+     assert_eq!(first_chaos_seed(&seeded_chaos, "fixture").unwrap(), 7);
+@@ -738,13 +923,16 @@ fn self_test() -> ExitCode {
+         "portable",
+         60,
+         None,
+-        &["--base-env=minimal".to_owned()],
++        &["--summary".to_owned()],
+         false,
+         "info",
+         &[],
++        true,
++        false,
+         "guest",
+     );
+-    assert!(custom.contains("run --backend ptrace --base-env=minimal -- guest"));
++    assert!(custom.contains("run --base-env=minimal --backend ptrace --summary"));
++    assert!(custom.contains("--mount=type=tmpfs,target=/test --workdir=/test -- guest"));
+     assert!(!custom.contains("--strict"));
+     assert!(!custom.contains("--no-virtualize-cpuid"));
+ 
+@@ -758,6 +946,8 @@ fn self_test() -> ExitCode {
+         true,
+         "info",
+         &[],
++        true,
++        false,
+         "guest",
+     );
+     assert!(verify.contains("run --base-env=minimal"));
+@@ -766,6 +956,7 @@ fn self_test() -> ExitCode {
+     ));
+     assert!(!verify.contains("--no-virtualize-cpuid"));
+     assert!(!verify.contains("--max-timeslice=disabled"));
++    assert!(verify.contains("--mount=type=tmpfs,target=/test --workdir=/test"));
+     let weak_verify = hermit_command(
+         "verify",
+         "ptrace",
+@@ -776,10 +967,68 @@ fn self_test() -> ExitCode {
+         false,
+         "info",
+         &[],
++        true,
++        false,
+         "guest",
+     );
+     assert!(weak_verify.contains("--verify --verify-json \"$cell/captures/verify.json\""));
+     assert!(weak_verify.contains("--strict $run_verify_strict --verify"));
++    let manual_verify = hermit_command(
++        "verify",
++        "liteinst",
++        "portable",
++        60,
++        None,
++        &[],
++        false,
++        "info",
++        &[],
++        false,
++        false,
++        "./examples/example.py",
++    );
++    assert!(manual_verify.contains("--env LC_ALL=C"));
++    assert!(!manual_verify.contains("--workdir=/test"));
++    assert!(!manual_verify.contains("target=/test"));
++    assert!(manual_verify.ends_with("-- ./examples/example.py"));
++
++    let selection: Value = r#"
++ci:
++  ptrace: true
++  liteinst: false
++backends_enabled: [ptrace, liteinst]
++"#
++    .parse()
++    .unwrap();
++    assert!(cell_required(
++        &selection,
++        "verify",
++        "ptrace",
++        "fixture"
++    ));
++    assert!(!cell_required(
++        &selection,
++        "verify",
++        "liteinst",
++        "fixture"
++    ));
++    let uniform: Value = "ci: true\nbackends_enabled: [ptrace]".parse().unwrap();
++    assert!(!cell_required(&uniform, "verify", "kvm", "fixture"));
++    assert_eq!(render_guest_argument("./README.md"), "\"$(pwd)\"/README.md");
++    assert_eq!(render_guest_argument("README.md"), "README.md");
++    let prepared: Value = r#"
++program: tests/e2e/prepared.sh
++prepared_fixture_args: [fork-tree, nested/pipe-chain]
++"#
++    .parse()
++    .unwrap();
++    assert_eq!(
++        prepared_fixture_paths(&prepared, "fixture", false),
++        vec![
++            "/tmp/hermit-e2e-fixtures/fork-tree",
++            "/tmp/hermit-e2e-fixtures/nested/pipe-chain",
++        ]
++    );
+     println!("manifest-cli self-test: PASS");
+     ExitCode::SUCCESS
+ }

@@ -1,0 +1,4 @@
+d5e3d5e096da84d4a72baccf6efc52a1fd2620d8
+2026-08-25 03:42:38 -0700
+Ryan Newton
+[hermit2, degraded-hermit-004, unresolved, devbig014, role=impl] Record the two false negatives that bite when landing from a linked worktree

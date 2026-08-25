@@ -1,0 +1,4235 @@
+diff --git a/.github/workflows/ci-privileged.yml b/.github/workflows/ci-privileged.yml
+index cca76c4290..3904cce9fb 100644
+--- a/.github/workflows/ci-privileged.yml
++++ b/.github/workflows/ci-privileged.yml
+@@ -47,8 +47,8 @@ jobs:
+     # This is a WALL, not an expected duration: a green run of this job measured
+     # 126s end to end on 2026-08-08 (run 31282467953). The wall must still cover
+     # the case where every budgeted step spends its whole allowance, which is
+-    # 720s (DAG launcher) + 330s (30s locks + 60s submodule init + 30s hardware
+-    # capabilities + 210s occasional KVM probes) + an allowance for the steps
++    # 1470s: 720s DAG launcher + 330s fixed setup/KVM probes + 120s diagnostic
++    # boxing probe + 300s private-/test topology probes, plus an allowance for the steps
+     # that carry no `timeout` of their own (job setup, checkout, and the two
+     # artifact uploads measured 7s warm, but a cold checkout and a large
+     # artifact upload are far slower). target/debug/test-harness reads the
+@@ -56,7 +56,7 @@ jobs:
+     # closed on their ordering drift, so
+     # raise the step budgets and rerun `target/debug/test-harness validate` rather
+     # than guessing here.
+-    timeout-minutes: 22
++    timeout-minutes: 27
+     env:
+       DETCORE_TEST_RUST_LOG: "off"
+ 
+@@ -111,6 +111,18 @@ jobs:
+     - name: PROBE — can this runner actually box? (diagnostic, never gates)
+       run: timeout --foreground --kill-after=10s 120s ./ci/probe-runner-boxing.sh
+ 
++    - name: Validate private /test lease and scoped cleanup topology
++      run: |
++        test ! -e /test
++        timeout --foreground --kill-after=10s 180s \
++          ./ci/run-with-ephemeral-test-root.sh --forward-lease-argv -- \
++          ./scripts/validate.rs --live-private-root-self-test
++        test ! -e /test
++        timeout --foreground --kill-after=10s 120s \
++          ./ci/run-with-ephemeral-test-root.sh --forward-lease-argv -- \
++          ./ci/compat-envelope/pressure-test.rs live-private-root-self-test
++        test ! -e /test
++
+     - name: PMU, CPUID-faulting, and KVM smoke DAG
+       # GitHub Actions sets GITHUB_ACTIONS=true, which makes the runner's ordinary
+       # scope bring-up deliberately skip systemd --user. Select explicit unboxed
+@@ -140,7 +152,8 @@ jobs:
+           bash -euo pipefail -c '
+             target/debug/test-harness build --lane privileged --category applications \
+               --ci-only --include-occasional
+-            target/debug/test-harness run --lane privileged --category applications \
++            exec ./ci/run-with-hermit-e2e-artifact.sh \
++              target/debug/test-harness run --lane privileged --category applications \
+               --ci-only --include-occasional --prebuilt \
+               --results ignored/e2e/privileged/occasional/results.jsonl \
+               --junit ignored/e2e/privileged/occasional/junit.xml
+diff --git a/ci/compat-envelope/README.md b/ci/compat-envelope/README.md
+index 04d8591816..381cbcde5b 100644
+--- a/ci/compat-envelope/README.md
++++ b/ci/compat-envelope/README.md
+@@ -189,6 +189,11 @@ not change its denominator or green definition:
+ 
+ The command reuses the canonical Hermit/resource build nodes, serializes
+ fixture preparation, and gives every red cell its own cgroup-boxed node.
++After entering its outer safe-ci scope, the pressure runner re-execs itself
++through one `run-with-ephemeral-test-root.sh` owner for the whole DAG. Parallel
++cell wrappers only validate and inherit its live pid/start-time plus
++device/inode lease; they never create or remove `/test` and never start a
++competing process group.
+ The plan derives that build closure from the selected cells: a sample without
+ LiteInst does not build the LiteInst runtime, while any sample containing a
+ LiteInst cell retains the complete canonical LiteInst build chain.
+diff --git a/ci/compat-envelope/pressure-test.rs b/ci/compat-envelope/pressure-test.rs
+index a3807dd18d..c49bcdabae 100755
+--- a/ci/compat-envelope/pressure-test.rs
++++ b/ci/compat-envelope/pressure-test.rs
+@@ -5,6 +5,7 @@
+ //! [dependencies]
+ //! csv = "1"
+ //! dagrun = { path = "../../agent-utils/rs/dagrun" }
++//! libc = "0.2"
+ //! serde = { version = "1", features = ["derive"] }
+ //! serde_json = "1"
+ //! ```
+@@ -22,6 +23,8 @@ use std::collections::BTreeMap;
+ use std::collections::BTreeSet;
+ use std::env;
+ use std::fs;
++use std::os::unix::process::CommandExt;
++use std::os::unix::process::ExitStatusExt;
+ use std::path::Path;
+ use std::path::PathBuf;
+ use std::process::Command;
+@@ -85,6 +88,15 @@ const PRESSURE_CELL_TIMEOUT_SECONDS: i64 = 600;
+ /// threshold: breach makes the run incomplete and publishes no promotion.
+ const PRESSURE_RUN_TIMEOUT_SECONDS: i64 = 2 * 60 * 60;
+ const PRESSURE_SCOPE_TIMEOUT_ENV: &str = "HERMIT_PRESSURE_SCOPE_TIMEOUT_SECONDS";
++const EPHEMERAL_TEST_ROOT_LEASE_ENV: &str = "HERMIT_EPHEMERAL_TEST_ROOT_LEASE_V2";
++const EPHEMERAL_TEST_ROOT_LEASE_ARG: &str = "--internal-ephemeral-test-root-lease-v2";
++const PRESSURE_SCOPE_CLEANUP_PROBE_ENV: &str = "HERMIT_PRESSURE_SCOPE_CLEANUP_PROBE";
++const PRESSURE_SCOPE_PROBE_READY_ENV: &str = "HERMIT_PRESSURE_SCOPE_PROBE_READY";
++const PRESSURE_SCOPE_PROBE_SURVIVOR_ENV: &str = "HERMIT_PRESSURE_SCOPE_PROBE_SURVIVOR";
++const PRESSURE_SCOPE_PROBE_SIGNAL: &str = "top-signal";
++const PRESSURE_SCOPE_PROBE_RUNTIME: &str = "runtime";
++const PRESSURE_SCOPE_PROBE_RUNTIME_S: i64 = 5;
++const PRESSURE_SCOPE_PROBE_DEADLINE_S: u64 = 20;
+ 
+ /// Match validate's measured host-adaptive outer scheduling policy.
+ ///
+@@ -113,29 +125,414 @@ fn pressure_scope_grace_s(run_timeout_s: i64) -> i64 {
+     60.max(run_timeout_s / 10)
+ }
+ 
+-fn establish_pressure_cgroups(run_timeout_s: i64) -> Result<BoxedCgroups, String> {
++fn ensure_pressure_scope_reexec(run_timeout_s: i64) -> Result<(), String> {
+     let already_in_scope = dagrun::cgroup::is_in_scope();
+-    let inherited_marker = env::var(PRESSURE_SCOPE_TIMEOUT_ENV)
+-        .ok()
+-        .and_then(|value| value.parse::<i64>().ok());
+     if !already_in_scope {
+         env::set_var(PRESSURE_SCOPE_TIMEOUT_ENV, run_timeout_s.to_string());
+     }
+-    let owns_runtime = inherited_marker == Some(run_timeout_s) || !already_in_scope;
+     let scope_runtime_s = Some(
+         run_timeout_s
+             .checked_add(pressure_scope_grace_s(run_timeout_s))
+             .ok_or("--run-timeout is too large to establish a scope backstop")?,
+     );
+-    safe_ci_scope::propagate_result(safe_ci_scope::resolve_cgroups(
++    safe_ci_scope::ensure_scope_reexec(
+         "compatibility pressure test",
+         false,
+         scope_runtime_s,
++    )
++    .map_err(|code| format!("cgroup setup refused with exit {code}"))
++}
++
++fn establish_pressure_cgroups_after_reexec(
++    run_timeout_s: i64,
++) -> Result<BoxedCgroups, String> {
++    let owns_runtime = env::var(PRESSURE_SCOPE_TIMEOUT_ENV)
++        .ok()
++        .and_then(|value| value.parse::<i64>().ok())
++        == Some(run_timeout_s);
++    safe_ci_scope::propagate_result(safe_ci_scope::resolve_cgroups_after_reexec(
++        "compatibility pressure test",
++        false,
+         owns_runtime,
+     ))
+     .map_err(|code| format!("cgroup setup refused with exit {code}"))
+ }
+ 
++fn validate_ephemeral_test_root_lease_tuple(value: &str) -> Result<(), String> {
++    let fields = value.split(':').collect::<Vec<_>>();
++    if fields.len() != 8
++        || fields[0] != "v2"
++        || fields[1..]
++            .iter()
++            .any(|field| field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_digit()))
++    {
++        return Err("malformed internal /test lease argument".into());
++    }
++    Ok(())
++}
++
++fn extract_ephemeral_test_root_lease_argument(
++    argv: Vec<String>,
++) -> Result<(Vec<String>, Option<String>), String> {
++    let mut ordinary = Vec::with_capacity(argv.len());
++    let mut lease = None;
++    for argument in argv {
++        if argument.starts_with(EPHEMERAL_TEST_ROOT_LEASE_ARG) {
++            let value = argument
++                .strip_prefix(EPHEMERAL_TEST_ROOT_LEASE_ARG)
++                .and_then(|suffix| suffix.strip_prefix('='))
++                .ok_or("malformed internal /test lease argument")?;
++            validate_ephemeral_test_root_lease_tuple(value)?;
++            if lease.replace(value.to_string()).is_some() {
++                return Err("duplicate internal /test lease argument".into());
++            }
++        } else {
++            ordinary.push(argument);
++        }
++    }
++    Ok((ordinary, lease))
++}
++
++#[derive(Clone, Debug, Default)]
++struct EphemeralTestRootLeaseInput {
++    tuple: Option<String>,
++    carried_by_argv: bool,
++}
++
++fn capture_ephemeral_test_root_lease_input(
++    carried_lease: Option<&str>,
++) -> Result<EphemeralTestRootLeaseInput, String> {
++    let ambient = env::var_os(EPHEMERAL_TEST_ROOT_LEASE_ENV);
++    env::remove_var(EPHEMERAL_TEST_ROOT_LEASE_ENV);
++    let ambient = ambient
++        .map(|value| {
++            value
++                .into_string()
++                .map_err(|_| "inherited /test lease is not valid UTF-8".to_string())
++        })
++        .transpose()?;
++    if let Some(value) = carried_lease {
++        validate_ephemeral_test_root_lease_tuple(value)?;
++    }
++    if let Some(value) = ambient.as_deref() {
++        validate_ephemeral_test_root_lease_tuple(value)?;
++    }
++    if let (Some(carried), Some(ambient)) = (carried_lease, ambient.as_deref()) {
++        if carried != ambient {
++            return Err("internal /test lease argument does not match the inherited lease".into());
++        }
++    }
++    Ok(EphemeralTestRootLeaseInput {
++        tuple: carried_lease.map(str::to_owned).or(ambient),
++        carried_by_argv: carried_lease.is_some(),
++    })
++}
++
++fn validate_ephemeral_test_root_lease(root: &Path, lease: &str) -> Result<(), String> {
++    let status = Command::new(root.join("ci/run-with-ephemeral-test-root.sh"))
++        .arg("--check-lease")
++        .env(EPHEMERAL_TEST_ROOT_LEASE_ENV, lease)
++        .status()
++        .map_err(|error| format!("cannot validate inherited /test lease: {error}"))?;
++    if status.success() {
++        Ok(())
++    } else {
++        Err(format!(
++            "carried /test lease validation failed with {status}; refusing unowned /test state"
++        ))
++    }
++}
++
++fn ensure_pressure_ephemeral_test_root(
++    root: &Path,
++    lease_input: &EphemeralTestRootLeaseInput,
++) -> Result<String, String> {
++    let wrapper = root.join("ci/run-with-ephemeral-test-root.sh");
++    if let Some(lease) = lease_input.tuple.as_deref() {
++        validate_ephemeral_test_root_lease(root, lease)?;
++        if lease_input.carried_by_argv || dagrun::cgroup::is_in_scope() {
++            return Ok(lease.to_string());
++        }
++    }
++    if dagrun::cgroup::is_in_scope() {
++        return Err(
++            "in-scope pressure run has neither a validated inherited lease nor a pre-scope lease token"
++                .into(),
++        );
++    }
++    let executable = env::current_exe()
++        .map_err(|error| format!("cannot resolve pressure-test executable: {error}"))?;
++    let mut command = Command::new(&wrapper);
++    command
++        .arg("--forward-lease-argv")
++        .arg("--")
++        .arg(executable)
++        .args(env::args().skip(1))
++        .env_remove(EPHEMERAL_TEST_ROOT_LEASE_ENV);
++    if let Some(lease) = lease_input.tuple.as_deref() {
++        command.env(EPHEMERAL_TEST_ROOT_LEASE_ENV, lease);
++    }
++    let error = command.exec();
++    Err(format!(
++        "cannot re-exec pressure run through {}: {error}",
++        wrapper.display()
++    ))
++}
++
++fn export_ephemeral_test_root_lease_for_children(
++    root: &Path,
++    lease: &str,
++) -> Result<(), String> {
++    validate_ephemeral_test_root_lease(root, lease)?;
++    env::set_var(EPHEMERAL_TEST_ROOT_LEASE_ENV, lease);
++    Ok(())
++}
++
++fn process_identity(pid: i32) -> Option<(char, u64)> {
++    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
++    let close = stat.rfind(')')?;
++    let fields = stat.get(close + 1..)?.split_whitespace().collect::<Vec<_>>();
++    Some((
++        fields.first()?.chars().next()?,
++        fields.get(19)?.parse().ok()?,
++    ))
++}
++
++fn matching_process_identity_is_live(observed: Option<(char, u64)>, expected_start: u64) -> bool {
++    observed.is_some_and(|(state, start)| state != 'Z' && start == expected_start)
++}
++
++fn run_pressure_scope_cleanup_payload(
++    root: &Path,
++    lease_input: &EphemeralTestRootLeaseInput,
++    mode: &str,
++) -> Result<(), String> {
++    let lease = ensure_pressure_ephemeral_test_root(root, lease_input)?;
++    let runtime = if mode == PRESSURE_SCOPE_PROBE_RUNTIME {
++        PRESSURE_SCOPE_PROBE_RUNTIME_S
++    } else {
++        30
++    };
++    safe_ci_scope::ensure_scope_reexec(
++        "compatibility pressure cleanup probe",
++        false,
++        Some(runtime),
++    )
++    .map_err(|code| format!("pressure cleanup scope re-exec refused with exit {code}"))?;
++    export_ephemeral_test_root_lease_for_children(root, &lease)?;
++    let _cgroups = safe_ci_scope::resolve_cgroups_after_reexec(
++        "compatibility pressure cleanup probe",
++        false,
++        true,
++    )
++    .map_err(|code| format!("pressure cleanup cgroup setup refused with exit {code}"))?;
++    let attempt = dagrun::cgroup::attempt_scope_reexec(None, None, None);
++    let proof = attempt
++        .proof()
++        .ok_or_else(|| format!("pressure cleanup lost scope proof: {}", attempt.describe()))?;
++    let unit = proof
++        .unit
++        .as_deref()
++        .ok_or("pressure cleanup scope proof has no promised unit")?;
++    let scope = proof
++        .cgroup
++        .ancestors()
++        .find(|path| path.file_name().and_then(|name| name.to_str()) == Some(unit))
++        .ok_or("pressure cleanup cannot locate promised scope ancestor")?
++        .to_path_buf();
++    let ready = env::var(PRESSURE_SCOPE_PROBE_READY_ENV)
++        .map(PathBuf::from)
++        .map_err(|_| "pressure cleanup probe has no ready path".to_string())?;
++    let _survivor = env::var(PRESSURE_SCOPE_PROBE_SURVIVOR_ENV)
++        .map(PathBuf::from)
++        .map_err(|_| "pressure cleanup probe has no survivor path".to_string())?;
++    unsafe {
++        libc::signal(libc::SIGTERM, libc::SIG_DFL);
++    }
++    let descendant = Command::new("/usr/bin/sleep")
++        .arg("15")
++        .spawn()
++        .map_err(|error| format!("cannot launch pressure cleanup descendant: {error}"))?;
++    let descendant_pid = descendant.id() as i32;
++    let descendant_start = process_identity(descendant_pid)
++        .map(|(_, start)| start)
++        .ok_or("cannot bind pressure cleanup descendant to start ticks")?;
++    fs::write(
++        &ready,
++        format!(
++            "{descendant_pid}:{descendant_start}\n{}\n",
++            scope.display()
++        ),
++    )
++    .map_err(|error| format!("cannot publish pressure cleanup readiness: {error}"))?;
++    drop(descendant);
++    loop {
++        std::thread::sleep(std::time::Duration::from_secs(1));
++    }
++}
++
++fn pressure_scope_cleanup_probe(
++    root: &Path,
++    mode: &str,
++    send_signal: bool,
++    lease: &str,
++) -> Result<(), String> {
++    validate_ephemeral_test_root_lease(root, lease)?;
++    let nonce = SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map_err(|error| format!("pressure cleanup clock failure: {error}"))?
++        .as_nanos();
++    let scratch = env::temp_dir().join(format!(
++        "pressure-top-level-{mode}-{}-{nonce}",
++        std::process::id()
++    ));
++    fs::create_dir(&scratch)
++        .map_err(|error| format!("cannot create pressure cleanup scratch: {error}"))?;
++    let ready = scratch.join("ready");
++    let survivor = scratch.join("survivor");
++    let stdout = scratch.join("stdout");
++    let stderr = scratch.join("stderr");
++    let exe = env::current_exe()
++        .map_err(|error| format!("cannot resolve pressure cleanup executable: {error}"))?;
++    let mut command = Command::new(exe);
++    let mut child = command
++        .arg("self-test")
++        .arg(format!("{EPHEMERAL_TEST_ROOT_LEASE_ARG}={lease}"))
++        .env(PRESSURE_SCOPE_CLEANUP_PROBE_ENV, mode)
++        .env(PRESSURE_SCOPE_PROBE_READY_ENV, &ready)
++        .env(PRESSURE_SCOPE_PROBE_SURVIVOR_ENV, &survivor)
++        .env("DAGRUN_FORCE_SCOPE_ATTEMPT", "1")
++        .env_remove(EPHEMERAL_TEST_ROOT_LEASE_ENV)
++        .env_remove("DAGRUN_IN_SCOPE")
++        .env_remove("DAGRUN_SCOPE_UNIT")
++        .env_remove("DAGRUN_EXPECTED_OUTER_MEMORY_MAX_BYTES")
++        .env_remove("DAGRUN_EXPECTED_RUNTIME_MAX_SEC")
++        .process_group(0)
++        .stdout(
++            fs::File::create(&stdout)
++                .map_err(|error| format!("cannot create pressure cleanup stdout: {error}"))?,
++        )
++        .stderr(
++            fs::File::create(&stderr)
++                .map_err(|error| format!("cannot create pressure cleanup stderr: {error}"))?,
++        )
++        .spawn()
++        .map_err(|error| format!("cannot launch pressure {mode} cleanup probe: {error}"))?;
++    let deadline = Instant::now() + std::time::Duration::from_secs(PRESSURE_SCOPE_PROBE_DEADLINE_S);
++    while !ready.is_file() {
++        if let Some(status) = child
++            .try_wait()
++            .map_err(|error| format!("cannot poll pressure {mode} cleanup probe: {error}"))?
++        {
++            let out = fs::read_to_string(&stdout).unwrap_or_default();
++            let err = fs::read_to_string(&stderr).unwrap_or_default();
++            let _ = fs::remove_dir_all(&scratch);
++            return Err(format!(
++                "pressure {mode} cleanup probe exited {status} before readiness\nstdout:\n{out}\nstderr:\n{err}"
++            ));
++        }
++        if Instant::now() >= deadline {
++            unsafe {
++                libc::kill(-(child.id() as i32), libc::SIGTERM);
++            }
++            let _ = child.wait();
++            return Err(format!(
++                "pressure {mode} cleanup probe did not become ready within {PRESSURE_SCOPE_PROBE_DEADLINE_S}s"
++            ));
++        }
++        std::thread::sleep(std::time::Duration::from_millis(50));
++    }
++    let descendant_identity = fs::read_to_string(&ready)
++        .map_err(|error| format!("cannot read pressure {mode} descendant identity: {error}"))?;
++    let mut identity_lines = descendant_identity.lines();
++    let (descendant_pid, descendant_start) = identity_lines
++        .next()
++        .and_then(|identity| identity.split_once(':'))
++        .and_then(|(pid, start)| Some((pid.parse::<i32>().ok()?, start.parse::<u64>().ok()?)))
++        .ok_or_else(|| format!("pressure {mode} emitted malformed descendant identity"))?;
++    let scope = identity_lines
++        .next()
++        .map(PathBuf::from)
++        .filter(|path| path.is_absolute())
++        .ok_or_else(|| format!("pressure {mode} emitted malformed scope identity"))?;
++    if send_signal {
++        let rc = unsafe { libc::kill(-(child.id() as i32), libc::SIGTERM) };
++        if rc != 0 {
++            return Err(format!(
++                "cannot signal pressure {mode} wrapper: {}",
++                std::io::Error::last_os_error()
++            ));
++        }
++    }
++    let status = loop {
++        if let Some(status) = child
++            .try_wait()
++            .map_err(|error| format!("cannot poll pressure {mode} cleanup probe: {error}"))?
++        {
++            break status;
++        }
++        if Instant::now() >= deadline {
++            unsafe {
++                libc::kill(-(child.id() as i32), libc::SIGTERM);
++            }
++            let _ = child.wait();
++            return Err(format!(
++                "pressure {mode} cleanup probe exceeded {PRESSURE_SCOPE_PROBE_DEADLINE_S}s"
++            ));
++        }
++        std::thread::sleep(std::time::Duration::from_millis(50));
++    };
++    let out = fs::read_to_string(&stdout).unwrap_or_default();
++    let err = fs::read_to_string(&stderr).unwrap_or_default();
++    let scope_empty = if scope.exists() {
++        fs::read_to_string(scope.join("cgroup.events"))
++            .ok()
++            .is_some_and(|events| events.lines().any(|line| line == "populated 0"))
++    } else {
++        true
++    };
++    let expected_term = send_signal
++        && (status.code() == Some(128 + libc::SIGTERM)
++            || status.signal() == Some(libc::SIGTERM));
++    let runtime_evidence = out.contains("RuntimeMaxSec=5s") || err.contains("RuntimeMaxSec=5s");
++    let failure = if status.success() {
++        Some("scoped pressure payload unexpectedly exited successfully".to_string())
++    } else if send_signal && !expected_term {
++        Some(format!(
++            "scoped pressure driver did not terminate by SIGTERM: {status}"
++        ))
++    } else if !send_signal && !runtime_evidence {
++        Some("pressure RuntimeMax probe emitted no enforced RuntimeMaxSec=5s evidence".to_string())
++    } else if matching_process_identity_is_live(process_identity(descendant_pid), descendant_start)
++    {
++        Some(format!(
++            "scoped pressure descendant {descendant_pid}@{descendant_start} remained live after wrapper exit"
++        ))
++    } else if let Err(error) = validate_ephemeral_test_root_lease(root, lease) {
++        Some(format!(
++            "outside-scope owner lost its exact /test lease after pressure termination: {error}"
++        ))
++    } else if !scope_empty {
++        Some(format!(
++            "pressure scope {} still exists without cgroup.events populated 0",
++            scope.display()
++        ))
++    } else {
++        None
++    };
++    let _ = fs::remove_dir_all(&scratch);
++    if let Some(failure) = failure {
++        return Err(format!(
++            "pressure {mode} cleanup probe failed: {failure}\nstdout:\n{out}\nstderr:\n{err}"
++        ));
++    }
++    println!(
++        "pressure {mode}: scoped subtree terminated, outside wrapper remained live, exact /test lease intact"
++    );
++    let _ = root;
++    Ok(())
++}
++
+ const USAGE: &str = r#"Hermit compatibility pressure test
+ 
+ Ordinary `validate` reruns the committed green compatibility cells and fails on
+@@ -179,6 +576,10 @@ Commands:
+   self-test
+       Test pressure-runner selection, timeout, execution-plan, and retained-
+       evidence checks without running a guest.
++  live-private-root-self-test
++      Exercise the real outside-lease, SIGTERM, and RuntimeMax topology. This
++      internal CI probe must be invoked through run-with-ephemeral-test-root.sh
++      with --forward-lease-argv.
+ 
+ Exact-cell options (run and plan):
+   --test TEST-ID           Exact manifest test ID, such as
+@@ -249,7 +650,9 @@ How it runs:
+   budgets from the typed manifest tool. The in-memory graph then reuses the
+   canonical Hermit/resource build commands from ci/dag/portable.json without
+   recursively running the full validation metadata audit. Fixture preparation
+-  is serialized. Every selected red cell, or every selected green-cell
++  is serialized. One outer ephemeral-/test owner encloses the whole run; the
++  parallel cell wrappers validate and inherit that lease without creating,
++  removing, or placing a second process group around /test. Every selected red cell, or every selected green-cell
+   repetition, then runs in its own safe-ci cgroup. Existing resource caps admit
+   four manifest guests at once and one KVM guest. A failure, timeout, OOM, or missing result does not
+   intentionally stop later selected checks.
+@@ -1205,10 +1608,34 @@ fn main() -> ExitCode {
+ }
+ 
+ fn run() -> Result<(), String> {
+-    let mut args = env::args().skip(1).peekable();
++    let (argv, carried_lease) =
++        extract_ephemeral_test_root_lease_argument(env::args().skip(1).collect())?;
++    let lease_input = capture_ephemeral_test_root_lease_input(carried_lease.as_deref())?;
++    let mut args = argv.into_iter().peekable();
+     let Some(command) = args.next() else {
+         return Err(format!("missing command\n\n{USAGE}"));
+     };
++    let cleanup_probe = env::var(PRESSURE_SCOPE_CLEANUP_PROBE_ENV).ok();
++    let internal_cleanup_probe = command == "self-test"
++        && cleanup_probe.as_deref().is_some_and(|mode| {
++            matches!(
++                mode,
++                PRESSURE_SCOPE_PROBE_SIGNAL | PRESSURE_SCOPE_PROBE_RUNTIME
++            )
++        });
++    if cleanup_probe.is_some() && !internal_cleanup_probe {
++        return Err("invalid internal pressure cleanup probe request".into());
++    }
++    let inert_self_test_descendant =
++        command == "self-test" && !lease_input.carried_by_argv && cleanup_probe.is_none();
++    if command != "run"
++        && command != "live-private-root-self-test"
++        && lease_input.tuple.is_some()
++        && !internal_cleanup_probe
++        && !inert_self_test_descendant
++    {
++        return Err("internal /test lease state is valid only for run".into());
++    }
+     if matches!(command.as_str(), "-h" | "--help" | "help") {
+         print!("{USAGE}");
+         return Ok(());
+@@ -1217,6 +1644,9 @@ fn run() -> Result<(), String> {
+         .peek()
+         .is_some_and(|argument| matches!(argument.as_str(), "-h" | "--help" | "help"))
+     {
++        if lease_input.tuple.is_some() {
++            return Err("internal /test lease state is invalid for help".into());
++        }
+         args.next();
+         if args.next().is_some() {
+             return Err("help accepts no additional options".into());
+@@ -1225,6 +1655,19 @@ fn run() -> Result<(), String> {
+         return Ok(());
+     }
+     let root = repo_root()?;
++    if let Some(lease) = lease_input.tuple.as_deref() {
++        validate_ephemeral_test_root_lease(&root, lease)?;
++    }
++    if internal_cleanup_probe {
++        if args.next().is_some() {
++            return Err("pressure cleanup probe accepts no options".into());
++        }
++        return run_pressure_scope_cleanup_payload(
++            &root,
++            &lease_input,
++            cleanup_probe.as_deref().unwrap(),
++        );
++    }
+     match command.as_str() {
+         "plan" => {
+             let (results, output, selection) = result_options(&root, &mut args, false, true)?;
+@@ -1276,7 +1719,10 @@ fn run() -> Result<(), String> {
+             let run_timeout_seconds = selection
+                 .run_timeout_seconds
+                 .unwrap_or(PRESSURE_RUN_TIMEOUT_SECONDS);
+-            let cgroups = establish_pressure_cgroups(run_timeout_seconds)?;
++            let lease = ensure_pressure_ephemeral_test_root(&root, &lease_input)?;
++            ensure_pressure_scope_reexec(run_timeout_seconds)?;
++            export_ephemeral_test_root_lease_for_children(&root, &lease)?;
++            let cgroups = establish_pressure_cgroups_after_reexec(run_timeout_seconds)?;
+             require_empty_result_dir(&results)?;
+             let started = Instant::now();
+             let sha = git_output(&root, &["rev-parse", "HEAD"])?;
+@@ -1364,6 +1810,22 @@ fn run() -> Result<(), String> {
+             }
+             self_test(&root)?;
+         }
++        "live-private-root-self-test" => {
++            if args.next().is_some() {
++                return Err("live-private-root-self-test accepts no options".into());
++            }
++            let lease = lease_input.tuple.as_deref().ok_or(
++                "live-private-root-self-test requires the outside wrapper's carried lease",
++            )?;
++            if !lease_input.carried_by_argv || dagrun::cgroup::is_in_scope() {
++                return Err(
++                    "live-private-root-self-test requires an argv-carried lease before cgroup scope"
++                        .into(),
++                );
++            }
++            pressure_scope_cleanup_probe(&root, PRESSURE_SCOPE_PROBE_SIGNAL, true, lease)?;
++            pressure_scope_cleanup_probe(&root, PRESSURE_SCOPE_PROBE_RUNTIME, false, lease)?;
++        }
+         _ => return Err(format!("unknown command `{command}`\n\n{USAGE}")),
+     }
+     Ok(())
+@@ -2477,7 +2939,7 @@ fn write_plan_after_scorecard_check(
+                     ""
+                 };
+                 format!(
+-                    "HERMIT_BIN=\"$PWD/target/release/hermit\" target/debug/test-harness run {selector} --include-occasional{prebuilt} --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
++                    "HERMIT_BIN=\"$PWD/target/release/hermit\" ./ci/run-with-ephemeral-test-root.sh -- target/debug/test-harness run {selector} --include-occasional{prebuilt} --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
+                     selector = selector,
+                     prebuilt = prebuilt,
+                     test = shell_quote(&cell.test),
+@@ -4256,6 +4718,61 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
+ 
+ fn self_test(root: &Path) -> Result<(), String> {
+     safe_ci_scope::self_test()?;
++    if !matching_process_identity_is_live(Some(('T', 42)), 42)
++        || !matching_process_identity_is_live(Some(('t', 42)), 42)
++        || matching_process_identity_is_live(Some(('Z', 42)), 42)
++        || matching_process_identity_is_live(Some(('S', 41)), 42)
++    {
++        return Err(
++            "scope cleanup identity bracket did not treat stopped PID@start as live or zombie/mismatch as terminal"
++                .into(),
++        );
++    }
++    let lease = "v2:11:22:33:44:55:66:77";
++    let (ordinary, parsed) = extract_ephemeral_test_root_lease_argument(vec![
++        "run".into(),
++        "--green".into(),
++        format!("{EPHEMERAL_TEST_ROOT_LEASE_ARG}={lease}"),
++    ])?;
++    if ordinary != ["run", "--green"] || parsed.as_deref() != Some(lease) {
++        return Err("internal /test lease argument was not consumed exactly".into());
++    }
++    for malformed in [
++        EPHEMERAL_TEST_ROOT_LEASE_ARG.to_string(),
++        format!("{EPHEMERAL_TEST_ROOT_LEASE_ARG}=v1:11:22:33:44"),
++        format!("{EPHEMERAL_TEST_ROOT_LEASE_ARG}=v2:11:22:33:44"),
++        format!("{EPHEMERAL_TEST_ROOT_LEASE_ARG}=v2:11:nope:33:44:55:66:77"),
++    ] {
++        if extract_ephemeral_test_root_lease_argument(vec!["run".into(), malformed]).is_ok() {
++            return Err("internal /test lease parser accepted malformed state".into());
++        }
++    }
++    if extract_ephemeral_test_root_lease_argument(vec![
++        "run".into(),
++        format!("{EPHEMERAL_TEST_ROOT_LEASE_ARG}={lease}"),
++        format!("{EPHEMERAL_TEST_ROOT_LEASE_ARG}={lease}"),
++    ])
++    .is_ok()
++    {
++        return Err("internal /test lease parser accepted a duplicate token".into());
++    }
++    env::set_var(EPHEMERAL_TEST_ROOT_LEASE_ENV, lease);
++    let captured = capture_ephemeral_test_root_lease_input(None)?;
++    if captured.tuple.as_deref() != Some(lease)
++        || captured.carried_by_argv
++        || env::var_os(EPHEMERAL_TEST_ROOT_LEASE_ENV).is_some()
++    {
++        return Err("pre-scope lease capture did not become argv/local-only state".into());
++    }
++    let env_output = Command::new("/usr/bin/env")
++        .output()
++        .map_err(|error| format!("pre-scope lease env spy could not run: {error}"))?;
++    if String::from_utf8_lossy(&env_output.stdout)
++        .lines()
++        .any(|line| line.starts_with(EPHEMERAL_TEST_ROOT_LEASE_ENV))
++    {
++        return Err("pre-scope subprocess inherited the internal /test lease".into());
++    }
+     // The checked files remain immutable throughout this self-test. Production
+     // plan/run still checks at its command boundary before constructing a plan.
+     let checked_scorecard = check_scorecard(root)?;
+@@ -4544,7 +5061,7 @@ fn self_test(root: &Path) -> Result<(), String> {
+     }
+ 
+     let exact_cell_command = "printf '125\\n' > harness-status; status=0; \
+-        env HERMIT_BIN=\"$PWD/target/release/hermit\" target/debug/test-harness run \
++        env HERMIT_BIN=\"$PWD/target/release/hermit\" ./ci/run-with-ephemeral-test-root.sh -- target/debug/test-harness run \
+         --include-manual --test fixture --mode verify \
+         --results results.in-progress.jsonl --junit junit.in-progress.xml || status=$?; \
+         if test -e results.in-progress.jsonl; then \
+@@ -5237,6 +5754,9 @@ fn self_test(root: &Path) -> Result<(), String> {
+             || !step
+                 .cmd
+                 .contains("HERMIT_BIN=\"$PWD/target/release/hermit\"")
++            || !step
++                .cmd
++                .contains("./ci/run-with-ephemeral-test-root.sh -- target/debug/test-harness run")
+             || step.cmd.contains("run-with-hermit-e2e-artifact.sh")
+             || !step
+                 .cmd
+diff --git a/ci/manifest-plan/src/main.rs b/ci/manifest-plan/src/main.rs
+index 41623cad7a..47cf725516 100644
+--- a/ci/manifest-plan/src/main.rs
++++ b/ci/manifest-plan/src/main.rs
+@@ -636,6 +636,7 @@ fn validate_and_expand(
+             "slow_reason",
+             "preprocessors",
+             "prepared_fixture_args",
++            "expected_scheduled_worker_capacity",
+         ],
+         &id,
+     );
+@@ -742,6 +743,13 @@ fn validate_and_expand(
+             }
+         }
+     }
++    if let Some(capacity) = test.get("expected_scheduled_worker_capacity") {
++        if capacity.as_integer().is_none_or(|capacity| capacity <= 0) {
++            die(format!(
++                "{id}: expected_scheduled_worker_capacity must be a positive integer"
++            ));
++        }
++    }
+ 
+     validate_observation(test, &id);
+ 
+@@ -990,6 +998,11 @@ fn validate_mode(
+         ci_disabled_reason.as_ref(),
+     )
+     .unwrap_or_else(|error| die(format!("{id}: modes.{mode} {error}")));
++    if ci.any_selected() && workdir.is_some() {
++        die(format!(
++            "{id}: {mode} required cells always run in /test and must not declare workdir"
++        ));
++    }
+     if let Some(guest_args) = spec.get("guest_args") {
+         let guest_args = guest_args
+             .as_table()
+@@ -1445,7 +1458,6 @@ min_distinct = 2
+ ci = true
+ backends_enabled = ["ptrace"]
+ guest_args = { ptrace = ["multi"] }
+-workdir = "/tmp"
+ 
+ [backends_disabled]
+ dbt = "unsupported"
+@@ -1487,6 +1499,33 @@ ci = true
+ backends_enabled = ["ptrace"]
+ workdir = "tmp"
+ 
++[backends_disabled]
++dbt = "unsupported"
++kvm = "unsupported"
++sabre = "unsupported"
++liteinst = "unsupported"
++"#,
++        );
++        validate_mode(
++            "bucket/test",
++            "bucket",
++            "portable",
++            "verify",
++            90,
++            &spec,
++            &mut Vec::new(),
++        );
++    }
++
++    #[test]
++    #[should_panic(expected = "required cells always run in /test and must not declare workdir")]
++    fn rejects_required_cell_workdir() {
++        let spec = parse_mode(
++            r#"
++ci = true
++backends_enabled = ["ptrace"]
++workdir = "/tmp"
++
+ [backends_disabled]
+ dbt = "unsupported"
+ kvm = "unsupported"
+diff --git a/ci/manifest-plan/src/runner.rs b/ci/manifest-plan/src/runner.rs
+index b5ac99dacb..e338df0107 100644
+--- a/ci/manifest-plan/src/runner.rs
++++ b/ci/manifest-plan/src/runner.rs
+@@ -33,6 +33,7 @@ const BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
+ const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
+ const GUEST_FIXTURE_ROOT: &str = "/tmp/hermit-e2e-fixtures";
+ const PRIVATE_WORKDIR: &str = "/test";
++const EPHEMERAL_TEST_ROOT_LEASE_ENV: &str = "HERMIT_EPHEMERAL_TEST_ROOT_LEASE_V2";
+ pub const CELL_RESULT_SCHEMA: u64 = 4;
+ 
+ #[derive(Clone, Debug, Deserialize)]
+@@ -66,6 +67,11 @@ pub struct TestRecipe {
+     /// and these relative paths are appended to the wrapper's `--run` argv.
+     #[serde(default)]
+     pub prepared_fixture_args: Vec<String>,
++    /// If present, require the harness's parsed worker capacity to equal this
++    /// value and append the actual capacity to the guest argv. This keeps
++    /// scheduler-width ratchets explicit without forwarding harness environment.
++    #[serde(default)]
++    pub expected_scheduled_worker_capacity: Option<usize>,
+ }
+ 
+ #[derive(Clone, Debug, Deserialize)]
+@@ -375,6 +381,12 @@ fn validate_document(document: &ManifestDocument, stem: &str, root: &Path) -> Re
+                 ));
+             }
+         }
++        if test.expected_scheduled_worker_capacity == Some(0) {
++            return Err(format!(
++                "{}.expected_scheduled_worker_capacity must be positive",
++                test.id
++            ));
++        }
+         let actual: BTreeSet<_> = test.modes.keys().map(String::as_str).collect();
+         let expected: BTreeSet<_> = MODES.into_iter().collect();
+         if actual != expected {
+@@ -456,6 +468,11 @@ fn validate_mode(id: &str, mode: &str, recipe: &ModeRecipe) -> Result<(), String
+             "{id}: naked is opt-in meta-CI and must set ci=false"
+         ));
+     }
++    if ci.any_selected() && recipe.workdir.is_some() {
++        return Err(format!(
++            "{id}: {mode} required cells always run in /test and must not declare workdir"
++        ));
++    }
+     for backend in recipe.guest_args.keys() {
+         if !enabled.contains(backend.as_str()) {
+             return Err(format!(
+@@ -959,6 +976,18 @@ pub fn prepare_test(
+             );
+         }
+     }
++    if let Some(expected) = cell.test.expected_scheduled_worker_capacity {
++        let actual = context.scheduled_worker_capacity.configured();
++        if actual != expected {
++            return Err(format!(
++                "{}: expected scheduled worker capacity {expected}, got {actual}",
++                cell.test.id
++            ));
++        }
++        let actual = actual.to_string();
++        host_argv.push(actual.clone());
++        guest_argv.push(actual);
++    }
+     host_argv.extend(host_guest_args);
+     guest_argv.extend(guest_guest_args);
+     if context.isolated_workdir.is_some() && !required {
+@@ -1566,6 +1595,7 @@ fn normalize_ptrace_golden(hermit: &str, directory: &Path) -> Result<(), String>
+         let output = Command::new(hermit)
+             .arg("log-diff")
+             .arg(&run1[0])
++            .env_remove(EPHEMERAL_TEST_ROOT_LEASE_ENV)
+             .output()
+             .map_err(|e| format!("cannot normalize {}: {e}", run1[0].display()))?;
+         if output.status.success() {
+@@ -1605,6 +1635,11 @@ fn execute_process(
+         .stdout(stdout_file)
+         .stderr(stderr_file);
+     command.envs(env.iter());
++    // The harness retains this lease only so nested repository wrappers can
++    // prove one live outer /test owner. It is never guest/test input and must
++    // not become an undeclared ambient variable in preparation, naked,
++    // manual, disabled, or Hermit-launched cells.
++    command.env_remove(EPHEMERAL_TEST_ROOT_LEASE_ENV);
+     unsafe {
+         command.pre_exec(|| {
+             if libc::setpgid(0, 0) == -1 {
+@@ -2315,9 +2350,10 @@ fn append_lockdown_args(argv: &mut Vec<String>, mounts: &[GuestMountSpec]) {
+ }
+ 
+ fn append_record_lockdown_args(argv: &mut Vec<String>) {
+-    // Record/replay stores the cwd in its launch metadata and recreates it in
+-    // the replay root. The outer validation mount namespace provides an empty
+-    // `/test`, so the required replay cell needs no new mount surface here.
++    // The canonical parent namespace already supplies `/test`; ordinary hosted
++    // runs supply only its empty mountpoint. Mount a fresh tmpfs here so both
++    // recording and the immediate replay observe private contents.
++    argv.push(format!("--mount=type=tmpfs,target={PRIVATE_WORKDIR}"));
+     argv.push(format!("--workdir={PRIVATE_WORKDIR}"));
+ }
+ 
+@@ -2521,11 +2557,15 @@ mod tests {
+             slow_reason: None,
+             preprocessors: Vec::new(),
+             prepared_fixture_args: Vec::new(),
++            expected_scheduled_worker_capacity: None,
+         }
+     }
+ 
+     fn prepared(argv: &[&str]) -> PreparedTest {
+-        let argv = argv.iter().map(|value| (*value).to_string()).collect::<Vec<_>>();
++        let argv = argv
++            .iter()
++            .map(|value| (*value).to_string())
++            .collect::<Vec<_>>();
+         PreparedTest {
+             host_argv: argv.clone(),
+             guest_argv: argv,
+@@ -2691,7 +2731,6 @@ mod tests {
+ ci:
+   ptrace: true
+   liteinst: false
+-workdir: /tmp
+ ci_disabled_reason:
+   liteinst:
+     result: determinism-failure
+@@ -2706,7 +2745,7 @@ backends_disabled:
+         )
+         .unwrap();
+         validate_mode("fixture/test", "verify", &mode).unwrap();
+-        assert_eq!(mode.workdir.as_deref(), Some("/tmp"));
++        assert_eq!(mode.workdir, None);
+         let policy = ci_selection(&mode).unwrap();
+         assert!(policy.selected("ptrace"));
+         assert!(!policy.selected("liteinst"));
+@@ -2726,6 +2765,16 @@ backends_disabled:
+         );
+     }
+ 
++    #[test]
++    fn required_cells_reject_declared_workdir() {
++        let mut mode = recipe(true).modes.remove("verify").unwrap();
++        mode.workdir = Some("/tmp".into());
++        assert_eq!(
++            validate_mode("fixture/test", "verify", &mode).unwrap_err(),
++            "fixture/test: verify required cells always run in /test and must not declare workdir"
++        );
++    }
++
+     #[test]
+     fn rejects_workdir_for_non_run_modes() {
+         for mode in ["replay", "naked"] {
+@@ -2884,6 +2933,12 @@ backends_disabled:
+         )
+         .unwrap();
+         assert!(replay.argv.iter().any(|arg| arg == "--base-env=minimal"));
++        assert!(
++            replay
++                .argv
++                .iter()
++                .any(|arg| arg == "--mount=type=tmpfs,target=/test")
++        );
+         assert!(replay.argv.iter().any(|arg| arg == "--workdir=/test"));
+         assert!(!replay.argv.iter().any(|arg| arg == "--env"));
+ 
+@@ -3181,6 +3236,12 @@ backends_disabled:
+             window[0] == "--verify-json" && window[1] == "/repo/results/replay-cell/verify-1.json"
+         }));
+         assert!(replay.argv.iter().any(|arg| arg == "--base-env=minimal"));
++        assert!(
++            replay
++                .argv
++                .iter()
++                .any(|arg| arg == "--mount=type=tmpfs,target=/test")
++        );
+         assert!(replay.argv.iter().any(|arg| arg == "--workdir=/test"));
+         assert!(!replay.argv.iter().any(|arg| arg == "--env"));
+     }
+@@ -3312,9 +3373,11 @@ backends_disabled:
+         )
+         .unwrap();
+         assert!(!spec.argv.iter().any(|arg| arg == "--base-env=minimal"));
+-        assert!(spec.argv.windows(2).any(|window| {
+-            window[0] == "--env" && window[1].starts_with(SCHEDULED_JOBS_ENV)
+-        }));
++        assert!(
++            spec.argv.windows(2).any(|window| {
++                window[0] == "--env" && window[1].starts_with(SCHEDULED_JOBS_ENV)
++            })
++        );
+         assert!(!spec.argv.iter().any(|arg| arg == "--workdir=/test"));
+         assert_eq!(spec.guest_argv, vec!["/host/program"]);
+     }
+@@ -3344,6 +3407,32 @@ backends_disabled:
+         fs::remove_dir_all(root).unwrap();
+     }
+ 
++    #[test]
++    fn preparation_and_guest_processes_strip_the_internal_test_root_lease() {
++        let root = std::env::temp_dir().join(format!(
++            "hermit-lease-env-strip-bracket-{}",
++            std::process::id()
++        ));
++        fs::create_dir_all(&root).unwrap();
++        let stdout = root.join("stdout");
++        let stderr = root.join("stderr");
++        let env = BTreeMap::from([(
++            EPHEMERAL_TEST_ROOT_LEASE_ENV.to_string(),
++            "v2:11:22:33:44:55:66:77".to_string(),
++        )]);
++        let output =
++            execute_process(&root, "/usr/bin/env", &[], &env, &stdout, &stderr, 5).unwrap();
++        assert!(output.status.success());
++        let observed = fs::read_to_string(&stdout).unwrap();
++        assert!(
++            !observed
++                .lines()
++                .any(|line| line.starts_with(EPHEMERAL_TEST_ROOT_LEASE_ENV)),
++            "manual/preparation child observed an internal harness lease: {observed}"
++        );
++        fs::remove_dir_all(root).unwrap();
++    }
++
+     fn attempt_with_divergence(
+         turn: Option<u64>,
+         nanos: Option<u64>,
+@@ -3999,7 +4088,11 @@ backends_disabled:
+         let source = build_root.join("system-utils-procfs-sanitized-paths/fixtures");
+         let cell_dir = root.join("cell");
+         fs::create_dir_all(&source).unwrap();
+-        fs::write(source.join("procfs-sanitized-paths"), b"#!/bin/sh\nexit 0\n").unwrap();
++        fs::write(
++            source.join("procfs-sanitized-paths"),
++            b"#!/bin/sh\nexit 0\n",
++        )
++        .unwrap();
+         fs::set_permissions(
+             source.join("procfs-sanitized-paths"),
+             fs::Permissions::from_mode(0o755),
+@@ -4037,15 +4130,94 @@ backends_disabled:
+             arg.contains("target=/tmp/hermit-e2e-fixtures") && arg.ends_with(",readonly")
+         }));
+         assert!(!spec.argv.iter().any(|arg| arg == "--env"));
+-        assert!(
+-            !spec
+-                .argv
+-                .iter()
+-                .any(|arg| arg.contains("E2E_FIXTURE_DIR"))
+-        );
++        assert!(!spec.argv.iter().any(|arg| arg.contains("E2E_FIXTURE_DIR")));
+         fs::remove_dir_all(root).unwrap();
+     }
+ 
++    #[test]
++    fn harness_width_contract_receives_the_parsed_capacity_as_argv() {
++        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
++            .join("../..")
++            .canonicalize()
++            .unwrap();
++        let manifests = ManifestSet::load(&repo).unwrap();
++        let mut cells = manifests
++            .select(&Selection {
++                population: Some(Population::Required),
++                test: Some("system-utils/harness-width-contract".into()),
++                mode: Some("verify".into()),
++                backend: Some("ptrace".into()),
++                ..Selection::default()
++            })
++            .unwrap();
++        assert_eq!(cells.len(), 1);
++        let cell = cells.pop().unwrap();
++        assert_eq!(cell.test.expected_scheduled_worker_capacity, Some(1));
++
++        let root = std::env::temp_dir().join(format!(
++            "hermit-runner-width-contract-{}",
++            std::process::id()
++        ));
++        let _ = fs::remove_dir_all(&root);
++        let build_root = root.join("build");
++        fs::create_dir_all(build_root.join("system-utils-harness-width-contract/fixtures"))
++            .unwrap();
++        let mut context = RunContext {
++            root: repo,
++            hermit_bin: root.join("hermit"),
++            result_root: root.join("results"),
++            build_root,
++            run_id: "fixture".into(),
++            source_sha: "0".repeat(40),
++            source_dirty: false,
++            prebuilt: true,
++            keep_logs: false,
++            run_verify_strict: true,
++            record_verify_strict: true,
++            scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
++            isolated_workdir: None,
++        };
++        let cell_dir = root.join("cell");
++        let prepared = prepare_test(&context, &cell, &cell_dir).unwrap();
++        assert_eq!(prepared.guest_argv.last().map(String::as_str), Some("1"));
++        let spec = build_spec(&context, &cell, cell_dir, &prepared, "1", None).unwrap();
++        assert!(!spec.argv.iter().any(|arg| arg.contains(SCHEDULED_JOBS_ENV)));
++
++        context.scheduled_worker_capacity = ScheduledWorkerCapacity::new(2);
++        let error = prepare_test(&context, &cell, &root.join("wrong-width")).unwrap_err();
++        assert!(error.contains("expected scheduled worker capacity 1, got 2"));
++        fs::remove_dir_all(root).unwrap();
++    }
++
++    #[test]
++    fn harness_width_contract_fails_closed_on_missing_or_mismatched_argv() {
++        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
++            .join("../../tests/e2e/system-utils/harness-width-contract.sh")
++            .canonicalize()
++            .unwrap();
++        let invoke = |args: &[&str]| Command::new(&script).args(args).output().unwrap();
++
++        let accepted = invoke(&["--run", "1"]);
++        assert!(accepted.status.success());
++        assert_eq!(
++            String::from_utf8_lossy(&accepted.stdout),
++            "system-utils-width=1\n"
++        );
++
++        for (args, observed) in [
++            (&["--run"][..], "missing"),
++            (&["--run", "2"][..], "2"),
++            (&["--run", "1", "extra"][..], "1"),
++        ] {
++            let refused = invoke(args);
++            assert!(!refused.status.success(), "accepted {args:?}");
++            assert_eq!(
++                String::from_utf8_lossy(&refused.stdout),
++                format!("system-utils-width expected=1 observed={observed}\n")
++            );
++        }
++    }
++
+     #[test]
+     fn only_dot_slash_guest_arguments_are_rebased_to_the_checkout() {
+         let root = std::env::temp_dir().join(format!(
+diff --git a/ci/run-dag.sh b/ci/run-dag.sh
+index 2887735aa3..b83d5c527a 100755
+--- a/ci/run-dag.sh
++++ b/ci/run-dag.sh
+@@ -118,4 +118,12 @@ if (($# > 0)) && [[ $1 == list || $1 == ascii || $1 == dot || $1 == json ]]; the
+ fi
+ 
+ echo "run-dag.sh: lane=$lane runner=$runner verb=$verb cargo-jobs=$CARGO_BUILD_JOBS reverie-dbt-budget=portable-build-child-only" >&2
++if [[ $verb == run ]]; then
++    if [[ -n ${HERMIT_EPHEMERAL_TEST_ROOT_LEASE_V2+x} ]]; then
++        "$ROOT_DIR/ci/run-with-ephemeral-test-root.sh" --check-lease || exit $?
++    else
++        exec "$ROOT_DIR/ci/run-with-ephemeral-test-root.sh" -- \
++            "$ROOT_DIR/ci/run-dag.sh" "$lane" "$@"
++    fi
++fi
+ exec "$runner" "$verb" --dag "$dag" "$@"
+diff --git a/ci/run-with-hermit-e2e-artifact.sh b/ci/run-with-hermit-e2e-artifact.sh
+index fda173fed4..e307a59693 100755
+--- a/ci/run-with-hermit-e2e-artifact.sh
++++ b/ci/run-with-hermit-e2e-artifact.sh
+@@ -81,4 +81,7 @@ printf 'hermit-e2e-artifact: verified bin=%s install=%s\n' \
+ if ((private_test_root)); then
+     exec "$private_test_root_helper" -- "$@"
+ fi
++if [[ ${1:-} == target/debug/test-harness && ${2:-} == run ]]; then
++    exec "$ROOT_DIR/ci/run-with-ephemeral-test-root.sh" -- "$@"
++fi
+ exec "$@"
+diff --git a/docs/SABRE_COMPATIBILITY.md b/docs/SABRE_COMPATIBILITY.md
+index 3ffa0c0e6f..f14f933a22 100644
+--- a/docs/SABRE_COMPATIBILITY.md
++++ b/docs/SABRE_COMPATIBILITY.md
+@@ -293,7 +293,7 @@ Validate manifest policy and run the blocking SaBRe cells:
+ 
+ ```bash
+ target/debug/test-harness validate
+-target/debug/test-harness run --lane portable --backend sabre --ci-only
++./ci/run-with-ephemeral-test-root.sh -- target/debug/test-harness run --lane portable --backend sabre --ci-only
+ ```
+ 
+ Run a manual enabled cell with its exact ID:
+diff --git a/hermit-cli/src/bin/hermit/container.rs b/hermit-cli/src/bin/hermit/container.rs
+index 7e83ebf4ad..d83dbb3e8c 100644
+--- a/hermit-cli/src/bin/hermit/container.rs
++++ b/hermit-cli/src/bin/hermit/container.rs
+@@ -143,6 +143,17 @@ pub(super) fn apply_affinity(container: &mut Container, pin_threads: bool) {
+     }
+ }
+ 
++/// Mount operations that must lead every newly-created mount namespace.
++/// Keeping them as typed values lets tests assert the executable ordering
++/// contract without scanning source text.
++pub(super) fn mount_namespace_prelude(include_proc: bool) -> Vec<Mount> {
++    let mut mounts = vec![Mount::new("/").rprivate()];
++    if include_proc {
++        mounts.push(Mount::proc());
++    }
++    mounts
++}
++
+ pub fn default_container(pin_threads: bool) -> Container {
+     let mut container = Container::new();
+     container
+@@ -150,7 +161,10 @@ pub fn default_container(pin_threads: bool) -> Container {
+         .map_root()
+         .hostname("hermetic-container.local")
+         .domainname("local")
+-        .mount(Mount::proc());
++        // Mount propagation is inherited across CLONE_NEWNS. The typed
++        // prelude makes the root recursively private before proc, identity, or
++        // caller mounts so a shared host `/` cannot receive guest mount events.
++        .mounts(mount_namespace_prelude(true));
+ 
+     apply_affinity(&mut container, pin_threads);
+     container
+@@ -183,7 +197,8 @@ pub(super) fn image_container(
+         .unshare(Namespace::PID)
+         .map_root()
+         .hostname("hermetic-container.local")
+-        .domainname("local");
++        .domainname("local")
++        .mounts(mount_namespace_prelude(false));
+ 
+     // The cache is a deterministic input, not a writable container layer. Bind
+     // it onto itself and remount it read-only so a guest cannot poison later
+@@ -655,4 +670,14 @@ mod tests {
+         }
+         assert_eq!(choose_affinity_core(&[]), None);
+     }
++
++    #[test]
++    fn mount_namespace_is_made_private_before_other_mounts() {
++        let without_proc = mount_namespace_prelude(false);
++        assert_eq!(without_proc, vec![Mount::new("/").rprivate()]);
++
++        let with_proc = mount_namespace_prelude(true);
++        assert_eq!(with_proc[0], Mount::new("/").rprivate());
++        assert_eq!(with_proc[1], Mount::proc());
++    }
+ }
+diff --git a/hermit-cli/src/bin/hermit/record_start.rs b/hermit-cli/src/bin/hermit/record_start.rs
+index eab0942f64..6a8c799661 100644
+--- a/hermit-cli/src/bin/hermit/record_start.rs
++++ b/hermit-cli/src/bin/hermit/record_start.rs
+@@ -212,8 +212,9 @@ pub struct StartOpts {
+     #[clap(long)]
+     mount: Vec<Mount>,
+ 
+-    /// Set the working directory for both recording and replay after mounts apply.
+-    #[clap(long, value_name = "path")]
++    /// Set the working directory for both recording and replay after mounts apply. PATH must be
++    /// absolute.
++    #[clap(long, value_name = "PATH")]
+     workdir: Option<String>,
+ 
+     /// Directory where recorded syscall data is stored.
+diff --git a/hermit-cli/src/bin/hermit/run.rs b/hermit-cli/src/bin/hermit/run.rs
+index 4ea4c29779..89f1b55dd8 100644
+--- a/hermit-cli/src/bin/hermit/run.rs
++++ b/hermit-cli/src/bin/hermit/run.rs
+@@ -51,6 +51,7 @@ use super::container::apply_affinity;
+ use super::container::default_container;
+ use super::container::identity_hardening_mounts;
+ use super::container::image_container;
++use super::container::mount_namespace_prelude;
+ use super::container::with_container;
+ use super::global_opts::GlobalOpts;
+ use super::record_envelope::RecordEnvelope;
+@@ -434,9 +435,9 @@ pub struct RunOpts {
+     #[clap(short = 'e', long, value_parser = parse_assignment, value_name="name[=val]")]
+     env: Vec<(String, Option<String>)>,
+ 
+-    /// Set the guest working directory. The path is resolved after guest mounts are applied, so an
+-    /// isolated path such as `/tmp` refers to the guest view.
+-    #[clap(long, value_name = "path")]
++    /// Set the guest working directory. PATH must be absolute and is resolved after guest mounts
++    /// are applied, so an isolated path such as `/tmp` refers to the guest view.
++    #[clap(long, value_name = "PATH")]
+     workdir: Option<String>,
+ 
+     /// For debugging, save the details of this final run config: printed to a file in a human
+@@ -514,42 +515,7 @@ pub(super) fn apply_base_environment(
+ }
+ 
+ fn parse_mount(src: &str) -> Result<Mount, String> {
+-    let mount_type = src.split(',').rev().find_map(|item| {
+-        let (key, value) = item.trim().split_once('=')?;
+-        (key == "type").then_some(value)
+-    });
+-    if mount_type != Some("bind")
+-        && src.split(',').any(|item| {
+-            item.trim()
+-                .split_once('=')
+-                .is_some_and(|(key, _)| key == "bind-propagation")
+-        })
+-    {
+-        return Err("bind-propagation is supported only for bind mounts".into());
+-    }
+-    let parsed = Mount::from_str(src).map_err(|error| error.to_string())?;
+-    let Some(mount_type) = mount_type else {
+-        return Ok(parsed);
+-    };
+-    if mount_type == "bind" {
+-        return Ok(parsed);
+-    }
+-
+-    // reverie-process's Docker-syntax parser applies the default bind
+-    // propagation flags to every mount. For a source-less filesystem mount,
+-    // combining MS_REC|MS_PRIVATE with the initial mount turns the operation
+-    // into a propagation change and never creates the requested filesystem.
+-    // Reconstruct non-bind mounts without those bind-only flags.
+-    let target = parsed.get_target().to_path_buf();
+-    let source = parsed.get_source().map(Path::to_path_buf);
+-    let mut mount = Mount::new(target).fstype(mount_type);
+-    if let Some(source) = source {
+-        mount = mount.source(source);
+-    }
+-    if src.split(',').any(|item| item.trim() == "readonly") {
+-        mount = mount.readonly();
+-    }
+-    Ok(mount)
++    Mount::from_str(src).map_err(|error| error.to_string())
+ }
+ 
+ #[derive(Debug, Default, Clone, Copy, Parser, Eq, PartialEq)]
+@@ -1042,6 +1008,9 @@ fn backend_values_parse_and_round_trip() {
+ 
+ #[test]
+ fn guest_filesystem_paths_must_be_absolute() {
++    let absolute_workdir = RunOpts::parse_from(["fakehermit", "--workdir=/test", "/bin/true"]);
++    absolute_workdir.validate_mount_sources().unwrap();
++
+     let relative_workdir = RunOpts::parse_from(["fakehermit", "--workdir=test", "/bin/true"]);
+     assert!(
+         relative_workdir
+@@ -1060,34 +1029,19 @@ fn guest_filesystem_paths_must_be_absolute() {
+             .to_string()
+             .contains("--mount target must be absolute")
+     );
+-}
+ 
+-#[test]
+-fn source_less_filesystem_mounts_do_not_inherit_bind_propagation_flags() {
+-    let options =
+-        RunOpts::parse_from(["fakehermit", "--mount=type=tmpfs,target=/test", "/bin/true"]);
+-    assert_eq!(options.mount, vec![Mount::tmpfs("/test")]);
+-
+-    let bind = RunOpts::parse_from([
++    let relative_bind = RunOpts::parse_from([
+         "fakehermit",
+-        "--mount=type=bind,source=/tmp,target=/test,readonly",
++        "--bind=/tmp/hermit-bind-source:relative-target",
+         "/bin/true",
+     ]);
+-    assert_eq!(
+-        bind.mount,
+-        vec![Mount::bind("/tmp", "/test").readonly().rprivate()]
+-    );
+-
+-    let invalid = RunOpts::try_parse_from([
+-        "fakehermit",
+-        "--mount=type=tmpfs,target=/test,bind-propagation=rprivate",
+-        "/bin/true",
+-    ])
+-    .unwrap_err();
++    let error = relative_bind
++        .validate_mount_sources()
++        .unwrap_err()
++        .to_string();
+     assert!(
+-        invalid
+-            .to_string()
+-            .contains("bind-propagation is supported only for bind mounts")
++        error.contains("--bind source /tmp/hermit-bind-source does not exist"),
++        "relative --bind targets retain their guest-/tmp semantics and must not fail absolute-target validation: {error}"
+     );
+ }
+ 
+@@ -1217,8 +1171,14 @@ fn dbt_rejects_mount_and_workdir_options_it_cannot_apply() {
+         .to_string();
+     assert!(error.contains("dbt backend cannot apply --mount"));
+ 
+-    let mut with_tmp =
+-        RunOpts::parse_from(["fakehermit", "--backend", "dbt", "--tmp", "/test", "/bin/true"]);
++    let mut with_tmp = RunOpts::parse_from([
++        "fakehermit",
++        "--backend",
++        "dbt",
++        "--tmp",
++        "/test",
++        "/bin/true",
++    ]);
+     let error = with_tmp
+         .validate_args_with_perf_support(true)
+         .unwrap_err()
+@@ -2778,10 +2738,6 @@ impl RunOpts {
+         }
+         for bind in &self.bind {
+             let source = Path::new(OsStr::from_bytes(bind.source.to_bytes()));
+-            let target = Path::new(OsStr::from_bytes(bind.target.to_bytes()));
+-            if !target.is_absolute() {
+-                anyhow::bail!("--bind target must be absolute: {}", target.display());
+-            }
+             if !source.exists() {
+                 anyhow::bail!(
+                     "--bind source {} does not exist. Create it or correct the source path before \
+@@ -3339,7 +3295,7 @@ impl RunOpts {
+             .map_root()
+             .hostname("hermetic-container.local")
+             .domainname("local")
+-            .mount(Mount::proc())
++            .mounts(mount_namespace_prelude(true))
+             .mounts(mounts);
+ 
+         match &self.network {
+diff --git a/hermit-cli/src/replay.rs b/hermit-cli/src/replay.rs
+index 3891fe161d..e434de971c 100644
+--- a/hermit-cli/src/replay.rs
++++ b/hermit-cli/src/replay.rs
+@@ -33,6 +33,10 @@ use crate::replayer::Replayer;
+ type ReplayTool = detcore::Detcore<Replayer>;
+ type Tracer = reverie_ptrace::Tracer<detcore::GlobalState>;
+ 
++fn replay_mount_namespace_prelude() -> [Mount; 1] {
++    [Mount::new("/").rprivate()]
++}
++
+ /// Represents a replay that is currently running.
+ pub struct Replay {
+     // The running tracee.
+@@ -83,6 +87,12 @@ impl Replay {
+         let chroot =
+             prepare_chroot(dir, &metadata).context("Failed to create chroot environment")?;
+ 
++        // A new mount namespace inherits the parent's propagation flags. Make
++        // its root recursively private before applying replay mounts so no
++        // mount event can escape to a shared host root.
++        for mount in replay_mount_namespace_prelude() {
++            command.mount(mount);
++        }
+         for mount in prepare_replay_mounts(&chroot, mounts)? {
+             command.mount(mount);
+         }
+@@ -313,6 +323,14 @@ fn populate_recorded_exec_paths(
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn replay_makes_root_private_before_requested_mounts() {
++        assert_eq!(
++            replay_mount_namespace_prelude(),
++            [Mount::new("/").rprivate()]
++        );
++    }
++
+     #[test]
+     fn requested_mount_targets_are_rebased_into_the_replay_chroot() {
+         let data_dir = tempfile::tempdir().unwrap();
+diff --git a/hermit-cli/tests/cli.rs b/hermit-cli/tests/cli.rs
+index 29ec01d072..626d9990dd 100644
+--- a/hermit-cli/tests/cli.rs
++++ b/hermit-cli/tests/cli.rs
+@@ -3061,6 +3061,82 @@ fn run_rejects_a_missing_bind_source_before_mounting() {
+     assert_failure_contains(&output, &["--mount source", "does not exist", "correct"]);
+ }
+ 
++#[test]
++fn run_workdir_accepts_absolute_and_refuses_relative_before_launch() {
++    let _guard = hermit_run_guard();
++    let absolute = hermit(&["run", "--workdir=/tmp", "--", "/bin/pwd"]);
++    assert_success(&absolute, &["run", "--workdir=/tmp", "--", "/bin/pwd"]);
++    assert_eq!(stdout(&absolute), "/tmp\n");
++
++    let relative = hermit(&["run", "--workdir=tmp", "--", "/bin/true"]);
++    assert_failure_contains(&relative, &["--workdir must be absolute", "tmp"]);
++}
++
++#[test]
++fn record_start_workdir_accepts_absolute_and_refuses_relative_before_launch() {
++    let _guard = hermit_run_guard();
++    let recording = tempfile::tempdir().expect("failed to create recording data directory");
++    let data_dir = recording
++        .path()
++        .to_str()
++        .expect("temporary path should be UTF-8");
++    let absolute = hermit(&[
++        "record",
++        "start",
++        "--workdir=/tmp",
++        "--data-dir",
++        data_dir,
++        "--",
++        "/bin/pwd",
++    ]);
++    assert_success(
++        &absolute,
++        &[
++            "record",
++            "start",
++            "--workdir=/tmp",
++            "--data-dir",
++            data_dir,
++            "--",
++            "/bin/pwd",
++        ],
++    );
++    assert_eq!(stdout(&absolute), "/tmp\n");
++
++    let relative = hermit(&[
++        "record",
++        "start",
++        "--workdir=tmp",
++        "--data-dir",
++        data_dir,
++        "--",
++        "/bin/true",
++    ]);
++    assert_failure_contains(&relative, &["--workdir must be absolute", "tmp"]);
++}
++
++#[test]
++fn relative_bind_target_remains_under_guest_tmp() {
++    let _guard = hermit_run_guard();
++    let source = tempfile::tempdir().expect("failed to create relative-bind source");
++    fs::write(source.path().join("message"), b"relative-bind-ok\n")
++        .expect("failed to write relative-bind fixture");
++    let bind = format!("{}:relative-bind", source.path().display());
++    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
++        .args([
++            "run",
++            "--bind",
++            &bind,
++            "--",
++            "/bin/cat",
++            "/tmp/relative-bind/message",
++        ])
++        .output()
++        .expect("failed to run relative-bind CLI bracket");
++    assert_success(&output, &["run", "--bind", "<fixture>:relative-bind"]);
++    assert_eq!(stdout(&output), "relative-bind-ok\n");
++}
++
+ #[test]
+ fn minimal_env_private_workdir_is_empty_for_both_verify_runs() {
+     let _guard = HERMIT_RUN_LOCK.lock().unwrap();
+@@ -3156,6 +3232,71 @@ int main(void) {
+     assert_eq!(snapshot(), before, "Hermit changed the outer /test");
+ }
+ 
++#[test]
++fn guest_mounts_do_not_propagate_to_a_shared_parent_mount() {
++    let _guard = hermit_run_guard();
++    let unshare = Path::new("/usr/bin/unshare");
++    if !unshare.is_file()
++        || !Command::new(unshare)
++            .args(["--user", "--map-root-user", "--mount", "/bin/true"])
++            .status()
++            .is_ok_and(|status| status.success())
++    {
++        eprintln!(
++            "skipping mount-propagation check: unprivileged user+mount namespaces unavailable"
++        );
++        return;
++    }
++
++    let root = tempfile::Builder::new()
++        .prefix("mount-propagation-")
++        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
++        .expect("create mount-propagation fixture");
++    let script = r#"
++set -eu
++root=$1
++hermit=$2
++shared=$root/shared
++target=$shared/target
++/usr/bin/mkdir -p -- "$target"
++/usr/bin/mount --bind "$shared" "$shared"
++cleanup() {
++    /usr/bin/umount -l -- "$target" 2>/dev/null || true
++    /usr/bin/umount -l -- "$shared" 2>/dev/null || true
++}
++trap cleanup EXIT HUP INT TERM
++/usr/bin/mount --make-shared "$shared"
++"$hermit" run --base-env=minimal --no-sequentialize-threads \
++    --max-timeslice=disabled --no-virtualize-cpuid \
++    --mount="type=tmpfs,target=$target" -- \
++    /usr/bin/mountpoint -q "$target"
++if /usr/bin/mountpoint -q -- "$target"; then
++    echo "guest tmpfs propagated into parent namespace: $target" >&2
++    exit 97
++fi
++"#;
++    let output = Command::new(unshare)
++        .args([
++            "--user",
++            "--map-root-user",
++            "--mount",
++            "/bin/sh",
++            "-c",
++            script,
++            "_",
++        ])
++        .arg(root.path())
++        .arg(env!("CARGO_BIN_EXE_hermit"))
++        .output()
++        .expect("run shared-mount propagation probe");
++    assert!(
++        output.status.success(),
++        "shared-mount propagation probe failed:\nstdout:\n{}\nstderr:\n{}",
++        String::from_utf8_lossy(&output.stdout),
++        String::from_utf8_lossy(&output.stderr),
++    );
++}
++
+ #[test]
+ fn run_reports_denied_ptrace_and_seccomp_capabilities() {
+     for (syscall, expected) in [
+diff --git a/scripts/lib/safe_ci_scope.rs b/scripts/lib/safe_ci_scope.rs
+index 8f3f95f7fc..6be5a3675b 100644
+--- a/scripts/lib/safe_ci_scope.rs
++++ b/scripts/lib/safe_ci_scope.rs
+@@ -230,26 +230,17 @@ fn outer_scope_limits_observed(proof: Option<&ContainmentProof>, expected_memory
+     verify_outer_scope_limits_at(&scope, expected_memory_max)
+ }
+ 
+-/// Establish two-level cgroup-v2 boxing for a direct Rust scheduler client.
+-///
+-/// A successful initial call re-executes the current CLI inside a transient
+-/// scope. The in-scope call verifies the running process and every requested
+-/// outer limit before returning a per-step cgroup manager. `verify_runtime`
+-/// is false only when the caller inherited somebody else's scope rather than
+-/// requesting its own `RuntimeMaxSec` rung.
+-pub fn resolve_cgroups(
++/// Complete only the transient-scope re-exec phase. A successful out-of-scope
++/// call never returns; the replacement process returns here already in scope.
++/// No cgroup manager or teardown handler is constructed in this phase.
++pub fn ensure_scope_reexec(
+     label: &str,
+     allow_failure: bool,
+     scope_runtime_s: Option<i64>,
+-    verify_runtime: bool,
+-) -> Result<BoxedCgroups, u8> {
++) -> Result<(), u8> {
+     if !is_in_scope() {
+         if allow_failure {
+-            return unavailable(
+-                label,
+-                true,
+-                "cgroup boxing was not established; process-group teardown and per-step wall limits remain active",
+-            );
++            return Ok(());
+         }
+         let attempt = attempt_scope_reexec(None, None, scope_runtime_s);
+         return unavailable(
+@@ -259,6 +250,27 @@ pub fn resolve_cgroups(
+                 "cgroup boxing could not be established: {}; resource boxing is required",
+                 attempt.describe()
+             ),
++        )
++        .map(|_| ());
++    }
++    Ok(())
++}
++
++/// Verify an already-established outer scope, construct its per-step manager,
++/// and install teardown exactly once. This separate phase lets a caller keep
++/// an external cleanup owner outside the killable systemd scope, revalidate its
++/// argv-carried lease after scope entry, and only then create cgroup ownership
++/// or signal-handler state.
++pub fn resolve_cgroups_after_reexec(
++    label: &str,
++    allow_failure: bool,
++    verify_runtime: bool,
++) -> Result<BoxedCgroups, u8> {
++    if !is_in_scope() {
++        return unavailable(
++            label,
++            allow_failure,
++            "cgroup boxing was not established; process-group teardown and per-step wall limits remain active",
+         );
+     }
+ 
+diff --git a/scripts/manifest-to-commands.rs b/scripts/manifest-to-commands.rs
+index f007f2b1ef..3a297edb83 100755
+--- a/scripts/manifest-to-commands.rs
++++ b/scripts/manifest-to-commands.rs
+@@ -42,8 +42,8 @@ use manifest_value::Value;
+ 
+ const MANIFEST_SCHEMA: i64 = 2;
+ const GUEST_FIXTURE_ROOT: &str = "/tmp/hermit-e2e-fixtures";
+-const RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=\"$cell/tmp\" E2E_FIXTURE_DIR=\"$cell/fixtures\"";
+-const HERMIT_RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=/tmp/hermit-e2e E2E_FIXTURE_DIR=\"$cell/fixtures\"";
++const RUN_ENV: &str = "env -u HERMIT_EPHEMERAL_TEST_ROOT_LEASE_V2 LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=\"$cell/tmp\" E2E_FIXTURE_DIR=\"$cell/fixtures\"";
++const HERMIT_RUN_ENV: &str = "env -u HERMIT_EPHEMERAL_TEST_ROOT_LEASE_V2 LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=/tmp/hermit-e2e E2E_FIXTURE_DIR=\"$cell/fixtures\"";
+ const HERMIT_GUEST_ENV_ARGS: &str = "--env LC_ALL=C --env TZ=UTC --env HOME=\"$cell/home\" --env XDG_CONFIG_HOME=\"$cell/xdg-config\" --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=\"$cell/fixtures\"";
+ 
+ #[cfg(not(test))]
+@@ -296,6 +296,20 @@ fn cell_required(spec: &Value, mode: &str, backend: &str, id: &str) -> bool {
+         && ci_selected(spec, mode, backend, id)
+ }
+ 
++fn validate_required_workdir(
++    spec: &Value,
++    required: bool,
++    id: &str,
++    mode: &str,
++) -> Result<(), String> {
++    if required && spec.get("workdir").is_some() {
++        return Err(format!(
++            "{id}: {mode} required cells always run in /test and must not declare workdir"
++        ));
++    }
++    Ok(())
++}
++
+ /// Append the guest's own arguments to an already-quoted guest word.
+ fn guest_with_args(guest: &str, guest_args: &[String], resolve_checkout: bool) -> String {
+     if guest_args.is_empty() {
+@@ -375,6 +389,23 @@ fn guest_with_prepared_fixtures(guest: &str, fixtures: &[String]) -> String {
+     }
+ }
+ 
++fn expected_scheduled_worker_capacity(test: &Value, id: &str) -> Option<i64> {
++    test.get("expected_scheduled_worker_capacity").map(|value| {
++        value
++            .as_integer()
++            .filter(|capacity| *capacity > 0)
++            .unwrap_or_else(|| {
++                fail(format!(
++                    "{id}.expected_scheduled_worker_capacity must be a positive integer"
++                ))
++            })
++    })
++}
++
++fn guest_with_scheduled_worker_capacity(guest: &str, capacity: Option<i64>) -> String {
++    capacity.map_or_else(|| guest.to_owned(), |capacity| format!("{guest} {capacity}"))
++}
++
+ fn hermit_command(
+     mode: &str,
+     backend: &str,
+@@ -414,7 +445,11 @@ fn hermit_command(
+                 fail("prepared_fixture_args are not supported by record/replay");
+             }
+             let base_env = if required { " --base-env=minimal" } else { "" };
+-            let workdir = if required { " --workdir=/test" } else { "" };
++            let workdir = if required {
++                " --mount=type=tmpfs,target=/test --workdir=/test"
++            } else {
++                ""
++            };
+             format!(
+                 "{HERMIT_RUN_ENV} \"$hermit_bin\" --log info --backend {} record start{base_env} --strict $record_verify_strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout {timeout}{workdir}{legacy_guest_env} -- {guest}",
+                 shell_quote(backend)
+@@ -441,6 +476,11 @@ fn hermit_command(
+         }
+         other => fail(format!("unsupported mode `{other}`")),
+     };
++    let command = if required {
++        format!("./ci/run-with-ephemeral-test-root.sh -- {command}")
++    } else {
++        command
++    };
+     format!("timeout --kill-after=10s {timeout}s {command}")
+ }
+ 
+@@ -472,6 +512,7 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
+     let (setup, host_guest, lockdown_guest) = setup_prefix(test, &id);
+     let native_prepared = prepared_fixture_paths(test, &id, true);
+     let guest_prepared = prepared_fixture_paths(test, &id, false);
++    let scheduled_capacity = expected_scheduled_worker_capacity(test, &id);
+     let has_prepared_fixtures = !guest_prepared.is_empty();
+     let mut mode_names = modes.keys().map(String::as_str).collect::<Vec<_>>();
+     mode_names.sort_unstable();
+@@ -489,6 +530,8 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
+             }
+             let runs = spec.get("runs").and_then(Value::as_integer).unwrap_or(3);
+             let native_guest = guest_with_prepared_fixtures(&host_guest, &native_prepared);
++            let native_guest =
++                guest_with_scheduled_worker_capacity(&native_guest, scheduled_capacity);
+             let run = format!("timeout --kill-after=10s {timeout}s {RUN_ENV} {native_guest}");
+             lines.push(format!(
+                 "{setup} && {} # {id} mode=naked backend=native",
+@@ -526,12 +569,15 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
+ 
+         for backend in backends {
+             let required = cell_required(spec, mode, &backend, &id);
++            validate_required_workdir(spec, required, &id, mode)
++                .unwrap_or_else(|error| fail(error));
+             let guest_args = mode_guest_args(spec, mode, &backend, &id);
+             let guest = if required {
+                 guest_with_prepared_fixtures(&lockdown_guest, &guest_prepared)
+             } else {
+                 guest_with_prepared_fixtures(&host_guest, &native_prepared)
+             };
++            let guest = guest_with_scheduled_worker_capacity(&guest, scheduled_capacity);
+             let guest = guest_with_args(&guest, &guest_args, required);
+             for seed in &seeds {
+                 let seed = (mode == "chaos").then_some(*seed);
+@@ -844,6 +890,9 @@ test:
+             .find(|command| command.contains("backend=ptrace"))
+             .unwrap();
+         assert!(required.contains("--mount=type=tmpfs,target=/test --workdir=/test"));
++        assert!(required.contains(
++            "./ci/run-with-ephemeral-test-root.sh -- env -u HERMIT_EPHEMERAL_TEST_ROOT_LEASE_V2 LC_ALL=C"
++        ));
+         assert!(required.contains("-- \"$(pwd)\"/examples/example.py"));
+         assert!(!required.contains("--env LC_ALL"));
+ 
+@@ -853,11 +902,24 @@ test:
+             .unwrap();
+         assert!(!manual.contains("--workdir=/test"));
+         assert!(!manual.contains("target=/test"));
++        assert!(!manual.contains("run-with-ephemeral-test-root.sh"));
++        assert!(manual.contains("env -u HERMIT_EPHEMERAL_TEST_ROOT_LEASE_V2"));
+         assert!(manual.contains("--env LC_ALL=C"));
+         assert!(manual.contains("-- ./examples/example.py"));
+         assert!(!manual.contains("\"$(pwd)\"/examples/example.py"));
+     }
+ 
++    #[test]
++    fn required_workdir_is_refused_instead_of_silently_overridden() {
++        let spec: Value = "ci: true\nworkdir: /tmp\nbackends_enabled: [ptrace]"
++            .parse()
++            .unwrap();
++        let error = validate_required_workdir(&spec, true, "fixture/test", "verify")
++            .unwrap_err();
++        assert!(error.contains("must not declare workdir"));
++        validate_required_workdir(&spec, false, "fixture/test", "verify").unwrap();
++    }
++
+     #[test]
+     #[should_panic(expected = "must not escape the repository")]
+     fn dot_slash_guest_arguments_reject_parent_escape() {
+@@ -933,7 +995,9 @@ test:
+         assert!(replay.contains("--strict $record_verify_strict --verify"));
+         assert!(replay.contains("--verify-json \"$cell/captures/verify.json\""));
+         assert!(replay.contains("record start --base-env=minimal"));
+-        assert!(replay.contains("--workdir=/test -- guest"));
++        assert!(replay.contains(
++            "--mount=type=tmpfs,target=/test --workdir=/test -- guest"
++        ));
+         assert!(!replay.contains("--env"));
+         assert!(!replay.contains("--no-virtualize-cpuid"));
+ 
+@@ -1029,6 +1093,21 @@ test:
+         assert!(verify.contains("/tmp/hermit-e2e-fixtures/nested/pipe-chain"));
+     }
+ 
++    #[test]
++    fn scheduled_worker_capacity_is_a_typed_guest_argument() {
++        let test: Value = r#"
++program: tests/e2e/system-utils/harness-width-contract.sh
++expected_scheduled_worker_capacity: 1
++"#
++        .parse()
++        .unwrap();
++        assert_eq!(expected_scheduled_worker_capacity(&test, "fixture"), Some(1));
++        assert_eq!(
++            guest_with_scheduled_worker_capacity("guest --run", Some(1)),
++            "guest --run 1"
++        );
++    }
++
+     #[test]
+     fn prepared_fixture_suffixes_are_shell_quoted() {
+         let tests = manifest(
+diff --git a/scripts/validate.rs b/scripts/validate.rs
+index 953137a636..b1688dc46f 100755
+--- a/scripts/validate.rs
++++ b/scripts/validate.rs
+@@ -95,6 +95,8 @@ use std::io::Read;
+ use std::os::unix::fs::MetadataExt;
+ use std::os::unix::fs::OpenOptionsExt;
+ use std::os::unix::fs::PermissionsExt;
++use std::os::unix::process::CommandExt;
++use std::os::unix::process::ExitStatusExt;
+ use std::path::Path;
+ use std::path::PathBuf;
+ use std::process::Command;
+@@ -152,11 +154,32 @@ fn validation_step_identity(step: &Step) -> ValidationStepIdentity {
+     }
+ }
+ 
++fn validation_step_requires_private_test_root(step: &Step) -> bool {
++    validation_step_identity(step) == ValidationStepIdentity::ManifestRun
++        || (step.group == "quick" && step.job == "e2e_verify")
++        || (step.group == "requalify" && step.job == "cell")
++}
++
++fn plan_requires_private_test_root(plan: &Plan) -> bool {
++    std::iter::once(&plan.cfg)
++        .chain(plan.second.iter())
++        .flat_map(|cfg| cfg.steps.iter())
++        .any(validation_step_requires_private_test_root)
++}
++
++fn step_command_directly_consumes_private_test_root(step: &Step) -> bool {
++    step.cmd.contains("target/debug/test-harness run")
++        || step.cmd.contains("ci/compat-envelope/pressure-test.rs run")
++}
++
+ const LEDGER_ENV: &str = "HERMIT_VALIDATE_LEDGER";
+ const PARENT_ENV: &str = "DEV_HERMIT_PARENT";
+ const OWN_SCOPE_DEADLINE_ENV: &str = "HERMIT_VALIDATE_SCOPE_DEADLINE_MONOTONIC_NS";
+ const NESTED_SCOPE_SELF_TEST_ENV: &str = "HERMIT_VALIDATE_NESTED_SCOPE_SELF_TEST";
+ const SUMMARY_EPILOGUE_SELF_TEST_ENV: &str = "HERMIT_VALIDATE_SUMMARY_EPILOGUE_SELF_TEST";
++const EPHEMERAL_TEST_ROOT_LEASE_ENV: &str = "HERMIT_EPHEMERAL_TEST_ROOT_LEASE_V2";
++const EPHEMERAL_TEST_ROOT_LEASE_ARG: &str = "--internal-ephemeral-test-root-lease-v2";
++const PRIVATE_TEST_ROOT_HELPER_DECISION_ARG: &str = "--internal-private-test-root-helper";
+ const PRIVATE_TEST_ROOT_ENV: &str = "HERMIT_VALIDATE_PRIVATE_TEST_ROOT";
+ const PRIVATE_TEST_ROOT_HELPER_ENV: &str = "HERMIT_VALIDATE_PRIVATE_TEST_ROOT_HELPER";
+ const PRIVATE_TEST_ROOT_HELPER_SHA256_ENV: &str =
+@@ -169,16 +192,26 @@ const PRIVATE_TEST_ROOT_AUTHORITY: &str =
+ const NESTED_SCOPE_OUTER: &str = "outer";
+ const NESTED_SCOPE_INNER: &str = "inner";
+ const NESTED_SCOPE_SIGNAL: &str = "signal";
++const NESTED_SCOPE_TOP_SIGNAL: &str = "top-signal";
++const NESTED_SCOPE_RUNTIME: &str = "runtime";
++const SCOPE_PROBE_READY_ENV: &str = "HERMIT_VALIDATE_SCOPE_PROBE_READY";
++const SCOPE_PROBE_SURVIVOR_ENV: &str = "HERMIT_VALIDATE_SCOPE_PROBE_SURVIVOR";
++const NESTED_SIGNAL_READY_ENV: &str = "HERMIT_VALIDATE_NESTED_SIGNAL_READY";
++const NESTED_SIGNAL_RELEASE_ENV: &str = "HERMIT_VALIDATE_NESTED_SIGNAL_RELEASE";
+ const NESTED_INNER_STEP_S: i64 = 2;
+ const NESTED_INNER_RUN_S: i64 = 5;
+ const NESTED_OUTER_CHILD_STEP_S: i64 = 10;
+ const NESTED_OUTER_CHILD_RUN_S: i64 = 12;
+-const NESTED_SIGNAL_STEP_S: i64 = 5;
+-const NESTED_SIGNAL_RUN_S: i64 = 7;
++const NESTED_SIGNAL_STARTUP_S: u64 = 12;
++const NESTED_SIGNAL_AFTER_READY_S: u64 = 7;
++const NESTED_SIGNAL_STEP_S: i64 = 20;
++const NESTED_SIGNAL_RUN_S: i64 = 22;
+ const NESTED_SURVIVOR_STEP_S: i64 = 2;
+ const NESTED_SURVIVOR_RUN_S: i64 = 4;
+-const NESTED_SCOPE_RUNTIME_S: i64 = 30;
+-const NESTED_WRAPPER_TIMEOUT_S: i64 = 45;
++const NESTED_SCOPE_RUNTIME_S: i64 = 45;
++const NESTED_WRAPPER_TIMEOUT_S: i64 = 60;
++const CLEANUP_PROBE_RUNTIME_S: i64 = 5;
++const CLEANUP_PROBE_DEADLINE_S: u64 = 20;
+ 
+ /// Standalone-only in-repo ledger directory.
+ ///
+@@ -316,7 +349,13 @@ struct Args {
+     merge_lanes: bool,
+     reuse_parent_manifest_gate: bool,
+     private_test_root_eligible: bool,
++    /// Exact live lease tuple appended by the hardened wrapper. This is an
++    /// internal transport across systemd's argv-preserving re-exec, never a
++    /// user-facing credential and never part of a cache key or receipt.
++    ephemeral_test_root_lease: Option<String>,
++    private_test_root_helper_decision: Option<PrivateTestRootHelperDecision>,
+     self_test: bool,
++    live_private_root_self_test: bool,
+     show_plan: bool,
+ }
+ 
+@@ -374,8 +413,9 @@ fn usage() -> &'static str {
+      \x20 --merge-lanes    Fuse the portable and privileged lanes (the full default).\n\
+      \x20 --sequential-lanes  Diagnostic fallback: run full lanes back to back.\n\
+      \x20 --show-plan      Print the boxed DAG plan (nodes, caps, deps) and exit.\n\
+-     \x20 --self-test      Run inert policy/data brackets plus one bounded disposable\n\
+-     \x20                  nested-cgroup check, then exit.\n\
++     \x20 --self-test      Run inert policy/data brackets; safe inside a validation DAG.\n\
++     \x20 --live-private-root-self-test  Exercise the real outer-lease, nested-cgroup,\n\
++     \x20                  SIGTERM, and RuntimeMax cleanup topology; internal CI use only.\n\
+      \x20 -h, --help       Show this help and exit.\n\
+      \n\
+      Environment: VALIDATE_LEVEL, VALIDATE_LABEL_PR, VALIDATE_RUN_ON_DIRTY_TREE,\n\
+@@ -410,6 +450,58 @@ fn parse_args() -> Result<Args, u8> {
+     parse_argv(&argv)
+ }
+ 
++fn parse_ephemeral_test_root_lease_argument(argv: &[String]) -> Result<Option<String>, u8> {
++    let mut lease = None;
++    for argument in argv {
++        if !argument.starts_with(EPHEMERAL_TEST_ROOT_LEASE_ARG) {
++            continue;
++        }
++        let Some(value) = argument
++            .strip_prefix(EPHEMERAL_TEST_ROOT_LEASE_ARG)
++            .and_then(|suffix| suffix.strip_prefix('='))
++        else {
++            eprintln!("validate: malformed internal /test lease argument");
++            return Err(2);
++        };
++        validate_ephemeral_test_root_lease_tuple(value).map_err(|error| {
++            eprintln!("validate: {error}");
++            2
++        })?;
++        if lease.replace(value.to_string()).is_some() {
++            eprintln!("validate: duplicate internal /test lease argument");
++            return Err(2);
++        }
++    }
++    Ok(lease)
++}
++
++fn parse_private_test_root_helper_decision_argument(
++    argv: &[String],
++) -> Result<Option<PrivateTestRootHelperDecision>, u8> {
++    let mut decision = None;
++    for argument in argv {
++        if !argument.starts_with(PRIVATE_TEST_ROOT_HELPER_DECISION_ARG) {
++            continue;
++        }
++        let Some(value) = argument
++            .strip_prefix(PRIVATE_TEST_ROOT_HELPER_DECISION_ARG)
++            .and_then(|suffix| suffix.strip_prefix('='))
++        else {
++            eprintln!("validate: malformed internal helper decision argument");
++            return Err(2);
++        };
++        let parsed = PrivateTestRootHelperDecision::parse(value).map_err(|error| {
++            eprintln!("validate: {error}");
++            2
++        })?;
++        if decision.replace(parsed).is_some() {
++            eprintln!("validate: duplicate internal helper decision argument");
++            return Err(2);
++        }
++    }
++    Ok(decision)
++}
++
+ /// Argument parsing over an EXPLICIT argv.
+ ///
+ /// Split out from [`parse_args`] so `--self-test` can exercise the real parser
+@@ -417,6 +509,7 @@ fn parse_args() -> Result<Args, u8> {
+ /// re-enter `main`, hit the dirty-tree and rebase-freshness gates, and turn a CLI
+ /// bracket into a test of the checkout's state instead of the flag surface.
+ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
++    let internal_lease = parse_ephemeral_test_root_lease_argument(argv)?;
+     let mut level = Level::Full;
+     let mut level_explicit = false;
+     if let Ok(v) = std::env::var("VALIDATE_LEVEL") {
+@@ -452,7 +545,10 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
+         merge_lanes: true,
+         reuse_parent_manifest_gate: false,
+         private_test_root_eligible: canonical_full_private_test_root_args(argv),
++        ephemeral_test_root_lease: internal_lease,
++        private_test_root_helper_decision: parse_private_test_root_helper_decision_argument(argv)?,
+         self_test: false,
++        live_private_root_self_test: false,
+         show_plan: false,
+     };
+     let mut shallow = false;
+@@ -545,7 +641,11 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
+             // gates this node on it. The nested payload still reruns submodule
+             // and Reverie-pin checks, so `reverie_pin_current` remains observed.
+             "--reuse-parent-manifest-gate" => args.reuse_parent_manifest_gate = true,
++            other
++                if other.starts_with(EPHEMERAL_TEST_ROOT_LEASE_ARG)
++                    || other.starts_with(PRIVATE_TEST_ROOT_HELPER_DECISION_ARG) => {}
+             "--self-test" => args.self_test = true,
++            "--live-private-root-self-test" => args.live_private_root_self_test = true,
+             "-k" | "--keep-going" => args.keep_going = true,
+             "--allow-cgroup-failure" => args.allow_cgroup_failure = true,
+             "--run-timeout" => {
+@@ -590,6 +690,12 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
+                 i += 2;
+             }
+             "-h" | "--help" => {
++                if args.ephemeral_test_root_lease.is_some()
++                    || args.private_test_root_helper_decision.is_some()
++                {
++                    eprintln!("validate: internal /test isolation state is invalid for help");
++                    return Err(2);
++                }
+                 println!("{}", usage());
+                 return Err(0);
+             }
+@@ -616,6 +722,17 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
+     }
+     args.show_plan = show_plan;
+     args.focused = focused.pop();
++    if args.live_private_root_self_test
++        && (args.self_test
++            || args.show_plan
++            || args.focused.is_some()
++            || args.level_explicit)
++    {
++        eprintln!(
++            "validate: --live-private-root-self-test is an exclusive internal probe mode"
++        );
++        return Err(2);
++    }
+     if args.reuse_parent_manifest_gate
+         && (!matches!(args.focused, Some(Focused::PortableStrictCompat)) || args.label_pr)
+     {
+@@ -661,21 +778,90 @@ fn canonical_full_private_test_root_args(argv: &[String]) -> bool {
+     }
+     let mut seen = BTreeSet::new();
+     argv[1..].iter().all(|argument| {
+-        matches!(argument.as_str(), "--ignore-cache" | "--no-label-pr" | "--verbose")
+-            && seen.insert(argument.as_str())
++        if argument.starts_with(EPHEMERAL_TEST_ROOT_LEASE_ARG)
++            || argument.starts_with(PRIVATE_TEST_ROOT_HELPER_DECISION_ARG)
++        {
++            true
++        } else {
++            matches!(argument.as_str(), "--ignore-cache" | "--no-label-pr" | "--verbose")
++                && seen.insert(argument.as_str())
++        }
+     })
+ }
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ enum PrivateTestRootActivation {
+     Disabled,
+-    CanonicalFull,
++    HelperBacked,
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++enum PrivateTestRootHelperPolicy {
++    Disabled,
++    Optional,
++    Required,
+ }
+ 
+ #[derive(Clone, Debug, Eq, PartialEq)]
+ struct PrivateTestRootHelper {
+     path: String,
+     sha256: String,
++    decision: PrivateTestRootHelperDecision,
++}
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++struct PrivateTestRootHelperDecision {
++    helper_sha256: String,
++    target: String,
++    owner_pid: u32,
++    owner_start_ticks: u64,
++    authority_sha256: String,
++}
++
++impl PrivateTestRootHelperDecision {
++    fn encode(&self) -> String {
++        format!(
++            "v1:{}:{}:{}:{}:{}",
++            self.helper_sha256,
++            self.target,
++            self.owner_pid,
++            self.owner_start_ticks,
++            self.authority_sha256
++        )
++    }
++
++    fn parse(value: &str) -> Result<Self, String> {
++        let fields = value.split(':').collect::<Vec<_>>();
++        if fields.len() != 6 || fields[0] != "v1" {
++            return Err("malformed internal helper decision argument".into());
++        }
++        let helper_sha256 = fields[1].to_string();
++        let target = fields[2].to_string();
++        let owner_pid = fields[3]
++            .parse::<u32>()
++            .ok()
++            .filter(|pid| *pid > 1)
++            .ok_or("malformed internal helper decision owner pid")?;
++        let owner_start_ticks = fields[4]
++            .parse::<u64>()
++            .ok()
++            .filter(|ticks| *ticks > 0)
++            .ok_or("malformed internal helper decision owner start")?;
++        let authority_sha256 = fields[5].to_string();
++        if !is_lower_hex(&helper_sha256, 64)
++            || !is_lower_hex(&target, 40)
++            || !is_lower_hex(&authority_sha256, 64)
++        {
++            return Err("malformed internal helper decision digest/target".into());
++        }
++        Ok(Self {
++            helper_sha256,
++            target,
++            owner_pid,
++            owner_start_ticks,
++            authority_sha256,
++        })
++    }
+ }
+ 
+ #[derive(Clone, Debug, Eq, PartialEq)]
+@@ -699,25 +885,69 @@ struct ValidateLockAdmission {
+ /// top-level, complete full profile. Focused and nested invocations remain
+ /// diagnostic payloads and must not acquire canonical behavior by inheriting an
+ /// environment variable.
+-fn private_test_root_activation(
++fn private_test_root_helper_policy(
+     args: &Args,
+     nested: bool,
+     lock_admitted: bool,
++    plan_requires_private_test_root: bool,
++) -> PrivateTestRootHelperPolicy {
++    if !lock_admitted || nested || !plan_requires_private_test_root {
++        return PrivateTestRootHelperPolicy::Disabled;
++    }
++    if args.private_test_root_eligible && args.level == Level::Full && args.focused.is_none() {
++        return PrivateTestRootHelperPolicy::Required;
++    }
++    if matches!(
++        args.focused,
++        Some(Focused::Only { .. } | Focused::Selective { .. })
++    ) {
++        return PrivateTestRootHelperPolicy::Optional;
++    }
++    PrivateTestRootHelperPolicy::Disabled
++}
++
++fn private_test_root_activation(
++    policy: PrivateTestRootHelperPolicy,
++    helper_available: bool,
+ ) -> PrivateTestRootActivation {
+-    if lock_admitted
+-        && !nested
+-        && args.private_test_root_eligible
+-        && args.level == Level::Full
+-        && args.focused.is_none()
+-    {
+-        PrivateTestRootActivation::CanonicalFull
++    if helper_available && policy != PrivateTestRootHelperPolicy::Disabled {
++        PrivateTestRootActivation::HelperBacked
+     } else {
+         PrivateTestRootActivation::Disabled
+     }
+ }
+ 
+-fn private_test_root_allows_cache(activation: PrivateTestRootActivation) -> bool {
+-    activation == PrivateTestRootActivation::Disabled
++fn private_test_root_allows_cache(
++    activation: PrivateTestRootActivation,
++    canonical_authority_expected: bool,
++) -> bool {
++    !canonical_authority_expected && activation == PrivateTestRootActivation::Disabled
++}
++
++/// Once the product front door observes canonical lock authority, this logical
++/// process may not silently degrade to standalone behavior. Re-read the live
++/// authority at the private-root/cache boundary and require the same owner.
++fn refresh_canonical_validate_lock_authority(
++    expected: Option<&ValidateLockAdmission>,
++    observed: Option<ValidateLockAdmission>,
++) -> Result<Option<ValidateLockAdmission>, String> {
++    match (expected, observed) {
++        (Some(expected), Some(observed)) if expected == &observed => Ok(Some(observed)),
++        (Some(expected), Some(observed)) => Err(format!(
++            "canonical validate-lock authority changed after admission: expected owner {}@{} for {}, observed owner {}@{} for {}",
++            expected.owner_pid,
++            expected.owner_start_ticks,
++            expected.target,
++            observed.owner_pid,
++            observed.owner_start_ticks,
++            observed.target,
++        )),
++        (Some(expected), None) => Err(format!(
++            "canonical validate-lock authority disappeared after admission for target {} owner {}@{}",
++            expected.target, expected.owner_pid, expected.owner_start_ticks
++        )),
++        (None, observed) => Ok(observed),
++    }
+ }
+ 
+ fn is_lower_hex(value: &str, len: usize) -> bool {
+@@ -948,12 +1178,8 @@ fn private_test_root_authority_matches(
+ }
+ 
+ fn load_private_test_root_helper(
+-    activation: PrivateTestRootActivation,
+     admission: Option<&ValidateLockAdmission>,
+-) -> Result<Option<PrivateTestRootHelper>, String> {
+-    if activation == PrivateTestRootActivation::Disabled {
+-        return Ok(None);
+-    }
++) -> Result<PrivateTestRootHelper, String> {
+     let admission = admission.ok_or_else(|| {
+         "canonical full validation has no live validate-lock admission to bind private /test"
+             .to_string()
+@@ -973,6 +1199,7 @@ fn load_private_test_root_helper(
+                 authority_path.display()
+             )
+         })?;
++    let authority_sha256 = format!("{:x}", sha2::Sha256::digest(&authority_bytes));
+     let authority = parse_private_test_root_authority(&authority_bytes)?;
+     let live_unit = live_validate_service_unit(admission)?;
+     private_test_root_authority_matches(&authority, admission, &live_unit)?;
+@@ -1010,19 +1237,25 @@ fn load_private_test_root_helper(
+         authority.owner_start_ticks,
+         authority.unit,
+     );
+-    Ok(Some(PrivateTestRootHelper {
++    Ok(PrivateTestRootHelper {
+         path: path.to_string_lossy().into_owned(),
+-        sha256: authority.helper_sha256,
+-    }))
++        sha256: authority.helper_sha256.clone(),
++        decision: PrivateTestRootHelperDecision {
++            helper_sha256: authority.helper_sha256,
++            target: authority.target,
++            owner_pid: authority.owner_pid,
++            owner_start_ticks: authority.owner_start_ticks,
++            authority_sha256,
++        },
++    })
+ }
+ 
+ fn activate_private_test_root(
+     plan: &mut Plan,
+     activation: PrivateTestRootActivation,
+-    admission: Option<&ValidateLockAdmission>,
++    helper: Option<&PrivateTestRootHelper>,
+ ) -> Result<usize, String> {
+-    let helper = load_private_test_root_helper(activation, admission)?;
+-    let marked = configure_private_test_root(plan, activation, helper.as_ref())?;
++    let marked = configure_private_test_root(plan, activation, helper)?;
+     if marked > 0 {
+         eprintln!(
+             "validate: private empty /test enabled for {marked} admitted full-profile manifest node(s); tree-only cache disabled"
+@@ -1031,6 +1264,38 @@ fn activate_private_test_root(
+     Ok(marked)
+ }
+ 
++fn ensure_private_test_root_helper_decision(
++    helper: &PrivateTestRootHelper,
++    carried: Option<&PrivateTestRootHelperDecision>,
++) -> Result<(), String> {
++    if let Some(carried) = carried {
++        if carried != &helper.decision {
++            return Err(
++                "helper-backed /test authority changed after the pre-scope decision".into(),
++            );
++        }
++        return Ok(());
++    }
++    if is_in_scope() {
++        return Err(
++            "in-scope helper-backed validation has no pre-scope helper decision".into(),
++        );
++    }
++    let executable = std::env::current_exe()
++        .map_err(|error| format!("cannot resolve validate executable for helper re-exec: {error}"))?;
++    let error = Command::new(executable)
++        .args(std::env::args().skip(1))
++        .arg(format!(
++            "{PRIVATE_TEST_ROOT_HELPER_DECISION_ARG}={}",
++            helper.decision.encode()
++        ))
++        .env_remove(EPHEMERAL_TEST_ROOT_LEASE_ENV)
++        .exec();
++    Err(format!(
++        "cannot re-exec validation with its helper-backed /test decision: {error}"
++    ))
++}
++
+ fn reject_ambient_private_test_root_environment(
+     supplied: &[&'static str],
+ ) -> Result<(), String> {
+@@ -1148,12 +1413,15 @@ fn nested_scope_probe_requested() -> bool {
+     std::env::var_os(NESTED_SCOPE_SELF_TEST_ENV).is_some()
+ }
+ 
+-/// Every local rung is strict, and the three sequential outer runs sum to
+-/// 12 + 7 + 4 = 23s, below the disposable scope's 30s and wrapper's 45s.
++/// The signal child gets a bounded startup window for rust-script and repository
++/// discovery, then a separate seven-second post-readiness signal/cleanup budget.
++/// The three sequential outer runs remain below the disposable scope and wrapper.
+ fn nested_scope_budgets_are_ordered() -> bool {
+     NESTED_INNER_STEP_S < NESTED_INNER_RUN_S
+         && NESTED_INNER_RUN_S < NESTED_OUTER_CHILD_STEP_S
+         && NESTED_OUTER_CHILD_STEP_S < NESTED_OUTER_CHILD_RUN_S
++        && (NESTED_SIGNAL_STARTUP_S + NESTED_SIGNAL_AFTER_READY_S)
++            < NESTED_SIGNAL_STEP_S as u64
+         && NESTED_SIGNAL_STEP_S < NESTED_SIGNAL_RUN_S
+         && NESTED_SURVIVOR_STEP_S < NESTED_SURVIVOR_RUN_S
+         && NESTED_OUTER_CHILD_RUN_S + NESTED_SIGNAL_RUN_S + NESTED_SURVIVOR_RUN_S
+@@ -1229,17 +1497,90 @@ fn run_one_nested_scope_probe_step(
+ 
+ fn run_one_nested_scope_signal_step(
+     cgroups: BoxedCgroups,
+-    step: dagrun::model::Step,
++    mut step: dagrun::model::Step,
+     run_timeout_s: i64,
+ ) -> Result<(), String> {
++    let scratch = std::env::temp_dir().join(format!(
++        "validate-nested-signal-{}-{}",
++        std::process::id(),
++        epoch_now()
++    ));
++    std::fs::create_dir(&scratch)
++        .map_err(|error| format!("cannot create nested-signal scratch: {error}"))?;
++    let ready = scratch.join("ready");
++    let release = scratch.join("release");
++    step.env.insert(
++        NESTED_SIGNAL_READY_ENV.into(),
++        ready.to_string_lossy().into_owned(),
++    );
++    step.env.insert(
++        NESTED_SIGNAL_RELEASE_ENV.into(),
++        release.to_string_lossy().into_owned(),
++    );
+     let mut cfg = DagConfig {
+         description: "real inherited-scope signal self-test".into(),
+         ..Default::default()
+     };
+     cfg.steps.push(step);
+-    let result = run_dag_boxed_deadline(
+-        &cfg, 1, true, 2, cgroups, None, Some(1), Some(run_timeout_s),
+-    );
++    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
++    let worker = std::thread::spawn(move || {
++        let result = run_dag_boxed_deadline(
++            &cfg, 1, true, 2, cgroups, None, Some(1), Some(run_timeout_s),
++        );
++        let _ = sender.send(result);
++    });
++    let startup_deadline = std::time::Instant::now()
++        + std::time::Duration::from_secs(NESTED_SIGNAL_STARTUP_S);
++    while !ready.is_file() {
++        match receiver.try_recv() {
++            Ok(result) => {
++                let _ = worker.join();
++                let _ = std::fs::remove_dir_all(&scratch);
++                return Err(format!(
++                    "nested signal step exited before its ready marker: outcomes={:?}",
++                    result.outcomes
++                ));
++            }
++            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
++                let _ = worker.join();
++                let _ = std::fs::remove_dir_all(&scratch);
++                return Err("nested signal scheduler disconnected before readiness".into());
++            }
++            Err(std::sync::mpsc::TryRecvError::Empty) => {}
++        }
++        if std::time::Instant::now() >= startup_deadline {
++            let _ = std::fs::write(&release, b"release\n");
++            let _ = receiver.recv();
++            let _ = worker.join();
++            let _ = std::fs::remove_dir_all(&scratch);
++            return Err(format!(
++                "nested signal child did not become ready within {NESTED_SIGNAL_STARTUP_S}s"
++            ));
++        }
++        std::thread::sleep(std::time::Duration::from_millis(20));
++    }
++    std::fs::write(&release, b"release\n")
++        .map_err(|error| format!("cannot release ready nested signal child: {error}"))?;
++    let result = match receiver.recv_timeout(std::time::Duration::from_secs(
++        NESTED_SIGNAL_AFTER_READY_S,
++    )) {
++        Ok(result) => result,
++        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
++            let eventual = receiver.recv().ok();
++            let _ = worker.join();
++            let _ = std::fs::remove_dir_all(&scratch);
++            return Err(format!(
++                "nested signal child exceeded the {NESTED_SIGNAL_AFTER_READY_S}s post-readiness budget: eventual={eventual:?}"
++            ));
++        }
++        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
++            let _ = worker.join();
++            let _ = std::fs::remove_dir_all(&scratch);
++            return Err("nested signal scheduler disconnected after readiness".into());
++        }
++    };
++    let _ = worker.join();
++    let _ = std::fs::remove_dir_all(&scratch);
+     if result.ok || result.run_timed_out || !result.skipped.is_empty()
+         || result.outcomes.len() != 1
+         || result.outcomes[0].ok
+@@ -1254,14 +1595,97 @@ fn run_one_nested_scope_signal_step(
+     Ok(())
+ }
+ 
++fn run_top_level_scope_cleanup_payload(
++    lease_input: &EphemeralTestRootLeaseInput,
++    runtime_max_s: i64,
++) -> Result<String, String> {
++    let root = repo_root();
++    let lease = ensure_noncanonical_ephemeral_test_root(&root, false, lease_input)?;
++    safe_ci_scope::ensure_scope_reexec(
++        "safe-ci top-level cleanup probe",
++        false,
++        Some(runtime_max_s),
++    )
++    .map_err(|code| format!("top-level cleanup scope re-exec refused with exit {code}"))?;
++    export_ephemeral_test_root_lease_for_children(&root, lease.as_deref())?;
++    let _cgroups = safe_ci_scope::resolve_cgroups_after_reexec(
++        "safe-ci top-level cleanup probe",
++        false,
++        true,
++    )
++    .map_err(|code| format!("top-level cleanup cgroup setup refused with exit {code}"))?;
++    let attempt = dagrun::cgroup::attempt_scope_reexec(None, None, None);
++    let proof = attempt
++        .proof()
++        .ok_or_else(|| format!("cleanup probe lost live scope proof: {}", attempt.describe()))?;
++    let unit = proof
++        .unit
++        .as_deref()
++        .ok_or("cleanup probe scope proof has no promised unit")?;
++    let scope = proof
++        .cgroup
++        .ancestors()
++        .find(|path| path.file_name().and_then(|name| name.to_str()) == Some(unit))
++        .ok_or("cleanup probe cannot locate promised scope ancestor")?
++        .to_path_buf();
++
++    let ready = std::env::var(SCOPE_PROBE_READY_ENV)
++        .map(PathBuf::from)
++        .map_err(|_| "top-level cleanup probe has no ready path".to_string())?;
++    let _survivor = std::env::var(SCOPE_PROBE_SURVIVOR_ENV)
++        .map(PathBuf::from)
++        .map_err(|_| "top-level cleanup probe has no survivor path".to_string())?;
++    // The probe measures the outer wrapper, not validate's ordinary graceful
++    // stop bookkeeping. Restore the default so either the operator signal or
++    // systemd RuntimeMax terminates the scoped driver itself.
++    unsafe {
++        libc::signal(libc::SIGTERM, libc::SIG_DFL);
++    }
++    let descendant = Command::new("/usr/bin/sleep")
++        .arg("15")
++        .spawn()
++        .map_err(|error| format!("cannot launch cleanup-probe descendant: {error}"))?;
++    let descendant_pid = descendant.id() as i32;
++    let descendant_start = validate_runtime::process_identity(descendant_pid)
++        .map(|(_, start)| start)
++        .ok_or_else(|| "cannot bind cleanup-probe descendant to start ticks".to_string())?;
++    std::fs::write(
++        &ready,
++        format!(
++            "{descendant_pid}:{descendant_start}\n{}\n",
++            scope.display()
++        ),
++    )
++        .map_err(|error| format!("cannot publish cleanup-probe readiness: {error}"))?;
++    drop(descendant);
++    loop {
++        std::thread::sleep(std::time::Duration::from_secs(1));
++    }
++}
++
+ /// Exercise outer-scope verification from a real scheduler `step-*` child,
+ /// then require that child to dispatch one further per-step cgroup.
+-fn run_nested_scope_probe() -> Result<String, String> {
++fn run_nested_scope_probe(lease_input: &EphemeralTestRootLeaseInput) -> Result<String, String> {
+     match std::env::var(NESTED_SCOPE_SELF_TEST_ENV).as_deref() {
+         Ok(NESTED_SCOPE_OUTER) => {
+-            let cgroups = safe_ci_scope::resolve_cgroups(
+-                "safe-ci nested self-test outer", false, Some(NESTED_SCOPE_RUNTIME_S), true,
+-            ).map_err(|code| format!("outer cgroup setup refused with exit {code}"))?;
++            let root = repo_root();
++            let lease = ensure_noncanonical_ephemeral_test_root(&root, false, lease_input)?;
++            safe_ci_scope::ensure_scope_reexec(
++                "safe-ci nested self-test outer",
++                false,
++                Some(NESTED_SCOPE_RUNTIME_S),
++            )
++            .map_err(|code| format!("outer cgroup scope re-exec refused with exit {code}"))?;
++            export_ephemeral_test_root_lease_for_children(&root, lease.as_deref())?;
++            let cgroups = safe_ci_scope::resolve_cgroups_after_reexec(
++                "safe-ci nested self-test outer",
++                false,
++                true,
++            )
++            .map_err(|code| format!("outer cgroup setup refused with exit {code}"))?;
++            eprintln!(
++                "safe-ci nested self-test outer: ephemeral /test lease verified before cgroup manager construction"
++            );
+             require_private_test_root_environment_clear("after the forced outer cgroup re-exec")?;
+             let exe = std::env::current_exe()
+                 .map_err(|error| format!("cannot resolve self-test executable: {error}"))?;
+@@ -1298,9 +1722,15 @@ fn run_nested_scope_probe() -> Result<String, String> {
+         Ok(NESTED_SCOPE_INNER) => {
+             // This process inherited the outer scope's RuntimeMax; it did not
+             // request a second systemd unit. Every other limit stays mandatory.
+-            let cgroups = safe_ci_scope::resolve_cgroups(
+-                "safe-ci nested self-test inner", false, None, false,
+-            ).map_err(|code| format!("nested cgroup setup refused with exit {code}"))?;
++            let root = repo_root();
++            let lease = ensure_noncanonical_ephemeral_test_root(&root, false, lease_input)?;
++            export_ephemeral_test_root_lease_for_children(&root, lease.as_deref())?;
++            let cgroups = safe_ci_scope::resolve_cgroups_after_reexec(
++                "safe-ci nested self-test inner",
++                false,
++                false,
++            )
++            .map_err(|code| format!("nested cgroup setup refused with exit {code}"))?;
+             require_private_test_root_environment_clear("inside the nested boxed child")?;
+             run_one_nested_scope_probe_step(
+                 cgroups,
+@@ -1320,27 +1750,219 @@ fn run_nested_scope_probe() -> Result<String, String> {
+             unsafe {
+                 libc::signal(libc::SIGTERM, libc::SIG_DFL);
+             }
+-            let _cgroups = safe_ci_scope::resolve_cgroups(
+-                "safe-ci nested signal self-test", false, None, false,
+-            ).map_err(|code| format!("nested signal cgroup setup refused with exit {code}"))?;
++            let root = repo_root();
++            let lease = ensure_noncanonical_ephemeral_test_root(&root, false, lease_input)?;
++            export_ephemeral_test_root_lease_for_children(&root, lease.as_deref())?;
++            let _cgroups = safe_ci_scope::resolve_cgroups_after_reexec(
++                "safe-ci nested signal self-test",
++                false,
++                false,
++            )
++            .map_err(|code| format!("nested signal cgroup setup refused with exit {code}"))?;
++            let ready = std::env::var_os(NESTED_SIGNAL_READY_ENV)
++                .map(PathBuf::from)
++                .ok_or_else(|| "nested signal child has no ready-marker path".to_string())?;
++            let release = std::env::var_os(NESTED_SIGNAL_RELEASE_ENV)
++                .map(PathBuf::from)
++                .ok_or_else(|| "nested signal child has no release-marker path".to_string())?;
++            std::fs::write(&ready, b"ready\n")
++                .map_err(|error| format!("cannot publish nested signal readiness: {error}"))?;
++            while !release.is_file() {
++                std::thread::sleep(std::time::Duration::from_millis(10));
++            }
+             eprintln!("nested signal child resolved inherited cgroups; delivering SIGTERM");
+             let raised = unsafe { libc::raise(libc::SIGTERM) };
+             Err(format!("nested signal child survived SIGTERM (libc::raise rc={raised})"))
+         }
++        Ok(NESTED_SCOPE_TOP_SIGNAL) => {
++            run_top_level_scope_cleanup_payload(lease_input, NESTED_SCOPE_RUNTIME_S)
++        }
++        Ok(NESTED_SCOPE_RUNTIME) => {
++            run_top_level_scope_cleanup_payload(lease_input, CLEANUP_PROBE_RUNTIME_S)
++        }
+         Ok(other) => Err(format!("unknown nested scope self-test mode {other:?}")),
+         Err(error) => Err(format!("nested scope self-test mode is unavailable: {error}")),
+     }
+ }
+ 
+-/// Launch the real nested topology in a bounded child. Clearing inherited
+-/// scope sentinels forces that child to establish and observe a fresh scope.
+-fn nested_scope_self_test() -> Result<String, String> {
++fn top_level_scope_cleanup_probe(
++    mode: &str,
++    send_signal: bool,
++    lease: &str,
++) -> Result<String, String> {
++    validate_ephemeral_test_root_lease(&repo_root(), lease)?;
++    let scratch = std::env::temp_dir().join(format!(
++        "validate-top-level-{mode}-{}-{}",
++        std::process::id(),
++        epoch_now()
++    ));
++    std::fs::create_dir(&scratch)
++        .map_err(|error| format!("cannot create top-level cleanup scratch: {error}"))?;
++    let ready = scratch.join("ready");
++    let survivor = scratch.join("survivor");
++    let stdout = scratch.join("stdout");
++    let stderr = scratch.join("stderr");
++    let exe = std::env::current_exe()
++        .map_err(|error| format!("cannot resolve cleanup-probe executable: {error}"))?;
++    let stdout_file = std::fs::File::create(&stdout)
++        .map_err(|error| format!("cannot create cleanup-probe stdout: {error}"))?;
++    let stderr_file = std::fs::File::create(&stderr)
++        .map_err(|error| format!("cannot create cleanup-probe stderr: {error}"))?;
++    let mut command = Command::new(exe);
++    let mut child = command
++        .arg("--self-test")
++        .arg(format!("{EPHEMERAL_TEST_ROOT_LEASE_ARG}={lease}"))
++        .env(NESTED_SCOPE_SELF_TEST_ENV, mode)
++        .env(SCOPE_PROBE_READY_ENV, &ready)
++        .env(SCOPE_PROBE_SURVIVOR_ENV, &survivor)
++        .env("DAGRUN_FORCE_SCOPE_ATTEMPT", "1")
++        .env_remove(EPHEMERAL_TEST_ROOT_LEASE_ENV)
++        .env_remove("DAGRUN_IN_SCOPE")
++        .env_remove("DAGRUN_SCOPE_UNIT")
++        .env_remove("DAGRUN_EXPECTED_OUTER_MEMORY_MAX_BYTES")
++        .env_remove("DAGRUN_EXPECTED_RUNTIME_MAX_SEC")
++        .process_group(0)
++        .stdout(stdout_file)
++        .stderr(stderr_file)
++        .spawn()
++        .map_err(|error| format!("cannot launch top-level {mode} cleanup probe: {error}"))?;
++
++    let deadline = std::time::Instant::now()
++        + std::time::Duration::from_secs(CLEANUP_PROBE_DEADLINE_S);
++    while !ready.is_file() {
++        if let Some(status) = child
++            .try_wait()
++            .map_err(|error| format!("cannot poll top-level {mode} cleanup probe: {error}"))?
++        {
++            let out = std::fs::read_to_string(&stdout).unwrap_or_default();
++            let err = std::fs::read_to_string(&stderr).unwrap_or_default();
++            let _ = std::fs::remove_dir_all(&scratch);
++            return Err(format!(
++                "top-level {mode} cleanup probe exited {status} before readiness\nstdout:\n{out}\nstderr:\n{err}"
++            ));
++        }
++        if std::time::Instant::now() >= deadline {
++            unsafe {
++                libc::kill(-(child.id() as i32), libc::SIGTERM);
++            }
++            let _ = child.wait();
++            return Err(format!(
++                "top-level {mode} cleanup probe did not become ready within {CLEANUP_PROBE_DEADLINE_S}s"
++            ));
++        }
++        std::thread::sleep(std::time::Duration::from_millis(50));
++    }
++    let descendant_identity = std::fs::read_to_string(&ready)
++        .map_err(|error| format!("cannot read top-level {mode} descendant identity: {error}"))?;
++    let mut identity_lines = descendant_identity.lines();
++    let (descendant_pid, descendant_start) = identity_lines
++        .next()
++        .and_then(|identity| identity.split_once(':'))
++        .and_then(|(pid, start)| Some((pid.parse::<i32>().ok()?, start.parse::<u64>().ok()?)))
++        .ok_or_else(|| format!("top-level {mode} emitted malformed descendant identity"))?;
++    let scope = identity_lines
++        .next()
++        .map(PathBuf::from)
++        .filter(|path| path.is_absolute())
++        .ok_or_else(|| format!("top-level {mode} emitted malformed scope identity"))?;
++    if send_signal {
++        let rc = unsafe { libc::kill(-(child.id() as i32), libc::SIGTERM) };
++        if rc != 0 {
++            return Err(format!(
++                "cannot signal top-level {mode} wrapper: {}",
++                std::io::Error::last_os_error()
++            ));
++        }
++    }
++
++    let status = loop {
++        if let Some(status) = child
++            .try_wait()
++            .map_err(|error| format!("cannot poll top-level {mode} cleanup probe: {error}"))?
++        {
++            break status;
++        }
++        if std::time::Instant::now() >= deadline {
++            unsafe {
++                libc::kill(-(child.id() as i32), libc::SIGTERM);
++            }
++            let _ = child.wait();
++            return Err(format!(
++                "top-level {mode} cleanup probe exceeded {CLEANUP_PROBE_DEADLINE_S}s"
++            ));
++        }
++        std::thread::sleep(std::time::Duration::from_millis(50));
++    };
++    std::thread::sleep(std::time::Duration::from_millis(150));
++    let out = std::fs::read_to_string(&stdout).unwrap_or_default();
++    let err = std::fs::read_to_string(&stderr).unwrap_or_default();
++    let scope_empty = if scope.exists() {
++        std::fs::read_to_string(scope.join("cgroup.events"))
++            .ok()
++            .is_some_and(|events| events.lines().any(|line| line == "populated 0"))
++    } else {
++        true
++    };
++    let expected_term = send_signal
++        && (status.code() == Some(128 + libc::SIGTERM)
++            || status.signal() == Some(libc::SIGTERM));
++    let runtime_evidence = out.contains("RuntimeMaxSec=5s") || err.contains("RuntimeMaxSec=5s");
++    let failure = if status.success() {
++        Some("scoped cleanup payload unexpectedly exited successfully".to_string())
++    } else if send_signal && !expected_term {
++        Some(format!(
++            "scoped cleanup driver did not terminate by SIGTERM: {status}"
++        ))
++    } else if !send_signal && !runtime_evidence {
++        Some("RuntimeMax cleanup probe emitted no enforced RuntimeMaxSec=5s evidence".to_string())
++    } else if matching_process_identity_is_live(
++        validate_runtime::process_identity(descendant_pid),
++        descendant_start,
++    )
++    {
++        Some(format!(
++            "scoped descendant {descendant_pid}@{descendant_start} remained live after wrapper exit"
++        ))
++    } else if let Err(error) = validate_ephemeral_test_root_lease(&repo_root(), lease) {
++        Some(format!(
++            "outside-scope owner lost its exact /test lease after scoped termination: {error}"
++        ))
++    } else if !scope_empty {
++        Some(format!(
++            "scope {} still exists without cgroup.events populated 0",
++            scope.display()
++        ))
++    } else {
++        None
++    };
++    let _ = std::fs::remove_dir_all(&scratch);
++    if let Some(failure) = failure {
++        return Err(format!(
++            "top-level {mode} cleanup probe failed: {failure}\nstdout:\n{out}\nstderr:\n{err}"
++        ));
++    }
++    Ok(format!(
++        "top-level {mode}: scoped subtree terminated, outside wrapper remained live, exact /test lease intact"
++    ))
++}
++
++fn matching_process_identity_is_live(observed: Option<(char, u64)>, expected_start: u64) -> bool {
++    observed.is_some_and(|(state, start)| state != 'Z' && start == expected_start)
++}
++
++/// Launch the real nested topology under one already-established outside-scope
++/// lease owner. Clearing inherited scope sentinels forces the child to establish
++/// and observe a fresh scope without becoming a competing `/test` owner.
++fn live_private_root_self_test(lease: &str) -> Result<String, String> {
++    validate_ephemeral_test_root_lease(&repo_root(), lease)?;
+     let exe = std::env::current_exe()
+         .map_err(|error| format!("cannot resolve self-test executable: {error}"))?;
+     let output = Command::new("timeout")
+         .arg("--kill-after=5s")
+         .arg(format!("{NESTED_WRAPPER_TIMEOUT_S}s"))
+-        .arg(exe).arg("--self-test")
++        .arg(exe)
++        .arg("--self-test")
++        .arg(format!("{EPHEMERAL_TEST_ROOT_LEASE_ARG}={lease}"))
+         .env(NESTED_SCOPE_SELF_TEST_ENV, NESTED_SCOPE_OUTER)
+         .env("DAGRUN_FORCE_SCOPE_ATTEMPT", "1")
+         .env("DAGRUN_NO_STEP_LOGS", "1")
+@@ -1362,6 +1984,7 @@ fn nested_scope_self_test() -> Result<String, String> {
+     for required in [
+         "nested child verified the outer scope and dispatched its own boxed step",
+         "safe-ci nested self-test inner: cgroup boxing ACTIVE",
++        "ephemeral /test lease verified before cgroup manager construction",
+         "outer cgroup audit at ",
+         "safe_ci_scope_self_test.inner_child] ✓ PASS",
+         "safe_ci_scope_self_test.signal_child] ✗ FAIL",
+@@ -1375,7 +1998,13 @@ fn nested_scope_self_test() -> Result<String, String> {
+             ));
+         }
+     }
+-    Ok("safe-ci scope: real outer -> step child -> nested boxed step passed".into())
++    validate_ephemeral_test_root_lease(&repo_root(), lease)?;
++    let signal = top_level_scope_cleanup_probe(NESTED_SCOPE_TOP_SIGNAL, true, lease)?;
++    let runtime = top_level_scope_cleanup_probe(NESTED_SCOPE_RUNTIME, false, lease)?;
++    validate_ephemeral_test_root_lease(&repo_root(), lease)?;
++    Ok(format!(
++        "safe-ci scope: real outer -> step child -> nested boxed step passed; {signal}; {runtime}"
++    ))
+ }
+ 
+ /// The literal flag that enables Hermit's strict execution mode.
+@@ -1660,7 +2289,7 @@ fn self_test() -> Result<(), String> {
+     }
+     let exe = std::env::current_exe()
+         .map_err(|error| format!("summary: cannot resolve self-test executable: {error}"))?;
+-    let output = Command::new(exe)
++    let output = Command::new(&exe)
+         .arg("--self-test")
+         .env(SUMMARY_EPILOGUE_SELF_TEST_ENV, "1")
+         .output()
+@@ -1675,6 +2304,77 @@ fn self_test() -> Result<(), String> {
+         ));
+     }
+ 
++    let internal_isolation_tokens = [
++        (
++            "lease",
++            format!("{EPHEMERAL_TEST_ROOT_LEASE_ARG}=v2:11:22:33:44:55:66:77"),
++            "v2:11:22:33:44:55:66:77".to_string(),
++        ),
++        (
++            "helper decision",
++            format!(
++                "{PRIVATE_TEST_ROOT_HELPER_DECISION_ARG}=v1:{}:{}:42:1234:{}",
++                "0".repeat(64),
++                "1".repeat(40),
++                "2".repeat(64)
++            ),
++            format!(
++                "v1:{}:{}:42:1234:{}",
++                "0".repeat(64),
++                "1".repeat(40),
++                "2".repeat(64)
++            ),
++        ),
++    ];
++    for (kind, token, secret) in &internal_isolation_tokens {
++        for public_mode in ["--help", "--show-plan", "--self-test"] {
++            let output = Command::new(&exe)
++                .arg(public_mode)
++                .arg(token)
++                .env_remove(EPHEMERAL_TEST_ROOT_LEASE_ENV)
++                .output()
++                .map_err(|error| {
++                    format!(
++                        "internal {kind} early-path bracket could not run {public_mode}: {error}"
++                    )
++                })?;
++            if output.status.code() != Some(2) {
++                return Err(format!(
++                    "internal {kind} early-path bracket: {public_mode} exited {}, expected refusal 2",
++                    output.status
++                ));
++            }
++            let text = format!(
++                "{}{}",
++                String::from_utf8_lossy(&output.stdout),
++                String::from_utf8_lossy(&output.stderr)
++            );
++            if text.contains(secret) {
++                return Err(format!(
++                    "internal {kind} early-path bracket: {public_mode} leaked the token"
++                ));
++            }
++        }
++    }
++    let (_, helper_token, helper_secret) = &internal_isolation_tokens[1];
++    let output = Command::new(&exe)
++        .arg("--live-private-root-self-test")
++        .arg(helper_token)
++        .env_remove(EPHEMERAL_TEST_ROOT_LEASE_ENV)
++        .output()
++        .map_err(|error| format!("internal helper live-probe bracket could not run: {error}"))?;
++    let text = format!(
++        "{}{}",
++        String::from_utf8_lossy(&output.stdout),
++        String::from_utf8_lossy(&output.stderr)
++    );
++    if output.status.code() != Some(2) || text.contains(helper_secret) {
++        return Err(format!(
++            "internal helper live-probe bracket did not refuse without leaking: status={} text={text:?}",
++            output.status
++        ));
++    }
++
+     if !nested_scope_probe_selected(true, true)
+         || nested_scope_probe_selected(false, true)
+         || nested_scope_probe_selected(true, false)
+@@ -1695,6 +2395,16 @@ fn self_test() -> Result<(), String> {
+              wrapper={NESTED_WRAPPER_TIMEOUT_S}s"
+         ));
+     }
++    if !matching_process_identity_is_live(Some(('T', 42)), 42)
++        || !matching_process_identity_is_live(Some(('t', 42)), 42)
++        || matching_process_identity_is_live(Some(('Z', 42)), 42)
++        || matching_process_identity_is_live(Some(('S', 41)), 42)
++    {
++        return Err(
++            "scope cleanup identity bracket did not treat stopped PID@start as live or zombie/mismatch as terminal"
++                .into(),
++        );
++    }
+     // CLI bracket: a real positive budget reaches the typed field, while zero,
+     // negative, malformed, and missing values are all refused.
+     let parsed = parse_argv(&["--run-timeout".into(), "600".into(), "--self-test".into()])
+@@ -1710,6 +2420,53 @@ fn self_test() -> Result<(), String> {
+             return Err(format!("run-timeout parser accepted invalid value {bad:?}"));
+         }
+     }
++    let lease = "v2:11:22:33:44:55:66:77";
++    let parsed = parse_argv(&[
++        "--self-test".into(),
++        format!("{EPHEMERAL_TEST_ROOT_LEASE_ARG}={lease}"),
++    ])
++    .map_err(|code| format!("internal lease parser refused a typed tuple with exit {code}"))?;
++    if parsed.ephemeral_test_root_lease.as_deref() != Some(lease) {
++        return Err("internal lease parser did not preserve the exact typed tuple".into());
++    }
++    for malformed in [
++        EPHEMERAL_TEST_ROOT_LEASE_ARG.to_string(),
++        format!("{EPHEMERAL_TEST_ROOT_LEASE_ARG}=v1:11:22:33:44"),
++        format!("{EPHEMERAL_TEST_ROOT_LEASE_ARG}=v2:11:22:33:44"),
++        format!("{EPHEMERAL_TEST_ROOT_LEASE_ARG}=v2:11:nope:33:44:55:66:77"),
++    ] {
++        if parse_argv(&["--self-test".into(), malformed.clone()]).is_ok() {
++            return Err(format!(
++                "internal lease parser accepted malformed token {malformed:?}"
++            ));
++        }
++    }
++    if parse_argv(&[
++        "--self-test".into(),
++        format!("{EPHEMERAL_TEST_ROOT_LEASE_ARG}={lease}"),
++        format!("{EPHEMERAL_TEST_ROOT_LEASE_ARG}={lease}"),
++    ])
++    .is_ok()
++    {
++        return Err("internal lease parser accepted a duplicate token".into());
++    }
++    std::env::set_var(EPHEMERAL_TEST_ROOT_LEASE_ENV, lease);
++    let captured = capture_ephemeral_test_root_lease_input(None)?;
++    if captured.tuple.as_deref() != Some(lease)
++        || captured.carried_by_argv
++        || std::env::var_os(EPHEMERAL_TEST_ROOT_LEASE_ENV).is_some()
++    {
++        return Err("pre-scope lease capture did not become argv/local-only state".into());
++    }
++    let env_output = Command::new("/usr/bin/env")
++        .output()
++        .map_err(|error| format!("pre-scope lease env spy could not run: {error}"))?;
++    if String::from_utf8_lossy(&env_output.stdout)
++        .lines()
++        .any(|line| line.starts_with(EPHEMERAL_TEST_ROOT_LEASE_ENV))
++    {
++        return Err("pre-scope subprocess inherited the internal /test lease".into());
++    }
+     if parse_argv(&["--run-timeout".into()]).is_ok() {
+         return Err("run-timeout parser accepted a missing value".into());
+     }
+@@ -1979,13 +2736,12 @@ fn self_test() -> Result<(), String> {
+         rr_rows.len(),
+         validate_corpus::RR_COMPAT_EXPECTED
+     );
+-    // Policy/data brackets are inert: none runs a gate, publishes a label,
+-    // writes the real ledger, or touches a PR. The one deliberate exception is
+-    // nested_scope_self_test: it uses a fresh disposable scope with strict
+-    // inner/run/scope/wrapper bounds, then proves a nested signal cannot stop it.
++    // Policy/data brackets are inert: none runs a gate, creates `/test`,
++    // publishes a label, writes the real ledger, or touches a PR. The live
++    // private-root/scope proof is an explicit top-level-only command so the
++    // manifest audit can safely invoke this self-test inside its own DAG.
+     for line in [
+         safe_ci_scope::self_test()?,
+-        nested_scope_self_test()?,
+         scheduler_accounting_bracket()?,
+         budget_reason_bracket()?,
+         validate_super::self_test(&root)?,
+@@ -2017,6 +2773,7 @@ fn self_test() -> Result<(), String> {
+     product_front_door_bracket()?;
+     product_front_door_process_bracket()?;
+     ambient_private_test_root_refusal_bracket()?;
++    artifact_wrapper_ephemeral_test_root_bracket(&root)?;
+     // ---- DAG-config carry + ungrantable-resource brackets -------------------
+     // BOTH directions. A check that refuses everything would pass the negative
+     // case alone, so the positive case (a real lane admits) is load-bearing.
+@@ -2121,25 +2878,135 @@ cleared-caps refusal names {} starved step(s)",
+         if full.second.is_some() {
+             return Err("full-plan bracket: default full plan is still sequential".into());
+         }
+-        if private_test_root_activation(&full_args, false, true)
+-            != PrivateTestRootActivation::CanonicalFull
+-            || private_test_root_activation(&full_args, false, false)
+-                != PrivateTestRootActivation::Disabled
+-            || private_test_root_activation(&full_args, true, true)
+-                != PrivateTestRootActivation::Disabled
++        if !plan_requires_private_test_root(&full) {
++            return Err(
++                "private-/test bracket: full manifest-run plan lost its outer-lease demand"
++                    .into(),
++            );
++        }
++        let quick_args = parse_argv(&["quick".into(), "--no-label-pr".into()])
++            .map_err(|rc| format!("private-/test bracket: quick parser refused rc={rc}"))?;
++        let quick = build_plan(&root, &quick_args, &tmp)?;
++        if !plan_requires_private_test_root(&quick)
++            || !quick
++                .cfg
++                .steps
++                .iter()
++                .find(|step| step.tag() == "quick.e2e_verify")
++                .is_some_and(validation_step_requires_private_test_root)
++        {
++            return Err(
++                "private-/test bracket: quick.e2e_verify lost its outer-lease demand".into(),
++            );
++        }
++        for step in full
++            .cfg
++            .steps
++            .iter()
++            .chain(full.second.iter().flat_map(|cfg| cfg.steps.iter()))
++            .chain(quick.cfg.steps.iter())
++        {
++            if step_command_directly_consumes_private_test_root(step)
++                && !validation_step_requires_private_test_root(step)
++            {
++                return Err(format!(
++                    "private-/test bracket: direct consumer {} is not in the typed lease predicate",
++                    step.tag()
++                ));
++            }
++        }
++        if private_test_root_helper_policy(&full_args, false, true, true)
++            != PrivateTestRootHelperPolicy::Required
++            || private_test_root_helper_policy(&full_args, false, false, true)
++                != PrivateTestRootHelperPolicy::Disabled
++            || private_test_root_helper_policy(&full_args, true, true, true)
++                != PrivateTestRootHelperPolicy::Disabled
++            || private_test_root_activation(PrivateTestRootHelperPolicy::Required, true)
++                != PrivateTestRootActivation::HelperBacked
++            || private_test_root_activation(PrivateTestRootHelperPolicy::Optional, false)
++                != PrivateTestRootActivation::Disabled
++        {
++            return Err(
++                "private-/test bracket: admission/top-level policy is not exact".into(),
++            );
++        }
++        let portable_args = parse_argv(&["portable-only".into(), "--no-label-pr".into()])
++            .map_err(|rc| format!("private-/test bracket: portable parser refused rc={rc}"))?;
++        if private_test_root_helper_policy(&portable_args, false, true, true)
++            != PrivateTestRootHelperPolicy::Disabled
++            || private_test_root_allows_cache(PrivateTestRootActivation::HelperBacked, false)
++            || private_test_root_allows_cache(PrivateTestRootActivation::Disabled, true)
++            || !private_test_root_allows_cache(PrivateTestRootActivation::Disabled, false)
++        {
++            return Err("private-/test bracket: admission or cache policy is not exact".into());
++        }
++        let requalify_args = parse_argv(&[
++            "--requalify-cell".into(),
++            "fixture/test".into(),
++            "verify".into(),
++            "ptrace".into(),
++            "--no-label-pr".into(),
++        ])
++        .map_err(|rc| format!("private-/test bracket: requalify parser refused rc={rc}"))?;
++        if private_test_root_helper_policy(&requalify_args, false, true, true)
++            != PrivateTestRootHelperPolicy::Disabled
++            || private_test_root_helper_policy(&requalify_args, false, true, false)
++                != PrivateTestRootHelperPolicy::Disabled
++        {
++            return Err(
++                "private-/test bracket: pressure-backed requalification did not retain fallback lease ownership"
++                    .into(),
++            );
++        }
++        let only_args = parse_argv(&[
++            "--only".into(),
++            "portable".into(),
++            "e2e.manifest_applications".into(),
++            "--no-label-pr".into(),
++        ])
++        .map_err(|rc| format!("private-/test bracket: --only parser refused rc={rc}"))?;
++        let only_plan = build_plan(&root, &only_args, &tmp)?;
++        if !plan_requires_private_test_root(&only_plan)
++            || private_test_root_helper_policy(&only_args, false, true, true)
++                != PrivateTestRootHelperPolicy::Optional
++        {
++            return Err(
++                "private-/test bracket: admitted selected ManifestRun lost optional helper activation"
++                    .into(),
++            );
++        }
++        let selective_args = parse_argv(&["--selective".into(), "--no-label-pr".into()])
++            .map_err(|rc| format!("private-/test bracket: selective parser refused rc={rc}"))?;
++        if private_test_root_helper_policy(&selective_args, false, true, true)
++            != PrivateTestRootHelperPolicy::Optional
+         {
+             return Err(
+-                "private-/test bracket: admission/top-level policy is not exact".into(),
++                "private-/test bracket: admitted selective ManifestRun lost optional helper activation"
++                    .into(),
+             );
+         }
+-        let portable_args = parse_argv(&["portable-only".into(), "--no-label-pr".into()])
+-            .map_err(|rc| format!("private-/test bracket: portable parser refused rc={rc}"))?;
+-        if private_test_root_activation(&portable_args, false, true)
+-            != PrivateTestRootActivation::Disabled
+-            || private_test_root_allows_cache(PrivateTestRootActivation::CanonicalFull)
+-            || !private_test_root_allows_cache(PrivateTestRootActivation::Disabled)
++        let admitted = ValidateLockAdmission {
++            target: "1".repeat(40),
++            owner_pid: 42,
++            owner_start_ticks: 1234,
++        };
++        if refresh_canonical_validate_lock_authority(Some(&admitted), Some(admitted.clone()))?
++            != Some(admitted.clone())
++            || refresh_canonical_validate_lock_authority(None, None)?.is_some()
+         {
+-            return Err("private-/test bracket: admission or cache policy is not exact".into());
++            return Err("private-/test bracket: stable/standalone authority state changed".into());
++        }
++        if refresh_canonical_validate_lock_authority(Some(&admitted), None).is_ok() {
++            return Err(
++                "private-/test bracket: admitted authority loss degraded to standalone".into(),
++            );
++        }
++        let changed = ValidateLockAdmission {
++            owner_start_ticks: admitted.owner_start_ticks + 1,
++            ..admitted.clone()
++        };
++        if refresh_canonical_validate_lock_authority(Some(&admitted), Some(changed)).is_ok() {
++            return Err("private-/test bracket: admitted authority owner change was accepted".into());
+         }
+         let helper = PrivateTestRootHelper {
+             path: format!(
+@@ -2147,7 +3014,27 @@ cleared-caps refusal names {} starved step(s)",
+                 "0".repeat(64)
+             ),
+             sha256: "0".repeat(64),
++            decision: PrivateTestRootHelperDecision {
++                helper_sha256: "0".repeat(64),
++                target: "1".repeat(40),
++                owner_pid: 42,
++                owner_start_ticks: 1234,
++                authority_sha256: "2".repeat(64),
++            },
+         };
++        if PrivateTestRootHelperDecision::parse(&helper.decision.encode())? != helper.decision.clone() {
++            return Err("private-/test bracket: helper decision did not round-trip".into());
++        }
++        let mut changed_decision = helper.decision.clone();
++        changed_decision.authority_sha256 = "3".repeat(64);
++        if ensure_private_test_root_helper_decision(&helper, Some(&changed_decision)).is_ok() {
++            return Err(
++                "private-/test bracket: changed post-scope helper decision was accepted".into(),
++            );
++        }
++        if PrivateTestRootHelperDecision::parse("v1:not-a-digest").is_ok() {
++            return Err("private-/test bracket: malformed helper decision was accepted".into());
++        }
+         let authority = PrivateTestRootAuthority {
+             helper_sha256: helper.sha256.clone(),
+             target: "1".repeat(40),
+@@ -2260,7 +3147,7 @@ cleared-caps refusal names {} starved step(s)",
+         }
+         let marked = configure_private_test_root(
+             &mut full,
+-            PrivateTestRootActivation::CanonicalFull,
++            PrivateTestRootActivation::HelperBacked,
+             Some(&helper),
+         )?;
+         let mut manifest_runs = 0;
+@@ -2542,7 +3429,10 @@ cleared-caps refusal names {} starved step(s)",
+         }
+         let sequential_marked = configure_private_test_root(
+             &mut sequential,
+-            private_test_root_activation(&sequential_args, false, true),
++            private_test_root_activation(
++                private_test_root_helper_policy(&sequential_args, false, true, true),
++                true,
++            ),
+             Some(&helper),
+         )?;
+         if sequential_marked != 0
+@@ -2572,9 +3462,15 @@ cleared-caps refusal names {} starved step(s)",
+         let nested = build_plan(&root, &nested_args, &tmp)?;
+         if nested.cfg.steps.iter().any(|s| s.tag() == "gate.manifest")
+             || !nested.cfg.steps.iter().any(|s| s.tag() == PIN_GATE_TAG)
++            || nested
++                .cfg
++                .steps
++                .iter()
++                .any(|step| validation_step_identity(step) == ValidationStepIdentity::ManifestRun)
++            || plan_requires_private_test_root(&nested)
+         {
+             return Err(
+-                "full-plan bracket: nested reuse did not remove only manifest while retaining the pin gate"
++                "full-plan bracket: nested strict-compat reuse retained manifest work or lost the pin gate"
+                     .into(),
+             );
+         }
+@@ -2595,6 +3491,162 @@ cleared-caps refusal names {} starved step(s)",
+     Ok(())
+ }
+ 
++fn artifact_wrapper_ephemeral_test_root_bracket(root: &Path) -> Result<(), String> {
++    if !noncanonical_ephemeral_test_root_needed(false)
++        || noncanonical_ephemeral_test_root_needed(true)
++    {
++        return Err(
++            "ephemeral /test wrapper bracket blurred canonical-helper and noncanonical ownership"
++                .into(),
++        );
++    }
++    let output = Command::new(root.join("ci/run-with-ephemeral-test-root.sh"))
++        .arg("--self-test")
++        .output()
++        .map_err(|error| format!("ephemeral /test wrapper bracket could not run: {error}"))?;
++    if !output.status.success() {
++        return Err(format!(
++            "ephemeral /test wrapper bracket failed: status={} stdout={:?} stderr={:?}",
++            output.status,
++            String::from_utf8_lossy(&output.stdout),
++            String::from_utf8_lossy(&output.stderr)
++        ));
++    }
++    if !String::from_utf8_lossy(&output.stdout)
++        .contains("run-with-ephemeral-test-root self-test: PASS")
++    {
++        return Err("ephemeral /test wrapper bracket omitted its success marker".into());
++    }
++    Ok(())
++}
++
++fn validate_ephemeral_test_root_lease_tuple(value: &str) -> Result<(), String> {
++    let fields = value.split(':').collect::<Vec<_>>();
++    if fields.len() != 8
++        || fields[0] != "v2"
++        || fields[1..]
++            .iter()
++            .any(|field| field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_digit()))
++    {
++        return Err("malformed internal /test lease argument".into());
++    }
++    Ok(())
++}
++
++#[derive(Clone, Debug, Default)]
++struct EphemeralTestRootLeaseInput {
++    tuple: Option<String>,
++    carried_by_argv: bool,
++}
++
++fn capture_ephemeral_test_root_lease_input(
++    carried_lease: Option<&str>,
++) -> Result<EphemeralTestRootLeaseInput, String> {
++    let ambient = std::env::var_os(EPHEMERAL_TEST_ROOT_LEASE_ENV);
++    std::env::remove_var(EPHEMERAL_TEST_ROOT_LEASE_ENV);
++    let ambient = ambient
++        .map(|value| {
++            value
++                .into_string()
++                .map_err(|_| "inherited /test lease is not valid UTF-8".to_string())
++        })
++        .transpose()?;
++    if let Some(value) = carried_lease {
++        validate_ephemeral_test_root_lease_tuple(value)?;
++    }
++    if let Some(value) = ambient.as_deref() {
++        validate_ephemeral_test_root_lease_tuple(value)?;
++    }
++    if let (Some(carried), Some(ambient)) = (carried_lease, ambient.as_deref()) {
++        if carried != ambient {
++            return Err("internal /test lease argument does not match the inherited lease".into());
++        }
++    }
++    Ok(EphemeralTestRootLeaseInput {
++        tuple: carried_lease.map(str::to_owned).or(ambient),
++        carried_by_argv: carried_lease.is_some(),
++    })
++}
++
++fn validate_ephemeral_test_root_lease(
++    root: &Path,
++    lease: &str,
++) -> Result<(), String> {
++    let status = Command::new(root.join("ci/run-with-ephemeral-test-root.sh"))
++        .arg("--check-lease")
++        .env(EPHEMERAL_TEST_ROOT_LEASE_ENV, lease)
++        .status()
++        .map_err(|error| format!("cannot validate inherited /test lease: {error}"))?;
++    if status.success() {
++        Ok(())
++    } else {
++        Err(format!(
++            "carried /test lease validation failed with {status}; refusing unowned /test state"
++        ))
++    }
++}
++
++fn ensure_noncanonical_ephemeral_test_root(
++    root: &Path,
++    canonical_admission: bool,
++    lease_input: &EphemeralTestRootLeaseInput,
++) -> Result<Option<String>, String> {
++    if !noncanonical_ephemeral_test_root_needed(canonical_admission) {
++        if lease_input.tuple.is_some() {
++            return Err(
++                "canonical validation refuses noncanonical ephemeral-/test lease state".into(),
++            );
++        }
++        return Ok(None);
++    }
++    let wrapper = root.join("ci/run-with-ephemeral-test-root.sh");
++    if let Some(lease) = lease_input.tuple.as_deref() {
++        validate_ephemeral_test_root_lease(root, lease)?;
++        if lease_input.carried_by_argv || is_in_scope() {
++            return Ok(Some(lease.to_string()));
++        }
++    }
++    if is_in_scope() {
++        return Err(
++            "in-scope validation has neither a verified helper decision nor a pre-scope /test lease"
++                .into(),
++        );
++    }
++
++    let executable = std::env::current_exe()
++        .map_err(|error| format!("cannot resolve validate executable for /test re-exec: {error}"))?;
++    let mut command = Command::new(&wrapper);
++    command
++        .arg("--forward-lease-argv")
++        .arg("--")
++        .arg(executable)
++        .args(std::env::args().skip(1))
++        .env_remove(EPHEMERAL_TEST_ROOT_LEASE_ENV);
++    if let Some(lease) = lease_input.tuple.as_deref() {
++        command.env(EPHEMERAL_TEST_ROOT_LEASE_ENV, lease);
++    }
++    let error = command.exec();
++    Err(format!(
++        "cannot re-exec noncanonical validation through {}: {error}",
++        wrapper.display()
++    ))
++}
++
++fn export_ephemeral_test_root_lease_for_children(
++    root: &Path,
++    lease: Option<&str>,
++) -> Result<(), String> {
++    if let Some(lease) = lease {
++        validate_ephemeral_test_root_lease(root, lease)?;
++        std::env::set_var(EPHEMERAL_TEST_ROOT_LEASE_ENV, lease);
++    }
++    Ok(())
++}
++
++fn noncanonical_ephemeral_test_root_needed(canonical_admission: bool) -> bool {
++    !canonical_admission
++}
++
+ /// Execute the production manifest producer/audit dependency spine in both
+ /// directions. The positive case starts with no output and requires the
+ /// producer to create it before the audit runs. The negative case makes the
+@@ -3560,18 +4612,11 @@ fn owns_scope_request(deadline_ns: Option<u64>) -> bool {
+ /// `resolve_cgroups` policy. Returns the manager (`None` = intentional unboxed
+ /// run) or `Err(exit_code)`. On the default path this re-execs into a transient
+ /// `systemd --user` scope and does not return on success.
+-fn resolve_cgroups(
++fn ensure_cgroup_scope_reexec(
+     allow_failure: bool,
+     run_timeout_s: Option<i64>,
+     deadline_ns: Option<u64>,
+-) -> Result<BoxedCgroups, u8> {
+-    let owns_request = owns_scope_request(deadline_ns);
+-    if is_in_scope() && run_timeout_s.is_some() && !owns_request {
+-        eprintln!(
+-            "validate: inherited cgroup scope has no invocation-owned RuntimeMaxSec rung; \
+-             the anchored in-process deadline remains inside the enclosing DAG node limit"
+-        );
+-    }
++) -> Result<(), u8> {
+     let scope_runtime_s = run_timeout_s.and_then(|run| {
+         remaining_budget_s(deadline_ns).map(|remaining| remaining + scope_grace_s(run))
+     });
+@@ -3582,10 +4627,24 @@ fn resolve_cgroups(
+             std::env::remove_var(OWN_SCOPE_DEADLINE_ENV);
+         }
+     }
+-    safe_ci_scope::propagate_result(safe_ci_scope::resolve_cgroups(
++    safe_ci_scope::ensure_scope_reexec("validate", allow_failure, scope_runtime_s)
++}
++
++fn resolve_cgroups_after_reexec(
++    allow_failure: bool,
++    run_timeout_s: Option<i64>,
++    deadline_ns: Option<u64>,
++) -> Result<BoxedCgroups, u8> {
++    let owns_request = owns_scope_request(deadline_ns);
++    if is_in_scope() && run_timeout_s.is_some() && !owns_request {
++        eprintln!(
++            "validate: inherited cgroup scope has no invocation-owned RuntimeMaxSec rung; \
++             the anchored in-process deadline remains inside the enclosing DAG node limit"
++        );
++    }
++    safe_ci_scope::propagate_result(safe_ci_scope::resolve_cgroups_after_reexec(
+         "validate",
+         allow_failure,
+-        scope_runtime_s,
+         owns_request,
+     ))
+ }
+@@ -4032,6 +5091,10 @@ fn product_front_door_refusal(
+ fn requested_validate_args() -> String {
+     let args = std::env::args()
+         .skip(1)
++        .filter(|arg| {
++            !arg.starts_with(EPHEMERAL_TEST_ROOT_LEASE_ARG)
++                && !arg.starts_with(PRIVATE_TEST_ROOT_HELPER_DECISION_ARG)
++        })
+         .map(|arg| validate_plan::shell_quote(&arg))
+         .collect::<Vec<_>>();
+     if args.is_empty() {
+@@ -4216,7 +5279,7 @@ fn configure_private_test_root(
+         return Ok(0);
+     }
+     let helper = helper.ok_or_else(|| {
+-        "canonical full validation was admitted without a trusted private-/test helper".to_string()
++        "helper-backed validation was selected without a trusted private-/test helper".to_string()
+     })?;
+ 
+     let mut marked = 0;
+@@ -4240,7 +5303,7 @@ fn configure_private_test_root(
+         }
+     }
+     if marked == 0 {
+-        return Err("canonical full plan contains no manifest-run nodes to isolate".into());
++        return Err("helper-backed plan contains no manifest-run nodes to isolate".into());
+     }
+     Ok(marked)
+ }
+@@ -4588,7 +5651,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
+         };
+         add("build", "Build workspace", "cargo build --workspace --features third-party-backends".into(), vec![gate.into()], 3600, 16 * 1024 * 1024 * 1024);
+         add("e2e_metadata", "Portable E2E metadata", "target/debug/test-harness validate".into(), vec!["quick.build".into()], 600, 4 * 1024 * 1024 * 1024);
+-        add("e2e_verify", "Portable ptrace E2E verification", "target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only".into(), vec!["quick.build".into()], 1800, 8 * 1024 * 1024 * 1024);
++        add("e2e_verify", "Portable ptrace E2E verification", "./ci/run-with-ephemeral-test-root.sh -- target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only".into(), vec!["quick.build".into()], 1800, 8 * 1024 * 1024 * 1024);
+         add("detcore_unit", "Detcore core unit tests", "./ci/run-nextest-counted.sh -p hermit-detcore --lib".into(), vec!["quick.build".into(), "setup.nextest".into()], 1800, 8 * 1024 * 1024 * 1024);
+         add("run_smoke", "Hermit run smoke test",
+             format!("out=$(timeout 30s {hermit} {run_args} -- /bin/echo {marker}) && test \"$out\" = {marker}"),
+@@ -9526,6 +10589,11 @@ fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
+         .iter()
+         .find(|step| step.tag() == "requalify.cell")
+         .ok_or("requalification plan: exact cell step is absent")?;
++    if !validation_step_requires_private_test_root(step)
++        || !plan_requires_private_test_root(&plan)
++    {
++        return Err("requalification plan: exact cell lost its outer-/test lease demand".into());
++    }
+     for token in [
+         "--test applications/timed-progress-bar",
+         "--mode verify",
+@@ -10248,6 +11316,61 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
+         }
+     };
+ 
++    let entry_root = repo_root();
++    let lease_input = match capture_ephemeral_test_root_lease_input(
++        args.ephemeral_test_root_lease.as_deref(),
++    ) {
++        Ok(input) => input,
++        Err(error) => {
++            return RunSummary::refused(
++                2,
++                args.focused
++                    .as_ref()
++                    .map(Focused::profile)
++                    .unwrap_or_else(|| args.level.name().to_string())
++                    .as_str(),
++                "internal ephemeral-/test lease transport",
++                vec![error],
++            )
++        }
++    };
++    let nested_probe = nested_scope_probe_selected(args.self_test, nested_scope_probe_requested());
++    let inert_self_test_descendant =
++        args.self_test && !nested_probe && !lease_input.carried_by_argv;
++    if (lease_input.tuple.is_some()
++        && (args.show_plan || (args.self_test && !nested_probe && !inert_self_test_descendant)))
++        || (args.private_test_root_helper_decision.is_some()
++            && (args.show_plan || args.self_test || args.live_private_root_self_test))
++    {
++        return RunSummary::refused(
++            2,
++            args.focused
++                .as_ref()
++                .map(Focused::profile)
++                .unwrap_or_else(|| args.level.name().to_string())
++                .as_str(),
++            "internal ephemeral-/test lease transport",
++            vec![
++                "an internal /test lease is valid only for an executing noncanonical validation"
++                    .into(),
++            ],
++        );
++    }
++    if let Some(lease) = lease_input.tuple.as_deref() {
++        if let Err(error) = validate_ephemeral_test_root_lease(&entry_root, lease) {
++            return RunSummary::refused(
++                3,
++                args.focused
++                    .as_ref()
++                    .map(Focused::profile)
++                    .unwrap_or_else(|| args.level.name().to_string())
++                    .as_str(),
++                "internal ephemeral-/test lease authority",
++                vec![error],
++            );
++        }
++    }
++
+     if let Err(error) =
+         reject_ambient_private_test_root_environment(&ambient_private_test_root)
+     {
+@@ -10276,8 +11399,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
+         ]);
+     }
+ 
+-    if nested_scope_probe_selected(args.self_test, nested_scope_probe_requested()) {
+-        return match run_nested_scope_probe() {
++    if nested_probe {
++        return match run_nested_scope_probe(&lease_input) {
+             Ok(detail) => RunSummary::new(
+                 Verdict::SelfTest, 0, "nested safe-ci scope self-test", vec![detail],
+             ),
+@@ -10291,6 +11414,45 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
+         };
+     }
+ 
++    if args.live_private_root_self_test {
++        let Some(lease) = lease_input.tuple.as_deref() else {
++            return RunSummary::refused(
++                2,
++                "live-private-root-self-test",
++                "outside-scope ephemeral-/test lease",
++                vec![
++                    "invoke this internal probe through ci/run-with-ephemeral-test-root.sh --forward-lease-argv"
++                        .into(),
++                ],
++            );
++        };
++        if !lease_input.carried_by_argv || is_in_scope() {
++            return RunSummary::refused(
++                2,
++                "live-private-root-self-test",
++                "outside-scope ephemeral-/test lease",
++                vec![
++                    "the live probe requires a wrapper-carried argv lease before any cgroup scope"
++                        .into(),
++                ],
++            );
++        }
++        return match live_private_root_self_test(lease) {
++            Ok(detail) => RunSummary::new(
++                Verdict::SelfTest,
++                0,
++                "live private-/test topology self-test",
++                vec![detail],
++            ),
++            Err(error) => RunSummary::new(
++                Verdict::Fail,
++                2,
++                "live private-/test topology self-test",
++                vec![error],
++            ),
++        };
++    }
++
+     if args.self_test {
+         return match self_test() {
+             Ok(()) => RunSummary::new(
+@@ -10302,8 +11464,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
+                      envelope scoring/comparison, ledger cache, receipt eligibility, and the \
+                      selective/only subset builders all passed"
+                         .into(),
+-                    "policy/data brackets are inert; the cgroup bracket runs only inside a bounded \
+-                     disposable scope and neither publishes nor writes the real ledger"
++                    "all policy/data brackets are inert and safe inside the manifest audit; the \
++                     explicit live-private-root self-test owns topology and cleanup probes"
+                         .into(),
+                 ],
+             ),
+@@ -10315,7 +11477,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
+     }
+ 
+     let level_name = args.level.name().to_string();
+-    let root = repo_root();
++    let root = entry_root;
+     if std::env::set_current_dir(&root).is_err() {
+         return RunSummary::refused(
+             2,
+@@ -10408,6 +11570,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
+     // explicitly inert here.
+     let ci_hub_dir_present =
+         parent.as_ref().is_some_and(|candidate| candidate.join("ci-hub").is_dir());
++    let mut product_front_door_admission = None;
+     if product_front_door_applies(
+         parent.is_some(),
+         ci_hub_dir_present,
+@@ -10418,14 +11581,15 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
+         let commit = git_sha();
+         let host = short_hostname();
+         let ci_hub_launcher_available = parent.join("ci-hub/ci-hub").is_file();
+-        let admitted = canonical_validate_lock_admission(Some(parent), &commit, &host);
++        product_front_door_admission =
++            canonical_validate_lock_authority(Some(parent), &commit, &host);
+         if let Some(refusal) = product_front_door_refusal(
+             parent,
+             &root,
+             &commit,
+             &requested_validate_args(),
+             ci_hub_launcher_available,
+-            admitted,
++            product_front_door_admission.is_some(),
+         ) {
+             eprintln!("{refusal}");
+             return RunSummary::refused(
+@@ -10443,7 +11607,6 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
+             );
+         }
+     }
+-
+     // Anchor the logical run before locks, freshness checks, plan construction, cgroup re-exec,
+     // durable-log setup, and registration.  A nested focused payload inherits the enclosing
+     // safe-ci step's scheduler-owned epoch; a top-level run owns its epoch here.
+@@ -10730,24 +11893,122 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
+     // Decide the private-/test policy BEFORE consulting the tree-keyed PASS
+     // cache. Canonical runs never reuse that cache: the run-bound root-owned
+     // helper authority is external to the Hermit tree. The outer pre-scope
+-    // process deliberately does not read that authority. After the normal
+-    // systemd cgroup re-exec, the observed in-scope process validates it and
+-    // marks the typed manifest steps before reaching the (disabled) lookup.
++    // process deliberately does not read that authority. After the fallback
++    // owner and systemd cgroup re-execs, the observed in-scope process validates
++    // its exact lease and marks the typed manifest steps before reaching the
++    // (disabled) lookup.
+     let commit = git_sha();
+     let host = short_hostname();
+-    let private_test_root_admission =
+-        canonical_validate_lock_authority(parent.as_deref(), &commit, &host);
+-    let private_test_root_mode = private_test_root_activation(
++    let private_test_root_admission = match refresh_canonical_validate_lock_authority(
++        product_front_door_admission.as_ref(),
++        canonical_validate_lock_authority(parent.as_deref(), &commit, &host),
++    ) {
++        Ok(admission) => admission,
++        Err(error) => {
++            return RunSummary::refused(
++                4,
++                &plan.profile,
++                "canonical validate-lock authority continuity",
++                vec![
++                    error,
++                    "a product run that passed the front door cannot fall back to standalone cache or execution semantics"
++                        .into(),
++                ],
++            )
++        }
++    };
++    let plan_requires_private_test_root = plan_requires_private_test_root(&plan);
++    let private_test_root_policy = private_test_root_helper_policy(
+         &args,
+         nesting.nested,
+         private_test_root_admission.is_some(),
++        plan_requires_private_test_root,
++    );
++    let private_test_root_helper = match private_test_root_policy {
++        PrivateTestRootHelperPolicy::Disabled => {
++            if args.private_test_root_helper_decision.is_some() {
++                return RunSummary::refused(
++                    4,
++                    &plan.profile,
++                    "private /test helper decision continuity",
++                    vec!["this plan is not eligible for helper-backed /test authority".into()],
++                );
++            }
++            None
++        }
++        PrivateTestRootHelperPolicy::Required => {
++            match load_private_test_root_helper(private_test_root_admission.as_ref()) {
++                Ok(helper) => Some(helper),
++                Err(error) => {
++                    return RunSummary::refused(
++                        3,
++                        &plan.profile,
++                        "required private /test helper authority",
++                        vec![error],
++                    )
++                }
++            }
++        }
++        PrivateTestRootHelperPolicy::Optional => {
++            match load_private_test_root_helper(private_test_root_admission.as_ref()) {
++                Ok(helper) => Some(helper),
++                Err(error) => {
++                    if args.private_test_root_helper_decision.is_some() {
++                        return RunSummary::refused(
++                            4,
++                            &plan.profile,
++                            "private /test helper decision continuity",
++                            vec![
++                                "helper-backed /test authority disappeared after the pre-scope decision"
++                                    .into(),
++                                error,
++                            ],
++                        );
++                    }
++                    eprintln!(
++                        "validate: admitted focused plan has no usable helper-backed /test authority ({error}); using the outside-scope ephemeral lease owner"
++                    );
++                    None
++                }
++            }
++        }
++    };
++    let private_test_root_mode = private_test_root_activation(
++        private_test_root_policy,
++        private_test_root_helper.is_some(),
+     );
++    if private_test_root_mode == PrivateTestRootActivation::HelperBacked
++        && lease_input.tuple.is_some()
++    {
++        return RunSummary::refused(
++            4,
++            &plan.profile,
++            "helper-backed/noncanonical private-/test authority separation",
++            vec![
++                "helper-backed validation refuses an internal noncanonical /test lease token"
++                    .into(),
++            ],
++        );
++    }
++    if let Some(helper) = private_test_root_helper.as_ref() {
++        if let Err(error) = ensure_private_test_root_helper_decision(
++            helper,
++            args.private_test_root_helper_decision.as_ref(),
++        ) {
++            return RunSummary::refused(
++                4,
++                &plan.profile,
++                "private /test helper decision continuity",
++                vec![error],
++            );
++        }
++    }
+     let mut private_test_root_nodes = None;
+     if private_test_root_mode == PrivateTestRootActivation::Disabled || is_in_scope() {
+         match activate_private_test_root(
+             &mut plan,
+             private_test_root_mode,
+-            private_test_root_admission.as_ref(),
++            private_test_root_helper.as_ref(),
+         ) {
+             Ok(marked) => private_test_root_nodes = Some(marked),
+             Err(error) => {
+@@ -10786,7 +12047,10 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
+     if !nesting.nested
+         && !args.ignore_cache
+         && plan.cacheable
+-        && private_test_root_allows_cache(private_test_root_mode)
++        && private_test_root_allows_cache(
++            private_test_root_mode,
++            product_front_door_admission.is_some(),
++        )
+         && !wt_dirty
+         && !tree_dirty()
+         && plan.selection_mode == "full"
+@@ -10855,19 +12119,64 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
+         ),
+     }
+ 
+-    let cgroups: BoxedCgroups =
+-        match resolve_cgroups(args.allow_cgroup_failure, run_timeout, deadline_ns) {
+-            Ok(c) => {
+-                // Claim the re-entrancy marker HERE, not before resolve_cgroups.
+-                // On the default path resolve_cgroups re-execs into a transient
+-                // systemd scope and does not return, so the process that reaches
+-                // this line is the one that will actually drive the run -- and it is
+-                // the only one whose pid a nested payload should see. Claiming
+-                // earlier made the driver read its own boxing re-exec as a nested
+-                // invocation and refuse itself.
+-                validate_runtime::claim_active_marker();
+-                c
++    // A noncanonical run first places its one ephemeral-/test cleanup owner
++    // OUTSIDE every killable cgroup. The wrapper appends the exact live lease
++    // tuple to this driver's argv; systemd preserves that internal argument,
++    // and the in-scope process revalidates/re-exports it before constructing
++    // any cgroup manager or signal teardown. Only an actually verified helper-
++    // backed plan suppresses this fallback; admitted focused work without that
++    // helper keeps the outside-scope owner.
++    let noncanonical_lease = if plan_requires_private_test_root {
++        match ensure_noncanonical_ephemeral_test_root(
++            &root,
++            private_test_root_mode == PrivateTestRootActivation::HelperBacked,
++            &lease_input,
++        ) {
++            Ok(lease) => lease,
++            Err(error) => {
++                return RunSummary::refused(
++                    3,
++                    &plan.profile,
++                    "noncanonical private /test lease",
++                    vec![error],
++                )
+             }
++        }
++    } else {
++        None
++    };
++
++    if let Err(code) =
++        ensure_cgroup_scope_reexec(args.allow_cgroup_failure, run_timeout, deadline_ns)
++    {
++        return RunSummary::refused(
++            code,
++            &plan.profile,
++            "cgroup boxing (fail-closed)",
++            vec![
++                "two-level cgroup-v2 boxing could not be established; see the message above"
++                    .into(),
++                "resource boxing is this tool's primary purpose — re-run with \
++                 --allow-cgroup-failure to accept an UNBOXED run"
++                    .into(),
++            ],
++        );
++    }
++
++    if let Err(error) =
++        export_ephemeral_test_root_lease_for_children(&root, noncanonical_lease.as_deref())
++    {
++        return RunSummary::refused(
++            3,
++            &plan.profile,
++            "post-scope ephemeral-/test lease authority",
++            vec![error],
++        );
++    }
++
++    let cgroups: BoxedCgroups =
++        match resolve_cgroups_after_reexec(args.allow_cgroup_failure, run_timeout, deadline_ns) {
++            Ok(c) => c,
+             Err(code) => {
+                 return RunSummary::refused(
+                     code,
+@@ -10884,11 +12193,15 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
+             }
+         };
+ 
++    // Claim the re-entrancy marker only after both possible same-logical-run
++    // re-execs (ephemeral-/test owner and systemd scope) have completed.
++    validate_runtime::claim_active_marker();
++
+     if private_test_root_nodes.is_none() {
+         match activate_private_test_root(
+             &mut plan,
+             private_test_root_mode,
+-            private_test_root_admission.as_ref(),
++            private_test_root_helper.as_ref(),
+         ) {
+             Ok(marked) => private_test_root_nodes = Some(marked),
+             Err(error) => {
+@@ -11160,7 +12473,10 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
+     let commit_anchored = commit != "unknown" && !dirty_now;
+     // Observed, not inferred: did the pin gate actually run and pass in THIS run?
+     let pin_gate_passed = outcomes.iter().any(|o| o.tag == PIN_GATE_TAG && o.ok);
+-    let lock_admitted = canonical_validate_lock_admission(parent.as_deref(), &commit, &host);
++    // The front-door admission is the authority for this logical run. Reusing
++    // that proven state here avoids a late transient query turning a completed
++    // admitted run into an unadmitted ledger row.
++    let lock_admitted = product_front_door_admission.is_some();
+     let ctx = LedgerCtx {
+         started_at,
+         host: host.clone(),
+diff --git a/tests/e2e/manifests/README.md b/tests/e2e/manifests/README.md
+index 1e31fd0006..c6577f6651 100644
+--- a/tests/e2e/manifests/README.md
++++ b/tests/e2e/manifests/README.md
+@@ -104,14 +104,14 @@ The mode contracts are:
+ | `naked` | Opt-in meta-CI only; run natively three to five times and require declared variation |
+ | `custom` | Run declared edge-case Hermit arguments and require three to five identical observations |
+ 
+-`verify`, `chaos`, and `custom` may set an absolute `workdir` path. The harness
+-passes it to `hermit run` before the guest-command separator, so it is resolved
+-inside the guest after mounts are applied. Use this when a guest's interpreter
+-or toolchain inspects its inherited working directory before the program can
+-change directories itself. `naked` and `replay` do not accept this field.
+-The checked-in use is currently ptrace-only. A mode that enables DBT is
+-rejected because the DBT launcher does not yet preserve the requested guest
+-working directory; qualify that backend behavior before using `workdir` there.
++Non-required/manual `verify`, `chaos`, and `custom` cells may set an absolute
++`workdir` path. The harness passes it to `hermit run` before the guest-command
++separator, so it is resolved inside the guest after mounts are applied.
++Required cells always start in the fresh private `/test` and must not declare
++`workdir`; `naked` and `replay` do not accept the field either. A mode that
++enables DBT is rejected because the DBT launcher does not yet preserve a
++requested guest working directory; qualify that backend behavior before using
++`workdir` there.
+ 
+ An enabled `verify` cell is green only when its typed report records canonical
+ strictness, log comparison, positive INFO counts on both runs, bitwise parity,
+@@ -247,8 +247,8 @@ target/debug/test-harness validate
+ target/debug/test-harness plan --format json
+ target/debug/test-harness audit-gaps --format json
+ target/debug/test-harness build --lane portable --ci-only
+-target/debug/test-harness run --lane portable
+-target/debug/test-harness run --lane portable --category system-utils --ci-only --prebuilt
++./ci/run-with-ephemeral-test-root.sh -- target/debug/test-harness run --lane portable
++./ci/run-with-ephemeral-test-root.sh -- target/debug/test-harness run --lane portable --category system-utils --ci-only --prebuilt
+ target/debug/test-harness run --mode naked --test system-utils/random-device
+ ```
+ 
+diff --git a/tests/e2e/manifests/applications.yaml b/tests/e2e/manifests/applications.yaml
+index a6f1a421f9..c3739d6255 100644
+--- a/tests/e2e/manifests/applications.yaml
++++ b/tests/e2e/manifests/applications.yaml
+@@ -322,12 +322,6 @@ test:
+           native: Fixed content, identities, timestamps, and configuration make the repository transaction deterministic by construction
+       verify:
+         ci: true
+-        # Bash inspects inherited PWD before this script can cd, and Git
+-        # discovers repositories through cwd ancestors, so an ancestor
+-        # directory's st_size changing between the verify pair produced
+-        # unequal strict logs. Start in the fresh private guest /tmp, which
+-        # hermit resolves AFTER installing guest mounts.
+-        workdir: /tmp
+         backends_enabled:
+           - ptrace
+         backends_disabled:
+diff --git a/tests/e2e/manifests/system-utils.yaml b/tests/e2e/manifests/system-utils.yaml
+index 3257ecb421..cbda0a221d 100644
+--- a/tests/e2e/manifests/system-utils.yaml
++++ b/tests/e2e/manifests/system-utils.yaml
+@@ -2051,6 +2051,7 @@ test:
+     timeout_seconds: 60
+     occasional: false
+     program: tests/e2e/system-utils/harness-width-contract.sh
++    expected_scheduled_worker_capacity: 1
+     observation:
+       status: true
+       stdout: true
+diff --git a/tests/e2e/system-utils/harness-width-contract.sh b/tests/e2e/system-utils/harness-width-contract.sh
+index fcf6d0bc28..ce28016d25 100755
+--- a/tests/e2e/system-utils/harness-width-contract.sh
++++ b/tests/e2e/system-utils/harness-width-contract.sh
+@@ -11,12 +11,12 @@ case ${1:-} in
+     --prepare) exit 0 ;;
+     --run)
+         expected=1
+-        observed=${HERMIT_E2E_SCHEDULED_JOBS:-missing}
+-        if [[ $observed != "$expected" ]]; then
++        observed=${2:-missing}
++        if [[ $# -ne 2 || $observed != "$expected" ]]; then
+             printf 'system-utils-width expected=%s observed=%s\n' "$expected" "$observed"
+             exit 1
+         fi
+         printf 'system-utils-width=%s\n' "$observed"
+         ;;
+-    *) echo "usage: $0 --prepare|--run" >&2; exit 2 ;;
++    *) echo "usage: $0 --prepare|--run SCHEDULED-WORKER-CAPACITY" >&2; exit 2 ;;
+ esac
+diff --git a/tests/manifest-cli.rs b/tests/manifest-cli.rs
+index 33528a915a..86b81d2dee 100755
+--- a/tests/manifest-cli.rs
++++ b/tests/manifest-cli.rs
+@@ -20,7 +20,9 @@
+ //! - `list` enumerates tests across all manifests, filterable by bucket,
+ //!   by a backend that is enabled in some mode, by a `requires` capability
+ //!   token ("tag"), and/or by mode.
+-//! - `get` prints the exact Hermit command(s) a test runs, ready to paste.
++//! - `get` prints the exact Hermit command(s) a test runs, ready to paste;
++//!   required cells include the checked-in boundary that creates and removes
++//!   the otherwise-absent host `/test` mountpoint.
+ //! - `run` executes a single test cell directly, honoring `--log`, a backend
+ //!   override, a lane override, and any extra flags after `--` (injected into
+ //!   the hermit invocation before the `-- <guest>` separator).
+@@ -55,8 +57,8 @@ use manifest_value::Value;
+ 
+ const MANIFEST_SCHEMA: i64 = 2;
+ const GUEST_FIXTURE_ROOT: &str = "/tmp/hermit-e2e-fixtures";
+-const RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=\"$cell/tmp\" E2E_FIXTURE_DIR=\"$cell/fixtures\"";
+-const HERMIT_RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=/tmp/hermit-e2e E2E_FIXTURE_DIR=\"$cell/fixtures\"";
++const RUN_ENV: &str = "env -u HERMIT_EPHEMERAL_TEST_ROOT_LEASE_V2 LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=\"$cell/tmp\" E2E_FIXTURE_DIR=\"$cell/fixtures\"";
++const HERMIT_RUN_ENV: &str = "env -u HERMIT_EPHEMERAL_TEST_ROOT_LEASE_V2 LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=/tmp/hermit-e2e E2E_FIXTURE_DIR=\"$cell/fixtures\"";
+ const HERMIT_GUEST_ENV_ARGS: &str = "--env LC_ALL=C --env TZ=UTC --env HOME=\"$cell/home\" --env XDG_CONFIG_HOME=\"$cell/xdg-config\" --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=\"$cell/fixtures\"";
+ 
+ fn fail(message: impl AsRef<str>) -> ! {
+@@ -330,6 +332,23 @@ fn guest_with_prepared_fixtures(guest: &str, fixtures: &[String]) -> String {
+     }
+ }
+ 
++fn expected_scheduled_worker_capacity(test: &Value, id: &str) -> Option<i64> {
++    test.get("expected_scheduled_worker_capacity").map(|value| {
++        value
++            .as_integer()
++            .filter(|capacity| *capacity > 0)
++            .unwrap_or_else(|| {
++                fail(format!(
++                    "{id}.expected_scheduled_worker_capacity must be a positive integer"
++                ))
++            })
++    })
++}
++
++fn guest_with_scheduled_worker_capacity(guest: &str, capacity: Option<i64>) -> String {
++    capacity.map_or_else(|| guest.to_owned(), |capacity| format!("{guest} {capacity}"))
++}
++
+ fn mode_guest_args(spec: &Value, mode: &str, backend: &str, id: &str) -> Vec<String> {
+     let Some(by_backend) = spec.get("guest_args") else {
+         return Vec::new();
+@@ -366,6 +385,20 @@ fn cell_required(spec: &Value, mode: &str, backend: &str, id: &str) -> bool {
+         && ci_selected(spec, mode, backend, id)
+ }
+ 
++fn validate_required_workdir(
++    spec: &Value,
++    required: bool,
++    id: &str,
++    mode: &str,
++) -> Result<(), String> {
++    if required && spec.get("workdir").is_some() {
++        return Err(format!(
++            "{id}: {mode} required cells always run in /test and must not declare workdir"
++        ));
++    }
++    Ok(())
++}
++
+ fn guest_with_args(guest: &str, guest_args: &[String], resolve_checkout: bool) -> String {
+     if guest_args.is_empty() {
+         return guest.to_owned();
+@@ -451,7 +484,11 @@ fn hermit_command(
+                 fail("prepared_fixture_args are not supported by record/replay");
+             }
+             let base_env = if required { " --base-env=minimal" } else { "" };
+-            let workdir = if required { " --workdir=/test" } else { "" };
++            let workdir = if required {
++                " --mount=type=tmpfs,target=/test --workdir=/test"
++            } else {
++                ""
++            };
+             format!(
+                 "{HERMIT_RUN_ENV} \"$hermit_bin\" --log {log} --backend {be} record start{base_env} --strict $record_verify_strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout {timeout}{workdir}{legacy_guest_env}{extra_joined} -- {guest}"
+             )
+@@ -480,6 +517,11 @@ fn hermit_command(
+         }
+         other => fail(format!("unsupported mode `{other}`")),
+     };
++    let command = if required {
++        format!("./ci/run-with-ephemeral-test-root.sh -- {command}")
++    } else {
++        command
++    };
+     format!("timeout --kill-after=10s {timeout}s {command}")
+ }
+ 
+@@ -805,10 +847,13 @@ fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, S
+     let (setup, host_guest, lockdown_guest) = setup_prefix(test, id);
+     let native_prepared = prepared_fixture_paths(test, id, true);
+     let guest_prepared = prepared_fixture_paths(test, id, false);
++    let scheduled_capacity = expected_scheduled_worker_capacity(test, id);
+     let has_prepared_fixtures = !guest_prepared.is_empty();
+     let modes = modes_table(test, id);
+     let spec = &modes[&mode];
+     let required = mode != "naked" && cell_required(spec, &mode, &backend, id);
++    validate_required_workdir(spec, required, id, &mode)
++        .unwrap_or_else(|error| fail(error));
+     let guest_args = mode_guest_args(spec, &mode, &backend, id);
+     let log = args
+         .flag("log")
+@@ -835,6 +880,7 @@ fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, S
+     };
+     let run = if mode == "naked" {
+         let guest = guest_with_prepared_fixtures(&host_guest, &native_prepared);
++        let guest = guest_with_scheduled_worker_capacity(&guest, scheduled_capacity);
+         let guest = guest_with_args(&guest, &guest_args, false);
+         format!("timeout --kill-after=10s {timeout}s {RUN_ENV} {guest}")
+     } else {
+@@ -843,6 +889,7 @@ fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, S
+         } else {
+             guest_with_prepared_fixtures(&host_guest, &native_prepared)
+         };
++        let guest = guest_with_scheduled_worker_capacity(&guest, scheduled_capacity);
+         let guest = guest_with_args(&guest, &guest_args, required);
+         hermit_command(
+             &mode,
+@@ -882,7 +929,12 @@ fn self_test() -> ExitCode {
+     assert!(replay.contains("--strict $record_verify_strict --verify"));
+     assert!(replay.contains("--verify-json \"$cell/captures/verify.json\""));
+     assert!(replay.contains("record start --base-env=minimal"));
+-    assert!(replay.contains("--workdir=/test -- guest"));
++    assert!(replay.contains(
++        "--mount=type=tmpfs,target=/test --workdir=/test -- guest"
++    ));
++    assert!(replay.contains(
++        "./ci/run-with-ephemeral-test-root.sh -- env -u HERMIT_EPHEMERAL_TEST_ROOT_LEASE_V2 LC_ALL=C"
++    ));
+     assert!(!replay.contains("--env"));
+     assert!(!replay.contains("--no-virtualize-cpuid"));
+ 
+@@ -988,8 +1040,10 @@ fn self_test() -> ExitCode {
+         "./examples/example.py",
+     );
+     assert!(manual_verify.contains("--env LC_ALL=C"));
++    assert!(manual_verify.contains("env -u HERMIT_EPHEMERAL_TEST_ROOT_LEASE_V2"));
+     assert!(!manual_verify.contains("--workdir=/test"));
+     assert!(!manual_verify.contains("target=/test"));
++    assert!(!manual_verify.contains("run-with-ephemeral-test-root.sh"));
+     assert!(manual_verify.ends_with("-- ./examples/example.py"));
+ 
+     let selection: Value = r#"
+@@ -1014,6 +1068,27 @@ backends_enabled: [ptrace, liteinst]
+     ));
+     let uniform: Value = "ci: true\nbackends_enabled: [ptrace]".parse().unwrap();
+     assert!(!cell_required(&uniform, "verify", "kvm", "fixture"));
++    let invalid_required_workdir: Value =
++        "ci: true\nworkdir: /tmp\nbackends_enabled: [ptrace]"
++            .parse()
++            .unwrap();
++    assert!(
++        validate_required_workdir(
++            &invalid_required_workdir,
++            true,
++            "fixture/test",
++            "verify"
++        )
++        .unwrap_err()
++        .contains("must not declare workdir")
++    );
++    validate_required_workdir(
++        &invalid_required_workdir,
++        false,
++        "fixture/test",
++        "verify",
++    )
++    .unwrap();
+     assert_eq!(render_guest_argument("./README.md"), "\"$(pwd)\"/README.md");
+     assert_eq!(render_guest_argument("README.md"), "README.md");
+     let prepared: Value = r#"
+@@ -1029,6 +1104,12 @@ prepared_fixture_args: [fork-tree, nested/pipe-chain]
+             "/tmp/hermit-e2e-fixtures/nested/pipe-chain",
+         ]
+     );
++    let width: Value = "expected_scheduled_worker_capacity: 1".parse().unwrap();
++    assert_eq!(expected_scheduled_worker_capacity(&width, "fixture"), Some(1));
++    assert_eq!(
++        guest_with_scheduled_worker_capacity("guest --run", Some(1)),
++        "guest --run 1"
++    );
+     println!("manifest-cli self-test: PASS");
+     ExitCode::SUCCESS
+ }
+@@ -1122,6 +1203,8 @@ get/run:
+   --all-modes (get only) print every enabled (mode,backend) command
+   -- <flags> (run only) extra hermit flags injected before the `-- <guest>` separator
+   A chaos mode without declared seeds is unavailable; get/run refuse rather than invent seed 0.
++  Required cells run through ci/run-with-ephemeral-test-root.sh, whose only privileged operations
++  create and remove the exact empty /test mountpoint; the rendered guest command stays unprivileged.
+ 
+ ENV:
+   HERMIT_BIN  hermit binary for `run` (default target/release/hermit; a RELEASE binary is required)"

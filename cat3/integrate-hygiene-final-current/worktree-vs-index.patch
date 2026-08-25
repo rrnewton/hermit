@@ -1,0 +1,171 @@
+diff --git a/ci/manifest-plan/src/runner.rs b/ci/manifest-plan/src/runner.rs
+index a8d0baf793..b5ac99dacb 100644
+--- a/ci/manifest-plan/src/runner.rs
++++ b/ci/manifest-plan/src/runner.rs
+@@ -3970,6 +3970,82 @@ backends_disabled:
+         fs::remove_dir_all(root).unwrap();
+     }
+ 
++    #[test]
++    fn required_procfs_cell_uses_a_prepared_fixture_without_ambient_environment() {
++        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
++            .join("../..")
++            .canonicalize()
++            .unwrap();
++        let manifests = ManifestSet::load(&repo).unwrap();
++        let mut cells = manifests
++            .select(&Selection {
++                population: Some(Population::Required),
++                test: Some("system-utils/procfs-sanitized-paths".into()),
++                mode: Some("verify".into()),
++                backend: Some("ptrace".into()),
++                ..Selection::default()
++            })
++            .unwrap();
++        assert_eq!(cells.len(), 1);
++        let cell = cells.pop().unwrap();
++        assert_eq!(cell.test.prepared_fixture_args, ["procfs-sanitized-paths"]);
++
++        let root = std::env::temp_dir().join(format!(
++            "hermit-runner-procfs-lockdown-{}",
++            std::process::id()
++        ));
++        let _ = fs::remove_dir_all(&root);
++        let build_root = root.join("build");
++        let source = build_root.join("system-utils-procfs-sanitized-paths/fixtures");
++        let cell_dir = root.join("cell");
++        fs::create_dir_all(&source).unwrap();
++        fs::write(source.join("procfs-sanitized-paths"), b"#!/bin/sh\nexit 0\n").unwrap();
++        fs::set_permissions(
++            source.join("procfs-sanitized-paths"),
++            fs::Permissions::from_mode(0o755),
++        )
++        .unwrap();
++        let context = RunContext {
++            root: repo,
++            hermit_bin: root.join("hermit"),
++            result_root: root.join("results"),
++            build_root,
++            run_id: "fixture".into(),
++            source_sha: "0".repeat(40),
++            source_dirty: false,
++            prebuilt: true,
++            keep_logs: false,
++            run_verify_strict: true,
++            record_verify_strict: true,
++            scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
++            isolated_workdir: None,
++        };
++        let prepared = prepare_test(&context, &cell, &cell_dir).unwrap();
++        assert_eq!(
++            prepared.guest_argv.last().map(String::as_str),
++            Some("/tmp/hermit-e2e-fixtures/procfs-sanitized-paths")
++        );
++        let spec = build_spec(&context, &cell, cell_dir, &prepared, "1", None).unwrap();
++        assert!(spec.argv.iter().any(|arg| arg == "--base-env=minimal"));
++        assert!(
++            spec.argv
++                .iter()
++                .any(|arg| arg == "--mount=type=tmpfs,target=/test")
++        );
++        assert!(spec.argv.iter().any(|arg| arg == "--workdir=/test"));
++        assert!(spec.argv.iter().any(|arg| {
++            arg.contains("target=/tmp/hermit-e2e-fixtures") && arg.ends_with(",readonly")
++        }));
++        assert!(!spec.argv.iter().any(|arg| arg == "--env"));
++        assert!(
++            !spec
++                .argv
++                .iter()
++                .any(|arg| arg.contains("E2E_FIXTURE_DIR"))
++        );
++        fs::remove_dir_all(root).unwrap();
++    }
++
+     #[test]
+     fn only_dot_slash_guest_arguments_are_rebased_to_the_checkout() {
+         let root = std::env::temp_dir().join(format!(
+diff --git a/scripts/validate.rs b/scripts/validate.rs
+index 484b972b0f..953137a636 100755
+--- a/scripts/validate.rs
++++ b/scripts/validate.rs
+@@ -818,11 +818,14 @@ fn parse_private_test_root_authority(
+ }
+ 
+ fn is_validate_service_unit(unit: &str) -> bool {
+-    unit.starts_with("validate-")
+-        && unit.ends_with(".service")
+-        && unit
+-            .bytes()
+-            .all(|byte| byte.is_ascii_alphanumeric() || b"_.@:-".contains(&byte))
++    unit.strip_prefix("validate-")
++        .and_then(|body| body.strip_suffix(".service"))
++        .is_some_and(|body| {
++            !body.is_empty()
++                && unit
++                    .bytes()
++                    .all(|byte| byte.is_ascii_alphanumeric() || b"_.@:-".contains(&byte))
++        })
+ }
+ 
+ fn validate_service_unit_from_cgroup(text: &str) -> Result<String, String> {
+@@ -2183,6 +2186,7 @@ cleared-caps refusal names {} starved step(s)",
+                 "validate-private-root:test.service",
+                 "not-a-validate-unit.service",
+             ),
++            encoded.replace("validate-private-root:test.service", "validate-.service"),
+             encoded.replace("{\"schema_version\"", "{ \"schema_version\""),
+         ] {
+             if parse_private_test_root_authority(bad.as_bytes()).is_ok() {
+diff --git a/tests/e2e/manifests/system-utils.yaml b/tests/e2e/manifests/system-utils.yaml
+index 83c1ccfce6..3257ecb421 100644
+--- a/tests/e2e/manifests/system-utils.yaml
++++ b/tests/e2e/manifests/system-utils.yaml
+@@ -1218,6 +1218,8 @@ test:
+     timeout_seconds: 90
+     occasional: false
+     program: tests/e2e/system-utils/procfs-sanitized-paths.sh
++    prepared_fixture_args:
++      - procfs-sanitized-paths
+     observation:
+       status: true
+       stdout: true
+diff --git a/tests/e2e/system-utils/procfs-sanitized-paths.sh b/tests/e2e/system-utils/procfs-sanitized-paths.sh
+index 5a0321de21..84d354a9ae 100755
+--- a/tests/e2e/system-utils/procfs-sanitized-paths.sh
++++ b/tests/e2e/system-utils/procfs-sanitized-paths.sh
+@@ -7,12 +7,13 @@
+ 
+ set -euo pipefail
+ 
+-ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)"
+-SOURCE="$ROOT_DIR/tests/e2e/system-utils/procfs_sanitized_paths.c"
+-
+ compile_probe() {
+     local output=$1
+-    cc -std=c11 -O2 -g -Wall -Wextra -Werror "$SOURCE" -o "$output"
++    local root_dir
++    local source
++    root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)"
++    source="$root_dir/tests/e2e/system-utils/procfs_sanitized_paths.c"
++    cc -std=c11 -O2 -g -Wall -Wextra -Werror "$source" -o "$output"
+ }
+ 
+ populate_fixture() {
+@@ -86,10 +87,14 @@ case ${1:-} in
+         compile_probe "$E2E_FIXTURE_DIR/procfs-sanitized-paths"
+         ;;
+     --run)
+-        exec "$E2E_FIXTURE_DIR/procfs-sanitized-paths" --run
++        [[ $# -eq 2 && ${2:-} == /* ]] || {
++            echo "usage: $0 --run ABSOLUTE-PREPARED-PROBE" >&2
++            exit 2
++        }
++        exec "$2" --run
+         ;;
+     --self-test)
+         self_test
+         ;;
+-    *) echo "usage: $0 --prepare|--run|--self-test" >&2; exit 2 ;;
++    *) echo "usage: $0 --prepare|--run ABSOLUTE-PREPARED-PROBE|--self-test" >&2; exit 2 ;;
+ esac

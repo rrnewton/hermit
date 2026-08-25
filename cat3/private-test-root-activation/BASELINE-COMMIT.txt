@@ -1,0 +1,4 @@
+8bc26dba1d53cbb8120db6f73456ad5ea788a8ca
+2026-08-24 21:14:02 -0400
+Ryan Newton
+Hash syscall IO buffers by default in every verify and parity mode (#2384)

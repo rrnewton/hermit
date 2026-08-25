@@ -1,0 +1,4 @@
+740cc6563a640a83cf842968555635e41aa5bd2b
+2026-08-25 00:16:48 -0700
+Ryan Newton
+[hermit2, degraded-hermit-004, unresolved, devbig014, role=impl] Skip the DBT tests when DBT was not built in, instead of reporting 18 product failures

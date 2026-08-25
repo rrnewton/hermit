@@ -1,0 +1,412 @@
+diff --git a/tests/e2e/applications/git-repository-workflow.sh b/tests/e2e/applications/git-repository-workflow.sh
+index a7828361ae..19fe4cca4a 100755
+--- a/tests/e2e/applications/git-repository-workflow.sh
++++ b/tests/e2e/applications/git-repository-workflow.sh
+@@ -12,7 +12,7 @@ case ${1:-} in
+             echo "/usr/bin/git not found" >&2
+             exit 1
+         }
+-        for tool in sha256sum tar; do
++        for tool in find mktemp sha256sum tar; do
+             command -v "$tool" >/dev/null 2>&1 || {
+                 echo "$tool not found" >&2
+                 exit 1
+@@ -20,22 +20,85 @@ case ${1:-} in
+         done
+         ;;
+     --run)
+-        work="${E2E_TMPDIR:-/tmp}/hermit-git-repository-workflow"
++        shift
++        expected_cwd=
++        if [[ ${1:-} == --expect-cwd ]]; then
++            if (($# != 2)) || [[ -z ${2:-} || ${2:-} != /* ]]; then
++                echo "usage: $0 --run [--expect-cwd <absolute-path>]" >&2
++                exit 2
++            fi
++            expected_cwd=$2
++            shift 2
++        fi
++        if (($# != 0)); then
++            echo "usage: $0 --run [--expect-cwd <absolute-path>]" >&2
++            exit 2
++        fi
++
++        actual_cwd=$(pwd -P)
++        if [[ -n $expected_cwd ]]; then
++            if [[ $actual_cwd != "$expected_cwd" ]]; then
++                echo "git workflow cwd is $actual_cwd, expected $expected_cwd" >&2
++                exit 1
++            fi
++            # The lockdown contract is stronger than merely naming /test:
++            # every verification leg must enter it empty. The workflow creates
++            # every file it consumes below.
++            if [[ -n $(find "$actual_cwd" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
++                echo "git workflow cwd is not empty: $actual_cwd" >&2
++                exit 1
++            fi
++            work=$actual_cwd
++        else
++            # Backward-compatible manual/naked path used before the global
++            # /test lockdown. Never operate in, below, or relative to the
++            # ambient checkout working directory.
++            if [[ -n ${E2E_TMPDIR:-} ]]; then
++                if [[ $E2E_TMPDIR != /* ]]; then
++                    echo "E2E_TMPDIR must be absolute: $E2E_TMPDIR" >&2
++                    exit 2
++                fi
++                work="$E2E_TMPDIR/hermit-git-repository-workflow"
++                rm -rf -- "$work"
++                mkdir -p -- "$work"
++            else
++                scratch_root=${TMPDIR:-/tmp}
++                if [[ $scratch_root != /* ]]; then
++                    echo "TMPDIR must be absolute: $scratch_root" >&2
++                    exit 2
++                fi
++                mkdir -p -- "$scratch_root"
++                work=$(mktemp -d \
++                    "$scratch_root/hermit-git-repository-workflow.XXXXXXXX")
++            fi
++            trap 'rm -rf -- "$work"' EXIT
++        fi
++
++        cd -- "$work"
++        work=$(pwd -P)
+         repo="$work/repo"
+         git_bin=/usr/bin/git
+-        rm -rf -- "$work"
+-        mkdir -p -- "$repo" "$work/home" "$work/xdg"
++        mkdir -p -- \
++            "$repo" "$work/home" "$work/xdg" "$work/tmp" "$work/git-template"
+ 
+         # Keep the transaction independent of developer and system Git config.
++        export LC_ALL=C
+         export HOME="$work/home"
+         export XDG_CONFIG_HOME="$work/xdg"
++        export TMPDIR="$work/tmp"
++        export GIT_ATTR_NOSYSTEM=1
++        export GIT_CONFIG_GLOBAL=/dev/null
+         export GIT_CONFIG_NOSYSTEM=1
++        export GIT_TERMINAL_PROMPT=0
+         export GIT_AUTHOR_NAME='Hermit Corpus'
+         export GIT_AUTHOR_EMAIL='hermit-corpus@example.invalid'
+         export GIT_COMMITTER_NAME=$GIT_AUTHOR_NAME
+         export GIT_COMMITTER_EMAIL=$GIT_AUTHOR_EMAIL
++        unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_DIR GIT_INDEX_FILE \
++            GIT_OBJECT_DIRECTORY GIT_WORK_TREE
+ 
+-        "$git_bin" init -q --initial-branch=main "$repo"
++        "$git_bin" init -q --initial-branch=main \
++            --template="$work/git-template" "$repo"
+         "$git_bin" -C "$repo" config commit.gpgsign false
+         "$git_bin" -C "$repo" config core.autocrlf false
+ 
+@@ -66,7 +129,7 @@ case ${1:-} in
+         printf 'GIT archive_sha256=%s\n' "$(sha256sum "$work/head.tar" | cut -d' ' -f1)"
+         ;;
+     *)
+-        echo "usage: $0 --prepare|--run" >&2
++        echo "usage: $0 --prepare|--run [--expect-cwd <absolute-path>]" >&2
+         exit 2
+         ;;
+ esac
+diff --git a/tests/e2e/applications/kvm-python-examples.sh b/tests/e2e/applications/kvm-python-examples.sh
+index 86c032078f..8126030f6c 100755
+--- a/tests/e2e/applications/kvm-python-examples.sh
++++ b/tests/e2e/applications/kvm-python-examples.sh
+@@ -6,13 +6,31 @@
+ # LICENSE file in the root directory of this source tree.
+ set -euo pipefail
+ 
+-readonly ROOT="${BASH_SOURCE[0]%/*}/../../.."
+-
+ case ${1:-} in
+     --prepare) test -x /usr/bin/python3 ;;
+     --run)
+-        "$ROOT/examples/rand.py"
+-        exec "$ROOT/examples/timed-progress-bar.py"
++        shift
++        if (($# == 2)); then
++            random_example=$1
++            progress_example=$2
++            for example in "$random_example" "$progress_example"; do
++                if [[ $example != /* || ! -x $example ]]; then
++                    echo "example must be an absolute executable path: $example" >&2
++                    exit 2
++                fi
++            done
++        elif (($# == 0)); then
++            # Manual/naked compatibility only. Hermetic manifest runs stage
++            # both examples and pass their guest-visible paths explicitly.
++            script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
++            random_example="$script_dir/../../../examples/rand.py"
++            progress_example="$script_dir/../../../examples/timed-progress-bar.py"
++        else
++            echo "usage: $0 --run [<rand.py> <timed-progress-bar.py>]" >&2
++            exit 2
++        fi
++        "$random_example"
++        exec "$progress_example"
+         ;;
+-    *) echo "usage: $0 --prepare|--run" >&2; exit 2 ;;
++    *) echo "usage: $0 --prepare|--run [example paths]" >&2; exit 2 ;;
+ esac
+diff --git a/tests/e2e/determinism-stress/thread-output.sh b/tests/e2e/determinism-stress/thread-output.sh
+index d1dd39590d..9dafb89172 100755
+--- a/tests/e2e/determinism-stress/thread-output.sh
++++ b/tests/e2e/determinism-stress/thread-output.sh
+@@ -8,6 +8,25 @@ set -euo pipefail
+ 
+ case ${1:-} in
+     --prepare) test -x /bin/bash ;;
+-    --run) exec "${BASH_SOURCE[0]%/*}/../../../examples/race.sh" ;;
+-    *) echo "usage: $0 --prepare|--run" >&2; exit 2 ;;
++    --run)
++        shift
++        if (($# == 1)); then
++            example=$1
++            if [[ $example != /* ]]; then
++                echo "example path must be absolute: $example" >&2
++                exit 2
++            fi
++        elif (($# == 0)); then
++            # Manual/naked compatibility only. Hermetic manifest runs stage
++            # the example and pass its guest-visible path explicitly.
++            script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
++            example="$script_dir/../../../examples/race.sh"
++        else
++            echo "usage: $0 --run [<race.sh>]" >&2
++            exit 2
++        fi
++        test -x "$example"
++        exec "$example"
++        ;;
++    *) echo "usage: $0 --prepare|--run [example path]" >&2; exit 2 ;;
+ esac
+diff --git a/tests/e2e/language-runtimes/python-random.sh b/tests/e2e/language-runtimes/python-random.sh
+index 599c9218c8..29c20e9fda 100755
+--- a/tests/e2e/language-runtimes/python-random.sh
++++ b/tests/e2e/language-runtimes/python-random.sh
+@@ -8,6 +8,25 @@ set -euo pipefail
+ 
+ case ${1:-} in
+     --prepare) test -x /usr/bin/python3 ;;
+-    --run) exec "${BASH_SOURCE[0]%/*}/../../../examples/rand.py" ;;
+-    *) echo "usage: $0 --prepare|--run" >&2; exit 2 ;;
++    --run)
++        shift
++        if (($# == 1)); then
++            example=$1
++            if [[ $example != /* ]]; then
++                echo "example path must be absolute: $example" >&2
++                exit 2
++            fi
++        elif (($# == 0)); then
++            # Manual/naked compatibility only. Hermetic manifest runs stage
++            # the example and pass its guest-visible path explicitly.
++            script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
++            example="$script_dir/../../../examples/rand.py"
++        else
++            echo "usage: $0 --run [<rand.py>]" >&2
++            exit 2
++        fi
++        test -x "$example"
++        exec "$example"
++        ;;
++    *) echo "usage: $0 --prepare|--run [example path]" >&2; exit 2 ;;
+ esac
+diff --git a/tests/e2e/system-utils/date-nanoseconds.sh b/tests/e2e/system-utils/date-nanoseconds.sh
+index 8f642351d2..6cbc9a8448 100755
+--- a/tests/e2e/system-utils/date-nanoseconds.sh
++++ b/tests/e2e/system-utils/date-nanoseconds.sh
+@@ -11,12 +11,29 @@ readonly TIMESTAMP_PATTERN='^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])_(
+ case ${1:-} in
+     --prepare) test -x /bin/bash && test -x /usr/bin/date ;;
+     --run)
+-        output=$("${BASH_SOURCE[0]%/*}/../../../examples/date.sh")
++        shift
++        if (($# == 1)); then
++            example=$1
++            if [[ $example != /* ]]; then
++                echo "example path must be absolute: $example" >&2
++                exit 2
++            fi
++        elif (($# == 0)); then
++            # Manual/naked compatibility only. Hermetic manifest runs stage
++            # the example and pass its guest-visible path explicitly.
++            script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
++            example="$script_dir/../../../examples/date.sh"
++        else
++            echo "usage: $0 --run [<date.sh>]" >&2
++            exit 2
++        fi
++        test -x "$example"
++        output=$("$example")
+         if [[ ! $output =~ $TIMESTAMP_PATTERN ]]; then
+             echo "invalid date example output: $output" >&2
+             exit 1
+         fi
+         printf '%s\n' "$output"
+         ;;
+-    *) echo "usage: $0 --prepare|--run" >&2; exit 2 ;;
++    *) echo "usage: $0 --prepare|--run [example path]" >&2; exit 2 ;;
+ esac
+diff --git a/tests/e2e/system-utils/du-tree-summary.sh b/tests/e2e/system-utils/du-tree-summary.sh
+new file mode 100755
+index 0000000000..8135c0332c
+--- /dev/null
++++ b/tests/e2e/system-utils/du-tree-summary.sh
+@@ -0,0 +1,63 @@
++#!/usr/bin/env bash
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++# All rights reserved.
++#
++# This source code is licensed under the BSD-style license found in the
++# LICENSE file in the root directory of this source tree.
++set -euo pipefail
++
++case ${1:-} in
++    --prepare)
++        test -x /usr/bin/du
++        ;;
++    --run)
++        # Under the hygiene lockdown E2E_TMPDIR is absent, so this fixed tree
++        # lives in the initially empty guest cwd (/test). The legacy override
++        # keeps manual and pre-lockdown runs isolated as before.
++        work="${E2E_TMPDIR:-.}/hermit-du-tree-summary"
++        tree="$work/tree"
++        rm -rf -- "$work"
++        mkdir -p -- "$tree/alpha" "$tree/beta-layer/deeper"
++        trap 'rm -rf -- "$work"' EXIT
++
++        # Four leaves at depths 1, 2, and 3, with deliberately varied name
++        # lengths and payload sizes. This keeps recursive path traversal and
++        # byte accounting live without coupling the oracle to the checkout.
++        : >"$tree/root-empty"
++        printf 'abc\n' >"$tree/alpha/short.txt"
++        printf '123456\n' >"$tree/beta-layer/medium.bin"
++        printf '0123456789abcdef\n' \
++            >"$tree/beta-layer/deeper/fixed-width-name.dat"
++
++        listing=$(
++            /usr/bin/du -ab -- "$tree" |
++                while IFS=$'\t' read -r size path; do
++                    if [[ -f $path ]]; then
++                        printf '%s %s\n' "${path#"$tree"/}" "$size"
++                    fi
++                done | LC_ALL=C sort
++        )
++        expected=$(printf '%s\n' \
++            'alpha/short.txt 4' \
++            'beta-layer/deeper/fixed-width-name.dat 17' \
++            'beta-layer/medium.bin 7' \
++            'root-empty 0')
++        if [[ $listing != "$expected" ]]; then
++            printf 'du listing mismatch\nexpected:\n%s\nactual:\n%s\n' \
++                "$expected" "$listing" >&2
++            exit 1
++        fi
++
++        summary=$(/usr/bin/du -sb -- "$tree")
++        bytes=${summary%%[[:space:]]*}
++        if [[ ! $bytes =~ ^[0-9]+$ ]] || ((bytes < 28)); then
++            echo "du produced an invalid byte total: $summary" >&2
++            exit 1
++        fi
++        printf 'DU files=4 max_depth=3 bytes=%s\n%s\n' "$bytes" "$listing"
++        ;;
++    *)
++        echo "usage: $0 --prepare|--run" >&2
++        exit 2
++        ;;
++esac
+diff --git a/tests/e2e/system-utils/find-tree-metadata.sh b/tests/e2e/system-utils/find-tree-metadata.sh
+new file mode 100755
+index 0000000000..90b41563af
+--- /dev/null
++++ b/tests/e2e/system-utils/find-tree-metadata.sh
+@@ -0,0 +1,52 @@
++#!/usr/bin/env bash
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++# All rights reserved.
++#
++# This source code is licensed under the BSD-style license found in the
++# LICENSE file in the root directory of this source tree.
++set -euo pipefail
++
++case ${1:-} in
++    --prepare)
++        test -x /usr/bin/find
++        ;;
++    --run)
++        # Under the hygiene lockdown E2E_TMPDIR is absent, so this fixed tree
++        # lives in the initially empty guest cwd (/test). The legacy override
++        # keeps manual and pre-lockdown runs isolated as before.
++        work="${E2E_TMPDIR:-.}/hermit-find-tree-metadata"
++        tree="$work/tree"
++        rm -rf -- "$work"
++        mkdir -p -- "$tree/alpha" "$tree/beta-layer/deeper"
++        trap 'rm -rf -- "$work"' EXIT
++
++        # Four leaves at depths 1, 2, and 3, with deliberately varied name
++        # lengths and payload sizes. The exact expected listing makes this a
++        # live traversal/metadata oracle rather than a command-exit smoke test.
++        : >"$tree/root-empty"
++        printf 'abc\n' >"$tree/alpha/short.txt"
++        printf '123456\n' >"$tree/beta-layer/medium.bin"
++        printf '0123456789abcdef\n' \
++            >"$tree/beta-layer/deeper/fixed-width-name.dat"
++
++        listing=$(
++            /usr/bin/find "$tree" -mindepth 1 -maxdepth 3 -type f \
++                -printf '%P %s\n' | LC_ALL=C sort
++        )
++        expected=$(printf '%s\n' \
++            'alpha/short.txt 4' \
++            'beta-layer/deeper/fixed-width-name.dat 17' \
++            'beta-layer/medium.bin 7' \
++            'root-empty 0')
++        if [[ $listing != "$expected" ]]; then
++            printf 'find listing mismatch\nexpected:\n%s\nactual:\n%s\n' \
++                "$expected" "$listing" >&2
++            exit 1
++        fi
++        printf 'FIND files=4 max_depth=3\n%s\n' "$listing"
++        ;;
++    *)
++        echo "usage: $0 --prepare|--run" >&2
++        exit 2
++        ;;
++esac
+diff --git a/tests/e2e/system-utils/random-device.sh b/tests/e2e/system-utils/random-device.sh
+index 999f0cb506..66ba56d07f 100755
+--- a/tests/e2e/system-utils/random-device.sh
++++ b/tests/e2e/system-utils/random-device.sh
+@@ -8,6 +8,25 @@ set -euo pipefail
+ 
+ case ${1:-} in
+     --prepare) command -v hexdump >/dev/null ;;
+-    --run) exec "${BASH_SOURCE[0]%/*}/../../../examples/devrand.sh" ;;
+-    *) echo "usage: $0 --prepare|--run" >&2; exit 2 ;;
++    --run)
++        shift
++        if (($# == 1)); then
++            example=$1
++            if [[ $example != /* ]]; then
++                echo "example path must be absolute: $example" >&2
++                exit 2
++            fi
++        elif (($# == 0)); then
++            # Manual/naked compatibility only. Hermetic manifest runs stage
++            # the example and pass its guest-visible path explicitly.
++            script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
++            example="$script_dir/../../../examples/devrand.sh"
++        else
++            echo "usage: $0 --run [<devrand.sh>]" >&2
++            exit 2
++        fi
++        test -x "$example"
++        exec "$example"
++        ;;
++    *) echo "usage: $0 --prepare|--run [example path]" >&2; exit 2 ;;
+ esac
