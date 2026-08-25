@@ -8,6 +8,8 @@
 
 //! System calls for dealing with the file system.
 
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
@@ -490,10 +492,59 @@ impl<T: RecordOrReplay> Detcore<T> {
         // TODO-HUMAN-REVIEW(PR-955): Review deterministic kernel UUID generation.
         let random_uuid =
             needs_random_uuid.then(|| guest.thread_state_mut().thread_prng().random::<[u8; 16]>());
+        // ⚠️ DETERMINIZE HERE, IN THE CALLER, THROUGH THE SAME POOLS `stat` USES.
+        //
+        // The sanitizers in `crate::procfs` are pure functions of content and
+        // hold no guest handle, so they cannot reach `InodePool`/`DevicePool`.
+        // Minting an identity down there would make the maps column stable and
+        // STILL DISAGREE with `stat` -- deterministic, reproducible and wrong.
+        // This mirrors how `fdinfo_identity` is built a few lines above:
+        // determinize with `determinize_inode`/`determinize_device`, then hand
+        // the finished values down purely to be rendered.
+        //
+        // BOTH COLUMNS, not just the inode. `determinize_stat` sanitizes
+        // `st_dev` as well, so rewriting only the inode would leave the device
+        // disagreeing -- the same defect with the reported symptom removed.
+        let needs_mapping_identities = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_mapping_identities())?;
+        let mut mapping_identities: BTreeMap<(u64, u64), (u64, u64)> = BTreeMap::new();
+        if needs_mapping_identities {
+            // A mapping backed by stdio must report the SAME inode fdinfo
+            // reports for that fd, which is the fixed `deterministic_stdio_inode`
+            // value rather than a pooled one. Matching is by raw inode, read
+            // from the cached stat only: injecting an fstat here would add
+            // syscalls to every maps read and perturb the very traces this
+            // change is meant to keep consistent.
+            let mut stdio_by_raw_inode: BTreeMap<u64, DetInode> = BTreeMap::new();
+            for fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
+                let cached = guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.inode))
+                    .ok()
+                    .flatten();
+                if let (Some(raw), Some(det)) = (cached, deterministic_stdio_inode(fd)) {
+                    stdio_by_raw_inode.insert(raw, det);
+                }
+            }
+            let raw_pairs: BTreeSet<(u64, u64)> = String::from_utf8_lossy(&contents)
+                .lines()
+                .filter_map(crate::procfs::mapping_header_identity)
+                .collect();
+            for (raw_dev, raw_inode) in raw_pairs {
+                let det_inode = match stdio_by_raw_inode.get(&raw_inode) {
+                    Some(inode) => *inode,
+                    None => determinize_inode(guest, raw_inode).await.0,
+                };
+                let det_dev = determinize_device(guest, raw_dev).await;
+                mapping_identities.insert((raw_dev, raw_inode), (det_dev, det_inode.as_raw()));
+            }
+        }
         guest.thread_state().with_detfd(call.fd(), |detfd| {
             detfd.initialize_procfs(
                 contents.clone(),
                 ProcfsSnapshotContext {
+                    mapping_identities: mapping_identities.clone(),
                     virtual_uptime_seconds,
                     virtual_realtime_seconds,
                     virtual_memory_kb,

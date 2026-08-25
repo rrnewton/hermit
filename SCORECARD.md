@@ -8,17 +8,17 @@ Every selected `verify` cell, and every seed in a selected `chaos` cell, runs th
 
 | Backend | Green | Red | Total |
 | --- | ---: | ---: | ---: |
-| `ptrace` | 227 | 814 | 1041 |
-| `dbt` | 0 | 1041 | 1041 |
-| `kvm` | 0 | 1041 | 1041 |
-| `sabre` | 53 | 988 | 1041 |
-| `liteinst` | 0 | 1041 | 1041 |
-| `native` | 0 | 347 | 347 |
-| **Total** | **280** | **5272** | **5552** |
+| `ptrace` | 227 | 817 | 1044 |
+| `dbt` | 0 | 1044 | 1044 |
+| `kvm` | 0 | 1044 | 1044 |
+| `sabre` | 53 | 991 | 1044 |
+| `liteinst` | 0 | 1044 | 1044 |
+| `native` | 0 | 348 | 348 |
+| **Total** | **280** | **5288** | **5568** |
 
 ## Denominator, and why the percentage is not comparable across changes to it
 
-Green is **280 of 5552**, which is **5.04%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
+Green is **280 of 5568**, which is **5.03%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
 
 - backends: `ptrace`, `dbt`, `kvm`, `sabre`, `liteinst`, `native`
 - modes: `chaos`, `naked`, `replay`, `verify`
@@ -29,11 +29,11 @@ The mode view makes the current order of work explicit: expand `verify` first, t
 
 | Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `native` | Green | Red | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `verify` | 224 / 347 | 0 / 347 | 0 / 347 | 53 / 347 | 0 / 347 | — | 277 | 1458 | 1735 |
-| `replay` | 1 / 347 | 0 / 347 | 0 / 347 | 0 / 347 | 0 / 347 | — | 1 | 1734 | 1735 |
-| `chaos` | 2 / 347 | 0 / 347 | 0 / 347 | 0 / 347 | 0 / 347 | — | 2 | 1733 | 1735 |
-| `naked` | — | — | — | — | — | 0 / 347 | 0 | 347 | 347 |
-| **Total** | | | | | | | **280** | **5272** | **5552** |
+| `verify` | 224 / 348 | 0 / 348 | 0 / 348 | 53 / 348 | 0 / 348 | — | 277 | 1463 | 1740 |
+| `replay` | 1 / 348 | 0 / 348 | 0 / 348 | 0 / 348 | 0 / 348 | — | 1 | 1739 | 1740 |
+| `chaos` | 2 / 348 | 0 / 348 | 0 / 348 | 0 / 348 | 0 / 348 | — | 2 | 1738 | 1740 |
+| `naked` | — | — | — | — | — | 0 / 348 | 0 | 348 | 348 |
+| **Total** | | | | | | | **280** | **5288** | **5568** |
 
 ## Cross-backend parity
 
@@ -48,7 +48,7 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | `applications` | 2 / 6 | 0 / 6 | 0 / 6 | 2 | 18 |
 | `backend-parity-c` | 86 / 101 | 0 / 101 | 0 / 101 | 86 | 303 |
 | `bin-c` | 0 / 2 | 0 / 2 | 0 / 2 | 0 | 6 |
-| `c-programs` | 76 / 161 | 0 / 161 | 0 / 161 | 76 | 483 |
+| `c-programs` | 76 / 162 | 0 / 162 | 0 / 162 | 76 | 486 |
 | `chaos-c` | 0 / 1 | 0 / 1 | 1 / 1 | 1 | 3 |
 | `data-handling` | 6 / 6 | 0 / 6 | 0 / 6 | 6 | 18 |
 | `debugger-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |

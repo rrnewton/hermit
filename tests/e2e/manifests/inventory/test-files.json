@@ -794,6 +794,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/procfs_identity_agreement.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace; ci=true)",
+      "why": "tests/c/procfs_identity_agreement.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace; ci=true): regression guest for the /proc/<pid>/maps identity class, asserting that stat, maps and fdinfo report ONE inode for the same mapped file so a second determinization route cannot present a second stable-but-wrong identity"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/add_key_enosys.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
       "why": "tests/c/add_key_enosys.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and DBT and runs in blocking GitHub CI"
