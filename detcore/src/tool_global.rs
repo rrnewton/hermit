@@ -1005,7 +1005,7 @@ impl GlobalTool for GlobalState {
                 self.sched
                     .lock()
                     .unwrap()
-                    .notify_signal_pending(dettid, signal);
+                    .notify_signal_pending(dettid, SigWrapper(signal));
                 R::NotifySignalPending(())
             }
             GlobalRequest::ThreadIsLive(dtid) => {
@@ -1840,7 +1840,17 @@ impl GlobalState {
             // We send a raw signal here and let the guest pick it up WHENEVER it resumes.
             // We don't use the "signal_guest" method because we don't necessarily respect that
             // protocol here.
-            signal::kill(tid, sig.0).unwrap();
+            // Alarm/timer signals are guest-chosen and may be realtime, which
+            // `nix` cannot name; fall through to the raw syscall for those.
+            match sig.signal() {
+                Some(named) => signal::kill(tid, named).unwrap(),
+                None => {
+                    // SAFETY: `tid` is a live thread this scheduler owns and
+                    // `sig.raw()` is a signal number the guest already supplied.
+                    let rc = unsafe { libc::kill(tid.as_raw(), sig.raw()) };
+                    assert_eq!(rc, 0, "raw kill of signal {} failed", sig.raw());
+                }
+            }
         }
 
         SchedulerRpcResult::Continue(result)
@@ -1884,9 +1894,14 @@ impl GlobalState {
         if sched.thread_is_logically_killed(dettid) || !sched.rpc_incarnation_matches(dettid, mm) {
             return SchedulerRpcResult::ThreadExited;
         }
-        SchedulerRpcResult::Continue(
-            sched.register_alarm(detpid, dettid, now, duration, interval, sig.0),
-        )
+        SchedulerRpcResult::Continue(sched.register_alarm(
+            detpid,
+            dettid,
+            now,
+            duration,
+            interval,
+            alarm_signal(sig),
+        ))
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1906,7 +1921,14 @@ impl GlobalState {
         if sched.thread_is_logically_killed(dettid) || !sched.rpc_incarnation_matches(dettid, mm) {
             return SchedulerRpcResult::ThreadExited;
         }
-        sched.register_posix_timer(detpid, dettid, timer_id, deadline, interval, sig.0);
+        sched.register_posix_timer(
+            detpid,
+            dettid,
+            timer_id,
+            deadline,
+            interval,
+            alarm_signal(sig),
+        );
         SchedulerRpcResult::Continue(())
     }
 }
@@ -2734,7 +2756,7 @@ where
     let detpid = guest.thread_state().detpid.expect("detpid unset");
     let resp = send_and_update_time(
         guest,
-        GlobalRequest::RegisterAlarm(detpid, dettid, duration, interval, SigWrapper(sig)),
+        GlobalRequest::RegisterAlarm(detpid, dettid, duration, interval, SigWrapper::from(sig)),
     )
     .await;
     match resp.1 {
@@ -2782,7 +2804,7 @@ pub async fn register_posix_timer<G, T>(
             timer_id,
             deadline,
             interval,
-            SigWrapper(sig),
+            SigWrapper::from(sig),
         ),
     )
     .await;
@@ -2944,16 +2966,29 @@ where
 
 /// Tell the scheduler that a successful kill(2) left a physical
 /// signal pending for a sole, known target.
-pub async fn notify_signal_pending<G, T>(guest: &mut G, dettid: DetTid, signal: Signal)
+/// The `nix` signal a timer will raise.
+///
+/// Timer registration still models a named signal: `setitimer`/`timer_create`
+/// reach here with one, and the timer wheel stores it. Widening that is a
+/// separate axis from the notification defect this change fixes, so the
+/// conversion is asserted here rather than silently widened — a realtime timer
+/// signal would be a NEW capability, not a regression of an existing one.
+fn alarm_signal(sig: SigWrapper) -> Signal {
+    sig.signal().unwrap_or_else(|| {
+        panic!(
+            "timer registration received unnameable signal {}",
+            sig.raw()
+        )
+    })
+}
+
+pub async fn notify_signal_pending<G, T>(guest: &mut G, dettid: DetTid, signal: SigWrapper)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let response = send_and_update_time(
-        guest,
-        GlobalRequest::NotifySignalPending(dettid, SigWrapper(signal)),
-    )
-    .await;
+    let response =
+        send_and_update_time(guest, GlobalRequest::NotifySignalPending(dettid, signal)).await;
     match response.1 {
         GlobalResponse::NotifySignalPending(()) => {}
         _ => unreachable!(),
@@ -4028,7 +4063,7 @@ mod tests {
                 now,
                 LogicalTime::from_nanos(10),
                 LogicalTime::ZERO,
-                SigWrapper(Signal::SIGALRM),
+                SigWrapper::from(Signal::SIGALRM),
             )
             .await;
         assert_eq!(alarm, SchedulerRpcResult::ThreadExited);
@@ -4043,7 +4078,7 @@ mod tests {
                 1,
                 Some(now + LogicalTime::from_nanos(10)),
                 LogicalTime::ZERO,
-                SigWrapper(Signal::SIGALRM),
+                SigWrapper::from(Signal::SIGALRM),
             )
             .await;
         assert_eq!(posix, SchedulerRpcResult::ThreadExited);
