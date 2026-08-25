@@ -47,8 +47,16 @@ pub enum FailureKind {
 ///
 /// Extending a serialized type is safe HERE specifically because the writer and
 /// the reader are the SAME BINARY IMAGE -- hermit's container child and its own
-/// parent -- so there is no cross-version compatibility surface. `serde(default)`
-/// is belt-and-braces so an older record still reads as an ordinary `Error`.
+/// parent, over a fork-local pipe -- so there is no cross-version compatibility
+/// surface.
+///
+/// ⚠️ `serde(default)` BELOW IS NOT A COMPATIBILITY GUARANTEE, and must not be
+/// read as one. reverie serializes this with `bincode::config::legacy()`
+/// (`reverie-process/src/container.rs:861`), which is NOT self-describing: a
+/// record written by an older binary with two fields would fail to decode
+/// outright rather than defaulting the third. The attribute is harmless and
+/// keeps the field optional at the Rust level; the property that actually makes
+/// this safe is the same-image one above.
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SerializableError {
     /// The main error.
