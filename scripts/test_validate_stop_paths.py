@@ -575,6 +575,33 @@ def run_cleanup_signal_race() -> None:
 
 
 def main() -> None:
+    # ⚠️ EVERY CHILD THIS FILE SPAWNS IS A FIXTURE, NOT A NESTED VALIDATION, so the
+    # outer run's active marker is cleared ONCE HERE rather than in each env
+    # builder. I scrubbed it in stop_test_env first and the failure simply MOVED
+    # to run_canonical_adapter_contract, which builds its own environment — the
+    # marker has to be gone from the process, not from one dictionary.
+    #
+    # scripts/validate.rs exports HERMIT_VALIDATE_ACTIVE=<pid> to every gate child
+    # (validate.rs:9509); detect_nesting() reads it at :11022 and the guard fires
+    # at :11042 — BEFORE the stop-test seam at :11073. So under `make lint-checks`
+    # inside a validate, each child is refused as a nested invocation and exits
+    # before emitting VALIDATE_STOP_TEST_READY, having run none of the stop-path
+    # code:
+    #
+    #     validate: refusing to re-enter a full validation level from inside
+    #     validate (outer pid ...); nested invocations may only ...
+    #     nodes: none executed (stopped before the DAG ran)
+    #
+    # That is the whole of check.lint_checks' main-red at 4e168f2aa5b9, and it is
+    # why this file passed standalone and failed as a node: THE ANSWER DEPENDED ON
+    # WHERE IT RAN. The seam is documented as placed "before every admission gate
+    # on purpose" and as deliberately not taking the invocation lock; the nesting
+    # guard is neither, so the seam was never reached.
+    #
+    # Clearing it here, rather than moving the guard in validate.rs, keeps that
+    # guard intact for REAL nested runs — which is exactly what it is for.
+    os.environ.pop("HERMIT_VALIDATE_ACTIVE", None)
+
     unevaluated: list[str] = []
     # ⚠️ A REFUSED CHILD MAKES EVERY SIGNAL CASE UNEVALUABLE, NOT FAILED, so the
     # whole block is bracketed rather than each call. If validate declines to
