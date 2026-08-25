@@ -570,6 +570,9 @@ pub enum HostCapability {
     /// can trap the guest's `CPUID` and Detcore can mask host feature bits.
     /// Advertised by the kernel as the `cpuid_fault` flag in `/proc/cpuinfo`.
     CpuidFaulting,
+    /// Hardware virtualization reachable through `/dev/kvm`, so the KVM backend
+    /// can create a VM. Corroborated by the `vmx`/`svm` flags in `/proc/cpuinfo`.
+    Kvm,
 }
 
 impl HostCapability {
@@ -577,6 +580,7 @@ impl HostCapability {
     pub fn value(self) -> &'static str {
         match self {
             Self::CpuidFaulting => "cpuid-faulting",
+            Self::Kvm => "kvm",
         }
     }
 
@@ -584,6 +588,7 @@ impl HostCapability {
     pub fn from_value(text: &str) -> Option<Self> {
         match text {
             "cpuid-faulting" => Some(Self::CpuidFaulting),
+            "kvm" => Some(Self::Kvm),
             _ => None,
         }
     }
@@ -701,6 +706,7 @@ pub fn probe_host_capability(capability: HostCapability) -> CapabilityVerdict {
     }
     match capability {
         HostCapability::CpuidFaulting => probe_cpuid_faulting(),
+        HostCapability::Kvm => probe_kvm(),
     }
 }
 
@@ -777,6 +783,88 @@ fn probe_cpuid_faulting() -> CapabilityVerdict {
         capability: HostCapability::CpuidFaulting,
         present: !cpuid_faulting_absent(syscall, advertised),
         evidence: format!("{syscall_text}; {cpuinfo_text}"),
+    }
+}
+
+/// Can this machine open `/dev/kvm` for reading and writing?
+///
+/// Returns `Ok(())` when the device accepted the open, or `Err(errno)`.
+fn open_dev_kvm() -> Result<(), i32> {
+    let path = std::ffi::CString::new("/dev/kvm").expect("static path has no NUL");
+    // SAFETY: `path` is a valid NUL-terminated C string that outlives the call,
+    // and the descriptor is closed immediately on success.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if fd >= 0 {
+        // SAFETY: `fd` was just returned by a successful `open`.
+        unsafe { libc::close(fd) };
+        return Ok(());
+    }
+    // SAFETY: reading the thread-local errno immediately after a failed call.
+    let errno = unsafe { *libc::__errno_location() };
+    Err(errno.clamp(1, 255))
+}
+
+/// Does `/proc/cpuinfo` advertise hardware virtualization (`vmx` on Intel,
+/// `svm` on AMD)?
+///
+/// `None` when `/proc/cpuinfo` could not be read — unknown, never "absent".
+fn cpuinfo_advertises_virtualization() -> Option<bool> {
+    let text = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    Some(text
+        .split_whitespace()
+        .any(|word| word == "vmx" || word == "svm"))
+}
+
+/// TWO INDEPENDENT SOURCES must agree before KVM is called absent, mirroring
+/// `cpuid_faulting_absent`: opening `/dev/kvm` must fail with `ENOENT` AND
+/// `/proc/cpuinfo` must advertise neither `vmx` nor `svm`. Anything else —
+/// a successful open, `EACCES` from a restricted sandbox, an unreadable
+/// `/proc/cpuinfo`, or the two sources disagreeing — is PRESENT, so the node
+/// runs.
+///
+/// ⚠️ "DOUBT RUNS THE NODE" IS ONLY SAFE HERE BECAUSE THE NODE COUNTS ITS TESTS.
+/// For `cpuid-faulting` a wrongly-run node fails loudly and the run turns red.
+/// The `run_kvm_` tests do NOT behave that way: every one of them self-guards on
+/// `Path::new("/dev/kvm").exists()` and RETURNS EARLY, so a wrongly-run node
+/// would report 22 silent passes — a phantom green, strictly worse than the
+/// unscheduled state it replaces, because the gap would then hide behind green
+/// ticks instead of being greppable in the DAG.
+///
+/// The node therefore carries TWO guards, and they catch different things.
+/// Neither substitutes for the other:
+///
+/// * it OPENS `/dev/kvm` before running anything and fails if it cannot. This is
+///   what catches a wrongly-PRESENT probe, because an early-returning test still
+///   counts as run and passed — a test count cannot see a guard fire.
+/// * it asserts 22 tests were SELECTED. This catches the opposite regression: a
+///   rename or a filter change silently shrinking the set, which is exactly how
+///   these 22 became unobserved in the first place.
+///
+/// Getting that split wrong is easy: the count looks like it proves the tests
+/// did work, and it does not.
+///
+/// PURE, so `--self-test` can bracket the conjunction with planted observations
+/// on a machine of either kind.
+pub fn kvm_absent(open: Result<(), i32>, advertised: Option<bool>) -> bool {
+    open == Err(libc::ENOENT) && advertised == Some(false)
+}
+
+fn probe_kvm() -> CapabilityVerdict {
+    let open = open_dev_kvm();
+    let advertised = cpuinfo_advertises_virtualization();
+    let open_text = match open {
+        Ok(()) => "open(/dev/kvm, O_RDWR) = ok".to_string(),
+        Err(errno) => format!("open(/dev/kvm, O_RDWR) = -1 errno={errno}"),
+    };
+    let cpuinfo_text = match advertised {
+        Some(true) => "/proc/cpuinfo advertises vmx or svm",
+        Some(false) => "/proc/cpuinfo advertises neither vmx nor svm",
+        None => "/proc/cpuinfo could not be read",
+    };
+    CapabilityVerdict {
+        capability: HostCapability::Kvm,
+        present: !kvm_absent(open, advertised),
+        evidence: format!("{open_text}; {cpuinfo_text}"),
     }
 }
 

@@ -6264,6 +6264,37 @@ fn host_capability_bracket(root: &Path) -> Result<(), String> {
         }
     }
 
+    // The same conjunction for KVM, and the same rule: only a corroborated
+    // ENOENT may read as absent. ⚠️ For this capability "doubt runs the node" is
+    // only safe because the node also asserts its executed-test COUNT -- every
+    // `run_kvm_` test self-guards on /dev/kvm and returns early, so a wrongly-run
+    // node would report silent passes rather than a loud failure.
+    let kvm_absent_cases: &[(Result<(), i32>, Option<bool>, bool)] = &[
+        // The only shape that may read as absent: no device AND no vmx/svm.
+        (Err(libc::ENOENT), Some(false), true),
+        // The device opened: present, whatever /proc/cpuinfo says.
+        (Ok(()), Some(false), false),
+        (Ok(()), Some(true), false),
+        // The two sources DISAGREE -- doubt, so the node runs.
+        (Err(libc::ENOENT), Some(true), false),
+        // /proc/cpuinfo unreadable -- doubt, so the node runs.
+        (Err(libc::ENOENT), None, false),
+        // A restricted sandbox or a permissions problem is doubt about the
+        // PROBE, not proof the machine lacks KVM.
+        (Err(libc::EACCES), Some(false), false),
+        (Err(libc::EPERM), Some(false), false),
+        (Err(libc::EBUSY), Some(false), false),
+    ];
+    for (open, advertised, want_absent) in kvm_absent_cases {
+        if validate_plan::kvm_absent(*open, *advertised) != *want_absent {
+            return Err(format!(
+                "host capability: kvm absence for (open={open:?}, cpuinfo={advertised:?}) must be \
+                 {want_absent}; only a corroborated ENOENT may read as absent and every other \
+                 shape must run the node"
+            ));
+        }
+    }
+
     node_vacuity_bracket(root)?;
 
     // The one override can only force PRESENT; nothing forces ABSENT.
