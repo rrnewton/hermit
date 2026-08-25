@@ -153,10 +153,10 @@ moving parts:
 
 ## Before you add a gate: scope is where gates go blind
 
-Five gates in this repository have been found reporting nothing while looking
-like they passed. **Five different causes, one outcome.** Not one of them was
+Eight gates in this repository have been found reporting nothing while looking
+like they passed. **Eight different causes, one outcome.** Not one of them was
 disabled, and every one looked reasonable when it was written — which is the
-reason to read this list before adding the sixth.
+reason to read this list before adding the ninth.
 
 | # | Mechanism | What it looked like | What it actually covered |
 |---|-----------|---------------------|--------------------------|
@@ -165,6 +165,9 @@ reason to read this list before adding the sixth.
 | 3 | **Execution** | a budget wrapper around a command | the wrapped command never executed, for want of calibration |
 | 4 | **Feature** | `cargo clippy --workspace --all-targets` | default features, so it never linted `dbt`/`sabre`/`e9patch` — every feature in the workspace |
 | 5 | **Severity** | `cargo doc --workspace --no-deps` | exited 0 while emitting warnings; it rendered docs and could not fail on doc defects |
+| 6 | **File type** | a repository-wide source check | it skipped whole extensions, so files outside its allowlist were invisible |
+| 7 | **Repository boundary** | a pin checker in the parent tree | it saw the gitlink SHA but could not establish the pinned repository's content |
+| 8 | **Ownership without execution** | an inventory entry naming a suite's maintainer | the file was accounted for, but no DAG node invoked it |
 
 The shape they share: **a gate's scope is narrower than the claim its name
 makes.** "Documentation", "Clippy", "portability" all sound total. Each was

@@ -13,6 +13,7 @@
     "check.skill_discovery",
     "check.backend_abstraction",
     "check.backend_parity_mutation",
+    "check.backend_parity_suites",
     "check.portability_paths",
     "check.dagrun_naming",
     "check.check_outcome_consumers",

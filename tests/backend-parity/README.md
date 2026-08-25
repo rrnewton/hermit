@@ -317,6 +317,19 @@ unlandable PR becomes landable code plus explicit, queryable test debt.
 
 ## Running
 
+The portable `check.backend_parity_suites` DAG node runs the three driver-side
+contract suites on every portable-lane validation without building Hermit or starting a guest:
+
+```bash
+python3 tests/backend-parity/test_verify_tier_evidence.py
+python3 tests/backend-parity/test_scorecard_header_compat.py
+python3 tests/backend-parity/test_run_matrix_output_skew.py
+```
+
+These are separate from `parity_mutation.py` and from executing `run_matrix.py`
+as a backend matrix. They protect the evidence-tier, scorecard-schema, and
+whole-artifact writer contracts used by that driver.
+
 Validate the case catalog and known-gap invariants without backend prerequisites:
 
 ```bash
