@@ -31,6 +31,14 @@ enum ProcfsKind {
     ProcessStat,
     Statm,
     ProcessStatus,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-2150): Review Linux-compatible timer-slack
+    // path recognition, open-time target binding, and snapshot behavior.
+    /// Linux exposes timer slack only at top-level `/proc/<tid>/timerslack_ns`
+    /// (and `/proc/self/timerslack_ns` for the process leader).  The nested
+    /// `task/<tid>` and `thread-self` spellings do not exist. `None` is the
+    /// unresolved `self` alias, bound to the opener's process at open time.
+    TimerSlack(Option<i32>),
     SystemStat,
     Cpuinfo,
     Diskstats,
@@ -362,7 +370,20 @@ pub(crate) struct ProcfsFile {
     kind: ProcfsKind,
     target_fd: Option<i32>,
     bound_thread_identity: Option<(i32, i32, i32)>,
+    #[serde(default)]
+    timer_slack_identity: Option<(u64, u64)>,
     contents: Option<Vec<u8>>,
+    offset: usize,
+}
+
+/// A non-mutating candidate for one sequential timer-slack read.
+///
+/// The snapshot and cursor are committed only after the guest-memory copy
+/// succeeds. This mirrors seq_file: an `EFAULT` must leave both untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TimerSlackReadPreview {
+    pub(crate) bytes: Vec<u8>,
+    snapshot: Vec<u8>,
     offset: usize,
 }
 
@@ -408,6 +429,9 @@ impl ProcfsFile {
             other if is_process_file_path(other, "stat") => ProcfsKind::ProcessStat,
             other if is_process_file_path(other, "statm") => ProcfsKind::Statm,
             other if is_process_file_path(other, "status") => ProcfsKind::ProcessStatus,
+            other if let Some(target) = parse_timer_slack_target(other) => {
+                ProcfsKind::TimerSlack(target)
+            }
             "/proc/cpuinfo" => ProcfsKind::Cpuinfo,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-861): Review deterministic kernel I/O accounting.
@@ -565,6 +589,7 @@ impl ProcfsFile {
             kind,
             target_fd,
             bound_thread_identity: None,
+            timer_slack_identity: None,
             contents: None,
             offset: 0,
         })
@@ -578,12 +603,15 @@ impl ProcfsFile {
     }
 
     pub(crate) fn needs_snapshot(&self) -> bool {
-        self.contents.is_none()
+        !matches!(self.kind, ProcfsKind::TimerSlack(_)) && self.contents.is_none()
     }
 
     /// Returns true when the procfs inode binds to the thread that opened it.
     pub(crate) fn needs_bound_thread_identity(&self) -> bool {
-        matches!(self.kind, ProcfsKind::ThreadStat | ProcfsKind::ThreadStatus)
+        matches!(
+            self.kind,
+            ProcfsKind::ThreadStat | ProcfsKind::ThreadStatus | ProcfsKind::TimerSlack(None)
+        )
     }
 
     /// Binds a thread-self procfs inode to its opener's process identity.
@@ -593,7 +621,13 @@ impl ProcfsFile {
             self.needs_bound_thread_identity(),
             "only thread-self procfs files bind an opener identity"
         );
-        self.bound_thread_identity = Some((tgid, tid, ppid));
+        match &mut self.kind {
+            ProcfsKind::TimerSlack(target @ None) => *target = Some(tgid),
+            ProcfsKind::ThreadStat | ProcfsKind::ThreadStatus => {
+                self.bound_thread_identity = Some((tgid, tid, ppid));
+            }
+            _ => unreachable!("non-binding procfs kind requested an opener identity"),
+        }
     }
 
     /// Returns true when this snapshot consumes deterministic random bytes.
@@ -639,6 +673,9 @@ impl ProcfsFile {
             ProcfsKind::ProcessStat => sanitize_stat(&contents, None),
             ProcfsKind::Statm => sanitize_statm(&contents),
             ProcfsKind::ProcessStatus => sanitize_status(&contents, None),
+            ProcfsKind::TimerSlack(_) => {
+                unreachable!("timer-slack procfs content is generated from ThreadState")
+            }
             ProcfsKind::SystemStat => sanitize_system_stat(
                 &contents,
                 virtual_uptime_seconds,
@@ -721,6 +758,95 @@ impl ProcfsFile {
         Some(bytes)
     }
 
+    /// Return the task id bound to a top-level timer-slack procfs file.
+    pub(crate) fn timer_slack_target(&self) -> Option<i32> {
+        match self.kind {
+            ProcfsKind::TimerSlack(Some(target)) => Some(target),
+            ProcfsKind::TimerSlack(None) => {
+                unreachable!("/proc/self/timerslack_ns was not bound at open time")
+            }
+            _ => None,
+        }
+    }
+
+    /// Bind a timer-slack procfs file to the raw inode resolved by its open.
+    pub(crate) fn bind_timer_slack_identity(&mut self, device: u64, inode: u64) {
+        self.timer_slack_target()
+            .expect("only timer-slack procfs files have task identities");
+        self.timer_slack_identity = Some((device, inode));
+    }
+
+    /// Return the task and raw proc inode captured by the successful open.
+    pub(crate) fn timer_slack_binding(&self) -> Option<(i32, u64, u64)> {
+        let target = self.timer_slack_target()?;
+        let (device, inode) = self
+            .timer_slack_identity
+            .expect("timer-slack procfs file lacks open-time inode identity");
+        Some((target, device, inode))
+    }
+
+    /// Preview bytes from the open file description's timer-slack snapshot.
+    /// Linux keeps a partial-read snapshot until the description is rewound,
+    /// but does not create or consume that snapshot when copying to userspace
+    /// fails.
+    pub(crate) fn preview_timer_slack(
+        &self,
+        value: u64,
+        maximum: usize,
+    ) -> Option<TimerSlackReadPreview> {
+        self.timer_slack_target()?;
+        let snapshot = self
+            .contents
+            .clone()
+            .unwrap_or_else(|| format!("{value}\n").into_bytes());
+        let start = self.offset.min(snapshot.len());
+        let end = start.saturating_add(maximum).min(snapshot.len());
+        Some(TimerSlackReadPreview {
+            bytes: snapshot[start..end].to_vec(),
+            snapshot,
+            offset: self.offset,
+        })
+    }
+
+    /// Commit only bytes successfully copied from a sequential preview.
+    pub(crate) fn commit_timer_slack_read(
+        &mut self,
+        preview: &TimerSlackReadPreview,
+        copied: usize,
+    ) {
+        assert!(copied <= preview.bytes.len());
+        if copied == 0 {
+            return;
+        }
+        assert_eq!(
+            self.offset, preview.offset,
+            "timer-slack cursor changed between preview and commit"
+        );
+        match &self.contents {
+            Some(contents) => assert_eq!(
+                contents, &preview.snapshot,
+                "timer-slack snapshot changed between preview and commit"
+            ),
+            None => self.contents = Some(preview.snapshot.clone()),
+        }
+        self.offset = self.offset.saturating_add(copied);
+    }
+
+    /// A positioned procfs read regenerates the scalar and does not change the
+    /// shared cursor or its cached partial-read snapshot.
+    pub(crate) fn take_timer_slack_at(
+        &self,
+        value: u64,
+        offset: usize,
+        maximum: usize,
+    ) -> Option<Vec<u8>> {
+        self.timer_slack_target()?;
+        let contents = format!("{value}\n").into_bytes();
+        let start = offset.min(contents.len());
+        let end = start.saturating_add(maximum).min(contents.len());
+        Some(contents[start..end].to_vec())
+    }
+
     /// Returns bytes at an explicit offset without changing the shared cursor.
     pub(crate) fn take_at(&self, offset: usize, maximum: usize) -> Option<Vec<u8>> {
         let contents = self.contents.as_ref()?;
@@ -737,6 +863,10 @@ impl ProcfsFile {
     /// Updates the shared cursor used by all aliases of this open file.
     pub(crate) fn set_offset(&mut self, offset: usize) {
         self.offset = offset;
+        if matches!(self.kind, ProcfsKind::TimerSlack(_)) && offset == 0 {
+            // seq_file regenerates its single-record snapshot after rewind.
+            self.contents = None;
+        }
     }
 
     pub(crate) fn target_fd(&self) -> Option<i32> {
@@ -774,6 +904,24 @@ fn is_process_file_path(path: &str, filename: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// Parse only the spellings Linux actually exposes for timer slack.
+///
+/// The outer `Option` distinguishes "not this file" from `/proc/self`, whose
+/// target is bound at open time. Numeric components are namespace-visible TIDs,
+/// including non-leaders reachable through the top-level `/proc/<tid>` lookup.
+fn parse_timer_slack_target(path: &str) -> Option<Option<i32>> {
+    let relative = path.strip_prefix("/proc/")?;
+    let components = relative.split('/').collect::<Vec<_>>();
+    let [task, "timerslack_ns"] = components.as_slice() else {
+        return None;
+    };
+    if *task == "self" {
+        return Some(None);
+    }
+    let target = task.parse::<i32>().ok().filter(|target| *target > 0)?;
+    Some(Some(target))
 }
 
 fn parse_fdinfo_target(path: &str) -> Option<i32> {
@@ -3854,6 +4002,58 @@ Rss:                   4 kB\n" as &[u8];
         assert!(
             !out.contains("1234567"),
             "raw inode must not survive smaps: {out}"
+        );
+    }
+
+    #[test]
+    fn timer_slack_recognizes_only_linux_top_level_spellings() {
+        let mut self_file = ProcfsFile::from_path(Path::new("/proc/self/timerslack_ns")).unwrap();
+        assert_eq!(self_file.kind, ProcfsKind::TimerSlack(None));
+        assert!(self_file.needs_bound_thread_identity());
+        self_file.bind_thread_identity(101, 202, 303);
+        assert_eq!(self_file.timer_slack_target(), Some(101));
+
+        let tid_file = ProcfsFile::from_path(Path::new("/proc/202/timerslack_ns")).unwrap();
+        assert_eq!(tid_file.kind, ProcfsKind::TimerSlack(Some(202)));
+        assert!(!tid_file.needs_bound_thread_identity());
+
+        for path in [
+            "/proc/thread-self/timerslack_ns",
+            "/proc/self/task/202/timerslack_ns",
+            "/proc/101/task/202/timerslack_ns",
+            "/proc/0/timerslack_ns",
+            "/proc/-1/timerslack_ns",
+            "/proc/not-a-tid/timerslack_ns",
+        ] {
+            assert!(ProcfsFile::from_path(Path::new(path)).is_none(), "{path}");
+        }
+    }
+
+    #[test]
+    fn timer_slack_snapshot_rewinds_and_positioned_reads_are_fresh() {
+        let mut procfs = ProcfsFile::from_path(Path::new("/proc/202/timerslack_ns")).unwrap();
+        let failed = procfs.preview_timer_slack(111, 2).unwrap();
+        assert_eq!(failed.bytes, b"11");
+        assert_eq!(procfs.position(), (0, None));
+
+        let first = procfs.preview_timer_slack(222, 2).unwrap();
+        assert_eq!(first.bytes, b"22");
+        procfs.commit_timer_slack_read(&first, first.bytes.len());
+        assert_eq!(
+            procfs.preview_timer_slack(999, usize::MAX).unwrap().bytes,
+            b"2\n",
+            "a partial sequential read retains its original scalar"
+        );
+
+        procfs.set_offset(0);
+        let rewound = procfs.preview_timer_slack(333, usize::MAX).unwrap();
+        assert_eq!(rewound.bytes, b"333\n");
+        procfs.commit_timer_slack_read(&rewound, rewound.bytes.len());
+        assert_eq!(procfs.take_timer_slack_at(333, 1, 2).unwrap(), b"33");
+        assert_eq!(
+            procfs.preview_timer_slack(444, usize::MAX).unwrap().bytes,
+            b"",
+            "positioned reads do not change the shared cursor"
         );
     }
 
