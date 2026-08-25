@@ -3803,9 +3803,19 @@ fn a_guest_side_fault_is_not_reported_as_a_hermit_internal_failure() {
 /// First the claim was that no fault could reach a replay stage at all; then,
 /// after that was disproved, that reaching THIS one wedges the process. Both
 /// were wrong, and `agent(codex-rev-2628)` supplied the missing step each time.
-/// The hang was never hermit's: killing the replay gdbserver while leaving GDB
-/// ALIVE leaves GDB holding the captured stderr pipe open, so the test's reader
-/// never sees EOF. Making GDB `quit` after the kill returns promptly.
+/// THE HANG THAT BLOCKED THIS TEST WAS THE PROBE'S: killing the replay gdbserver
+/// while leaving GDB ALIVE leaves GDB holding the captured stderr pipe open, so
+/// the reader never sees EOF. Making GDB `quit` after the kill returns promptly
+/// -- rc=125 in about a second.
+///
+/// ⚠️ THAT IS NOT THE SAME AS SAYING HERMIT HAS NO BUG HERE, AND AN EARLIER
+/// VERSION OF THIS COMMENT SAID EXACTLY THAT. `agent(hermit-dbgrev7)` measured
+/// the two cases apart: killing the replay CONTAINER CHILD makes hermit exit in
+/// 0.050s, but killing GDB makes hermit NEVER RETURN -- 188s, killed by hand.
+/// `--verify-with-gdbex` waits forever when GDB dies before completing the
+/// connection, and `--record-timeout` arms the recording only. That defect is
+/// real, is filed, and is out of scope for a test-only change. Correcting the
+/// CAUSE of a hang is not the same as retracting the hang.
 ///
 /// ⚠️ SO `--verify-with-gdbex` IS ITSELF THE CONTROL HOOK. The CLI already
 /// accepts GDB commands, GDB runs while the replay container is alive, and GDB
@@ -3999,8 +4009,12 @@ fn record_classifies_a_replay_stage_container_child_failure() {
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_hermit"))
         .env("HERMIT_DATA_DIR", data_dir.path())
-        // Long enough that the replay stage is still running when the kill
-        // lands; the test never depends on the guest finishing.
+        // ⚠️ THE GUEST ARGUMENT BUYS NO HEADROOM AND AN EARLIER COMMENT HERE
+        // CLAIMED IT DID. Guest time is virtualized, so `sleep 1`, `sleep 5` and
+        // `sleep 60` all give the same ~0.4s window and `/bin/true` gives 0.2s --
+        // measured by `agent(hermit-dbgrev7)`. What makes the kill land is the
+        // poll loop below, which waits for the replay container to appear rather
+        // than assuming it is already there; the guest is incidental.
         .args(["record", "--verify", "--", "/bin/sleep", "5"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -4010,9 +4024,10 @@ fn record_classifies_a_replay_stage_container_child_failure() {
     let stderr = child.stderr.take().expect("hermit stderr must be piped");
 
     // ⚠️ A DEADLINE, SO A HANG IS A FAILURE RATHER THAN A STUCK SUITE. This test
-    // drives hermit into an error path on purpose, and the neighbouring
-    // `--verify-with-gdbex` spelling really does hang there. A test that can
-    // wedge CI is not an acceptable price for a covered call site.
+    // drives hermit into an error path on purpose, and hermit really does hang
+    // on a neighbouring one: under `--verify-with-gdbex`, GDB dying before it
+    // connects leaves hermit waiting forever. A test that can wedge CI is not an
+    // acceptable price for a covered call site.
     let deadline = Instant::now() + Duration::from_secs(120);
     let captured = Arc::new(Mutex::new(String::new()));
     let reader_captured = Arc::clone(&captured);
@@ -4118,10 +4133,11 @@ fn record_classifies_a_replay_stage_container_child_failure() {
 /// VERSION OF THIS COMMENT SAID OTHERWISE. It claimed the two sites could not be
 /// reached without a stage-aware injector, and `agent(codex-rev-2628)` disproved
 /// it in review: the fault does not have to come from inside the child.
-/// `record_classifies_a_replay_stage_container_child_failure` above now pins
-/// `:535` by killing the container child from outside after `:: Replaying...`.
-/// `:660` remains uncovered for a different and measured reason given there --
-/// hermit does not exit when its gdbserver replay container is killed.
+/// `record_classifies_a_replay_stage_container_child_failure` above pins `:535`
+/// by killing the container child from outside after `:: Replaying...`, and
+/// `record_classifies_a_gdbserver_replay_stage_container_child_failure` pins
+/// `:660` by killing from inside GDB and then quitting it. All six sites are
+/// covered; this test carries four of them.
 #[test]
 fn record_classifies_a_container_child_failure_the_same_way_run_does() {
     let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
