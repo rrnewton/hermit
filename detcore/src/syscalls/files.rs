@@ -2960,26 +2960,42 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Some(pipefd) = call.pipefd() {
             let fds: [i32; 2] = memory.read_value(pipefd)?;
             if internally_nonblocking {
-                let actual_capacity = guest
+                // `record_or_replay` above already succeeded, so the KERNEL HAS
+                // ALREADY CREATED BOTH DESCRIPTORS and written them into the guest.
+                // Returning here without undoing that leaves the guest holding two
+                // open descriptors that Detcore never registered, while telling it
+                // pipe2 failed -- a descriptor leak plus an fd table that disagrees
+                // with the kernel's. Collect the failure first, roll the pipe back,
+                // and only then report it.
+                let pinned = guest
                     .inject(
                         syscalls::Fcntl::new()
                             .with_fd(fds[0])
                             .with_cmd(F_SETPIPE_SZ(DETERMINISTIC_PIPE_CAPACITY_BYTES)),
                     )
-                    .await
-                    .map_err(|error| {
-                        Error::Tool(anyhow::anyhow!(
-                            "failed to pin internal pipe capacity to {} bytes: {}",
-                            DETERMINISTIC_PIPE_CAPACITY_BYTES,
-                            error
+                    .await;
+                let failure = match pinned {
+                    Err(error) => Some(format!(
+                        "failed to pin internal pipe capacity to {} bytes: {}",
+                        DETERMINISTIC_PIPE_CAPACITY_BYTES, error
+                    )),
+                    Ok(actual_capacity)
+                        if actual_capacity != i64::from(DETERMINISTIC_PIPE_CAPACITY_BYTES) =>
+                    {
+                        Some(format!(
+                            "kernel set internal pipe capacity to {} bytes instead of {}",
+                            actual_capacity, DETERMINISTIC_PIPE_CAPACITY_BYTES
                         ))
-                    })?;
-                if actual_capacity != i64::from(DETERMINISTIC_PIPE_CAPACITY_BYTES) {
-                    return Err(Error::Tool(anyhow::anyhow!(
-                        "kernel set internal pipe capacity to {} bytes instead of {}",
-                        actual_capacity,
-                        DETERMINISTIC_PIPE_CAPACITY_BYTES
-                    )));
+                    }
+                    Ok(_) => None,
+                };
+                if let Some(detail) = failure {
+                    // Best effort: the pipe is already unusable for determinism, and a
+                    // close that itself fails must not mask the reason we are here.
+                    for fd in fds {
+                        let _ = guest.inject(syscalls::Close::new().with_fd(fd)).await;
+                    }
+                    return Err(Error::Tool(anyhow::anyhow!("{}", detail)));
                 }
             }
             self.add_fd(guest, fds[0], call.flags(), FdType::Pipe)
@@ -4257,5 +4273,70 @@ mod test {
         for len in 0..8 {
             canonicalize_tcp_info(&mut [0xff; 8][..len]);
         }
+    }
+}
+
+#[cfg(test)]
+mod pipe_capacity_rollback_guard {
+    //! `handle_pipe2` must undo the pipe before reporting a capacity failure.
+    //!
+    //! WHY A SOURCE-LEVEL GUARD. By the time capacity pinning runs, the kernel has
+    //! already created BOTH descriptors and written them into the guest. Returning
+    //! an error without closing them leaves the guest holding two open descriptors
+    //! that Detcore never registered, while being told `pipe2` failed -- a leak and
+    //! an fd table that disagrees with the kernel. Observing that behaviourally
+    //! needs a fault injected into `F_SETPIPE_SZ` on a live traced guest, and no
+    //! such seam exists; this guard binds to the call instead, and is deliberately
+    //! loud when it cannot see the code.
+
+    /// Production source only, truncated before the first in-file test module so
+    /// this guard never scans its own string literals.
+    fn production_source() -> &'static str {
+        const WHOLE: &str = include_str!("files.rs");
+        const CUT: &str = "#[cfg(test)]\nmod procfs_wiring_guard {";
+        match WHOLE.find(CUT) {
+            Some(cut) => &WHOLE[..cut],
+            None => WHOLE,
+        }
+    }
+
+    fn handle_pipe2_body() -> &'static str {
+        let src = production_source();
+        let start = src.find("pub async fn handle_pipe2").unwrap_or_else(|| {
+            panic!(
+                "pipe2 rollback guard: `handle_pipe2` not found in files.rs.\n\
+                 Either it was RENAMED (update this guard) or DELETED (the capacity \
+                 determinization and its rollback are gone). Check which before editing."
+            )
+        });
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    pub async fn ")
+            .map(|e| e + 1)
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn capacity_failure_closes_both_created_descriptors_before_reporting() {
+        let body = handle_pipe2_body();
+        let close = body
+            .find("syscalls::Close::new().with_fd(fd)")
+            .unwrap_or_else(|| {
+                panic!(
+                    "pipe2 rollback guard: handle_pipe2 no longer closes the descriptors the \
+                 kernel created before reporting a capacity failure. The guest would be \
+                 told pipe2 failed while holding two unregistered open descriptors."
+                )
+            });
+        let report = body.find("return Err(Error::Tool").unwrap_or_else(|| {
+            panic!("pipe2 rollback guard: the capacity-failure report is gone from handle_pipe2")
+        });
+        assert!(
+            close < report,
+            "pipe2 rollback guard: handle_pipe2 reports the capacity failure at byte {report} \
+             BEFORE closing the created descriptors at byte {close}; the rollback must run first \
+             or the descriptors leak."
+        );
     }
 }
