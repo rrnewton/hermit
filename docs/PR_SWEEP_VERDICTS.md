@@ -1862,6 +1862,60 @@ Three consequences worth keeping:
   "whole-line match on raw comment text, not through the parser". A count is a
   measurement and carries its method or it carries nothing.
 
+### 21. A new refusal needs a NEW exit code, or an explicit argument for sharing one
+
+⚠️ **Borrowing a nearby exit code is locally plausible and globally wrong.** The
+condition you are adding resembles one already on the list, the code is right
+there, and reusing it costs nothing to write. What it costs is the caller's
+ability to act: two conditions behind one code cannot be reacted to differently,
+and if they could be reacted to identically they would not be two conditions.
+
+**An exit code passed on from an INNER call carries the inner meaning, not the
+outer one.** This is the specific trap. A guard that cannot resolve its input
+says "could not determine" — truthfully, about itself. The caller reads that code
+as the *tool's* could-not-determine, which is about something else entirely. Same
+code, two meanings, one boundary.
+
+**Measured 2026-08-25, three instances in one night, two of them added by the
+same agent in the act of fixing the first.**
+
+| condition | shared code | should be |
+| --- | --- | --- |
+| stale-TOOL refusal (the lander is not current) | 6 | 7 |
+| stale-LABEL refusal (approval bound to another sha) | 6 | 6 |
+| admission cannot resolve comments | 4 | 8 |
+| merge outcome cannot be determined | 4 | 4 |
+
+The second pair is the costly one, because the reactions are **opposite**:
+
+- after an admission failure the merge was **never attempted**, so a plain re-run
+  is safe;
+- after a merge-outcome failure the merge **was** attempted and may have
+  succeeded, so re-running risks a second landing.
+
+A caller that treats them alike either re-merges something already on `main`, or
+refuses to retry something that never ran.
+
+⚠️ **And a shared code hides a dead code path.** While admission-cannot-resolve
+and merge-cannot-determine both exited 4, three race cases in
+`gh-merge-verified-test` passed on an exit 4 produced by the *admission guard* —
+the race they claimed to exercise never ran. The assertion checking the CODE
+passed; the two assertions checking the REASON failed. The code was right and
+meant nothing. That is check 20's error inside a test suite.
+
+**The rule, in enforceable form.** When you add a refusal:
+
+- give it its own code, **or** write down why sharing is correct — and "they are
+  both failures" is not a reason, it is a restatement;
+- say what a caller should DO with it, not only what it means. A code without an
+  action is a label;
+- state which side of the retry boundary it falls on. *Can I re-run this safely?*
+  is the only question most callers actually ask.
+
+**The tell that you are about to do this:** you are adding a `die(N, ...)` and
+you picked `N` by looking at the line above. Reaching for a neighbouring code is
+the moment to check whether the neighbour means what you mean.
+
 ## A guard keyed on a PROXY rejects the safest cases first
 
 ⚠️ **When you enforce a rule, write down the PROPERTY you want, then check whether
