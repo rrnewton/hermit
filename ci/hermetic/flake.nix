@@ -44,19 +44,60 @@
         extensions = [ "rust-src" "rustfmt" "clippy" ];
       };
 
-      # Executables that manifests run as a hermit GUEST. Derived from the
-      # `program:` entries in tests/e2e/manifests/*.yaml and the commands their
-      # shell fixtures invoke, not guessed.
+      # These are the exact versions used by the portable CI contract. The
+      # pinned nixpkgs revision carries older releases (rust-script 0.34.0 and
+      # cargo-nextest 0.9.72), so using those attributes directly would make an
+      # offline run green under tools different from the ones CI selected.
+      pinnedRustPlatform = pkgs.makeRustPlatform {
+        cargo = rustToolchain;
+        rustc = rustToolchain;
+      };
+      rustScriptVersion = "0.36.0";
+      rustScript = pinnedRustPlatform.buildRustPackage {
+        pname = "rust-script";
+        version = rustScriptVersion;
+        src = pkgs.fetchFromGitHub {
+          owner = "fornwall";
+          repo = "rust-script";
+          rev = rustScriptVersion;
+          hash = "sha256-Bb8ULD2MmZiSW/Tx5vAAHv95OMJ0EdWgR+NFhBkTlDU=";
+        };
+        cargoHash = "sha256-c1Ia3+WkbSsOAgrTh+OY0eYDD72Z7qmIir9RehUB7GU=";
+        doCheck = false;
+      };
+      cargoNextestVersion = "0.9.100";
+      cargoNextest = pinnedRustPlatform.buildRustPackage {
+        pname = "cargo-nextest";
+        version = cargoNextestVersion;
+        src = pkgs.fetchFromGitHub {
+          owner = "nextest-rs";
+          repo = "nextest";
+          rev = "cargo-nextest-${cargoNextestVersion}";
+          hash = "sha256-MbgX/n6TC5hz66gvRAc7A0xFWbF2Ec68gMxCgPFpeoQ=";
+        };
+        cargoHash = "sha256-QXrsLNpxN9pg2OGYnYydeb8WjtFeIAtto3hPU9XGWXU=";
+        cargoBuildFlags = [ "-p" "cargo-nextest" ];
+        cargoTestFlags = [ "-p" "cargo-nextest" ];
+        # The pinned nixpkgs cargo-auditable predates Rust edition 2024.
+        auditable = false;
+      };
+
+      # Executables that the selected portable population runs as hermit guests.
+      # This was re-audited mechanically from ci/expected-e2e-plan.json, each
+      # selected manifest entry's requirements/program, and commands invoked by
+      # shell fixtures. The second line supplies the previously missing lua, m4,
+      # node, ssh-keygen, ruby, tclsh, uuidgen, mcookie, hexdump and ps.
       guestTools = with pkgs; [
         bash coreutils diffutils findutils gnugrep gnused gawk
         openssl zstd gnutar gzip xz jq sqlite git perl python3 redis
+        lua5_4 gnum4 nodejs openssh ruby tcl util-linux procps
       ];
 
       # Toolchain and native libraries needed to build Hermit and to compile the
       # project's C fixtures INSIDE the root with the pinned compiler.
       buildTools = with pkgs; [
         rustToolchain gcc binutils gnumake cmake pkg-config
-        libunwind elfutils zlib openssl.dev
+        libunwind elfutils zlib openssl.dev rustScript cargoNextest
       ];
     in
     {
@@ -80,12 +121,21 @@
           # rather than passing vacuously. That is the good failure mode, but the
           # directories have to exist. Sticky-bit 1777 as on a normal system.
           extraCommands = ''
-            mkdir -p tmp var/tmp
+            mkdir -p tmp var/tmp usr/bin
             chmod 1777 tmp var/tmp
+
+            # Ten selected portable cells name these FHS paths literally. Nix
+            # places their providers in /bin, while usrBinEnv creates only
+            # /usr/bin/env; add exactly the audited compatibility paths.
+            for command in bash date du find python3 sort tr; do
+              ln -s "/bin/$command" "usr/bin/$command"
+            done
           '';
           config = {
             Env = [
               "PATH=/bin:/usr/bin"
+              "HERMIT_RUST_SCRIPT_VERSION=${rustScriptVersion}"
+              "HERMIT_CARGO_NEXTEST_VERSION=${cargoNextestVersion}"
               "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
               # The run is offline by construction; make a stray fetch fail loudly
               # rather than silently reach a network that a rebuild will not have.
@@ -95,9 +145,11 @@
           };
         };
 
-        # Convenience: the exact toolchain, so a bump can be inspected without
+        # Convenience outputs, so version bumps can be inspected without
         # building the whole image.
         toolchain = rustToolchain;
+        rust-script = rustScript;
+        cargo-nextest = cargoNextest;
       };
     };
 }
