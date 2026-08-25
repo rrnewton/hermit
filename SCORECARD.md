@@ -8,17 +8,17 @@ Every selected `verify` cell, and every seed in a selected `chaos` cell, runs th
 
 | Backend | Green | Red | Total |
 | --- | ---: | ---: | ---: |
-| `ptrace` | 229 | 821 | 1050 |
+| `ptrace` | 230 | 820 | 1050 |
 | `dbt` | 0 | 1050 | 1050 |
 | `kvm` | 0 | 1050 | 1050 |
 | `sabre` | 53 | 997 | 1050 |
 | `liteinst` | 0 | 1050 | 1050 |
 | `native` | 0 | 350 | 350 |
-| **Total** | **282** | **5318** | **5600** |
+| **Total** | **283** | **5317** | **5600** |
 
 ## Denominator, and why the percentage is not comparable across changes to it
 
-Green is **282 of 5600**, which is **5.04%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
+Green is **283 of 5600**, which is **5.05%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
 
 - backends: `ptrace`, `dbt`, `kvm`, `sabre`, `liteinst`, `native`
 - modes: `chaos`, `naked`, `replay`, `verify`
@@ -29,11 +29,11 @@ The mode view makes the current order of work explicit: expand `verify` first, t
 
 | Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `native` | Green | Red | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `verify` | 226 / 350 | 0 / 350 | 0 / 350 | 53 / 350 | 0 / 350 | — | 279 | 1471 | 1750 |
+| `verify` | 227 / 350 | 0 / 350 | 0 / 350 | 53 / 350 | 0 / 350 | — | 280 | 1470 | 1750 |
 | `replay` | 1 / 350 | 0 / 350 | 0 / 350 | 0 / 350 | 0 / 350 | — | 1 | 1749 | 1750 |
 | `chaos` | 2 / 350 | 0 / 350 | 0 / 350 | 0 / 350 | 0 / 350 | — | 2 | 1748 | 1750 |
 | `naked` | — | — | — | — | — | 0 / 350 | 0 | 350 | 350 |
-| **Total** | | | | | | | **282** | **5318** | **5600** |
+| **Total** | | | | | | | **283** | **5317** | **5600** |
 
 ## Cross-backend parity
 
@@ -45,7 +45,7 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 
 | Manifest category | Verify | Replay | Chaos | Green | Total |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `applications` | 2 / 6 | 0 / 6 | 0 / 6 | 2 | 18 |
+| `applications` | 3 / 6 | 0 / 6 | 0 / 6 | 3 | 18 |
 | `backend-parity-c` | 86 / 101 | 0 / 101 | 0 / 101 | 86 | 303 |
 | `bin-c` | 0 / 2 | 0 / 2 | 0 / 2 | 0 | 6 |
 | `c-programs` | 76 / 162 | 0 / 162 | 0 / 162 | 76 | 486 |
@@ -59,4 +59,4 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | `system-utils` | 28 / 30 | 1 / 30 | 0 / 30 | 29 | 90 |
 | `util-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |
 
-Ordinary full validation executes 284 selected regression cells: the 282 green compatibility cells above (including 2 chaos-mode race-exposure checks), and 2 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
+Ordinary full validation executes 285 selected regression cells: the 283 green compatibility cells above (including 2 chaos-mode race-exposure checks), and 2 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
