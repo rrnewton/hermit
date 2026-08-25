@@ -3665,7 +3665,9 @@ int main(void) {
 /// everything would be WORSE than the behaviour it replaces: today the two are
 /// equally wrong, and that change would make the common case (a typo in a guest
 /// path) silently claim the rarer one. A test asserting only the new code would
-/// pass on exactly that broken change, so the 125 arm is load-bearing.
+/// pass on exactly that broken change, so the 125 arm has to be load-bearing --
+/// which means it has to reach `failure_exit_code`, and as first written it did
+/// not. See the comment on that arm below for the measurement.
 ///
 /// Measured before the fix, at main `b97a4bc3a4`: `/no/such/program` and an
 /// unwritable `--log-file` both returned 125 with the same class.
@@ -3710,17 +3712,22 @@ fn a_guest_side_fault_is_not_reported_as_a_hermit_internal_failure() {
         "found-but-not-executable is 126, not 127\nstderr:\n{denied_stderr}"
     );
 
-    // ⚠️ THE ARM THAT STOPS THIS BECOMING A BLANKET 127. A genuine hermit-internal
-    // failure must still report 125.
+    // ⚠️ THE ARM THAT STOPS THIS BECOMING A BLANKET 127, AND IT HAS TO REACH THE
+    // MAPPING TO BE THAT ARM. An injected container-child fault is a genuine
+    // hermit-internal failure that travels the ordinary route: `main` -> `Err` ->
+    // `failure_exit_code`, which is the function a blanket 127 would live in.
+    //
+    // ⚠️ IT WAS WRITTEN WITH AN UNWRITABLE `--log-file` AND THAT DID NOT WORK.
+    // `--log-file` fails in `open_log_file`, BEFORE the command is dispatched, and
+    // that path raises the 125 constant directly without consulting
+    // `failure_exit_code` at all. Measured on this branch: with `None => 127`
+    // substituted for `None => HERMIT_INTERNAL_FAILURE_EXIT`, the test as
+    // originally written still reported `1 passed` -- the arm named for the
+    // mutation did not see it. Through the fault-injected route the same mutation
+    // fails here.
     let internal = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args([
-            "--log-file",
-            "/nonexistent-directory-for-hermit-cli-test/log",
-            "run",
-            "--strict",
-            "--",
-            "/bin/true",
-        ])
+        .env("HERMIT_TEST_CONTAINER_CHILD_FAULT", "segv")
+        .args(["run", "--strict", "--", "/bin/true"])
         .output()
         .expect("failed to run the hermit-internal case");
     let internal_stderr = String::from_utf8_lossy(&internal.stderr).into_owned();
@@ -3730,8 +3737,35 @@ fn a_guest_side_fault_is_not_reported_as_a_hermit_internal_failure() {
         "a hermit-internal failure must stay 125\nstderr:\n{internal_stderr}"
     );
     assert!(
+        internal_stderr.contains("class=container-child-exit"),
+        "this arm is only load-bearing if it goes through the mapping, which needs a \
+         failure that reaches it\nstderr:\n{internal_stderr}"
+    );
+    assert!(
         !internal_stderr.contains("guest-program"),
         "a hermit-internal failure must not be classed as guest-side\nstderr:\n{internal_stderr}"
+    );
+
+    // The pre-dispatch path keeps its own answer, which is a SEPARATE fact: an
+    // unwritable `--log-file` never reaches `failure_exit_code`, so this pins the
+    // constant in `main` rather than the mapping. Kept, and no longer described as
+    // the arm that guards the mapping.
+    let pre_dispatch = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log-file",
+            "/nonexistent-directory-for-hermit-cli-test/log",
+            "run",
+            "--strict",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .expect("failed to run the unwritable-log-file case");
+    let pre_dispatch_stderr = String::from_utf8_lossy(&pre_dispatch.stderr).into_owned();
+    assert_eq!(
+        pre_dispatch.status.code(),
+        Some(125),
+        "a failure before dispatch must still be 125\nstderr:\n{pre_dispatch_stderr}"
     );
 
     // And the guest's own exit is untouched by any of this.
