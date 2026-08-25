@@ -3424,6 +3424,9 @@ fn tracer_panic_and_guest_failure_have_different_exit_codes() {
         panic_code,
         Some(125),
         "hermit-internal failure should use the reserved wrapper code"
+    );
+}
+
 /// A container child that exits with a status IT DID NOT CHOOSE must be
 /// distinguishable from an ordinary CLI error, and neither may be confused with
 /// the guest's own exit.
@@ -3524,5 +3527,93 @@ stderr:
     assert!(
         !String::from_utf8_lossy(&guest_exit.stderr).contains("HERMIT_INTERNAL_FAILURE"),
         "the guest's own exit must not be classified as a hermit-internal failure"
+    );
+}
+
+/// A guest-side fact must not be reported as a hermit-internal failure — and a
+/// genuine hermit-internal failure must keep saying so.
+///
+/// ⚠️ BOTH ARMS ARE PINNED DELIBERATELY. A change that returned 127 for
+/// everything would be WORSE than the behaviour it replaces: today the two are
+/// equally wrong, and that change would make the common case (a typo in a guest
+/// path) silently claim the rarer one. A test asserting only the new code would
+/// pass on exactly that broken change, so the 125 arm is load-bearing.
+///
+/// Measured before the fix, at main `b97a4bc3a4`: `/no/such/program` and an
+/// unwritable `--log-file` both returned 125 with the same class.
+#[test]
+fn a_guest_side_fault_is_not_reported_as_a_hermit_internal_failure() {
+    let missing = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "run",
+            "--strict",
+            "--",
+            "/no/such/program-for-hermit-cli-test",
+        ])
+        .output()
+        .expect("failed to run the missing-program case");
+    let missing_stderr = String::from_utf8_lossy(&missing.stderr).into_owned();
+    assert_eq!(
+        missing.status.code(),
+        Some(127),
+        "a missing program is command-not-found, the GNU convention 125 came from\nstderr:\n{missing_stderr}"
+    );
+    assert!(
+        missing_stderr.contains("class=guest-program-not-found"),
+        "the class must name a guest-side fault\nstderr:\n{missing_stderr}"
+    );
+
+    // Present but not executable: 126, distinct from both 127 and 125.
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("guest-fault-not-executable");
+    fs::create_dir_all(&build_root).expect("failed to create the not-executable build root");
+    let unexecutable = build_root.join("not-executable");
+    fs::write(&unexecutable, b"\x7fELF not really\n").expect("failed to write the file");
+    fs::set_permissions(&unexecutable, fs::Permissions::from_mode(0o644))
+        .expect("failed to drop the execute bit");
+    let denied = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["run", "--strict", "--"])
+        .arg(&unexecutable)
+        .output()
+        .expect("failed to run the not-executable case");
+    let denied_stderr = String::from_utf8_lossy(&denied.stderr).into_owned();
+    assert_eq!(
+        denied.status.code(),
+        Some(126),
+        "found-but-not-executable is 126, not 127\nstderr:\n{denied_stderr}"
+    );
+
+    // ⚠️ THE ARM THAT STOPS THIS BECOMING A BLANKET 127. A genuine hermit-internal
+    // failure must still report 125.
+    let internal = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log-file",
+            "/nonexistent-directory-for-hermit-cli-test/log",
+            "run",
+            "--strict",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .expect("failed to run the hermit-internal case");
+    let internal_stderr = String::from_utf8_lossy(&internal.stderr).into_owned();
+    assert_eq!(
+        internal.status.code(),
+        Some(125),
+        "a hermit-internal failure must stay 125\nstderr:\n{internal_stderr}"
+    );
+    assert!(
+        !internal_stderr.contains("guest-program"),
+        "a hermit-internal failure must not be classed as guest-side\nstderr:\n{internal_stderr}"
+    );
+
+    // And the guest's own exit is untouched by any of this.
+    let guest = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["run", "--strict", "--", "/bin/false"])
+        .output()
+        .expect("failed to run the guest-exit case");
+    assert_eq!(
+        guest.status.code(),
+        Some(1),
+        "a guest exiting 1 still exits 1"
     );
 }
