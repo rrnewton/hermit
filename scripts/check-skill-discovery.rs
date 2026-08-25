@@ -461,7 +461,7 @@ fn package_resource_regression_test() -> Result<(), String> {
 
     fs::write(outside.join("target.md"), "outside\n")
         .map_err(|error| format!("write escaping resource target: {error}"))?;
-    symlink(&outside.join("target.md"), references.join("escaping.md"))
+    symlink(outside.join("target.md"), references.join("escaping.md"))
         .map_err(|error| format!("create escaping resource fixture: {error}"))?;
     if check_package_tree(&root, &canonical, &canonical, &codex, &llms).is_ok() {
         return Err("escaping package-resource fixture passed containment".to_owned());

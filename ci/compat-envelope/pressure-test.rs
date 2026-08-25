@@ -830,6 +830,13 @@ struct VerificationEvidence {
     /// aggregates RETAINED reports, including ones written before this field
     /// existed, so there absence has to mean "older report" rather than "broken
     /// producer".
+    ///
+    /// NEVER READ, AND THAT IS THE POINT -- so `#[allow(dead_code)]` rather than
+    /// deletion. The assertion this field makes happens at DESERIALIZATION: a
+    /// report missing the key fails to parse. Removing the field to satisfy
+    /// dead_code would delete the check while leaving the doc above claiming it
+    /// exists, which is the failure mode this whole test guards against.
+    #[allow(dead_code)]
     first_divergent_record: RequiredNullableU64,
 }
 
@@ -1682,15 +1689,15 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
         let selected = selection
             .mode
             .as_deref()
-            .map_or(true, |value| cell.id.mode == value)
+            .is_none_or(|value| cell.id.mode == value)
             && selection
                 .test
                 .as_deref()
-                .map_or(true, |value| cell.id.test == value)
+                .is_none_or(|value| cell.id.test == value)
             && selection
                 .backend
                 .as_deref()
-                .map_or(true, |value| cell.id.backend == value)
+                .is_none_or(|value| cell.id.backend == value)
             && !(selection.sample.is_some()
                 && selection.mode.is_none()
                 && !matches!(cell.id.mode.as_str(), "verify" | "replay" | "chaos"));
@@ -2846,7 +2853,6 @@ fn validate_run_contract(
         .keys()
         .flat_map(|cell| {
             repetition_numbers(metadata.repetitions)
-                .into_iter()
                 .map(move |repetition| cell_run_slug(cell, repetition))
         })
         .collect();
