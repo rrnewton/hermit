@@ -265,6 +265,11 @@ static int live_sibling_signal(int mode) {
       break;
     }
   }
+  sigset_t pending_signals;
+  int signals_pending =
+      sigpending(&pending_signals) == 0 &&
+      sigismember(&pending_signals, SIGUSR1) == 1 &&
+      sigismember(&pending_signals, SIGUSR2) == 1;
   int sender_live = kill(signaler, 0) == 0;
 
   int handler_before_restore = handler_ran;
@@ -292,7 +297,7 @@ static int live_sibling_signal(int mode) {
         sender_live);
   } else if (mode == 3) {
     printf(
-        "wait4-live-sibling-blocked rc-ok=%d errno=%d handler=%d pid-match=%d exited=%d status=%d mask-preserved=%d sender-live=%d\n",
+        "wait4-live-sibling-blocked rc-ok=%d errno=%d handler=%d pid-match=%d exited=%d status=%d mask-preserved=%d signals-pending=%d sender-live=%d\n",
         rc >= 0,
         rc < 0 ? saved_errno : 0,
         handler_before_restore,
@@ -300,6 +305,7 @@ static int live_sibling_signal(int mode) {
         WIFEXITED(wait_status),
         WIFEXITED(wait_status) ? WEXITSTATUS(wait_status) : -1,
         mask_preserved,
+        signals_pending,
         sender_live);
   } else {
     printf(
@@ -325,7 +331,7 @@ static int live_sibling_signal(int mode) {
     return 2;
   }
   if (mode == 3) {
-    return rc == target && WIFEXITED(wait_status) &&
+    return signals_pending && rc == target && WIFEXITED(wait_status) &&
                    WEXITSTATUS(wait_status) == 29
                ? 0
                : 3;

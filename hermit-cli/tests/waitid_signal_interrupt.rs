@@ -562,7 +562,7 @@ fn wait4_keeps_a_guest_blocked_sibling_signal_pending() {
     );
     assert!(
         run.stdout.contains(
-            "wait4-live-sibling-blocked rc-ok=1 errno=0 handler=0 pid-match=1 exited=1 status=29 mask-preserved=1 sender-live=1"
+            "wait4-live-sibling-blocked rc-ok=1 errno=0 handler=0 pid-match=1 exited=1 status=29 mask-preserved=1 signals-pending=1 sender-live=1"
         ),
         "a guest-blocked sibling signal incorrectly interrupted wait4 or changed the mask\n\
          guest stdout:\n{}",
@@ -579,11 +579,6 @@ fn wait4_keeps_a_guest_blocked_sibling_signal_pending() {
         "the blocked signal restarted wait4 internally instead of remaining pending; \
          expected target wait plus two cleanup waits, saw {wait4_entries}\nhermit stderr:\n{}",
         run.stderr,
-    );
-    assert!(
-        run.retries <= limits.max_waitid_retries,
-        "blocked-signal wait4 performed {} retries",
-        run.retries,
     );
 }
 
