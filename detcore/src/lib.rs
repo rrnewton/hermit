@@ -326,6 +326,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             DetTid::from_raw(child_tid.into()),
             child_tid_addr,
             Some(flags),
+            (flags.bits() & 0xff) as libc::c_int,
         )
         .await;
     }
@@ -1523,7 +1524,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 &new_dettid,
                 guest.config()
             );
-            if let Some(post_exec_mm) = create_child_thread(guest, new_dettid, 0, None).await {
+            if let Some(post_exec_mm) =
+                create_child_thread(guest, new_dettid, 0, None, libc::SIGCHLD).await
+            {
                 guest.thread_state_mut().mm_id = post_exec_mm;
             }
         }
@@ -2152,6 +2155,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Wait4(s) => self.handle_wait4(guest, s).await,
                 Syscall::Waitid(s) => self.handle_waitid(guest, s).await,
 
+                Syscall::Setpgid(s) => self.handle_setpgid(guest, s).await,
                 Syscall::Setsid(s) => self.handle_setsid(guest, s).await,
                 Syscall::Gettimeofday(s) => {
                     if virtualize_time {

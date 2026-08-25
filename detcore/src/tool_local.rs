@@ -1342,6 +1342,7 @@ pub struct PendingVfork {
     pub parent_detpid: DetPid,
     pub child_tid_addr: usize,
     pub flags: CloneFlags,
+    pub exit_signal: libc::c_int,
     pub child_priority_entropy: Option<u64>,
 }
 

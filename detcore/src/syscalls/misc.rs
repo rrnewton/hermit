@@ -24,7 +24,10 @@ use reverie::syscalls::MemoryAccess;
 use crate::consts::DEFAULT_HOSTNAME;
 use crate::detlog;
 use crate::record_or_replay::RecordOrReplay;
+use crate::tool_global::create_session;
+use crate::tool_global::set_process_group;
 use crate::tool_local::Detcore;
+use crate::types::DetPid;
 
 const ARCH_GET_XCOMP_SUPP: libc::c_int = 0x1021;
 const ARCH_GET_XCOMP_PERM: libc::c_int = 0x1022;
@@ -643,12 +646,38 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Setsid,
     ) -> Result<i64, Error> {
         let res = guest.inject(call).await?;
+        let process = guest.thread_state().detpid.expect("detpid unset");
+        let _ = create_session(guest, process).await;
 
         // task is trying to become a daemon process. for more details
         // see: https://notes.shichao.io/apue/ch13/
         if guest.config().kill_daemons {
             guest.daemonize().await;
         }
+        Ok(res)
+    }
+
+    /// setpgid system call. The kernel remains authoritative for validation;
+    /// after success Detcore mirrors the guest-visible process-group change so
+    /// group-selecting waits do not consult host `/proc` state.
+    pub async fn handle_setpgid<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Setpgid,
+    ) -> Result<i64, Error> {
+        let res = guest.inject(call).await?;
+        let caller = guest.thread_state().detpid.expect("detpid unset");
+        let process = if call.pid() == 0 {
+            caller
+        } else {
+            DetPid::from_raw(call.pid())
+        };
+        let group = if call.pgid() == 0 {
+            process
+        } else {
+            DetPid::from_raw(call.pgid())
+        };
+        let _ = set_process_group(guest, process, group).await;
         Ok(res)
     }
 

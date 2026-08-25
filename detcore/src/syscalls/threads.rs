@@ -50,6 +50,7 @@ use crate::tool_global::consume_child_wait;
 use crate::tool_global::create_child_thread;
 use crate::tool_global::futex_action;
 use crate::tool_global::prepare_exec;
+use crate::tool_global::process_group;
 use crate::tool_global::ready_child_wait;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_is_live;
@@ -58,7 +59,9 @@ use crate::tool_global::wait_for_child_lifecycle;
 use crate::tool_global::yield_once;
 use crate::tool_local::Detcore;
 use crate::tool_local::PendingVfork;
+use crate::types::ChildWaitExitClass;
 use crate::types::ChildWaitSelector;
+use crate::types::ChildWaitSpec;
 use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::ExactChildWaitState;
@@ -499,6 +502,29 @@ fn stale_any_wait_must_interrupt(signaled: bool, next_ready: Option<DetPid>) -> 
     signaled && next_ready.is_none()
 }
 
+fn terminal_child_wait_spec(
+    selector: ChildWaitSelector,
+    caller: DetTid,
+    options: libc::c_int,
+) -> ChildWaitSpec {
+    let exit_class = if options & libc::__WALL != 0 {
+        ChildWaitExitClass::Any
+    } else if options & libc::__WCLONE != 0 {
+        ChildWaitExitClass::Clone
+    } else {
+        ChildWaitExitClass::Sigchld
+    };
+    ChildWaitSpec {
+        selector,
+        owner: (options & libc::__WNOTHREAD != 0).then_some(caller),
+        exit_class,
+    }
+}
+
+fn child_wait_can_retry_after_stale(spec: ChildWaitSpec) -> bool {
+    !matches!(spec.selector, ChildWaitSelector::Exact(_))
+}
+
 fn snapshot_process_group(pid: Pid) -> Result<libc::pid_t, Errno> {
     let pgrp = Process::new(pid.as_raw())
         .and_then(|process| process.stat())
@@ -642,6 +668,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         clone_family: syscalls::family::CloneFamily,
     ) -> Result<i64, Error> {
         let flags = clone_family.flags(&guest.memory());
+        let exit_signal = match clone_family {
+            #[cfg(not(target_arch = "aarch64"))]
+            syscalls::family::CloneFamily::Fork(_) | syscalls::family::CloneFamily::Vfork(_) => {
+                libc::SIGCHLD
+            }
+            syscalls::family::CloneFamily::Clone(clone) => {
+                (clone.flags().bits() & 0xff) as libc::c_int
+            }
+            syscalls::family::CloneFamily::Clone3(clone) => clone
+                .args()
+                .and_then(|address| guest.memory().read_value(address).ok())
+                .map_or(0, |args: syscalls::CloneArgs| {
+                    args.exit_signal as libc::c_int
+                }),
+        };
         let ctid = clone_family.child_tid(&guest.memory());
         let is_vfork = flags.contains(CloneFlags::CLONE_VFORK);
         let parent_blocks_for_child = is_vfork
@@ -672,6 +713,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 parent_detpid: ts.detpid.expect("detpid unset"),
                 child_tid_addr: ctid,
                 flags,
+                exit_signal,
                 child_priority_entropy,
             });
         }
@@ -763,7 +805,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         );
 
         if !parent_blocks_for_child && !backend_uninstrumented_thread {
-            create_child_thread(guest, child_dettid, ctid, Some(flags)).await;
+            create_child_thread(guest, child_dettid, ctid, Some(flags), exit_signal).await;
         }
 
         {
@@ -1170,25 +1212,35 @@ impl<T: RecordOrReplay> Detcore<T> {
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("wait4");
 
+        let parent = guest.thread_state().detpid.expect("detpid unset");
+        // Stop/continue events need a backend waitability callback. Non-SIGCHLD
+        // process clones also remain legacy until backends distinguish
+        // PTRACE_EVENT_CLONE from CLONE_THREAD. The common matcher already
+        // carries those filters so activation does not require another model.
         let selector = if call.options().intersects(
             WaitPidFlag::WUNTRACED
                 | WaitPidFlag::WCONTINUED
-                | WaitPidFlag::__WNOTHREAD
-                | WaitPidFlag::__WCLONE,
+                | WaitPidFlag::__WCLONE
+                | WaitPidFlag::__WALL,
         ) {
             None
         } else {
             match call.pid() {
                 pid if pid > 0 => Some(ChildWaitSelector::Exact(DetPid::from_raw(pid))),
                 -1 => Some(ChildWaitSelector::Any),
-                _ => None,
+                0 => process_group(guest, parent)
+                    .await
+                    .map(ChildWaitSelector::ProcessGroup),
+                pid if pid < -1 => Some(ChildWaitSelector::ProcessGroup(DetPid::from_raw(-pid))),
+                _ => unreachable!(),
             }
         };
-        let managed_selector = if let Some(selector) = selector {
-            ready_child_wait(guest, selector)
-                .await
-                .1
-                .then_some(selector)
+        let spec = selector
+            .map(|selector| terminal_child_wait_spec(selector, dettid, call.options().bits()));
+        let complete_lineage = guest.config().backend_tracks_process_children;
+        let managed_spec = if let Some(spec) = spec {
+            let (_, has_child) = ready_child_wait(guest, spec).await;
+            (has_child || complete_lineage).then_some(spec)
         } else {
             None
         };
@@ -1199,12 +1251,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 "[dtid {}] Executing non-blocking wait4 in one shot.",
                 dettid
             );
-            if let Some(selector) = selector {
+            if let Some(spec) = spec {
                 'select_child: loop {
-                    let (ready, has_child) = ready_child_wait(guest, selector).await;
+                    let (ready, has_child) = ready_child_wait(guest, spec).await;
                     let Some(child) = ready else {
                         break if has_child {
                             0
+                        } else if complete_lineage {
+                            return Err(Errno::ECHILD.into());
                         } else {
                             guest.inject_with_retry(call).await?
                         };
@@ -1217,7 +1271,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                             Ok(_) => yield_once().await,
                             Err(Errno::ECHILD) => {
                                 let _ = consume_child_wait(guest, child).await;
-                                if selector == ChildWaitSelector::Any {
+                                if child_wait_can_retry_after_stale(spec) {
                                     continue 'select_child;
                                 }
                                 return Err(Errno::ECHILD.into());
@@ -1227,11 +1281,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                 }
             } else {
-                // pid 0 and negative process-group selectors retain the legacy
-                // one-shot path until Detcore models process-group membership.
                 guest.inject_with_retry(call).await?
             }
-        } else if let Some(selector) = managed_selector {
+        } else if let Some(spec) = managed_spec {
             // Keep ordinary signals pending until child readiness is resolved.
             let mut blocked_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
             unsafe {
@@ -1253,18 +1305,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             let mut pending_signal = false;
             let result: Result<i64, Error> = loop {
                 let signaled =
-                    wait_for_child_lifecycle(guest, selector).await == ResumeStatus::Signaled;
+                    wait_for_child_lifecycle(guest, spec).await == ResumeStatus::Signaled;
                 pending_signal |= signaled;
-                let (ready, _) = ready_child_wait(guest, selector).await;
+                let (ready, has_child) = ready_child_wait(guest, spec).await;
                 if let Some(child) = ready {
                     let _ = await_exact_child_physical_exit(guest, child).await;
                     match guest.inject_with_retry(call.with_pid(child.as_raw())).await {
                         Ok(value) => break Ok(value),
                         Err(Errno::ECHILD) => {
                             let _ = consume_child_wait(guest, child).await;
-                            if selector == ChildWaitSelector::Any {
-                                let (next_ready, _) =
-                                    ready_child_wait(guest, ChildWaitSelector::Any).await;
+                            if child_wait_can_retry_after_stale(spec) {
+                                let (next_ready, _) = ready_child_wait(guest, spec).await;
                                 if stale_any_wait_must_interrupt(pending_signal, next_ready) {
                                     break Err(Errno::ERESTARTSYS.into());
                                 }
@@ -1274,6 +1325,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                         }
                         Err(errno) => break Err(errno.into()),
                     }
+                }
+                if !has_child {
+                    break Err(Errno::ECHILD.into());
                 }
                 match guest.inject(poll_call).await {
                     Ok(value) => {
@@ -1359,9 +1413,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::EFAULT.into());
         }
 
-        // Linux snapshots P_PGID with id 0 at syscall entry. Preserve that
-        // identity across polling calls without issuing a guest-visible syscall.
-        if call.which() == libc::P_PGID as i32 && call.pid() == 0 {
+        // Keep clone-class waits on the legacy path until ptrace and KVM both
+        // register non-SIGCHLD clone children as processes rather than threads.
+        let terminal_events_only = call.options() & libc::WEXITED != 0
+            && call.options() & (libc::WSTOPPED | libc::WCONTINUED | libc::__WCLONE | libc::__WALL)
+                == 0;
+
+        // The parked nonterminal path still uses kernel polling. Preserve its
+        // P_PGID(0) entry snapshot until backend lifecycle events replace it.
+        if !terminal_events_only && call.which() == libc::P_PGID as i32 && call.pid() == 0 {
             call = call.with_pid(snapshot_process_group(guest.pid())?);
         }
 
@@ -1399,26 +1459,31 @@ impl<T: RecordOrReplay> Detcore<T> {
         // The lifecycle scheduler currently models terminal child events for
         // exact and any-child selectors. Group membership and stop/continue
         // state remain on the legacy kernel-polling path.
-        let terminal_selector = if call.options() & libc::WEXITED != 0
-            && call.options()
-                & (libc::WSTOPPED | libc::WCONTINUED | libc::__WNOTHREAD | libc::__WCLONE)
-                == 0
-        {
-            match call.which() {
+        let terminal_spec = if terminal_events_only {
+            let selector = match call.which() {
                 which if which == libc::P_PID as i32 => {
                     Some(ChildWaitSelector::Exact(DetPid::from_raw(call.pid())))
                 }
                 which if which == libc::P_ALL as i32 => Some(ChildWaitSelector::Any),
+                which if which == libc::P_PGID as i32 => {
+                    let group = if call.pid() == 0 {
+                        process_group(guest, guest.thread_state().detpid.expect("detpid unset"))
+                            .await
+                    } else {
+                        Some(DetPid::from_raw(call.pid()))
+                    };
+                    group.map(ChildWaitSelector::ProcessGroup)
+                }
                 _ => None,
-            }
+            };
+            selector.map(|selector| terminal_child_wait_spec(selector, dettid, call.options()))
         } else {
             None
         };
-        let managed_terminal_selector = if let Some(selector) = terminal_selector {
-            ready_child_wait(guest, selector)
-                .await
-                .1
-                .then_some(selector)
+        let complete_lineage = guest.config().backend_tracks_process_children;
+        let managed_terminal_spec = if let Some(spec) = terminal_spec {
+            let (_, has_child) = ready_child_wait(guest, spec).await;
+            (has_child || complete_lineage).then_some(spec)
         } else {
             None
         };
@@ -1432,11 +1497,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 dettid
             );
             'select_child: loop {
-                let selected = if let Some(selector) = terminal_selector {
-                    let (ready, has_child) = ready_child_wait(guest, selector).await;
+                let selected = if let Some(spec) = terminal_spec {
+                    let (ready, has_child) = ready_child_wait(guest, spec).await;
                     if ready.is_none() && has_child {
                         guest.memory().write_value(info, &empty_info)?;
                         return Ok(0);
+                    }
+                    if ready.is_none() && complete_lineage {
+                        return Err(Errno::ECHILD.into());
                     }
                     ready
                 } else {
@@ -1455,7 +1523,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         Err(Errno::ECHILD) if selected.is_some() => {
                             let child = selected.expect("selected child checked above");
                             let _ = consume_child_wait(guest, child).await;
-                            if terminal_selector == Some(ChildWaitSelector::Any) {
+                            if terminal_spec.is_some_and(child_wait_can_retry_after_stale) {
                                 continue 'select_child;
                             }
                             return Err(Errno::ECHILD.into());
@@ -1514,15 +1582,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             // Do not return on Signaled yet. Linux lets an already-waitable child
             // status win over an interrupt, so the zero-timeout kernel probe below
             // remains authoritative when readiness and a signal coincide.
-            let managed_selector = managed_terminal_selector;
-            let signaled = if let Some(selector) = managed_selector {
-                wait_for_child_lifecycle(guest, selector).await == ResumeStatus::Signaled
+            let managed_spec = managed_terminal_spec;
+            let signaled = if let Some(spec) = managed_spec {
+                wait_for_child_lifecycle(guest, spec).await == ResumeStatus::Signaled
             } else {
                 resource_request(guest, rsrc.clone()).await == ResumeStatus::Signaled
             };
             pending_signal |= signaled;
-            let (ready, has_child) = if let Some(selector) = managed_selector {
-                ready_child_wait(guest, selector).await
+            let (ready, has_child) = if let Some(spec) = managed_spec {
+                ready_child_wait(guest, spec).await
             } else {
                 (None, true)
             };
@@ -1542,9 +1610,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                     Err(Errno::ECHILD) => {
                         let _ = consume_child_wait(guest, child).await;
-                        if managed_selector == Some(ChildWaitSelector::Any) {
+                        if managed_spec.is_some_and(child_wait_can_retry_after_stale) {
                             let (next_ready, _) =
-                                ready_child_wait(guest, ChildWaitSelector::Any).await;
+                                ready_child_wait(guest, managed_spec.expect("managed spec")).await;
                             if stale_any_wait_must_interrupt(pending_signal, next_ready) {
                                 break Err(Errno::ERESTARTSYS.into());
                             }
@@ -1554,6 +1622,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                     Err(errno) => break Err(errno.into()),
                 }
+            }
+            if managed_spec.is_some() && !has_child {
+                break Err(Errno::ECHILD.into());
             }
 
             if let Err(error) = guest.memory().write_value(info, &empty_info) {
@@ -1580,7 +1651,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         ExactWaitPollDecision::AwaitPhysicalExit
                         | ExactWaitPollDecision::ReapAfterLogicalExit => unreachable!(),
                     }
-                    if managed_selector.is_some() {
+                    if managed_spec.is_some() {
                         if !has_child {
                             break Ok(value);
                         }

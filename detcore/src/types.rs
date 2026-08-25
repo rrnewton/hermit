@@ -18,6 +18,30 @@ pub enum ChildWaitSelector {
     Exact(DetPid),
     /// Any direct child process.
     Any,
+    /// Any direct child process currently in this process group.
+    ProcessGroup(DetPid),
+}
+
+/// Linux's clone-child filtering for terminal wait events.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum ChildWaitExitClass {
+    /// Children whose clone exit signal is SIGCHLD (the normal wait population).
+    Sigchld,
+    /// Children whose clone exit signal is zero or a signal other than SIGCHLD.
+    Clone,
+    /// Both normal and clone children (`__WALL`).
+    Any,
+}
+
+/// Scheduler-owned selection criteria for a terminal child wait.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct ChildWaitSpec {
+    /// PID or process-group population selected by the syscall.
+    pub selector: ChildWaitSelector,
+    /// Restrict to children owned by this exact task (`__WNOTHREAD`).
+    pub owner: Option<DetTid>,
+    /// Filter normal versus clone children.
+    pub exit_class: ChildWaitExitClass,
 }
 
 /// Scheduler-owned lifecycle state for an exact child-process wait.

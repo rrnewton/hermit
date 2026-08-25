@@ -1713,6 +1713,7 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // TODO-HUMAN-REVIEW(PR-1122): Review concurrent KVM process-child scheduling.
     config.backend_serializes_fork_children = false;
     config.backend_dispatches_thread_tools = true;
+    config.backend_tracks_process_children = backend != Backend::Dbt;
     config.backend_requires_thread_directed_process_signals = backend == Backend::Dbt;
     config.backend_virtualizes_capability_prctls = backend == Backend::Kvm;
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2564,6 +2565,7 @@ mod tests {
         assert!(sabre.backend_reports_physical_process_exits);
         assert!(!sabre.backend_serializes_fork_children);
         assert!(sabre.backend_dispatches_thread_tools);
+        assert!(sabre.backend_tracks_process_children);
         assert!(!sabre.backend_requires_thread_directed_process_signals);
         assert!(!sabre.backend_virtualizes_capability_prctls);
         assert!(!sabre.backend_defers_vfork_child_registration);
@@ -2576,6 +2578,7 @@ mod tests {
         assert!(!ptrace.backend_reports_physical_process_exits);
         assert!(!ptrace.backend_serializes_fork_children);
         assert!(ptrace.backend_dispatches_thread_tools);
+        assert!(ptrace.backend_tracks_process_children);
         assert!(!ptrace.backend_requires_thread_directed_process_signals);
         assert!(!ptrace.backend_virtualizes_capability_prctls);
         assert!(!ptrace.backend_defers_vfork_child_registration);
@@ -2587,6 +2590,7 @@ mod tests {
         let kvm = prepare_backend_config(config, Backend::Kvm);
         assert!(!kvm.backend_serializes_fork_children);
         assert!(kvm.backend_dispatches_thread_tools);
+        assert!(kvm.backend_tracks_process_children);
         assert!(!kvm.backend_requires_thread_directed_process_signals);
         assert!(kvm.backend_virtualizes_capability_prctls);
         assert!(kvm.backend_defers_vfork_child_registration);
@@ -2595,6 +2599,7 @@ mod tests {
     #[test]
     fn dbt_backend_config_translates_process_signals_to_host_threads() {
         let config = prepare_backend_config(super::DetConfig::default(), Backend::Dbt);
+        assert!(!config.backend_tracks_process_children);
         assert!(config.backend_requires_thread_directed_process_signals);
         assert!(!config.backend_defers_vfork_child_registration);
     }

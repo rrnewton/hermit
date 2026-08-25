@@ -128,6 +128,7 @@ struct ChildRegistration {
     child_dettid: DetTid,
     child_tid_addr: usize,
     flags: Option<CloneFlags>,
+    exit_signal: libc::c_int,
     maybe_priority: Option<Priority>,
     parent_is_kernel_blocked: bool,
 }
@@ -634,7 +635,7 @@ impl GlobalTool for GlobalState {
         let (exec_reconnect, is_exec_caller_after_local_mm_swap) = {
             let pending = self.pending_exec_states.lock().unwrap();
             let reconnect = match &request {
-                GlobalRequest::CreateChildThread(child, process, _, None, _)
+                GlobalRequest::CreateChildThread(child, process, _, None, _, _)
                     if *child == dtid && *child == *process =>
                 {
                     pending.get(process).cloned()
@@ -796,7 +797,14 @@ impl GlobalTool for GlobalState {
                 R::MarkPastFirstExecve(overrides)
             }
             // Requested by the parent thread:
-            GlobalRequest::CreateChildThread(dettid, parent_detpid, ctid, flags, priority) => {
+            GlobalRequest::CreateChildThread(
+                dettid,
+                parent_detpid,
+                ctid,
+                flags,
+                exit_signal,
+                priority,
+            ) => {
                 if let Some(prepared) = &exec_reconnect {
                     let (pending, post_exec_mm) = {
                         let mut states = self.pending_exec_states.lock().unwrap();
@@ -849,6 +857,7 @@ impl GlobalTool for GlobalState {
                                 child_dettid: dettid,
                                 child_tid_addr: ctid,
                                 flags,
+                                exit_signal,
                                 maybe_priority: priority,
                                 parent_is_kernel_blocked: false,
                             },
@@ -867,6 +876,7 @@ impl GlobalTool for GlobalState {
                 child_dettid,
                 ctid,
                 flags,
+                exit_signal,
                 priority,
             ) => match self
                 .recv_create_child_thread(
@@ -878,6 +888,7 @@ impl GlobalTool for GlobalState {
                         child_dettid,
                         child_tid_addr: ctid,
                         flags: Some(flags),
+                        exit_signal,
                         maybe_priority: priority,
                         parent_is_kernel_blocked: true,
                     },
@@ -1009,6 +1020,27 @@ impl GlobalTool for GlobalState {
             GlobalRequest::ConsumeChildWait(parent, child) => {
                 R::ConsumeChildWait(self.sched.lock().unwrap().consume_child_wait(parent, child))
             }
+            GlobalRequest::ProcessGroup(process) => R::ProcessGroup(
+                self.sched
+                    .lock()
+                    .unwrap()
+                    .thread_tree
+                    .process_group(process),
+            ),
+            GlobalRequest::SetProcessGroup(process, group) => R::SetProcessGroup(
+                self.sched
+                    .lock()
+                    .unwrap()
+                    .thread_tree
+                    .set_process_group(process, group),
+            ),
+            GlobalRequest::CreateSession(process) => R::CreateSession(
+                self.sched
+                    .lock()
+                    .unwrap()
+                    .thread_tree
+                    .create_session(process),
+            ),
             GlobalRequest::UnrecoverableShutdown => {
                 self.force_shutdown_with_error();
                 R::UnrecoverableShutdown(())
@@ -1225,6 +1257,7 @@ impl GlobalState {
             child_dettid,
             child_tid_addr: ctid,
             flags,
+            exit_signal,
             maybe_priority,
             parent_is_kernel_blocked,
         } = registration;
@@ -1291,9 +1324,13 @@ impl GlobalState {
                 } else {
                     true // root thread
                 };
-                sched
-                    .thread_tree
-                    .add_child(parent_dettid, child_dettid, is_group_leader);
+                sched.thread_tree.add_child_with_wait_metadata(
+                    parent_dettid,
+                    child_dettid,
+                    is_group_leader,
+                    flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_PARENT)),
+                    exit_signal,
+                );
             }
 
             // Record this thread in deterministic creation order so a
@@ -1910,13 +1947,28 @@ pub enum GlobalRequest {
     /// The only scenario where the Priority will be missing is when we're replaying preemptions.
     /// In that case it is the global state that holds the information regarding the new thread's
     /// initial priority.
-    CreateChildThread(DetTid, DetPid, usize, Option<CloneFlags>, Option<Priority>),
+    CreateChildThread(
+        DetTid,
+        DetPid,
+        usize,
+        Option<CloneFlags>,
+        libc::c_int,
+        Option<Priority>,
+    ),
 
     /// A vfork child registering itself while its parent is blocked inside the
     /// kernel. Contains the (real) parent dettid and detpid, the child dettid,
     /// the child TID address, the clone flags, and the starting priority (absent
     /// only when replaying preemptions).
-    CreateVforkChildThread(DetTid, DetPid, DetTid, usize, CloneFlags, Option<Priority>),
+    CreateVforkChildThread(
+        DetTid,
+        DetPid,
+        DetTid,
+        usize,
+        CloneFlags,
+        libc::c_int,
+        Option<Priority>,
+    ),
 
     /// New thread is alive and waiting to run its first instruction.  Contains the dettid
     /// and detpid of the new child.
@@ -1978,9 +2030,15 @@ pub enum GlobalRequest {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     /// Deterministically select a logically exited matching child.
-    ReadyChildWait(DetPid, ChildWaitSelector),
+    ReadyChildWait(DetPid, ChildWaitSpec),
     /// Retire a consumed terminal child wait status.
     ConsumeChildWait(DetPid, DetPid),
+    /// Query scheduler-owned process-group membership.
+    ProcessGroup(DetPid),
+    /// Apply a successful setpgid transition.
+    SetProcessGroup(DetPid, DetPid),
+    /// Apply a successful setsid transition.
+    CreateSession(DetPid),
     /// Query live threads before translating process-directed signal delivery.
     ResolveKillTargets(DetPid),
     /// Liveness of one tid, leader or not; see [`thread_is_live`].
@@ -2041,6 +2099,9 @@ pub enum GlobalResponse {
     // TODO-HUMAN-REVIEW(PR-841): Review logical alarm query RPC.
     ReadyChildWait((Option<DetPid>, bool)),
     ConsumeChildWait(bool),
+    ProcessGroup(Option<DetPid>),
+    SetProcessGroup(bool),
+    CreateSession(bool),
     AlarmRemaining(LogicalTime),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
@@ -2268,6 +2329,7 @@ pub async fn create_child_thread<G, T>(
     child_dettid: DetTid,
     ctid: usize,
     flags: Option<CloneFlags>,
+    exit_signal: libc::c_int,
 ) -> Option<MmId>
 where
     G: Guest<Detcore<T>>,
@@ -2311,7 +2373,14 @@ where
 
     let resp = send_and_update_time(
         guest,
-        GlobalRequest::CreateChildThread(child_dettid, detpid, ctid, flags, starting_priority),
+        GlobalRequest::CreateChildThread(
+            child_dettid,
+            detpid,
+            ctid,
+            flags,
+            exit_signal,
+            starting_priority,
+        ),
     )
     .await;
     match resp.1 {
@@ -2364,6 +2433,7 @@ pub async fn create_vfork_child_thread<G, T>(
             child_dettid,
             vfork.child_tid_addr,
             vfork.flags,
+            vfork.exit_signal,
             starting_priority,
         ),
     )
@@ -2770,10 +2840,7 @@ where
 }
 
 /// Park until an exact or any-child process wait has a logical exit to reap.
-pub async fn wait_for_child_lifecycle<G, T>(
-    guest: &mut G,
-    selector: ChildWaitSelector,
-) -> ResumeStatus
+pub async fn wait_for_child_lifecycle<G, T>(guest: &mut G, spec: ChildWaitSpec) -> ResumeStatus
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -2781,24 +2848,57 @@ where
     let dettid = guest.thread_state().dettid;
     let parent = guest.thread_state().detpid.expect("detpid unset");
     let mut resources = Resources::new(dettid);
-    resources.insert(ResourceID::WaitChild { parent, selector }, Permission::R);
+    resources.insert(ResourceID::WaitChild { parent, spec }, Permission::R);
     resources.fyi("wait-child-lifecycle");
     resource_request(guest, resources).await
 }
 
-pub async fn ready_child_wait<G, T>(
-    guest: &mut G,
-    selector: ChildWaitSelector,
-) -> (Option<DetPid>, bool)
+pub async fn ready_child_wait<G, T>(guest: &mut G, spec: ChildWaitSpec) -> (Option<DetPid>, bool)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
     let parent = guest.thread_state().detpid.expect("detpid unset");
-    let response =
-        send_and_update_time(guest, GlobalRequest::ReadyChildWait(parent, selector)).await;
+    let response = send_and_update_time(guest, GlobalRequest::ReadyChildWait(parent, spec)).await;
     match response.1 {
         GlobalResponse::ReadyChildWait(snapshot) => snapshot,
+        _ => unreachable!(),
+    }
+}
+
+pub async fn process_group<G, T>(guest: &mut G, process: DetPid) -> Option<DetPid>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::ProcessGroup(process)).await;
+    match response.1 {
+        GlobalResponse::ProcessGroup(group) => group,
+        _ => unreachable!(),
+    }
+}
+
+pub async fn set_process_group<G, T>(guest: &mut G, process: DetPid, group: DetPid) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response =
+        send_and_update_time(guest, GlobalRequest::SetProcessGroup(process, group)).await;
+    match response.1 {
+        GlobalResponse::SetProcessGroup(updated) => updated,
+        _ => unreachable!(),
+    }
+}
+
+pub async fn create_session<G, T>(guest: &mut G, process: DetPid) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::CreateSession(process)).await;
+    match response.1 {
+        GlobalResponse::CreateSession(updated) => updated,
         _ => unreachable!(),
     }
 }
@@ -3031,6 +3131,7 @@ mod tests {
                         detpid,
                         0,
                         None,
+                        libc::SIGCHLD,
                         Some(DEFAULT_PRIORITY),
                     ),
                 ),
@@ -3138,6 +3239,7 @@ mod tests {
                         detpid,
                         0,
                         None,
+                        libc::SIGCHLD,
                         Some(DEFAULT_PRIORITY),
                     ),
                 ),
@@ -3210,6 +3312,7 @@ mod tests {
                         detpid,
                         0,
                         None,
+                        libc::SIGCHLD,
                         Some(DEFAULT_PRIORITY),
                     ),
                 ),
@@ -3735,6 +3838,7 @@ mod tests {
                         detpid,
                         0,
                         None,
+                        libc::SIGCHLD,
                         Some(DEFAULT_PRIORITY),
                     ),
                 ),
@@ -3963,7 +4067,14 @@ mod tests {
             (
                 DetTime::new(&config),
                 MmId::initial(parent),
-                GlobalRequest::CreateChildThread(child, detpid, 0, None, Some(DEFAULT_PRIORITY)),
+                GlobalRequest::CreateChildThread(
+                    child,
+                    detpid,
+                    0,
+                    None,
+                    libc::SIGCHLD,
+                    Some(DEFAULT_PRIORITY),
+                ),
             ),
         );
         let kill_after_parent_parks = async {

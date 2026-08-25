@@ -16,7 +16,7 @@ use reverie::syscalls::Syscall;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::types::ChildWaitSelector;
+use crate::types::ChildWaitSpec;
 use crate::types::DetInode;
 use crate::types::DetPid;
 use crate::types::DetTid;
@@ -285,7 +285,7 @@ pub enum ResourceID {
         /// The process issuing the wait.
         parent: DetPid,
         /// Child population selected by the syscall.
-        selector: ChildWaitSelector,
+        spec: ChildWaitSpec,
     },
 
     /// Park until a backend reports that a logically exited child is physically waitable.

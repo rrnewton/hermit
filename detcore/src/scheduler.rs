@@ -73,7 +73,9 @@ use crate::resources::SABRE_LOOPBACK_POLL_YIELD_FYI;
 use crate::scheduler::replayer::StopReason;
 use crate::scheduler::replayer::events_consistent;
 use crate::scheduler::replayer::events_match;
+use crate::types::ChildWaitExitClass;
 use crate::types::ChildWaitSelector;
+use crate::types::ChildWaitSpec;
 use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::ExactChildWaitState;
@@ -229,7 +231,7 @@ pub struct BlockedPool {
     pub timed_waiters: TimedEvents,
 
     /// Threads parked until a matching child process exits logically.
-    pub child_waiters: BTreeMap<DetTid, (DetPid, ChildWaitSelector)>,
+    pub child_waiters: BTreeMap<DetTid, (DetPid, ChildWaitSpec)>,
 
     /// Threads parked between logical process exit and a backend's final
     /// physical-exit report.
@@ -670,13 +672,26 @@ pub struct ThreadTree {
     /// here. If, however, a thread is a group leader, this will map back to itself.
     thread_to_leader: HashMap<DetTid, DetPid>,
 
-    /// Reverse map from a process (group-leader `DetPid`) to the `DetPid` of the
-    /// process that created it. Populated when a new group leader is registered
-    /// (a `clone`/`fork` without `CLONE_THREAD`); the root process has no entry.
-    /// Used to target a deterministic child-exit `SIGCHLD` at the reaping
-    /// parent. Entries are not removed on exit (mirroring `tree`/`thread_to_leader`);
-    /// a stale parent is handled gracefully by `select_signal_target`.
+    /// Reverse map from a process (group-leader `DetPid`) to its effective Linux
+    /// wait parent, including `CLONE_PARENT`. Populated when a new group leader
+    /// is registered; the root process has no entry. Entries survive logical
+    /// exit until the terminal status is consumed.
     process_parent: HashMap<DetPid, DetPid>,
+
+    /// Linux child-wait identity for each process leader. Unlike the thread
+    /// tree edge, this records the effective wait parent after CLONE_PARENT,
+    /// the exact creating task for __WNOTHREAD, clone exit-signal class, and
+    /// mutable process-group/session membership.
+    process_wait: HashMap<DetPid, ProcessWaitMetadata>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProcessWaitMetadata {
+    wait_parent: Option<DetPid>,
+    wait_owner: DetTid,
+    exit_signal: libc::c_int,
+    process_group: DetPid,
+    session: DetPid,
 }
 
 use pretty::Doc;
@@ -789,11 +804,33 @@ impl ThreadTree {
 
     /// Simultaneously update the thread tree and leader tracking to reflect the creation
     /// of a new child thread.
+    #[cfg(test)]
     pub fn add_child(
         &mut self,
         parent_dettid: DetTid,
         child_dettid: DetTid,
         is_group_leader: bool,
+    ) {
+        self.add_child_with_wait_metadata(
+            parent_dettid,
+            child_dettid,
+            is_group_leader,
+            false,
+            libc::SIGCHLD,
+        );
+    }
+
+    /// Add a child while preserving the Linux identities used by wait-family
+    /// selection. `clone_parent` changes the child's effective wait parent and
+    /// owner to the caller's own parent task; threads never enter this process
+    /// metadata table.
+    pub fn add_child_with_wait_metadata(
+        &mut self,
+        parent_dettid: DetTid,
+        child_dettid: DetTid,
+        is_group_leader: bool,
+        clone_parent: bool,
+        exit_signal: libc::c_int,
     ) {
         // TODO(T78538674): virtualize pid/tid:
         if parent_dettid == child_dettid {
@@ -804,13 +841,50 @@ impl ThreadTree {
         if is_group_leader {
             self.thread_group_leaders.insert(child_dettid);
             self.thread_to_leader.insert(child_dettid, child_dettid);
-            // Record the creating process (the parent thread's group leader) so a
-            // deterministic child-exit SIGCHLD can later be targeted at it. The
-            // root process (parent == child) has no parent process.
-            if parent_dettid != child_dettid
-                && let Some(parent_leader) = self.thread_to_leader.get(&parent_dettid).copied()
-            {
-                self.process_parent.insert(child_dettid, parent_leader);
+            if parent_dettid == child_dettid {
+                self.process_wait.insert(
+                    child_dettid,
+                    ProcessWaitMetadata {
+                        wait_parent: None,
+                        wait_owner: child_dettid,
+                        exit_signal: libc::SIGCHLD,
+                        process_group: child_dettid,
+                        session: child_dettid,
+                    },
+                );
+            } else {
+                let parent_process = self
+                    .thread_to_leader
+                    .get(&parent_dettid)
+                    .copied()
+                    .expect("process child parent must have a thread-group leader");
+                let parent_metadata = self.process_wait.get(&parent_process).copied().unwrap_or(
+                    ProcessWaitMetadata {
+                        wait_parent: None,
+                        wait_owner: parent_dettid,
+                        exit_signal: libc::SIGCHLD,
+                        process_group: parent_process,
+                        session: parent_process,
+                    },
+                );
+                let (wait_parent, wait_owner) = if clone_parent {
+                    (parent_metadata.wait_parent, parent_metadata.wait_owner)
+                } else {
+                    (Some(parent_process), parent_dettid)
+                };
+                if let Some(wait_parent) = wait_parent {
+                    self.process_parent.insert(child_dettid, wait_parent);
+                }
+                self.process_wait.insert(
+                    child_dettid,
+                    ProcessWaitMetadata {
+                        wait_parent,
+                        wait_owner,
+                        exit_signal,
+                        process_group: parent_metadata.process_group,
+                        session: parent_metadata.session,
+                    },
+                );
             }
         } else {
             let parent_leader: DetPid =
@@ -831,6 +905,29 @@ impl ThreadTree {
     /// signal to a `Gone` target.
     pub fn parent_process(&self, pid: &DetPid) -> Option<DetPid> {
         self.process_parent.get(pid).copied()
+    }
+
+    pub fn process_group(&self, pid: DetPid) -> Option<DetPid> {
+        self.process_wait
+            .get(&pid)
+            .map(|metadata| metadata.process_group)
+    }
+
+    pub fn set_process_group(&mut self, pid: DetPid, process_group: DetPid) -> bool {
+        let Some(metadata) = self.process_wait.get_mut(&pid) else {
+            return false;
+        };
+        metadata.process_group = process_group;
+        true
+    }
+
+    pub fn create_session(&mut self, pid: DetPid) -> bool {
+        let Some(metadata) = self.process_wait.get_mut(&pid) else {
+            return false;
+        };
+        metadata.session = pid;
+        metadata.process_group = pid;
+        true
     }
 
     /// Return the set of thread IDs in the "same process" as me (same TGID), including
@@ -2272,37 +2369,37 @@ impl Scheduler {
         }
     }
 
-    fn child_matches_wait(
-        &self,
-        parent: DetPid,
-        child: DetPid,
-        selector: ChildWaitSelector,
-    ) -> bool {
-        self.thread_tree.parent_process(&child) == Some(parent)
-            && match selector {
+    fn child_matches_wait(&self, parent: DetPid, child: DetPid, spec: ChildWaitSpec) -> bool {
+        let Some(metadata) = self.thread_tree.process_wait.get(&child) else {
+            return false;
+        };
+        metadata.wait_parent == Some(parent)
+            && spec.owner.is_none_or(|owner| metadata.wait_owner == owner)
+            && match spec.exit_class {
+                ChildWaitExitClass::Sigchld => metadata.exit_signal == libc::SIGCHLD,
+                ChildWaitExitClass::Clone => metadata.exit_signal != libc::SIGCHLD,
+                ChildWaitExitClass::Any => true,
+            }
+            && match spec.selector {
                 ChildWaitSelector::Exact(expected) => child == expected,
                 ChildWaitSelector::Any => true,
+                ChildWaitSelector::ProcessGroup(group) => metadata.process_group == group,
             }
     }
 
-    pub fn ready_child_wait(&self, parent: DetPid, selector: ChildWaitSelector) -> Option<DetPid> {
+    pub fn ready_child_wait(&self, parent: DetPid, spec: ChildWaitSpec) -> Option<DetPid> {
         self.logically_exited_processes
             .iter()
             .copied()
-            .find(|child| self.child_matches_wait(parent, *child, selector))
+            .find(|child| self.child_matches_wait(parent, *child, spec))
     }
 
-    pub fn has_child_wait_target(&self, parent: DetPid, selector: ChildWaitSelector) -> bool {
+    pub fn has_child_wait_target(&self, parent: DetPid, spec: ChildWaitSpec) -> bool {
         self.thread_tree
-            .process_parent
-            .iter()
-            .any(|(child, wait_parent)| {
-                *wait_parent == parent
-                    && match selector {
-                        ChildWaitSelector::Exact(expected) => *child == expected,
-                        ChildWaitSelector::Any => true,
-                    }
-            })
+            .process_wait
+            .keys()
+            .copied()
+            .any(|child| self.child_matches_wait(parent, child, spec))
     }
 
     pub fn consume_child_wait(&mut self, parent: DetPid, child: DetPid) -> bool {
@@ -2312,6 +2409,7 @@ impl Scheduler {
         self.wake_child_waiters(parent, child);
         self.completed_physical_process_exits.remove(&child);
         self.thread_tree.process_parent.remove(&child);
+        self.thread_tree.process_wait.remove(&child);
         self.logically_exited_processes.remove(&child)
     }
 
@@ -2320,8 +2418,8 @@ impl Scheduler {
             .blocked
             .child_waiters
             .iter()
-            .filter_map(|(dettid, (wait_parent, selector))| {
-                (*wait_parent == parent && self.child_matches_wait(parent, child, *selector))
+            .filter_map(|(dettid, (wait_parent, spec))| {
+                (*wait_parent == parent && self.child_matches_wait(parent, child, *spec))
                     .then_some(*dettid)
             })
             .collect();
@@ -3256,20 +3354,20 @@ impl Scheduler {
                 Ok(())
             }
 
-            ResourceID::WaitChild { parent, selector } => {
-                if self.ready_child_wait(*parent, *selector).is_some()
-                    || !self.has_child_wait_target(*parent, *selector)
+            ResourceID::WaitChild { parent, spec } => {
+                if self.ready_child_wait(*parent, *spec).is_some()
+                    || !self.has_child_wait_target(*parent, *spec)
                 {
                     Ok(())
                 } else {
                     info!(
                         "[scheduler] NONCOMMIT turn {}, parking dettid {} for child {:?}",
-                        self.turn, dettid, selector
+                        self.turn, dettid, spec
                     );
                     assert!(
                         self.blocked
                             .child_waiters
-                            .insert(dettid, (*parent, *selector))
+                            .insert(dettid, (*parent, *spec))
                             .is_none()
                     );
                     self.skip_turn_blocked(dettid)
@@ -4397,6 +4495,14 @@ impl Scheduler {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    fn normal_wait(selector: ChildWaitSelector) -> ChildWaitSpec {
+        ChildWaitSpec {
+            selector,
+            owner: None,
+            exit_class: ChildWaitExitClass::Sigchld,
+        }
+    }
 
     fn futex_waiter(dettid: i32, bitset: u32) -> FutexWaiter {
         FutexWaiter {
@@ -5795,14 +5901,80 @@ mod test {
         scheduler.logically_exited_processes.insert(second);
 
         assert_eq!(
-            scheduler.ready_child_wait(parent, ChildWaitSelector::Any),
+            scheduler.ready_child_wait(parent, normal_wait(ChildWaitSelector::Any)),
             Some(first)
         );
         assert!(scheduler.consume_child_wait(parent, first));
         assert_eq!(
-            scheduler.ready_child_wait(parent, ChildWaitSelector::Any),
+            scheduler.ready_child_wait(parent, normal_wait(ChildWaitSelector::Any)),
             Some(second)
         );
+    }
+
+    #[test]
+    fn terminal_wait_selects_group_owner_and_clone_class() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let parent = DetPid::from_raw(100);
+        let owner_a = DetTid::from_raw(101);
+        let owner_b = DetTid::from_raw(102);
+        let normal = DetPid::from_raw(200);
+        let clone_child = DetPid::from_raw(300);
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, owner_a, false);
+        scheduler.thread_tree.add_child(parent, owner_b, false);
+        scheduler.thread_tree.add_child_with_wait_metadata(
+            owner_a,
+            normal,
+            true,
+            false,
+            libc::SIGCHLD,
+        );
+        scheduler
+            .thread_tree
+            .add_child_with_wait_metadata(owner_b, clone_child, true, false, 0);
+        let group = DetPid::from_raw(77);
+        assert!(scheduler.thread_tree.set_process_group(normal, group));
+        assert!(scheduler.thread_tree.set_process_group(clone_child, group));
+        scheduler.logically_exited_processes.insert(normal);
+        scheduler.logically_exited_processes.insert(clone_child);
+
+        assert_eq!(
+            scheduler.ready_child_wait(
+                parent,
+                ChildWaitSpec {
+                    selector: ChildWaitSelector::ProcessGroup(group),
+                    owner: Some(owner_b),
+                    exit_class: ChildWaitExitClass::Clone,
+                },
+            ),
+            Some(clone_child)
+        );
+        assert_eq!(
+            scheduler.ready_child_wait(
+                parent,
+                ChildWaitSpec {
+                    selector: ChildWaitSelector::Any,
+                    owner: Some(owner_a),
+                    exit_class: ChildWaitExitClass::Sigchld,
+                },
+            ),
+            Some(normal)
+        );
+    }
+
+    #[test]
+    fn clone_parent_inherits_effective_wait_owner() {
+        let mut tree = ThreadTree::default();
+        let grandparent = DetTid::from_raw(10);
+        let parent = DetTid::from_raw(20);
+        let child = DetTid::from_raw(30);
+        tree.add_child(grandparent, grandparent, true);
+        tree.add_child_with_wait_metadata(grandparent, parent, true, false, libc::SIGCHLD);
+        tree.add_child_with_wait_metadata(parent, child, true, true, libc::SIGCHLD);
+
+        assert_eq!(tree.parent_process(&child), Some(grandparent));
+        let metadata = tree.process_wait.get(&child).expect("child metadata");
+        assert_eq!(metadata.wait_owner, grandparent);
     }
 
     #[test]

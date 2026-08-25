@@ -191,6 +191,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sendmmsg
         | Sysno::sendmsg
         | Sysno::sendto
+        | Sysno::setpgid
         | Sysno::setsid
         | Sysno::signalfd
         | Sysno::signalfd4
@@ -708,9 +709,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // queries under fixed guest address and PID namespaces.
         | Sysno::get_robust_list
         | Sysno::set_robust_list
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#663)
-        | Sysno::setpgid
         | Sysno::set_tid_address
         | Sysno::sigaltstack
         // capget/capset/getgroups observe or update kernel credential state that starts
@@ -1614,6 +1612,7 @@ mod tests {
         "sethostname",
         "setitimer",
         "setns",
+        "setpgid",
         "setpriority",
         "setregid",
         "setresgid",
@@ -1745,7 +1744,6 @@ mod tests {
         "set_robust_list",
         "set_thread_area",
         "set_tid_address",
-        "setpgid",
         "setxattr",
         "sigaltstack",
         "symlink",
@@ -2015,6 +2013,7 @@ mod tests {
             Sysno::prctl,
             Sysno::rt_sigpending,
             Sysno::setitimer,
+            Sysno::setpgid,
             Sysno::setpriority,
             Sysno::process_madvise,
             Sysno::setrlimit,
@@ -2068,7 +2067,6 @@ mod tests {
             Sysno::getpgid,
             Sysno::getpgrp,
             Sysno::getsid,
-            Sysno::setpgid,
             Sysno::lgetxattr,
             Sysno::link,
             Sysno::linkat,

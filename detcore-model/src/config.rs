@@ -109,6 +109,13 @@ pub struct Config {
     #[clap(skip = true)]
     pub backend_dispatches_thread_tools: bool,
 
+    /// The backend reports every process child through Detcore's child-registration protocol.
+    /// When true, an empty scheduler selection is authoritative ECHILD rather than a reason to
+    /// fall back to backend-specific wait filtering.
+    #[serde(default = "default_true")]
+    #[clap(skip = true)]
+    pub backend_tracks_process_children: bool,
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1058): Review process-signal identity translation.
     /// The backend cannot execute process-directed signal syscalls using Detcore's guest PID and
@@ -1288,6 +1295,7 @@ mod tests {
         assert!(!config.backend_reports_physical_process_exits);
         assert!(!config.backend_serializes_fork_children);
         assert!(config.backend_dispatches_thread_tools);
+        assert!(config.backend_tracks_process_children);
         assert!(!config.backend_requires_thread_directed_process_signals);
         assert!(!config.backend_virtualizes_capability_prctls);
         assert!(!config.backend_defers_vfork_child_registration);
