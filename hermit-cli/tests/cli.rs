@@ -3120,14 +3120,40 @@ fn record_list_rejects_a_non_directory_inventory() {
 
 #[test]
 fn run_rejects_invalid_programs_with_actionable_errors() {
+    // ⚠️ THE CODE IS ASSERTED HERE, NOT LEFT TO `assert_failure_contains`, WHICH
+    // PINS 1. A missing guest program is 127 -- the GNU command-not-found
+    // convention -- and the whole point of these two arms is that the SAME fault
+    // gets the SAME code whichever way the caller spelled the path. The shared
+    // helper cannot express that: it asserts a single legacy status across
+    // seventeen call sites and is being dealt with separately.
     let output = hermit(&["run", "--", "/definitely/missing/hermit-program"]);
-    assert_failure_contains(
-        &output,
-        &["does not exist or is not accessible", "Check the path"],
+    assert_eq!(
+        output.status.code(),
+        Some(127),
+        "an absolute path that does not exist is command-not-found\nstderr:\n{}",
+        stderr(&output)
     );
+    for message in ["does not exist or is not accessible", "Check the path"] {
+        assert!(stderr(&output).contains(message), "missing {message:?}");
+    }
 
+    // ⚠️ THE ARM THIS EXISTS FOR. The same fault reached by PATH lookup returned
+    // 125 with class=cli-error, so a caller scripting on the code got 127 or 125
+    // for one mistake depending only on spelling -- and 125 is also what
+    // bin/safehermit returns for a byte-cap cgroup kill, so under that wrapper a
+    // mistyped program name was indistinguishable from a run killed for output
+    // volume.
     let output = hermit(&["run", "--", "definitely-missing-hermit-program"]);
-    assert_failure_contains(&output, &["Could not resolve program", "guest PATH"]);
+    assert_eq!(
+        output.status.code(),
+        Some(127),
+        "a bare name unresolvable on the guest PATH is the SAME fault as the \
+         absolute case and must carry the same code\nstderr:\n{}",
+        stderr(&output)
+    );
+    for message in ["Could not resolve program", "guest PATH"] {
+        assert!(stderr(&output).contains(message), "missing {message:?}");
+    }
 
     let temp = tempfile::tempdir().expect("failed to create program fixture directory");
     let non_executable = temp.path().join("non-executable");
@@ -3138,14 +3164,33 @@ fn run_rejects_invalid_programs_with_actionable_errors() {
         .arg(&non_executable)
         .output()
         .expect("failed to run hermit");
-    assert_failure_contains(&output, &["is not executable", "chmod +x"]);
+    // 126: present but not executable. DISTINCT from the 127 above -- if these
+    // ever collapse, a caller cannot tell "you typed the wrong name" from "the
+    // file is there and you forgot chmod +x".
+    assert_eq!(
+        output.status.code(),
+        Some(126),
+        "found-but-not-executable is 126, not 127 and not 125\nstderr:\n{}",
+        stderr(&output)
+    );
+    for message in ["is not executable", "chmod +x"] {
+        assert!(stderr(&output).contains(message), "missing {message:?}");
+    }
 
     let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
         .args(["run", "--tmp=/tmp", "--"])
         .arg(temp.path())
         .output()
         .expect("failed to run hermit");
-    assert_failure_contains(&output, &["is a directory", "executable file"]);
+    assert_eq!(
+        output.status.code(),
+        Some(126),
+        "a directory is found-but-not-executable, 126\nstderr:\n{}",
+        stderr(&output)
+    );
+    for message in ["is a directory", "executable file"] {
+        assert!(stderr(&output).contains(message), "missing {message:?}");
+    }
 
     let bad_shebang = temp.path().join("bad-shebang");
     fs::write(&bad_shebang, "#!/definitely/missing/interpreter\n").expect("failed to write script");
@@ -3160,10 +3205,24 @@ fn run_rejects_invalid_programs_with_actionable_errors() {
         .arg(&bad_shebang)
         .output()
         .expect("failed to run hermit");
-    assert_failure_contains(
-        &output,
-        &["uses shebang interpreter", "does not exist", "#! line"],
+    // ⚠️ 125 IS PINNED HERE AS WHAT THE PRODUCT DOES, NOT AS WHAT IT SHOULD DO.
+    // The program exists and is executable; its INTERPRETER does not exist. By
+    // the GNU convention that gives 127 its meaning that is arguably another
+    // command-not-found, and by the argument above it is certainly not a
+    // hermit-internal failure. But it is a separate product decision from the one
+    // this change makes, and deciding it silently inside a test is how the
+    // 127/125 split arrived in the first place. Left as an open question with the
+    // current value asserted so a change to it is deliberate and visible.
+    assert_eq!(
+        output.status.code(),
+        Some(125),
+        "a missing shebang interpreter currently reports as a cli-error; see the \
+         note above before changing this\nstderr:\n{}",
+        stderr(&output)
     );
+    for message in ["uses shebang interpreter", "does not exist", "#! line"] {
+        assert!(stderr(&output).contains(message), "missing {message:?}");
+    }
 }
 
 #[test]
