@@ -5695,7 +5695,14 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          liteinst: false
+        ci_disabled_reason:
+          liteinst:
+            result: timeout
+            evidence: "task requalify_pr_2333_liteinst; /home/newton/liteinst-pr2333-requal-20260825"
+            reason: Exact-current-main qualification with a staged, positively activated LiteInst runtime timed out opening the tracee pidfd in 21 of 21 isolated and paired-load runs before producing a terminal comparison; retain this executable cell as red and requalify after the LiteInst startup failure is fixed.
         backends_enabled:
           - ptrace
           - liteinst
@@ -5761,7 +5768,14 @@ test:
         - -D_GNU_SOURCE
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          liteinst: false
+        ci_disabled_reason:
+          liteinst:
+            result: timeout
+            evidence: "task requalify_pr_2333_liteinst; /home/newton/liteinst-pr2333-requal-20260825"
+            reason: Exact-current-main qualification with a staged, positively activated LiteInst runtime timed out opening the tracee pidfd in 21 of 21 isolated and paired-load runs before producing a terminal comparison; retain this executable cell as red and requalify after the LiteInst startup failure is fixed.
         backends_enabled:
           - ptrace
           - liteinst
