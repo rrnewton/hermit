@@ -8,23 +8,23 @@ Every selected `verify` cell, and every seed in a selected `chaos` cell, runs th
 
 | Backend | Green | Red | Total |
 | --- | ---: | ---: | ---: |
-| `ptrace` | 227 | 808 | 1035 |
-| `dbt` | 0 | 1035 | 1035 |
-| `kvm` | 0 | 1035 | 1035 |
-| `sabre` | 53 | 982 | 1035 |
-| `liteinst` | 0 | 1035 | 1035 |
-| `native` | 0 | 345 | 345 |
-| **Total** | **280** | **5240** | **5520** |
+| `ptrace` | 227 | 811 | 1038 |
+| `dbt` | 0 | 1038 | 1038 |
+| `kvm` | 0 | 1038 | 1038 |
+| `sabre` | 53 | 985 | 1038 |
+| `liteinst` | 0 | 1038 | 1038 |
+| `native` | 0 | 346 | 346 |
+| **Total** | **280** | **5256** | **5536** |
 
 The mode view makes the current order of work explicit: expand `verify` first, then `replay`, then `chaos`. Each backend cell is `green / total`; an em dash means that mode does not exist for that backend.
 
 | Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `native` | Green | Red | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `verify` | 224 / 345 | 0 / 345 | 0 / 345 | 53 / 345 | 0 / 345 | — | 277 | 1448 | 1725 |
-| `replay` | 1 / 345 | 0 / 345 | 0 / 345 | 0 / 345 | 0 / 345 | — | 1 | 1724 | 1725 |
-| `chaos` | 2 / 345 | 0 / 345 | 0 / 345 | 0 / 345 | 0 / 345 | — | 2 | 1723 | 1725 |
-| `naked` | — | — | — | — | — | 0 / 345 | 0 | 345 | 345 |
-| **Total** | | | | | | | **280** | **5240** | **5520** |
+| `verify` | 224 / 346 | 0 / 346 | 0 / 346 | 53 / 346 | 0 / 346 | — | 277 | 1453 | 1730 |
+| `replay` | 1 / 346 | 0 / 346 | 0 / 346 | 0 / 346 | 0 / 346 | — | 1 | 1729 | 1730 |
+| `chaos` | 2 / 346 | 0 / 346 | 0 / 346 | 0 / 346 | 0 / 346 | — | 2 | 1728 | 1730 |
+| `naked` | — | — | — | — | — | 0 / 346 | 0 | 346 | 346 |
+| **Total** | | | | | | | **280** | **5256** | **5536** |
 
 ## Cross-backend parity
 
@@ -39,7 +39,7 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | `applications` | 3 / 6 | 0 / 6 | 0 / 6 | 3 | 18 |
 | `backend-parity-c` | 85 / 100 | 0 / 100 | 0 / 100 | 85 | 300 |
 | `bin-c` | 0 / 2 | 0 / 2 | 0 / 2 | 0 | 6 |
-| `c-programs` | 75 / 160 | 0 / 160 | 0 / 160 | 75 | 480 |
+| `c-programs` | 75 / 161 | 0 / 161 | 0 / 161 | 75 | 483 |
 | `chaos-c` | 0 / 1 | 0 / 1 | 1 / 1 | 1 | 3 |
 | `data-handling` | 6 / 6 | 0 / 6 | 0 / 6 | 6 | 18 |
 | `debugger-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |

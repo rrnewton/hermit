@@ -338,6 +338,15 @@ impl DetFd {
     /// Whether this procfs snapshot consumes deterministic random bytes.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-955): Review deterministic kernel UUID generation.
+    /// Whether this snapshot has maps-format headers needing determinized
+    /// device and inode columns.
+    pub(crate) fn procfs_needs_mapping_identities(&self) -> bool {
+        self.description()
+            .procfs
+            .as_ref()
+            .is_some_and(ProcfsFile::needs_mapping_identities)
+    }
+
     pub(crate) fn procfs_needs_random_uuid(&self) -> bool {
         self.description()
             .procfs
