@@ -137,6 +137,10 @@ struct OpenFileDescription {
     /// whose binary dump replies carry host-assigned socket inode numbers that
     /// must be determinized (see `crate::sock_diag`).
     sock_diag: bool,
+    /// Whether this open file is a `NETLINK_ROUTE` socket whose link-dump
+    /// replies carry live interface counters that must be zeroed (see
+    /// `crate::netlink_route`).
+    netlink_route: bool,
     /// True when this socket connected to an IPv4 or IPv6 loopback peer.
     #[serde(default)]
     loopback_peer: bool,
@@ -216,6 +220,7 @@ impl DetFd {
                 procfs: None,
                 socket_receive_timestamp: None,
                 sock_diag: false,
+                netlink_route: false,
                 loopback_peer: false,
                 flock_mode: None,
                 flock_mode_known: true,
@@ -554,6 +559,19 @@ impl DetFd {
     /// must have their socket inode numbers determinized.
     pub(crate) fn is_sock_diag(&self) -> bool {
         self.description().sock_diag
+    }
+
+    /// Mark this open file as a `NETLINK_ROUTE` socket. Like `set_sock_diag`
+    /// this applies to the open file description, so a dup or fork alias of the
+    /// same socket is covered too.
+    pub(crate) fn set_netlink_route(&self) {
+        self.description().netlink_route = true;
+    }
+
+    /// Whether this open file is a `NETLINK_ROUTE` socket whose link-dump
+    /// replies carry live interface counters.
+    pub(crate) fn is_netlink_route(&self) -> bool {
+        self.description().netlink_route
     }
 
     /// Update whether this open file is connected to a loopback peer.
