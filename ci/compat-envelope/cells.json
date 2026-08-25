@@ -59248,7 +59248,7 @@
       "backend": "sabre",
       "enabled": false,
       "status": "not-applicable",
-      "not_applicable_reason": "SaBRe requires its external runtime",
+      "not_applicable_reason": "SaBRe path ineligible - the measured verify pair recorded 132 trusted shared-object sites (33 libc/ld-linux syscall instructions x Perl and tr x two runs; clock_gettime, getrandom, file I/O, memory mapping, and signal operations); forcing the first through the SaBRe marker caused SIGILL, so qualification requires zero trusted or fallback sites",
       "observations": [],
       "measurement": "never-measured"
     },
