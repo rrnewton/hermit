@@ -29,6 +29,8 @@ use super::deterministic_stdio_inode;
 use crate::record_or_replay::RecordOrReplay;
 use crate::tool_global::determinize_inode;
 use crate::tool_local::Detcore;
+use crate::types::DetInode;
+use crate::types::RawInode;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#877)
@@ -147,7 +149,100 @@ fn host_self_proc_fd_alias(path: &Path, current_pid: i64) -> Option<PathBuf> {
     (i64::from(subject) == current_pid).then(|| PathBuf::from(format!("/proc/self/fd/{fd}")))
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct AnonymousProcFdIdentity {
+    kind: &'static str,
+    raw_inode: RawInode,
+}
+
+/// Recognize only a complete kernel pipe/socket symlink target.
+fn anonymous_proc_fd_identity(target: &[u8]) -> Option<AnonymousProcFdIdentity> {
+    for (kind, prefix) in [
+        ("pipe", b"pipe:[".as_slice()),
+        ("socket", b"socket:[".as_slice()),
+    ] {
+        let Some(digits) = target
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(b"]"))
+        else {
+            continue;
+        };
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        let raw_inode = std::str::from_utf8(digits).ok()?.parse().ok()?;
+        return Some(AnonymousProcFdIdentity { kind, raw_inode });
+    }
+    None
+}
+
+/// Match a raw identity against cached current-process stdio identities.
+///
+/// Iterating in fd order deliberately matches the last-insert-wins behavior of
+/// the maps sanitizer's `stdio_by_raw_inode` table when stdio descriptors alias.
+fn deterministic_stdio_inode_for_raw(
+    raw_inode: RawInode,
+    stdio_raw_inodes: &[Option<RawInode>; 3],
+) -> Option<DetInode> {
+    let mut matched = None;
+    for (fd, cached) in stdio_raw_inodes.iter().enumerate() {
+        if *cached == Some(raw_inode) {
+            matched = deterministic_stdio_inode(fd as i32);
+        }
+    }
+    matched
+}
+
+fn canonical_anonymous_proc_fd_target(
+    identity: &AnonymousProcFdIdentity,
+    inode: DetInode,
+    buffer_len: usize,
+) -> Vec<u8> {
+    let mut target = format!("{}:[{}]", identity.kind, inode.as_raw()).into_bytes();
+    target.truncate(buffer_len);
+    target
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
+    /// Canonicalize a pipe/socket link belonging to another virtual process.
+    /// The target descriptor is not in the caller's table, so its raw readlink
+    /// bytes are the only safe identity evidence available here.
+    async fn canonicalize_other_proc_fd_readlink<G>(
+        &self,
+        guest: &mut G,
+        buffer: Option<AddrMut<'_, libc::c_char>>,
+        buffer_len: usize,
+        result: i64,
+    ) -> Result<i64, Error>
+    where
+        G: Guest<Self>,
+    {
+        let buffer = buffer.expect("a successful readlink requires a non-null buffer");
+        let observed_len = usize::try_from(result)
+            .expect("a positive readlink result must fit usize")
+            .min(buffer_len);
+        let mut observed = vec![0; observed_len];
+        guest.memory().read_exact(buffer.cast(), &mut observed)?;
+        let Some(identity) = anonymous_proc_fd_identity(&observed) else {
+            return Ok(result);
+        };
+        let mut stdio_raw_inodes = [None; 3];
+        for fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
+            stdio_raw_inodes[fd as usize] = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.inode))
+                .ok()
+                .flatten();
+        }
+        let inode = match deterministic_stdio_inode_for_raw(identity.raw_inode, &stdio_raw_inodes) {
+            Some(inode) => inode,
+            None => determinize_inode(guest, identity.raw_inode).await.0,
+        };
+        let target = canonical_anonymous_proc_fd_target(&identity, inode, buffer_len);
+        guest.memory().write_exact(buffer.cast(), &target)?;
+        Ok(target.len() as i64)
+    }
+
     async fn canonicalize_namespace_readlink_result<G>(
         &self,
         guest: &mut G,
@@ -169,7 +264,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             if let Some(subject) = subject {
                 let current_pid = guest.inject(syscalls::Getpid::new()).await?;
                 if current_pid != i64::from(subject) {
-                    return Ok(result);
+                    return self
+                        .canonicalize_other_proc_fd_readlink(guest, buffer, buffer_len, result)
+                        .await;
                 }
             }
 
@@ -356,5 +453,68 @@ mod tests {
         ] {
             assert_eq!(proc_fd_target(Path::new(path)), None, "{path}");
         }
+    }
+
+    #[test]
+    fn recognizes_only_anonymous_pipe_and_socket_targets() {
+        assert_eq!(
+            anonymous_proc_fd_identity(b"pipe:[987654321]"),
+            Some(AnonymousProcFdIdentity {
+                kind: "pipe",
+                raw_inode: 987_654_321,
+            })
+        );
+        assert_eq!(
+            anonymous_proc_fd_identity(b"socket:[42]"),
+            Some(AnonymousProcFdIdentity {
+                kind: "socket",
+                raw_inode: 42,
+            })
+        );
+
+        for target in [
+            b"pip".as_slice(),
+            b"socket:[12345".as_slice(),
+            b"/tmp/regular-file".as_slice(),
+            b"anon_inode:[eventpoll]".as_slice(),
+            b"pipe:[]".as_slice(),
+            b"pipe:[12]suffix".as_slice(),
+            b"socket:[not-a-number]".as_slice(),
+        ] {
+            assert_eq!(anonymous_proc_fd_identity(target), None, "{target:?}");
+        }
+    }
+
+    #[test]
+    fn stdio_identity_requires_a_raw_inode_match_and_preserves_alias_precedence() {
+        let stdio = [Some(11), Some(22), Some(33)];
+        assert_eq!(
+            deterministic_stdio_inode_for_raw(22, &stdio),
+            Some(DetInode::mint(1001))
+        );
+        assert_eq!(deterministic_stdio_inode_for_raw(44, &stdio), None);
+
+        let aliased = [None, Some(55), Some(55)];
+        assert_eq!(
+            deterministic_stdio_inode_for_raw(55, &aliased),
+            Some(DetInode::mint(1002))
+        );
+    }
+
+    #[test]
+    fn anonymous_target_rewrite_ignores_raw_inode_width_and_truncates_to_buffer() {
+        let short_raw = anonymous_proc_fd_identity(b"pipe:[42]").unwrap();
+        let long_raw = anonymous_proc_fd_identity(b"pipe:[987654321]").unwrap();
+        let short_rewrite =
+            canonical_anonymous_proc_fd_target(&short_raw, DetInode::mint(1001), usize::MAX);
+        let long_rewrite =
+            canonical_anonymous_proc_fd_target(&long_raw, DetInode::mint(1001), usize::MAX);
+        assert_eq!(short_rewrite, b"pipe:[1001]");
+        assert_eq!(long_rewrite, short_rewrite);
+
+        assert_eq!(
+            canonical_anonymous_proc_fd_target(&long_raw, DetInode::mint(1001), 8),
+            b"pipe:[10"
+        );
     }
 }
