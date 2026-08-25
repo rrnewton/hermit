@@ -45,7 +45,7 @@ Commands:
       Print the derived compatibility table.
   check
       Refuse if SCORECARD.md or ci/compat-envelope/cells.json is stale.
-  update [--allow-green-removal] [--allow-cell-removal]
+  update [--allow-green-removal REASON] [--allow-cell-removal]
       Rewrite the two tracked files. Green regressions and cell deletion are
       refused unless the matching explicit flag is present.
   update-observations --summary FILE
@@ -162,6 +162,29 @@ struct TrackedCell {
     status: CellStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ci_disabled_reason: Option<CiDisabledReasonData>,
+    /// Why the green-removal ratchet was OVERRIDDEN for this cell, verbatim from
+    /// `update --allow-green-removal <reason>`.
+    ///
+    /// ⚠️ THIS EXISTS BECAUSE THE OVERRIDE USED TO LEAVE NO TRACE. The ratchet at
+    /// the top of [`tracked_from`] does refuse a green -> red move -- measured, it
+    /// names the cell and exits 2. But `--allow-green-removal` was a bare flag
+    /// typed into a shell, so once it was used nothing in the tree recorded that
+    /// it had been. A reviewer reading the diff saw a cell flip green -> red and
+    /// could not tell "the generator was run normally" from "the generator
+    /// refused and the author told it not to". Both readings produce byte-
+    /// identical output, which is what made the guard's override invisible rather
+    /// than merely permissive.
+    ///
+    /// Measured on 2026-08-25: the two required-plan reductions on main
+    /// (3398c18343, 300 -> 299 and 8ca72c6851, 298 -> 296) both took this path and
+    /// both recorded their reason -- one in a 33-line commit message, one in a
+    /// `ci_disabled_reason` field. Two conventions, two places, and no gate reads
+    /// either. This field is the one place that travels with the cell.
+    ///
+    /// CLEARED when the cell is green again, so it describes the CURRENT
+    /// override and never accumulates history a reader would have to date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    green_removal_reason: Option<String>,
     /// Why this cell is [`CellStatus::NotApplicable`], verbatim from the
     /// manifest. Present exactly when the status is `NotApplicable`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1047,16 +1070,36 @@ fn run() -> Result<(), String> {
             );
         }
         "update" => {
-            let mut allow_green_removal = false;
+            let mut allow_green_removal: Option<String> = None;
             let mut allow_cell_removal = false;
-            for arg in args {
+            let mut args = args;
+            while let Some(arg) = args.next() {
                 match arg.as_str() {
-                    "--allow-green-removal" => allow_green_removal = true,
+                    // TAKES THE REASON AS ITS VALUE rather than pairing a bare
+                    // flag with a separate --reason. A bare flag can be used
+                    // without one; this cannot, so the justification is not
+                    // something the author may forget to supply.
+                    "--allow-green-removal" => {
+                        let reason = args.next().ok_or_else(|| {
+                            "--allow-green-removal requires a reason: \
+                             --allow-green-removal \"why this transition is correct\". \
+                             The reason is written into ci/compat-envelope/cells.json next to \
+                             each cell it moves, so the override is visible in the diff instead \
+                             of living only in the shell history of whoever ran it."
+                                .to_string()
+                        })?;
+                        if reason.trim().is_empty() || reason.starts_with("--") {
+                            return Err(format!(
+                                "--allow-green-removal needs a reason, got `{reason}`"
+                            ));
+                        }
+                        allow_green_removal = Some(reason);
+                    }
                     "--allow-cell-removal" => allow_cell_removal = true,
                     _ => return Err(format!("unknown update option `{arg}`\n\n{USAGE}")),
                 }
             }
-            update_tracked(&root, allow_green_removal, allow_cell_removal)?;
+            update_tracked(&root, allow_green_removal.as_deref(), allow_cell_removal)?;
         }
         "update-observations" => {
             let mut summary = None;
@@ -1588,7 +1631,7 @@ all of them; a failing green cell is a regression, not permission to move it to 
 fn tracked_from(
     derived: &Derived,
     existing: Option<TrackedCells>,
-    allow_green_removal: bool,
+    allow_green_removal: Option<&str>,
     allow_cell_removal: bool,
 ) -> Result<TrackedCells, String> {
     let mut previous = BTreeMap::new();
@@ -1629,14 +1672,21 @@ fn tracked_from(
         })
         .map(|cell| cell.id.clone())
         .collect();
-    if !regressed.is_empty() && !allow_green_removal {
+    if !regressed.is_empty() && allow_green_removal.is_none() {
         return Err(format!(
             "refusing to move {} green cell(s) to red; first is {}. Fix the regression, or use \
-             --allow-green-removal only at an explicit compatibility-standard transition",
+             --allow-green-removal <reason> only at an explicit compatibility-standard transition",
             regressed.len(),
             display_id(&regressed[0])
         ));
     }
+    // The override is recorded ON the cells it was used for, so it lands in the
+    // same diff hunk as the status flip a reviewer is reading.
+    let overridden: BTreeSet<_> = if allow_green_removal.is_some() {
+        regressed.iter().cloned().collect()
+    } else {
+        BTreeSet::new()
+    };
 
 
     let cells = derived
@@ -1667,6 +1717,18 @@ fn tracked_from(
             };
             let ci_disabled_reason = derived.ci_disabled_reasons.get(&id).cloned();
             let not_applicable_reason = derived.not_applicable_reasons.get(&id).cloned();
+            // Set when THIS update overrode the ratchet for this cell; otherwise
+            // carried forward while the cell stays red, and dropped the moment it
+            // is green again so the field always describes a live override.
+            let green_removal_reason = if status == CellStatus::Green {
+                None
+            } else if overridden.contains(&id) {
+                allow_green_removal.map(str::to_string)
+            } else {
+                previous
+                    .get(&id)
+                    .and_then(|cell| cell.green_removal_reason.clone())
+            };
             TrackedCell {
                 id,
                 enabled,
@@ -1676,6 +1738,7 @@ fn tracked_from(
                 last_tested,
                 observations,
                 measurement: MeasurementState::NeverMeasured,
+                green_removal_reason,
             }
         })
         .collect();
@@ -1902,7 +1965,7 @@ fn check_tracked(root: &Path) -> Result<Derived, String> {
     // nowhere in the message the operator actually saw. Deleting a cell already reported its own
     // cause correctly, because that path has no SCORECARD.md difference to mask it -- which is
     // why this looked intermittent rather than ordered.
-    let mut cells = tracked_from(&derived, load_existing(root)?, false, false)?;
+    let mut cells = tracked_from(&derived, load_existing(root)?, None, false)?;
     let expected_scorecard = render_scorecard(&derived);
     compare_file(&root.join(SCORECARD), &expected_scorecard)?;
     // The WRITE path applies this before serialising (see `update_tracked`), so the READ path
@@ -1936,7 +1999,7 @@ fn compare_file(path: &Path, expected: &str) -> Result<(), String> {
 
 fn update_tracked(
     root: &Path,
-    allow_green_removal: bool,
+    allow_green_removal: Option<&str>,
     allow_cell_removal: bool,
 ) -> Result<(), String> {
     let derived = derive(root)?;
@@ -3594,7 +3657,7 @@ fn self_test() -> Result<(), String> {
         selected: BTreeSet::new(),
         green: BTreeSet::new(),
     };
-    let visible_tracked = tracked_from(&visible_red, None, true, false)?;
+    let visible_tracked = tracked_from(&visible_red, None, Some("self-test"), false)?;
     if visible_tracked.cells[0].ci_disabled_reason.as_ref() != Some(&visible_reason)
         || !encoded_cells(&visible_tracked)?.contains("ci_disabled_reason")
     {
@@ -3612,6 +3675,7 @@ fn self_test() -> Result<(), String> {
             last_tested: None,
             observations: Vec::new(),
             measurement: MeasurementState::NeverMeasured,
+            green_removal_reason: None,
         }],
     };
     let regressed = Derived {
@@ -3622,7 +3686,7 @@ fn self_test() -> Result<(), String> {
         selected: BTreeSet::new(),
         green: BTreeSet::new(),
     };
-    if tracked_from(&regressed, Some(old_green), false, false).is_ok() {
+    if tracked_from(&regressed, Some(old_green), None, false).is_ok() {
         return Err("negative ratchet bracket accepted green-to-red movement".into());
     }
     let intentional = TrackedCells {
@@ -3637,10 +3701,46 @@ fn self_test() -> Result<(), String> {
             last_tested: None,
             observations: Vec::new(),
             measurement: MeasurementState::NeverMeasured,
+            green_removal_reason: None,
         }],
     };
-    tracked_from(&regressed, Some(intentional), true, false)
+    let overridden = tracked_from(&regressed, Some(intentional.clone()), Some("self-test"), false)
         .map_err(|e| format!("explicit compatibility-transition bracket failed: {e}"))?;
+    // ⚠️ AN OVERRIDE THAT LEAVES NO TRACE IS THE THING THIS FIELD EXISTS TO STOP,
+    // so assert the reason actually landed rather than trusting that it did. The
+    // guard refusing is only half of it; a reviewer must be able to see, from the
+    // tracked file alone, that the refusal was overridden and why.
+    match overridden.cells.iter().find(|cell| cell.id == id) {
+        Some(cell) if cell.green_removal_reason.as_deref() == Some("self-test") => {}
+        Some(cell) => {
+            return Err(format!(
+                "green-removal override did not record its reason on {}; got {:?}",
+                display_id(&id),
+                cell.green_removal_reason
+            ));
+        }
+        None => return Err("green-removal override dropped the cell entirely".into()),
+    }
+    // And it must CLEAR once the cell is green again, or the file accumulates
+    // stale justifications that read as live ones.
+    let back_to_green = Derived {
+        population: BTreeSet::from([id.clone()]),
+        enabled: BTreeSet::from([id.clone()]),
+        ci_disabled_reasons: BTreeMap::new(),
+        not_applicable_reasons: BTreeMap::new(),
+        selected: BTreeSet::new(),
+        green: BTreeSet::from([id.clone()]),
+    };
+    let recovered = tracked_from(&back_to_green, Some(overridden), None, false)
+        .map_err(|e| format!("recovery after an override was refused: {e}"))?;
+    if let Some(cell) = recovered.cells.iter().find(|cell| cell.id == id) {
+        if cell.status == CellStatus::Green && cell.green_removal_reason.is_some() {
+            return Err(format!(
+                "green cell {} still carries a green-removal reason",
+                display_id(&id)
+            ));
+        }
+    }
 
     let mut observed = TrackedCells {
         schema: SCHEMA,
@@ -3654,6 +3754,7 @@ fn self_test() -> Result<(), String> {
             last_tested: None,
             observations: Vec::new(),
             measurement: MeasurementState::NeverMeasured,
+            green_removal_reason: None,
         }],
     };
     let pressure_row = |result: &str, turn, virtual_nanoseconds| PressureSummaryRow {
@@ -3944,7 +4045,7 @@ fn self_test() -> Result<(), String> {
             "observations are not keyed by (tree, provenance) in sorted order: {keys:?}"
         ));
     }
-    let preserved = tracked_from(&regressed, Some(observed.clone()), true, false)?;
+    let preserved = tracked_from(&regressed, Some(observed.clone()), Some("self-test"), false)?;
     if preserved.cells[0].observations != observed.cells[0].observations {
         return Err("ordinary scorecard derivation changed pressure observations".into());
     }
@@ -4167,6 +4268,7 @@ fn self_test() -> Result<(), String> {
             not_applicable_reason: None,
             last_tested: None,
             measurement: MeasurementState::NeverMeasured,
+            green_removal_reason: None,
             observations,
         };
         // ⚠️ DERIVE IT HERE RATHER THAN HARDCODING, or this helper builds rows
@@ -4440,6 +4542,7 @@ fn self_test() -> Result<(), String> {
                 last_tested: None,
                 observations: Vec::new(),
                 measurement: MeasurementState::NeverMeasured,
+                green_removal_reason: None,
             },
         ],
     };
@@ -4567,7 +4670,7 @@ fn self_test() -> Result<(), String> {
         selected: BTreeSet::from([boundary_id.clone()]),
         green: BTreeSet::new(),
     };
-    let rederived = tracked_from(&derived_fixture, Some(stamped.clone()), false, false)?;
+    let rederived = tracked_from(&derived_fixture, Some(stamped.clone()), None, false)?;
     if rederived.projection != stamped.projection {
         return Err(format!(
             "`update` did not carry the projection block forward: {:?} became {:?}. Every              ordinary derivation would then delete the record of when the observations were              last projected",
