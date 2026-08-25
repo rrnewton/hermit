@@ -1414,13 +1414,44 @@ land on no information at all.
 | hermit#2587 | `UNKNOWN/UNKNOWN` at t+0s, `MERGEABLE/CLEAN` by t+20s |
 | hermit#2588 | `UNKNOWN/UNKNOWN` at t+0, +20, +40, +60, +85, +110, +135s |
 
-⚠️ **And then hermit#2588 MERGED — at 17:41:08Z, merge commit `7ee6853ede0d` —
+⚠️ **CORRECTION — the claim this section originally drew from hermit#2588 was
+wrong, and the mistake is worth more than the claim was.** It said #2588 "merged
 while `mergeable` still read `UNKNOWN`, which it still reads on the merged pull
-request.** So the field is not merely slow. It can stay `UNKNOWN` through a
-successful merge and afterwards. A lander that waits for `MERGEABLE` before
-acting would have waited forever on a head that merged cleanly; a lander that
-read `UNKNOWN` as `CONFLICTING` would have reported a conflict that did not
-exist.
+request", and concluded the field can persist as `UNKNOWN` *through* a successful
+merge. It cannot be concluded from that:
+
+```console
+gh pr list --state merged --limit 10   # then read .mergeable on each
+  -> 10 of 10 read UNKNOWN
+gh pr list --state open   --limit 8
+  ->  8 of 8 read MERGEABLE
+```
+
+**GitHub stops computing mergeability when a pull request closes**, so *every*
+merged PR reads `UNKNOWN`. The post-merge reading is therefore a constant and
+says nothing about what the field held before the merge — and #2588's lander had
+in fact polled `MERGEABLE CLEAN` immediately before merging it. The author read
+an accurately-reported observation as support for an inference it could not
+support, which is [check 12](#the-checks-in-order)'s shape committed inside a
+section about verifying claims. The falsifying test was one `gh pr list` away and
+was not run until a reviewer ran it.
+
+**What is true, and is the reason to care:** the field is **not populated on a
+merged pull request**, so it cannot serve as after-the-fact evidence of what was
+true at merge time. If you need that, capture it while the pull request is open
+or reconstruct it locally — the answer no longer exists in the API afterwards.
+
+⚠️ **It also goes backwards on an OPEN pull request.** hermit#2587 read
+`MERGEABLE/CLEAN` and then `UNKNOWN/UNKNOWN` minutes later while still open
+(`state=OPEN mergedAt=null`, read immediately before — so this is not the
+closed-PR effect above). `main` had advanced to `1417d7ce` in between; that is
+the plausible cause but it was not isolated, so treat the observation as measured
+and the explanation as inference. Either way a good reading is not durable: where
+main churns roughly one commit every two and a half minutes, a `MERGEABLE`
+fetched a minute ago describes a base that may no longer exist.
+
+A lander therefore cannot wait for `MERGEABLE` and cannot read `UNKNOWN` as
+`CONFLICTING`. Answer it locally instead.
 
 Do not poll it unboundedly and do not infer from it. When it matters, **answer
 the question locally instead** — this needs no API and works from a
@@ -1478,14 +1509,9 @@ A block offered as the reliable answer to a question the API answers unreliably
 has to be at least as trustworthy as what it replaces, and `MERGES-CLEAN` about a
 base you never fetched is worse than the `UNKNOWN` it was written to replace.
 
-⚠️ **It also goes BACKWARDS, so a good reading is not durable either.**
-hermit#2587 read `MERGEABLE/CLEAN` at t+20s and `UNKNOWN/UNKNOWN` again a few
-minutes later, because `main` had advanced (`1417d7ce`) and invalidated the
-computation. On a repository where main churns roughly one commit every two and
-a half minutes, a `MERGEABLE` you fetched a minute ago describes a base that no
-longer exists. The local check does not have this problem: run at that same
-moment against the same two refs it returned MERGES-CLEAN, definitively, in one
-command. Cross-checked exactly this way while writing this section.
+The local check does not have the durability problem either. Run at the same
+moment GitHub reported `UNKNOWN` for hermit#2587, against the same two refs, it
+returned MERGES-CLEAN — definitively, in one command.
 
 Related: `mergeStateStatus` carries the same third value (`UNKNOWN`) and the same
 caveat. And note the separate trap in the other direction — a head does not need
