@@ -92,6 +92,7 @@ fi
 
 scratch=$(mktemp -d)
 worktree="$scratch/merged"
+# shellcheck disable=SC2317 # invoked indirectly by the trap below
 cleanup() { git worktree remove --force "$worktree" >/dev/null 2>&1 || true; rm -rf "$scratch"; }
 trap cleanup EXIT
 
