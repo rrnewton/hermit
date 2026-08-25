@@ -5456,6 +5456,33 @@ fn blocking_listing<'a>(
     (named, listing)
 }
 
+/// Cap a refusal's item list and NAME THE REMAINDER.
+///
+/// ⚠️ A CAP IS DEFENSIBLE; A SILENT CAP IS NOT. Every caller here prints a count
+/// taken from `.len()` and then the list. With more offenders than the cap, the
+/// operator is told a number, shown fewer, and told nothing about the
+/// difference -- so the refusal understates the very thing it exists to report,
+/// and it understates it in the direction of "less work to do".
+///
+/// `blocking_listing` above fixed this shape at the blocking-failure headline
+/// (hermit#2636). The class was three, not one: the two `RunSummary::refused(3, ..)`
+/// sites for ungrantable resources and node-vs-whole-run budgets carried the same
+/// bare `.take(8)`. This is the shared cap-and-declare those sites use, so the
+/// next one cannot be added without going through a function whose whole purpose
+/// is to state the remainder.
+const REFUSAL_ITEM_CAP: usize = 8;
+
+fn capped_refusal_items(items: Vec<String>) -> Vec<String> {
+    let total = items.len();
+    let shown = total.min(REFUSAL_ITEM_CAP);
+    let elided = total - shown;
+    let mut out: Vec<String> = items.into_iter().take(shown).collect();
+    if elided != 0 {
+        out.push(format!("  (+{elided} more not shown)"));
+    }
+    out
+}
+
 /// Pin the count-versus-enumeration invariant that broke on `4e168f2aa5b9`.
 ///
 /// The regression it exists to catch is a cap that drops names silently. Case 2
@@ -5530,9 +5557,54 @@ fn summary_listing_bracket() -> Result<String, String> {
         return Err(format!("nonblocking row leaked into the list: {listing}"));
     }
 
-    Ok("summary listing: count and enumeration agree across 6 cases (the 9-failure \
-shape named in full, the cap states its remainder, and a budget kill is counted \
-and named without being folded into the failure count)"
+    // 7. THE OTHER TWO INSTANCES OF THE SAME SHAPE. `capped_refusal_items` is
+    //    what the two `RunSummary::refused(3, ..)` sites use; pin it here so the
+    //    class is bracketed in one place rather than at each call site.
+    //
+    //    ⚠️ CONTROL FIRST, AND IT MUST NOT ELIDE. Without a case that stays
+    //    whole, a helper that appended "(+N more)" unconditionally -- or one
+    //    that dropped everything -- would satisfy every remaining assertion.
+    let exactly_at_cap: Vec<String> =
+        (0..REFUSAL_ITEM_CAP).map(|i| format!("  a{i}")).collect();
+    let kept = capped_refusal_items(exactly_at_cap);
+    if kept.len() != REFUSAL_ITEM_CAP || kept.iter().any(|l| l.contains("more not shown")) {
+        return Err(format!(
+            "a list exactly at the cap must be shown whole and unannotated: {kept:?}"
+        ));
+    }
+
+    // 8. One over the cap: the remainder is STATED, and the arithmetic is right.
+    let over: Vec<String> = (0..REFUSAL_ITEM_CAP + 1).map(|i| format!("  b{i}")).collect();
+    let capped = capped_refusal_items(over);
+    if capped.len() != REFUSAL_ITEM_CAP + 1 {
+        return Err(format!("cap produced {} lines, want {}", capped.len(), REFUSAL_ITEM_CAP + 1));
+    }
+    if !capped.last().is_some_and(|l| l.contains("(+1 more not shown)")) {
+        return Err(format!("one over the cap did not declare its remainder: {capped:?}"));
+    }
+
+    // 9. Well over the cap: the elided count is total-minus-shown, not a guess.
+    let far_over: Vec<String> = (0..REFUSAL_ITEM_CAP + 7).map(|i| format!("  c{i}")).collect();
+    let capped = capped_refusal_items(far_over);
+    if !capped.last().is_some_and(|l| l.contains("(+7 more not shown)")) {
+        return Err(format!("elided count is wrong: {capped:?}"));
+    }
+    //    And nothing above the cap is silently retained OR silently dropped: the
+    //    shown items must be the FIRST ones, in order.
+    if capped.first().map(String::as_str) != Some("  c0") {
+        return Err(format!("cap did not keep the first items in order: {capped:?}"));
+    }
+
+    // 10. The empty case says nothing at all -- no "(+0 more)" noise.
+    if !capped_refusal_items(Vec::new()).is_empty() {
+        return Err("an empty list must produce no lines".to_string());
+    }
+
+    Ok("summary listing: count and enumeration agree across 10 cases (the 9-failure \
+shape named in full, the cap states its remainder, a budget kill is counted \
+and named without being folded into the failure count, and the two refusal \
+sites' shared cap is whole at the cap, declares +1 and +7 above it, and is \
+silent when empty)"
         .to_string())
 }
 
@@ -11522,7 +11594,9 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                 format!("{} step(s) demand capacity the DAG config never grants:", ungrantable.len()),
             ]
             .into_iter()
-            .chain(ungrantable.iter().take(8).map(|b| format!("  {b}")))
+            .chain(capped_refusal_items(
+                ungrantable.iter().map(|b| format!("  {b}")).collect(),
+            ))
             .chain(std::iter::once(
                 "the scheduler would sleep forever rather than fail: its only exit is                  running.is_empty() && done+skipped >= steps.len()".to_string(),
             ))
@@ -11579,7 +11653,11 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                     "{} node(s) declare a wall budget >= the {secs}s whole-run budget:",
                     bad.len()
                 ))
-                .chain(bad.iter().take(8).map(|(tag, t)| format!("  {tag} ({t}s)")))
+                .chain(capped_refusal_items(
+                    bad.iter()
+                        .map(|(tag, t)| format!("  {tag} ({t}s)"))
+                        .collect(),
+                ))
                 .chain(std::iter::once(
                     "lower the named node budgets so each can diagnose itself before the whole-run boundary"
                         .to_string(),
