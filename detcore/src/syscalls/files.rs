@@ -4074,9 +4074,9 @@ mod test {
     use super::UNIX_AUTOBIND_NAME_LEN;
     use super::canonicalize_tcp_info;
     use super::classify_timer_slack_binding;
+    use super::is_inherited_container_output;
     use super::parse_timer_slack_write;
     use super::random_device_lseek_result;
-    use super::is_inherited_container_output;
     use super::should_tag_sabre_internal_pipe_io;
     use super::unix_autobind_address;
     use super::unix_autobind_addrlen;
