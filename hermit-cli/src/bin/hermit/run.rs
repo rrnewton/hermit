@@ -2261,6 +2261,12 @@ impl RunOpts {
             compare_io_buffers: self.det_opts.det_config.detlog_io_buffers,
             keep_logs: self.keep_logs,
             record_envelope: RecordEnvelope::all_records_v1(),
+            // Read from the LIVE config, not a constant: `--no-virtualize-time`
+            // makes this a genuine runtime choice on the run path, so a hard-coded
+            // `true` would publish a time policy the run did not use. The
+            // record/replay path is a fixed decision instead and names it once, as
+            // `RECORD_REPLAY_VIRTUALIZES_TIME`.
+            virtualize_time: self.det_opts.det_config.virtualize_time,
         }
     }
 
