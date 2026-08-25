@@ -40,8 +40,10 @@ process + QEMU prerequisites ──> demo 5 ──> hermit-boot.qcow2
 
 Demos 1-4 already build their shared Hermit binaries incrementally. Demo 5
 provisions the fixed kernel/initramfs and atomically publishes
-`ignored/qemu-linux/hermit-boot.qcow2`. That file is a real Make prerequisite
-of demos 6 and 7. If it is present, both restore it without booting Linux. If it
+`ignored/qemu-linux/hermit-boot.qcow2` (or, for a checkout under `/tmp`, the
+host-visible `/var/tmp/hermit-qemu-strict-l2-$UID-<checkout-hash>/hermit-boot.qcow2`).
+That file
+is a real Make prerequisite of demos 6 and 7. If it is present, both restore it without booting Linux. If it
 is missing, `make demo6`, `make demo7`, and the direct demo 6/7 scripts invoke
 Demo 5 once and continue with the newly stored snapshot. A deliberately chosen
 custom snapshot path is never overwritten implicitly; a missing custom path
@@ -110,8 +112,14 @@ machine under the internal name `hermit-boot`, and atomically publishes the
 reusable image here:
 
 ```text
-ignored/qemu-linux/hermit-boot.qcow2
+$QEMU_ASSETS/hermit-boot.qcow2
 ```
+
+`QEMU_ASSETS` defaults to `ignored/qemu-linux`, except that a checkout under
+`/tmp` defaults to the checkout-scoped
+`/var/tmp/hermit-qemu-strict-l2-$UID-<checkout-hash>`. In that case the Hermit
+launch also identity-mounts host `/tmp`, so both the persistent inputs
+and the checkout-local controller/runtime paths stay visible to the guest.
 
 This is the only Linux boot needed for the remaining walkthrough.
 

@@ -5,7 +5,9 @@ set -euo pipefail
 
 DEMO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$DEMO_DIR/.." && pwd)"
-ASSETS="${QEMU_ASSETS:-$ROOT/ignored/qemu-linux}"
+# shellcheck source=lib/qemu-paths.sh
+source "$DEMO_DIR/lib/qemu-paths.sh"
+ASSETS="${QEMU_ASSETS:-$(qemu_default_assets "$ROOT")}"
 ARTIFACTS="${DEMO07_ARTIFACTS:-$ROOT/ignored/demo07-drgn}"
 
 usage() {
