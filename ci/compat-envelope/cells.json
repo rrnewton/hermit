@@ -9949,7 +9949,12 @@
       "mode": "verify",
       "backend": "liteinst",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "timeout",
+        "evidence": "task requalify_pr_2333_liteinst; /home/newton/liteinst-pr2333-requal-20260825",
+        "reason": "Exact-current-main qualification with a staged, positively activated LiteInst runtime timed out opening the tracee pidfd in 21 of 21 isolated and paired-load runs before producing a terminal comparison; retain this executable cell as red and requalify after the LiteInst startup failure is fixed."
+      },
       "observations": [],
       "measurement": "never-measured"
     },
@@ -18049,7 +18054,12 @@
       "mode": "verify",
       "backend": "liteinst",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "timeout",
+        "evidence": "task requalify_pr_2333_liteinst; /home/newton/liteinst-pr2333-requal-20260825",
+        "reason": "Exact-current-main qualification with a staged, positively activated LiteInst runtime timed out opening the tracee pidfd in 21 of 21 isolated and paired-load runs before producing a terminal comparison; retain this executable cell as red and requalify after the LiteInst startup failure is fixed."
+      },
       "observations": [],
       "measurement": "never-measured"
     },
