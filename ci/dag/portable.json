@@ -6,6 +6,15 @@
   "default_step_timeout": 600,
   "steps": [
     {
+      "group": "setup", "job": "manifest_plan",
+      "desc": "Build the manifest-plan binaries the metadata validation runs",
+      "description": "MOVED OUT OF e2e.metadata 2026-08-08. e2e.metadata is a DAG ROOT whose first action is `cargo run -p hermit-manifest-plan` -- twice: load_tests uses the default bin, audit_test_footprints uses generate-test-footprints. It therefore COMPILES, upstream of every build node. That made the old metadata budget BIMODAL: 16.5s warm, 57s cold, 2 slow in 9 sampled CI runs. The compile remains HERE under a build-shaped budget so metadata inherits a warm artifact. The later 180s metadata budget is independent: by 2026-08-09 the non-build audit workload itself consumed 71.44-73.84s wall and 58.36-60.38s CPU across three warm samples, exceeding the former 60s ceiling even after this compile split.",
+      "cmd": "cargo build -p hermit-manifest-plan --bins",
+      "timeout": 180,
+      "hint": {"est_duration_s": 60, "rss_baseline_bytes": 536870912,
+               "hard_mem_max_bytes": 2147483648, "classification": "cpu-bound"}
+    },
+      {
       "group": "check", "job": "reverie_pin",
       "desc": "Require Hermit's recorded Reverie revision to be an ANCESTOR of rrnewton/reverie:main and to never regress below the base pin",
       "cmd": "./ci/run-reverie-pin-check.sh",
@@ -142,16 +151,7 @@
       "hint": {"est_duration_s": 120, "rss_baseline_bytes": 8589934592,
                "hard_mem_max_bytes": 17179869184, "classification": "cpu-bound"}
     },
-    {
-      "group": "setup", "job": "manifest_plan",
-      "desc": "Build the manifest-plan binaries the metadata validation runs",
-      "description": "MOVED OUT OF e2e.metadata 2026-08-08. e2e.metadata is a DAG ROOT whose first action is `cargo run -p hermit-manifest-plan` -- twice: load_tests uses the default bin, audit_test_footprints uses generate-test-footprints. It therefore COMPILES, upstream of every build node. That made the old metadata budget BIMODAL: 16.5s warm, 57s cold, 2 slow in 9 sampled CI runs. The compile remains HERE under a build-shaped budget so metadata inherits a warm artifact. The later 180s metadata budget is independent: by 2026-08-09 the non-build audit workload itself consumed 71.44-73.84s wall and 58.36-60.38s CPU across three warm samples, exceeding the former 60s ceiling even after this compile split.",
-      "cmd": "cargo build -p hermit-manifest-plan --bins",
-      "timeout": 180,
-      "hint": {"est_duration_s": 60, "rss_baseline_bytes": 536870912,
-               "hard_mem_max_bytes": 2147483648, "classification": "cpu-bound"}
-    },
-    {
+        {
       "group": "e2e", "job": "metadata",
       "desc": "Validate E2E metadata, generated test footprints, and required-cell plan",
       "description": "MEASURED 2026-08-09 at hermit 93575493 after the Rust validate cutover: the warm audit-ci subroutine completed in 71.44s, 72.11s, and 73.84s wall (58.36-60.38s CPU), and the complete command passed in 73.77s. The former 60s ceiling was therefore below intrinsic CPU demand, not detecting a hang. The host was loaded (load 78.58 on 316 CPUs; CPU PSI some 5.74%), but CPU time alone reached the ceiling and all samples made forward progress through footprint generation, splitter, inventory, and correspondence checks. 180s preserves >2.4x headroom for observed host variance without changing the command or hiding failures; a real hang still terminates and records a timeout.",
