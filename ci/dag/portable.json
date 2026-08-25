@@ -534,8 +534,9 @@
     {
       "group": "test", "job": "dbt_parity",
       "desc": "DynamoRIO DBT strict backend parity matrix",
+      "description": "THE DEPENDENCY ON check.dbt_runtime_abi IS AN ORDERING FIX, NOT A DATA DEPENDENCY. This node does not consume anything the ABI check produces; it depends on it so the ABI check runs FIRST. Both nodes previously listed only build.runtime_release, so they started together, and eager-exit cancels in-flight steps on the first failure. MEASURED 2026-08-25 during the Reverie pin bump to 3798935e: this node failed at 13s and check.dbt_runtime_abi was aborted at 14s -- the run killed the only node that could name the cause. The cause was a missing reverie_dbt_runtime_process_clone_result callback, and all this node could report was that stdout differed from the ptrace reference, because DynamoRIO's own message is the unhelpful '<ERROR: using undefined symbol!>'. With the edge, an ABI break makes check.dbt_runtime_abi fail and leaves this node dependency-skipped, so the run reports the named missing callback INSTEAD OF an opaque parity diff. Cost is serialising ~14s of ABI check ahead of this node when both would otherwise overlap. NOTE THE GENERAL DEFECT IS NOT FIXED BY THIS EDGE: every gate-family node is concurrent with 34-36 of the 36 scenario nodes and is equally cancellable, and dagrun's Step schema has no per-node eager-exit exemption to express the general rule. This edge fixes the one pair where cancellation was measured to destroy the diagnosis.",
       "cmd": "python3 tests/backend-parity/run_matrix.py --hermit target/release/hermit --backend dbt --strict --require-backend --no-parent-scorecard",
-      "deps": ["build.runtime_release"],
+      "deps": ["build.runtime_release", "check.dbt_runtime_abi"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
                "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
