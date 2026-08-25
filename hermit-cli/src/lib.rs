@@ -55,6 +55,46 @@ pub const RECORD_REPLAY_HASHES_IO_BUFFERS: bool = true;
 /// because `--no-virtualize-time` makes it a genuine runtime choice there. Only
 /// the record/replay path is a fixed decision, so only it gets a constant.
 pub const RECORD_REPLAY_VIRTUALIZES_TIME: bool = false;
+
+/// Exit status for a failure of HERMIT ITSELF, as distinct from the guest's.
+///
+/// ⚠️ EVERY CLI ERROR USED TO BE `Exited(1)`, WHICH IS THE SINGLE MOST COMMON
+/// GUEST FAILURE CODE. A tracer panic and a guest that exited 1 of its own
+/// accord were therefore INDISTINGUISHABLE from `$?` alone — and every harness,
+/// gate and script on this project decides pass/fail from exactly that value.
+/// The information was not missing, only discarded: reverie's container reports
+/// the child's real status as a typed `ExitStatus`, and hermit collapsed it to
+/// prose and then to `1`.
+///
+/// WHY THIS DOES NOT BREAK THE "hermit's exit IS the guest's exit" CONTRACT.
+/// That contract describes the case where the guest RAN AND EXITED, and it is
+/// untouched: a guest status still flows through `raise_or_exit` unchanged, and
+/// only the `Err` arm — where there is NO guest exit code, because hermit failed
+/// before or instead of producing one — uses this value. The contract did not
+/// cover that case; it does now.
+///
+/// WHY 125. It is the established convention for "the wrapper tool itself
+/// failed" — GNU `env`, `chroot` and `timeout` all reserve 125 for exactly this,
+/// leaving 126/127 for exec-level problems. It is not a value hermit emits
+/// anywhere else.
+///
+/// ⚠️ THIS REDUCES A COLLISION, IT DOES NOT REMOVE ONE. A guest is free to exit
+/// 125 deliberately, and every value in 0..=255 is a legal guest status, so no
+/// code can be reserved outright. What it removes is the GUARANTEED collision
+/// with the most common failure code. For an unambiguous signal, read the
+/// `HERMIT_TASK_PANIC` marker on stderr or the verification JSON; this makes the
+/// cheap check — `$?` — stop actively lying.
+///
+/// ⚠️ IT LIVES IN THE LIBRARY, NOT IN `main.rs`, AND THAT PLACEMENT IS THE FIX
+/// FOR HOW IT WENT STALE. It was a private `const` inside the binary, so
+/// `tests/cli.rs` — the only thing that asserts on it — could not name it and
+/// wrote the number out by hand instead. When hermit#2558 moved the value from
+/// `1` to `125`, the definition moved and the sixteen copies did not: eight cli
+/// tests went red on main and stayed red, each failing an assertion about the
+/// exit code rather than about the behaviour it exists to check. Same shape as
+/// [`RECORD_REPLAY_HASHES_IO_BUFFERS`] above — a decision carried in two places
+/// that had to agree and had no way to. Exported here, the tests move with it.
+pub const HERMIT_INTERNAL_FAILURE_EXIT: i32 = 125;
 mod record;
 mod record_replay_path;
 mod recorder;

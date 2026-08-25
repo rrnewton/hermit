@@ -22,6 +22,11 @@ use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
 
+// The one definition of hermit's own failure status, imported rather than
+// written out. Copying the number here is what let eight tests keep asserting
+// `1` for months after the product moved to `125`.
+use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
+
 static DBT_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_EXEC_FAILURE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_EXECVEAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -559,11 +564,28 @@ fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).expect("hermit stderr should be UTF-8")
 }
 
-fn assert_failure_contains(output: &Output, expected: &[&str]) {
+/// Assert that HERMIT ITSELF refused, said why, and never started the guest.
+///
+/// ⚠️ THE EXIT CODE HERE IS A CLAIM, NOT A FORMALITY, WHICH IS WHY IT IS NAMED.
+/// Every caller of this helper drives hermit into a refusal BEFORE the guest
+/// runs — an unreadable log path, an unresolvable program, a contradictory flag
+/// pair, a missing bind source, a denied capability. For those,
+/// `HERMIT_INTERNAL_FAILURE_EXIT` says something the message text cannot: that
+/// no guest was launched. A guest that ran and exited with the same number would
+/// be a different and much worse outcome with identical stderr.
+///
+/// ⚠️ SO DO NOT REPLACE THIS WITH WHATEVER THE CODE HAPPENS TO BE. It was
+/// `Some(1)` until hermit#2558, and it was passing for the wrong reason: `1` is
+/// also the commonest guest failure code, so the assertion could not tell "hermit
+/// refused" from "the guest ran and failed" and would have accepted either. That
+/// is the defect #2558 introduced 125 to remove. A test that does NOT mean to
+/// pin the code should not call this helper; a test meaning a guest-side status
+/// should assert that status directly and say why.
+fn assert_hermit_refusal_contains(output: &Output, expected: &[&str]) {
     assert_eq!(
         output.status.code(),
-        Some(1),
-        "unexpected status: {output:?}"
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        "expected a hermit-internal refusal (no guest launched), got: {output:?}"
     );
     let stderr = stderr(output);
     for message in expected {
@@ -2336,9 +2358,12 @@ fn run_kvm_preserves_closed_standard_input() {
     ];
     let output = hermit_with_closed_stdin(&args);
 
+    // A hermit-internal refusal: stdin was closed before the guest could be set
+    // up, so no guest ran. Not routed through `assert_hermit_refusal_contains`
+    // only because this test additionally pins stdout.
     assert_eq!(
         output.status.code(),
-        Some(1),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
         "unexpected output: {output:?}"
     );
     assert_eq!(stdout(&output), "");
@@ -2754,7 +2779,7 @@ fn backend_accepted_in_global_position() {
 #[test]
 fn sabre_backend_validation_honors_command_scope() {
     let non_run = hermit(&["--backend", "sabre", "record", "list"]);
-    assert_failure_contains(&non_run, &["SaBRe backend", "only through", "strace"]);
+    assert_hermit_refusal_contains(&non_run, &["SaBRe backend", "only through", "strace"]);
 
     let local_override = hermit(&[
         "--backend",
@@ -2765,7 +2790,7 @@ fn sabre_backend_validation_honors_command_scope() {
         "--",
         "/definitely/missing/sabre-backend-override-test",
     ]);
-    assert_failure_contains(&local_override, &["does not exist or is not accessible"]);
+    assert_hermit_refusal_contains(&local_override, &["does not exist or is not accessible"]);
     assert!(!stderr(&local_override).contains("SaBRe backend"));
 
     let log = hermit(&[
@@ -2777,7 +2802,7 @@ fn sabre_backend_validation_honors_command_scope() {
         "--",
         "/bin/true",
     ]);
-    assert_failure_contains(&log, &["does not support --log or --log-file"]);
+    assert_hermit_refusal_contains(&log, &["does not support --log or --log-file"]);
 }
 
 #[test]
@@ -3098,7 +3123,7 @@ fn record_list_rejects_a_non_directory_inventory() {
         .arg(&data_file)
         .output()
         .expect("failed to run hermit record list");
-    assert_failure_contains(
+    assert_hermit_refusal_contains(
         &output,
         &["Failed to read recording inventory", "not-a-directory"],
     );
@@ -3108,7 +3133,7 @@ fn record_list_rejects_a_non_directory_inventory() {
         .arg(&data_file)
         .output()
         .expect("failed to run hermit record clean");
-    assert_failure_contains(
+    assert_hermit_refusal_contains(
         &output,
         &["Failed to read recording inventory", "not-a-directory"],
     );
@@ -3121,13 +3146,13 @@ fn record_list_rejects_a_non_directory_inventory() {
 #[test]
 fn run_rejects_invalid_programs_with_actionable_errors() {
     let output = hermit(&["run", "--", "/definitely/missing/hermit-program"]);
-    assert_failure_contains(
+    assert_hermit_refusal_contains(
         &output,
         &["does not exist or is not accessible", "Check the path"],
     );
 
     let output = hermit(&["run", "--", "definitely-missing-hermit-program"]);
-    assert_failure_contains(&output, &["Could not resolve program", "guest PATH"]);
+    assert_hermit_refusal_contains(&output, &["Could not resolve program", "guest PATH"]);
 
     let temp = tempfile::tempdir().expect("failed to create program fixture directory");
     let non_executable = temp.path().join("non-executable");
@@ -3138,14 +3163,14 @@ fn run_rejects_invalid_programs_with_actionable_errors() {
         .arg(&non_executable)
         .output()
         .expect("failed to run hermit");
-    assert_failure_contains(&output, &["is not executable", "chmod +x"]);
+    assert_hermit_refusal_contains(&output, &["is not executable", "chmod +x"]);
 
     let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
         .args(["run", "--tmp=/tmp", "--"])
         .arg(temp.path())
         .output()
         .expect("failed to run hermit");
-    assert_failure_contains(&output, &["is a directory", "executable file"]);
+    assert_hermit_refusal_contains(&output, &["is a directory", "executable file"]);
 
     let bad_shebang = temp.path().join("bad-shebang");
     fs::write(&bad_shebang, "#!/definitely/missing/interpreter\n").expect("failed to write script");
@@ -3160,7 +3185,7 @@ fn run_rejects_invalid_programs_with_actionable_errors() {
         .arg(&bad_shebang)
         .output()
         .expect("failed to run hermit");
-    assert_failure_contains(
+    assert_hermit_refusal_contains(
         &output,
         &["uses shebang interpreter", "does not exist", "#! line"],
     );
@@ -3169,13 +3194,13 @@ fn run_rejects_invalid_programs_with_actionable_errors() {
 #[test]
 fn run_rejects_invalid_configuration_without_panicking() {
     let output = hermit(&["run", "--no-virtualize-time", "--", "/bin/true"]);
-    assert_failure_contains(
+    assert_hermit_refusal_contains(
         &output,
         &["also requires --no-virtualize-metadata", "timestamps"],
     );
 
     let output = hermit(&["run", "--sched-sticky-random-param=-0.1", "--", "/bin/true"]);
-    assert_failure_contains(&output, &["must be between 0 and 1", "received -0.1"]);
+    assert_hermit_refusal_contains(&output, &["must be between 0 and 1", "received -0.1"]);
 }
 
 #[test]
@@ -3186,7 +3211,7 @@ fn run_rejects_a_missing_bind_source_before_mounting() {
         "--",
         "/bin/true",
     ]);
-    assert_failure_contains(&output, &["--bind source", "does not exist", "correct"]);
+    assert_hermit_refusal_contains(&output, &["--bind source", "does not exist", "correct"]);
 
     let output = hermit(&[
         "run",
@@ -3194,7 +3219,7 @@ fn run_rejects_a_missing_bind_source_before_mounting() {
         "--",
         "/bin/true",
     ]);
-    assert_failure_contains(&output, &["--mount source", "does not exist", "correct"]);
+    assert_hermit_refusal_contains(&output, &["--mount source", "does not exist", "correct"]);
 }
 
 #[test]
@@ -3223,7 +3248,7 @@ fn run_reports_denied_ptrace_and_seccomp_capabilities() {
         ]);
         deny_syscall(&mut command, syscall);
         let output = command.output().expect("failed to run restricted hermit");
-        assert_failure_contains(&output, &expected);
+        assert_hermit_refusal_contains(&output, &expected);
     }
 }
 
@@ -3341,7 +3366,7 @@ fn log_file_that_cannot_be_opened_is_refused_by_path() {
         "/bin/true",
     ]);
 
-    assert_failure_contains(
+    assert_hermit_refusal_contains(
         &output,
         &[
             "cannot open --log-file",
@@ -3461,6 +3486,11 @@ fn tracer_panic_and_guest_failure_have_different_exit_codes() {
          (both {panic_code:?}); every gate reading the exit code cannot tell a crash \
          from a failure"
     );
+    // Deliberately a literal `1`: this is the GUEST's own chosen status passing
+    // through, not hermit's reserved code, so it must NOT track
+    // `HERMIT_INTERNAL_FAILURE_EXIT`. If that constant ever became 1 this
+    // assertion pair should start failing, and substituting the constant here
+    // would hide exactly that.
     assert_eq!(
         guest_code,
         Some(1),
@@ -3468,7 +3498,7 @@ fn tracer_panic_and_guest_failure_have_different_exit_codes() {
     );
     assert_eq!(
         panic_code,
-        Some(125),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
         "hermit-internal failure should use the reserved wrapper code"
     );
 }
