@@ -385,7 +385,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let targets = resolve_kill_targets(guest, DetPid::from_raw(tgid)).await;
         let tid = deterministic_kill_target(&targets, call.sig())?;
-        let source = guest.thread_state().dettid;
         let value = if !guest
             .config()
             .backend_requires_thread_directed_process_signals
@@ -398,11 +397,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .with_sig(call.sig());
             self.record_or_replay(guest, targeted).await?
         };
-        if tid != source
-            && let Ok(signal) = Signal::try_from(call.sig())
-        {
-            notify_signal_pending(guest, tid, signal).await;
-        }
+        self.notify_cross_task_signal(guest, tid, call.sig()).await;
         Ok(value)
     }
 
@@ -415,7 +410,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Tgkill,
     ) -> Result<i64, Error> {
-        Ok(self.record_or_replay(guest, call).await?)
+        let value = self.record_or_replay(guest, call).await?;
+        // `pthread_kill` lowers to `tgkill`, so this is the ordinary way one
+        // guest THREAD signals a sibling. Like `kill`, a successful cross-task
+        // send must tell the scheduler, or a target parked in a child wait is
+        // never woken and the wait hangs.
+        self.notify_cross_task_signal(guest, DetTid::from_raw(call.tid()), call.sig())
+            .await;
+        Ok(value)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -429,7 +431,34 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Tkill,
     ) -> Result<i64, Error> {
-        Ok(self.record_or_replay(guest, call).await?)
+        let value = self.record_or_replay(guest, call).await?;
+        // Same wakeup obligation as `tgkill`; `tkill` is the older two-argument
+        // spelling of the same thread-directed send.
+        self.notify_cross_task_signal(guest, DetTid::from_raw(call.tid()), call.sig())
+            .await;
+        Ok(value)
+    }
+
+    /// Tell the scheduler that a successful thread-directed send left a signal
+    /// physically pending for another task.
+    ///
+    /// Shared by `kill`, `tgkill` and `tkill` so the three cannot drift: a fix
+    /// applied to one spelling of "signal another task" must apply to all of
+    /// them, which is exactly the gap that let a `pthread_kill` from a sibling
+    /// thread hang a `waitid` that a `kill` from a sibling process could
+    /// interrupt. Self-directed signals are excluded: the sender is running, so
+    /// it is not parked waiting to be woken.
+    async fn notify_cross_task_signal<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        target: DetTid,
+        raw_signal: i32,
+    ) {
+        if target != guest.thread_state().dettid
+            && let Ok(signal) = Signal::try_from(raw_signal)
+        {
+            notify_signal_pending(guest, target, signal).await;
+        }
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -443,7 +472,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::RtTgsigqueueinfo,
     ) -> Result<i64, Error> {
-        Ok(self.record_or_replay(guest, call).await?)
+        let value = self.record_or_replay(guest, call).await?;
+        // Thread-directed like `tgkill`, so it carries the same wakeup
+        // obligation. `sigqueue`/`pthread_sigqueue` reach a parked sibling
+        // through here.
+        self.notify_cross_task_signal(guest, DetTid::from_raw(call.tid()), call.sig())
+            .await;
+        Ok(value)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -472,18 +507,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let targets = resolve_kill_targets(guest, DetPid::from_raw(tgid)).await;
         let tid = deterministic_kill_target(&targets, call.sig())?;
-        if !guest
+        let value = if !guest
             .config()
             .backend_requires_thread_directed_process_signals
         {
-            return Ok(self.record_or_replay(guest, call).await?);
-        }
-        let targeted = syscalls::RtTgsigqueueinfo::new()
-            .with_tgid(tgid)
-            .with_tid(tid.as_raw())
-            .with_sig(call.sig())
-            .with_siginfo(call.siginfo());
-        Ok(self.record_or_replay(guest, targeted).await?)
+            self.record_or_replay(guest, call).await?
+        } else {
+            let targeted = syscalls::RtTgsigqueueinfo::new()
+                .with_tgid(tgid)
+                .with_tid(tid.as_raw())
+                .with_sig(call.sig())
+                .with_siginfo(call.siginfo());
+            self.record_or_replay(guest, targeted).await?
+        };
+        self.notify_cross_task_signal(guest, tid, call.sig()).await;
+        Ok(value)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

@@ -17,6 +17,7 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -317,6 +318,71 @@ static int live_sibling_signal(int mode) {
   return rc == -1 && saved_errno == EINTR ? 0 : 4;
 }
 
+/*
+ * A sibling THREAD, not a sibling process. `pthread_kill` lowers to `tgkill`,
+ * which is a different Detcore handler from `kill`: an earlier revision of the
+ * waitid wakeup notified the scheduler only from `handle_kill`, so a
+ * thread-directed signal to a waiter parked on a child that never exits was
+ * recorded nowhere and the wait hung forever. Every fixture above sends from a
+ * forked PROCESS, which is why none of them could see it.
+ */
+static pthread_t waitid_waiter_thread;
+
+static void *thread_signaler(void *unused) {
+  (void)unused;
+  const struct timespec delay = {.tv_sec = 0, .tv_nsec = 150 * 1000 * 1000};
+  nanosleep(&delay, NULL);
+  pthread_kill(waitid_waiter_thread, SIGUSR1);
+  return NULL;
+}
+
+static int live_sibling_thread_signal(void) {
+  struct sigaction action;
+  memset(&action, 0, sizeof action);
+  action.sa_handler = on_signal;
+  sigemptyset(&action.sa_mask);
+  action.sa_flags = 0; /* deliberately NOT SA_RESTART */
+  if (sigaction(SIGUSR1, &action, NULL) != 0) {
+    printf("waitid-thread-sibling-setup-failed sigaction errno=%d\n", errno);
+    return 1;
+  }
+
+  pid_t target = fork();
+  if (target < 0) {
+    printf("waitid-thread-sibling-setup-failed fork errno=%d\n", errno);
+    return 1;
+  }
+  if (target == 0) {
+    for (;;) {
+      pause();
+    }
+  }
+
+  waitid_waiter_thread = pthread_self();
+  pthread_t signaler;
+  if (pthread_create(&signaler, NULL, thread_signaler, NULL) != 0) {
+    printf("waitid-thread-sibling-setup-failed pthread_create errno=%d\n", errno);
+    kill(target, SIGKILL);
+    return 1;
+  }
+
+  siginfo_t info;
+  memset(&info, 0, sizeof info);
+  errno = 0;
+  int rc = waitid(P_PID, target, &info, WEXITED);
+  int captured = errno;
+
+  printf("waitid-thread-sibling rc=%d errno=%d handler=%d\n", rc,
+         rc < 0 ? captured : 0, handler_ran);
+
+  pthread_join(signaler, NULL);
+  kill(target, SIGKILL);
+  int status = 0;
+  waitpid(target, &status, 0);
+  printf("waitid-thread-sibling-done\n");
+  return 0;
+}
+
 int main(int argc, char **argv) {
   if (argc == 1) {
     return signal_interrupt();
@@ -336,6 +402,9 @@ int main(int argc, char **argv) {
   if (argc == 2 && strcmp(argv[1], "--live-sibling-signal-blocked") == 0) {
     return live_sibling_signal(2);
   }
-  fprintf(stderr, "usage: %s [--child-ready-wins|--signal-restart|--live-sibling-signal|--live-sibling-signal-restart|--live-sibling-signal-blocked]\n", argv[0]);
+  if (argc == 2 && strcmp(argv[1], "--live-sibling-thread-signal") == 0) {
+    return live_sibling_thread_signal();
+  }
+  fprintf(stderr, "usage: %s [--child-ready-wins|--signal-restart|--live-sibling-signal|--live-sibling-signal-restart|--live-sibling-signal-blocked|--live-sibling-thread-signal]\n", argv[0]);
   return 64;
 }

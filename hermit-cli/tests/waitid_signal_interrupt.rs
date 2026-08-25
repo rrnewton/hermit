@@ -82,7 +82,9 @@ fn waitid_guest() -> &'static Path {
         let guest = build_root.join("waitid_signal_interrupt");
         let source = repository.join("tests/c/waitid_signal_interrupt.c");
         let compile = Command::new("cc")
-            .args(["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror"])
+            // `-pthread` is required by the thread-directed sender mode, which
+            // uses `pthread_kill` to reach `tgkill`.
+            .args(["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread"])
             .arg(&source)
             .arg("-o")
             .arg(&guest)
@@ -677,5 +679,47 @@ fn watchdog_escapes_and_reports_against_a_live_hermit() {
     assert!(
         message.contains("guest stdout:") && message.contains("hermit stderr:"),
         "the watchdog must attach the captured diagnostics: {message}"
+    );
+}
+
+/// A sibling THREAD, not a sibling process.
+///
+/// Every other fixture here signals from a forked process, which reaches
+/// Detcore through `handle_kill`. `pthread_kill` lowers to `tgkill`, a
+/// different handler. An earlier revision of the waitid wakeup notified the
+/// scheduler only from `handle_kill`, so this case hung forever while all the
+/// process-sender tests passed -- both adversarial reviewers found it and it
+/// reproduced as a 30s timeout against a real Hermit.
+///
+/// The bound is deliberately tight: if the wakeup regresses, this reports a
+/// named watchdog failure in seconds instead of hanging the suite.
+#[test]
+fn waitid_live_sibling_thread_signal_interrupts_without_spinning() {
+    let limits = WatchdogLimits {
+        max_waitid_retries: 2_000,
+        backstop: Duration::from_secs(8),
+        max_stderr_events_per_tick: 64,
+    };
+    let run = run_bounded_with_limits(&["--live-sibling-thread-signal"], true, None, limits);
+    assert!(
+        run.status.success(),
+        "hermit exited with {}\nguest stdout:\n{}\nhermit stderr:\n{}",
+        run.status,
+        run.stdout,
+        run.stderr,
+    );
+    // errno 4 is EINTR, and handler=1 proves the signal was actually delivered
+    // rather than the wait merely being abandoned.
+    assert!(
+        run.stdout
+            .contains("waitid-thread-sibling rc=-1 errno=4 handler=1"),
+        "a thread-directed sibling signal did not interrupt waitid with its handler run\n\
+         guest stdout:\n{}",
+        run.stdout,
+    );
+    assert!(
+        run.stdout.contains("waitid-thread-sibling-done"),
+        "the guest did not clean up its child\nguest stdout:\n{}",
+        run.stdout,
     );
 }
