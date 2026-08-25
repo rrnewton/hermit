@@ -263,10 +263,10 @@ fn derive_measurement(cell: &TrackedCell) -> MeasurementState {
                 ObservedResult::CrashError | ObservedResult::Timeout | ObservedResult::Oom => {}
             }
         }
-        located |= observation.first_divergent_record.is_some()
-            || observation.first_divergent_syscall.is_some()
-            || observation.first_divergent_scheduler_turn.is_some()
-            || observation.first_divergent_virtual_nanoseconds.is_some();
+        located |= !observation.first_divergent_record.is_empty()
+            || !observation.first_divergent_syscall.is_empty()
+            || !observation.first_divergent_scheduler_turn.is_empty()
+            || !observation.first_divergent_virtual_nanoseconds.is_empty();
     }
     if diverged {
         return if located {
@@ -318,17 +318,21 @@ struct Observation {
     hermit_shas: BTreeSet<String>,
     results: BTreeSet<ObservedResult>,
     invocations: BTreeSet<ObservedInvocation>,
-    first_divergent_scheduler_turn: Option<ObservedRange>,
-    first_divergent_virtual_nanoseconds: Option<ObservedRange>,
+    #[serde(default, skip_serializing_if = "ObservedPositions::is_empty")]
+    first_divergent_scheduler_turn: ObservedPositions,
+    #[serde(default, skip_serializing_if = "ObservedPositions::is_empty")]
+    first_divergent_virtual_nanoseconds: ObservedPositions,
     /// The prefix of the log that was deterministic, as a compared-record
     /// index. Shares a unit with the report's compared counts, unlike the two
     /// above, which are positions in scheduler and virtual time.
-    first_divergent_record: Option<ObservedRange>,
+    #[serde(default, skip_serializing_if = "ObservedPositions::is_empty")]
+    first_divergent_record: ObservedPositions,
     /// Syscalls the guest completed before diverging. A DIFFERENT KEYSPACE from
     /// the three above -- one real divergence was record 98, syscall 37,
     /// scheduler turn 4 -- so these bounds must never be read against another
     /// coordinate's axis.
-    first_divergent_syscall: Option<ObservedRange>,
+    #[serde(default, skip_serializing_if = "ObservedPositions::is_empty")]
+    first_divergent_syscall: ObservedPositions,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -481,6 +485,117 @@ struct ObservedRange {
     /// `samples == 1` is the honest way to say "one observation, so these
     /// bounds are a point, not a range".
     samples: u64,
+}
+
+/// Every located position for one coordinate, ONE ENTRY PER RUN THAT LOCATED IT.
+///
+/// ⚠️ THE STORED FORM IS THE POSITIONS; THE RANGE IS DERIVED. Storing only
+/// `{earliest, latest, samples}` discards the distribution the pressure test
+/// exists to measure: `{earliest 93, latest 94, samples 2}` and fifty runs
+/// clustered at 93 with one outlier at 94 are the same triple and completely
+/// different findings. Keeping the positions makes the bound recomputable and
+/// everything else -- median, clustering, whether a "range" is really a point
+/// with one stray -- answerable later without re-running anything.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+struct ObservedPositions {
+    /// One entry per run that located this coordinate, in insertion order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    positions: Vec<u64>,
+    /// Bounds inherited from before positions were stored.
+    ///
+    /// ⚠️ DELIBERATELY NOT EXPANDED INTO POSITIONS, and this is the whole
+    /// honesty of the migration. `{earliest 93, latest 94, samples 2}` records
+    /// that two runs diverged somewhere in [93, 94]; it does NOT record which
+    /// run was which, and no rule recovers that. Synthesising two positions
+    /// would invent measurements nobody took -- the exact fabrication this
+    /// change exists to prevent -- so legacy evidence is carried forward as the
+    /// weaker claim it always was, and marked as such.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    legacy_bounds: Option<ObservedRange>,
+}
+
+impl ObservedPositions {
+    /// The DERIVED `{earliest, latest, samples}` view. `None` when nothing
+    /// located this coordinate.
+    fn range(&self) -> Option<ObservedRange> {
+        let from_positions = if self.positions.is_empty() {
+            None
+        } else {
+            Some(ObservedRange {
+                earliest: *self.positions.iter().min().expect("non-empty"),
+                latest: *self.positions.iter().max().expect("non-empty"),
+                samples: self.positions.len() as u64,
+            })
+        };
+        match (from_positions, self.legacy_bounds) {
+            (None, legacy) => legacy,
+            (Some(range), None) => Some(range),
+            // Both present: widen the bounds and ADD the sample counts, because
+            // the legacy triple stands for runs that really happened even though
+            // their individual positions are gone.
+            (Some(range), Some(legacy)) => Some(ObservedRange {
+                earliest: range.earliest.min(legacy.earliest),
+                latest: range.latest.max(legacy.latest),
+                samples: range.samples + legacy.samples,
+            }),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.positions.is_empty() && self.legacy_bounds.is_none()
+    }
+
+    /// Record one run's located position. A run that located nothing is not a
+    /// sample of WHERE the divergence was and contributes no entry.
+    fn record(&mut self, value: Option<u64>) {
+        if let Some(value) = value {
+            self.positions.push(value);
+        }
+    }
+}
+
+/// Accept both the current form and the pre-step-5 bare range, without letting
+/// a legacy object silently deserialize as "no evidence".
+impl<'de> Deserialize<'de> for ObservedPositions {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Current {
+            #[serde(default)]
+            positions: Vec<u64>,
+            #[serde(default)]
+            legacy_bounds: Option<ObservedRange>,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            // ⚠️ `null` IS A REAL FORM IN THE EXISTING FILE and must be handled
+            // explicitly. Before this change the four coordinates were
+            // `Option<ObservedRange>` and serialized as `null` when nothing had
+            // located them, so the tracked corpus is full of them. Omitting this
+            // variant made `update` abort with "data did not match any variant
+            // of untagged enum Either" -- caught by running it, not by reading.
+            Absent(()),
+            // ⚠️ `Current` IS TRIED FIRST AND USES `deny_unknown_fields`, which is
+            // load-bearing: without it a legacy `{earliest, latest, samples}`
+            // object would match `Current` with every field defaulted and the
+            // bounds would be SILENTLY DISCARDED -- evidence loss that looks
+            // exactly like a cell that was never measured.
+            Current(Current),
+            Legacy(ObservedRange),
+        }
+        Ok(match Either::deserialize(deserializer)? {
+            Either::Absent(()) => ObservedPositions::default(),
+            Either::Current(current) => ObservedPositions {
+                positions: current.positions,
+                legacy_bounds: current.legacy_bounds,
+            },
+            Either::Legacy(range) => ObservedPositions {
+                positions: Vec::new(),
+                legacy_bounds: Some(range),
+            },
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1705,7 +1820,8 @@ fn render_evidence_coverage(root: &Path) -> Result<String, String> {
         for (id, tree, pressure, validate) in conflicts {
             let n = |o: &Observation| {
                 o.first_divergent_record
-                    .or(o.first_divergent_scheduler_turn)
+                    .range()
+                    .or_else(|| o.first_divergent_scheduler_turn.range())
                     .map(|r| r.samples)
                     .unwrap_or(0)
             };
@@ -1733,28 +1849,9 @@ fn default_provenance() -> ObservationProvenance {
     ObservationProvenance::PressureTest
 }
 
-fn merge_range(range: &mut Option<ObservedRange>, value: Option<u64>) {
-    let Some(value) = value else {
-        // A run that located nothing is not a sample of WHERE the divergence
-        // was, so it must not increment `samples`. Counting it would inflate
-        // the denominator with runs that contributed no bound.
-        return;
-    };
-    match range {
-        Some(range) => {
-            range.earliest = range.earliest.min(value);
-            range.latest = range.latest.max(value);
-            range.samples += 1;
-        }
-        None => {
-            *range = Some(ObservedRange {
-                earliest: value,
-                latest: value,
-                samples: 1,
-            });
-        }
-    }
-}
+// `merge_range` was removed by step 5: a stored range is no longer the
+// form being merged into. `ObservedPositions::record` appends the run's
+// position and `ObservedPositions::range()` derives the bound on demand.
 
 /// What a fold admitted and what it refused, so the caller can report both.
 ///
@@ -2019,10 +2116,10 @@ fn apply_pressure_summary(
                     hermit_shas: BTreeSet::new(),
                     results: BTreeSet::new(),
                     invocations: BTreeSet::new(),
-                    first_divergent_scheduler_turn: None,
-                    first_divergent_virtual_nanoseconds: None,
-                    first_divergent_record: None,
-                    first_divergent_syscall: None,
+                    first_divergent_scheduler_turn: ObservedPositions::default(),
+                    first_divergent_virtual_nanoseconds: ObservedPositions::default(),
+                    first_divergent_record: ObservedPositions::default(),
+                    first_divergent_syscall: ObservedPositions::default(),
                 });
                 observations.last_mut().expect("observation was appended")
             }
@@ -2040,13 +2137,10 @@ fn apply_pressure_summary(
             shell_command: invocation.shell_command,
             attempts: invocation.attempts,
         });
-        merge_range(&mut observation.first_divergent_scheduler_turn, turn);
-        merge_range(
-            &mut observation.first_divergent_virtual_nanoseconds,
-            virtual_nanoseconds,
-        );
-        merge_range(&mut observation.first_divergent_record, divergent_record);
-        merge_range(&mut observation.first_divergent_syscall, divergent_syscall);
+        observation.first_divergent_scheduler_turn.record(turn);
+        observation.first_divergent_virtual_nanoseconds.record(virtual_nanoseconds);
+        observation.first_divergent_record.record(divergent_record);
+        observation.first_divergent_syscall.record(divergent_syscall);
         // Sort by the full key, so a tree carrying both a pressure-test and a
         // validate observation still has a stable tracked-file order.
         observations.sort_by(|left, right| {
@@ -2193,10 +2287,10 @@ fn apply_validate_results(
                         hermit_shas: BTreeSet::new(),
                         results: BTreeSet::new(),
                         invocations: BTreeSet::new(),
-                        first_divergent_scheduler_turn: None,
-                        first_divergent_virtual_nanoseconds: None,
-                        first_divergent_record: None,
-                        first_divergent_syscall: None,
+                        first_divergent_scheduler_turn: ObservedPositions::default(),
+                        first_divergent_virtual_nanoseconds: ObservedPositions::default(),
+                        first_divergent_record: ObservedPositions::default(),
+                        first_divergent_syscall: ObservedPositions::default(),
                     });
                     observations.last_mut().expect("observation was appended")
                 }
@@ -2218,22 +2312,10 @@ fn apply_validate_results(
                 shell_command: row.shell_command.clone(),
                 attempts: attempt_invocations,
             });
-            merge_range(
-                &mut observation.first_divergent_scheduler_turn,
-                row.first_divergent_scheduler_turn,
-            );
-            merge_range(
-                &mut observation.first_divergent_virtual_nanoseconds,
-                row.first_divergent_virtual_nanoseconds,
-            );
-            merge_range(
-                &mut observation.first_divergent_record,
-                row.first_divergent_record,
-            );
-            merge_range(
-                &mut observation.first_divergent_syscall,
-                row.first_divergent_syscall,
-            );
+            observation.first_divergent_scheduler_turn.record(row.first_divergent_scheduler_turn);
+            observation.first_divergent_virtual_nanoseconds.record(row.first_divergent_virtual_nanoseconds);
+            observation.first_divergent_record.record(row.first_divergent_record);
+            observation.first_divergent_syscall.record(row.first_divergent_syscall);
             observations.sort_by(|left, right| {
                 left.detcore_tree
                     .cmp(&right.detcore_tree)
@@ -3044,14 +3126,14 @@ fn self_test() -> Result<(), String> {
     //
     // Reporting "earliest 10, latest 30" against an implied five runs would
     // overstate the evidence by two thirds.
-    if observation.first_divergent_scheduler_turn
-        != Some(ObservedRange {
+    if observation.first_divergent_scheduler_turn.range()
+!= Some(ObservedRange {
             earliest: 10,
             latest: 30,
             samples: 3,
         })
-        || observation.first_divergent_virtual_nanoseconds
-            != Some(ObservedRange {
+        || observation.first_divergent_virtual_nanoseconds.range()
+!= Some(ObservedRange {
                 earliest: 500,
                 latest: 1000,
                 samples: 3,
@@ -3146,8 +3228,8 @@ fn self_test() -> Result<(), String> {
         .iter()
         .find(|o| o.provenance == ObservationProvenance::PressureTest)
         .ok_or("validate fold destroyed the pressure-test observation")?;
-    if pressure.first_divergent_scheduler_turn
-        != Some(ObservedRange {
+    if pressure.first_divergent_scheduler_turn.range()
+!= Some(ObservedRange {
             earliest: 10,
             latest: 30,
             samples: 3,
@@ -3165,14 +3247,14 @@ fn self_test() -> Result<(), String> {
     // `samples: 1` is the honest reading of a single validate run: a POINT, not
     // a distribution. Validate runs a cell once per commit, so it cannot
     // produce a range at one tree by itself.
-    if from_validate.first_divergent_scheduler_turn
-        != Some(ObservedRange {
+    if from_validate.first_divergent_scheduler_turn.range()
+!= Some(ObservedRange {
             earliest: 7,
             latest: 7,
             samples: 1,
         })
-        || from_validate.first_divergent_virtual_nanoseconds
-            != Some(ObservedRange {
+        || from_validate.first_divergent_virtual_nanoseconds.range()
+!= Some(ObservedRange {
                 earliest: 70,
                 latest: 70,
                 samples: 1,
@@ -3180,16 +3262,16 @@ fn self_test() -> Result<(), String> {
         // The third coordinate, from hermit#2386. Unlike the two above it
         // LOCATES the divergence rather than bounding it, so it is the one a
         // reader should trust for "how far did the run get".
-        || from_validate.first_divergent_record
-            != Some(ObservedRange {
+        || from_validate.first_divergent_record.range()
+!= Some(ObservedRange {
                 earliest: 12,
                 latest: 12,
                 samples: 1,
             })
         // The fourth unit, a different keyspace again: 12 records in but only
         // 9 syscalls completed.
-        || from_validate.first_divergent_syscall
-            != Some(ObservedRange {
+        || from_validate.first_divergent_syscall.range()
+!= Some(ObservedRange {
                 earliest: 9,
                 latest: 9,
                 samples: 1,
@@ -3465,10 +3547,10 @@ fn self_test() -> Result<(), String> {
         hermit_shas: BTreeSet::new(),
         results: BTreeSet::new(),
         invocations: BTreeSet::new(),
-        first_divergent_scheduler_turn: None,
-        first_divergent_virtual_nanoseconds: None,
-        first_divergent_record: None,
-        first_divergent_syscall: None,
+        first_divergent_scheduler_turn: ObservedPositions::default(),
+        first_divergent_virtual_nanoseconds: ObservedPositions::default(),
+        first_divergent_record: ObservedPositions::default(),
+        first_divergent_syscall: ObservedPositions::default(),
     };
     let with_evidence = TrackedCells {
         schema: SCHEMA,
@@ -3495,6 +3577,100 @@ fn self_test() -> Result<(), String> {
                 .into(),
         );
     }
+    // ---- step 5: positions are stored, the range is derived ----
+    {
+        // The range is a VIEW. Three runs at 93, 97, 94 must derive
+        // {93, 97, 3} -- and, unlike a stored bound, the individual positions
+        // survive so a later reader can ask whether that is a cluster or a
+        // spread.
+        let mut positions = ObservedPositions::default();
+        for value in [93u64, 97, 94] {
+            positions.record(Some(value));
+        }
+        if positions.range()
+            != Some(ObservedRange {
+                earliest: 93,
+                latest: 97,
+                samples: 3,
+            })
+        {
+            return Err("derived range did not reproduce the bounds of its positions".into());
+        }
+        if positions.positions != vec![93, 97, 94] {
+            return Err("individual positions were not retained in run order".into());
+        }
+
+        // A run that located nothing contributes no sample. Counting it would
+        // inflate the denominator with runs that produced no bound.
+        let mut sparse = ObservedPositions::default();
+        sparse.record(Some(5));
+        sparse.record(None);
+        if sparse.range().map(|r| r.samples) != Some(1) {
+            return Err("a run that located nothing was counted as a sample".into());
+        }
+
+        // Nothing located at all is None, not a zero-width range at zero.
+        if ObservedPositions::default().range().is_some() {
+            return Err("an empty coordinate derived a range".into());
+        }
+
+        // ⚠️ THE LEGACY MIGRATION, AND THE POINT IS WHAT IT REFUSES TO DO.
+        // `{earliest 93, latest 94, samples 2}` records that two runs diverged
+        // somewhere in [93, 94]; it does NOT record which run was which, and no
+        // rule recovers that. The bounds must survive as bounds, and NO
+        // positions may be invented from them.
+        let legacy: ObservedPositions = serde_json::from_str(
+            r#"{"earliest":93,"latest":94,"samples":2}"#,
+        )
+        .map_err(|e| format!("legacy range failed to migrate: {e}"))?;
+        if !legacy.positions.is_empty() {
+            return Err(
+                "legacy bounds were expanded into fabricated positions; they cannot be \
+                 recovered and must not be invented"
+                    .into(),
+            );
+        }
+        if legacy.range()
+            != Some(ObservedRange {
+                earliest: 93,
+                latest: 94,
+                samples: 2,
+            })
+        {
+            return Err("legacy bounds were lost during migration".into());
+        }
+
+        // ⚠️ AND THE SILENT-LOSS CASE THAT `deny_unknown_fields` EXISTS FOR.
+        // Without it the legacy object would match the current shape with every
+        // field defaulted, and the bounds would vanish -- evidence loss that
+        // looks exactly like a cell nobody measured. Asserting the round trip
+        // is what pins that.
+        let reserialised = serde_json::to_string(&legacy)
+            .map_err(|e| format!("cannot reserialise migrated legacy bounds: {e}"))?;
+        let round_tripped: ObservedPositions = serde_json::from_str(&reserialised)
+            .map_err(|e| format!("migrated legacy bounds do not round trip: {e}"))?;
+        if round_tripped != legacy {
+            return Err("migrated legacy bounds changed across a round trip".into());
+        }
+
+        // Positions and legacy bounds coexisting: widen, and ADD the counts,
+        // because the legacy triple stands for runs that really happened.
+        let mut mixed: ObservedPositions = serde_json::from_str(
+            r#"{"earliest":10,"latest":20,"samples":2}"#,
+        )
+        .map_err(|e| format!("legacy range failed to migrate: {e}"))?;
+        mixed.record(Some(30));
+        if mixed.range()
+            != Some(ObservedRange {
+                earliest: 10,
+                latest: 30,
+                samples: 3,
+            })
+        {
+            return Err("positions and legacy bounds did not combine correctly".into());
+        }
+    }
+
     // ---- step 6: `measurement` is derived, and cannot be written to disagree ----
     //
     // ⚠️ EVERY ONE OF THESE IS A REFUSAL OR A DERIVATION, DEMONSTRATED. A field
@@ -3507,7 +3683,7 @@ fn self_test() -> Result<(), String> {
             .results
             .insert(ObservedResult::DeterminismFailure);
         if located {
-            observation.first_divergent_record = Some(ObservedRange { earliest: 98, latest: 98, samples: 1 });
+            observation.first_divergent_record.record(Some(98));
         }
         observation
     };
