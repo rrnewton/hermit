@@ -1232,7 +1232,8 @@ test:
           native: Native execution removes all eighteen sanitizers together and is a negative control, not a green cell
         ci_disabled_reason: 'NOT-EXERCISED: native execution removes every sanitizer under test and fails the guest assertions.'
       verify:
-        ci: true
+        ci: false
+        ci_disabled_reason: 'MEASURED-BUT-NOT-QUALIFIED: The one-guest assertions pass, but canonical comparison with syscall I/O-buffer hashing enabled intermittently diverges on live procfs bytes that are intentionally outside the sanitizer contract (mountinfo first, then smaps after mount identities were normalized). This tuple remains enabled for manual diagnostic execution, where the guest assertions can be inspected without claiming a canonical pass, but is quarantined from required CI; accepting matched-without-I/O or exempting the cell from canonical admission would weaken the comparator.'
         compare_io_buffers: false
         compare_io_buffers_disabled_reason: The guest asserts sanitizer-specific invariants for sixteen procfs files that legitimately retain process, virtual-time, topology, or host data; comparing their raw whole-file bytes would manufacture flakes.
         rcb_time: false
@@ -1240,20 +1241,20 @@ test:
         backends_enabled:
           - ptrace
         backends_disabled:
-          dbt: The procfs read sanitizers are backend-independent; ptrace is the canonical required witness
-          kvm: The procfs read sanitizers are backend-independent; ptrace is the canonical required witness
-          sabre: The procfs read sanitizers are backend-independent; ptrace is the canonical required witness
-          liteinst: The procfs read sanitizers are backend-independent; ptrace is the canonical required witness
+          dbt: The procfs read sanitizers are backend-independent; ptrace is the enabled diagnostic witness, but no backend is CI-qualified
+          kvm: The procfs read sanitizers are backend-independent; ptrace is the enabled diagnostic witness, but no backend is CI-qualified
+          sabre: The procfs read sanitizers are backend-independent; ptrace is the enabled diagnostic witness, but no backend is CI-qualified
+          liteinst: The procfs read sanitizers are backend-independent; ptrace is the enabled diagnostic witness, but no backend is CI-qualified
       replay:
         ci: false
         backends_enabled: []
         backends_disabled:
-          ptrace: The guest assertions and required verify cell own this procfs normalization contract
+          ptrace: The verify guest owns these assertions, but its ptrace tuple is quarantined from required CI
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
-        ci_disabled_reason: 'NOT-EXERCISED: the required verify cell owns the procfs normalization contract.'
+        ci_disabled_reason: 'NOT-EXERCISED: the verify guest owns these assertions, but its ptrace tuple is quarantined from required CI.'
       chaos:
         ci: false
         backends_enabled: []
@@ -1263,17 +1264,17 @@ test:
           kvm: Chaos scheduling is unsupported by KVM
           sabre: Chaos scheduling is unsupported by SaBRe
           liteinst: Chaos scheduling is unsupported by LiteInst
-        ci_disabled_reason: 'NOT-EXERCISED: no scheduling surface; the verify cell owns this contract.'
+        ci_disabled_reason: 'NOT-EXERCISED: no scheduling surface; the verify guest owns these assertions but is not CI-qualified.'
       custom:
         ci: false
         backends_enabled: []
         backends_disabled:
-          ptrace: The verify cell already self-asserts every procfs invariant; a custom arm adds no observation
+          ptrace: The verify guest already self-asserts every procfs invariant; a custom arm adds no observation
           dbt: No edge-case Hermit arguments are required
           kvm: No edge-case Hermit arguments are required
           sabre: No edge-case Hermit arguments are required
           liteinst: No edge-case Hermit arguments are required
-        ci_disabled_reason: 'NOT-EXERCISED: the required verify cell owns this procfs normalization contract.'
+        ci_disabled_reason: 'NOT-EXERCISED: the verify guest owns these assertions, but its ptrace tuple is quarantined from required CI.'
   - id: system-utils/du-tree-summary
     description: GNU du recursively traverses and byte-accounts the shared e2e tree under Hermit
     lane: portable

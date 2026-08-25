@@ -66328,7 +66328,7 @@
       "backend": "ptrace",
       "enabled": false,
       "status": "not-applicable",
-      "not_applicable_reason": "The guest assertions and required verify cell own this procfs normalization contract",
+      "not_applicable_reason": "The verify guest owns these assertions, but its ptrace tuple is quarantined from required CI",
       "observations": [],
       "measurement": "never-measured"
     },
@@ -66352,7 +66352,7 @@
       "backend": "dbt",
       "enabled": false,
       "status": "not-applicable",
-      "not_applicable_reason": "The procfs read sanitizers are backend-independent; ptrace is the canonical required witness",
+      "not_applicable_reason": "The procfs read sanitizers are backend-independent; ptrace is the enabled diagnostic witness, but no backend is CI-qualified",
       "observations": [],
       "measurement": "never-measured"
     },
@@ -66364,7 +66364,7 @@
       "backend": "kvm",
       "enabled": false,
       "status": "not-applicable",
-      "not_applicable_reason": "The procfs read sanitizers are backend-independent; ptrace is the canonical required witness",
+      "not_applicable_reason": "The procfs read sanitizers are backend-independent; ptrace is the enabled diagnostic witness, but no backend is CI-qualified",
       "observations": [],
       "measurement": "never-measured"
     },
@@ -66376,7 +66376,7 @@
       "backend": "liteinst",
       "enabled": false,
       "status": "not-applicable",
-      "not_applicable_reason": "The procfs read sanitizers are backend-independent; ptrace is the canonical required witness",
+      "not_applicable_reason": "The procfs read sanitizers are backend-independent; ptrace is the enabled diagnostic witness, but no backend is CI-qualified",
       "observations": [],
       "measurement": "never-measured"
     },
@@ -66387,7 +66387,10 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "reason": "MEASURED-BUT-NOT-QUALIFIED: The one-guest assertions pass, but canonical comparison with syscall I/O-buffer hashing enabled intermittently diverges on live procfs bytes that are intentionally outside the sanitizer contract (mountinfo first, then smaps after mount identities were normalized). This tuple remains enabled for manual diagnostic execution, where the guest assertions can be inspected without claiming a canonical pass, but is quarantined from required CI; accepting matched-without-I/O or exempting the cell from canonical admission would weaken the comparator."
+      },
       "observations": [],
       "measurement": "never-measured"
     },
@@ -66399,7 +66402,7 @@
       "backend": "sabre",
       "enabled": false,
       "status": "not-applicable",
-      "not_applicable_reason": "The procfs read sanitizers are backend-independent; ptrace is the canonical required witness",
+      "not_applicable_reason": "The procfs read sanitizers are backend-independent; ptrace is the enabled diagnostic witness, but no backend is CI-qualified",
       "observations": [],
       "measurement": "never-measured"
     },
