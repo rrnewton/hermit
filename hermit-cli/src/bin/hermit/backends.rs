@@ -48,7 +48,7 @@ use std::path::Path;
 #[cfg(feature = "dbt")]
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
-#[cfg(feature = "dbt")]
+#[cfg(any(feature = "dbt", test))]
 use std::process::Output;
 
 use detcore::Config;
@@ -1325,7 +1325,11 @@ fn write_output(output: &Output) -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(feature = "dbt")]
+// `test` as well as `dbt`, matching process_status above. This is the site where
+// the signal-losing conversion was MISSED -- `code().unwrap_or(1)` reported every
+// signalled death as Exited(1) -- so it is the one that most needs a bracket that
+// actually runs, and the bracket for it ran ZERO times on the default build.
+#[cfg(any(feature = "dbt", test))]
 fn output_status(output: &Output) -> ExitStatus {
     // ⚠️ SAME SIGNAL-LOSING CONVERSION `process_status` ALREADY FIXED, MISSED HERE.
     // `std::process::ExitStatus::code()` is `None` for a process killed by a
@@ -2046,7 +2050,6 @@ mod tests {
     /// ITS SIBLING DID NOT. `process_status` was converted to `from_raw`;
     /// `output_status` kept `code().unwrap_or(1)` and nothing noticed, because no
     /// test asserted the signalled case for either. Asserting it here binds BOTH.
-    #[cfg(feature = "dbt")]
     #[test]
     fn a_signalled_guest_is_not_reported_as_a_normal_exit() {
         use std::os::unix::process::ExitStatusExt as _;
