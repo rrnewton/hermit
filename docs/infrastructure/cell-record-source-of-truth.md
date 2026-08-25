@@ -1,6 +1,8 @@
 # Storage redesign: validate and pressure-test records
 
-Status: proposed plan, measured 2026-08-24 against hermit `8bc26dba1d`.
+Status: proposed plan. Part 1 measured 2026-08-24 against hermit `8bc26dba1d`;
+population, landing states and the scheduling finding re-measured 2026-08-25
+after #2396 and #2444 landed.
 
 Part 1 states the architecture as it actually is, measured rather than recalled,
 because an earlier description of it was wrong in a way that changed what kind
@@ -68,7 +70,7 @@ someone. The root is `TrackedCells`.
 
 `ci_disabled_reason` is prose, not structured divergence data:
 `CiDisabledReasonData { result: Option<String>, evidence: Option<String>,
-reason: String }`. Its population is sparse (373 of 5520 cells) and **that is
+reason: String }`. Its population is sparse (373 of 5520 cells when measured; the denominator has since grown to 5584) and **that is
 correct** — a note exists only where someone tried and failed. It is not a
 backfill target, and reading its sparseness as missing data is a misreading.
 
@@ -117,21 +119,23 @@ its consequence named, rather than an accident of where each tool was written.
   no mechanism behind it, which is why there is one entry.
 - **`nextest` has zero retries configured** anywhere in the tree. Nothing
   incidentally samples a cell more than once.
-- **`ObservedRange` is populated on 2 of 5520 cells** — and the precise version
-  is worse than the round number. On `main` it is **0 of 5520**; the two
-  populated cells exist only on the unlanded PR
-  [#2396](https://github.com/rrnewton/hermit/pull/2396), and of those two only
-  **one** actually carries ranges (`data-handling/sqlite-query-determinism
-  verify sabre`: record 93–94, scheduler turn 68–69, virtual nanoseconds
-  …317250–…354000, `samples: 2`). The other is a `pass` with all coordinates
-  null.
+- **`ObservedRange` is populated on 2 of 5584 cells**, and the precise version is
+  worse than the round number: only **one** of those two carries an actual
+  divergence range (`data-handling/sqlite-query-determinism verify sabre`:
+  record 93–94, scheduler turn 68–69, virtual nanoseconds …317250–…354000,
+  `samples: 2`). The other is a `pass` with all four coordinates null.
+  Re-measured on `main` after
+  [#2396](https://github.com/rrnewton/hermit/pull/2396) landed 2026-08-25.
+- **Both existing observations are `provenance: pressure-test`.** The
+  validate-side writer `observe-results` landed with #2396 and has written
+  **zero** rows, because nothing invokes it. See the next section.
 
 ## The divergence coordinates
 
 `Observation` carries three coordinate ranges on `main`
 (`first_divergent_record`, `first_divergent_scheduler_turn`,
-`first_divergent_virtual_nanoseconds`) and a fourth,
-`first_divergent_syscall`, only on unlanded #2396.
+`first_divergent_virtual_nanoseconds`) plus a fourth, `first_divergent_syscall`,
+which landed with #2396 on 2026-08-25 and is null in the one populated cell.
 
 These are **different keyspaces and must never be read against one another's
 axis**. One real measured divergence was record 98, syscall 37, scheduler turn
@@ -142,6 +146,67 @@ On `main` the validate side does not populate any of them: the harness in
 `canonical_verdict.rs` test string. The value is computed in
 `hermit-cli/src/bin/hermit/verify.rs` and **dropped one hop before any cell sees
 it**. #2396 adds the wiring (`runner.rs` +218, `canonical_verdict.rs` +126).
+
+## NOTHING SCHEDULES THE PRODUCER
+
+This is the finding that determines whether the series can ever exist, and it
+outranks every schema question below.
+
+**Measured 2026-08-25, exhaustively. No scheduler of any kind invokes
+`pressure-test.rs`, `scorecard.rs update-observations`, or
+`scorecard.rs observe-results`:**
+
+| Candidate scheduler | Result |
+|---|---|
+| `ci/dag/*.json` validate DAG nodes | no node invokes any of the three |
+| `scripts/validate.rs` | invokes `scorecard.rs verify-results` ONLY — read-only |
+| `.github/workflows/` | no reference to any of the three |
+| `crontab -l` | no matching entry |
+| systemd user timers | none; the only relevant timer is `hermit-health-tick` |
+| `ci-hub/health/tick-hub.yaml` gates | zero gates reference them (its six "observation" hits are the English word, in comments about the ledger spool and saturation gates) |
+
+The code says the same thing in its own doc comment on `observations`:
+
+> ORDINARY VALIDATE STILL NEVER CHANGES THIS ARRAY. Two commands write it, both
+> explicit and opt-in […] Neither runs as part of a normal validate, so the
+> tracked file stays untouched by routine runs.
+
+That opt-in design is CORRECT — a routine validate must not rewrite the tracked
+table. But "opt-in" was only ever half a design, and the other half was never
+built: **nothing else opts in either.**
+
+### The consequence, stated plainly
+
+The divergence data populates **only when a coordinator asks for a campaign by
+hand.** There is no periodic job, no post-validate hook, no trigger of any kind.
+
+So the population will stay at 2 of 5584 cells — one of them carrying an actual
+range — indefinitely, however many producers exist and however good the schema
+is. Running more campaigns by hand does not fix this; it is the same manual act
+repeated, and it stops the moment nobody remembers to do it.
+
+The sharpest evidence is `observe-results`. It is the validate-side writer, it
+landed with #2396, it works, and it has written **zero rows** — because no
+caller exists. A writer with no scheduler is indistinguishable from an absent
+writer at the only thing that matters, which is whether rows accumulate.
+
+### What this means for the plan
+
+Phase 3 below ("point the producers at it") is therefore NOT the small wiring
+step it reads as. It is the load-bearing phase, and it needs a scheduling
+decision the repository has never made:
+
+- **What triggers a sample?** Per validate run, per landed commit, periodic
+  (nightly/weekly), or on a red cell transitioning?
+- **Who pays for it?** The box is already the bottleneck — main lands roughly
+  one commit every 22 minutes against a ~26-minute full receipt, so a campaign
+  competes with landings for the validate lock.
+- **What stops it perturbing the measured tree?** Per requirement 5 below, if
+  the trigger writes to `cells.json` it moves the hermit SHA on every sample.
+
+None of those are schema questions, which is why they are stated here rather
+than in the schema sections. A durable series with a perfect schema and no
+trigger is still an empty table.
 
 ## The gap, stated exactly
 
@@ -237,29 +302,32 @@ projection's staleness marker is built. So is `provenance`, so is per-repo
 `depth`, so is `samples`. The redesign is substantially *completing #2396's
 direction*, not replacing it.
 
-### The writer is 60% built and unlanded
+### The writer is built; the trigger is not
 
-The gap is a writer, and most of one already exists on an unlanded branch:
+The gap is NOT the writer. As of 2026-08-25 every writer is on main; what is
+missing is the store and, more importantly, anything that CALLS them:
 
 | Piece | State |
 |---|---|
-| `observe-results` command (the append entry point) | written, #2396, unlanded |
-| validate-side wiring so a validate run can emit a divergence position at all | written, #2396, unlanded (`runner.rs` +218, `canonical_verdict.rs` +126) |
-| row-independent fold, so a batch of N cells equals N single-cell runs | written, #2396, unlanded |
-| `samples`, `provenance`, `depth`, `last_tested` | written, #2396, unlanded |
+| `observe-results` command (the append entry point) | **landed**, #2396 — but never invoked, zero rows written |
+| validate-side wiring so a validate run can emit a divergence position at all | **landed**, #2396 (`runner.rs` +218, `canonical_verdict.rs` +126) |
+| row-independent fold, so a batch of N cells equals N single-cell runs | **landed**, #2396 |
+| `samples`, `provenance`, `depth`, `last_tested` | **landed**, #2396 |
 | the append-only series store itself | **not written** |
+| **a trigger that invokes any writer** | **not written, and not designed** |
 | a third producer path for `hermit-repeat` | **not written** |
 | `flaky-cells.json` derived rather than hand-kept | **not written** |
 
-The honest summary is that this redesign is one unlanded PR plus a store, not a
-rewrite.
+The honest summary is that this redesign is now a store plus a TRIGGER, not a
+rewrite — #2396 landed on 2026-08-25, so every writer in the table above except
+the store itself is on main. The trigger is the part nobody has designed; see
+"NOTHING SCHEDULES THE PRODUCER" above.
 
 ### Phases, in dependency order
 
-**Phase 0 — land [#2396](https://github.com/rrnewton/hermit/pull/2396).**
-Everything else builds on its types and its `observe-results` entry point.
-Nothing new should be written until it lands, or the work will be rebased twice.
-*Done when:* it is on main and the four coordinates can be written by something.
+**Phase 0 — land [#2396](https://github.com/rrnewton/hermit/pull/2396). DONE,
+landed 2026-08-25.** Its types and its `observe-results` entry point are on main,
+so the remaining phases can be built without rebasing twice.
 
 **Phase 1 — enforce the writer boundary in code.** Today the
 `update` / `update-observations` split is correct by convention and unenforced.
@@ -317,8 +385,8 @@ better placed to answer it than the measurements are.
 
 | Item | State |
 |---|---|
-| [#2396](https://github.com/rrnewton/hermit/pull/2396) — 4th coordinate, `samples`, `provenance`, per-repo `depth`, `last_tested`, validate-side wiring, and the row-independent fold with `observe-results` | open, not landed |
-| [#2444](https://github.com/rrnewton/hermit/pull/2444) — denominator provenance beside the published count | open, not landed |
+| [#2396](https://github.com/rrnewton/hermit/pull/2396) — 4th coordinate, `samples`, `provenance`, per-repo `depth`, `last_tested`, validate-side wiring, and the row-independent fold with `observe-results` | **LANDED 2026-08-25** |
+| [#2444](https://github.com/rrnewton/hermit/pull/2444) — denominator provenance beside the published count | **LANDED 2026-08-25** |
 | [#2446](https://github.com/rrnewton/hermit/pull/2446) — unrelated to storage; adds one manifest cell | open, not landed |
 
 The fold work tracked as `implement-fold-option-b-skip-and-name-untrustworthy-rows`
