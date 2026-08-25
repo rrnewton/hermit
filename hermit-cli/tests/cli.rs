@@ -1377,8 +1377,8 @@ fn run_kvm_setpriv_capability_wrapper_is_deterministic() {
 /// end to end, in the guest's own `env` output.
 ///
 /// So these two lines are *expected* output of `--base-env=empty`. Measured on
-/// devbig014 at hermit `2b6005cf`: `--backend kvm` and `--backend ptrace` both
-/// emit exactly this pair plus the explicit value, byte-identical, 5/5 runs
+/// a dedicated KVM host at hermit `2b6005cf`: `--backend kvm` and `--backend
+/// ptrace` both emit exactly this pair plus the explicit value, byte-identical, 5/5 runs
 /// each.
 const FORCED_GUEST_ENV: [&str; 2] = ["ASAN_OPTIONS=detect_leaks=0", "LSAN_OPTIONS=detect_leaks=0"];
 
