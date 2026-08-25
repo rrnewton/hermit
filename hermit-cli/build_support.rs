@@ -111,6 +111,8 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8(output.stdout).ok()?.trim().to_owned())
 }
 
+include!("reverie_pin.rs");
+
 /// The Reverie revision this tree pins, read from the canonical manifest.
 ///
 /// `detcore/Cargo.toml` is the source of truth the pin checker uses; every other
@@ -127,17 +129,5 @@ pub fn reverie_pin() -> String {
     let Ok(text) = std::fs::read_to_string(&manifest) else {
         return "unknown".into();
     };
-    for line in text.lines() {
-        if !line.contains("rrnewton/reverie") {
-            continue;
-        }
-        if let Some(rest) = line.split("rev = \"").nth(1)
-            && let Some(rev) = rest.split('"').next()
-            && rev.len() == 40
-            && rev.chars().all(|c| c.is_ascii_hexdigit())
-        {
-            return rev.to_string();
-        }
-    }
-    "unknown".into()
+    parse_reverie_pin(&text).unwrap_or_else(|| "unknown".into())
 }

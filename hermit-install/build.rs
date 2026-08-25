@@ -403,22 +403,12 @@ fn main() {
     .expect("failed to write install package README");
 }
 
+include!("../hermit-cli/reverie_pin.rs");
+
 /// The Reverie revision this tree pins, read from the canonical manifest.
 fn reverie_pin(repository: &Path) -> String {
     let Ok(text) = fs::read_to_string(repository.join("detcore/Cargo.toml")) else {
         return "unknown".into();
     };
-    for line in text.lines() {
-        if !line.contains("rrnewton/reverie") {
-            continue;
-        }
-        if let Some(rest) = line.split("rev = \"").nth(1)
-            && let Some(rev) = rest.split('"').next()
-            && rev.len() == 40
-            && rev.chars().all(|c| c.is_ascii_hexdigit())
-        {
-            return rev.to_string();
-        }
-    }
-    "unknown".into()
+    parse_reverie_pin(&text).unwrap_or_else(|| "unknown".into())
 }
