@@ -212,7 +212,9 @@ pub fn is_deterministically_refused_syscall(sysno: Sysno) -> bool {
     syscall_classification::is_deterministically_refused_syscall(sysno)
 }
 
-/// Returns whether `sysno` is refused only when strict execution is enabled.
+/// Returns whether `sysno` is refused by the default fail-closed policy but
+/// forwarded under the explicit compatibility opt-out. The legacy
+/// `strict_only` name is retained for API compatibility.
 pub fn is_strict_only_deterministic_refusal_syscall(sysno: Sysno) -> bool {
     syscall_classification::is_strict_only_deterministic_refusal_syscall(sysno)
 }
