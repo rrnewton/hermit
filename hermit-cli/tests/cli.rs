@@ -3796,6 +3796,135 @@ fn a_guest_side_fault_is_not_reported_as_a_hermit_internal_failure() {
     );
 }
 
+/// The REPLAY-stage classification site of `record --verify-with-gdbex`, the
+/// sixth and last of them.
+///
+/// ⚠️ THIS SITE WAS TWICE DECLARED UNTESTABLE BY THIS BRANCH AND IS NEITHER.
+/// First the claim was that no fault could reach a replay stage at all; then,
+/// after that was disproved, that reaching THIS one wedges the process. Both
+/// were wrong, and `agent(codex-rev-2628)` supplied the missing step each time.
+/// The hang was never hermit's: killing the replay gdbserver while leaving GDB
+/// ALIVE leaves GDB holding the captured stderr pipe open, so the test's reader
+/// never sees EOF. Making GDB `quit` after the kill returns promptly.
+///
+/// ⚠️ SO `--verify-with-gdbex` IS ITSELF THE CONTROL HOOK. The CLI already
+/// accepts GDB commands, GDB runs while the replay container is alive, and GDB
+/// can run Python. No production change, no new injector, and no external
+/// process supervision: the kill is issued from inside the run being tested and
+/// the same `-ex` sequence then shuts GDB down.
+#[test]
+fn record_classifies_a_gdbserver_replay_stage_container_child_failure() {
+    let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create a recording dir");
+    let script = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kill-gdbserver-replay-peer.py");
+    // Finds the OUTER `hermit record` by walking GDB's own ancestry, then kills
+    // that process's non-ancestor children -- the replay container. Written from
+    // inside the run rather than supervised from outside, so the test does not
+    // have to guess a pid or race the fork.
+    fs::write(
+        &script,
+        r#"import os, signal
+
+def parent_of(pid):
+    try:
+        return int(open("/proc/%d/stat" % pid).read().rsplit(")", 1)[-1].split()[1])
+    except (OSError, IndexError, ValueError):
+        return None
+
+def cmdline(pid):
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as handle:
+            return handle.read().replace(b"\0", b" ").decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+ancestors = []
+current = os.getpid()
+for _ in range(30):
+    ancestors.append(current)
+    current = parent_of(current)
+    if current is None or current <= 1:
+        break
+
+outer = None
+for candidate in ancestors:
+    text = cmdline(candidate)
+    if "hermit" in text and " record " in text:
+        outer = candidate
+        break
+
+if outer is not None:
+    known = set(ancestors)
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid in known:
+            continue
+        if parent_of(pid) == outer:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+"#,
+    )
+    .expect("failed to write the gdb kill script");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .env("HERMIT_DATA_DIR", data_dir.path())
+        .args([
+            "record",
+            "--verify-with-gdbex",
+            // `;` is the -ex delimiter: kill the replay container, then shut GDB
+            // down. ⚠️ THE `quit` IS LOAD-BEARING -- without it GDB stays alive
+            // holding this test's stderr pipe and the run never appears to end.
+            &format!("pi exec(open(\"{}\").read());quit", script.display()),
+            "--",
+            "/bin/true",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn the gdbserver verify");
+
+    // ⚠️ A DEADLINE, SO A HANG IS A FAILURE RATHER THAN A STUCK SUITE. This
+    // drives hermit into an error path on purpose and an earlier version of the
+    // probe really did wedge; a test that can stall CI is not an acceptable
+    // price for a covered call site.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut timed_out = false;
+    loop {
+        match child.try_wait().expect("failed to poll hermit") {
+            Some(_) => break,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                timed_out = true;
+                break;
+            }
+            None => thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .expect("failed to collect the gdbserver verify output");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    assert!(
+        !timed_out,
+        "hermit did not exit within 120s after its gdbserver replay container was killed\n\
+         stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("HERMIT_INTERNAL_FAILURE class=container-child-exit"),
+        "a gdbserver-replay container child killed by a signal it did not choose must be \
+         classified as a container-child exit, not as a CLI error\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("status=Signaled(SIGKILL"),
+        "the typed status must survive to the classification\nstderr:\n{stderr}"
+    );
+}
+
 /// The REPLAY-stage classification site of `record --verify`, which the fault
 /// injector cannot reach and which was therefore left unpinned.
 ///
@@ -3814,13 +3943,14 @@ fn a_guest_side_fault_is_not_reported_as_a_hermit_internal_failure() {
 /// intercept, so reverie hands hermit a typed `RunError::ExitStatus` -- exactly
 /// the shape `.classified()` preserves and `.context(..)??` destroyed.
 ///
-/// ⚠️ THE `--verify-with-gdbex` REPLAY SITE IS STILL NOT COVERED, AND THE REASON
-/// IS A HERMIT BUG RATHER THAN A MISSING IDEA. The same kill reaches it and
-/// classifies correctly, but hermit then never exits: the gdbserver replay keeps
-/// waiting for a connection that will never complete. Measured -- three such
-/// invocations sat for 25 minutes before being killed by hand, and an in-suite
-/// version timed out at 300s. Putting that in the suite would trade a
-/// mutation-blind site for a hanging test, which is the worse of the two. Filed.
+/// ⚠️ THE `--verify-with-gdbex` REPLAY SITE IS COVERED BY THE TEST ABOVE, AND AN
+/// EARLIER VERSION OF THIS COMMENT BLAMED HERMIT FOR NOT COVERING IT. It said
+/// hermit hangs when that replay container is killed, on the evidence of three
+/// invocations that sat for 25 minutes and an in-suite probe that timed out at
+/// 300s. The hang was real and the attribution was wrong: it was the PROBE
+/// leaving GDB alive holding the captured stderr pipe, so the reader never saw
+/// EOF. Issuing GDB `quit` after the kill returns in about a second. Hermit has
+/// no bug here.
 #[test]
 fn record_classifies_a_replay_stage_container_child_failure() {
     let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
