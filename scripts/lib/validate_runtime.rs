@@ -323,6 +323,73 @@ pub fn environmental_block_class(output: &str) -> Option<&'static str> {
     None
 }
 
+/// What an actual re-execution established about an environmental classification.
+///
+/// Classification binds a host/sandbox signature to one failed node attempt. It
+/// is only a hypothesis about cause until the same node executes again. Keeping
+/// the never-executed case explicit prevents a planned or aborted retry from
+/// being reported as evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvBlockVerdict {
+    /// A later, reported, non-aborted execution passed.
+    Confirmed,
+    /// A later, reported, non-aborted execution failed.
+    Refuted,
+    /// No later execution produced a usable completion payload.
+    Unconfirmed,
+}
+
+impl EnvBlockVerdict {
+    /// Settle the hypothesis from the first later execution that actually
+    /// completed. `None` means no such execution occurred.
+    pub fn settle(rerun_result: Option<bool>) -> Self {
+        match rerun_result {
+            Some(true) => Self::Confirmed,
+            Some(false) => Self::Refuted,
+            None => Self::Unconfirmed,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Confirmed => "confirmed",
+            Self::Refuted => "refuted",
+            Self::Unconfirmed => "unconfirmed",
+        }
+    }
+}
+
+/// How the failed re-execution's environmental signature compares with the
+/// signature that caused the retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefutedShape {
+    /// The re-execution emitted a new detail region and failed without the
+    /// original environmental signature.
+    BannerGone,
+    /// The re-execution failed with the same environmental signature.
+    Persistent,
+    /// The re-execution failed with a different environmental signature.
+    SignatureChanged,
+}
+
+impl RefutedShape {
+    pub fn of(original: &str, latest: Option<&str>) -> Self {
+        match latest {
+            None => Self::BannerGone,
+            Some(latest) if latest == original => Self::Persistent,
+            Some(_) => Self::SignatureChanged,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BannerGone => "banner-gone",
+            Self::Persistent => "persistent",
+            Self::SignatureChanged => "signature-changed",
+        }
+    }
+}
+
 /// Extract one failed DAG node's captured output from the driver's durable log.
 ///
 /// `dagrun` re-emits a failed step's combined stdout+stderr between
@@ -332,8 +399,9 @@ pub fn environmental_block_class(output: &str) -> Option<&'static str> {
 /// failed, so a jail banner printed by an unrelated concurrent node cannot excuse
 /// a genuine product red.
 ///
-/// Returns `None` when the region is absent (log not flushed, or the node's
-/// failure predates detail emission).
+/// Returns `None` when either delimiter is absent. A region is evidence only
+/// after its matching end marker arrives; accepting a partial tee write would
+/// turn an in-progress attempt into a classification.
 pub fn extract_node_detail(log: &str, tag: &str) -> Option<String> {
     let open = format!("[{tag}] ----- detail -----");
     let close = format!("[{tag}] ----- end detail -----");
@@ -341,7 +409,7 @@ pub fn extract_node_detail(log: &str, tag: &str) -> Option<String> {
     // The LAST region, so a retried node is classified on its newest attempt.
     let start = log.rfind(&open)? + open.len();
     let rest = &log[start..];
-    let end = rest.find(&close).unwrap_or(rest.len());
+    let end = rest.find(&close)?;
     let mut out = String::new();
     for line in rest[..end].lines() {
         out.push_str(line.strip_prefix(&prefix).unwrap_or(line));
@@ -1373,6 +1441,51 @@ pub fn self_test() -> Result<String, String> {
     if extract_node_detail(log, "lint.clippy").is_some() {
         return Err("extract: a node with no detail region must yield None".into());
     }
+    let partial = "[build.workspace] ----- detail -----\n\
+                   [build.workspace] Enforcer: FS, Reason: FILE_OPEN\n";
+    if extract_node_detail(partial, "build.workspace").is_some() {
+        return Err("extract: an unterminated detail region must remain unknown".into());
+    }
+
+    // ---- environmental retry verdict: all three states and refuted shapes ----
+    // A coincident banner and real assertion still classifies on the first
+    // attempt. Only the later execution's typed result may settle that
+    // hypothesis; classification itself can never turn a red into a pass.
+    let coincident = "[test.detcore] ----- detail -----\n\
+                      [test.detcore] Enforcer: FS, Reason: FILE_OPEN\n\
+                      [test.detcore] assertion `left == right` failed\n\
+                      [test.detcore] test result: FAILED. 412 passed; 1 failed\n\
+                      [test.detcore] ----- end detail -----\n";
+    let coincident_detail = extract_node_detail(coincident, "test.detcore")
+        .ok_or("retry verdict: coincident detail region was not found")?;
+    if environmental_block_class(&coincident_detail) != Some("bpfjailer-banner") {
+        return Err(
+            "retry verdict: coincident banner + real failure must remain a classified hypothesis"
+                .into(),
+        );
+    }
+    for (rerun, want) in [
+        (Some(true), EnvBlockVerdict::Confirmed),
+        (Some(false), EnvBlockVerdict::Refuted),
+        (None, EnvBlockVerdict::Unconfirmed),
+    ] {
+        if EnvBlockVerdict::settle(rerun) != want {
+            return Err(format!(
+                "retry verdict: rerun result {rerun:?} did not settle as {want:?}"
+            ));
+        }
+    }
+    for (latest, want) in [
+        (None, RefutedShape::BannerGone),
+        (Some("bpfjailer-banner"), RefutedShape::Persistent),
+        (Some("proxy-egress"), RefutedShape::SignatureChanged),
+    ] {
+        if RefutedShape::of("bpfjailer-banner", latest) != want {
+            return Err(format!(
+                "retry verdict: latest class {latest:?} did not attribute refutation as {want:?}"
+            ));
+        }
+    }
 
     // ---- CPU-vs-wall hints, both directions ----
     if cpu_wall_hint(5.0, 600.0, 316) != Some("low CPU vs wall — mostly waiting/blocked, not compute-bound") {
@@ -1808,7 +1921,8 @@ pub fn self_test() -> Result<String, String> {
 
     Ok(format!(
         "runtime: environmental classifier bracketed {accepted} accept / {refused} refuse \
-         (incl. the 2 NEW classes), node-detail extraction 1 hit / 1 miss, CPU-vs-wall hints \
+         (incl. the 2 NEW classes), node-detail extraction 1 hit / 2 miss (incl. partial), retry verdict \
+         1 confirmed / 1 refuted / 1 unconfirmed with all 3 refuted shapes, CPU-vs-wall hints \
          2 fire / 2 silent, nesting 1 ancestor-accept / 3 refuse, invocation lock \
          {lock_accept} accept (incl. the sequential re-claim) / {lock_refuse} concurrent-refuse / \
          {lock_safety_refuse} safety-refuse, \
