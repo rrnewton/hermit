@@ -264,18 +264,10 @@ fn write_no_cookie(out: &mut [u8], at: usize, end: usize, modified: &mut bool) {
         return;
     }
 
-    let mut changed = false;
-    for (slot, word) in out[at..cookie_end]
-        .chunks_exact_mut(std::mem::size_of::<u32>())
-        .zip(SOCK_DIAG_NOCOOKIE)
-    {
-        let bytes = word.to_ne_bytes();
-        if slot != bytes.as_slice() {
-            slot.copy_from_slice(&bytes);
-            changed = true;
-        }
+    if out[at..cookie_end].iter().any(|&byte| byte != u8::MAX) {
+        out[at..cookie_end].fill(u8::MAX);
+        *modified = true;
     }
-    *modified |= changed;
 }
 
 #[cfg(test)]
