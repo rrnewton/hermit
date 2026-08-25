@@ -3937,7 +3937,20 @@ mod procfs_wiring_guard {
     fn handler_body(name: &str) -> &'static str {
         let start = production_source()
             .find(&format!("fn {}<G: Guest<Self>>", name))
-            .unwrap_or_else(|| panic!("procfs wiring guard: handler `{name}` not found in files.rs"));
+            .unwrap_or_else(|| {
+                panic!(
+                    "procfs wiring guard: handler `{name}` not found in files.rs.\n\
+                     TWO VERY DIFFERENT CAUSES, and the guard cannot tell them apart:\n\
+                       (a) the handler was RENAMED or its signature changed -- the \
+                     mechanism is fine, update the name in this guard; or\n\
+                       (b) the handler was DELETED -- the procfs snapshot wiring is gone.\n\
+                     Check which before editing. This guard binds to source text on \
+                     purpose: the handlers are async `Tool` methods taking a live Guest, \
+                     so nothing cheaper can observe the call. It is deliberately loud \
+                     when it cannot see the code, because silently passing is the \
+                     failure it exists to prevent."
+                )
+            });
         let rest = &production_source()[start..];
         let end = rest.find("
     }
