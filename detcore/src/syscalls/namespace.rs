@@ -155,6 +155,13 @@ struct AnonymousProcFdIdentity {
     raw_inode: RawInode,
 }
 
+// Long enough for `socket:[` + every decimal u64 inode + `]`.
+const ANONYMOUS_PROC_FD_TARGET_CAPACITY: usize = 32;
+
+fn needs_anonymous_proc_fd_scratch(buffer_present: bool, buffer_len: usize) -> bool {
+    buffer_present && buffer_len != 0 && buffer_len < ANONYMOUS_PROC_FD_TARGET_CAPACITY
+}
+
 /// Recognize only a complete kernel pipe/socket symlink target.
 fn anonymous_proc_fd_identity(target: &[u8]) -> Option<AnonymousProcFdIdentity> {
     for (kind, prefix) in [
@@ -204,6 +211,37 @@ fn canonical_anonymous_proc_fd_target(
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    async fn canonicalize_other_proc_fd_target<G>(
+        &self,
+        guest: &mut G,
+        raw_target: &[u8],
+        buffer: Option<AddrMut<'_, libc::c_char>>,
+        buffer_len: usize,
+    ) -> Result<Option<i64>, Error>
+    where
+        G: Guest<Self>,
+    {
+        let Some(identity) = anonymous_proc_fd_identity(raw_target) else {
+            return Ok(None);
+        };
+        let mut stdio_raw_inodes = [None; 3];
+        for fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
+            stdio_raw_inodes[fd as usize] = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.inode))
+                .ok()
+                .flatten();
+        }
+        let inode = match deterministic_stdio_inode_for_raw(identity.raw_inode, &stdio_raw_inodes) {
+            Some(inode) => inode,
+            None => determinize_inode(guest, identity.raw_inode).await.0,
+        };
+        let target = canonical_anonymous_proc_fd_target(&identity, inode, buffer_len);
+        let buffer = buffer.ok_or(Errno::EFAULT)?;
+        guest.memory().write_exact(buffer.cast(), &target)?;
+        Ok(Some(target.len() as i64))
+    }
+
     /// Canonicalize a pipe/socket link belonging to another virtual process.
     /// The target descriptor is not in the caller's table, so its raw readlink
     /// bytes are the only safe identity evidence available here.
@@ -223,24 +261,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             .min(buffer_len);
         let mut observed = vec![0; observed_len];
         guest.memory().read_exact(buffer.cast(), &mut observed)?;
-        let Some(identity) = anonymous_proc_fd_identity(&observed) else {
-            return Ok(result);
-        };
-        let mut stdio_raw_inodes = [None; 3];
-        for fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
-            stdio_raw_inodes[fd as usize] = guest
-                .thread_state()
-                .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.inode))
-                .ok()
-                .flatten();
-        }
-        let inode = match deterministic_stdio_inode_for_raw(identity.raw_inode, &stdio_raw_inodes) {
-            Some(inode) => inode,
-            None => determinize_inode(guest, identity.raw_inode).await.0,
-        };
-        let target = canonical_anonymous_proc_fd_target(&identity, inode, buffer_len);
-        guest.memory().write_exact(buffer.cast(), &target)?;
-        Ok(target.len() as i64)
+        Ok(self
+            .canonicalize_other_proc_fd_target(guest, &observed, Some(buffer), buffer_len)
+            .await?
+            .unwrap_or(result))
     }
 
     async fn canonicalize_namespace_readlink_result<G>(
@@ -292,6 +316,107 @@ impl<T: RecordOrReplay> Detcore<T> {
             .write_exact(buffer.cast(), &target[..written])?;
         Ok(written as i64)
     }
+    async fn write_other_proc_fd_target<G>(
+        &self,
+        guest: &mut G,
+        raw_target: &[u8],
+        buffer: Option<AddrMut<'_, libc::c_char>>,
+        buffer_len: usize,
+    ) -> Result<i64, Error>
+    where
+        G: Guest<Self>,
+    {
+        if let Some(result) = self
+            .canonicalize_other_proc_fd_target(guest, raw_target, buffer, buffer_len)
+            .await?
+        {
+            return Ok(result);
+        }
+        let written = raw_target.len().min(buffer_len);
+        let buffer = buffer.ok_or(Errno::EFAULT)?;
+        guest
+            .memory()
+            .write_exact(buffer.cast(), &raw_target[..written])?;
+        Ok(written as i64)
+    }
+
+    async fn finish_other_proc_fd_readlink<G>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Readlink,
+    ) -> Result<i64, Error>
+    where
+        G: Guest<Self>,
+    {
+        let buffer = call.buf();
+        let buffer_len = call.bufsize();
+        if !needs_anonymous_proc_fd_scratch(buffer.is_some(), buffer_len) {
+            let result = self.record_or_replay(guest, call).await?;
+            if result <= 0 {
+                return Ok(result);
+            }
+            return self
+                .canonicalize_other_proc_fd_readlink(guest, buffer, buffer_len, result)
+                .await;
+        }
+
+        let mut stack = guest.stack().await;
+        let scratch = stack
+            .reserve::<[u8; ANONYMOUS_PROC_FD_TARGET_CAPACITY]>()
+            .cast::<libc::c_char>();
+        let guard = stack.commit()?;
+        let physical_call = call
+            .with_buf(Some(scratch))
+            .with_bufsize(ANONYMOUS_PROC_FD_TARGET_CAPACITY);
+        let result = self.record_or_replay(guest, physical_call).await?;
+        let length = usize::try_from(result)
+            .expect("a successful readlink result must fit usize")
+            .min(ANONYMOUS_PROC_FD_TARGET_CAPACITY);
+        let mut raw_target = vec![0; length];
+        guest.memory().read_exact(scratch.cast(), &mut raw_target)?;
+        drop(guard);
+        self.write_other_proc_fd_target(guest, &raw_target, buffer, buffer_len)
+            .await
+    }
+
+    async fn finish_other_proc_fd_readlinkat<G>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Readlinkat,
+    ) -> Result<i64, Error>
+    where
+        G: Guest<Self>,
+    {
+        let buffer = call.buf();
+        let buffer_len = call.buf_len();
+        if !needs_anonymous_proc_fd_scratch(buffer.is_some(), buffer_len) {
+            let result = self.record_or_replay(guest, call).await?;
+            if result <= 0 {
+                return Ok(result);
+            }
+            return self
+                .canonicalize_other_proc_fd_readlink(guest, buffer, buffer_len, result)
+                .await;
+        }
+
+        let mut stack = guest.stack().await;
+        let scratch = stack
+            .reserve::<[u8; ANONYMOUS_PROC_FD_TARGET_CAPACITY]>()
+            .cast::<libc::c_char>();
+        let guard = stack.commit()?;
+        let physical_call = call
+            .with_buf(Some(scratch))
+            .with_buf_len(ANONYMOUS_PROC_FD_TARGET_CAPACITY);
+        let result = self.record_or_replay(guest, physical_call).await?;
+        let length = usize::try_from(result)
+            .expect("a successful readlinkat result must fit usize")
+            .min(ANONYMOUS_PROC_FD_TARGET_CAPACITY);
+        let mut raw_target = vec![0; length];
+        guest.memory().read_exact(scratch.cast(), &mut raw_target)?;
+        drop(guard);
+        self.write_other_proc_fd_target(guest, &raw_target, buffer, buffer_len)
+            .await
+    }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#877)
@@ -321,11 +446,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Readlink,
     ) -> Result<i64, Error> {
         let path: PathBuf = call.path().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
-        let host_path = if matches!(proc_fd_target(&path), Some((Some(_), _))) {
+        let (host_path, other_proc_fd) = if let Some((Some(subject), _)) = proc_fd_target(&path) {
             let current_pid = guest.inject(syscalls::Getpid::new()).await?;
-            host_self_proc_fd_alias(&path, current_pid)
+            (
+                host_self_proc_fd_alias(&path, current_pid),
+                current_pid != i64::from(subject),
+            )
         } else {
-            None
+            (None, false)
         };
         if let Some(host_path) = host_path {
             let bytes = host_path.as_os_str().as_bytes();
@@ -349,6 +477,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )
                 .await;
         }
+        if other_proc_fd {
+            return self.finish_other_proc_fd_readlink(guest, call).await;
+        }
         self.finish_namespace_readlink(guest, path, call.buf(), call.bufsize(), call)
             .await
     }
@@ -370,6 +501,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .with_detfd(call.dirfd(), |detfd| detfd.path())?
                 .map_or(path.clone(), |directory| directory.join(path))
         };
+        if let Some((Some(subject), _)) = proc_fd_target(&observed_path) {
+            let current_pid = guest.inject(syscalls::Getpid::new()).await?;
+            if current_pid != i64::from(subject) {
+                return self.finish_other_proc_fd_readlinkat(guest, call).await;
+            }
+        }
         self.finish_namespace_readlink(guest, observed_path, call.buf(), call.buf_len(), call)
             .await
     }
@@ -483,6 +620,25 @@ mod tests {
         ] {
             assert_eq!(anonymous_proc_fd_identity(target), None, "{target:?}");
         }
+    }
+
+    #[test]
+    fn short_buffers_use_scratch_large_enough_for_every_anonymous_target() {
+        assert!(!needs_anonymous_proc_fd_scratch(false, 1));
+        assert!(!needs_anonymous_proc_fd_scratch(true, 0));
+        assert!(needs_anonymous_proc_fd_scratch(true, 1));
+        assert!(needs_anonymous_proc_fd_scratch(true, 31));
+        assert!(!needs_anonymous_proc_fd_scratch(true, 32));
+
+        let maximum = format!("socket:[{}]", RawInode::MAX);
+        assert!(maximum.len() < ANONYMOUS_PROC_FD_TARGET_CAPACITY);
+        assert_eq!(
+            anonymous_proc_fd_identity(maximum.as_bytes()),
+            Some(AnonymousProcFdIdentity {
+                kind: "socket",
+                raw_inode: RawInode::MAX,
+            })
+        );
     }
 
     #[test]
