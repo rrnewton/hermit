@@ -71,7 +71,13 @@ package. That BusyBox is static but is commonly installed at
 report before starting Demo 5.
 
 Demo 5 downloads a fixed public kernel, verifies its SHA-256, and caches it with
-the generated initramfs and qcow2 snapshot disk under `ignored/qemu-linux`.
+the generated initramfs and qcow2 snapshot disk under `ignored/qemu-linux`. From a
+checkout under `/tmp`, the default moves to the checkout-scoped
+`/var/tmp/hermit-qemu-strict-l2-$UID-<checkout-hash>` so concurrent clones do not
+share or clean each other's artifacts and Hermit's private guest `/tmp` does not
+hide those QEMU inputs. The Hermit
+command also identity-mounts host `/tmp`, keeping the checkout-local controller
+and per-run paths visible.
 
 ## Layout
 
@@ -220,15 +226,15 @@ The resulting internal snapshot is stored in the ignored
 `hermit-snapshot.qcow2` disk. The disk is deliberately not attached to the
 guest; it exists only as QEMU's VM-state store. Demo 5 then exits QEMU over QMP
 and records the image hash, raw INFO log, Hermit and QEMU versions, QEMU binary
-SHA-256, and timestamp. The first run becomes
-`ignored/qemu-linux/run-metadata.json`; later runs compare their exact qcow2,
+SHA-256, and timestamp. The first run becomes `run-metadata.json` under the
+resolved QEMU asset directory; later runs compare their exact qcow2,
 serial-output, and QEMU binary hashes. INFO logs are compared byte-for-byte
 after removing only each line's leading ISO-8601 wallclock timestamp. No
 address, path, virtual time, scheduler count, or other number is normalized.
 
-The demo-6 resume path keeps the QEMU-visible paths fixed at
-`ignored/qemu-linux/qmp.sock`, the `serial-pipe.in`/`serial-pipe.out` FIFO pair,
-and `hermit-snapshot.qcow2`. (Resume uses a `-serial pipe:` FIFO pair, not a
+The demo-6 resume path keeps the QEMU-visible paths fixed under the resolved
+QEMU asset directory: `qmp.sock`, the `serial-pipe.in`/`serial-pipe.out` FIFO
+pair, and `hermit-snapshot.qcow2`. (Resume uses a `-serial pipe:` FIFO pair, not a
 unix socket, because a socket chardev's poll fd starves the -icount vCPU under
 `hermit --no-rcb-time`; boot uses a `-serial file:` transcript for the same
 reason.) Changing a socket or image path changes QEMU's initial stack and heap, so a

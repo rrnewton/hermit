@@ -20,8 +20,11 @@ from demo_common import (  # noqa: E402
     check_qemu_dependencies,
     compare_runs,
     copy_file,
+    default_qemu_assets,
+    display_path,
     extract_info_tail,
     hash_file,
+    hermit_tmp_args,
     load_committed_anchor,
     make_temp_result_dir,
     print_comparison,
@@ -43,7 +46,7 @@ HERMIT = Path(os.environ.get("HERMIT_RELEASE", HERMIT_REPO / "target/release/her
 # Whether the caller pinned the binary. Must be read BEFORE main() writes
 # HERMIT_RELEASE back into the environment, which would make this always true.
 HERMIT_PINNED = "HERMIT_RELEASE" in os.environ
-ASSETS = Path(os.environ.get("QEMU_ASSETS", ROOT / "ignored/qemu-linux"))
+ASSETS = Path(os.environ.get("QEMU_ASSETS", default_qemu_assets(ROOT)))
 QEMU = os.environ.get("QEMU_BIN", shutil.which("qemu-system-x86_64") or "")
 TIMEOUT = int(os.environ.get("QEMU_TIMEOUT", "600"))
 # Run hermit through the bounded entry point rather than bare. Three runs at
@@ -220,6 +223,7 @@ def main() -> int:
             str(TIMEOUT + 60),
             str(HERMIT),
             "run",
+            *hermit_tmp_args(ROOT),
             "--strict",
             # Keep RCB/PMU branch-count preemption ARMED with a large-but-finite
             # --max-timeslice so the deterministic scheduler makes fine-grained
@@ -319,9 +323,9 @@ def main() -> int:
             raise RuntimeError("serial transcript lacks the fixed RTC epoch")
 
         banner("Snapshot ready")
-        display_path = os.path.relpath(str(snapshot_disk), str(ROOT))
+        snapshot_display = display_path(snapshot_disk, ROOT)
         print(
-            "Snapshot disk: {} (internal tag: {})".format(display_path, SNAPSHOT_NAME)
+            "Snapshot disk: {} (internal tag: {})".format(snapshot_display, SNAPSHOT_NAME)
         )
         run_checked(["qemu-img", "snapshot", "-l", str(snapshot_disk)])
         print("Snapshot SHA-256: {}".format(snapshot_sha))
@@ -376,7 +380,7 @@ def main() -> int:
             result = "FIRST RUN SAVED"
             print(
                 "PASS: this run won the anchor claim; saved first run at {}".format(
-                    anchor_dir.relative_to(ROOT)
+                    display_path(anchor_dir, ROOT)
                 )
             )
         else:
@@ -390,12 +394,12 @@ def main() -> int:
             result = "SUCCESS" if passed else "PARTIAL"
         print(
             "Run metadata: {}".format(
-                (final_dir / "run-metadata.json").relative_to(ROOT)
+                display_path(final_dir / "run-metadata.json", ROOT)
             )
         )
         print(
             "Archived snapshot: {}".format(
-                (final_dir / "boot-snapshot.qcow2").relative_to(ROOT)
+                display_path(final_dir / "boot-snapshot.qcow2", ROOT)
             )
         )
         print("\n=== {}: {} ===".format(DEMO_LABEL, result))
