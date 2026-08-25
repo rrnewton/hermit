@@ -3817,3 +3817,89 @@ fn record_classifies_a_container_child_failure_the_same_way_run_does() {
          as a CLI error\nstderr:\n{panicked}"
     );
 }
+
+/// Every `record` container site classifies a child fault, addressed BY NAME.
+///
+/// ⚠️ WHY A NAME AND NOT AN OCCURRENCE INDEX. `record` enters a container at six
+/// `run_guarded` sites. With only `HERMIT_TEST_CONTAINER_CHILD_FAULT` set, the
+/// FIRST child to run faults and every later stage is never entered, so two of the
+/// six -- the replay stages of `--verify` and `--verify-with-gdbex` -- could not be
+/// reached by any test and their classification was asserted rather than measured.
+/// An occurrence index would aim at them but is positional: it retargets silently
+/// the moment a site is added, removed or reordered, and the test keeps passing
+/// while pointing somewhere else. A process-local counter does not work at all,
+/// because each `run_guarded` forks a fresh child and the injector runs in the
+/// CHILD, so a static counter resets every time. The label is identity, which is
+/// the thing whose absence made these sites untestable.
+#[test]
+fn every_record_container_site_classifies_a_child_fault_by_name() {
+    let data_dir =
+        tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("failed to create a data dir");
+
+    let case = |site: &str, fault: &str, extra: &[&str]| -> String {
+        let mut args = vec!["record"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--", "/bin/true"]);
+        let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+            .env("HERMIT_TEST_CONTAINER_CHILD_FAULT", fault)
+            .env("HERMIT_TEST_CONTAINER_CHILD_FAULT_SITE", site)
+            .env("HERMIT_DATA_DIR", data_dir.path())
+            .args(&args)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run {args:?} for site {site}: {error}"));
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+
+    // One row per `run_guarded` site in `record_start.rs`, with a spelling that
+    // reaches it. The last two are the sites that had no coverage at all.
+    let sites: [(&str, &[&str]); 6] = [
+        ("record.main", &[]),
+        ("record.main.deadline", &["--record-timeout", "600"]),
+        ("record_verify.record", &["--verify"]),
+        ("record_verify.replay", &["--verify"]),
+        ("record_verify_debug.record", &["--verify-with-gdbex", "quit"]),
+        ("record_verify_debug.replay", &["--verify-with-gdbex", "quit"]),
+    ];
+
+    for (site, extra) in sites {
+        for (fault, class) in [
+            ("segv", "container-child-exit"),
+            ("panic", "container-child-panic"),
+        ] {
+            let stderr = case(site, fault, extra);
+            assert!(
+                stderr.contains(&format!("HERMIT_INTERNAL_FAILURE class={class}")),
+                "site {site} under an injected {fault} must be classified as {class}, \
+                 not folded into a CLI error\nstderr:\n{stderr}"
+            );
+        }
+    }
+}
+
+/// The control WITHOUT WHICH THE TEST ABOVE PROVES NOTHING.
+///
+/// If the site filter were ignored -- the injector faulting on every container as it
+/// does today -- every row above would still pass, because the first child would
+/// fault and produce the expected class. Naming a site that does not exist must
+/// therefore fault NOTHING: the recording completes and no internal-failure class is
+/// printed. That is what distinguishes "the fault was aimed" from "the fault always
+/// fires".
+#[test]
+fn a_fault_aimed_at_no_existing_site_fires_nowhere() {
+    let data_dir =
+        tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("failed to create a data dir");
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .env("HERMIT_TEST_CONTAINER_CHILD_FAULT", "segv")
+        .env("HERMIT_TEST_CONTAINER_CHILD_FAULT_SITE", "no.such.site")
+        .env("HERMIT_DATA_DIR", data_dir.path())
+        .args(["record", "--", "/bin/true"])
+        .output()
+        .expect("failed to run the unaimed fault injection");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("HERMIT_INTERNAL_FAILURE"),
+        "a fault aimed at a site that does not exist must fire nowhere; firing anyway \
+         means the site filter is not consulted and the by-name test above is vacuous\
+         \nstderr:\n{stderr}"
+    );
+}

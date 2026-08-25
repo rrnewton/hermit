@@ -495,12 +495,35 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 /// force: if a real fault stopped reporting as a signal after this change, the
 /// change would have made a genuine memory error indistinguishable from a
 /// caught panic, which is the same blindness in the other direction.
-fn inject_test_fault() {
+/// ⚠️ AND IT TAKES THE CALL SITE, BECAUSE A FAULT THAT CANNOT BE AIMED CANNOT
+/// TEST MORE THAN THE FIRST SITE IT REACHES. `record` enters a container at six
+/// sites; with only `HERMIT_TEST_CONTAINER_CHILD_FAULT` set, the FIRST child to
+/// run faults and every later stage is never entered. Two of the six -- the
+/// replay stages of `--verify` and `--verify-with-gdbex` -- are therefore
+/// unreachable by any test, so their classification was asserted rather than
+/// measured. `HERMIT_TEST_CONTAINER_CHILD_FAULT_SITE` names which one to hit.
+///
+/// A LABEL RATHER THAN AN OCCURRENCE INDEX, deliberately. An index is positional:
+/// it silently retargets the moment a call site is added, removed or reordered,
+/// and the test keeps passing while aiming somewhere else. A label is identity,
+/// and identity is the thing whose absence made these two sites untestable. An
+/// occurrence counter also cannot be process-local -- each `run_guarded` forks a
+/// fresh child and this runs in the CHILD, so a static counter resets to zero
+/// every time.
+///
+/// Unset `..._SITE` keeps the previous behaviour exactly: fault at whichever site
+/// is reached first. Existing callers and tests are unaffected.
+fn inject_test_fault(site: &str) {
+    if std::env::var("HERMIT_TEST_CONTAINER_CHILD_FAULT_SITE").is_ok_and(|want| want != site) {
+        return;
+    }
     match std::env::var("HERMIT_TEST_CONTAINER_CHILD_FAULT")
         .ok()
         .as_deref()
     {
-        Some("panic") => panic!("deliberate container-child panic for fault-injection testing"),
+        Some("panic") => panic!(
+            "deliberate container-child panic for fault-injection testing at site {site}"
+        ),
         Some("segv") => {
             // A genuine memory fault, NOT a panic. catch_unwind must not touch this.
             unsafe { std::ptr::null_mut::<u8>().write_volatile(1) };
@@ -518,7 +541,7 @@ where
 {
     install_panic_location_hook();
     match panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        inject_test_fault();
+        inject_test_fault("with_container");
         f()
     })) {
         Ok(result) => result.map_err(SerializableError::from),
@@ -541,14 +564,33 @@ where
 /// `record_start`, which is the path the partial-revents-copyout replay
 /// divergence takes.
 pub trait RunGuarded {
-    fn run_guarded<F, T>(&mut self, f: F) -> Result<Result<T, SerializableError>, RunError>
+    /// Runs a container-child closure with panics converted to errors, carrying
+    /// the CALL SITE'S IDENTITY into the child.
+    ///
+    /// ⚠️ THE LABEL IS NOT OPTIONAL, AND THAT IS DELIBERATE. An unlabelled form was
+    /// tried and removed: every site would have compiled while silently opting out
+    /// of being addressable, which is exactly the state that left two sites
+    /// untestable. Requiring the argument makes a new call site declare what it is,
+    /// and `cargo` asks the question at the moment the site is added.
+    ///
+    /// The label is inert in production. It is read only by `inject_test_fault`,
+    /// which is itself inert unless the test environment variables are set.
+    fn run_guarded_at<F, T>(
+        &mut self,
+        site: &'static str,
+        f: F,
+    ) -> Result<Result<T, SerializableError>, RunError>
     where
         F: FnMut() -> Result<T, SerializableError>,
         T: serde::Serialize + serde::de::DeserializeOwned;
 }
 
 impl RunGuarded for Container {
-    fn run_guarded<F, T>(&mut self, mut f: F) -> Result<Result<T, SerializableError>, RunError>
+    fn run_guarded_at<F, T>(
+        &mut self,
+        site: &'static str,
+        mut f: F,
+    ) -> Result<Result<T, SerializableError>, RunError>
     where
         F: FnMut() -> Result<T, SerializableError>,
         T: serde::Serialize + serde::de::DeserializeOwned,
@@ -556,7 +598,7 @@ impl RunGuarded for Container {
         self.run(move || {
             install_panic_location_hook();
             match panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                inject_test_fault();
+                inject_test_fault(site);
                 f()
             })) {
                 Ok(result) => result,
