@@ -410,6 +410,39 @@ the RNG determinism fix and the format gate all landed in the last hours. Any of
 them can be reverted by a draft whose diff looks unrelated. Pick the symbols that
 matter for the files in the conflict set, and count them before and after.
 
+### 10. File-identity alone establishes NEITHER "absent" NOR "no residual"
+
+Counting files where `main` matches the pull request's head answers one narrow
+question and is routinely mistaken for two others. Use the **three-way** split:
+
+| bucket | test | means |
+|---|---|---|
+| **arrived** | `main` blob == PR blob | that file's content is on `main` |
+| **absent** | `main` blob == MERGE-BASE blob | `main` never moved; definitely not landed |
+| **moved on** | matches neither | undecidable from blobs; `main` went somewhere else |
+
+**`absent == 0` is the close test, not `arrived == all`.** A branch far behind
+`main` will show few arrivals and many moved-on files while being entirely
+superseded, because `main` built past it.
+
+Measured on real rows:
+
+- `#2420` and `#2398`, both closed as already-landed: **arrived == all,
+  absent 0, moved-on 0.** Every changed file byte-identical, corroborated by
+  matching per-file `numstat` from the same base.
+- `#2436`: **arrived 1 of 24, absent 0, moved-on 23.** A file-identity read of
+  "1 of 24 identical" was published as evidence it was PARTIAL and needed
+  residual extraction. That was wrong. `absent 0` plus 41 of 54 markers landed
+  and **zero** both-absent made it `supersede-and-regress`, and `main` had moved
+  two to nine times further in every substantive source file.
+
+And "no residual" is a separate question that file-identity cannot answer at
+all. On `#2405` a close was published with *"residual: none"* after comparing
+the headline constant and its call site; the descriptor-cleanup path in the
+**error branch** was absent from `main` and was missed. Diff the error paths,
+and check distinctive string literals as well as symbols — on `#2436` that meant
+210 literals grepped against `main`, of which 0 were absent.
+
 ## Verdict vocabulary
 
 | verdict | meaning | action |
