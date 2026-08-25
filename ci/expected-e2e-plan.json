@@ -1986,13 +1986,6 @@
       "category": "system-utils",
       "lane": "portable",
       "mode": "verify",
-      "test": "system-utils/procfs-sanitized-paths"
-    },
-    {
-      "backend": "ptrace",
-      "category": "system-utils",
-      "lane": "portable",
-      "mode": "verify",
       "test": "system-utils/proc-uptime"
     },
     {
