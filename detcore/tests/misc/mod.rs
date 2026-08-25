@@ -11,10 +11,63 @@
 mod notification_fds;
 mod vfork;
 
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
+use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
 use nix::unistd;
+use reverie::Error;
+use reverie::ExitStatus;
+use reverie::Guest;
+use reverie::Subscription;
+use reverie::Tool;
+use reverie::syscalls::Syscall;
 
 #[global_allocator]
 static ALLOC: test_allocator::Global = test_allocator::Global;
+
+/// Test-only inner tool that turns an otherwise inert getter into a raw kernel
+/// timer-slack observation. Detcore handles the virtual getter itself, so the
+/// bracket needs this lower layer to observe the physical tracee value.
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
+struct PhysicalTimerSlackProbe;
+
+#[reverie::tool]
+impl Tool for PhysicalTimerSlackProbe {
+    type GlobalState = detcore::GlobalState;
+    type ThreadState = ();
+
+    fn subscriptions(_config: &detcore::Config) -> Subscription {
+        Subscription::none()
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        let call = match call {
+            Syscall::Prctl(call) if call.option() == libc::PR_GET_DUMPABLE => {
+                Syscall::Prctl(call.with_option(libc::PR_GET_TIMERSLACK))
+            }
+            call => call,
+        };
+        Ok(guest.inject(call).await?)
+    }
+}
+
+#[repr(C)]
+struct TimerSlackBracketState {
+    stage: AtomicU8,
+    physical_before: AtomicI32,
+    physical_after: AtomicI32,
+}
 
 #[derive(Clone, Copy)]
 struct HardwareRandomFeatures {
@@ -248,22 +301,583 @@ fn prctl_keepcaps_round_trips_deterministically() {
 }
 
 #[test]
-fn prctl_timer_slack_round_trips_deterministically() {
-    // Timer slack only controls host timer coalescing. Detcore virtualizes
-    // sleeps and thread scheduling, so preserving Linux's per-thread set/get
-    // behavior cannot change guest ordering or logical time.
+fn timer_slack_prctl_and_procfs_share_virtual_state() {
+    const DEFAULT_TIMER_SLACK_NS: libc::c_int = 50_000;
     det_test_fn_sequential_without_pmu(|| unsafe {
-        let original = libc::prctl(libc::PR_GET_TIMERSLACK);
-        assert!(original > 0, "timer slack must be positive");
+        assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), DEFAULT_TIMER_SLACK_NS);
+
+        // Detcore exposes one guest scheduling policy (SCHED_OTHER). Even a
+        // successful request for an RT policy therefore cannot reach Linux's
+        // physical RT/DL special case that forces timer slack to zero.
+        let param = libc::sched_param { sched_priority: 1 };
+        assert_eq!(libc::sched_setscheduler(0, libc::SCHED_FIFO, &param), 0);
+        assert_eq!(libc::sched_getscheduler(0), libc::SCHED_OTHER);
 
         const REQUESTED_SLACK_NS: libc::c_int = 1_000_000;
         assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, REQUESTED_SLACK_NS), 0);
         assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), REQUESTED_SLACK_NS);
+        assert_eq!(
+            std::fs::read_to_string("/proc/self/timerslack_ns")
+                .unwrap()
+                .trim(),
+            REQUESTED_SLACK_NS.to_string()
+        );
 
-        // A zero value restores the thread's inherited default timer slack.
-        assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, 0), 0);
-        assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), original);
+        let tid = libc::syscall(libc::SYS_gettid) as libc::pid_t;
+        assert_eq!(
+            std::fs::read_to_string(format!("/proc/{tid}/timerslack_ns"))
+                .unwrap()
+                .trim(),
+            REQUESTED_SLACK_NS.to_string()
+        );
+        for absent in [
+            "/proc/thread-self/timerslack_ns".to_owned(),
+            format!("/proc/self/task/{tid}/timerslack_ns"),
+            format!("/proc/{tid}/task/{tid}/timerslack_ns"),
+        ] {
+            assert_eq!(
+                std::fs::File::open(absent).unwrap_err().raw_os_error(),
+                Some(libc::ENOENT)
+            );
+        }
+
+        let read_only = std::fs::File::open("/proc/self/timerslack_ns").unwrap();
+        assert_eq!(
+            libc::write(read_only.as_raw_fd(), b"1".as_ptr().cast(), 1),
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        let write_only = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/proc/self/timerslack_ns")
+            .unwrap();
+        let mut denied = [0_u8; 1];
+        assert_eq!(
+            libc::read(
+                write_only.as_raw_fd(),
+                denied.as_mut_ptr().cast(),
+                denied.len(),
+            ),
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+
+        let mut writable = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/proc/self/timerslack_ns")
+            .unwrap();
+        writable.write_all(b"222222\n").unwrap();
+        assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), 222_222);
+
+        assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, 333_333), 0);
+        let mut readable = std::fs::File::open("/proc/self/timerslack_ns").unwrap();
+        assert_eq!(
+            libc::read(readable.as_raw_fd(), std::ptr::null_mut(), 1),
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EFAULT)
+        );
+        assert_eq!(
+            libc::lseek(readable.as_raw_fd(), 0, libc::SEEK_CUR),
+            0,
+            "a failed copy must not advance the procfs cursor"
+        );
+
+        let mut prefix = [0_u8; 2];
+        readable.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"33");
+        assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, 444_444), 0);
+        let mut suffix = String::new();
+        readable.read_to_string(&mut suffix).unwrap();
+        assert_eq!(suffix, "3333\n", "partial reads retain one snapshot");
+        readable.seek(SeekFrom::Start(0)).unwrap();
+        let mut rewound = String::new();
+        readable.read_to_string(&mut rewound).unwrap();
+        assert_eq!(rewound, "444444\n", "rewind regenerates the snapshot");
+
+        assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, 555_555), 0);
+        let mut positioned = [0_u8; 6];
+        assert_eq!(
+            libc::pread(
+                readable.as_raw_fd(),
+                positioned.as_mut_ptr().cast(),
+                positioned.len(),
+                1,
+            ),
+            positioned.len() as isize
+        );
+        assert_eq!(&positioned, b"55555\n");
+
+        let mut writable = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/proc/self/timerslack_ns")
+            .unwrap();
+        writable.write_all(b"0\n").unwrap();
+        assert_eq!(
+            libc::prctl(libc::PR_GET_TIMERSLACK),
+            DEFAULT_TIMER_SLACK_NS,
+            "zero restores the thread's inherited default"
+        );
     });
+}
+
+#[test]
+fn timer_slack_procfs_vector_io_matches_linux() {
+    det_test_fn_sequential_without_pmu(|| unsafe {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/proc/self/timerslack_ns")
+            .unwrap();
+        let fd = file.as_raw_fd();
+
+        let first = b"343";
+        let second = b"434\n";
+        let writes = [
+            libc::iovec {
+                iov_base: first.as_ptr().cast_mut().cast(),
+                iov_len: first.len(),
+            },
+            libc::iovec {
+                iov_base: second.as_ptr().cast_mut().cast(),
+                iov_len: second.len(),
+            },
+        ];
+        assert_eq!(libc::writev(fd, writes.as_ptr(), writes.len() as i32), 7);
+        assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), 434);
+
+        assert_eq!(file.seek(SeekFrom::Start(0)).unwrap(), 0);
+        let mut left = [0_u8; 2];
+        let mut right = [0_u8; 8];
+        let reads = [
+            libc::iovec {
+                iov_base: left.as_mut_ptr().cast(),
+                iov_len: left.len(),
+            },
+            libc::iovec {
+                iov_base: right.as_mut_ptr().cast(),
+                iov_len: right.len(),
+            },
+        ];
+        assert_eq!(libc::readv(fd, reads.as_ptr(), reads.len() as i32), 4);
+        assert_eq!(&left, b"43");
+        assert_eq!(&right[..2], b"4\n");
+
+        assert_eq!(file.seek(SeekFrom::Start(0)).unwrap(), 0);
+        assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, 246_810), 0);
+        let mut untouched = [0_u8; 2];
+        let bad_first = [
+            libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 1,
+            },
+            libc::iovec {
+                iov_base: untouched.as_mut_ptr().cast(),
+                iov_len: untouched.len(),
+            },
+        ];
+        assert_eq!(
+            libc::readv(fd, bad_first.as_ptr(), bad_first.len() as i32),
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EFAULT)
+        );
+        assert_eq!(
+            libc::lseek(fd, 0, libc::SEEK_CUR),
+            0,
+            "a failed first iovec must not advance the procfs cursor"
+        );
+
+        assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, 987_654), 0);
+        let mut partial = [0_u8; 2];
+        let bad_second = [
+            libc::iovec {
+                iov_base: partial.as_mut_ptr().cast(),
+                iov_len: partial.len(),
+            },
+            libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 1,
+            },
+        ];
+        assert_eq!(
+            libc::readv(fd, bad_second.as_ptr(), bad_second.len() as i32),
+            partial.len() as isize
+        );
+        assert_eq!(&partial, b"98");
+        assert_eq!(libc::lseek(fd, 0, libc::SEEK_CUR), 2);
+        assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, 111_111), 0);
+        let mut retained = String::new();
+        file.read_to_string(&mut retained).unwrap();
+        assert_eq!(
+            retained, "7654\n",
+            "a later failed iovec retains only the successfully copied prefix"
+        );
+
+        let pfirst = b"515";
+        let psecond = b"151\n";
+        let pwrites = [
+            libc::iovec {
+                iov_base: pfirst.as_ptr().cast_mut().cast(),
+                iov_len: pfirst.len(),
+            },
+            libc::iovec {
+                iov_base: psecond.as_ptr().cast_mut().cast(),
+                iov_len: psecond.len(),
+            },
+        ];
+        assert_eq!(
+            libc::pwritev(fd, pwrites.as_ptr(), pwrites.len() as i32, -1),
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+        assert_eq!(
+            libc::syscall(
+                libc::SYS_pwritev2,
+                fd,
+                pwrites.as_ptr(),
+                pwrites.len(),
+                u64::MAX,
+                0_u64,
+                libc::RWF_HIPRI,
+            ),
+            7
+        );
+        assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), 151);
+        assert_eq!(
+            libc::pwritev(fd, pwrites.as_ptr(), pwrites.len() as i32, 0),
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESPIPE)
+        );
+        assert_eq!(libc::pwrite(fd, first.as_ptr().cast(), first.len(), -1), -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+
+        assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, 987_654), 0);
+        let mut pleft = [0_u8; 2];
+        let mut pright = [0_u8; 4];
+        let preads = [
+            libc::iovec {
+                iov_base: pleft.as_mut_ptr().cast(),
+                iov_len: pleft.len(),
+            },
+            libc::iovec {
+                iov_base: pright.as_mut_ptr().cast(),
+                iov_len: pright.len(),
+            },
+        ];
+        assert_eq!(
+            libc::preadv(fd, preads.as_ptr(), preads.len() as i32, -1),
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+        assert_eq!(file.seek(SeekFrom::Start(0)).unwrap(), 0);
+        assert_eq!(
+            libc::syscall(
+                libc::SYS_preadv2,
+                fd,
+                preads.as_ptr(),
+                preads.len(),
+                u64::MAX,
+                0_u64,
+                libc::RWF_HIPRI,
+            ),
+            6
+        );
+        assert_eq!(&pleft, b"98");
+        assert_eq!(&pright, b"7654");
+        pleft.fill(0);
+        pright.fill(0);
+        assert_eq!(libc::preadv(fd, preads.as_ptr(), preads.len() as i32, 1), 6);
+        assert_eq!(&pleft, b"87");
+        assert_eq!(&pright, b"654\n");
+    });
+}
+
+#[test]
+fn timer_slack_procfs_binds_target_at_open() {
+    det_test_fn_sequential_without_pmu(|| unsafe {
+        const PARENT_SLACK_NS: libc::c_int = 1_000_000;
+        assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, PARENT_SLACK_NS), 0);
+
+        let (tid_send, tid_recv) = std::sync::mpsc::channel();
+        let (file_send, file_recv) = std::sync::mpsc::channel::<std::fs::File>();
+        let (back_send, back_recv) = std::sync::mpsc::channel::<std::fs::File>();
+        let worker = std::thread::spawn(move || {
+            let tid = libc::syscall(libc::SYS_gettid) as libc::pid_t;
+            tid_send.send(tid).unwrap();
+            let mut file = file_recv.recv().unwrap();
+
+            assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), PARENT_SLACK_NS);
+            assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, 0), 0);
+            assert_eq!(
+                libc::prctl(libc::PR_GET_TIMERSLACK),
+                PARENT_SLACK_NS,
+                "a new thread resets to its inherited current value"
+            );
+            assert_eq!(
+                std::fs::read_to_string("/proc/self/timerslack_ns")
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EPERM),
+                "/proc/self remains bound to the process leader"
+            );
+
+            file.seek(SeekFrom::Start(0)).unwrap();
+            let mut inherited = String::new();
+            file.read_to_string(&mut inherited).unwrap();
+            assert_eq!(inherited.trim(), PARENT_SLACK_NS.to_string());
+            let mut own = std::fs::OpenOptions::new()
+                .write(true)
+                .open(format!("/proc/{tid}/timerslack_ns"))
+                .unwrap();
+            own.write_all(b"777777\n").unwrap();
+            assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), 777_777);
+            file.seek(SeekFrom::Start(0)).unwrap();
+            back_send.send(file).unwrap();
+        });
+
+        let tid = tid_recv.recv().unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(format!("/proc/{tid}/timerslack_ns"))
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        assert_eq!(libc::read(file.as_raw_fd(), byte.as_mut_ptr().cast(), 0), 0);
+        assert_eq!(
+            libc::pread(file.as_raw_fd(), byte.as_mut_ptr().cast(), 0, 0),
+            0
+        );
+        assert_eq!(libc::lseek(file.as_raw_fd(), 0, libc::SEEK_SET), 0);
+        assert_eq!(libc::lseek(file.as_raw_fd(), 0, libc::SEEK_CUR), 0);
+        assert_eq!(libc::lseek(file.as_raw_fd(), 0, libc::SEEK_END), -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+        assert_eq!(
+            file.read(&mut byte).unwrap_err().raw_os_error(),
+            Some(libc::EPERM),
+            "a live other task requires CAP_SYS_NICE"
+        );
+        file_send.send(file).unwrap();
+        let mut file = back_recv.recv().unwrap();
+        worker.join().unwrap();
+        assert_eq!(libc::read(file.as_raw_fd(), byte.as_mut_ptr().cast(), 0), 0);
+        assert_eq!(
+            libc::pread(file.as_raw_fd(), byte.as_mut_ptr().cast(), 0, 0),
+            0
+        );
+        assert_eq!(libc::lseek(file.as_raw_fd(), 0, libc::SEEK_SET), 0);
+        assert_eq!(libc::lseek(file.as_raw_fd(), 0, libc::SEEK_CUR), 0);
+        assert_eq!(libc::lseek(file.as_raw_fd(), 0, libc::SEEK_END), -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+        assert_eq!(
+            file.read(&mut byte).unwrap_err().raw_os_error(),
+            Some(libc::ESRCH),
+            "the open description retains the exited task incarnation"
+        );
+        assert_eq!(
+            libc::prctl(libc::PR_GET_TIMERSLACK),
+            PARENT_SLACK_NS,
+            "the worker's write must not disturb the leader"
+        );
+    });
+}
+
+#[test]
+fn timer_slack_is_mediated_under_passthru_opt() {
+    let config = detcore::Config {
+        max_timeslice: None,
+        sequentialize_threads: true,
+        passthru_opt: true,
+        ..Default::default()
+    };
+    detcore_testutils::det_test_fn_with_config(
+        true,
+        || unsafe {
+            assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), 50_000);
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/proc/self/timerslack_ns")
+                .unwrap();
+            file.write_all(b"123456\n").unwrap();
+            assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), 123_456);
+            file.seek(SeekFrom::Start(0)).unwrap();
+            let mut value = String::new();
+            file.read_to_string(&mut value).unwrap();
+            assert_eq!(value, "123456\n");
+        },
+        config,
+        detcore_testutils::expect_success,
+    );
+}
+
+#[test]
+fn timer_slack_virtual_state_is_isolated_from_physical_tracee() {
+    const PHYSICAL_SENTINEL_NS: libc::c_int = 7_654_321;
+    const VIRTUAL_REQUEST_NS: libc::c_int = 1_000_000_000;
+    const VIRTUAL_PROC_REQUEST_NS: libc::c_int = 888_888_888;
+
+    struct RestoreTimerSlack(libc::c_int);
+    impl Drop for RestoreTimerSlack {
+        fn drop(&mut self) {
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_TIMERSLACK, self.0) }, 0);
+        }
+    }
+
+    let original = unsafe { libc::prctl(libc::PR_GET_TIMERSLACK) };
+    assert!(original >= 0);
+    let _restore = RestoreTimerSlack(original);
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_TIMERSLACK, PHYSICAL_SENTINEL_NS) },
+        0
+    );
+
+    let mapping = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            std::mem::size_of::<TimerSlackBracketState>(),
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(mapping, libc::MAP_FAILED);
+    let bracket = mapping.cast::<TimerSlackBracketState>();
+    unsafe {
+        bracket.write(TimerSlackBracketState {
+            stage: AtomicU8::new(0),
+            physical_before: AtomicI32::new(-1),
+            physical_after: AtomicI32::new(-1),
+        })
+    };
+
+    let config = detcore::Config {
+        max_timeslice: None,
+        sequentialize_threads: true,
+        ..Default::default()
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let tracer =
+            reverie_ptrace::spawn_fn_with_config::<detcore::Detcore<PhysicalTimerSlackProbe>, _>(
+                move || unsafe {
+                    let bracket = &*bracket;
+                    assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), 50_000);
+                    assert_eq!(
+                        std::fs::read_to_string("/proc/self/timerslack_ns")
+                            .unwrap()
+                            .trim(),
+                        "50000"
+                    );
+                    bracket
+                        .physical_before
+                        .store(libc::prctl(libc::PR_GET_DUMPABLE), Ordering::Release);
+                    bracket.stage.store(1, Ordering::Release);
+                    while bracket.stage.load(Ordering::Acquire) != 2 {
+                        std::hint::spin_loop();
+                    }
+
+                    assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, VIRTUAL_REQUEST_NS), 0);
+                    assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), VIRTUAL_REQUEST_NS);
+                    assert_eq!(
+                        std::fs::read_to_string("/proc/self/timerslack_ns")
+                            .unwrap()
+                            .trim(),
+                        VIRTUAL_REQUEST_NS.to_string()
+                    );
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open("/proc/self/timerslack_ns")
+                        .unwrap()
+                        .write_all(b"888888888\n")
+                        .unwrap();
+                    assert_eq!(
+                        libc::prctl(libc::PR_GET_TIMERSLACK),
+                        VIRTUAL_PROC_REQUEST_NS
+                    );
+                    bracket
+                        .physical_after
+                        .store(libc::prctl(libc::PR_GET_DUMPABLE), Ordering::Release);
+                    bracket.stage.store(3, Ordering::Release);
+                    while bracket.stage.load(Ordering::Acquire) != 4 {
+                        std::hint::spin_loop();
+                    }
+                },
+                config,
+                true,
+            )
+            .await
+            .unwrap();
+        let bracket = unsafe { &*bracket };
+
+        async fn await_stage(stage: &AtomicU8, expected: u8) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while stage.load(Ordering::Acquire) != expected {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("tracee did not reach stage {expected}"));
+        }
+
+        let controller = async {
+            await_stage(&bracket.stage, 1).await;
+            assert_eq!(
+                bracket.physical_before.load(Ordering::Acquire),
+                PHYSICAL_SENTINEL_NS,
+                "the launcher's physical timer slack must not seed virtual state"
+            );
+            bracket.stage.store(2, Ordering::Release);
+
+            await_stage(&bracket.stage, 3).await;
+            assert_eq!(
+                bracket.physical_after.load(Ordering::Acquire),
+                PHYSICAL_SENTINEL_NS,
+                "a virtual timer-slack update must not mutate the physical tracee"
+            );
+            bracket.stage.store(4, Ordering::Release);
+        };
+        let ((), trace_result) = tokio::join!(controller, tracer.wait_with_output());
+        let (output, _) = trace_result.unwrap();
+        assert_eq!(output.status, ExitStatus::Exited(0));
+    });
+
+    assert_eq!(
+        unsafe { libc::munmap(mapping, std::mem::size_of::<TimerSlackBracketState>()) },
+        0
+    );
 }
 
 #[test]
