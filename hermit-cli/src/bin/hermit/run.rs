@@ -1061,6 +1061,17 @@ fn comparator_choice_does_not_depend_on_the_backend() {
 }
 
 #[test]
+fn verification_always_compares_retained_logs() {
+    for backend in ["ptrace", "dbt", "liteinst", "sabre", "kvm", "e9patch"] {
+        let run = RunOpts::parse_from(["fakehermit", "--backend", backend, "--verify", "fakeprog"]);
+        assert!(
+            run.verification_comparison_options().compare_logs,
+            "--verify on {backend} must compare both retained logs"
+        );
+    }
+}
+
+#[test]
 fn e9patch_preserves_executable_identity_and_uses_ptrace_runtime() {
     let mut ro = RunOpts::parse_from(["fakehermit", "--backend", "e9patch", "/bin/echo", "hello"]);
     ro.e9patch_overlay = Some(E9patchOverlay {
@@ -2234,6 +2245,22 @@ impl RunOpts {
             LogCompareStrictness::Canonical
         } else {
             LogCompareStrictness::Stripped
+        }
+    }
+
+    fn verification_comparison_options(&self) -> ComparisonOptions {
+        ComparisonOptions {
+            verbose: self.verify_verbose,
+            strictness: self.verification_strictness(),
+            // The original KVM defect made this false for one backend, reducing
+            // verification to guest-output comparison. Keep the actual options
+            // consumed by compare_two_runs behind the all-backend regression
+            // bracket above.
+            compare_logs: true,
+            diagnostic_full_trace: self.verify_verbose,
+            compare_io_buffers: self.det_opts.det_config.detlog_io_buffers,
+            keep_logs: self.keep_logs,
+            record_envelope: RecordEnvelope::all_records_v1(),
         }
     }
 
@@ -3469,26 +3496,7 @@ impl RunOpts {
                 log: log2_path,
                 label: "run 2",
             },
-            ComparisonOptions {
-                verbose: self.verify_verbose,
-                strictness: self.verification_strictness(),
-                // Every backend retains both logs, including KVM. Comparing
-                // them here is what makes `compare_io_buffers=true` truthful:
-                // otherwise the content hashes can differ in the retained
-                // files while an output-only verdict still reports a match.
-                // The comparator turns a truncated/unreadable comparison into
-                // the existing typed no-result outcome rather than silently
-                // accepting it.
-                compare_logs: true,
-                diagnostic_full_trace: self.verify_verbose,
-                compare_io_buffers: self.det_opts.det_config.detlog_io_buffers,
-                keep_logs: self.keep_logs,
-                // Every backend that reaches this generic comparator
-                // preserves every parsed record. DBT returns through `run_dbt`
-                // above and reaches the comparator by its own route, where it
-                // names the same `all_records_v1` envelope.
-                record_envelope: RecordEnvelope::all_records_v1(),
-            },
+            self.verification_comparison_options(),
         )?;
 
         // Emit the machine-readable verdict (if requested) before collapsing the
