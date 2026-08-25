@@ -666,6 +666,9 @@
       "backend": "ptrace",
       "enabled": true,
       "status": "red",
+      "ci_disabled_reason": {
+        "reason": "MEASURED 9 PASS / 1 FAIL of 10 on main. NOT the cwd defect, which is FIXED and whose fix stays: newfstatat on /home/newton is now 0 across ten runs, down from 24. The residual is a DIFFERENT and still-live divergence -- detcore::io_buffers [iobuf] getdents64 in +112, same syscall, same address, same byte count in both verification runs, only the CONTENT differing, i.e. a directory listing that changes between the pair. Exposed by #2384 turning IO-buffer hashing on, and one of three cells failing that same way (the other two are language-runtimes/python-dict-hash-iteration and python-io-subprocess-time, both on netlink recvmsg +1468). Held out of the required population because a 1-in-10 failure should not run in CI while every red truncates the lane; re-enable when the getdents64 buffer-content divergence is determinized, not before."
+      },
       "observations": [],
       "measurement": "never-measured"
     },
