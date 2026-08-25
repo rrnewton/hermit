@@ -19,7 +19,15 @@ ROOT = Path(__file__).resolve().parents[1]
 # EX_TEMPFAIL. scripts/validate.rs:5365 reserves 75 as "the only nonzero code that
 # is not a product failure", outcome_is_no_result() classifies it `no_result`, and
 # ci/lint-checks-node.sh already exits 75 for the sibling case (uninitialized
-# submodules). Reusing that spelling rather than inventing a third convention.
+# submodules).
+#
+# ⚠️ SHARING A CODE NEEDS AN ARGUMENT, not just a precedent -- a code shared by two
+# conditions is a collapsed value when they want different reactions. Here a new code
+# is not merely unnecessary, it is UNAVAILABLE: validate.rs recognises exactly one
+# no-result value, so any other number is classified a FAILURE and would reintroduce
+# the false main-red this exists to remove. The two conditions also want the same
+# reaction -- nothing was evaluated, fix the environment, re-run -- and differ only in
+# which fix, which the message carries. The full argument is in ci/lint-checks-node.sh.
 NO_RESULT_EXIT_CODE = 75
 
 

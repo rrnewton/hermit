@@ -102,6 +102,30 @@ case "$verdict" in
         ;;
 esac
 
+# ⚠️ WHY THIS SHARES EXIT 75 WITH THE SUBMODULE CHECK RATHER THAN TAKING A NEW CODE.
+# The house rule is that a new refusal needs a new code OR an explicit argument for
+# sharing one, because "an exit code shared by two conditions is a COLLAPSED VALUE:
+# the caller cannot tell whether ITS ENVIRONMENT is wrong or THE HEAD is, and those
+# want opposite responses" (ci-hub/bin/gh-merge-verified, which split 4 from 8 for
+# exactly that reason). The argument, in two parts:
+#
+#   1. A NEW CODE IS NOT AVAILABLE HERE, and this is the decisive half.
+#      scripts/validate.rs recognises exactly ONE no-result code --
+#      `const NO_RESULT_EXIT_CODE: i64 = 75`, consumed by outcome_is_no_result() and
+#      excluded by outcome_is_failure(). Any other value is classified a FAILURE. So
+#      a second code would reintroduce the false main-red this guard exists to
+#      remove; the code space has one slot and 75 is it.
+#   2. THE TWO CONDITIONS WANT THE SAME REACTION, which is the test gh-merge-verified
+#      applies. Both mean NOTHING WAS EVALUATED, both are fixed by changing where or
+#      how the node is invoked, and a plain re-run afterwards is safe. They differ
+#      only in WHICH environment fix is needed -- and that difference is carried by
+#      the message, which names the missing thing, the path, and the remedy. That is
+#      the right place for it: 75 already means "could not determine", and splitting
+#      by remedy would make a code per remedy.
+#
+# What would NOT be admissible under the same rule is folding a real lint failure in
+# here. Only conditions that make the checkers UNRUNNABLE belong behind 75.
+
 # SECOND SETUP PRECONDITION, same class and same spelling as the submodule check
 # above: scripts/test_validate_stop_paths.py's canonical-adapter contract exercises
 # the REAL dev-hermit parent adapter, found by walking ROOT.parents for
