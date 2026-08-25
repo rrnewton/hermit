@@ -161,6 +161,16 @@ struct OpenFileDescription {
     /// after entering the guest can already carry a lock.
     #[serde(default)]
     flock_mode_known: bool,
+    /// Whether Detcore has EVER known this description's lock state.
+    ///
+    /// This separates two different unknowns that `flock_mode_known == false`
+    /// otherwise collapses. A descriptor Detcore never observed -- stdin,
+    /// stdout, stderr, a live-discovered fd -- has no cached claim at all, so
+    /// there is nothing about it that can be STALE. A descriptor that was known
+    /// and then invalidated by a process copy does have a claim that may now be
+    /// wrong. Only the second is a reason to refuse `vfork`.
+    #[serde(default)]
+    flock_mode_ever_known: bool,
 }
 
 impl PartialEq for DetFd {
@@ -208,6 +218,7 @@ impl DetFd {
                 loopback_peer: false,
                 flock_mode: None,
                 flock_mode_known: true,
+                flock_mode_ever_known: true,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
             })),
@@ -541,6 +552,22 @@ impl DetFd {
         let mut description = self.description();
         description.flock_mode = None;
         description.flock_mode_known = false;
+    }
+
+    /// Record that Detcore never observed this description's lock history, as
+    /// opposed to having known it and then invalidated it. Used for descriptors
+    /// that existed before Detcore began observing the guest.
+    pub(crate) fn mark_flock_mode_unobserved(&self) {
+        let mut description = self.description();
+        description.flock_mode = None;
+        description.flock_mode_known = false;
+        description.flock_mode_ever_known = false;
+    }
+
+    /// True when a cached lock claim existed and may now be wrong.
+    pub(crate) fn flock_mode_may_be_stale(&self) -> bool {
+        let description = self.description();
+        description.flock_mode_ever_known && !description.flock_mode_known
     }
 }
 
