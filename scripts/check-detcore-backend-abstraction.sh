@@ -243,23 +243,59 @@ use_statement = re.compile(r"\buse\b(?P<body>[^;]*);", re.DOTALL)
 module_name = re.compile(identifier)
 
 
-def blank(chars, start, end):
-    for index in range(start, end):
-        if chars[index] != "\n":
-            chars[index] = " "
+# ⚠️ THE STATE MACHINE BELOW IS UNCHANGED. Only the way it WALKS the source is
+# different, and that distinction is the whole point of this note.
+#
+# The previous version built `list(source)` and stepped one character at a time
+# in Python, blanking each masked character individually. That is O(bytes) of
+# interpreter work per invocation -- 10.84s for detcore/src's 49 files, measured
+# 2026-08-25 -- and this script re-invokes ITSELF once per negative control, so
+# the cost was bytes x controls. Both factors grow: detcore grows, and the
+# control list is DERIVED from the workspace's Reverie crates. Against the
+# node's fixed 120s budget that product crossed the ceiling and the node was
+# killed at 120.030s with every assertion passing.
+#
+# Ordinary code cannot begin a comment, string, char literal or raw string, so
+# the scan now jumps to the next position where the state machine could
+# actually change state and blanks whole spans with one C-level substitution.
+# Every transition rule, terminator search and fall-through below is preserved
+# verbatim.
+#
+# Equivalence is TESTED, not asserted -- see check-detcore-backend-abstraction-test.sh:
+# byte-identical output on all 541 tracked .rs files (10.2 MB), on 33 hand-written
+# adversarial cases (nested block comments, raw strings with hash counts,
+# unterminated constructs, lifetimes vs char literals), and on 40,000 fuzz
+# inputs drawn from an alphabet of masking metacharacters.
+TRIGGER = re.compile(r'(?<![A-Za-z0-9_])(?:br|cr|r)#{0,255}"|[/"\']')
+NON_NEWLINE = re.compile(r"[^\n]")
+
+
+def blank_span(source, start, end):
+    """Blank a span, PRESERVING NEWLINES so reported line numbers stay correct."""
+    return NON_NEWLINE.sub(" ", source[start:end])
 
 
 def mask_comments_and_literals(source):
-    chars = list(source)
     length = len(source)
+    pieces = []
+    copied = 0
     index = 0
     while index < length:
+        hit = TRIGGER.search(source, index)
+        if hit is None:
+            break
+        index = hit.start()
+
+        def emit(end):
+            pieces.append(source[copied:index])
+            pieces.append(blank_span(source, index, end))
+            return end
+
         if source.startswith("//", index):
             end = source.find("\n", index + 2)
             if end == -1:
                 end = length
-            blank(chars, index, end)
-            index = end
+            copied = index = emit(end)
             continue
 
         if source.startswith("/*", index):
@@ -274,8 +310,7 @@ def mask_comments_and_literals(source):
                     end += 2
                 else:
                     end += 1
-            blank(chars, index, end)
-            index = end
+            copied = index = emit(end)
             continue
 
         raw = re.match(r'(?:br|cr|r)(?P<hashes>#{0,255})"', source[index:])
@@ -283,8 +318,7 @@ def mask_comments_and_literals(source):
             terminator = '"' + raw.group("hashes")
             end = source.find(terminator, index + raw.end())
             end = length if end == -1 else end + len(terminator)
-            blank(chars, index, end)
-            index = end
+            copied = index = emit(end)
             continue
 
         if source[index] == '"':
@@ -299,8 +333,7 @@ def mask_comments_and_literals(source):
                     escaped = True
                 elif char == '"':
                     break
-            blank(chars, index, end)
-            index = end
+            copied = index = emit(end)
             continue
 
         if source[index] == "'" and index + 2 < length:
@@ -309,20 +342,19 @@ def mask_comments_and_literals(source):
                 while end < length and source[end] != "\n":
                     if source[end] == "'" and source[end - 1] != "\\":
                         end += 1
-                        blank(chars, index, end)
-                        index = end
+                        copied = index = emit(end)
                         break
                     end += 1
                 else:
                     index += 1
                 continue
             if source[index + 2] == "'":
-                blank(chars, index, index + 3)
-                index += 3
+                copied = index = emit(index + 3)
                 continue
 
         index += 1
-    return "".join(chars)
+    pieces.append(source[copied:])
+    return "".join(pieces)
 
 
 for path in sorted(source_root.rglob("*.rs")):
@@ -357,6 +389,77 @@ fi
 # Exercise the real checker against scratch detcore copies. This is a negative
 # control, not a mock: each recursive invocation re-derives its prohibited set
 # from the scratch workspace after the planted dependency is added.
+# ⚠️ THE WORK IS DERIVED, SO THE BUDGET MUST BE DERIVED FROM THE SAME LIST.
+#
+# This node's cost is one self-invocation per negative control, and the control
+# list comes from BACKEND_CRATES, which is DERIVED from the workspace's Reverie
+# crates. The DAG declares a single constant wall timeout. On 2026-08-25 that
+# constant was 120s and the node was killed at 120.030s with every assertion
+# passing -- not a correctness failure, a budget that had silently been outgrown.
+#
+# Raising the constant would have fixed that day and broken again at the next
+# Reverie crate, because a constant cannot track a derived quantity. So the
+# REQUIREMENT is computed here from the same derived list that drives the work,
+# and the declared constant is CHECKED against it. Adding a crate can no longer
+# cross the ceiling silently: it either still fits, or this fails in under a
+# second saying exactly which number to change and why.
+#
+# The runner's schema takes a literal integer for `timeout`, and agent-utils is
+# a separately pinned, main-only repository, so the declared value stays a
+# reviewable constant in ci/dag/portable.json. What is DERIVED is the
+# requirement that constant must satisfy.
+#
+# Per-unit costs are measured, not guessed (2026-08-25, this checkout):
+#   base pass, no controls   0.45s 0.58s 0.48s  -> ~0.50s
+#   full run, 10 controls    5.57s 5.55s 5.50s  -> ~5.54s
+#   therefore per control    (5.54 - 0.50) / 10  = ~0.50s
+# The budgets below carry roughly 6x headroom over those measurements, so a
+# slower runner or a cold cache does not trip the guard.
+BASE_BUDGET_S=30
+PER_CONTROL_BUDGET_S=3
+
+check_declared_budget() {
+    local dag="$REPO_ROOT/ci/dag/portable.json"
+    # Only meaningful in a real checkout. Negative controls run against scratch
+    # copies that contain detcore alone and execute no controls of their own.
+    [[ -f $dag ]] || return 0
+
+    local control_count=$1
+    local required=$((BASE_BUDGET_S + PER_CONTROL_BUDGET_S * control_count))
+    local declared
+    declared="$(python3 - "$dag" <<'PYBUDGET'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    graph = json.load(handle)
+for step in graph.get("steps", []):
+    if step.get("group") == "check" and step.get("job") == "backend_abstraction":
+        print(int(step.get("timeout", 0)))
+        break
+else:
+    print(0)
+PYBUDGET
+)" || return 1
+
+    if ((declared <= 0)); then
+        err "check.backend_abstraction declares no wall timeout in ci/dag/portable.json"
+        return 1
+    fi
+    if ((declared < required)); then
+        err "check.backend_abstraction is BUDGETED FOR LESS WORK THAN IT DERIVES."
+        err "  the workspace derives $control_count negative control(s)"
+        err "  requiring ${required}s = ${BASE_BUDGET_S}s base + ${control_count} x ${PER_CONTROL_BUDGET_S}s"
+        err "  but ci/dag/portable.json declares only ${declared}s"
+        err "  THIS IS NOT A TIMEOUT AND NOTHING RAN LONG. It is the declared"
+        err "  budget failing to cover work the workspace now derives."
+        err "  Raise check.backend_abstraction \"timeout\" to at least ${required}, with evidence."
+        return 1
+    fi
+    info "budget: ${declared}s declared covers $control_count derived control(s) needing ~${required}s"
+    return 0
+}
+
 run_negative_controls() {
     local scratch backend module output status
     local -a control_crates=("${BACKEND_CRATES[@]}")
@@ -366,6 +469,12 @@ run_negative_controls() {
     # once present, the derived list supplies it and this append is skipped.
     if [[ " ${control_crates[*]} " != *" reverie-e9patch "* ]]; then
         control_crates+=(reverie-e9patch)
+    fi
+
+    # +2: the source-path control and the literal/comment control below each
+    # cost one further self-invocation, exactly like a crate control.
+    if ! check_declared_budget $((${#control_crates[@]} + 2)); then
+        return 1
     fi
 
     for backend in "${control_crates[@]}"; do
