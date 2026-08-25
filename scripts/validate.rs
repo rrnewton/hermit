@@ -5584,6 +5584,23 @@ fn remaining_budget_s(deadline_ns: Option<u64>) -> Option<i64> {
 }
 
 /// Planned runnable steps absent from both scheduler result collections.
+/// Split nodes that produced no outcome into the two states they actually occupy:
+/// those the scheduler DECIDED not to launch after a failure cut their fail-fast
+/// scope short (accounted for, and it names why), and those nothing explains.
+///
+/// Both still block a green lane. The distinction is diagnostic, and it is the
+/// whole point: a deliberate skip that reads identically to a vanished node makes
+/// every deliberate skip look like a defect and hides the real ones among them.
+fn partition_unreported(
+    unreported: &[String],
+    not_launched: &BTreeSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    unreported
+        .iter()
+        .cloned()
+        .partition(|tag| not_launched.contains(tag))
+}
+
 fn unreported_non_intentional_steps(
     cfg: &DagConfig,
     by_tag: &BTreeMap<String, StepOutcome>,
@@ -7043,6 +7060,13 @@ fn run_lane_with_env_retries(
         forward_step_profiles(&first, jobs);
     }
     let mut run_timed_out = first.run_timed_out;
+    // The scheduler already NAMES the steps it deliberately never launched, in
+    // `RunResult::not_launched`. Carrying it here is what lets a deliberate
+    // fail-fast skip read differently from a node that vanished for a reason
+    // nothing can account for. Both still block a green lane; only the report
+    // distinguishes them.
+    let mut deliberately_not_launched: BTreeSet<String> =
+        first.not_launched.iter().cloned().collect();
     let mut order: Vec<String> = first.outcomes.iter().map(|o| o.tag.clone()).collect();
     let mut by_tag: BTreeMap<String, StepOutcome> =
         first.outcomes.iter().map(|o| (o.tag.clone(), o.clone())).collect();
@@ -7216,6 +7240,7 @@ fn run_lane_with_env_retries(
             forward_step_profiles(&again, jobs);
         }
         run_timed_out = run_timed_out || again.run_timed_out;
+        deliberately_not_launched.extend(again.not_launched.iter().cloned());
         // Compute absent work from THIS retry result before cumulative `by_tag`
         // can make an old outcome look current. `RunResult::not_launched` carries
         // the same fact, but recomputing from the two round-local collections
@@ -7290,12 +7315,30 @@ fn run_lane_with_env_retries(
         unreported_non_intentional_steps(cfg, &by_tag, &skipped).into_iter().collect();
     unreported.extend(latest_unreported);
     let unreported: Vec<String> = unreported.into_iter().collect();
-    if !unreported.is_empty() {
+    // Two states, not one. A node the scheduler DECIDED not to launch after a
+    // failure is accounted for -- it names why it did not run. A node absent from
+    // that list is unaccounted for, and that is the only part that is a mystery.
+    // Collapsing them is what made an eleven-day history of deliberate fail-fast
+    // skips read as if work had silently vanished.
+    let (skipped_by_fail_fast, unaccounted) =
+        partition_unreported(&unreported, &deliberately_not_launched);
+    if !skipped_by_fail_fast.is_empty() {
         eprintln!(
-            "validate: ERROR: scheduler returned without an outcome or dependency-skip for {} \
-             non-intentional planned node(s): {}. The lane is incomplete and cannot be green.",
-            unreported.len(),
-            unreported.join(", ")
+            "validate: {} planned node(s) DID NOT RUN because an earlier failure cut their \
+             fail-fast scope short; the scheduler named them and they are accounted for: {}. \
+             The lane is still incomplete and cannot be green.",
+            skipped_by_fail_fast.len(),
+            skipped_by_fail_fast.join(", ")
+        );
+    }
+    if !unaccounted.is_empty() {
+        eprintln!(
+            "validate: ERROR: scheduler returned without an outcome, a dependency-skip, or a \
+             fail-fast skip for {} non-intentional planned node(s): {}. These are UNACCOUNTED \
+             FOR -- unlike a fail-fast skip, nothing explains why they did not run. The lane is \
+             incomplete and cannot be green.",
+            unaccounted.len(),
+            unaccounted.join(", ")
         );
     }
     // Raw failure policy may still treat an aborted peer as neutral, but execution
