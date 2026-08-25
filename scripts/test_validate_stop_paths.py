@@ -103,6 +103,30 @@ def stop_test_env(
 READY_TIMEOUT_SECONDS = 120
 
 
+# HOW LONG THE CHILD MAY TAKE TO EXIT ONCE SIGNALLED.
+#
+# The two readiness deadlines above were raised to READY_TIMEOUT_SECONDS for
+# scheduling delay on a shared box. The two `process.wait()` calls below were
+# left at a hard 10s, and they are the SAME quantity measured from the other
+# end: how long a loaded machine takes to get round to a process.
+#
+# MEASURED HERE, 21 observations at load ~56: SIGTERM/INT/HUP exit in
+# 0.364-0.466s and SIGKILL in 0.001s. That is the SAME ~0.4s baseline this file
+# already records for the readiness hook ("the hook fires in 0.4s, 3 of 3"), so
+# 10s was already 21x the observed maximum -- and it still expired: one run in
+# four failed at `process.wait(timeout=10)` in run_signal with load ~96, while
+# the three passes sat at 55-61. The distribution has a long tail under
+# contention; the median was never the problem.
+#
+# ⚠️ THIS IS NOT A TIMEOUT RELAXED TO MAKE A FAILURE GO AWAY. It is the value
+# already derived above, applied to the case it missed. The cost is bounded and
+# one-sided: unlike the readiness loops, `process.wait()` does not poll, so a
+# genuine HANG now costs the full bound instead of 10s -- paid once, against a
+# one-in-four false failure of a pre-flight gate. A crash or nonzero exit is
+# still observed the instant it happens, because `wait()` returns then.
+EXIT_TIMEOUT_SECONDS = READY_TIMEOUT_SECONDS
+
+
 def warm_validate_binary() -> None:
     """Compile validate.rs ONCE, before anything is on the clock.
 
@@ -226,7 +250,7 @@ def run_signal(
             )
             wait_for_text(log, "VALIDATE_STOP_TEST_READY", process)
             process.send_signal(sig)
-            rc = process.wait(timeout=10)
+            rc = process.wait(timeout=EXIT_TIMEOUT_SECONDS)
 
         rows = [json.loads(line) for line in ledger.read_text().splitlines()] if ledger.exists() else []
         if not expect_record:
@@ -409,7 +433,7 @@ def run_cleanup_signal_race() -> None:
             for _ in range(20):
                 process.send_signal(signal.SIGTERM)
                 time.sleep(0.01)
-            rc = process.wait(timeout=10)
+            rc = process.wait(timeout=EXIT_TIMEOUT_SECONDS)
 
         rows = [json.loads(line) for line in ledger.read_text().splitlines()]
         assert rc == 1, (rc, log.read_text(errors="replace"))
