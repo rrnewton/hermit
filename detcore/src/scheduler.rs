@@ -2557,6 +2557,26 @@ impl Scheduler {
     /// logical deadlines, all of which Detcore already guarantees to be
     /// deterministic. No host pointer is emitted.
     fn format_terminal_deadlock(&self) -> String {
+        // ⚠️ ADDING A SECTION HERE? RENDER `dtid` OR A STABLE ORDINAL, NEVER A
+        // DEBUG-FORMATTED ID. The rule is stated in full in the doc comment above
+        // and repeated here because that is not where authors edit: the doc
+        // comment already warned that the obvious `{:?}` implementation is not
+        // reproducible, and a later change added a section that did it anyway.
+        //
+        // A host-influenced counter is the failure that survives review, because
+        // it LOOKS like a small integer. `{:?}` of a wrapper type, a raw thread
+        // id, an allocation counter or anything seeded from host state will differ
+        // run to run while reading like an ordinary index.
+        //
+        // Print only identities Detcore already determinizes: dettids, resource
+        // ids, futex keys, logical deadlines, or a position computed by sorting on
+        // one of those.
+        //
+        // ⚠️ AND EXTEND THE FIXTURE. The determinism test cannot see a section its
+        // fixture never renders, so a section that only appears under state
+        // `deadlocked_scheduler` does not build is UNGUARDED however good the
+        // banned list is. If your section needs different scheduler state, add
+        // that state to the fixture in the same change.
         let mut out = format!(
             "Deadlock detected: {}, but no runnable threads left.\n",
             self.describe_terminal_waiters()
@@ -5563,7 +5583,20 @@ mod test {
         assert_eq!(forward, reversed);
 
         // No `Debug` of an Ivar/Waker, and so no host pointer.
-        for banned in ["Waker", "Ivar", "vtable", "Mutex", "poisoned"] {
+        //
+        // ⚠️ THIS LIST CANNOT SEE A SECTION THE FIXTURE NEVER RENDERS. It only
+        // inspects the text `deadlocked_scheduler` happens to produce. When you
+        // add a section to `format_terminal_deadlock`, add the state that triggers
+        // it to the fixture in the same change, or this test will pass and say
+        // nothing about your section.
+        //
+        // These tokens catch host POINTERS and raw thread ids. The subtler failure
+        // is a host-influenced COUNTER, which looks like an ordinary small integer
+        // and matches no banned word -- which is why the byte-identical assertion
+        // above is the load-bearing check and this list is only a backstop.
+        for banned in [
+            "Waker", "Ivar", "vtable", "Mutex", "poisoned", "ThreadId", "0x7f",
+        ] {
             assert!(
                 !forward.contains(banned),
                 "deadlock report leaked {banned:?}; it must print only guest-level \
