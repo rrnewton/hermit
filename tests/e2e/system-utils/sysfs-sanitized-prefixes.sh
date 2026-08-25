@@ -21,6 +21,21 @@
 set -euo pipefail
 shopt -s nullglob
 
+read_sysfs_text() {
+    local path=$1
+    local output_name=$2
+    local value=''
+    local status=0
+
+    # Sysfs attributes are text and contain no NUL bytes. `read -d ""` retains
+    # every newline, unlike command substitution, and reports 1 for normal EOF.
+    IFS= read -r -d '' value <"$path" || status=$?
+    if [[ $status -ne 0 && $status -ne 1 ]] || [[ -z $value ]]; then
+        return 1
+    fi
+    printf -v "$output_name" '%s' "$value"
+}
+
 probe_prefix() {
     local label=$1
     local root=$2
@@ -43,15 +58,11 @@ probe_prefix() {
 
     for candidate in "${candidates[@]}"; do
         [[ -r $candidate ]] || continue
-        if first=$(<"$candidate"); then
-            if [[ -z $first ]]; then
-                printf 'sysfs-sanitized-prefixes FAIL: %s read empty at %s\n' "$label" "$candidate" >&2
-                return 1
-            fi
+        if read_sysfs_text "$candidate" first; then
             if [[ ${SYSFS_PROBE_MUTATE_LABEL:-} == "$label" ]]; then
                 printf 'changed\n' >"$candidate"
             fi
-            if ! second=$(<"$candidate"); then
+            if ! read_sysfs_text "$candidate" second; then
                 printf 'sysfs-sanitized-prefixes FAIL: %s second read failed at %s\n' "$label" "$candidate" >&2
                 return 1
             fi
