@@ -3093,7 +3093,8 @@ impl Scheduler {
                 // to lower the level.
                 info!("scheduler (step2_process_blocked): zero threads left anywhere, fizzling.");
                 return Err(SkipTurn);
-            } else if timed_empty && external_waits_empty && (!futex_empty || !rt_sigsuspend_empty) {
+            } else if timed_empty && external_waits_empty && (!futex_empty || !rt_sigsuspend_empty)
+            {
                 return Err(self.report_terminal_deadlock());
             } else if !timed_empty {
                 // Only a *reachable* deadline justifies fast-forwarding the clock.
