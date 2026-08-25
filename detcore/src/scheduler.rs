@@ -73,8 +73,10 @@ use crate::resources::SABRE_LOOPBACK_POLL_YIELD_FYI;
 use crate::scheduler::replayer::StopReason;
 use crate::scheduler::replayer::events_consistent;
 use crate::scheduler::replayer::events_match;
+use crate::types::ChildWaitSelector;
 use crate::types::DetPid;
 use crate::types::DetTid;
+use crate::types::ExactChildWaitState;
 use crate::types::FutexID;
 use crate::types::GlobalTime;
 use crate::types::LogicalTime;
@@ -226,6 +228,16 @@ pub struct BlockedPool {
     /// NOTE: futex waiters will ALSO appear in here if they have timeouts.
     pub timed_waiters: TimedEvents,
 
+    /// Threads parked until a matching child process exits logically.
+    pub child_waiters: BTreeMap<DetTid, (DetPid, ChildWaitSelector)>,
+
+    /// Threads parked between logical process exit and a backend's final
+    /// physical-exit report.
+    pub physical_child_waiters: BTreeMap<DetPid, BTreeSet<DetTid>>,
+
+    /// Waiters whose deterministic physical-exit handoff is ready to commit.
+    pub physical_child_ready: BTreeSet<DetTid>,
+
     /// Blockers on external IO that are in the middle of executing (or have finished) and
     /// are waiting for permission from the scheduler to resume.
     ///
@@ -265,15 +277,22 @@ impl BlockedPool {
     fn is_empty(&self) -> bool {
         self.no_futex_waiters()
             && self.timed_waiters.is_empty()
+            && self.child_waiters.is_empty()
+            && self.physical_child_waiters.is_empty()
+            && self.physical_child_ready.is_empty()
             && self.external_io_blockers.is_empty()
             && self.sigchld_deferred.is_empty()
     }
 
     /// True if there are no runnable threads, and the only blocked ones are externally-blocked.
     fn only_external_blocked(&self) -> bool {
+        let has_external_wait = !self.external_io_blockers.is_empty()
+            || !self.child_waiters.is_empty()
+            || !self.physical_child_waiters.is_empty();
         self.no_futex_waiters()
             && self.timed_waiters.is_empty()
-            && !self.external_io_blockers.is_empty()
+            && self.physical_child_ready.is_empty()
+            && has_external_wait
     }
 
     /// Returns true if there are zero threads blocked on futexes.
@@ -537,6 +556,12 @@ pub struct Scheduler {
     /// final kernel exit status. While the run queue is empty, these prevent virtual timers from
     /// overtaking a child exit that is not physically waitable yet.
     pending_physical_process_exits: BTreeSet<DetPid>,
+
+    /// Logically exited child processes whose terminal wait status has not been consumed.
+    logically_exited_processes: BTreeSet<DetPid>,
+
+    /// Reporting-backend children whose final physical exit has been observed.
+    completed_physical_process_exits: BTreeSet<DetPid>,
 
     /// Whether the backend defers spawning a vfork child until after the parent posts its
     /// continuation, so an unfulfilled vfork barrier at parent continuation means the child is
@@ -1244,7 +1269,9 @@ impl Scheduler {
             deregistration_accounted: Default::default(),
             backend_reports_physical_process_exits: cfg.backend_reports_physical_process_exits,
             pending_physical_process_exits: Default::default(),
+            logically_exited_processes: Default::default(),
             backend_defers_vfork_child_registration: cfg.backend_defers_vfork_child_registration,
+            completed_physical_process_exits: Default::default(),
             resources: Default::default(),
             started_up: Default::default(),
             thread_tree: Default::default(),
@@ -1589,6 +1616,10 @@ impl Scheduler {
             .any(|tid| self.next_turns.contains_key(&tid));
         if !live_process_thread {
             let _ = self.begin_physical_process_exit(*detpid);
+            self.logically_exited_processes.insert(*detpid);
+            if let Some(parent) = self.thread_tree.parent_process(detpid) {
+                self.wake_child_waiters(parent, *detpid);
+            }
             self.blocked.timed_waiters.remove_process_timers(*detpid);
         }
     }
@@ -1743,6 +1774,7 @@ impl Scheduler {
     /// wait status. Other backends retain their existing lifecycle behavior.
     pub(crate) fn begin_physical_process_exit(&mut self, detpid: DetPid) -> bool {
         if self.backend_reports_physical_process_exits {
+            self.completed_physical_process_exits.remove(&detpid);
             let inserted = self.pending_physical_process_exits.insert(detpid);
             if inserted {
                 trace!(
@@ -1759,13 +1791,22 @@ impl Scheduler {
     /// Release the exact process barrier when the ptrace supervisor receives its final `Exited`
     /// or `Signaled` wait status. At that lifecycle point the process is physically waitable.
     pub(crate) fn complete_physical_process_exit(&mut self, detpid: DetPid) -> bool {
-        self.pending_physical_process_exits.remove(&detpid)
+        let removed = self.pending_physical_process_exits.remove(&detpid);
+        if removed {
+            self.completed_physical_process_exits.insert(detpid);
+            self.wake_physical_child_waiters(detpid);
+        }
+        removed
     }
 
     /// Release every physical-exit barrier after the backend supervisor has drained all tracees.
     pub(crate) fn release_all_physical_process_exits(&mut self) -> usize {
-        let released = self.pending_physical_process_exits.len();
-        self.pending_physical_process_exits.clear();
+        let children = std::mem::take(&mut self.pending_physical_process_exits);
+        let released = children.len();
+        for child in children {
+            self.completed_physical_process_exits.insert(child);
+            self.wake_physical_child_waiters(child);
+        }
         released
     }
 
@@ -1776,6 +1817,12 @@ impl Scheduler {
         self.blocked.timed_out_futex_waiters.remove(dtid);
         self.blocked.sigchld_deferred.remove(dtid);
         self.blocked.sigchld_ready.remove(dtid);
+        self.blocked.child_waiters.remove(dtid);
+        self.blocked.physical_child_ready.remove(dtid);
+        self.blocked.physical_child_waiters.retain(|_, waiters| {
+            waiters.remove(dtid);
+            !waiters.is_empty()
+        });
         self.pending_run_queue_admissions.remove(dtid);
         let _ = self.remove_futex_waiter(dtid);
     }
@@ -1962,6 +2009,19 @@ impl Scheduler {
         // still buffered is not re-enqueued.
         self.drain_pending_run_queue_removals();
         self.drain_pending_run_queue_admissions();
+        if self
+            .blocked
+            .physical_child_waiters
+            .keys()
+            .any(|child| self.pending_physical_process_exits.contains(child))
+        {
+            // A reaper has reached the deterministic logical-exit boundary.
+            // Do not let runnable siblings advance while the backend catches
+            // up to physical waitability; completion admits the waiter through
+            // the next deterministic drain.
+            std::thread::yield_now();
+            return Err(SkipTurn);
+        }
         self.step2a_wait_for_vfork_barrier()?;
         self.step2b_process_timed(); // May populate run_queue.
         self.step2c_process_io_blockers()?;
@@ -2178,6 +2238,109 @@ impl Scheduler {
     /// filters its own result by, so the two agree about what "live" means.
     pub fn thread_is_live(&self, dettid: DetTid) -> bool {
         self.next_turns.contains_key(&dettid)
+    }
+
+    /// Return scheduler-owned lifecycle state for an exact child-process wait.
+    ///
+    /// This deliberately models direct parentage and process liveness rather
+    /// than `kill(2)` target resolution. It lets wait syscalls stop exposing
+    /// the backend-dependent interval between logical exit and host waitability.
+    pub fn exact_child_wait_state(&mut self, parent: DetPid, child: DetPid) -> ExactChildWaitState {
+        if self.thread_tree.parent_process(&child) != Some(parent) {
+            return ExactChildWaitState::Unknown;
+        }
+
+        let live = self
+            .thread_tree
+            .my_thread_group(&child)
+            .into_iter()
+            .any(|tid| self.next_turns.contains_key(&tid));
+        if live {
+            return ExactChildWaitState::Running;
+        }
+
+        if !self.logically_exited_processes.contains(&child) {
+            return ExactChildWaitState::Unknown;
+        }
+
+        if !self.backend_reports_physical_process_exits {
+            ExactChildWaitState::LogicallyExited
+        } else if self.pending_physical_process_exits.contains(&child) {
+            ExactChildWaitState::PhysicalExitPending
+        } else {
+            ExactChildWaitState::PhysicallyExited
+        }
+    }
+
+    fn child_matches_wait(
+        &self,
+        parent: DetPid,
+        child: DetPid,
+        selector: ChildWaitSelector,
+    ) -> bool {
+        self.thread_tree.parent_process(&child) == Some(parent)
+            && match selector {
+                ChildWaitSelector::Exact(expected) => child == expected,
+                ChildWaitSelector::Any => true,
+            }
+    }
+
+    pub fn ready_child_wait(&self, parent: DetPid, selector: ChildWaitSelector) -> Option<DetPid> {
+        self.logically_exited_processes
+            .iter()
+            .copied()
+            .find(|child| self.child_matches_wait(parent, *child, selector))
+    }
+
+    pub fn has_child_wait_target(&self, parent: DetPid, selector: ChildWaitSelector) -> bool {
+        self.thread_tree
+            .process_parent
+            .iter()
+            .any(|(child, wait_parent)| {
+                *wait_parent == parent
+                    && match selector {
+                        ChildWaitSelector::Exact(expected) => *child == expected,
+                        ChildWaitSelector::Any => true,
+                    }
+            })
+    }
+
+    pub fn consume_child_wait(&mut self, parent: DetPid, child: DetPid) -> bool {
+        if self.thread_tree.parent_process(&child) != Some(parent) {
+            return false;
+        }
+        self.wake_child_waiters(parent, child);
+        self.completed_physical_process_exits.remove(&child);
+        self.thread_tree.process_parent.remove(&child);
+        self.logically_exited_processes.remove(&child)
+    }
+
+    fn wake_child_waiters(&mut self, parent: DetPid, child: DetPid) {
+        let waiters: Vec<DetTid> = self
+            .blocked
+            .child_waiters
+            .iter()
+            .filter_map(|(dettid, (wait_parent, selector))| {
+                (*wait_parent == parent && self.child_matches_wait(parent, child, *selector))
+                    .then_some(*dettid)
+            })
+            .collect();
+        for dettid in waiters {
+            self.blocked.child_waiters.remove(&dettid);
+            debug_assert!(!self.run_queue.contains_tid(dettid));
+            self.admit_to_run_queue(dettid, AdmitIntent::Fixed(AdmitSide::Back));
+        }
+    }
+
+    fn wake_physical_child_waiters(&mut self, child: DetPid) {
+        if let Some(waiters) = self.blocked.physical_child_waiters.remove(&child) {
+            for dettid in waiters {
+                self.blocked.physical_child_ready.insert(dettid);
+                if self.next_turns.contains_key(&dettid) && !self.run_queue.contains_tid(dettid) {
+                    self.admit_to_run_queue(dettid, AdmitIntent::Fixed(AdmitSide::Back));
+                }
+            }
+        }
     }
 
     pub fn process_signal_targets(&mut self, detpid: DetPid) -> Vec<DetTid> {
@@ -2717,7 +2880,9 @@ impl Scheduler {
         global_time: &Arc<Mutex<GlobalTime>>,
     ) -> Result<(), SkipTurn> {
         let timed_empty = self.blocked.timed_waiters.is_empty();
-        let blockers_empty = self.blocked.external_io_blockers.is_empty();
+        let blockers_empty = self.blocked.external_io_blockers.is_empty()
+            && self.blocked.child_waiters.is_empty()
+            && self.blocked.physical_child_waiters.is_empty();
         let futex_empty = self.blocked.no_futex_waiters();
 
         if self.run_queue.is_empty() {
@@ -3089,6 +3254,51 @@ impl Scheduler {
                 // We leave the thread out of the run-queue.  At the point we put it back
                 // in, this resource request is immediately granted.
                 Ok(())
+            }
+
+            ResourceID::WaitChild { parent, selector } => {
+                if self.ready_child_wait(*parent, *selector).is_some()
+                    || !self.has_child_wait_target(*parent, *selector)
+                {
+                    Ok(())
+                } else {
+                    info!(
+                        "[scheduler] NONCOMMIT turn {}, parking dettid {} for child {:?}",
+                        self.turn, dettid, selector
+                    );
+                    assert!(
+                        self.blocked
+                            .child_waiters
+                            .insert(dettid, (*parent, *selector))
+                            .is_none()
+                    );
+                    self.skip_turn_blocked(dettid)
+                }
+            }
+
+            ResourceID::WaitPhysicalChild(child) => {
+                if self.blocked.physical_child_ready.remove(&dettid) {
+                    Ok(())
+                } else {
+                    info!(
+                        "[scheduler] NONCOMMIT turn {}, parking dettid {} for physical child {}",
+                        self.turn, dettid, child
+                    );
+                    let completion_already_observed =
+                        self.completed_physical_process_exits.contains(child);
+                    assert!(
+                        self.blocked
+                            .physical_child_waiters
+                            .entry(*child)
+                            .or_default()
+                            .insert(dettid)
+                    );
+                    let skipped = self.skip_turn_blocked(dettid);
+                    if completion_already_observed {
+                        self.wake_physical_child_waiters(*child);
+                    }
+                    skipped
+                }
             }
 
             // Thread requests change in priority
@@ -3870,6 +4080,18 @@ impl Scheduler {
             }
             if self.blocked.external_io_blockers.contains_key(&dtid) {
                 return ThreadStatus::NotRunning;
+            }
+            if self.blocked.child_waiters.contains_key(&dtid)
+                || self
+                    .blocked
+                    .physical_child_waiters
+                    .values()
+                    .any(|waiters| waiters.contains(&dtid))
+            {
+                return ThreadStatus::NotRunning;
+            }
+            if self.pending_run_queue_admissions.contains_key(&dtid) {
+                return ThreadStatus::Running;
             }
             ThreadStatus::Gone
         }
@@ -5492,6 +5714,95 @@ mod test {
         assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
         assert!(scheduler.blocked.timed_waiters.is_empty());
         assert_eq!(global_time.lock().unwrap().as_nanos(), exit_deadline);
+    }
+
+    fn physical_wait_handoff_queue(completion_before_wait: bool) -> Vec<DetTid> {
+        let config = Config {
+            backend_reports_physical_process_exits: true,
+            ..Config::default()
+        };
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let mut scheduler = Scheduler::new(&config);
+        let waiter = DetTid::from_raw(100);
+        let sibling = DetTid::from_raw(200);
+        let child = DetPid::from_raw(300);
+        register_known_thread(&mut scheduler, waiter);
+        register_known_thread(&mut scheduler, sibling);
+        scheduler.runqueue_push_back(waiter);
+        scheduler.runqueue_push_back(sibling);
+
+        assert!(scheduler.begin_physical_process_exit(child));
+        if completion_before_wait {
+            assert!(scheduler.complete_physical_process_exit(child));
+        }
+
+        assert_eq!(scheduler.run_queue.tentative_pop_tid(waiter), Some(waiter));
+        assert!(
+            scheduler
+                .block_for_one_resource(
+                    waiter,
+                    &ResourceID::WaitPhysicalChild(child),
+                    &Permission::W,
+                    &Ivar::new(),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
+            vec![sibling]
+        );
+
+        if !completion_before_wait {
+            assert!(
+                scheduler.step2_process_blocked(&global_time).is_err(),
+                "a runnable sibling must not pass the pending physical-exit barrier"
+            );
+            assert_eq!(
+                scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
+                vec![sibling]
+            );
+            assert!(scheduler.complete_physical_process_exit(child));
+        }
+
+        assert!(scheduler.step2_process_blocked(&global_time).is_ok());
+        assert!(scheduler.pending_run_queue_admissions.is_empty());
+        assert!(scheduler.blocked.physical_child_ready.contains(&waiter));
+        scheduler.run_queue.tids().copied().collect()
+    }
+
+    #[test]
+    fn physical_wait_handoff_is_identical_before_or_after_backend_completion() {
+        let completion_before = physical_wait_handoff_queue(true);
+        let completion_after = physical_wait_handoff_queue(false);
+
+        assert_eq!(completion_before, completion_after);
+        assert_eq!(
+            completion_before,
+            vec![DetTid::from_raw(200), DetTid::from_raw(100)]
+        );
+    }
+
+    #[test]
+    fn consuming_auto_reaped_tombstone_exposes_the_next_ready_child() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let parent = DetPid::from_raw(100);
+        let first = DetPid::from_raw(200);
+        let second = DetPid::from_raw(300);
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, first, true);
+        scheduler.thread_tree.add_child(parent, second, true);
+        scheduler.logically_exited_processes.insert(first);
+        scheduler.logically_exited_processes.insert(second);
+
+        assert_eq!(
+            scheduler.ready_child_wait(parent, ChildWaitSelector::Any),
+            Some(first)
+        );
+        assert!(scheduler.consume_child_wait(parent, first));
+        assert_eq!(
+            scheduler.ready_child_wait(parent, ChildWaitSelector::Any),
+            Some(second)
+        );
     }
 
     #[test]

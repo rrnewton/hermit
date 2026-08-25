@@ -28,6 +28,7 @@ static DBT_EXECVEAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_PID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_PRLIMIT_SELF_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static KVM_EXACT_CHILD_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_UNSUPPORTED_SYSCALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_SELF_SIGQUEUE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_STDERR_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -378,6 +379,32 @@ fn dbt_wait_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "DBT wait guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn kvm_exact_child_waits_guest() -> &'static Path {
+    KVM_EXACT_CHILD_WAITS_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kvm-exact-child-waits");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create KVM exact-child wait guest directory");
+        let guest = build_root.join("kvm_exact_child_waits");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/kvm_exact_child_waits.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile KVM exact-child wait guest");
+        assert!(
+            output.status.success(),
+            "KVM exact-child wait guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -1445,6 +1472,69 @@ fn run_dbt_verifies_process_wait_lifecycle() {
         "DBT determinism confirmation missing:\n{}",
         stderr(&output),
     );
+}
+
+#[test]
+fn run_kvm_exact_child_waits_have_stable_scheduler_turns() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping KVM exact-child waits: /dev/kvm is unavailable");
+        return;
+    }
+
+    let _guard = hermit_run_guard();
+    let program = kvm_exact_child_waits_guest()
+        .to_str()
+        .expect("exact-child wait guest path should be UTF-8");
+    let args = [
+        "--log=info",
+        "run",
+        "--backend=kvm",
+        "--strict",
+        "--max-timeslice=disabled",
+        "--tmp=/tmp",
+        "--",
+        program,
+    ];
+    for iteration in 0..4 {
+        let output = hermit(&args);
+
+        assert_success(&output, &args);
+        assert!(
+            stdout(&output)
+                == "wait4=7 waitid=9 wait4-any=11 waitid-any=13 \
+                live-wnohang=empty child-ready-won\n",
+            "iteration {iteration} did not exercise the KVM child-wait contract: {:?}",
+            stdout(&output)
+        );
+        let log = stderr(&output);
+        assert!(
+            log.contains("hermit::kvm: launching guest through reverie-kvm"),
+            "iteration {iteration} did not use the KVM backend:\n{log}"
+        );
+        let sigchld_deliveries = log
+            .lines()
+            .filter(|line| line.contains("Alarm fired, delivering signal SIGCHLD"))
+            .count();
+        assert!(
+            sigchld_deliveries >= 4,
+            "iteration {iteration} did not race each ready child against SIGCHLD:\n{log}"
+        );
+        let exact_wait_turns = log
+            .lines()
+            .filter(|line| {
+                line.contains("resources {WaitChild") && line.contains("selector: Exact")
+            })
+            .count();
+        let any_wait_turns = log
+            .lines()
+            .filter(|line| line.contains("resources {WaitChild") && line.contains("selector: Any"))
+            .count();
+        assert_eq!(
+            (exact_wait_turns, any_wait_turns),
+            (2, 2),
+            "iteration {iteration} changed the scheduler child-wait turn population:\n{log}"
+        );
+    }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED

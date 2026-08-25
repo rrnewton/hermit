@@ -131,7 +131,7 @@ test:
       - kvm
       - python3
     timeout_seconds: 120
-    occasional: true
+    occasional: false
     program: tests/e2e/applications/kvm-python-examples.sh
     observation:
       status: true

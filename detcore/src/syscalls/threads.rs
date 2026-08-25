@@ -44,17 +44,24 @@ use crate::syscalls::helpers::retry_nonblocking_syscall;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::tool_global::FutexAction;
 use crate::tool_global::ResumeStatus;
+use crate::tool_global::await_exact_child_physical_exit;
 use crate::tool_global::cancel_exec;
+use crate::tool_global::consume_child_wait;
 use crate::tool_global::create_child_thread;
 use crate::tool_global::futex_action;
 use crate::tool_global::prepare_exec;
+use crate::tool_global::ready_child_wait;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_is_live;
 use crate::tool_global::thread_observe_time;
+use crate::tool_global::wait_for_child_lifecycle;
+use crate::tool_global::yield_once;
 use crate::tool_local::Detcore;
 use crate::tool_local::PendingVfork;
+use crate::types::ChildWaitSelector;
 use crate::types::DetPid;
 use crate::types::DetTid;
+use crate::types::ExactChildWaitState;
 use crate::types::LogicalTime;
 
 // Preserve the historical Detcore ABI while hiding the host's configured CPU
@@ -425,21 +432,71 @@ fn canonicalize_waitid_siginfo(info: &mut libc::siginfo_t) {
     sigchld.stime = 0;
 }
 
+fn finish_waitid_result<T, G>(
+    guest: &mut G,
+    call: syscalls::Waitid,
+    value: i64,
+    mut info_value: libc::siginfo_t,
+) -> Result<i64, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    // SAFETY: waitid writes either zeroed output or the SIGCHLD siginfo_t
+    // variant, for which libc exposes si_pid.
+    let child_pid = unsafe { info_value.si_pid() };
+    if child_pid != 0 {
+        canonicalize_waitid_siginfo(&mut info_value);
+        guest.memory().write_value(
+            call.info().expect("waitid infop checked before execution"),
+            &info_value,
+        )?;
+        if call.options() & libc::WNOWAIT == 0 && waitid_code_is_termination(info_value.si_code) {
+            guest
+                .thread_state_mut()
+                .reap_child_process_cpu_time(DetPid::from_raw(child_pid));
+        }
+        if let Some(rusage) = call.rusage() {
+            // Host CPU and scheduling counters are not deterministic.
+            let usage: libc::rusage = unsafe { std::mem::zeroed() };
+            guest.memory().write_value(rusage, &usage)?;
+        }
+    }
+    Ok(value)
+}
+
 #[derive(Debug, Eq, PartialEq)]
-enum WaitidPollDecision {
+enum ExactWaitPollDecision {
     ChildReady,
+    AwaitPhysicalExit,
+    ReapAfterLogicalExit,
     Interrupted,
     Retry,
 }
 
-fn waitid_poll_decision(child_pid: libc::pid_t, signaled: bool) -> WaitidPollDecision {
-    if child_pid != 0 {
-        WaitidPollDecision::ChildReady
+fn exact_wait_poll_decision(
+    child_ready: bool,
+    signaled: bool,
+    lifecycle: Option<ExactChildWaitState>,
+) -> ExactWaitPollDecision {
+    if child_ready {
+        ExactWaitPollDecision::ChildReady
+    } else if lifecycle == Some(ExactChildWaitState::PhysicalExitPending) {
+        ExactWaitPollDecision::AwaitPhysicalExit
+    } else if matches!(
+        lifecycle,
+        Some(ExactChildWaitState::LogicallyExited | ExactChildWaitState::PhysicallyExited)
+    ) {
+        ExactWaitPollDecision::ReapAfterLogicalExit
     } else if signaled {
-        WaitidPollDecision::Interrupted
+        ExactWaitPollDecision::Interrupted
     } else {
-        WaitidPollDecision::Retry
+        ExactWaitPollDecision::Retry
     }
+}
+
+fn stale_any_wait_must_interrupt(signaled: bool, next_ready: Option<DetPid>) -> bool {
+    signaled && next_ready.is_none()
 }
 
 fn snapshot_process_group(pid: Pid) -> Result<libc::pid_t, Errno> {
@@ -1113,13 +1170,131 @@ impl<T: RecordOrReplay> Detcore<T> {
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("wait4");
 
+        let selector = if call.options().intersects(
+            WaitPidFlag::WUNTRACED
+                | WaitPidFlag::WCONTINUED
+                | WaitPidFlag::__WNOTHREAD
+                | WaitPidFlag::__WCLONE,
+        ) {
+            None
+        } else {
+            match call.pid() {
+                pid if pid > 0 => Some(ChildWaitSelector::Exact(DetPid::from_raw(pid))),
+                -1 => Some(ChildWaitSelector::Any),
+                _ => None,
+            }
+        };
+        let managed_selector = if let Some(selector) = selector {
+            ready_child_wait(guest, selector)
+                .await
+                .1
+                .then_some(selector)
+        } else {
+            None
+        };
+
         let value = if call.options().contains(WaitPidFlag::WNOHANG) {
             resource_request(guest, rsrc.clone()).await;
             info!(
                 "[dtid {}] Executing non-blocking wait4 in one shot.",
                 dettid
             );
-            guest.inject_with_retry(call).await?
+            if let Some(selector) = selector {
+                'select_child: loop {
+                    let (ready, has_child) = ready_child_wait(guest, selector).await;
+                    let Some(child) = ready else {
+                        break if has_child {
+                            0
+                        } else {
+                            guest.inject_with_retry(call).await?
+                        };
+                    };
+                    let _ = await_exact_child_physical_exit(guest, child).await;
+                    let exact_call = call.with_pid(child.as_raw());
+                    loop {
+                        match guest.inject_with_retry(exact_call).await {
+                            Ok(value) if value != 0 => break 'select_child value,
+                            Ok(_) => yield_once().await,
+                            Err(Errno::ECHILD) => {
+                                let _ = consume_child_wait(guest, child).await;
+                                if selector == ChildWaitSelector::Any {
+                                    continue 'select_child;
+                                }
+                                return Err(Errno::ECHILD.into());
+                            }
+                            Err(errno) => return Err(errno.into()),
+                        }
+                    }
+                }
+            } else {
+                // pid 0 and negative process-group selectors retain the legacy
+                // one-shot path until Detcore models process-group membership.
+                guest.inject_with_retry(call).await?
+            }
+        } else if let Some(selector) = managed_selector {
+            // Keep ordinary signals pending until child readiness is resolved.
+            let mut blocked_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+            unsafe {
+                libc::sigfillset(&mut blocked_mask);
+                libc::sigdelset(&mut blocked_mask, reverie::PERF_EVENT_SIGNAL as i32);
+            }
+            let mut stack = guest.stack().await;
+            let blocked_mask_addr = stack.push(blocked_mask);
+            let old_mask_addr = stack.reserve::<libc::sigset_t>();
+            let _mask_guard = stack.commit()?;
+            let block_signals = syscalls::RtSigprocmask::new()
+                .with_how(libc::SIG_SETMASK)
+                .with_set(Some(blocked_mask_addr))
+                .with_oldset(Some(old_mask_addr))
+                .with_sigsetsize(std::mem::size_of::<u64>());
+            guest.inject_with_retry(block_signals).await?;
+
+            let poll_call = call.with_options(call.options() | WaitPidFlag::WNOHANG);
+            let mut pending_signal = false;
+            let result: Result<i64, Error> = loop {
+                let signaled =
+                    wait_for_child_lifecycle(guest, selector).await == ResumeStatus::Signaled;
+                pending_signal |= signaled;
+                let (ready, _) = ready_child_wait(guest, selector).await;
+                if let Some(child) = ready {
+                    let _ = await_exact_child_physical_exit(guest, child).await;
+                    match guest.inject_with_retry(call.with_pid(child.as_raw())).await {
+                        Ok(value) => break Ok(value),
+                        Err(Errno::ECHILD) => {
+                            let _ = consume_child_wait(guest, child).await;
+                            if selector == ChildWaitSelector::Any {
+                                let (next_ready, _) =
+                                    ready_child_wait(guest, ChildWaitSelector::Any).await;
+                                if stale_any_wait_must_interrupt(pending_signal, next_ready) {
+                                    break Err(Errno::ERESTARTSYS.into());
+                                }
+                                continue;
+                            }
+                            break Err(Errno::ECHILD.into());
+                        }
+                        Err(errno) => break Err(errno.into()),
+                    }
+                }
+                match guest.inject(poll_call).await {
+                    Ok(value) => {
+                        if value > 0 {
+                            break Ok(value);
+                        }
+                        if pending_signal {
+                            break Err(Errno::ERESTARTSYS.into());
+                        }
+                    }
+                    Err(errno) => break Err(errno.into()),
+                }
+            };
+
+            let restore_signals = syscalls::RtSigprocmask::new()
+                .with_how(libc::SIG_SETMASK)
+                .with_set(Some(old_mask_addr.into()))
+                .with_oldset(None)
+                .with_sigsetsize(std::mem::size_of::<u64>());
+            guest.inject_with_retry(restore_signals).await?;
+            result?
         } else {
             // wait4 is a scheduler poll, not a record/replay data read (see doc above),
             // so it is not routed through the record/replay subtool.
@@ -1138,6 +1313,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest
                 .thread_state_mut()
                 .reap_child_process_cpu_time(DetPid::from_raw(value as i32));
+            let _ = consume_child_wait(guest, DetPid::from_raw(value as i32)).await;
         }
         if value > 0
             && let Some(rusage) = call.rusage()
@@ -1220,6 +1396,33 @@ impl<T: RecordOrReplay> Detcore<T> {
         // waitid WNOHANG sentinel defined by POSIX and Linux.
         let empty_info: libc::siginfo_t = unsafe { std::mem::zeroed() };
 
+        // The lifecycle scheduler currently models terminal child events for
+        // exact and any-child selectors. Group membership and stop/continue
+        // state remain on the legacy kernel-polling path.
+        let terminal_selector = if call.options() & libc::WEXITED != 0
+            && call.options()
+                & (libc::WSTOPPED | libc::WCONTINUED | libc::__WNOTHREAD | libc::__WCLONE)
+                == 0
+        {
+            match call.which() {
+                which if which == libc::P_PID as i32 => {
+                    Some(ChildWaitSelector::Exact(DetPid::from_raw(call.pid())))
+                }
+                which if which == libc::P_ALL as i32 => Some(ChildWaitSelector::Any),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let managed_terminal_selector = if let Some(selector) = terminal_selector {
+            ready_child_wait(guest, selector)
+                .await
+                .1
+                .then_some(selector)
+        } else {
+            None
+        };
+
         if call.options() & libc::WNOHANG != 0 || pidfd_nonblocking {
             if !pidfd_nonblocking {
                 resource_request(guest, rsrc).await;
@@ -1228,29 +1431,53 @@ impl<T: RecordOrReplay> Detcore<T> {
                 "[dtid {}] Executing non-blocking waitid in one shot.",
                 dettid
             );
-            guest.memory().write_value(info, &empty_info)?;
-            let value = guest.inject_with_retry(call).await?;
-            let mut info_value: libc::siginfo_t = guest.memory().read_value(info)?;
-            // SAFETY: waitid writes either zeroed output or the SIGCHLD
-            // siginfo_t variant, for which libc exposes si_pid.
-            let child_pid = unsafe { info_value.si_pid() };
-            if child_pid != 0 {
-                canonicalize_waitid_siginfo(&mut info_value);
-                guest.memory().write_value(info, &info_value)?;
-                if call.options() & libc::WNOWAIT == 0
-                    && waitid_code_is_termination(info_value.si_code)
-                {
-                    guest
-                        .thread_state_mut()
-                        .reap_child_process_cpu_time(DetPid::from_raw(child_pid));
+            'select_child: loop {
+                let selected = if let Some(selector) = terminal_selector {
+                    let (ready, has_child) = ready_child_wait(guest, selector).await;
+                    if ready.is_none() && has_child {
+                        guest.memory().write_value(info, &empty_info)?;
+                        return Ok(0);
+                    }
+                    ready
+                } else {
+                    None
+                };
+                if let Some(child) = selected {
+                    let _ = await_exact_child_physical_exit(guest, child).await;
                 }
-                if let Some(rusage) = call.rusage() {
-                    // Host CPU and scheduling counters are not deterministic.
-                    let usage: libc::rusage = unsafe { std::mem::zeroed() };
-                    guest.memory().write_value(rusage, &usage)?;
+                let effective_call = selected.map_or(call, |child| {
+                    call.with_which(libc::P_PID as i32).with_pid(child.as_raw())
+                });
+                loop {
+                    guest.memory().write_value(info, &empty_info)?;
+                    let value = match guest.inject_with_retry(effective_call).await {
+                        Ok(value) => value,
+                        Err(Errno::ECHILD) if selected.is_some() => {
+                            let child = selected.expect("selected child checked above");
+                            let _ = consume_child_wait(guest, child).await;
+                            if terminal_selector == Some(ChildWaitSelector::Any) {
+                                continue 'select_child;
+                            }
+                            return Err(Errno::ECHILD.into());
+                        }
+                        Err(errno) => return Err(errno.into()),
+                    };
+                    let info_value: libc::siginfo_t = guest.memory().read_value(info)?;
+                    let child_pid = unsafe { info_value.si_pid() };
+                    if child_pid == 0 && selected.is_some() {
+                        yield_once().await;
+                        continue;
+                    }
+                    let consumed = child_pid != 0
+                        && call.options() & libc::WNOWAIT == 0
+                        && waitid_code_is_termination(info_value.si_code);
+                    let result = finish_waitid_result(guest, call, value, info_value)?;
+                    if consumed {
+                        let _ = consume_child_wait(guest, DetPid::from_raw(child_pid)).await;
+                    }
+                    return Ok(result);
                 }
             }
-            return Ok(value);
         }
 
         // A signal can arrive after the scheduler wakes this logical wait but
@@ -1275,6 +1502,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest.inject_with_retry(block_signals).await?;
 
         let poll_call = call.with_options(call.options() | libc::WNOHANG);
+        let mut pending_signal = false;
         let result: Result<i64, Error> = loop {
             // Match the polling protocol used by wait4: the first request with
             // poll_attempt zero establishes an ordinary runnable turn, while later
@@ -1286,7 +1514,47 @@ impl<T: RecordOrReplay> Detcore<T> {
             // Do not return on Signaled yet. Linux lets an already-waitable child
             // status win over an interrupt, so the zero-timeout kernel probe below
             // remains authoritative when readiness and a signal coincide.
-            let signaled = resource_request(guest, rsrc.clone()).await == ResumeStatus::Signaled;
+            let managed_selector = managed_terminal_selector;
+            let signaled = if let Some(selector) = managed_selector {
+                wait_for_child_lifecycle(guest, selector).await == ResumeStatus::Signaled
+            } else {
+                resource_request(guest, rsrc.clone()).await == ResumeStatus::Signaled
+            };
+            pending_signal |= signaled;
+            let (ready, has_child) = if let Some(selector) = managed_selector {
+                ready_child_wait(guest, selector).await
+            } else {
+                (None, true)
+            };
+            if let Some(child) = ready {
+                let _ = await_exact_child_physical_exit(guest, child).await;
+                if let Err(error) = guest.memory().write_value(info, &empty_info) {
+                    break Err(error.into());
+                }
+                let exact_call = call.with_which(libc::P_PID as i32).with_pid(child.as_raw());
+                match guest.inject_with_retry(exact_call).await {
+                    Ok(value) => {
+                        let info_value = match guest.memory().read_value(info) {
+                            Ok(value) => value,
+                            Err(error) => break Err(error.into()),
+                        };
+                        break finish_waitid_result(guest, call, value, info_value);
+                    }
+                    Err(Errno::ECHILD) => {
+                        let _ = consume_child_wait(guest, child).await;
+                        if managed_selector == Some(ChildWaitSelector::Any) {
+                            let (next_ready, _) =
+                                ready_child_wait(guest, ChildWaitSelector::Any).await;
+                            if stale_any_wait_must_interrupt(pending_signal, next_ready) {
+                                break Err(Errno::ERESTARTSYS.into());
+                            }
+                            continue;
+                        }
+                        break Err(Errno::ECHILD.into());
+                    }
+                    Err(errno) => break Err(errno.into()),
+                }
+            }
 
             if let Err(error) = guest.memory().write_value(info, &empty_info) {
                 break Err(error.into());
@@ -1294,39 +1562,29 @@ impl<T: RecordOrReplay> Detcore<T> {
             let result = guest.inject(poll_call).await;
             match result {
                 Ok(value) => {
-                    let mut info_value: libc::siginfo_t = match guest.memory().read_value(info) {
+                    let info_value: libc::siginfo_t = match guest.memory().read_value(info) {
                         Ok(value) => value,
                         Err(error) => break Err(error.into()),
                     };
                     // waitid writes the SIGCHLD variant of siginfo_t. A zeroed
                     // structure is used only for the no-event WNOHANG result.
                     let child_pid = unsafe { info_value.si_pid() };
-                    match waitid_poll_decision(child_pid, signaled) {
-                        WaitidPollDecision::ChildReady => {
-                            canonicalize_waitid_siginfo(&mut info_value);
-                            if let Err(error) = guest.memory().write_value(info, &info_value) {
-                                break Err(error.into());
-                            }
-                            if call.options() & libc::WNOWAIT == 0
-                                && waitid_code_is_termination(info_value.si_code)
-                            {
-                                guest
-                                    .thread_state_mut()
-                                    .reap_child_process_cpu_time(DetPid::from_raw(child_pid));
-                            }
-                            if let Some(rusage) = call.rusage() {
-                                // Host CPU and scheduling counters are not deterministic.
-                                let usage: libc::rusage = unsafe { std::mem::zeroed() };
-                                if let Err(error) = guest.memory().write_value(rusage, &usage) {
-                                    break Err(error.into());
-                                }
-                            }
-                            break Ok(value);
+                    match exact_wait_poll_decision(child_pid != 0, pending_signal, None) {
+                        ExactWaitPollDecision::ChildReady => {
+                            break finish_waitid_result(guest, call, value, info_value);
                         }
-                        WaitidPollDecision::Interrupted => {
+                        ExactWaitPollDecision::Interrupted => {
                             break Err(Errno::ERESTARTSYS.into());
                         }
-                        WaitidPollDecision::Retry => {}
+                        ExactWaitPollDecision::Retry => {}
+                        ExactWaitPollDecision::AwaitPhysicalExit
+                        | ExactWaitPollDecision::ReapAfterLogicalExit => unreachable!(),
+                    }
+                    if managed_selector.is_some() {
+                        if !has_child {
+                            break Ok(value);
+                        }
+                        continue;
                     }
                     rsrc.poll_attempt += 1;
                     trace!(
@@ -1335,7 +1593,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     );
                     record_retry_event(guest, poll_call).await;
                 }
-                Err(Errno::ERESTARTSYS) if signaled => break Err(Errno::EINTR.into()),
+                Err(Errno::ERESTARTSYS) if pending_signal => break Err(Errno::EINTR.into()),
                 Err(errno) => break Err(errno.into()),
             }
         };
@@ -1346,6 +1604,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_oldset(None)
             .with_sigsetsize(std::mem::size_of::<u64>());
         guest.inject_with_retry(restore_signals).await?;
+        if result.is_ok() && call.options() & libc::WNOWAIT == 0 {
+            let info_value: libc::siginfo_t = guest.memory().read_value(info)?;
+            let child_pid = unsafe { info_value.si_pid() };
+            if child_pid != 0 && waitid_code_is_termination(info_value.si_code) {
+                let _ = consume_child_wait(guest, DetPid::from_raw(child_pid)).await;
+            }
+        }
         result
     }
 
@@ -1727,14 +1992,40 @@ mod tests {
     #[test]
     fn waitid_ready_child_wins_when_scheduler_also_reports_a_signal() {
         assert_eq!(
-            waitid_poll_decision(123, true),
-            WaitidPollDecision::ChildReady
+            exact_wait_poll_decision(true, true, Some(ExactChildWaitState::Running)),
+            ExactWaitPollDecision::ChildReady
         );
         assert_eq!(
-            waitid_poll_decision(0, true),
-            WaitidPollDecision::Interrupted
+            exact_wait_poll_decision(false, true, Some(ExactChildWaitState::LogicallyExited)),
+            ExactWaitPollDecision::ReapAfterLogicalExit
         );
-        assert_eq!(waitid_poll_decision(0, false), WaitidPollDecision::Retry);
+        assert_eq!(
+            exact_wait_poll_decision(false, true, Some(ExactChildWaitState::PhysicalExitPending)),
+            ExactWaitPollDecision::AwaitPhysicalExit
+        );
+        assert_eq!(
+            exact_wait_poll_decision(false, true, Some(ExactChildWaitState::Running)),
+            ExactWaitPollDecision::Interrupted
+        );
+        assert_eq!(
+            exact_wait_poll_decision(false, false, Some(ExactChildWaitState::Running)),
+            ExactWaitPollDecision::Retry
+        );
+    }
+
+    #[test]
+    fn stale_any_child_preserves_interrupt_until_no_ready_child_remains() {
+        let next_child = DetPid::from_raw(200);
+
+        assert!(
+            !stale_any_wait_must_interrupt(true, Some(next_child)),
+            "another ready child must retain child-ready precedence"
+        );
+        assert!(
+            stale_any_wait_must_interrupt(true, None),
+            "a pending signal must interrupt before the wait parks again"
+        );
+        assert!(!stale_any_wait_must_interrupt(false, None));
     }
 
     #[test]

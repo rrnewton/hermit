@@ -86,7 +86,7 @@ use crate::tool_local::Detcore;
 use crate::tool_local::ExecFdBlockingOverrides;
 use crate::types::*;
 
-async fn yield_once() {
+pub(crate) async fn yield_once() {
     let mut yielded = false;
     std::future::poll_fn(|context| {
         if yielded {
@@ -992,6 +992,22 @@ impl GlobalTool for GlobalState {
             }
             GlobalRequest::ThreadIsLive(dtid) => {
                 R::ThreadIsLive(self.sched.lock().unwrap().thread_is_live(dtid))
+            }
+            GlobalRequest::ExactChildWaitState(parent, child) => R::ExactChildWaitState(
+                self.sched
+                    .lock()
+                    .unwrap()
+                    .exact_child_wait_state(parent, child),
+            ),
+            GlobalRequest::ReadyChildWait(parent, selector) => {
+                let sched = self.sched.lock().unwrap();
+                R::ReadyChildWait((
+                    sched.ready_child_wait(parent, selector),
+                    sched.has_child_wait_target(parent, selector),
+                ))
+            }
+            GlobalRequest::ConsumeChildWait(parent, child) => {
+                R::ConsumeChildWait(self.sched.lock().unwrap().consume_child_wait(parent, child))
             }
             GlobalRequest::UnrecoverableShutdown => {
                 self.force_shutdown_with_error();
@@ -1961,10 +1977,16 @@ pub enum GlobalRequest {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
+    /// Deterministically select a logically exited matching child.
+    ReadyChildWait(DetPid, ChildWaitSelector),
+    /// Retire a consumed terminal child wait status.
+    ConsumeChildWait(DetPid, DetPid),
     /// Query live threads before translating process-directed signal delivery.
     ResolveKillTargets(DetPid),
     /// Liveness of one tid, leader or not; see [`thread_is_live`].
     ThreadIsLive(DetTid),
+    /// Scheduler-owned lifecycle state for a direct child process.
+    ExactChildWaitState(DetPid, DetPid),
 
     /// The container is shutting down.  Exit the scheduler "thread".
     UnrecoverableShutdown,
@@ -2017,11 +2039,14 @@ pub enum GlobalResponse {
     RegisterPosixTimer(()),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-841): Review logical alarm query RPC.
+    ReadyChildWait((Option<DetPid>, bool)),
+    ConsumeChildWait(bool),
     AlarmRemaining(LogicalTime),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     ResolveKillTargets(Vec<DetTid>),
     ThreadIsLive(bool),
+    ExactChildWaitState(ExactChildWaitState),
     // TODO: use void_send_rpc, and remove this bogus response:
     UnrecoverableShutdown(()),
 
@@ -2701,6 +2726,93 @@ where
     let response = send_and_update_time(guest, GlobalRequest::ThreadIsLive(dettid)).await;
     match response.1 {
         GlobalResponse::ThreadIsLive(live) => live,
+        _ => unreachable!(),
+    }
+}
+
+/// Return scheduler-owned lifecycle state for an exact child-process wait.
+pub async fn exact_child_wait_state<G, T>(guest: &mut G, child: DetPid) -> ExactChildWaitState
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let parent = guest.thread_state().detpid.expect("detpid unset");
+    let response =
+        send_and_update_time(guest, GlobalRequest::ExactChildWaitState(parent, child)).await;
+    match response.1 {
+        GlobalResponse::ExactChildWaitState(state) => state,
+        _ => unreachable!(),
+    }
+}
+
+/// Wait without requesting a scheduler turn for a backend's physical-exit report.
+pub async fn await_exact_child_physical_exit<G, T>(
+    guest: &mut G,
+    child: DetPid,
+) -> ExactChildWaitState
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let mut state = exact_child_wait_state(guest, child).await;
+    if matches!(
+        state,
+        ExactChildWaitState::PhysicalExitPending | ExactChildWaitState::PhysicallyExited
+    ) {
+        let dettid = guest.thread_state().dettid;
+        let mut resources = Resources::new(dettid);
+        resources.insert(ResourceID::WaitPhysicalChild(child), Permission::R);
+        resources.fyi("wait-child-physical-exit");
+        let _ = resource_request(guest, resources).await;
+        state = exact_child_wait_state(guest, child).await;
+    }
+    state
+}
+
+/// Park until an exact or any-child process wait has a logical exit to reap.
+pub async fn wait_for_child_lifecycle<G, T>(
+    guest: &mut G,
+    selector: ChildWaitSelector,
+) -> ResumeStatus
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let dettid = guest.thread_state().dettid;
+    let parent = guest.thread_state().detpid.expect("detpid unset");
+    let mut resources = Resources::new(dettid);
+    resources.insert(ResourceID::WaitChild { parent, selector }, Permission::R);
+    resources.fyi("wait-child-lifecycle");
+    resource_request(guest, resources).await
+}
+
+pub async fn ready_child_wait<G, T>(
+    guest: &mut G,
+    selector: ChildWaitSelector,
+) -> (Option<DetPid>, bool)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let parent = guest.thread_state().detpid.expect("detpid unset");
+    let response =
+        send_and_update_time(guest, GlobalRequest::ReadyChildWait(parent, selector)).await;
+    match response.1 {
+        GlobalResponse::ReadyChildWait(snapshot) => snapshot,
+        _ => unreachable!(),
+    }
+}
+
+pub async fn consume_child_wait<G, T>(guest: &mut G, child: DetPid) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let parent = guest.thread_state().detpid.expect("detpid unset");
+    let response =
+        send_and_update_time(guest, GlobalRequest::ConsumeChildWait(parent, child)).await;
+    match response.1 {
+        GlobalResponse::ConsumeChildWait(consumed) => consumed,
         _ => unreachable!(),
     }
 }

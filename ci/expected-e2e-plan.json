@@ -2080,6 +2080,13 @@
       "test": "system-utils/uuidgen-random"
     },
     {
+      "backend": "kvm",
+      "category": "applications",
+      "lane": "privileged",
+      "mode": "verify",
+      "test": "applications/kvm-python-examples"
+    },
+    {
       "backend": "ptrace",
       "category": "backend-parity-c",
       "lane": "privileged",

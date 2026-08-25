@@ -16,6 +16,7 @@ use reverie::syscalls::Syscall;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::types::ChildWaitSelector;
 use crate::types::DetInode;
 use crate::types::DetPid;
 use crate::types::DetTid;
@@ -278,6 +279,17 @@ pub enum ResourceID {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
     PriorityChangePoint(u64, LogicalTime, u64, Vec<ChaosEpochTransition>),
+
+    /// Park until an exact or any-child process wait has a logical exit to reap.
+    WaitChild {
+        /// The process issuing the wait.
+        parent: DetPid,
+        /// Child population selected by the syscall.
+        selector: ChildWaitSelector,
+    },
+
+    /// Park until a backend reports that a logically exited child is physically waitable.
+    WaitPhysicalChild(DetPid),
 
     /// A physical signal has been received by the thread, request to continue delivering it and
     /// invoking the signal handler as the next thing to run.

@@ -68867,7 +68867,7 @@
       "mode": "verify",
       "backend": "kvm",
       "enabled": true,
-      "status": "red",
+      "status": "green",
       "observations": [],
       "measurement": "never-measured"
     },
