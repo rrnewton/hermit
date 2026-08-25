@@ -9948,9 +9948,8 @@
       "test": "backend-parity-c/mmap-layout-pointer-order",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "not-applicable",
-      "not_applicable_reason": "LiteInst preload runtime libreverie_liteinst.so is not built beside the binary; qualify LiteInst separately",
+      "enabled": true,
+      "status": "green",
       "observations": [],
       "measurement": "never-measured"
     },
@@ -18049,9 +18048,8 @@
       "test": "backend-parity-c/stat-metadata-identity",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "not-applicable",
-      "not_applicable_reason": "LiteInst preload handshake fails on the authoring host; qualify LiteInst separately",
+      "enabled": true,
+      "status": "green",
       "observations": [],
       "measurement": "never-measured"
     },
