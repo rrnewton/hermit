@@ -518,7 +518,11 @@ fn liteinst_runtime_pin_matches(path: &Path) -> io::Result<()> {
         // match we cannot establish.
         return Ok(());
     }
-    let marker = path.with_extension("so.revision");
+    // Append rather than `with_extension("so.revision")`: the latter REPLACES the
+    // final extension, so a caller-supplied `HERMIT_LITEINST_RUNTIME` pointing at
+    // a versioned soname like `libreverie_liteinst.so.1` would look for
+    // `libreverie_liteinst.so.so.revision` and refuse a correctly staged runtime.
+    let marker = PathBuf::from(format!("{}.revision", path.display()));
     let staged = match fs::read_to_string(&marker) {
         Ok(text) => text.trim().to_owned(),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -3213,5 +3217,189 @@ mod tests {
         let argv = vec!["a".to_owned()];
         assert!(resolve_kvm_shebang(&a, argv).is_err());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The pin guard shipped with zero tests, which made it deletable: replacing
+    /// the call with `let _ = liteinst_runtime_pin_matches;` left the suite green
+    /// and silently reverted the loader to the old "missing required export"
+    /// path. That is the same shape as the defect the guard itself exists to
+    /// prevent -- a mechanism nobody has watched refuse -- so it is bracketed
+    /// here at the level that needs no CMake, no staged runtime and no box.
+    mod liteinst_pin_guard {
+        use std::fs;
+
+        use crate::liteinst_runtime_pin_matches;
+
+        /// The guard is inert by design when the build could not read a pin.
+        /// Every case below asserts the *refusal*, so they would all pass
+        /// vacuously in that configuration; skip loudly instead.
+        fn pin_or_skip() -> Option<&'static str> {
+            let pin = env!("HERMIT_REVERIE_PIN");
+            (pin != "unknown").then_some(pin)
+        }
+
+        #[test]
+        fn a_runtime_with_no_recorded_revision_is_refused() {
+            let Some(_) = pin_or_skip() else { return };
+            let dir = tempfile::tempdir().unwrap();
+            let so = dir.path().join("libreverie_liteinst.so");
+            let error = liteinst_runtime_pin_matches(&so).unwrap_err();
+            let text = error.to_string();
+            assert!(
+                text.contains("records no Reverie revision"),
+                "must say the runtime carries no revision, said: {text}"
+            );
+            // The message has to carry the way out, not just the complaint --
+            // staging is release-only and nothing else restages.
+            assert!(
+                text.contains("cargo build --release -p hermit-install"),
+                "must name the restage command, said: {text}"
+            );
+        }
+
+        #[test]
+        fn a_runtime_from_another_revision_is_refused_naming_both() {
+            let Some(pin) = pin_or_skip() else { return };
+            let dir = tempfile::tempdir().unwrap();
+            let so = dir.path().join("libreverie_liteinst.so");
+            let stale = "0".repeat(40);
+            fs::write(dir.path().join("libreverie_liteinst.so.revision"), &stale).unwrap();
+            let text = liteinst_runtime_pin_matches(&so).unwrap_err().to_string();
+            // Naming BOTH is the point: a refusal that names only one revision
+            // cannot tell the reader which side is stale.
+            assert!(
+                text.contains(&stale),
+                "must name the staged revision: {text}"
+            );
+            assert!(text.contains(pin), "must name the binary's pin: {text}");
+        }
+
+        #[test]
+        fn a_matching_runtime_is_accepted() {
+            let Some(pin) = pin_or_skip() else { return };
+            let dir = tempfile::tempdir().unwrap();
+            let so = dir.path().join("libreverie_liteinst.so");
+            // Trailing newline: this is exactly what the build script writes.
+            fs::write(
+                dir.path().join("libreverie_liteinst.so.revision"),
+                format!("{pin}\n"),
+            )
+            .unwrap();
+            assert!(
+                liteinst_runtime_pin_matches(&so).is_ok(),
+                "the guard must not block a correctly staged runtime"
+            );
+        }
+
+        /// ⚠️ THE CALL SITE, NOT JUST THE FUNCTION. The reported defect was that
+        /// replacing the call with `let _ = liteinst_runtime_pin_matches;` left the
+        /// suite green -- so tests that only exercise the function directly would
+        /// not have caught it. This one goes through `validate_liteinst_runtime_library`
+        /// and asserts the PIN diagnosis specifically, because without the guard the
+        /// same input still fails, just with the older "missing required export"
+        /// message. Asserting `is_err()` here would pass either way.
+        #[test]
+        fn the_loader_consults_the_guard_before_anything_else() {
+            let Some(pin) = pin_or_skip() else { return };
+            let dir = tempfile::tempdir().unwrap();
+            let so = dir.path().join("libreverie_liteinst.so");
+            // A file that is not a valid DSO: if the guard is bypassed, the export
+            // check rejects it for an unrelated reason and the test must notice.
+            fs::write(&so, b"not an elf").unwrap();
+            let stale = "0".repeat(40);
+            fs::write(dir.path().join("libreverie_liteinst.so.revision"), &stale).unwrap();
+            let text = crate::validate_liteinst_runtime_library(&so)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                text.contains(&stale) && text.contains(pin),
+                "the loader must refuse on the PIN, naming both revisions, before it \
+                 reaches the export check; said: {text}"
+            );
+        }
+
+        /// `HERMIT_LITEINST_RUNTIME` is caller-supplied, so the marker path has to
+        /// survive a versioned soname. `with_extension("so.revision")` REPLACED the
+        /// final extension and looked for `libreverie_liteinst.so.so.revision`,
+        /// refusing a correctly staged runtime.
+        #[test]
+        fn a_versioned_soname_finds_its_marker() {
+            let Some(pin) = pin_or_skip() else { return };
+            let dir = tempfile::tempdir().unwrap();
+            let so = dir.path().join("libreverie_liteinst.so.1");
+            fs::write(
+                dir.path().join("libreverie_liteinst.so.1.revision"),
+                format!("{pin}\n"),
+            )
+            .unwrap();
+            assert!(
+                liteinst_runtime_pin_matches(&so).is_ok(),
+                "the marker beside a versioned soname must be the one consulted"
+            );
+        }
+    }
+
+    /// The build scripts' pin reader, bracketed against the inputs that
+    /// first-match-wins got wrong. Included rather than imported because the
+    /// reader is build-script code with no library home.
+    mod reverie_pin_reader {
+        include!("../reverie_pin.rs");
+
+        const A: &str = "1111111111111111111111111111111111111111";
+        const B: &str = "2222222222222222222222222222222222222222";
+
+        fn dep(rev: &str) -> String {
+            format!(
+                "reverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{rev}\" }}\n"
+            )
+        }
+
+        #[test]
+        fn a_single_revision_is_read() {
+            assert_eq!(parse_reverie_pin(&dep(A)).as_deref(), Some(A));
+        }
+
+        #[test]
+        fn agreeing_revisions_are_read_once() {
+            let text = format!("{}{}", dep(A), dep(A));
+            assert_eq!(parse_reverie_pin(&text).as_deref(), Some(A));
+        }
+
+        /// A manifest halfway through a bump names two revisions. First-match-wins
+        /// silently returned the first; the canonical rule refuses to resolve it.
+        #[test]
+        fn disagreeing_revisions_are_refused() {
+            let text = format!("{}{}", dep(A), dep(B));
+            assert_eq!(parse_reverie_pin(&text), None);
+        }
+
+        /// The reported reproduction: ONE commented line above the live pin made
+        /// the binary embed the comment's revision, so a correctly staged runtime
+        /// would be refused by a guard naming a revision that was never the pin.
+        #[test]
+        fn a_commented_out_dependency_is_not_the_pin() {
+            let text = format!("# {}{}", dep(B), dep(A));
+            assert_eq!(
+                parse_reverie_pin(&text).as_deref(),
+                Some(A),
+                "a commented-out revision must not win"
+            );
+        }
+
+        #[test]
+        fn a_manifest_naming_no_revision_yields_none() {
+            assert_eq!(parse_reverie_pin("[dependencies]\nlibc = \"0.2\"\n"), None);
+        }
+
+        /// An unparseable Reverie line could be hiding a disagreement, so it makes
+        /// the manifest ambiguous rather than being skipped as absent.
+        #[test]
+        fn an_unparseable_revision_is_ambiguous() {
+            let text = format!(
+                "{}reverie-x = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"beef\" }}\n",
+                dep(A)
+            );
+            assert_eq!(parse_reverie_pin(&text), None);
+        }
     }
 }
