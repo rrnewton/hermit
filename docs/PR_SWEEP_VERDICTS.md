@@ -1806,6 +1806,62 @@ This is check 12's cousin. Check 12 catches a comparison over an empty set —
 agreement asserted about nothing. This catches a comparison over a set that is
 non-empty but uniform: many observations of one case, reported as many cases.
 
+### 20. Counting a marker's TEXT counts the arguments about it, not the marker
+
+⚠️ **A grep for a marker matches every sentence that mentions it** — the request
+asking someone to post one, the review quoting one, the correction explaining why
+one did not bind. Those are discussion *about* the marker. The marker is a
+binding. A count that cannot tell them apart reports the loudest thread as the
+strongest evidence, and threads are loudest exactly where the situation is
+contested.
+
+**Measured 2026-08-25, twice, in unrelated contexts.**
+
+On [hermit#2176](https://github.com/rrnewton/hermit/pull/2176) a lander checked
+whether the codex lane had approved the current head:
+
+```console
+$ grep -ic "APPROVED-AT: codex $HEAD" bodies.txt
+3
+```
+
+Three matches, and the head was one lane from landing. All three were prose
+*requesting* the lane — `**Codex lane: please emit, alone on its own line,
+`APPROVED-AT: codex b3ca4e15…`**` — plus a checklist item repeating it. Exact
+whole-line matches: **0**. Worse, the same pull request carried a codex
+*refusal*, so acting on the count would have solicited an approval from a
+reviewer who had already said no.
+
+The sibling instance is the merge-base symbol rule (check 3): a symbol counted on
+`main` is not evidence of landing if it was already present at the merge base.
+Same defect — a token counted in a context that does not mean what the count is
+being used to mean.
+
+**The check is one word: whole-line.** A binding is a complete line in a fixed
+grammar, so match it as one and compare the count against the loose one:
+
+```console
+grep -cE '^APPROVED-AT: (claude|codex) [0-9a-f]{40}$' bodies.txt   # bindings
+grep -ci 'APPROVED-AT'                                bodies.txt   # mentions
+```
+
+⚠️ **When those two numbers differ, the gap is the finding, not noise.** It is
+where people are arguing about a verdict that does not exist yet. On #2176 the
+gap was 3 versus 0.
+
+Three consequences worth keeping:
+
+- **A quotation is not a retraction and not a re-assertion.** Deciding which
+  requires reading, so a counter must not guess; it reports the whole-line count
+  and the gap, and a human reads the gap.
+- **This applies to absence too.** "Zero refusals" from a loose grep is as
+  unsound as "three approvals" — a refusal written in a variant the pattern does
+  not match is counted as absent, which reads as permission. Absence claims need
+  the stricter instrument, not the looser one.
+- **Say which instrument produced the number.** "2 of 185" means nothing without
+  "whole-line match on raw comment text, not through the parser". A count is a
+  measurement and carries its method or it carries nothing.
+
 ## A guard keyed on a PROXY rejects the safest cases first
 
 ⚠️ **When you enforce a rule, write down the PROPERTY you want, then check whether
