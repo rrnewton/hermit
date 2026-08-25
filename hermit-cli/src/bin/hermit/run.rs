@@ -378,7 +378,8 @@ pub struct RunOpts {
     /// With --verify, write the verification verdict as a single JSON line to
     /// this path: `{"verified":bool,"bitwise_parity":bool,
     /// "verdict":"matched"|"diverged","comparison":{"strictness":
-    /// "stripped"|"canonical","compare_logs":bool,"log_scope":
+    /// "stripped"|"canonical","compare_logs":bool,"compare_io_buffers":bool,
+    /// "log_scope":
     /// "deterministic"|"info"|"full_trace","record_envelope":
     /// "all_records_v1","strip_lines":bool,
     /// "canonicalize_addresses":bool,"full_trace":bool,"exact_remainder":bool,
@@ -403,8 +404,9 @@ pub struct RunOpts {
     /// true only under the `canonical` (`BitwiseInfoV1`) policy — a full-INFO
     /// comparison inside a named canonical record envelope that strips only the
     /// real wall-clock prefix, canonicalizes host addresses to first-appearance
-    /// ordinals, and compares everything else exactly (see --verify-strict) — so
-    /// it cannot be silently weakened to a stripped or opaque filtered compare.
+    /// ordinals, includes syscall output-buffer hashes, and compares everything
+    /// else exactly (see --verify-strict) — so it cannot be silently weakened to
+    /// a stripped, content-blind, or opaque filtered compare.
     #[clap(long, requires = "verify", value_name = "PATH")]
     verify_json: Option<PathBuf>,
 
@@ -3310,7 +3312,6 @@ impl RunOpts {
             );
         }
 
-        let kvm_output_only = self.selected_backend() == Backend::Kvm;
         // Say what was actually established. Buffer hashing is ON BY DEFAULT, so
         // this qualification is now reachable only when the caller has asked for
         // the weaker comparison with `--no-detlog-io-buffers`. With it, the
@@ -3323,9 +3324,7 @@ impl RunOpts {
         // verified" on a run that the same command with hashing enabled
         // reports as diverged. Claiming
         // determinism there was the defect, so the sentence now names its limit.
-        let success_message = if kvm_output_only {
-            "Success: KVM guest output and exit status matched."
-        } else if !self.det_opts.det_config.detlog_io_buffers {
+        let success_message = if !self.det_opts.det_config.detlog_io_buffers {
             // The "Determinism verified" marker is RETAINED verbatim and the
             // qualification appended after it. That is not politeness: ~110
             // files in this repository assert on that exact substring -- Rust
@@ -3368,7 +3367,14 @@ impl RunOpts {
                 } else {
                     LogCompareStrictness::Stripped
                 },
-                compare_logs: !kvm_output_only,
+                // Every backend retains both logs, including KVM. Comparing
+                // them here is what makes `compare_io_buffers=true` truthful:
+                // otherwise the content hashes can differ in the retained
+                // files while an output-only verdict still reports a match.
+                // The comparator turns a truncated/unreadable comparison into
+                // the existing typed no-result outcome rather than silently
+                // accepting it.
+                compare_logs: true,
                 diagnostic_full_trace: self.verify_verbose,
                 compare_io_buffers: self.det_opts.det_config.detlog_io_buffers,
                 keep_logs: self.keep_logs,

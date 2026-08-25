@@ -56,7 +56,7 @@ function assert_native_nondeterminism {
 # `RunOpts::verify_json` and is explicit that a parity ratchet "must key on
 # `bitwise_parity`, NOT `verified`" -- `verified` is true for a stripped match
 # too. `bitwise_parity` is true only under the canonical (`--verify-strict`)
-# policy, and `compared_log_messages` is what makes it falsifiable: a strict
+# policy with syscall output-buffer hashes present, and `compared_log_messages` is what makes it falsifiable: a strict
 # CONFIGURATION is not evidence that the configured comparison had any data.
 #
 # Four outcomes are kept distinct, because collapsing them is how a harness

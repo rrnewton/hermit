@@ -68,6 +68,7 @@ fn assert_matched(report: &serde_json::Value) {
 fn a_verdict_without_buffer_content_does_not_claim_determinism() {
     let (stderr, report) = verify(false);
     assert_matched(&report);
+    assert_eq!(report["bitwise_parity"], false);
     assert_eq!(
         report["comparison"]["compare_io_buffers"], false,
         "the envelope must record that buffer content did not participate, so a consumer can \
@@ -92,6 +93,7 @@ fn a_verdict_with_buffer_content_may_claim_determinism() {
     let (stderr, report) = verify(true);
     assert_matched(&report);
     assert_eq!(report["comparison"]["compare_io_buffers"], true);
+    assert_eq!(report["bitwise_parity"], true);
     assert!(
         stderr.contains("Determinism verified"),
         "with buffer content compared the strong claim is earned and should be \

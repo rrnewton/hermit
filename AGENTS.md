@@ -193,10 +193,11 @@ for example, "e9patch preprocessing with the ptrace backend" rather than
 
 A feature is **done** only when the exact test meets its declared assurance
 level across **all in-scope backends**. A pass on one backend is evidence for
-that backend only, not a project-wide completion claim. KVM currently compares
-only exit status/stdout/stderr during `--verify`; it cannot claim full L2 INFO
-parity until internal log comparison exists. Report that gap explicitly instead
-of weakening the definition of done.
+that backend only, not a project-wide completion claim. KVM `--verify` compares
+the retained internal logs as well as exit status/stdout/stderr. Claim L2 for a
+KVM cell only when its strict typed report says `bitwise_parity: true` (which
+requires syscall output-buffer hashes) and names nonzero compared INFO-message counts; backend capability is not evidence that a
+particular guest passed.
 
 Start investigations in these locations:
 
@@ -243,8 +244,9 @@ wall-clock prefix, ordinalizes host addresses while preserving identity/order/
 aliasing, and compares the full remainder exactly. Virtual time,
 retired-branch counts, syscall values, sizes, flags, and other numeric payloads
 must not be stripped. State this canonical envelope rather than calling the raw
-log files literally byte-identical. KVM's output-only fallback reports
-`bitwise_parity: false` and is not L2.
+log files literally byte-identical. KVM uses this same retained-log comparison;
+an unreadable or truncated comparison must refuse with `verdict: no_result`
+rather than report a match.
 
 ## Debugging
 

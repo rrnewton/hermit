@@ -173,9 +173,9 @@ pub struct ComparisonSpec {
     /// The strictness label the comparison ran under.
     pub strictness: LogCompareStrictness,
     /// Whether the internal event stream was compared at all. When
-    /// `false` (e.g. KVM concurrent mode) only stdout/stderr/exit status were
-    /// compared and the strictness fields describe a log comparison that did not
-    /// run — a consumer must not read such a verdict as bitwise log parity.
+    /// `false` only stdout/stderr/exit status were compared and the strictness
+    /// fields describe a log comparison that did not run — a consumer must not
+    /// read such a verdict as bitwise log parity.
     pub compare_logs: bool,
     /// Whether the compared records contain the CONTENT of syscall output
     /// buffers, not merely the syscalls' return values.
@@ -358,21 +358,17 @@ impl ComparisonSpec {
     ///   caller-defined predicate cannot qualify;
     /// - no ad hoc ignore/skip filter dropped any line or event class
     ///   (`!ignore_lines && !skip_commit && !skip_detlog`);
+    /// - syscall output-buffer content hashes were present in the records
+    ///   ([`Self::compare_io_buffers`]);
     /// - the internal log stream was actually compared, not skipped for an
     ///   output-only fallback ([`Self::compare_logs`]).
     ///
     /// A consumer asking for parity must reject `Matched` under every weaker
-    /// comparison; this predicate is that single acceptance rule.
-    /// ⚠️ EVERY CLAUSE BELOW IS ABOUT THE COMPARATOR, NOT ABOUT WHAT THE
-    /// RECORDS CONTAIN. This answers "was the comparison maximally strict over
-    /// the records it was given", which is not the same question as "are the
-    /// two runs bitwise identical". A divergence in a syscall's output buffer is
-    /// absent from the records entirely unless [`Self::compare_io_buffers`] is
-    /// set, so this can return `true` for a pair of runs that differ in guest
-    /// memory. Check `compare_io_buffers` alongside this when the distinction
-    /// matters.
+    /// comparison or observation envelope; this predicate is that single
+    /// acceptance rule.
     pub fn is_bitwise_parity(&self) -> bool {
-        self.compare_logs
+        self.compare_io_buffers
+            && self.compare_logs
             && self.full_trace
             && matches!(
                 self.log_scope,
@@ -560,7 +556,7 @@ impl VerificationOutcome {
 /// output-only fallback is not a bitwise-parity claim. Such a consumer reads
 /// [`Self::bitwise_parity`] (or checks the `comparison` fields directly), which
 /// is `true` only when the verdict rests on a full-INFO, named canonical record
-/// envelope and unstripped log comparison.
+/// envelope, unstripped log comparison, and syscall output-buffer hashes.
 #[derive(Debug, Clone, Serialize)]
 pub struct VerificationReport {
     /// True iff the two runs matched (the verdict as a boolean).
@@ -569,8 +565,8 @@ pub struct VerificationReport {
     /// satisfies the bitwise INFO-parity contract (see
     /// [`ComparisonSpec::is_bitwise_parity`]). A determinism / record-replay
     /// ratchet keys on this single boolean; it can never be silently weakened to
-    /// a stripped or filtered compare because a stripped/filtered match sets it
-    /// `false`.
+    /// a stripped or filtered compare, or one missing syscall output-buffer
+    /// hashes, because every such match sets it `false`.
     pub bitwise_parity: bool,
     /// The verdict as a stable string ("matched" / "diverged").
     pub verdict: Verdict,
@@ -883,7 +879,7 @@ fn compare_two_runs_with_unsupported_scan(
     // The log comparator declined to produce a verdict (a truncated input).
     let mut comparison_refused = false;
     // None until the log comparison actually runs; stays None on the
-    // output-only (KVM concurrent) fallback so the report can distinguish
+    // output-only fallback so the report can distinguish
     // "compared nothing" from "compared and matched".
     let mut compared_log_messages: Option<ComparedLogCounts> = None;
     let mut first_divergent_scheduler_turn = None;
@@ -1012,7 +1008,7 @@ fn compare_two_runs_with_unsupported_scan(
             }
         } else {
             eprintln!(
-                ":: KVM concurrent mode: comparing guest output and exit status; internal syscall trace order is not deterministic"
+                ":: Comparing guest output and exit status only; internal logs were not compared"
             );
         }
 
@@ -1281,7 +1277,7 @@ mod tests {
                 strictness,
                 compare_logs: true,
                 diagnostic_full_trace: false,
-                compare_io_buffers: false,
+                compare_io_buffers: true,
                 keep_logs: false,
                 record_envelope,
             },
@@ -2342,6 +2338,15 @@ mod tests {
         assert!(
             !stripped.is_bitwise_parity(),
             "a stripped comparison normalizes away the parity-relevant data"
+        );
+
+        let missing_io_buffers = ComparisonSpec {
+            compare_io_buffers: false,
+            ..full
+        };
+        assert!(
+            !missing_io_buffers.is_bitwise_parity(),
+            "a comparison without syscall output-buffer content is not bitwise parity"
         );
 
         let output_only = ComparisonSpec {
