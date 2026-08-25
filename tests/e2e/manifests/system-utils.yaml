@@ -65,7 +65,6 @@ test:
       custom:
         ci: true
         args:
-          - --base-env=minimal
           - --no-virtualize-cpuid
           - --max-timeslice=disabled
         assert:
@@ -1219,6 +1218,8 @@ test:
     timeout_seconds: 90
     occasional: false
     program: tests/e2e/system-utils/procfs-sanitized-paths.sh
+    prepared_fixture_args:
+      - procfs-sanitized-paths
     observation:
       status: true
       stdout: true
@@ -1289,7 +1290,7 @@ test:
       - /usr/bin/du
       - -sb
       - --
-      - tests/e2e
+      - ./tests/e2e
     observation:
       status: true
       stdout: true
@@ -1350,7 +1351,7 @@ test:
     occasional: false
     direct:
       - /usr/bin/find
-      - tests/e2e
+      - ./tests/e2e
       - -mindepth
       - '1'
       - -maxdepth

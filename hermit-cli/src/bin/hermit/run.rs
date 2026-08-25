@@ -207,9 +207,9 @@ pub struct RunOpts {
     #[clap(long, value_name = "RCBS")]
     skid_margin: Option<u64>,
 
-    /// Mount a file or directory. This uses the same syntax as Docker's `--mount` option. The
+    /// Mount a file or directory. This uses the same syntax as Docker's `--mount` option. A bind
     /// source must exist on the host. For simple bind mounts into guest `/tmp`, use `--bind`.
-    #[clap(long, value_name = "path")]
+    #[clap(long, value_parser = parse_mount, value_name = "path")]
     mount: Vec<Mount>,
 
     /// Bind-mount a host file or directory into guest `/tmp`. Use `SOURCE` to preserve its path or
@@ -511,6 +511,45 @@ pub(super) fn apply_base_environment(
     command.env("ASAN_OPTIONS", "detect_leaks=0");
     command.env("LSAN_OPTIONS", "detect_leaks=0");
     Ok(())
+}
+
+fn parse_mount(src: &str) -> Result<Mount, String> {
+    let mount_type = src.split(',').rev().find_map(|item| {
+        let (key, value) = item.trim().split_once('=')?;
+        (key == "type").then_some(value)
+    });
+    if mount_type != Some("bind")
+        && src.split(',').any(|item| {
+            item.trim()
+                .split_once('=')
+                .is_some_and(|(key, _)| key == "bind-propagation")
+        })
+    {
+        return Err("bind-propagation is supported only for bind mounts".into());
+    }
+    let parsed = Mount::from_str(src).map_err(|error| error.to_string())?;
+    let Some(mount_type) = mount_type else {
+        return Ok(parsed);
+    };
+    if mount_type == "bind" {
+        return Ok(parsed);
+    }
+
+    // reverie-process's Docker-syntax parser applies the default bind
+    // propagation flags to every mount. For a source-less filesystem mount,
+    // combining MS_REC|MS_PRIVATE with the initial mount turns the operation
+    // into a propagation change and never creates the requested filesystem.
+    // Reconstruct non-bind mounts without those bind-only flags.
+    let target = parsed.get_target().to_path_buf();
+    let source = parsed.get_source().map(Path::to_path_buf);
+    let mut mount = Mount::new(target).fstype(mount_type);
+    if let Some(source) = source {
+        mount = mount.source(source);
+    }
+    if src.split(',').any(|item| item.trim() == "readonly") {
+        mount = mount.readonly();
+    }
+    Ok(mount)
 }
 
 #[derive(Debug, Default, Clone, Copy, Parser, Eq, PartialEq)]
@@ -1002,6 +1041,57 @@ fn backend_values_parse_and_round_trip() {
 }
 
 #[test]
+fn guest_filesystem_paths_must_be_absolute() {
+    let relative_workdir = RunOpts::parse_from(["fakehermit", "--workdir=test", "/bin/true"]);
+    assert!(
+        relative_workdir
+            .validate_mount_sources()
+            .unwrap_err()
+            .to_string()
+            .contains("--workdir must be absolute")
+    );
+
+    let relative_mount =
+        RunOpts::parse_from(["fakehermit", "--mount=type=tmpfs,target=test", "/bin/true"]);
+    assert!(
+        relative_mount
+            .validate_mount_sources()
+            .unwrap_err()
+            .to_string()
+            .contains("--mount target must be absolute")
+    );
+}
+
+#[test]
+fn source_less_filesystem_mounts_do_not_inherit_bind_propagation_flags() {
+    let options =
+        RunOpts::parse_from(["fakehermit", "--mount=type=tmpfs,target=/test", "/bin/true"]);
+    assert_eq!(options.mount, vec![Mount::tmpfs("/test")]);
+
+    let bind = RunOpts::parse_from([
+        "fakehermit",
+        "--mount=type=bind,source=/tmp,target=/test,readonly",
+        "/bin/true",
+    ]);
+    assert_eq!(
+        bind.mount,
+        vec![Mount::bind("/tmp", "/test").readonly().rprivate()]
+    );
+
+    let invalid = RunOpts::try_parse_from([
+        "fakehermit",
+        "--mount=type=tmpfs,target=/test,bind-propagation=rprivate",
+        "/bin/true",
+    ])
+    .unwrap_err();
+    assert!(
+        invalid
+            .to_string()
+            .contains("bind-propagation is supported only for bind mounts")
+    );
+}
+
+#[test]
 fn e9patch_preserves_executable_identity_and_uses_ptrace_runtime() {
     let mut ro = RunOpts::parse_from(["fakehermit", "--backend", "e9patch", "/bin/echo", "hello"]);
     ro.e9patch_overlay = Some(E9patchOverlay {
@@ -1126,6 +1216,46 @@ fn dbt_rejects_mount_and_workdir_options_it_cannot_apply() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("dbt backend cannot apply --mount"));
+
+    let mut with_tmp =
+        RunOpts::parse_from(["fakehermit", "--backend", "dbt", "--tmp", "/test", "/bin/true"]);
+    let error = with_tmp
+        .validate_args_with_perf_support(true)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("dbt backend cannot apply --mount"));
+}
+
+#[test]
+fn minimal_base_environment_is_exact_before_guest_startup() {
+    let options = RunOpts::parse_from([
+        "fakehermit",
+        "--backend=kvm",
+        "--base-env=minimal",
+        "/bin/true",
+    ]);
+    let environment = options.guest_command().unwrap().get_captured_envs();
+    assert_eq!(
+        environment
+            .keys()
+            .map(|key| key.to_string_lossy().into_owned())
+            .collect::<std::collections::BTreeSet<String>>(),
+        std::collections::BTreeSet::from([
+            "ASAN_OPTIONS".to_string(),
+            "HOME".to_string(),
+            "HOSTNAME".to_string(),
+            "LSAN_OPTIONS".to_string(),
+            "PATH".to_string(),
+        ])
+    );
+    assert_eq!(
+        environment.get(OsStr::new("HOME")),
+        Some(&OsStr::new("/root").to_os_string())
+    );
+    assert_eq!(
+        environment.get(OsStr::new("HOSTNAME")),
+        Some(&OsStr::new("hermetic-container.local").to_os_string())
+    );
 }
 
 #[test]
@@ -2396,10 +2526,13 @@ impl RunOpts {
             );
         }
         if backend == Backend::Dbt
-            && (!self.mount.is_empty() || !self.bind.is_empty() || self.workdir.is_some())
+            && (!self.mount.is_empty()
+                || !self.bind.is_empty()
+                || self.workdir.is_some()
+                || self.tmp.is_some())
         {
             anyhow::bail!(
-                "the dbt backend cannot apply --mount, --bind, or --workdir because its \
+                "the dbt backend cannot apply --mount, --bind, --workdir, or --tmp because its \
                  DynamoRIO adapter does not enter the guest mount namespace"
             );
         }
@@ -2638,8 +2771,17 @@ impl RunOpts {
     }
 
     fn validate_mount_sources(&self) -> Result<(), Error> {
+        if let Some(workdir) = &self.workdir
+            && !Path::new(workdir).is_absolute()
+        {
+            anyhow::bail!("--workdir must be absolute: {workdir}");
+        }
         for bind in &self.bind {
             let source = Path::new(OsStr::from_bytes(bind.source.to_bytes()));
+            let target = Path::new(OsStr::from_bytes(bind.target.to_bytes()));
+            if !target.is_absolute() {
+                anyhow::bail!("--bind target must be absolute: {}", target.display());
+            }
             if !source.exists() {
                 anyhow::bail!(
                     "--bind source {} does not exist. Create it or correct the source path before \
@@ -2649,6 +2791,12 @@ impl RunOpts {
             }
         }
         for mount in &self.mount {
+            if !mount.get_target().is_absolute() {
+                anyhow::bail!(
+                    "--mount target must be absolute: {}",
+                    mount.get_target().display()
+                );
+            }
             if let Some(source) = mount.get_source()
                 && !source.exists()
             {

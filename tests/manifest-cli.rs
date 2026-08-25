@@ -35,6 +35,7 @@
 //! [dependencies]
 //! serde = { version = "1", features = ["derive"] }
 //! serde_yaml = "0.9"
+//! toml = "0.8"
 //! ```
 
 #[path = "../scripts/lib/rust_script_prelude.rs"]
@@ -53,6 +54,7 @@ use std::process::ExitCode;
 use manifest_value::Value;
 
 const MANIFEST_SCHEMA: i64 = 2;
+const GUEST_FIXTURE_ROOT: &str = "/tmp/hermit-e2e-fixtures";
 const RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=\"$cell/tmp\" E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 const HERMIT_RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=/tmp/hermit-e2e E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 const HERMIT_GUEST_ENV_ARGS: &str = "--env LC_ALL=C --env TZ=UTC --env HOME=\"$cell/home\" --env XDG_CONFIG_HOME=\"$cell/xdg-config\" --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=\"$cell/fixtures\"";
@@ -80,6 +82,21 @@ fn shell_quote(value: &str) -> String {
         return value.to_owned();
     }
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn render_guest_argument(value: &str) -> String {
+    let Some(relative) = value.strip_prefix("./") else {
+        return shell_quote(value);
+    };
+    if Path::new(relative)
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        fail(format!(
+            "explicit checkout argument must not escape the repository: {value}"
+        ));
+    }
+    format!("\"$(pwd)\"/{}", shell_quote(relative))
 }
 
 fn slug(value: &str) -> String {
@@ -145,7 +162,7 @@ fn test_id(test: &Value, bucket: &str) -> String {
 
 /// Build the shell setup prefix (compile/prepare the guest) and return the
 /// guest invocation string. Identical contract to `manifest-to-commands.rs`.
-fn setup_prefix(test: &Value, id: &str) -> (String, String) {
+fn setup_prefix(test: &Value, id: &str) -> (String, String, String) {
     let cell = format!("ignored/e2e-commands/work/{}", slug(id));
     let mut commands = vec![
         format!("cell={}", shell_quote(&cell)),
@@ -160,19 +177,24 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
 
     let program = test.get("program").and_then(Value::as_str);
     let direct = test.get("direct");
-    let guest = match (program, direct) {
+    let (host_guest, lockdown_guest) = match (program, direct) {
         (Some(_), Some(_)) => fail(format!("{id}: set only one of `program` and `direct`")),
         (None, None) => fail(format!("{id}: missing `program` or `direct`")),
-        (None, Some(Value::String(command))) => format!("sh -c {}", shell_quote(command)),
+        (None, Some(Value::String(command))) => {
+            let guest = format!("sh -c {}", shell_quote(command));
+            (guest.clone(), guest)
+        }
         (None, Some(Value::Array(_))) => {
             let argv = string_array(direct, &format!("{id}.direct"));
             if argv.is_empty() {
                 fail(format!("{id}: direct argv must not be empty"));
             }
-            argv.iter()
-                .map(|argument| shell_quote(argument))
-                .collect::<Vec<_>>()
-                .join(" ")
+            let host = argv.iter().map(|argument| shell_quote(argument)).collect::<Vec<_>>();
+            let lockdown = argv
+                .iter()
+                .map(|argument| render_guest_argument(argument))
+                .collect::<Vec<_>>();
+            (host.join(" "), lockdown.join(" "))
         }
         (None, Some(_)) => fail(format!(
             "{id}: direct must be a shell command string or an argv array"
@@ -181,7 +203,10 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
             Some("sh") => {
                 let script = shell_quote(program);
                 commands.push(format!("{RUN_ENV} {script} --prepare"));
-                format!("{script} --run")
+                (
+                    format!("{script} --run"),
+                    format!("\"$(pwd)\"/{script} --run"),
+                )
             }
             Some("c") => {
                 let build = test.get("build").and_then(Value::as_table);
@@ -212,7 +237,10 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
                     .collect::<Vec<_>>()
                     .join(" ");
                 commands.push(format!("${{CC:-cc}} {args} -o \"$cell/guest\""));
-                "\"$cell/guest\"".to_owned()
+                (
+                    "\"$cell/guest\"".to_owned(),
+                    "\"$(pwd)/$cell/guest\"".to_owned(),
+                )
             }
             Some("rs") => {
                 let build = test.get("build").and_then(Value::as_table);
@@ -230,13 +258,130 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
                     .collect::<Vec<_>>()
                     .join(" ");
                 commands.push(format!("${{RUSTC:-rustc}} {args} -o \"$cell/guest\""));
-                "\"$cell/guest\"".to_owned()
+                (
+                    "\"$cell/guest\"".to_owned(),
+                    "\"$(pwd)/$cell/guest\"".to_owned(),
+                )
             }
             other => fail(format!("{id}: unsupported program extension {other:?}")),
         },
     };
 
-    (commands.join(" && "), guest)
+    (commands.join(" && "), host_guest, lockdown_guest)
+}
+
+fn prepared_fixture_paths(test: &Value, id: &str, native: bool) -> Vec<String> {
+    let fixtures = string_array(
+        test.get("prepared_fixture_args"),
+        &format!("{id}.prepared_fixture_args"),
+    );
+    if !fixtures.is_empty()
+        && !test
+            .get("program")
+            .and_then(Value::as_str)
+            .is_some_and(|program| program.ends_with(".sh"))
+    {
+        fail(format!(
+            "{id}: prepared_fixture_args requires a shell program with a --prepare phase"
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    let mut rendered = Vec::with_capacity(fixtures.len());
+    for path in fixtures {
+        let path = Path::new(&path);
+        if path.as_os_str().is_empty()
+            || path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            fail(format!(
+                "{id}.prepared_fixture_args must contain relative paths without `..`"
+            ));
+        }
+        if !seen.insert(path.to_path_buf()) {
+            fail(format!(
+                "{id}: duplicate prepared fixture argument: {}",
+                path.display()
+            ));
+        }
+        rendered.push(if native {
+            format!(
+                "\"$cell/fixtures\"/{}",
+                shell_quote(&path.to_string_lossy())
+            )
+        } else {
+            shell_quote(&format!("{GUEST_FIXTURE_ROOT}/{}", path.display()))
+        });
+    }
+    rendered
+}
+
+fn guest_with_prepared_fixtures(guest: &str, fixtures: &[String]) -> String {
+    if fixtures.is_empty() {
+        guest.to_owned()
+    } else {
+        format!("{guest} {}", fixtures.join(" "))
+    }
+}
+
+fn mode_guest_args(spec: &Value, mode: &str, backend: &str, id: &str) -> Vec<String> {
+    let Some(by_backend) = spec.get("guest_args") else {
+        return Vec::new();
+    };
+    let by_backend = by_backend
+        .as_table()
+        .unwrap_or_else(|| fail(format!("{id}.modes.{mode}.guest_args must be a table")));
+    string_array(
+        by_backend.get(backend),
+        &format!("{id}.modes.{mode}.guest_args.{backend}"),
+    )
+}
+
+fn ci_selected(spec: &Value, mode: &str, backend: &str, id: &str) -> bool {
+    let Some(ci) = spec.get("ci") else {
+        return false;
+    };
+    if let Some(selected) = ci.as_bool() {
+        return selected;
+    }
+    let by_backend = ci
+        .as_table()
+        .unwrap_or_else(|| fail(format!("{id}.modes.{mode}.ci must be a boolean or table")));
+    by_backend
+        .get(backend)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn cell_required(spec: &Value, mode: &str, backend: &str, id: &str) -> bool {
+    mode_backends(spec, mode, id)
+        .iter()
+        .any(|enabled| enabled == backend)
+        && ci_selected(spec, mode, backend, id)
+}
+
+fn guest_with_args(guest: &str, guest_args: &[String], resolve_checkout: bool) -> String {
+    if guest_args.is_empty() {
+        return guest.to_owned();
+    }
+    let rendered = guest_args
+        .iter()
+        .map(|argument| {
+            if resolve_checkout {
+                render_guest_argument(argument)
+            } else {
+                shell_quote(argument)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{guest} {rendered}")
 }
 
 /// Assemble the Hermit invocation for one (mode, backend) cell. `log` overrides
@@ -253,11 +398,25 @@ fn hermit_command(
     verify_bitwise_parity: bool,
     log: &str,
     extra: &[String],
+    required: bool,
+    prepared_fixtures: bool,
     guest: &str,
 ) -> String {
     let _lane = lane;
     let profile: Vec<String> = Vec::new();
     let be = shell_quote(backend);
+    let lockdown = if !required {
+        ""
+    } else if prepared_fixtures {
+        " --mount=type=bind,source=\"$(pwd)/$cell/fixtures\",target=/tmp/hermit-e2e-fixtures,readonly --mount=type=tmpfs,target=/test --workdir=/test"
+    } else {
+        " --mount=type=tmpfs,target=/test --workdir=/test"
+    };
+    let legacy_guest_env = if required {
+        String::new()
+    } else {
+        format!(" {HERMIT_GUEST_ENV_ARGS}")
+    };
     let run_extra_joined = {
         let mut all: Vec<String> = profile;
         all.extend(extra.iter().map(|x| shell_quote(x)));
@@ -284,18 +443,25 @@ fn hermit_command(
         "verify" => {
             let _verify_bitwise_parity = verify_bitwise_parity;
             format!(
-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --base-env=minimal --backend {be} --strict $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\"{run_extra_joined} -- {guest}"
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --base-env=minimal --backend {be} --strict $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\"{run_extra_joined}{legacy_guest_env}{lockdown} -- {guest}"
             )
         }
-        "replay" => format!(
-            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log {log} --backend {be} record start --strict $record_verify_strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout {timeout} {HERMIT_GUEST_ENV_ARGS}{extra_joined} -- {guest}"
-        ),
+        "replay" => {
+            if required && prepared_fixtures {
+                fail("prepared_fixture_args are not supported by record/replay");
+            }
+            let base_env = if required { " --base-env=minimal" } else { "" };
+            let workdir = if required { " --workdir=/test" } else { "" };
+            format!(
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log {log} --backend {be} record start{base_env} --strict $record_verify_strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout {timeout}{workdir}{legacy_guest_env}{extra_joined} -- {guest}"
+            )
+        }
         "chaos" => {
             let seed = seed.unwrap_or_else(|| {
                 fail("internal error: chaos command construction requires a declared seed")
             });
             format!(
-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --base-env=minimal --backend {be} --strict $run_verify_strict --verify --verify-allow=both --verify-json \"$cell/captures/verify-seed-{seed}.json\" --chaos --sched-heuristic=random --seed={seed}{run_extra_joined} -- {guest}"
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --base-env=minimal --backend {be} --strict $run_verify_strict --verify --verify-allow=both --verify-json \"$cell/captures/verify-seed-{seed}.json\" --chaos --sched-heuristic=random --seed={seed}{run_extra_joined}{legacy_guest_env}{lockdown} -- {guest}"
             )
         }
         "custom" => {
@@ -307,8 +473,9 @@ fn hermit_command(
                 .collect::<Vec<_>>()
                 .join(" ");
             let sep = if margs.is_empty() { "" } else { " " };
+            let base_env = if required { " --base-env=minimal" } else { "" };
             format!(
-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --backend {be}{sep}{margs} -- {guest}"
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run{base_env} --backend {be}{sep}{margs}{lockdown} -- {guest}"
             )
         }
         other => fail(format!("unsupported mode `{other}`")),
@@ -376,10 +543,7 @@ fn load_manifests(root: &Path) -> Manifests {
     Manifests { tests }
 }
 
-fn modes_table<'a>(
-    test: &'a Value,
-    id: &str,
-) -> &'a std::collections::BTreeMap<String, Value> {
+fn modes_table<'a>(test: &'a Value, id: &str) -> &'a std::collections::BTreeMap<String, Value> {
     test.get("modes")
         .and_then(Value::as_table)
         .unwrap_or_else(|| fail(format!("{id}: missing `modes`")))
@@ -638,20 +802,25 @@ fn resolve_cell(test: &Value, id: &str, args: &Args) -> (String, String, String,
 
 fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, String) {
     let (mode, backend, lane, timeout) = resolve_cell(test, id, args);
-    let (setup, guest) = setup_prefix(test, id);
+    let (setup, host_guest, lockdown_guest) = setup_prefix(test, id);
+    let native_prepared = prepared_fixture_paths(test, id, true);
+    let guest_prepared = prepared_fixture_paths(test, id, false);
+    let has_prepared_fixtures = !guest_prepared.is_empty();
+    let modes = modes_table(test, id);
+    let spec = &modes[&mode];
+    let required = mode != "naked" && cell_required(spec, &mode, &backend, id);
+    let guest_args = mode_guest_args(spec, &mode, &backend, id);
     let log = args
         .flag("log")
         .map(str::to_owned)
         .unwrap_or_else(|| default_log(&mode).to_owned());
     let mode_args = if mode == "custom" {
-        let modes = modes_table(test, id);
-        string_array(modes[&mode].get("args"), &format!("{id}.modes.custom.args"))
+        string_array(spec.get("args"), &format!("{id}.modes.custom.args"))
     } else {
         Vec::new()
     };
     let verify_bitwise_parity = if mode == "verify" {
-        modes_table(test, id)[&mode]
-            .get("assert")
+        spec.get("assert")
             .and_then(Value::as_table)
             .and_then(|assert| assert.get("bitwise_parity"))
             .and_then(Value::as_bool)
@@ -660,14 +829,21 @@ fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, S
         false
     };
     let seed = if mode == "chaos" {
-        let modes = modes_table(test, id);
-        Some(first_chaos_seed(&modes[&mode], id).unwrap_or_else(|error| fail(error)))
+        Some(first_chaos_seed(spec, id).unwrap_or_else(|error| fail(error)))
     } else {
         None
     };
     let run = if mode == "naked" {
+        let guest = guest_with_prepared_fixtures(&host_guest, &native_prepared);
+        let guest = guest_with_args(&guest, &guest_args, false);
         format!("timeout --kill-after=10s {timeout}s {RUN_ENV} {guest}")
     } else {
+        let guest = if required {
+            guest_with_prepared_fixtures(&lockdown_guest, &guest_prepared)
+        } else {
+            guest_with_prepared_fixtures(&host_guest, &native_prepared)
+        };
+        let guest = guest_with_args(&guest, &guest_args, required);
         hermit_command(
             &mode,
             &backend,
@@ -678,6 +854,8 @@ fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, S
             verify_bitwise_parity,
             &log,
             &args.passthrough,
+            required,
+            has_prepared_fixtures,
             &guest,
         )
     };
@@ -696,12 +874,16 @@ fn self_test() -> ExitCode {
         false,
         "info",
         &[],
+        true,
+        false,
         "guest",
     );
     assert!(replay.contains("--data-dir \"$cell/recording\" --record-timeout 60"));
     assert!(replay.contains("--strict $record_verify_strict --verify"));
     assert!(replay.contains("--verify-json \"$cell/captures/verify.json\""));
-    assert!(replay.contains(HERMIT_GUEST_ENV_ARGS));
+    assert!(replay.contains("record start --base-env=minimal"));
+    assert!(replay.contains("--workdir=/test -- guest"));
+    assert!(!replay.contains("--env"));
     assert!(!replay.contains("--no-virtualize-cpuid"));
 
     let chaos = hermit_command(
@@ -714,6 +896,8 @@ fn self_test() -> ExitCode {
         false,
         "info",
         &[],
+        true,
+        false,
         "guest",
     );
     assert!(chaos.contains("run --base-env=minimal"));
@@ -723,6 +907,7 @@ fn self_test() -> ExitCode {
     assert!(chaos.contains("--log=info"));
     assert!(!chaos.contains("--no-virtualize-cpuid"));
     assert!(!chaos.contains("--max-timeslice=disabled"));
+    assert!(chaos.contains("--mount=type=tmpfs,target=/test --workdir=/test"));
     let seeded_chaos: Value = "seeds: [7, 9]".parse().unwrap();
     let no_seed_chaos = Value::Table(Default::default());
     assert_eq!(first_chaos_seed(&seeded_chaos, "fixture").unwrap(), 7);
@@ -738,13 +923,16 @@ fn self_test() -> ExitCode {
         "portable",
         60,
         None,
-        &["--base-env=minimal".to_owned()],
+        &["--summary".to_owned()],
         false,
         "info",
         &[],
+        true,
+        false,
         "guest",
     );
-    assert!(custom.contains("run --backend ptrace --base-env=minimal -- guest"));
+    assert!(custom.contains("run --base-env=minimal --backend ptrace --summary"));
+    assert!(custom.contains("--mount=type=tmpfs,target=/test --workdir=/test -- guest"));
     assert!(!custom.contains("--strict"));
     assert!(!custom.contains("--no-virtualize-cpuid"));
 
@@ -758,6 +946,8 @@ fn self_test() -> ExitCode {
         true,
         "info",
         &[],
+        true,
+        false,
         "guest",
     );
     assert!(verify.contains("run --base-env=minimal"));
@@ -766,6 +956,7 @@ fn self_test() -> ExitCode {
     ));
     assert!(!verify.contains("--no-virtualize-cpuid"));
     assert!(!verify.contains("--max-timeslice=disabled"));
+    assert!(verify.contains("--mount=type=tmpfs,target=/test --workdir=/test"));
     let weak_verify = hermit_command(
         "verify",
         "ptrace",
@@ -776,10 +967,68 @@ fn self_test() -> ExitCode {
         false,
         "info",
         &[],
+        true,
+        false,
         "guest",
     );
     assert!(weak_verify.contains("--verify --verify-json \"$cell/captures/verify.json\""));
     assert!(weak_verify.contains("--strict $run_verify_strict --verify"));
+    let manual_verify = hermit_command(
+        "verify",
+        "liteinst",
+        "portable",
+        60,
+        None,
+        &[],
+        false,
+        "info",
+        &[],
+        false,
+        false,
+        "./examples/example.py",
+    );
+    assert!(manual_verify.contains("--env LC_ALL=C"));
+    assert!(!manual_verify.contains("--workdir=/test"));
+    assert!(!manual_verify.contains("target=/test"));
+    assert!(manual_verify.ends_with("-- ./examples/example.py"));
+
+    let selection: Value = r#"
+ci:
+  ptrace: true
+  liteinst: false
+backends_enabled: [ptrace, liteinst]
+"#
+    .parse()
+    .unwrap();
+    assert!(cell_required(
+        &selection,
+        "verify",
+        "ptrace",
+        "fixture"
+    ));
+    assert!(!cell_required(
+        &selection,
+        "verify",
+        "liteinst",
+        "fixture"
+    ));
+    let uniform: Value = "ci: true\nbackends_enabled: [ptrace]".parse().unwrap();
+    assert!(!cell_required(&uniform, "verify", "kvm", "fixture"));
+    assert_eq!(render_guest_argument("./README.md"), "\"$(pwd)\"/README.md");
+    assert_eq!(render_guest_argument("README.md"), "README.md");
+    let prepared: Value = r#"
+program: tests/e2e/prepared.sh
+prepared_fixture_args: [fork-tree, nested/pipe-chain]
+"#
+    .parse()
+    .unwrap();
+    assert_eq!(
+        prepared_fixture_paths(&prepared, "fixture", false),
+        vec![
+            "/tmp/hermit-e2e-fixtures/fork-tree",
+            "/tmp/hermit-e2e-fixtures/nested/pipe-chain",
+        ]
+    );
     println!("manifest-cli self-test: PASS");
     ExitCode::SUCCESS
 }

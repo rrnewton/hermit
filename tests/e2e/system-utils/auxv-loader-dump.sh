@@ -22,6 +22,7 @@ set -euo pipefail
 case ${1:-} in
     --prepare) exit 0 ;;
     --run)
+        E2E_TMPDIR=${E2E_TMPDIR:-.}
         # /bin/true is the smallest real dynamically-linked binary; the work
         # under test is the loader's, not the program's.
         work="${E2E_TMPDIR:-/tmp}"

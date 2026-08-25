@@ -9,7 +9,7 @@ set -euo pipefail
 case ${1:-} in
     --prepare) exit 0 ;;
     --run)
-        work="${E2E_TMPDIR:-/tmp}/archive"
+        work="${E2E_TMPDIR:-.}/archive"
         rm -rf "$work"
         mkdir -p "$work/input" "$work/output"
         printf 'alpha\nbeta\ngamma\n' >"$work/input/payload.txt"

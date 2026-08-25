@@ -60,6 +60,19 @@ command. Program extensions select the runner:
 - `.c`: compile implicitly with `cc` plus optional `build.cflags`;
 - `.rs`: compile implicitly with `rustc` plus optional `build.rustflags`.
 
+A shell program whose `--prepare` phase builds executables for `--run` declares
+their fixture-relative paths in `prepared_fixture_args`. The harness exposes
+that one per-cell fixture directory read-only at
+`/tmp/hermit-e2e-fixtures` and passes fixed absolute guest paths; absolute paths,
+`..`, duplicates, and non-shell use are rejected.
+
+Every required non-native invocation uses `--base-env=minimal` and begins in
+`/test`. Ordinary `run` modes mount a fresh tmpfs there for each invocation;
+the two halves of `--verify` therefore cannot exchange files. Tests may use the
+empty cwd as scratch space, but must receive intentional inputs through an
+explicit argument rather than inherited `PWD`, `OLDPWD`, `HOME`, or checkout
+cwd state.
+
 `MODE` is always the outer axis. Every entry declares exactly these five
 tables: `verify`, `chaos`, `replay`, `naked`, and `custom`. Each table has a
 `backends_enabled` list and a `backends_disabled` table. The two must form a
