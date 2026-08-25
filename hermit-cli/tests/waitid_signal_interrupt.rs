@@ -216,7 +216,16 @@ fn run_bounded_with_limits(
         .expect("failed to reopen guest stdout file");
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-    if trace_retries {
+    if args.contains(&"--wait4-live-sibling-signal-blocked") {
+        // The regression is an internal ERESTARTSYS followed by a transparent
+        // kernel restart, so guest exit alone cannot distinguish old from new.
+        // INFO exposes each guest-visible wait4 entry while the narrower TRACE
+        // filter retains the bounded retry diagnostics.
+        command.env(
+            "RUST_LOG",
+            "detcore=info,detcore::syscalls::threads=trace",
+        );
+    } else if trace_retries {
         command.env("RUST_LOG", "detcore::syscalls::threads=trace");
     } else {
         command.arg("--log=info");
@@ -535,6 +544,53 @@ fn waitid_keeps_a_guest_blocked_sibling_signal_pending() {
     assert!(
         run.retries <= limits.max_waitid_retries,
         "blocked-signal waitid performed {} retries",
+        run.retries,
+    );
+}
+
+#[test]
+fn wait4_keeps_a_guest_blocked_sibling_signal_pending() {
+    let limits = WatchdogLimits {
+        max_waitid_retries: 4_000,
+        backstop: Duration::from_secs(8),
+        max_stderr_events_per_tick: 64,
+    };
+    let run = run_bounded_with_limits(
+        &["--wait4-live-sibling-signal-blocked"],
+        true,
+        None,
+        limits,
+    );
+    assert!(
+        run.status.success(),
+        "hermit exited with {}\nguest stdout:\n{}\nhermit stderr:\n{}",
+        run.status,
+        run.stdout,
+        run.stderr,
+    );
+    assert!(
+        run.stdout.contains(
+            "wait4-live-sibling-blocked rc-ok=1 errno=0 handler=0 pid-match=1 exited=1 status=29 mask-preserved=1 sender-live=1"
+        ),
+        "a guest-blocked sibling signal incorrectly interrupted wait4 or changed the mask\n\
+         guest stdout:\n{}",
+        run.stdout,
+    );
+    assert!(
+        run.stdout.contains("wait4-live-sibling-done"),
+        "the guest did not clean up both live children\nguest stdout:\n{}",
+        run.stdout,
+    );
+    let wait4_entries = run.stderr.matches("inbound syscall: wait4(").count();
+    assert_eq!(
+        wait4_entries, 3,
+        "the blocked signal restarted wait4 internally instead of remaining pending; \
+         expected target wait plus two cleanup waits, saw {wait4_entries}\nhermit stderr:\n{}",
+        run.stderr,
+    );
+    assert!(
+        run.retries <= limits.max_waitid_retries,
+        "blocked-signal wait4 performed {} retries",
         run.retries,
     );
 }
