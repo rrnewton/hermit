@@ -49,14 +49,24 @@ pub(crate) fn report<S>(selected_backend: Backend, request: BackendStatsRequest,
 where
     S: BackendStatsSource,
 {
-    let Some(snapshot) = request.collect(source) else {
-        return;
-    };
+    // ⚠️ HOISTED ABOVE THE COLLECTION GATE ON PURPOSE, AND IT MUST STAY THERE.
+    // This asks "is the stats source wired to the backend we actually selected?"
+    // -- a wiring invariant that is true or false regardless of whether anyone
+    // asked for the record. Below the `else { return; }` it only ran when the
+    // level probe happened to be on, so a LOG-LEVEL CHANGE COULD DISABLE A
+    // CORRECTNESS CHECK: it did not start failing, it stopped executing, and a
+    // check that stops executing reports nothing. `BACKEND_NAME` is an
+    // associated const, so this needs no snapshot and costs nothing to keep
+    // unconditional. Reporting and checking are two different questions; only
+    // the first belongs behind the gate.
     assert_eq!(
         selected_backend.as_str(),
         S::Snapshot::BACKEND_NAME,
         "backend statistics source does not match selected backend"
     );
+    let Some(snapshot) = request.collect(source) else {
+        return;
+    };
     tracing::debug!(
         target: TARGET,
         backend = %selected_backend.as_str(),
@@ -147,5 +157,74 @@ mod tests {
         };
 
         report(Backend::Liteinst, BackendStatsRequest::ENABLED, &source);
+    }
+
+    /// The check must READ the source's own `BACKEND_NAME`, not compare against a
+    /// hardcoded `"ptrace"`.
+    ///
+    /// ⚠️ WHY A SECOND SOURCE EXISTS PURELY FOR THIS. Every other test in this
+    /// module uses `CountingSource`, whose `BACKEND_NAME` is `"ptrace"` — so
+    /// replacing the right-hand side of the assert with the literal `"ptrace"`
+    /// leaves all of them green. Review found exactly that mutation surviving.
+    /// A matched NON-ptrace pair is the only shape that distinguishes "reads the
+    /// source's declared name" from "happens to equal ptrace".
+    struct LiteinstLikeSource;
+
+    struct LiteinstLikeSnapshot;
+
+    impl fmt::Display for LiteinstLikeSnapshot {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("liteinst-like")
+        }
+    }
+
+    impl BackendStatsSnapshot for LiteinstLikeSnapshot {
+        const BACKEND_NAME: &'static str = "liteinst";
+    }
+
+    impl BackendStatsSource for LiteinstLikeSource {
+        type Snapshot = LiteinstLikeSnapshot;
+
+        fn backend_stats(&self) -> Self::Snapshot {
+            LiteinstLikeSnapshot
+        }
+    }
+
+    #[test]
+    fn report_accepts_a_matched_non_ptrace_source() {
+        // Both gate states, because the hoist means the assert now runs in both.
+        report(
+            Backend::Liteinst,
+            BackendStatsRequest::DISABLED,
+            &LiteinstLikeSource,
+        );
+        report(
+            Backend::Liteinst,
+            BackendStatsRequest::ENABLED,
+            &LiteinstLikeSource,
+        );
+    }
+
+    /// The wiring check must fire even when NOBODY ASKED FOR THE RECORD.
+    ///
+    /// ⚠️ THIS IS THE REGRESSION IT GUARDS, and it is a whole class. The assert
+    /// used to sit BELOW `request.collect(..)`'s early return, so it ran only
+    /// when the level probe was on. #2587 moved that probe from INFO to DEBUG
+    /// for an unrelated and correct reason — keeping harness output out of the
+    /// parity envelope — and the check silently stopped executing across the CI
+    /// corpus, which injects `--log info` and never `--log debug`. It did not
+    /// fail. It stopped running, and a check that stops running reports nothing.
+    ///
+    /// The sibling test above passes `ENABLED`, so it could not have caught
+    /// this: it exercises the path where the gate is already open. This one
+    /// passes `DISABLED`, which is what CI actually does.
+    #[test]
+    #[should_panic(expected = "backend statistics source does not match selected backend")]
+    fn report_checks_backend_wiring_even_when_stats_are_not_collected() {
+        let source = CountingSource {
+            snapshots: Cell::new(0),
+        };
+
+        report(Backend::Liteinst, BackendStatsRequest::DISABLED, &source);
     }
 }
