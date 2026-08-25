@@ -924,6 +924,45 @@ def verify_tier_from_json(path: Path) -> dict[str, str] | None:
         and comparison.get("compare_logs") is True
         and positive_count
     )
+    # ⚠️ A REFUSAL NOBODY CAN SEE IS NOT A CHECK. Silently degrading the tier is
+    # correct arithmetic and useless evidence: the operator reads `guest`, which
+    # is also what an honest output-only run reports, and never learns that a
+    # record CLAIMED parity and was rejected. Those two are the same row and
+    # different facts.
+    #
+    # So a record that does NOT claim parity and is not bitwise stays silent --
+    # that is the ordinary case and saying anything would be noise. A record that
+    # DOES claim parity and is refused is named, with the conjunct that refused
+    # it, because that record is either a producer defect or a contradiction and
+    # somebody has to be told which.
+    #
+    # This is the shape of the defect it detects: the KVM comparator reported
+    # `matched` while `compare_logs` was false -- a verdict disagreeing with its
+    # own evidence. Degrading that to `guest` without comment would file a
+    # self-contradictory record under the same label as a correct one.
+    if record.get("bitwise_parity") and not bitwise:
+        why = []
+        if record.get("bitwise_parity") is not True:
+            why.append(f"bitwise_parity is {record.get('bitwise_parity')!r}, not a JSON true")
+        if record.get("verified") is not True:
+            why.append(f"verified is {record.get('verified')!r}")
+        if record.get("verdict") != "matched":
+            why.append(f"verdict is {record.get('verdict')!r}, not 'matched'")
+        if strictness != "canonical":
+            why.append(f"comparator is {strictness or 'unset'!r}, not canonical")
+        if comparison.get("compare_logs") is not True:
+            why.append(
+                f"compare_logs is {comparison.get('compare_logs')!r} -- parity is "
+                "claimed over a log stream that was not compared"
+            )
+        if not positive_count:
+            why.append(f"compared counts are {left!r}|{right!r}, not equal positive integers")
+        print(
+            f"run_matrix: REFUSED the bitwise tier for {path}: the record claims "
+            f"bitwise_parity but {'; '.join(why)}.",
+            file=sys.stderr,
+        )
+
     if not record.get("verified"):
         tier = "gap"
     elif bitwise:
