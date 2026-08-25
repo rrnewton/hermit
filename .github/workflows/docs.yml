@@ -35,10 +35,11 @@ jobs:
       run: sudo apt-get install -y libunwind-dev liblzma-dev
     - name: Build documentation
       run: cargo doc --workspace --no-deps
-    - name: Add Hermetic Infra landing page
+    - name: Add Sentinel dashboard landing page
       run: |
         install -m 0644 docs/site/index.html target/doc/index.html
         install -m 0644 docs/site/site.css target/doc/site.css
+        install -m 0644 docs/site/site.js target/doc/site.js
     - name: Deploy to GitHub Pages
       # Only publish from the canonical branch, not from manual dispatch on a
       # feature branch.
