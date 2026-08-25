@@ -106,6 +106,7 @@ use dagrun::scheduler::monotonic_now_ns;
 use dagrun::scheduler::STEP_STARTED_MONOTONIC_NS_ENV;
 
 use validate_plan::CompatMode;
+use validate_plan::CompatDisposition;
 
 /// Current receipt schema. Missing evidence is represented by explicit nulls;
 /// a new writer must never downgrade itself into the schema-4 grandfather.
@@ -899,6 +900,131 @@ fn strict_flag_missing_from(argv: &[String]) -> bool {
 /// on every invocation (validate.sh:308); here they are a `--self-test` subcommand
 /// so the cost is not paid on the hot path.
 fn self_test() -> Result<(), String> {
+    // ---- known-fail-closed disposition, as a pure decision table ----
+    //
+    // The property under test is NOT "the listed rows get mentioned". It is that mentioning
+    // them did not quietly excuse them. Each row below pins BOTH the message class and the
+    // blocking verdict, so a future edit cannot improve the wording into an exemption.
+    {
+        use validate_plan::CompatDisposition as D;
+        use validate_plan::classify_compat_outcome as classify;
+        // (mode, ok, listed_failclosed, listed_diagnostic, expected, expected_blocking)
+        let cases: &[(CompatMode, bool, bool, bool, D, bool)] = &[
+            // PortableStrict: the whole point of this change. A listed failure is REPORTED and
+            // STILL BLOCKS; a listed pass is reported as a stale expectation.
+            (CompatMode::PortableStrict, false, true, false, D::KnownFailClosedBlocking, true),
+            (CompatMode::PortableStrict, true, true, false, D::PassedButListedFailClosed, false),
+            // ...and an UNLISTED failure is unaffected.
+            (CompatMode::PortableStrict, false, false, false, D::Blocking, true),
+            // Bounded portable diagnostics keep their existing nonblocking treatment.
+            (CompatMode::PortableStrict, false, false, true, D::PortableDiagnostic, false),
+            // Strict keeps its historical exemption, and only Strict has it.
+            (CompatMode::Strict, false, true, false, D::KnownFailClosedExempt, false),
+            (CompatMode::Strict, true, true, false, D::PassedButListedFailClosed, false),
+            (CompatMode::Strict, false, false, false, D::Blocking, true),
+            // No other mode consults either table: a failure blocks whatever the tables say.
+            (CompatMode::Sabre, false, true, false, D::Blocking, true),
+            (CompatMode::Sabre, false, false, true, D::Blocking, true),
+            (CompatMode::Sabre, true, true, false, D::Passed, false),
+            (CompatMode::E9patch, false, true, false, D::Blocking, true),
+            (CompatMode::Rr, false, true, false, D::Blocking, true),
+        ];
+        for (mode, ok, listed, diag, want, want_blocking) in cases.iter().copied() {
+            let got = classify(mode, ok, listed, diag);
+            if got != want {
+                return Err(format!(
+                    "compat disposition for mode={mode:?} ok={ok} listed_failclosed={listed} \
+                     listed_diagnostic={diag}: expected {want:?}, got {got:?}"
+                ));
+            }
+            if got.is_blocking() != want_blocking {
+                return Err(format!(
+                    "compat disposition {got:?} (mode={mode:?} ok={ok} listed={listed}) must \
+                     {} the run, but is_blocking() said {}",
+                    if want_blocking { "BLOCK" } else { "not block" },
+                    got.is_blocking()
+                ));
+            }
+        }
+    }
+
+    // ---- the REAL summary consumer, against a PLANTED table ----
+    //
+    // Bound to the shipped `compat_summary_with_tables`, not a copy of its logic, so the two
+    // cannot drift. The table is planted rather than real because the shipped
+    // `known_failclosed()` holds ONE row today, which cannot express "one listed row blocks
+    // while another listed row is exempt" in a single run -- and the answer to that is a
+    // planted table in the bracket, never an invented row in production.
+    {
+        let planted_known: BTreeMap<&'static str, &'static str> = BTreeMap::from([
+            ("listed_fails", "planted: refused by fail-closed --strict"),
+            ("listed_passes", "planted: expected to be refused"),
+        ]);
+        let planted_diag: BTreeMap<&'static str, &'static str> =
+            BTreeMap::from([("bounded_diag", "planted: bounded portable diagnostic")]);
+        let row = |label: &str, ok: bool| StepOutcome {
+            tag: format!("compat.{label}"),
+            ok,
+            duration_s: 0.0,
+            summary: String::new(),
+            executed_tests: None,
+            filtered_tests: None,
+            returncode: Some(if ok { 0 } else { 1 }),
+            reason: String::new(),
+            aborted: false,
+        };
+        let outcomes = vec![
+            row("listed_fails", false),
+            row("listed_passes", true),
+            row("bounded_diag", false),
+            row("unlisted_fails", false),
+            row("plain_passes", true),
+        ];
+        let (_, _, blocking) = compat_summary_with_tables(
+            CompatMode::PortableStrict,
+            &outcomes,
+            &planted_known,
+            &planted_diag,
+        );
+        // THE LOAD-BEARING ASSERTION: a listed failure is still in the blocking set. If a future
+        // change makes PortableStrict exempt listed rows the way Strict does, this fails.
+        if !blocking.iter().any(|l| l == "listed_fails") {
+            return Err(format!(
+                "PortableStrict dropped a listed known-fail-closed row from the blocking set, \
+                 which is the exemption this change exists to avoid: blocking={blocking:?}"
+            ));
+        }
+        if !blocking.iter().any(|l| l == "unlisted_fails") {
+            return Err(format!(
+                "PortableStrict dropped an UNLISTED failure from the blocking set: \
+                 blocking={blocking:?}"
+            ));
+        }
+        if blocking.iter().any(|l| l == "bounded_diag") {
+            return Err(format!(
+                "a bounded portable diagnostic became blocking, changing prior policy: \
+                 blocking={blocking:?}"
+            ));
+        }
+        if blocking.iter().any(|l| l == "listed_passes" || l == "plain_passes") {
+            return Err(format!("a PASSING row was reported as blocking: blocking={blocking:?}"));
+        }
+        // And the same planted table under Strict must exempt the listed failure, so the
+        // bracket also pins that the two modes still differ.
+        let (_, _, strict_blocking) = compat_summary_with_tables(
+            CompatMode::Strict,
+            &outcomes,
+            &planted_known,
+            &planted_diag,
+        );
+        if strict_blocking.iter().any(|l| l == "listed_fails") {
+            return Err(format!(
+                "Strict lost its historical exemption for a listed row: {strict_blocking:?}"
+            ));
+        }
+    }
+
+
     // Strict-execution bracket for the legacy below-L2 compatibility modes.
     // `--strict` must be a Hermit option before the first guest `--`; these
     // modes still use lossy `--verify`, so this does not call them L2. The
@@ -4102,30 +4228,113 @@ fn print_cost_table(outcomes: &[StepOutcome], skipped: &[String]) {
 /// Per-program compatibility summary, built from typed node outcomes rather than
 /// a scraped TSV. Reproduces `print_compatibility_summary`'s category table.
 fn print_compat_summary(mode: CompatMode, outcomes: &[StepOutcome]) -> (usize, usize, Vec<String>) {
-    let known = validate_corpus::known_failclosed();
-    let diag = validate_corpus::portable_diagnostic();
+    compat_summary_with_tables(
+        mode,
+        outcomes,
+        &validate_corpus::known_failclosed(),
+        &validate_corpus::portable_diagnostic(),
+    )
+}
+
+/// The real summary body, with its two policy tables passed in.
+///
+/// Production calls it through [`print_compat_summary`] with the REAL tables, so nothing is
+/// weakened; the tables are parameters purely so a bracket can exercise this exact code against
+/// a planted table. That matters here because the shipped `known_failclosed()` currently holds a
+/// single row, which is not enough to distinguish "listed and blocking" from "listed and
+/// exempt" in one run -- and the fix for that must not be to add a fake row to production.
+fn compat_summary_with_tables(
+    mode: CompatMode,
+    outcomes: &[StepOutcome],
+    known: &BTreeMap<&'static str, &'static str>,
+    diag: &BTreeMap<&'static str, &'static str>,
+) -> (usize, usize, Vec<String>) {
     let mut per_cat: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
     let mut passed = 0usize;
     let mut measured = 0usize;
     let mut blocking_failures: Vec<String> = Vec::new();
+    let mut measured_labels: BTreeSet<String> = BTreeSet::new();
     for o in outcomes {
         let Some(label) = o.tag.strip_prefix("compat.") else { continue };
         let cat = validate_corpus::category_of(label);
         let e = per_cat.entry(cat).or_insert((0, 0));
         e.1 += 1;
         measured += 1;
+        measured_labels.insert(label.to_string());
         if o.ok {
             e.0 += 1;
             passed += 1;
-            if mode == CompatMode::Strict && known.contains_key(label) {
-                println!("  WARN {label} unexpectedly passed fail-closed --strict; drop it from the known-failure table");
+        }
+        // ONE decision, read twice: once for what to print and once for whether the row
+        // blocks. Before this the two were separate arms of the same `if`, which is how a
+        // reporting change can silently become an exemption.
+        // `display_name()` deliberately renders Strict and PortableStrict identically, but these
+        // two modes treat a listed row in OPPOSITE ways, so the message must distinguish them or
+        // the reader cannot tell an exemption from a blocking report.
+        let mode_label = match mode {
+            CompatMode::Strict => "--strict",
+            CompatMode::PortableStrict => "--portable-strict",
+            other => other.display_name(),
+        };
+        let disposition = validate_plan::classify_compat_outcome(
+            mode,
+            o.ok,
+            known.contains_key(label),
+            diag.contains_key(label),
+        );
+        match disposition {
+            CompatDisposition::Passed => {}
+            CompatDisposition::PassedButListedFailClosed => {
+                println!(
+                    "  WARN {label} passed but is listed as known fail-closed under {} \
+                     ({}); the EXPECTATION is STALE -- drop it from the known-failure table",
+                    mode_label,
+                    known[label]
+                );
             }
-        } else if mode == CompatMode::Strict && known.contains_key(label) {
-            println!("  WARN {label} known fail-closed under --strict ({}; nonblocking)", known[label]);
-        } else if mode == CompatMode::PortableStrict && diag.contains_key(label) {
-            println!("  WARN {label} is a bounded portable diagnostic: {}", diag[label]);
-        } else {
+            CompatDisposition::KnownFailClosedExempt => {
+                println!(
+                    "  WARN {label} known fail-closed under --strict ({}; nonblocking)",
+                    known[label]
+                );
+            }
+            CompatDisposition::KnownFailClosedBlocking => {
+                // Reported AND still blocking. Naming the reason is not excusing the failure:
+                // the row is pushed onto `blocking_failures` below exactly as an unlisted
+                // failure would be.
+                println!(
+                    "  FAIL {label} known fail-closed under {} ({}); STILL BLOCKING -- \
+                     this mode does not exempt listed rows",
+                    mode_label,
+                    known[label]
+                );
+            }
+            CompatDisposition::PortableDiagnostic => {
+                println!("  WARN {label} is a bounded portable diagnostic: {}", diag[label]);
+            }
+            CompatDisposition::Blocking => {}
+        }
+        if disposition.is_blocking() {
             blocking_failures.push(label.to_string());
+        }
+    }
+    // AUDIT: a listed row the selected corpus never measured. Such a row is silently carried
+    // forever -- it can neither fail (nothing ran it) nor be reported stale (it never passed),
+    // so the table grows entries no run can retire. Naming them is reporting only; it changes
+    // no verdict.
+    if matches!(mode, CompatMode::Strict | CompatMode::PortableStrict) {
+        let unmeasured: Vec<&str> = known
+            .keys()
+            .copied()
+            .filter(|label| !measured_labels.contains(*label))
+            .collect();
+        if !unmeasured.is_empty() {
+            println!(
+                "  WARN {} known fail-closed row(s) not measured by this corpus, so no run can \
+                 confirm or retire them: {}",
+                unmeasured.len(),
+                unmeasured.join(", ")
+            );
         }
     }
     println!("\nCOMPATIBILITY SUMMARY ({measured} measured programs, mode {})", mode.display_name());
