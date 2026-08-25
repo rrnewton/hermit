@@ -395,12 +395,32 @@ where
     }
     let dir = direction(call).as_str();
     let name = call.name();
+    // NAME THE DESCRIPTOR THE BYTES CAME THROUGH.
+    //
+    // A content divergence is classified by WHAT the differing bytes are, and
+    // the descriptor is the cheapest available answer to that. Without it,
+    // identifying one real case cost reading backward five syscalls through a
+    // 5.8 MB log to find `socket(16, 524291, 0) = Ok(11)` and recognising
+    // AF_NETLINK by hand; with it, "this is a netlink dump" is on the line that
+    // diverged.
+    //
+    // Safe to add to a byte-for-byte compared surface because the value is
+    // ALREADY compared and already stable: the `[syscall]` lines carry these
+    // same fds, and across two verify pairs measured 2026-08-25 every
+    // fd-bearing syscall line matched with zero differing lines. `-` covers the
+    // calls with no single fd argument (getrandom, getcwd, readlink), which is
+    // a fact about the call rather than a missing lookup.
+    let fd = match crate::syscalls::helpers::get_fd(*call) {
+        Some(fd) => fd.to_string(),
+        None => "-".to_string(),
+    };
     for extent in extents(guest, call, ret)? {
         crate::detlog!(
-            "[iobuf][dtid {}] {} {} {:#x}+{}->{}",
+            "[iobuf][dtid {}] {} {} fd={} {:#x}+{}->{}",
             dettid,
             name,
             dir,
+            fd,
             extent.addr,
             extent.len,
             compute_hash_range(guest, extent.addr, extent.addr + extent.len)?

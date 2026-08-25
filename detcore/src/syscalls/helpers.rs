@@ -591,7 +591,7 @@ pub fn syscall_targets_internal_fd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
 ///
 /// It does not cover system calls with multiple fd arguments, with pointers to heap
 /// structures that contain fds.
-fn get_fd(s: Syscall) -> Option<i32> {
+pub(crate) fn get_fd(s: Syscall) -> Option<i32> {
     match s {
         Syscall::Recvfrom(s) => Some(s.fd()),
         Syscall::Recvmsg(s) => Some(s.sockfd()),
