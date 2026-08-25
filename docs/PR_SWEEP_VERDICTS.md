@@ -114,6 +114,59 @@ branch. It explains a whole population of "genuinely lost" rows that were not
 lost at all, and it is why the checks below anchor on content and behaviour
 rather than on identity.
 
+## Before you claim: search the pull request, not only the task graph
+
+Every check below decides what a change IS. This one decides whether it is
+YOURS to decide, and getting it wrong costs two agents instead of one.
+
+**Search for ownership signals on the pull request number itself, recent-first,
+REGARDLESS OF TASK STATUS.** Filtering the task graph for a live task is not
+enough, and it is wrong often enough to be dangerous:
+
+```console
+# 1. the obvious search — necessary, and NOT sufficient
+sqlite3 "$TG_DB_PATH" "SELECT local_id, status, owner FROM tasks
+   WHERE (title LIKE '%<N>%' OR description LIKE '%<N>%') AND status != 'CLOSED'"
+
+# 2. the search that actually fires
+sqlite3 "$TG_DB_PATH" "SELECT created_at, task_id, content FROM task_notes
+   WHERE content LIKE '%#<N>%' OR content LIKE '%pull/<N>%' OR content LIKE '%PR <N>%'
+   ORDER BY created_at DESC LIMIT 5"
+```
+
+⚠️ **Match a pull-request REFERENCE, not a bare number.** `LIKE '%<N>%'` also
+matches the digits inside a 40-hex SHA: searching for `2332` hits
+`de3cac715bb85d799d1e659ab9a1622332e7c0c9`, which mentions no pull request at
+all. Measured on the same corpus, the bare predicate returned 32 hits where the
+reference predicate returned 26, and 36 where it returned 26 — a fifth to a
+quarter of them spurious. A claim check that cries wolf gets skipped, which
+returns you to the task filter that was insufficient in the first place.
+
+Measured on 2026-08-25: **four consecutive claims where search 2 caught what
+search 1 missed.** Three of them — hermit#2547, hermit#2546 and hermit#2460 —
+were reported FREE by the task filter and all three were already held. The
+filter was not wrong by its own rule; no live task referenced those numbers. The
+ownership lived in a NOTE, and twice in a note on a task that was **already
+closed**.
+
+hermit#2547 is the sharp one: it was mid-collision between two agents, and the
+holder's note opened "STOP BEFORE IMPLEMENTING". A third claimant would have
+made it three. That single note was the only place the collision was visible.
+
+Two corollaries, both paid for:
+
+- **A closed task is not a released claim.** Work is routinely finished,
+  recorded and closed while the pull request stays open on purpose. A closed
+  task plus an open pull request means READ THE LAST NOTE, not "free".
+- **Claim on the pull request's OWN drain task, and re-read after claiming.**
+  A claim posted on a neighbouring task is invisible to the next agent's search,
+  which is how the duplicates happened. Create the row's own task, claim it,
+  then run both searches again before touching the head.
+
+If both searches are clean and you still find the row held, say so — a claim
+that had nowhere to be recorded is a defect in the recording path, not a
+collision you caused.
+
 ## The checks, in order
 
 ### 1. Content, anchored at the pull request's OWN merge base
