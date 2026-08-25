@@ -1363,9 +1363,9 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
 /// landed.
 ///
 /// ⚠️ HOW MUCH THIS IS WORTH, STATED HONESTLY. The mismatched pair is real, but
-/// **no git available here rejects one.** Measured 2026-08-25 on devbig014, with
-/// a positive control confirming the overrides were honoured (`zzz.probe=HIT`
-/// present in `config --list`):
+/// **no git available here rejects one.** Measured 2026-08-25 on the project's
+/// primary dev host, with a positive control confirming the overrides were
+/// honoured (`zzz.probe=HIT` present in `config --list`):
 ///
 /// | condition | git 2.52.0 | git 2.53.0-Meta |
 /// | --- | --- | --- |
@@ -3956,7 +3956,7 @@ mod tests {
     /// shelling out to git saw it in 83 of 600 invocations.
     ///
     /// ⚠️ WHAT THAT PARTIAL STATE DOES **NOT** DO, RE-MEASURED 2026-08-25 ON
-    /// devbig014: it does not make git fail. Neither git on this host rejects a
+    /// THE PRIMARY DEV HOST: it does not make git fail. Neither git there rejects a
     /// count with no key -- both exit 0 and ignore the surplus. An earlier
     /// revision of this comment said such a child "dies with `error: missing
     /// config key GIT_CONFIG_KEY_0`, exit 128", and that is not reproducible
