@@ -2558,9 +2558,31 @@ mod tests {
     #[test]
     fn the_tmpfs_explanation_is_withheld_where_it_does_not_apply() {
         let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
+        // ⚠️ A CONSTANT ABSOLUTE PATH, NOT ONE READ FROM THE ENVIRONMENT. The only
+        // property this arm needs is "outside /tmp", and a literal that is outside
+        // /tmp by construction supplies it without asking the runner anything.
+        //
+        // The earlier form wrote a developer-specific home path, which made
+        // `scripts/check-portable-paths.sh` red on main -- correctly: that gate
+        // rejects such a path anywhere in a tracked build or run file, tests and
+        // COMMENTS included, so spelling one out even to explain this would trip
+        // it. Replacing it by reading $HOME then made the test depend on the
+        // runner instead: measured by `agent(codex-rev-2641)`, HOME unset, empty,
+        // relative and /tmp-rooted gave three different fixtures and one failure.
+        // A unit test that consults the environment is answering a question about
+        // the environment.
+        //
+        // ⚠️ AND NO GUARD IS NEEDED HERE, WHICH IS THE POINT OF USING A CONSTANT.
+        // The $HOME form carried `assert!(!outside_path.starts_with("/tmp"))` to
+        // stop a /tmp-rooted HOME making this vacuous. That assertion could never
+        // fire: the `!outside.contains("tmpfs")` check below sits ABOVE it in
+        // source order and panics first in exactly that case. It was decorative,
+        // and an assertion over a compile-time constant would be too, so there is
+        // none. The fixture cannot drift into /tmp because nothing computes it.
+        let outside_path = std::path::Path::new("/nonexistent-home/wt");
         let outside = format!(
             "{}",
-            super::kvm_cwd_resolution_error(std::path::Path::new("/home/u/wt"), &not_found)
+            super::kvm_cwd_resolution_error(outside_path, &not_found)
         );
         assert!(!outside.contains("tmpfs"), "not a /tmp path: {outside}");
 
