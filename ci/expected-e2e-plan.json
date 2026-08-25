@@ -1556,41 +1556,6 @@
     },
     {
       "backend": "ptrace",
-      "category": "determinism-stress",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "determinism-stress/order-violation"
-    },
-    {
-      "backend": "ptrace",
-      "category": "determinism-stress",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "determinism-stress/process-chains"
-    },
-    {
-      "backend": "ptrace",
-      "category": "determinism-stress",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "determinism-stress/thread-contention"
-    },
-    {
-      "backend": "ptrace",
-      "category": "determinism-stress",
-      "lane": "portable",
-      "mode": "chaos",
-      "test": "determinism-stress/thread-interleaving"
-    },
-    {
-      "backend": "ptrace",
-      "category": "determinism-stress",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "determinism-stress/thread-output"
-    },
-    {
-      "backend": "ptrace",
       "category": "determinism-stress-c",
       "lane": "portable",
       "mode": "verify",
@@ -1637,6 +1602,41 @@
       "lane": "portable",
       "mode": "verify",
       "test": "determinism-stress-c/thread-contention"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress/order-violation"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress/process-chains"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress/thread-contention"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "chaos",
+      "test": "determinism-stress/thread-interleaving"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress/thread-output"
     },
     {
       "backend": "ptrace",
@@ -1847,6 +1847,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "system-utils/mktemp-name"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/nscd-neutralised"
     },
     {
       "backend": "ptrace",

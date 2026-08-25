@@ -54211,6 +54211,166 @@
     {
       "lane": "portable",
       "category": "system-utils",
+      "test": "system-utils/nscd-neutralised",
+      "mode": "chaos",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/nscd-neutralised",
+      "mode": "chaos",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/nscd-neutralised",
+      "mode": "chaos",
+      "backend": "liteinst",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/nscd-neutralised",
+      "mode": "chaos",
+      "backend": "ptrace",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/nscd-neutralised",
+      "mode": "chaos",
+      "backend": "sabre",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/nscd-neutralised",
+      "mode": "naked",
+      "backend": "native",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/nscd-neutralised",
+      "mode": "replay",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/nscd-neutralised",
+      "mode": "replay",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/nscd-neutralised",
+      "mode": "replay",
+      "backend": "liteinst",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/nscd-neutralised",
+      "mode": "replay",
+      "backend": "ptrace",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/nscd-neutralised",
+      "mode": "replay",
+      "backend": "sabre",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/nscd-neutralised",
+      "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/nscd-neutralised",
+      "mode": "verify",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/nscd-neutralised",
+      "mode": "verify",
+      "backend": "liteinst",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/nscd-neutralised",
+      "mode": "verify",
+      "backend": "ptrace",
+      "enabled": true,
+      "status": "green",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/nscd-neutralised",
+      "mode": "verify",
+      "backend": "sabre",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
       "test": "system-utils/openssl-enc",
       "mode": "chaos",
       "backend": "dbt",
