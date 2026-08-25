@@ -122,8 +122,8 @@ fi
 # while this layer declines with 2 reports the SAME condition as two different
 # things depending on which guard fired first. Both are "could not determine",
 # which is what EX_TEMPFAIL means to scripts/validate.rs.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != b0c3cfe4c0797445dedda93774db552edf96f62b ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to calibrated Reverie b0c3cfe4c0797445dedda93774db552edf96f62b (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a16e3c466a15c3746a5ef23a76d1f74e11aba935 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to calibrated Reverie a16e3c466a15c3746a5ef23a76d1f74e11aba935 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
