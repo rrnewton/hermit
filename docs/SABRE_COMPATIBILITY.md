@@ -293,7 +293,7 @@ Validate manifest policy and run the blocking SaBRe cells:
 
 ```bash
 target/debug/test-harness validate
-target/debug/test-harness run --lane portable --backend sabre --ci-only
+./ci/run-with-ephemeral-test-root.sh -- target/debug/test-harness run --lane portable --backend sabre --ci-only
 ```
 
 Run a manual enabled cell with its exact ID:

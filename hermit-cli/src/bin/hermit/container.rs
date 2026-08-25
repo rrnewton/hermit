@@ -143,6 +143,17 @@ pub(super) fn apply_affinity(container: &mut Container, pin_threads: bool) {
     }
 }
 
+/// Mount operations that must lead every newly-created mount namespace.
+/// Keeping them as typed values lets tests assert the executable ordering
+/// contract without scanning source text.
+pub(super) fn mount_namespace_prelude(include_proc: bool) -> Vec<Mount> {
+    let mut mounts = vec![Mount::new("/").rprivate()];
+    if include_proc {
+        mounts.push(Mount::proc());
+    }
+    mounts
+}
+
 pub fn default_container(pin_threads: bool) -> Container {
     let mut container = Container::new();
     container
@@ -150,7 +161,10 @@ pub fn default_container(pin_threads: bool) -> Container {
         .map_root()
         .hostname("hermetic-container.local")
         .domainname("local")
-        .mount(Mount::proc());
+        // Mount propagation is inherited across CLONE_NEWNS. The typed
+        // prelude makes the root recursively private before proc, identity, or
+        // caller mounts so a shared host `/` cannot receive guest mount events.
+        .mounts(mount_namespace_prelude(true));
 
     apply_affinity(&mut container, pin_threads);
     container
@@ -183,7 +197,8 @@ pub(super) fn image_container(
         .unshare(Namespace::PID)
         .map_root()
         .hostname("hermetic-container.local")
-        .domainname("local");
+        .domainname("local")
+        .mounts(mount_namespace_prelude(false));
 
     // The cache is a deterministic input, not a writable container layer. Bind
     // it onto itself and remount it read-only so a guest cannot poison later
@@ -654,5 +669,15 @@ mod tests {
             assert!(allowed.contains(&selected), "selected CPU {selected}");
         }
         assert_eq!(choose_affinity_core(&[]), None);
+    }
+
+    #[test]
+    fn mount_namespace_is_made_private_before_other_mounts() {
+        let without_proc = mount_namespace_prelude(false);
+        assert_eq!(without_proc, vec![Mount::new("/").rprivate()]);
+
+        let with_proc = mount_namespace_prelude(true);
+        assert_eq!(with_proc[0], Mount::new("/").rprivate());
+        assert_eq!(with_proc[1], Mount::proc());
     }
 }

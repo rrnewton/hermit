@@ -7,12 +7,13 @@
 
 set -euo pipefail
 
-ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)"
-SOURCE="$ROOT_DIR/tests/e2e/system-utils/procfs_sanitized_paths.c"
-
 compile_probe() {
     local output=$1
-    cc -std=c11 -O2 -g -Wall -Wextra -Werror "$SOURCE" -o "$output"
+    local root_dir
+    local source
+    root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)"
+    source="$root_dir/tests/e2e/system-utils/procfs_sanitized_paths.c"
+    cc -std=c11 -O2 -g -Wall -Wextra -Werror "$source" -o "$output"
 }
 
 populate_fixture() {
@@ -86,10 +87,14 @@ case ${1:-} in
         compile_probe "$E2E_FIXTURE_DIR/procfs-sanitized-paths"
         ;;
     --run)
-        exec "$E2E_FIXTURE_DIR/procfs-sanitized-paths" --run
+        [[ $# -eq 2 && ${2:-} == /* ]] || {
+            echo "usage: $0 --run ABSOLUTE-PREPARED-PROBE" >&2
+            exit 2
+        }
+        exec "$2" --run
         ;;
     --self-test)
         self_test
         ;;
-    *) echo "usage: $0 --prepare|--run|--self-test" >&2; exit 2 ;;
+    *) echo "usage: $0 --prepare|--run ABSOLUTE-PREPARED-PROBE|--self-test" >&2; exit 2 ;;
 esac

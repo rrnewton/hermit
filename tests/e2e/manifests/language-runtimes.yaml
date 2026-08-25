@@ -135,6 +135,8 @@ test:
     timeout_seconds: 90
     occasional: false
     program: tests/e2e/language-runtimes/cpp-stl-determinism.sh
+    prepared_fixture_args:
+      - program
     observation:
       status: true
       stdout: true

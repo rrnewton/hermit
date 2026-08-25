@@ -131,6 +131,10 @@ test:
     timeout_seconds: 120
     occasional: false
     program: tests/e2e/determinism-stress/thread-contention.sh
+    prepared_fixture_args:
+      - thread-contention
+      - thread-stress
+      - mmap-fork-shared
     observation:
       status: true
       stdout: true
@@ -194,6 +198,9 @@ test:
     timeout_seconds: 120
     occasional: false
     program: tests/e2e/determinism-stress/process-chains.sh
+    prepared_fixture_args:
+      - fork-tree
+      - pipe-chain
     observation:
       status: true
       stdout: true

@@ -3062,6 +3062,166 @@ fn run_rejects_a_missing_bind_source_before_mounting() {
 }
 
 #[test]
+fn minimal_env_private_workdir_is_empty_for_both_verify_runs() {
+    let _guard = HERMIT_RUN_LOCK.lock().unwrap();
+    let test_root = Path::new("/test");
+    if !test_root.is_dir() {
+        eprintln!(
+            "skipping private /test runtime check: the validation E2E mount namespace supplies the mountpoint"
+        );
+        return;
+    }
+    let snapshot = || {
+        let mut entries = fs::read_dir(test_root)
+            .expect("read outer /test")
+            .map(|entry| entry.expect("read /test entry").file_name())
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+    };
+    let before = snapshot();
+
+    let build = tempfile::Builder::new()
+        .prefix("lockdown-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create lockdown guest build directory beneath the checkout");
+    let source = build.path().join("lockdown.c");
+    let guest = build.path().join("lockdown");
+    fs::write(
+        &source,
+        r#"
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+int main(void) {
+    char cwd[4096];
+    if (getenv("PWD") != NULL || getenv("OLDPWD") != NULL) {
+        fputs("ambient cwd variable leaked\n", stderr);
+        return 1;
+    }
+    if (getcwd(cwd, sizeof(cwd)) == NULL || strcmp(cwd, "/test") != 0) {
+        perror("getcwd");
+        return 2;
+    }
+    if (access("verify-half-sentinel", F_OK) == 0 || errno != ENOENT) {
+        fputs("verify half inherited cwd contents\n", stderr);
+        return 3;
+    }
+    int fd = open("verify-half-sentinel", O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0 || close(fd) != 0) {
+        perror("sentinel");
+        return 4;
+    }
+    puts("lockdown-ok");
+    return 0;
+}
+"#,
+    )
+    .expect("write lockdown guest source");
+    let compile = Command::new("cc")
+        .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("compile lockdown guest");
+    assert!(
+        compile.status.success(),
+        "lockdown guest compilation failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "run",
+            "--base-env=minimal",
+            "--mount=type=tmpfs,target=/test",
+            "--workdir=/test",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--max-timeslice=disabled",
+            "--no-virtualize-cpuid",
+            "--",
+        ])
+        .arg(&guest)
+        .output()
+        .expect("run lockdown guest under Hermit");
+    assert_success(&output, &["private-/test-verify"]);
+    assert_eq!(stdout(&output), "lockdown-ok\n");
+    assert_eq!(snapshot(), before, "Hermit changed the outer /test");
+}
+
+#[test]
+fn guest_mounts_do_not_propagate_to_a_shared_parent_mount() {
+    let _guard = hermit_run_guard();
+    let unshare = Path::new("/usr/bin/unshare");
+    if !unshare.is_file()
+        || !Command::new(unshare)
+            .args(["--user", "--map-root-user", "--mount", "/bin/true"])
+            .status()
+            .is_ok_and(|status| status.success())
+    {
+        eprintln!(
+            "skipping mount-propagation check: unprivileged user+mount namespaces unavailable"
+        );
+        return;
+    }
+
+    let root = tempfile::Builder::new()
+        .prefix("mount-propagation-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create mount-propagation fixture");
+    let script = r#"
+set -eu
+root=$1
+hermit=$2
+shared=$root/shared
+target=$shared/target
+/usr/bin/mkdir -p -- "$target"
+/usr/bin/mount --bind "$shared" "$shared"
+cleanup() {
+    /usr/bin/umount -l -- "$target" 2>/dev/null || true
+    /usr/bin/umount -l -- "$shared" 2>/dev/null || true
+}
+trap cleanup EXIT HUP INT TERM
+/usr/bin/mount --make-shared "$shared"
+"$hermit" run --base-env=minimal --no-sequentialize-threads \
+    --max-timeslice=disabled --no-virtualize-cpuid \
+    --mount="type=tmpfs,target=$target" -- \
+    /usr/bin/mountpoint -q "$target"
+if /usr/bin/mountpoint -q -- "$target"; then
+    echo "guest tmpfs propagated into parent namespace: $target" >&2
+    exit 97
+fi
+"#;
+    let output = Command::new(unshare)
+        .args([
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "/bin/sh",
+            "-c",
+            script,
+            "_",
+        ])
+        .arg(root.path())
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .output()
+        .expect("run shared-mount propagation probe");
+    assert!(
+        output.status.success(),
+        "shared-mount propagation probe failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
 fn run_reports_denied_ptrace_and_seccomp_capabilities() {
     for (syscall, expected) in [
         (

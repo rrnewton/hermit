@@ -11,12 +11,12 @@ case ${1:-} in
     --prepare) exit 0 ;;
     --run)
         expected=1
-        observed=${HERMIT_E2E_SCHEDULED_JOBS:-missing}
-        if [[ $observed != "$expected" ]]; then
+        observed=${2:-missing}
+        if [[ $# -ne 2 || $observed != "$expected" ]]; then
             printf 'system-utils-width expected=%s observed=%s\n' "$expected" "$observed"
             exit 1
         fi
         printf 'system-utils-width=%s\n' "$observed"
         ;;
-    *) echo "usage: $0 --prepare|--run" >&2; exit 2 ;;
+    *) echo "usage: $0 --prepare|--run SCHEDULED-WORKER-CAPACITY" >&2; exit 2 ;;
 esac

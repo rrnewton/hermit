@@ -91,6 +91,9 @@ mod validate_super; // Normalizes and audits extracted Cargo tests/synthetic arg
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::io::Read;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -109,6 +112,7 @@ use dagrun::scheduler::steps_violating_run_timeout;
 use dagrun::scheduler::BoxedCgroups;
 use dagrun::scheduler::monotonic_now_ns;
 use dagrun::scheduler::STEP_STARTED_MONOTONIC_NS_ENV;
+use sha2::Digest;
 
 use validate_plan::CompatMode;
 use validate_plan::CompatDisposition;
@@ -153,6 +157,15 @@ const PARENT_ENV: &str = "DEV_HERMIT_PARENT";
 const OWN_SCOPE_DEADLINE_ENV: &str = "HERMIT_VALIDATE_SCOPE_DEADLINE_MONOTONIC_NS";
 const NESTED_SCOPE_SELF_TEST_ENV: &str = "HERMIT_VALIDATE_NESTED_SCOPE_SELF_TEST";
 const SUMMARY_EPILOGUE_SELF_TEST_ENV: &str = "HERMIT_VALIDATE_SUMMARY_EPILOGUE_SELF_TEST";
+const PRIVATE_TEST_ROOT_ENV: &str = "HERMIT_VALIDATE_PRIVATE_TEST_ROOT";
+const PRIVATE_TEST_ROOT_HELPER_ENV: &str = "HERMIT_VALIDATE_PRIVATE_TEST_ROOT_HELPER";
+const PRIVATE_TEST_ROOT_HELPER_SHA256_ENV: &str =
+    "HERMIT_VALIDATE_PRIVATE_TEST_ROOT_HELPER_SHA256";
+const PRIVATE_TEST_ROOT_VALUE: &str = "canonical-full-manifest-v1";
+const PRIVATE_TEST_ROOT_HELPER_DIR: &str = "/usr/local/libexec";
+const PRIVATE_TEST_ROOT_HELPER_PREFIX: &str = "hermit-private-test-root-";
+const PRIVATE_TEST_ROOT_AUTHORITY: &str =
+    "/usr/local/libexec/hermit-private-test-root.current";
 const NESTED_SCOPE_OUTER: &str = "outer";
 const NESTED_SCOPE_INNER: &str = "inner";
 const NESTED_SCOPE_SIGNAL: &str = "signal";
@@ -302,6 +315,7 @@ struct Args {
     run_timeout: Option<i64>,
     merge_lanes: bool,
     reuse_parent_manifest_gate: bool,
+    private_test_root_eligible: bool,
     self_test: bool,
     show_plan: bool,
 }
@@ -437,6 +451,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         run_timeout: None,
         merge_lanes: true,
         reuse_parent_manifest_gate: false,
+        private_test_root_eligible: canonical_full_private_test_root_args(argv),
         self_test: false,
         show_plan: false,
     };
@@ -636,6 +651,521 @@ fn force_full_policy_allows(force_full: bool, level: Level, focused: Option<&str
     !force_full || (level == Level::Full && focused.is_none())
 }
 
+/// Keep Hermit's activation decision byte-for-byte aligned with ci-hub's
+/// helper-install allowlist. The private root is available only for an explicit
+/// canonical `full` child with each harmless presentation/cache flag appearing
+/// at most once; every other full-shaped invocation keeps the legacy runner.
+fn canonical_full_private_test_root_args(argv: &[String]) -> bool {
+    if argv.first().map(String::as_str) != Some("full") {
+        return false;
+    }
+    let mut seen = BTreeSet::new();
+    argv[1..].iter().all(|argument| {
+        matches!(argument.as_str(), "--ignore-cache" | "--no-label-pr" | "--verbose")
+            && seen.insert(argument.as_str())
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrivateTestRootActivation {
+    Disabled,
+    CanonicalFull,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PrivateTestRootHelper {
+    path: String,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PrivateTestRootAuthority {
+    helper_sha256: String,
+    target: String,
+    owner_pid: u32,
+    owner_start_ticks: u64,
+    unit: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ValidateLockAdmission {
+    target: String,
+    owner_pid: u32,
+    owner_start_ticks: u64,
+}
+
+/// The private `/test` root is intentionally narrower than "an E2E command".
+/// It is canonical validation policy, so it applies only to an admitted,
+/// top-level, complete full profile. Focused and nested invocations remain
+/// diagnostic payloads and must not acquire canonical behavior by inheriting an
+/// environment variable.
+fn private_test_root_activation(
+    args: &Args,
+    nested: bool,
+    lock_admitted: bool,
+) -> PrivateTestRootActivation {
+    if lock_admitted
+        && !nested
+        && args.private_test_root_eligible
+        && args.level == Level::Full
+        && args.focused.is_none()
+    {
+        PrivateTestRootActivation::CanonicalFull
+    } else {
+        PrivateTestRootActivation::Disabled
+    }
+}
+
+fn private_test_root_allows_cache(
+    activation: PrivateTestRootActivation,
+    canonical_authority_expected: bool,
+) -> bool {
+    !canonical_authority_expected && activation == PrivateTestRootActivation::Disabled
+}
+
+/// Once the product front door observes canonical lock authority, this logical
+/// process may not silently degrade to standalone behavior. Re-read the live
+/// authority at the private-root/cache boundary and require the same owner.
+fn refresh_canonical_validate_lock_authority(
+    expected: Option<&ValidateLockAdmission>,
+    observed: Option<ValidateLockAdmission>,
+) -> Result<Option<ValidateLockAdmission>, String> {
+    match (expected, observed) {
+        (Some(expected), Some(observed)) if expected == &observed => Ok(Some(observed)),
+        (Some(expected), Some(observed)) => Err(format!(
+            "canonical validate-lock authority changed after admission: expected owner {}@{} for {}, observed owner {}@{} for {}",
+            expected.owner_pid,
+            expected.owner_start_ticks,
+            expected.target,
+            observed.owner_pid,
+            observed.owner_start_ticks,
+            observed.target,
+        )),
+        (Some(expected), None) => Err(format!(
+            "canonical validate-lock authority disappeared after admission for target {} owner {}@{}",
+            expected.target, expected.owner_pid, expected.owner_start_ticks
+        )),
+        (None, observed) => Ok(observed),
+    }
+}
+
+fn is_lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn parse_private_test_root_authority(
+    bytes: &[u8],
+) -> Result<PrivateTestRootAuthority, String> {
+    if !bytes.ends_with(b"\n") || bytes[..bytes.len().saturating_sub(1)].contains(&b'\n') {
+        return Err(
+            "private-/test authority must be exactly one compact JSON object plus newline"
+                .into(),
+        );
+    }
+    let object = serde_json::from_slice::<serde_json::Value>(&bytes[..bytes.len() - 1])
+        .map_err(|error| format!("private-/test authority is not valid JSON: {error}"))?;
+    let object = object
+        .as_object()
+        .ok_or_else(|| "private-/test authority must be a JSON object".to_string())?;
+    let schema_version = object
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "private-/test authority schema_version must be an integer".to_string())?;
+    let helper_sha256 = object
+        .get("helper_sha256")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "private-/test authority helper_sha256 must be a string".to_string())?
+        .to_string();
+    let target = object
+        .get("target")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "private-/test authority target must be a string".to_string())?
+        .to_string();
+    let owner_pid_u64 = object
+        .get("owner_pid")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "private-/test authority owner_pid must be an integer".to_string())?;
+    let owner_pid = u32::try_from(owner_pid_u64)
+        .map_err(|_| "private-/test authority owner_pid does not fit u32".to_string())?;
+    let owner_start_ticks = object
+        .get("owner_start_ticks")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            "private-/test authority owner_start_ticks must be an integer".to_string()
+        })?;
+    let unit = object
+        .get("unit")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "private-/test authority unit must be a string".to_string())?
+        .to_string();
+    if schema_version != 1 {
+        return Err(format!(
+            "private-/test authority schema_version must be 1, got {schema_version}"
+        ));
+    }
+    if !is_lower_hex(&helper_sha256, 64) {
+        return Err(
+            "private-/test authority helper_sha256 must be 64 lowercase hexadecimal bytes"
+                .into(),
+        );
+    }
+    if !is_lower_hex(&target, 40) {
+        return Err(
+            "private-/test authority target must be a 40-byte lowercase commit SHA".into(),
+        );
+    }
+    if owner_pid <= 1 || owner_start_ticks == 0 {
+        return Err(
+            "private-/test authority owner identity must contain pid > 1 and nonzero start ticks"
+                .into(),
+        );
+    }
+    if !is_validate_service_unit(&unit) {
+        return Err(
+            "private-/test authority unit must be an exact validate-*.service identity".into(),
+        );
+    }
+    let expected = format!(
+        "{{\"schema_version\":1,\"helper_sha256\":\"{helper_sha256}\",\"target\":\"{target}\",\"owner_pid\":{owner_pid},\"owner_start_ticks\":{owner_start_ticks},\"unit\":\"{unit}\"}}\n"
+    );
+    if bytes != expected.as_bytes() {
+        return Err(
+            "private-/test authority must use the closed schema, field order, and compact encoding"
+                .into(),
+        );
+    }
+    Ok(PrivateTestRootAuthority {
+        helper_sha256,
+        target,
+        owner_pid,
+        owner_start_ticks,
+        unit,
+    })
+}
+
+fn is_validate_service_unit(unit: &str) -> bool {
+    unit.strip_prefix("validate-")
+        .and_then(|body| body.strip_suffix(".service"))
+        .is_some_and(|body| {
+            !body.is_empty()
+                && unit
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_.@:-".contains(&byte))
+        })
+}
+
+fn validate_service_unit_from_cgroup(text: &str) -> Result<String, String> {
+    let mut unified = text.lines().filter_map(|line| line.strip_prefix("0::"));
+    let cgroup = unified
+        .next()
+        .filter(|path| path.starts_with('/'))
+        .ok_or_else(|| "validate-lock owner has no canonical unified cgroup path".to_string())?;
+    if unified.next().is_some() {
+        return Err("validate-lock owner has duplicate unified cgroup entries".into());
+    }
+    let units = Path::new(cgroup)
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .filter(|name| is_validate_service_unit(name))
+        .collect::<Vec<_>>();
+    match units.as_slice() {
+        [unit] => Ok((*unit).to_string()),
+        [] => Err(format!(
+            "validate-lock owner cgroup {cgroup:?} contains no validate-*.service unit"
+        )),
+        _ => Err(format!(
+            "validate-lock owner cgroup {cgroup:?} contains multiple validation units: {units:?}"
+        )),
+    }
+}
+
+fn live_validate_service_unit(admission: &ValidateLockAdmission) -> Result<String, String> {
+    let pid = i32::try_from(admission.owner_pid)
+        .map_err(|_| "validate-lock owner PID does not fit i32".to_string())?;
+    if !validate_runtime::identity_in_ancestry(pid, admission.owner_start_ticks) {
+        return Err("validate-lock owner identity is no longer live in this ancestry".into());
+    }
+    let path = PathBuf::from(format!("/proc/{}/cgroup", admission.owner_pid));
+    let text = std::fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "cannot read validate-lock owner cgroup {}: {error}",
+            path.display()
+        )
+    })?;
+    if !validate_runtime::identity_in_ancestry(pid, admission.owner_start_ticks) {
+        return Err("validate-lock owner identity changed while its cgroup was inspected".into());
+    }
+    validate_service_unit_from_cgroup(&text)
+}
+
+fn require_trusted_private_test_root_directory(path: &Path) -> Result<(), String> {
+    let metadata = path.symlink_metadata().map_err(|error| {
+        format!(
+            "cannot inspect private-/test trusted directory {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != 0
+        || metadata.gid() != 0
+        || metadata.mode() & 0o7777 != 0o755
+    {
+        return Err(format!(
+            "private-/test trusted directory must be a real root:root 0755 directory: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn open_trusted_private_test_root_file(
+    path: &Path,
+    exact_mode: u32,
+    what: &str,
+) -> Result<std::fs::File, String> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| format!("cannot open private-/test {what} {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect private-/test {what} {}: {error}", path.display()))?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != 0
+        || metadata.gid() != 0
+        || metadata.mode() & 0o7777 != exact_mode
+    {
+        return Err(format!(
+            "private-/test {what} must be a real root:root {:04o} regular file: {}",
+            exact_mode,
+            path.display()
+        ));
+    }
+    Ok(file)
+}
+
+fn private_test_root_authority_matches(
+    authority: &PrivateTestRootAuthority,
+    admission: &ValidateLockAdmission,
+    live_unit: &str,
+) -> Result<(), String> {
+    if authority.target != admission.target
+        || authority.owner_pid != admission.owner_pid
+        || authority.owner_start_ticks != admission.owner_start_ticks
+        || authority.unit != live_unit
+    {
+        return Err(format!(
+            "private-/test authority is not bound to this live validate-lock admission: target {} owner {}@{} unit {}, expected target {} owner {}@{} unit {}",
+            authority.target,
+            authority.owner_pid,
+            authority.owner_start_ticks,
+            authority.unit,
+            admission.target,
+            admission.owner_pid,
+            admission.owner_start_ticks,
+            live_unit,
+        ));
+    }
+    Ok(())
+}
+
+fn load_private_test_root_helper(
+    activation: PrivateTestRootActivation,
+    admission: Option<&ValidateLockAdmission>,
+) -> Result<Option<PrivateTestRootHelper>, String> {
+    if activation == PrivateTestRootActivation::Disabled {
+        return Ok(None);
+    }
+    let admission = admission.ok_or_else(|| {
+        "canonical full validation has no live validate-lock admission to bind private /test"
+            .to_string()
+    })?;
+    for path in ["/", "/usr", "/usr/local", PRIVATE_TEST_ROOT_HELPER_DIR] {
+        require_trusted_private_test_root_directory(Path::new(path))?;
+    }
+    let authority_path = Path::new(PRIVATE_TEST_ROOT_AUTHORITY);
+    let mut authority_file =
+        open_trusted_private_test_root_file(authority_path, 0o444, "authority")?;
+    let mut authority_bytes = Vec::new();
+    authority_file
+        .read_to_end(&mut authority_bytes)
+        .map_err(|error| {
+            format!(
+                "cannot read private-/test authority {}: {error}",
+                authority_path.display()
+            )
+        })?;
+    let authority = parse_private_test_root_authority(&authority_bytes)?;
+    let live_unit = live_validate_service_unit(admission)?;
+    private_test_root_authority_matches(&authority, admission, &live_unit)?;
+
+    let path = Path::new(PRIVATE_TEST_ROOT_HELPER_DIR).join(format!(
+        "{PRIVATE_TEST_ROOT_HELPER_PREFIX}{}",
+        authority.helper_sha256
+    ));
+    let mut file = open_trusted_private_test_root_file(&path, 0o555, "helper")?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| format!("cannot hash private-/test helper {}: {error}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != authority.helper_sha256 {
+        return Err(format!(
+            "private-/test helper digest mismatch for {}: expected {}, got {actual}",
+            path.display(),
+            authority.helper_sha256,
+        ));
+    }
+    eprintln!(
+        "validate: private-/test authority VERIFIED: helper={} sha256={} target={} owner={}@{} unit={}",
+        path.display(),
+        authority.helper_sha256,
+        authority.target,
+        authority.owner_pid,
+        authority.owner_start_ticks,
+        authority.unit,
+    );
+    Ok(Some(PrivateTestRootHelper {
+        path: path.to_string_lossy().into_owned(),
+        sha256: authority.helper_sha256,
+    }))
+}
+
+fn activate_private_test_root(
+    plan: &mut Plan,
+    activation: PrivateTestRootActivation,
+    admission: Option<&ValidateLockAdmission>,
+) -> Result<usize, String> {
+    let helper = load_private_test_root_helper(activation, admission)?;
+    let marked = configure_private_test_root(plan, activation, helper.as_ref())?;
+    if marked > 0 {
+        eprintln!(
+            "validate: private empty /test enabled for {marked} admitted full-profile manifest node(s); tree-only cache disabled"
+        );
+    }
+    Ok(marked)
+}
+
+fn reject_ambient_private_test_root_environment(
+    supplied: &[&'static str],
+) -> Result<(), String> {
+    if supplied.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "private-/test credentials are parent-owned authority, not ambient input; refusing inherited/supplied variable(s): {}",
+            supplied.join(", ")
+        ))
+    }
+}
+
+fn scrub_ambient_private_test_root_environment() -> Vec<&'static str> {
+    let names = [
+        PRIVATE_TEST_ROOT_ENV,
+        PRIVATE_TEST_ROOT_HELPER_ENV,
+        PRIVATE_TEST_ROOT_HELPER_SHA256_ENV,
+    ];
+    let supplied = names
+        .into_iter()
+        .filter(|name| std::env::var_os(name).is_some())
+        .collect::<Vec<_>>();
+    for name in names {
+        unsafe {
+            std::env::remove_var(name);
+        }
+    }
+    supplied
+}
+
+fn require_private_test_root_environment_clear(context: &str) -> Result<(), String> {
+    let names = [
+        PRIVATE_TEST_ROOT_ENV,
+        PRIVATE_TEST_ROOT_HELPER_ENV,
+        PRIVATE_TEST_ROOT_HELPER_SHA256_ENV,
+    ];
+    let live = names
+        .into_iter()
+        .filter(|name| std::env::var_os(name).is_some())
+        .collect::<Vec<_>>();
+    if !live.is_empty() {
+        return Err(format!(
+            "private-/test environment remained process-global {context}: {}",
+            live.join(", ")
+        ));
+    }
+    let output = Command::new("/usr/bin/env")
+        .output()
+        .map_err(|error| format!("cannot inspect child environment {context}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "/usr/bin/env failed while inspecting child environment {context}: {}",
+            output.status
+        ));
+    }
+    let child = String::from_utf8_lossy(&output.stdout);
+    let leaked = child.lines().find(|line| {
+        names
+            .iter()
+            .any(|name| line.strip_prefix(name).is_some_and(|rest| rest.starts_with('=')))
+    });
+    if let Some(line) = leaked {
+        return Err(format!(
+            "private-/test environment leaked to a child {context}: {line}"
+        ));
+    }
+    Ok(())
+}
+
+fn ambient_private_test_root_refusal_bracket() -> Result<(), String> {
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("private-/test ambient bracket cannot resolve itself: {error}"))?;
+    let names = [
+        PRIVATE_TEST_ROOT_ENV,
+        PRIVATE_TEST_ROOT_HELPER_ENV,
+        PRIVATE_TEST_ROOT_HELPER_SHA256_ENV,
+    ];
+    for supplied in names {
+        let mut command = Command::new(&exe);
+        command.arg("--self-test");
+        for name in names {
+            command.env_remove(name);
+        }
+        let output = command
+            .env(supplied, "forged-ambient-authority")
+            .output()
+            .map_err(|error| {
+                format!("private-/test ambient bracket cannot launch child: {error}")
+            })?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.code() != Some(3)
+            || (!stdout.contains("private /test ambient authority")
+                && !stderr.contains("private /test ambient authority"))
+            || (!stdout.contains(supplied) && !stderr.contains(supplied))
+        {
+            return Err(format!(
+                "private-/test ambient bracket did not refuse {supplied} exactly: status={} stdout={stdout:?} stderr={stderr:?}",
+                output.status
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The environment marker only routes an invocation that already parsed the
 /// explicit `--self-test` flag. An inherited or operator-supplied marker must
 /// never turn an ordinary validation into a small passing probe.
@@ -761,6 +1291,7 @@ fn run_nested_scope_probe() -> Result<String, String> {
             let cgroups = safe_ci_scope::resolve_cgroups(
                 "safe-ci nested self-test outer", false, Some(NESTED_SCOPE_RUNTIME_S), true,
             ).map_err(|code| format!("outer cgroup setup refused with exit {code}"))?;
+            require_private_test_root_environment_clear("after the forced outer cgroup re-exec")?;
             let exe = std::env::current_exe()
                 .map_err(|error| format!("cannot resolve self-test executable: {error}"))?;
             let exe = exe.to_str()
@@ -799,6 +1330,7 @@ fn run_nested_scope_probe() -> Result<String, String> {
             let cgroups = safe_ci_scope::resolve_cgroups(
                 "safe-ci nested self-test inner", false, None, false,
             ).map_err(|code| format!("nested cgroup setup refused with exit {code}"))?;
+            require_private_test_root_environment_clear("inside the nested boxed child")?;
             run_one_nested_scope_probe_step(
                 cgroups,
                 nested_scope_probe_step(
@@ -928,6 +1460,17 @@ fn strict_flag_missing_from(argv: &[String]) -> bool {
 /// on every invocation (validate.sh:308); here they are a `--self-test` subcommand
 /// so the cost is not paid on the hot path.
 fn self_test() -> Result<(), String> {
+    if [
+        PRIVATE_TEST_ROOT_ENV,
+        PRIVATE_TEST_ROOT_HELPER_ENV,
+        PRIVATE_TEST_ROOT_HELPER_SHA256_ENV,
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some())
+    {
+        return Err("private-/test credentials leaked from the invoking environment".into());
+    }
+
     // ---- known-fail-closed disposition, as a pure decision table ----
     //
     // The property under test is NOT "the listed rows get mentioned". It is that mentioning
@@ -1051,7 +1594,6 @@ fn self_test() -> Result<(), String> {
             ));
         }
     }
-
 
     // Strict-execution bracket for the legacy below-L2 compatibility modes.
     // `--strict` must be a Hermit option before the first guest `--`; these
@@ -1503,6 +2045,8 @@ fn self_test() -> Result<(), String> {
     self_output_bracket()?;
     product_front_door_bracket()?;
     product_front_door_process_bracket()?;
+    ambient_private_test_root_refusal_bracket()?;
+    artifact_wrapper_ephemeral_test_root_bracket(&root)?;
     // ---- DAG-config carry + ungrantable-resource brackets -------------------
     // BOTH directions. A check that refuses everything would pass the negative
     // case alone, so the positive case (a real lane admits) is load-bearing.
@@ -1576,9 +2120,254 @@ cleared-caps refusal names {} starved step(s)",
         let tmp = std::env::temp_dir().join(format!("validate-plan-selftest-{}", std::process::id()));
         let full_args = parse_argv(&["full".into(), "--no-label-pr".into()])
             .map_err(|rc| format!("full-plan bracket: parser refused positive form rc={rc}"))?;
-        let full = build_plan(&root, &full_args, &tmp)?;
+        for allowed in [
+            vec!["full"],
+            vec!["full", "--ignore-cache"],
+            vec!["full", "--no-label-pr", "--verbose"],
+            vec!["full", "--verbose", "--ignore-cache", "--no-label-pr"],
+        ] {
+            let argv = allowed.into_iter().map(str::to_string).collect::<Vec<_>>();
+            if !canonical_full_private_test_root_args(&argv) {
+                return Err(format!(
+                    "private-/test bracket: canonical argv was refused: {argv:?}"
+                ));
+            }
+        }
+        for rejected in [
+            vec!["full", "--ignore-cache", "--ignore-cache"],
+            vec!["full", "--run-timeout", "3600"],
+            vec!["full", "--allow-cgroup-failure"],
+            vec!["portable-only"],
+            Vec::new(),
+        ] {
+            let argv = rejected.into_iter().map(str::to_string).collect::<Vec<_>>();
+            if canonical_full_private_test_root_args(&argv) {
+                return Err(format!(
+                    "private-/test bracket: noncanonical argv was accepted: {argv:?}"
+                ));
+            }
+        }
+        let mut full = build_plan(&root, &full_args, &tmp)?;
         if full.second.is_some() {
             return Err("full-plan bracket: default full plan is still sequential".into());
+        }
+        if private_test_root_activation(&full_args, false, true)
+            != PrivateTestRootActivation::CanonicalFull
+            || private_test_root_activation(&full_args, false, false)
+                != PrivateTestRootActivation::Disabled
+            || private_test_root_activation(&full_args, true, true)
+                != PrivateTestRootActivation::Disabled
+        {
+            return Err(
+                "private-/test bracket: admission/top-level policy is not exact".into(),
+            );
+        }
+        let portable_args = parse_argv(&["portable-only".into(), "--no-label-pr".into()])
+            .map_err(|rc| format!("private-/test bracket: portable parser refused rc={rc}"))?;
+        if private_test_root_activation(&portable_args, false, true)
+            != PrivateTestRootActivation::Disabled
+            || private_test_root_allows_cache(PrivateTestRootActivation::CanonicalFull, false)
+            || private_test_root_allows_cache(PrivateTestRootActivation::Disabled, true)
+            || !private_test_root_allows_cache(PrivateTestRootActivation::Disabled, false)
+        {
+            return Err("private-/test bracket: admission or cache policy is not exact".into());
+        }
+        let admitted = ValidateLockAdmission {
+            target: "1".repeat(40),
+            owner_pid: 42,
+            owner_start_ticks: 1234,
+        };
+        if refresh_canonical_validate_lock_authority(Some(&admitted), Some(admitted.clone()))?
+            != Some(admitted.clone())
+            || refresh_canonical_validate_lock_authority(None, None)?.is_some()
+        {
+            return Err("private-/test bracket: stable/standalone authority state changed".into());
+        }
+        if refresh_canonical_validate_lock_authority(Some(&admitted), None).is_ok() {
+            return Err(
+                "private-/test bracket: admitted authority loss degraded to standalone".into(),
+            );
+        }
+        let changed = ValidateLockAdmission {
+            owner_start_ticks: admitted.owner_start_ticks + 1,
+            ..admitted.clone()
+        };
+        if refresh_canonical_validate_lock_authority(Some(&admitted), Some(changed)).is_ok() {
+            return Err("private-/test bracket: admitted authority owner change was accepted".into());
+        }
+        let helper = PrivateTestRootHelper {
+            path: format!(
+                "{PRIVATE_TEST_ROOT_HELPER_DIR}/{PRIVATE_TEST_ROOT_HELPER_PREFIX}{}",
+                "0".repeat(64)
+            ),
+            sha256: "0".repeat(64),
+        };
+        let authority = PrivateTestRootAuthority {
+            helper_sha256: helper.sha256.clone(),
+            target: "1".repeat(40),
+            owner_pid: 42,
+            owner_start_ticks: 1234,
+            unit: "validate-private-root:test.service".into(),
+        };
+        let encoded = format!(
+            "{{\"schema_version\":1,\"helper_sha256\":\"{}\",\"target\":\"{}\",\"owner_pid\":{},\"owner_start_ticks\":{},\"unit\":\"{}\"}}\n",
+            authority.helper_sha256,
+            authority.target,
+            authority.owner_pid,
+            authority.owner_start_ticks,
+            authority.unit,
+        );
+        if parse_private_test_root_authority(encoded.as_bytes())? != authority {
+            return Err("private-/test bracket: exact authority record did not round-trip".into());
+        }
+        for bad in [
+            format!("{}\n", helper.sha256),
+            format!(
+                "{{\"schema_version\":1,\"helper_sha256\":\"{}\",\"target\":\"{}\",\"owner_pid\":{},\"owner_start_ticks\":{}}}\n",
+                authority.helper_sha256,
+                authority.target,
+                authority.owner_pid,
+                authority.owner_start_ticks,
+            ),
+            encoded.trim_end().to_string(),
+            encoded.replace("\"schema_version\":1", "\"schema_version\":1,\"extra\":0"),
+            encoded.replace(
+                "\"schema_version\":1",
+                "\"schema_version\":1,\"schema_version\":1",
+            ),
+            encoded.replace("\"helper_sha256\":\"0", "\"helper_sha256\":\"A"),
+            encoded.replace(
+                "validate-private-root:test.service",
+                "not-a-validate-unit.service",
+            ),
+            encoded.replace("validate-private-root:test.service", "validate-.service"),
+            encoded.replace("{\"schema_version\"", "{ \"schema_version\""),
+        ] {
+            if parse_private_test_root_authority(bad.as_bytes()).is_ok() {
+                return Err(format!(
+                    "private-/test bracket: malformed or noncanonical authority was accepted: {bad:?}"
+                ));
+            }
+        }
+        let admission = ValidateLockAdmission {
+            target: authority.target.clone(),
+            owner_pid: authority.owner_pid,
+            owner_start_ticks: authority.owner_start_ticks,
+        };
+        private_test_root_authority_matches(&authority, &admission, &authority.unit)?;
+        for mismatch in [
+            ValidateLockAdmission {
+                target: "2".repeat(40),
+                ..admission.clone()
+            },
+            ValidateLockAdmission {
+                owner_pid: admission.owner_pid + 1,
+                ..admission.clone()
+            },
+            ValidateLockAdmission {
+                owner_start_ticks: admission.owner_start_ticks + 1,
+                ..admission.clone()
+            },
+        ] {
+            if private_test_root_authority_matches(&authority, &mismatch, &authority.unit).is_ok() {
+                return Err(
+                    "private-/test bracket: stale target/owner authority was accepted".into(),
+                );
+            }
+        }
+        if private_test_root_authority_matches(
+            &authority,
+            &admission,
+            "validate-stale.service",
+        )
+        .is_ok()
+        {
+            return Err("private-/test bracket: stale unit authority was accepted".into());
+        }
+        if validate_service_unit_from_cgroup(
+            "0::/user.slice/user-1000.slice/validate-private-root:test.service/safe-ci-1.scope\n",
+        )?
+            != authority.unit
+            || validate_service_unit_from_cgroup("0::/user.slice/session-1.scope\n").is_ok()
+            || validate_service_unit_from_cgroup(
+                "0::/validate-one.service/validate-two.service\n",
+            )
+            .is_ok()
+            || validate_service_unit_from_cgroup(
+                "0::/validate-private-root:test.service\n0::/duplicate\n",
+            )
+            .is_ok()
+        {
+            return Err(
+                "private-/test bracket: live validation-unit derivation is not exact".into(),
+            );
+        }
+        if reject_ambient_private_test_root_environment(&[]).is_err()
+            || reject_ambient_private_test_root_environment(&[PRIVATE_TEST_ROOT_ENV]).is_ok()
+            || reject_ambient_private_test_root_environment(&[
+                PRIVATE_TEST_ROOT_HELPER_ENV,
+                PRIVATE_TEST_ROOT_HELPER_SHA256_ENV,
+            ])
+            .is_ok()
+        {
+            return Err("private-/test bracket: ambient authority refusal is not exact".into());
+        }
+        let marked = configure_private_test_root(
+            &mut full,
+            PrivateTestRootActivation::CanonicalFull,
+            Some(&helper),
+        )?;
+        let mut manifest_runs = 0;
+        for step in full.cfg.steps.iter().chain(
+            full.second
+                .iter()
+                .flat_map(|cfg| cfg.steps.iter()),
+        ) {
+            let has_marker = step.env.get(PRIVATE_TEST_ROOT_ENV).map(String::as_str)
+                == Some(PRIVATE_TEST_ROOT_VALUE);
+            let has_helper = step.env.get(PRIVATE_TEST_ROOT_HELPER_ENV).map(String::as_str)
+                == Some(helper.path.as_str());
+            let has_helper_digest = step
+                .env
+                .get(PRIVATE_TEST_ROOT_HELPER_SHA256_ENV)
+                .map(String::as_str)
+                == Some(helper.sha256.as_str());
+            let is_manifest_run =
+                validation_step_identity(step) == ValidationStepIdentity::ManifestRun;
+            if is_manifest_run {
+                manifest_runs += 1;
+            }
+            if has_marker != is_manifest_run
+                || has_helper != is_manifest_run
+                || has_helper_digest != is_manifest_run
+            {
+                return Err(format!(
+                    "private-/test bracket: marker/helper/identity mismatch on {}",
+                    step.tag()
+                ));
+            }
+        }
+        if marked != manifest_runs || marked == 0 {
+            return Err(format!(
+                "private-/test bracket: marked {marked} of {manifest_runs} manifest runs"
+            ));
+        }
+        let mut forged = full.cfg.steps[0].clone();
+        forged
+            .env
+            .insert(PRIVATE_TEST_ROOT_ENV.into(), PRIVATE_TEST_ROOT_VALUE.into());
+        let mut forged_plan = Plan {
+            cfg: validate_plan::config_from(vec![forged], "forged private-/test marker"),
+            ..Default::default()
+        };
+        if configure_private_test_root(
+            &mut forged_plan,
+            PrivateTestRootActivation::Disabled,
+            None,
+        )
+        .is_ok()
+        {
+            return Err("private-/test bracket: an input-plan marker was accepted".into());
         }
         let manifest_nodes: Vec<String> = full
             .cfg
@@ -1801,8 +2590,32 @@ cleared-caps refusal names {} starved step(s)",
             "--no-label-pr".into(),
         ])
         .map_err(|rc| format!("full-plan bracket: sequential diagnostic refused rc={rc}"))?;
-        if build_plan(&root, &sequential_args, &tmp)?.second.is_none() {
+        let mut sequential = build_plan(&root, &sequential_args, &tmp)?;
+        if sequential.second.is_none() {
             return Err("full-plan bracket: --sequential-lanes did not preserve the fallback".into());
+        }
+        let sequential_marked = configure_private_test_root(
+            &mut sequential,
+            private_test_root_activation(&sequential_args, false, true),
+            Some(&helper),
+        )?;
+        if sequential_marked != 0
+            || sequential.cfg.steps.iter().chain(
+                sequential
+                    .second
+                    .iter()
+                    .flat_map(|cfg| cfg.steps.iter()),
+            )
+            .any(|step| {
+                step.env.contains_key(PRIVATE_TEST_ROOT_ENV)
+                    || step.env.contains_key(PRIVATE_TEST_ROOT_HELPER_ENV)
+                    || step.env.contains_key(PRIVATE_TEST_ROOT_HELPER_SHA256_ENV)
+            })
+        {
+            return Err(
+                "private-/test bracket: noncanonical sequential full plan received credentials"
+                    .into(),
+            );
         }
         let nested_args = parse_argv(&[
             "--portable-strict-compat-only".into(),
@@ -1833,6 +2646,27 @@ cleared-caps refusal names {} starved step(s)",
         );
     }
 
+    Ok(())
+}
+
+fn artifact_wrapper_ephemeral_test_root_bracket(root: &Path) -> Result<(), String> {
+    let output = Command::new(root.join("ci/run-with-ephemeral-test-root.sh"))
+        .arg("--self-test")
+        .output()
+        .map_err(|error| format!("ephemeral /test wrapper bracket could not run: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "ephemeral /test wrapper bracket failed: status={} stdout={:?} stderr={:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    if !String::from_utf8_lossy(&output.stdout)
+        .contains("run-with-ephemeral-test-root self-test: PASS")
+    {
+        return Err("ephemeral /test wrapper bracket omitted its success marker".into());
+    }
     Ok(())
 }
 
@@ -3427,6 +4261,65 @@ impl Default for Plan {
     }
 }
 
+/// Mark exactly the typed manifest-run nodes selected by canonical full
+/// validation. The marker is step-local state consumed by
+/// `ci/run-with-hermit-e2e-artifact.sh`; it is never injected by rewriting a
+/// shell command and never attached to metadata, builders, scorecards, focused
+/// plans, or nested payloads.
+fn configure_private_test_root(
+    plan: &mut Plan,
+    activation: PrivateTestRootActivation,
+    helper: Option<&PrivateTestRootHelper>,
+) -> Result<usize, String> {
+    let premarked: Vec<String> = std::iter::once(&plan.cfg)
+        .chain(plan.second.iter())
+        .flat_map(|cfg| cfg.steps.iter())
+        .filter(|step| {
+            step.env.contains_key(PRIVATE_TEST_ROOT_ENV)
+                || step.env.contains_key(PRIVATE_TEST_ROOT_HELPER_ENV)
+                || step.env.contains_key(PRIVATE_TEST_ROOT_HELPER_SHA256_ENV)
+        })
+        .map(Step::tag)
+        .collect();
+    if !premarked.is_empty() {
+        return Err(format!(
+            "private-/test admission credentials were supplied by the input plan: {}",
+            premarked.join(", ")
+        ));
+    }
+    if activation == PrivateTestRootActivation::Disabled {
+        return Ok(0);
+    }
+    let helper = helper.ok_or_else(|| {
+        "canonical full validation was admitted without a trusted private-/test helper".to_string()
+    })?;
+
+    let mut marked = 0;
+    for cfg in std::iter::once(&mut plan.cfg).chain(plan.second.iter_mut()) {
+        for step in &mut cfg.steps {
+            if validation_step_identity(step) == ValidationStepIdentity::ManifestRun {
+                step.env.insert(
+                    PRIVATE_TEST_ROOT_ENV.to_string(),
+                    PRIVATE_TEST_ROOT_VALUE.to_string(),
+                );
+                step.env.insert(
+                    PRIVATE_TEST_ROOT_HELPER_ENV.to_string(),
+                    helper.path.clone(),
+                );
+                step.env.insert(
+                    PRIVATE_TEST_ROOT_HELPER_SHA256_ENV.to_string(),
+                    helper.sha256.clone(),
+                );
+                marked += 1;
+            }
+        }
+    }
+    if marked == 0 {
+        return Err("canonical full plan contains no manifest-run nodes to isolate".into());
+    }
+    Ok(marked)
+}
+
 fn test_nodes_of(cfg: &DagConfig) -> BTreeSet<String> {
     cfg.steps
         .iter()
@@ -3770,7 +4663,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         };
         add("build", "Build workspace", "cargo build --workspace --features third-party-backends".into(), vec![gate.into()], 3600, 16 * 1024 * 1024 * 1024);
         add("e2e_metadata", "Portable E2E metadata", "target/debug/test-harness validate".into(), vec!["quick.build".into()], 600, 4 * 1024 * 1024 * 1024);
-        add("e2e_verify", "Portable ptrace E2E verification", "target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only".into(), vec!["quick.build".into()], 1800, 8 * 1024 * 1024 * 1024);
+        add("e2e_verify", "Portable ptrace E2E verification", "./ci/run-with-ephemeral-test-root.sh -- target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only".into(), vec!["quick.build".into()], 1800, 8 * 1024 * 1024 * 1024);
         add("detcore_unit", "Detcore core unit tests", "./ci/run-nextest-counted.sh -p hermit-detcore --lib".into(), vec!["quick.build".into(), "setup.nextest".into()], 1800, 8 * 1024 * 1024 * 1024);
         add("run_smoke", "Hermit run smoke test",
             format!("out=$(timeout 30s {hermit} {run_args} -- /bin/echo {marker}) && test \"$out\" = {marker}"),
@@ -7672,37 +8565,37 @@ fn receipt_evidence(
 /// Ask the canonical parent lock authority whether this exact run is admitted.
 /// Production never trusts caller-supplied owner PIDs or sidecar paths. The
 /// stop-test JSON seam is confined to an intrinsically non-qualifying fixture.
-fn canonical_validate_lock_admission(
+fn canonical_validate_lock_authority(
     parent: Option<&Path>,
     commit: &str,
     host: &str,
-) -> bool {
+) -> Option<ValidateLockAdmission> {
     let status = if env_flag("HERMIT_VALIDATE_STOP_TEST_MODE", "1") {
         let Ok(fixture) = std::env::var("VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON") else {
-            return false;
+            return None;
         };
         fixture.into_bytes()
     } else {
-        let Some(parent) = parent else { return false };
+        let Some(parent) = parent else { return None };
         let ci_hub = parent.join("ci-hub/ci-hub");
         if !ci_hub.is_file() {
-            return false;
+            return None;
         }
         let Ok(output) = Command::new(ci_hub)
             .args(["validate-lock", "authority-status", "--json"])
             .output()
         else {
-            return false;
+            return None;
         };
         if !output.status.success() {
-            return false;
+            return None;
         }
         output.stdout
     };
     let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .ok()
         .map(|id| id.trim().to_string());
-    canonical_validate_lock_status_admits(
+    canonical_validate_lock_status(
         &status,
         commit,
         host,
@@ -7715,13 +8608,13 @@ fn canonical_validate_lock_admission(
 /// predicate is the real `/proc` ancestry check in production and a planted,
 /// inert identity in `--self-test`; no caller-supplied environment marker can
 /// bypass these exact commit, host, boot, PID, and start-time checks.
-fn canonical_validate_lock_status_admits(
+fn canonical_validate_lock_status(
     status: &[u8],
     commit: &str,
     host: &str,
     boot_id: Option<&str>,
     identity_in_ancestry: impl FnOnce(i32, u64) -> bool,
-) -> bool {
+) -> Option<ValidateLockAdmission> {
     fn object_string<'a>(
         object: &'a serde_json::Map<String, serde_json::Value>,
         key: &str,
@@ -7729,13 +8622,13 @@ fn canonical_validate_lock_status_admits(
         object.get(key).and_then(serde_json::Value::as_str)
     }
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(status) else {
-        return false;
+        return None;
     };
     let Some(holder) = value.get("holder").and_then(serde_json::Value::as_object) else {
-        return false;
+        return None;
     };
     let Some(owner) = value.get("owner").and_then(serde_json::Value::as_object) else {
-        return false;
+        return None;
     };
     if value.get("schema_version").and_then(serde_json::Value::as_i64) != Some(1)
         || value.get("admissible").and_then(serde_json::Value::as_bool) != Some(true)
@@ -7752,22 +8645,47 @@ fn canonical_validate_lock_status_admits(
         || object_string(owner, "host") != Some(host)
         || object_string(owner, "liveness") != Some("alive")
     {
-        return false;
+        return None;
     }
     let Some(pid64) = owner.get("pid").and_then(serde_json::Value::as_i64) else {
-        return false;
+        return None;
     };
     let Some(start_ticks) = owner.get("start_ticks").and_then(serde_json::Value::as_u64) else {
-        return false;
+        return None;
     };
-    let Ok(pid) = i32::try_from(pid64) else { return false };
+    let Ok(pid) = i32::try_from(pid64) else { return None };
     if pid <= 1 || start_ticks == 0 {
-        return false;
+        return None;
     }
     if boot_id != object_string(owner, "boot_id") {
-        return false;
+        return None;
     }
-    identity_in_ancestry(pid, start_ticks)
+    if !identity_in_ancestry(pid, start_ticks) {
+        return None;
+    }
+    Some(ValidateLockAdmission {
+        target: commit.to_string(),
+        owner_pid: pid as u32,
+        owner_start_ticks: start_ticks,
+    })
+}
+
+fn canonical_validate_lock_status_admits(
+    status: &[u8],
+    commit: &str,
+    host: &str,
+    boot_id: Option<&str>,
+    identity_in_ancestry: impl FnOnce(i32, u64) -> bool,
+) -> bool {
+    canonical_validate_lock_status(status, commit, host, boot_id, identity_in_ancestry).is_some()
+}
+
+fn canonical_validate_lock_admission(
+    parent: Option<&Path>,
+    commit: &str,
+    host: &str,
+) -> bool {
+    canonical_validate_lock_authority(parent, commit, host).is_some()
 }
 
 /// Inert two-sided bracket for the front door and the canonical authority
@@ -9383,6 +10301,13 @@ fn main() -> ExitCode {
 
 /// The whole invocation, returning what it concluded rather than an exit code.
 fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
+    // The trusted parent publishes private-/test authority through a fixed,
+    // root-owned file. No caller environment value is a credential. Scrub the
+    // three step-local names before threads or child processes exist, then
+    // refuse the invocation so an inherited/forged value can never become an
+    // alternate authority channel.
+    let ambient_private_test_root = scrub_ambient_private_test_root_environment();
+
     let args = match parse_args() {
         Ok(a) => a,
         // `parse_args` returns 0 only for `--help`, whose usage text is the
@@ -9397,6 +10322,21 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             )
         }
     };
+
+    if let Err(error) =
+        reject_ambient_private_test_root_environment(&ambient_private_test_root)
+    {
+        return RunSummary::refused(
+            3,
+            args.focused
+                .as_ref()
+                .map(Focused::profile)
+                .unwrap_or_else(|| args.level.name().to_string())
+                .as_str(),
+            "private /test ambient authority",
+            vec![error],
+        );
+    }
 
     if args.self_test && std::env::var_os(SUMMARY_EPILOGUE_SELF_TEST_ENV).is_some() {
         return RunSummary::refused(
@@ -9543,6 +10483,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // explicitly inert here.
     let ci_hub_dir_present =
         parent.as_ref().is_some_and(|candidate| candidate.join("ci-hub").is_dir());
+    let mut product_front_door_admission = None;
     if product_front_door_applies(
         parent.is_some(),
         ci_hub_dir_present,
@@ -9553,14 +10494,15 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         let commit = git_sha();
         let host = short_hostname();
         let ci_hub_launcher_available = parent.join("ci-hub/ci-hub").is_file();
-        let admitted = canonical_validate_lock_admission(Some(parent), &commit, &host);
+        product_front_door_admission =
+            canonical_validate_lock_authority(Some(parent), &commit, &host);
         if let Some(refusal) = product_front_door_refusal(
             parent,
             &root,
             &commit,
             &requested_validate_args(),
             ci_hub_launcher_available,
-            admitted,
+            product_front_door_admission.is_some(),
         ) {
             eprintln!("{refusal}");
             return RunSummary::refused(
@@ -9862,6 +10804,56 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         );
     }
 
+    // Decide the private-/test policy BEFORE consulting the tree-keyed PASS
+    // cache. Canonical runs never reuse that cache: the run-bound root-owned
+    // helper authority is external to the Hermit tree. The outer pre-scope
+    // process deliberately does not read that authority. After the normal
+    // systemd cgroup re-exec, the observed in-scope process validates it and
+    // marks the typed manifest steps before reaching the (disabled) lookup.
+    let commit = git_sha();
+    let host = short_hostname();
+    let private_test_root_admission = match refresh_canonical_validate_lock_authority(
+        product_front_door_admission.as_ref(),
+        canonical_validate_lock_authority(parent.as_deref(), &commit, &host),
+    ) {
+        Ok(admission) => admission,
+        Err(error) => {
+            return RunSummary::refused(
+                4,
+                &plan.profile,
+                "canonical validate-lock authority continuity",
+                vec![
+                    error,
+                    "a product run that passed the front door cannot fall back to standalone cache or execution semantics"
+                        .into(),
+                ],
+            )
+        }
+    };
+    let private_test_root_mode = private_test_root_activation(
+        &args,
+        nesting.nested,
+        private_test_root_admission.is_some(),
+    );
+    let mut private_test_root_nodes = None;
+    if private_test_root_mode == PrivateTestRootActivation::Disabled || is_in_scope() {
+        match activate_private_test_root(
+            &mut plan,
+            private_test_root_mode,
+            private_test_root_admission.as_ref(),
+        ) {
+            Ok(marked) => private_test_root_nodes = Some(marked),
+            Err(error) => {
+                return RunSummary::refused(
+                    3,
+                    &plan.profile,
+                    "private /test authority",
+                    vec![error],
+                )
+            }
+        }
+    }
+
     // ---- tree-keyed result cache (validate.sh:620/655) -------------------
     //
     // Runs BEFORE boxing and before the durable log, so a hit leaves no partial
@@ -9874,7 +10866,6 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let ledger = ledger_path(&root);
     let ledger_rows = validate_history::read_rows(&ledger);
     let tree = git_tree();
-    let host = short_hostname();
     let toolchain = sh("rustc", &["--version"]).unwrap_or_else(|| "unknown".into());
     let cache = cache_state(&root);
     let cache_key = validate_history::CacheKey {
@@ -9888,6 +10879,10 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     if !nesting.nested
         && !args.ignore_cache
         && plan.cacheable
+        && private_test_root_allows_cache(
+            private_test_root_mode,
+            product_front_door_admission.is_some(),
+        )
         && !wt_dirty
         && !tree_dirty()
         && plan.selection_mode == "full"
@@ -9985,7 +10980,25 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             }
         };
 
-    let commit = git_sha();
+    if private_test_root_nodes.is_none() {
+        match activate_private_test_root(
+            &mut plan,
+            private_test_root_mode,
+            private_test_root_admission.as_ref(),
+        ) {
+            Ok(marked) => private_test_root_nodes = Some(marked),
+            Err(error) => {
+                return RunSummary::refused(
+                    3,
+                    &plan.profile,
+                    "private /test authority",
+                    vec![error],
+                )
+            }
+        }
+    }
+    debug_assert!(private_test_root_nodes.is_some());
+
     let git_depth = match measure_git_depth(&commit) {
         Ok(depth) => depth,
         Err(error) => {
@@ -10243,7 +11256,10 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let commit_anchored = commit != "unknown" && !dirty_now;
     // Observed, not inferred: did the pin gate actually run and pass in THIS run?
     let pin_gate_passed = outcomes.iter().any(|o| o.tag == PIN_GATE_TAG && o.ok);
-    let lock_admitted = canonical_validate_lock_admission(parent.as_deref(), &commit, &host);
+    // The front-door admission is the authority for this logical run. Reusing
+    // that proven state here avoids a late transient query turning a completed
+    // admitted run into an unadmitted ledger row.
+    let lock_admitted = product_front_door_admission.is_some();
     let ctx = LedgerCtx {
         started_at,
         host: host.clone(),

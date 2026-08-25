@@ -60,6 +60,19 @@ command. Program extensions select the runner:
 - `.c`: compile implicitly with `cc` plus optional `build.cflags`;
 - `.rs`: compile implicitly with `rustc` plus optional `build.rustflags`.
 
+A shell program whose `--prepare` phase builds executables for `--run` declares
+their fixture-relative paths in `prepared_fixture_args`. The harness exposes
+that one per-cell fixture directory read-only at
+`/tmp/hermit-e2e-fixtures` and passes fixed absolute guest paths; absolute paths,
+`..`, duplicates, and non-shell use are rejected.
+
+Every required non-native invocation uses `--base-env=minimal` and begins in
+`/test`. Ordinary `run` modes mount a fresh tmpfs there for each invocation;
+the two halves of `--verify` therefore cannot exchange files. Tests may use the
+empty cwd as scratch space, but must receive intentional inputs through an
+explicit argument rather than inherited `PWD`, `OLDPWD`, `HOME`, or checkout
+cwd state.
+
 `MODE` is always the outer axis. Every entry declares exactly these five
 tables: `verify`, `chaos`, `replay`, `naked`, and `custom`. Each table has a
 `backends_enabled` list and a `backends_disabled` table. The two must form a
@@ -91,14 +104,14 @@ The mode contracts are:
 | `naked` | Opt-in meta-CI only; run natively three to five times and require declared variation |
 | `custom` | Run declared edge-case Hermit arguments and require three to five identical observations |
 
-`verify`, `chaos`, and `custom` may set an absolute `workdir` path. The harness
-passes it to `hermit run` before the guest-command separator, so it is resolved
-inside the guest after mounts are applied. Use this when a guest's interpreter
-or toolchain inspects its inherited working directory before the program can
-change directories itself. `naked` and `replay` do not accept this field.
-The checked-in use is currently ptrace-only. A mode that enables DBT is
-rejected because the DBT launcher does not yet preserve the requested guest
-working directory; qualify that backend behavior before using `workdir` there.
+Non-required/manual `verify`, `chaos`, and `custom` cells may set an absolute
+`workdir` path. The harness passes it to `hermit run` before the guest-command
+separator, so it is resolved inside the guest after mounts are applied.
+Required cells always start in the fresh private `/test` and must not declare
+`workdir`; `naked` and `replay` do not accept the field either. A mode that
+enables DBT is rejected because the DBT launcher does not yet preserve a
+requested guest working directory; qualify that backend behavior before using
+`workdir` there.
 
 An enabled `verify` cell is green only when its typed report records canonical
 strictness, log comparison, positive INFO counts on both runs, bitwise parity,
@@ -234,8 +247,8 @@ target/debug/test-harness validate
 target/debug/test-harness plan --format json
 target/debug/test-harness audit-gaps --format json
 target/debug/test-harness build --lane portable --ci-only
-target/debug/test-harness run --lane portable
-target/debug/test-harness run --lane portable --category system-utils --ci-only --prebuilt
+./ci/run-with-ephemeral-test-root.sh -- target/debug/test-harness run --lane portable
+./ci/run-with-ephemeral-test-root.sh -- target/debug/test-harness run --lane portable --category system-utils --ci-only --prebuilt
 target/debug/test-harness run --mode naked --test system-utils/random-device
 ```
 

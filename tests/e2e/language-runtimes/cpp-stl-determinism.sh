@@ -8,8 +8,9 @@
 # End-to-end C++ STL determinism fixture.
 #
 # C++ has no implicit compile support in the harness (only .c and .rs), so this
-# shell wrapper compiles a small STL program natively during --prepare into the
-# persisted E2E_FIXTURE_DIR and execs the prebuilt binary during --run. The
+# shell wrapper compiles a small STL program natively during --prepare. The
+# manifest runner passes that binary's guest-visible path explicitly to --run;
+# E2E_FIXTURE_DIR remains only as a manual/naked compatibility fallback. The
 # program's only entropy source is std::random_device (OS getrandom/urandom),
 # which varies every run natively and is determinized by Hermit --strict; every
 # downstream STL result (std::set / std::map / std::unordered_map / std::sort /
@@ -128,24 +129,41 @@ int main() {
     }
     std::string payload = oss.str();
 
-    // File I/O: write the payload to E2E_TMPDIR and read it back as bytes.
-    // Hermit runs the guest with a fresh isolated /tmp per repeat, so create
-    // the directory first; otherwise the ofstream below fails silently.
+    // File I/O: write the payload to E2E_TMPDIR, or to the private cwd when
+    // the hermetic runner deliberately omits that legacy variable.
     const char* tmp = std::getenv("E2E_TMPDIR");
-    std::string dir = tmp ? tmp : "/tmp";
+    std::string dir = tmp ? tmp : ".";
     std::filesystem::create_directories(dir);
     std::string path = dir + "/hermit-cpp-stl.txt";
     {
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            std::fprintf(stderr, "cannot open %s for writing\n", path.c_str());
+            return 1;
+        }
         out << payload;
+        if (!out) {
+            std::fprintf(stderr, "cannot write %s\n", path.c_str());
+            return 1;
+        }
     }
     std::string readback;
     {
         std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            std::fprintf(stderr, "cannot open %s for reading\n", path.c_str());
+            return 1;
+        }
         std::ostringstream buf;
         buf << in.rdbuf();
+        if (in.bad()) {
+            std::fprintf(stderr, "cannot read %s\n", path.c_str());
+            return 1;
+        }
         readback = buf.str();
     }
+
+    const bool roundtrip = readback == payload;
 
     std::printf(
         "CPPSTL uniq=%zu map=%zu sorted0=%d sortedN=%d epoch_s=%lld "
@@ -153,16 +171,31 @@ int main() {
         uniq.size(), freq.size(), sorted_nums.front(), sorted_nums.back(),
         epoch_s, readback.size(),
         static_cast<unsigned long long>(fnv1a(payload)),
-        static_cast<int>(readback == payload));
-    return 0;
+        static_cast<int>(roundtrip));
+    return roundtrip ? 0 : 1;
 }
 CPP
         c++ -std=c++17 -O2 -g -Wall -Wextra -Werror \
             "$src" -o "$E2E_FIXTURE_DIR/program"
         ;;
     --run)
-        : "${E2E_FIXTURE_DIR:?E2E_FIXTURE_DIR must be set}"
-        exec "$E2E_FIXTURE_DIR/program"
+        shift
+        if (($# == 1)); then
+            program=$1
+            if [[ $program != /* || ! -x $program ]]; then
+                echo "run fixture must be an absolute executable path: $program" >&2
+                exit 2
+            fi
+        elif (($# == 0)) && [[ -n ${E2E_FIXTURE_DIR:-} ]]; then
+            # Backward-compatible manual/naked entrypoint. Hermetic manifest
+            # runs pass the guest-visible binary path explicitly instead of
+            # forwarding this preparation-only environment variable.
+            program="$E2E_FIXTURE_DIR/program"
+        else
+            echo "usage: $0 --run [<program>]" >&2
+            exit 2
+        fi
+        exec "$program"
         ;;
     *)
         echo "usage: $0 --prepare|--run" >&2

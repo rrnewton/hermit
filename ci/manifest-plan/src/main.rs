@@ -635,6 +635,8 @@ fn validate_and_expand(
             "modes",
             "slow_reason",
             "preprocessors",
+            "prepared_fixture_args",
+            "expected_scheduled_worker_capacity",
         ],
         &id,
     );
@@ -724,6 +726,30 @@ fn validate_and_expand(
             die(format!("{id}: the only supported preprocessor is e9patch"));
         }
     }
+    if let Some(fixtures) = test.get("prepared_fixture_args") {
+        let fixtures = string_array(Some(fixtures), &format!("{id}.prepared_fixture_args"));
+        if !program.is_some_and(|program| program.ends_with(".sh")) {
+            die(format!(
+                "{id}: prepared_fixture_args requires a shell program with a --prepare phase"
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for fixture in fixtures {
+            validate_relative_fixture_path(&fixture, &format!("{id}.prepared_fixture_args"));
+            if !seen.insert(fixture.clone()) {
+                die(format!(
+                    "{id}: duplicate prepared fixture argument: {fixture}"
+                ));
+            }
+        }
+    }
+    if let Some(capacity) = test.get("expected_scheduled_worker_capacity") {
+        if capacity.as_integer().is_none_or(|capacity| capacity <= 0) {
+            die(format!(
+                "{id}: expected_scheduled_worker_capacity must be a positive integer"
+            ));
+        }
+    }
 
     validate_observation(test, &id);
 
@@ -758,6 +784,25 @@ fn validate_and_expand(
         die(format!(
             "{id}: CI-enabled program symlink target is unavailable: {}",
             program.unwrap()
+        ));
+    }
+}
+
+fn validate_relative_fixture_path(path: &str, location: &str) {
+    let path = Path::new(path);
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        die(format!(
+            "{location} must contain non-empty relative paths without `..`"
         ));
     }
 }
@@ -953,6 +998,11 @@ fn validate_mode(
         ci_disabled_reason.as_ref(),
     )
     .unwrap_or_else(|error| die(format!("{id}: modes.{mode} {error}")));
+    if ci.any_selected() && workdir.is_some() {
+        die(format!(
+            "{id}: {mode} required cells always run in /test and must not declare workdir"
+        ));
+    }
     if let Some(guest_args) = spec.get("guest_args") {
         let guest_args = guest_args
             .as_table()
@@ -1333,6 +1383,23 @@ liteinst = "unsupported"
     }
 
     #[test]
+    fn prepared_fixture_paths_accept_only_relative_descendants() {
+        validate_relative_fixture_path("nested/program", "fixture");
+    }
+
+    #[test]
+    #[should_panic(expected = "non-empty relative paths")]
+    fn prepared_fixture_paths_reject_absolute_paths() {
+        validate_relative_fixture_path("/tmp/program", "fixture");
+    }
+
+    #[test]
+    #[should_panic(expected = "non-empty relative paths")]
+    fn prepared_fixture_paths_reject_parent_traversal() {
+        validate_relative_fixture_path("../program", "fixture");
+    }
+
+    #[test]
     #[should_panic(expected = "must partition")]
     fn rejects_incomplete_backend_partition() {
         let spec = parse_mode(
@@ -1391,7 +1458,6 @@ min_distinct = 2
 ci = true
 backends_enabled = ["ptrace"]
 guest_args = { ptrace = ["multi"] }
-workdir = "/tmp"
 
 [backends_disabled]
 dbt = "unsupported"
@@ -1432,6 +1498,33 @@ liteinst = "unsupported"
 ci = true
 backends_enabled = ["ptrace"]
 workdir = "tmp"
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            90,
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "required cells always run in /test and must not declare workdir")]
+    fn rejects_required_cell_workdir() {
+        let spec = parse_mode(
+            r#"
+ci = true
+backends_enabled = ["ptrace"]
+workdir = "/tmp"
 
 [backends_disabled]
 dbt = "unsupported"

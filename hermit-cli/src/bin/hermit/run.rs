@@ -51,6 +51,7 @@ use super::container::apply_affinity;
 use super::container::default_container;
 use super::container::identity_hardening_mounts;
 use super::container::image_container;
+use super::container::mount_namespace_prelude;
 use super::container::with_container;
 use super::global_opts::GlobalOpts;
 use super::record_envelope::RecordEnvelope;
@@ -207,9 +208,9 @@ pub struct RunOpts {
     #[clap(long, value_name = "RCBS")]
     skid_margin: Option<u64>,
 
-    /// Mount a file or directory. This uses the same syntax as Docker's `--mount` option. The
+    /// Mount a file or directory. This uses the same syntax as Docker's `--mount` option. A bind
     /// source must exist on the host. For simple bind mounts into guest `/tmp`, use `--bind`.
-    #[clap(long, value_name = "path")]
+    #[clap(long, value_parser = parse_mount, value_name = "path")]
     mount: Vec<Mount>,
 
     /// Bind-mount a host file or directory into guest `/tmp`. Use `SOURCE` to preserve its path or
@@ -434,9 +435,9 @@ pub struct RunOpts {
     #[clap(short = 'e', long, value_parser = parse_assignment, value_name="name[=val]")]
     env: Vec<(String, Option<String>)>,
 
-    /// Set the guest working directory. The path is resolved after guest mounts are applied, so an
-    /// isolated path such as `/tmp` refers to the guest view.
-    #[clap(long, value_name = "path")]
+    /// Set the guest working directory. PATH must be absolute and is resolved after guest mounts
+    /// are applied, so an isolated path such as `/tmp` refers to the guest view.
+    #[clap(long, value_name = "PATH")]
     workdir: Option<String>,
 
     /// For debugging, save the details of this final run config: printed to a file in a human
@@ -511,6 +512,10 @@ pub(super) fn apply_base_environment(
     command.env("ASAN_OPTIONS", "detect_leaks=0");
     command.env("LSAN_OPTIONS", "detect_leaks=0");
     Ok(())
+}
+
+fn parse_mount(src: &str) -> Result<Mount, String> {
+    Mount::from_str(src).map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Default, Clone, Copy, Parser, Eq, PartialEq)]
@@ -1002,6 +1007,31 @@ fn backend_values_parse_and_round_trip() {
 }
 
 #[test]
+fn guest_filesystem_paths_must_be_absolute() {
+    let absolute_workdir = RunOpts::parse_from(["fakehermit", "--workdir=/test", "/bin/true"]);
+    absolute_workdir.validate_mount_sources().unwrap();
+
+    let relative_workdir = RunOpts::parse_from(["fakehermit", "--workdir=test", "/bin/true"]);
+    assert!(
+        relative_workdir
+            .validate_mount_sources()
+            .unwrap_err()
+            .to_string()
+            .contains("--workdir must be absolute")
+    );
+
+    let relative_mount =
+        RunOpts::parse_from(["fakehermit", "--mount=type=tmpfs,target=test", "/bin/true"]);
+    assert!(
+        relative_mount
+            .validate_mount_sources()
+            .unwrap_err()
+            .to_string()
+            .contains("--mount target must be absolute")
+    );
+}
+
+#[test]
 fn e9patch_preserves_executable_identity_and_uses_ptrace_runtime() {
     let mut ro = RunOpts::parse_from(["fakehermit", "--backend", "e9patch", "/bin/echo", "hello"]);
     ro.e9patch_overlay = Some(E9patchOverlay {
@@ -1126,6 +1156,52 @@ fn dbt_rejects_mount_and_workdir_options_it_cannot_apply() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("dbt backend cannot apply --mount"));
+
+    let mut with_tmp = RunOpts::parse_from([
+        "fakehermit",
+        "--backend",
+        "dbt",
+        "--tmp",
+        "/test",
+        "/bin/true",
+    ]);
+    let error = with_tmp
+        .validate_args_with_perf_support(true)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("dbt backend cannot apply --mount"));
+}
+
+#[test]
+fn minimal_base_environment_is_exact_before_guest_startup() {
+    let options = RunOpts::parse_from([
+        "fakehermit",
+        "--backend=kvm",
+        "--base-env=minimal",
+        "/bin/true",
+    ]);
+    let environment = options.guest_command().unwrap().get_captured_envs();
+    assert_eq!(
+        environment
+            .keys()
+            .map(|key| key.to_string_lossy().into_owned())
+            .collect::<std::collections::BTreeSet<String>>(),
+        std::collections::BTreeSet::from([
+            "ASAN_OPTIONS".to_string(),
+            "HOME".to_string(),
+            "HOSTNAME".to_string(),
+            "LSAN_OPTIONS".to_string(),
+            "PATH".to_string(),
+        ])
+    );
+    assert_eq!(
+        environment.get(OsStr::new("HOME")),
+        Some(&OsStr::new("/root").to_os_string())
+    );
+    assert_eq!(
+        environment.get(OsStr::new("HOSTNAME")),
+        Some(&OsStr::new("hermetic-container.local").to_os_string())
+    );
 }
 
 #[test]
@@ -2396,10 +2472,13 @@ impl RunOpts {
             );
         }
         if backend == Backend::Dbt
-            && (!self.mount.is_empty() || !self.bind.is_empty() || self.workdir.is_some())
+            && (!self.mount.is_empty()
+                || !self.bind.is_empty()
+                || self.workdir.is_some()
+                || self.tmp.is_some())
         {
             anyhow::bail!(
-                "the dbt backend cannot apply --mount, --bind, or --workdir because its \
+                "the dbt backend cannot apply --mount, --bind, --workdir, or --tmp because its \
                  DynamoRIO adapter does not enter the guest mount namespace"
             );
         }
@@ -2638,8 +2717,17 @@ impl RunOpts {
     }
 
     fn validate_mount_sources(&self) -> Result<(), Error> {
+        if let Some(workdir) = &self.workdir
+            && !Path::new(workdir).is_absolute()
+        {
+            anyhow::bail!("--workdir must be absolute: {workdir}");
+        }
         for bind in &self.bind {
             let source = Path::new(OsStr::from_bytes(bind.source.to_bytes()));
+            let target = Path::new(OsStr::from_bytes(bind.target.to_bytes()));
+            if !target.is_absolute() {
+                anyhow::bail!("--bind target must be absolute: {}", target.display());
+            }
             if !source.exists() {
                 anyhow::bail!(
                     "--bind source {} does not exist. Create it or correct the source path before \
@@ -2649,6 +2737,12 @@ impl RunOpts {
             }
         }
         for mount in &self.mount {
+            if !mount.get_target().is_absolute() {
+                anyhow::bail!(
+                    "--mount target must be absolute: {}",
+                    mount.get_target().display()
+                );
+            }
             if let Some(source) = mount.get_source()
                 && !source.exists()
             {
@@ -3191,7 +3285,7 @@ impl RunOpts {
             .map_root()
             .hostname("hermetic-container.local")
             .domainname("local")
-            .mount(Mount::proc())
+            .mounts(mount_namespace_prelude(true))
             .mounts(mounts);
 
         match &self.network {

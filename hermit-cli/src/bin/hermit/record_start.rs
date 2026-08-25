@@ -212,8 +212,9 @@ pub struct StartOpts {
     #[clap(long)]
     mount: Vec<Mount>,
 
-    /// Set the working directory for both recording and replay after mounts apply.
-    #[clap(long, value_name = "path")]
+    /// Set the working directory for both recording and replay after mounts apply. PATH must be
+    /// absolute.
+    #[clap(long, value_name = "PATH")]
     workdir: Option<String>,
 
     /// Directory where recorded syscall data is stored.
@@ -313,6 +314,16 @@ impl StartOpts {
         }
         apply_base_environment(&mut command, &self.base_env, &self.env)?;
         Ok(command)
+    }
+
+    fn validate_filesystem_options(&self) -> Result<(), Error> {
+        if let Some(workdir) = &self.workdir {
+            let workdir = Path::new(workdir);
+            if !workdir.is_absolute() {
+                anyhow::bail!("--workdir must be absolute: {}", workdir.display());
+            }
+        }
+        Ok(())
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -424,6 +435,7 @@ impl StartOpts {
     }
 
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        self.validate_filesystem_options()?;
         if self.verify {
             validate_log_level(global)?;
             self.record_verify(global)
@@ -746,6 +758,40 @@ mod tests {
                 .to_string()
                 .contains("not set in the host environment")
         );
+    }
+
+    #[test]
+    fn record_minimal_environment_omits_pwd_and_records_absolute_workdir() {
+        let mut options = start_options(Vec::new());
+        options.base_env = BaseEnv::Minimal;
+        options.workdir = Some("/test".into());
+        options.validate_filesystem_options().unwrap();
+        let command = options.guest_command().unwrap();
+        let environment = command.get_captured_envs();
+        assert_eq!(command.get_current_dir(), Some(Path::new("/test")));
+        assert!(!environment.contains_key(std::ffi::OsStr::new("PWD")));
+        assert!(!environment.contains_key(std::ffi::OsStr::new("OLDPWD")));
+        assert_eq!(
+            environment
+                .keys()
+                .map(|key| key.to_string_lossy().into_owned())
+                .collect::<std::collections::BTreeSet<String>>(),
+            std::collections::BTreeSet::from([
+                "ASAN_OPTIONS".to_string(),
+                "HOME".to_string(),
+                "HOSTNAME".to_string(),
+                "LSAN_OPTIONS".to_string(),
+                "PATH".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn record_rejects_relative_workdir() {
+        let mut options = start_options(Vec::new());
+        options.workdir = Some("test".into());
+        let error = options.validate_filesystem_options().unwrap_err();
+        assert!(error.to_string().contains("--workdir must be absolute"));
     }
 
     // A blocked SIGALRM (e.g. inherited from the parent) would leave the alarm

@@ -2477,7 +2477,7 @@ fn write_plan_after_scorecard_check(
                     ""
                 };
                 format!(
-                    "HERMIT_BIN=\"$PWD/target/release/hermit\" target/debug/test-harness run {selector} --include-occasional{prebuilt} --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
+                    "HERMIT_BIN=\"$PWD/target/release/hermit\" ./ci/run-with-ephemeral-test-root.sh -- target/debug/test-harness run {selector} --include-occasional{prebuilt} --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
                     selector = selector,
                     prebuilt = prebuilt,
                     test = shell_quote(&cell.test),
@@ -4544,7 +4544,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
 
     let exact_cell_command = "printf '125\\n' > harness-status; status=0; \
-        env HERMIT_BIN=\"$PWD/target/release/hermit\" target/debug/test-harness run \
+        env HERMIT_BIN=\"$PWD/target/release/hermit\" ./ci/run-with-ephemeral-test-root.sh -- target/debug/test-harness run \
         --include-manual --test fixture --mode verify \
         --results results.in-progress.jsonl --junit junit.in-progress.xml || status=$?; \
         if test -e results.in-progress.jsonl; then \

@@ -140,7 +140,8 @@ jobs:
           bash -euo pipefail -c '
             target/debug/test-harness build --lane privileged --category applications \
               --ci-only --include-occasional
-            target/debug/test-harness run --lane privileged --category applications \
+            exec ./ci/run-with-hermit-e2e-artifact.sh \
+              target/debug/test-harness run --lane privileged --category applications \
               --ci-only --include-occasional --prebuilt \
               --results ignored/e2e/privileged/occasional/results.jsonl \
               --junit ignored/e2e/privileged/occasional/junit.xml

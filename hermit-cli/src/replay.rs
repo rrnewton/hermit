@@ -33,6 +33,10 @@ use crate::replayer::Replayer;
 type ReplayTool = detcore::Detcore<Replayer>;
 type Tracer = reverie_ptrace::Tracer<detcore::GlobalState>;
 
+fn replay_mount_namespace_prelude() -> [Mount; 1] {
+    [Mount::new("/").rprivate()]
+}
+
 /// Represents a replay that is currently running.
 pub struct Replay {
     // The running tracee.
@@ -83,6 +87,12 @@ impl Replay {
         let chroot =
             prepare_chroot(dir, &metadata).context("Failed to create chroot environment")?;
 
+        // A new mount namespace inherits the parent's propagation flags. Make
+        // its root recursively private before applying replay mounts so no
+        // mount event can escape to a shared host root.
+        for mount in replay_mount_namespace_prelude() {
+            command.mount(mount);
+        }
         for mount in prepare_replay_mounts(&chroot, mounts)? {
             command.mount(mount);
         }
@@ -312,6 +322,14 @@ fn populate_recorded_exec_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_makes_root_private_before_requested_mounts() {
+        assert_eq!(
+            replay_mount_namespace_prelude(),
+            [Mount::new("/").rprivate()]
+        );
+    }
 
     #[test]
     fn requested_mount_targets_are_rebased_into_the_replay_chroot() {

@@ -21,7 +21,7 @@ set -euo pipefail
 case ${1:-} in
     --prepare) exit 0 ;;
     --run)
-        work="${E2E_TMPDIR:-/tmp}/dd-partial"
+        work="${E2E_TMPDIR:-.}/dd-partial"
         rm -rf "$work"; mkdir -p "$work"
         src="$work/src.bin"
         # Deterministic, compressible-but-not-uniform 4096-byte payload.
@@ -35,6 +35,8 @@ case ${1:-} in
 
         # Byte-at-a-time through a pipe: the reader cannot get a full block, so
         # every transfer is partial.
+        # `cat` is intentionally the pipe writer under test.
+        # shellcheck disable=SC2002
         piped=$(cat "$src" | dd bs=1 status=none | wc -c | tr -d '[:space:]')
         printf 'PIPED %s\n' "$piped"
         if [ "$piped" -ne 4096 ]; then

@@ -6611,9 +6611,9 @@ test:
           - sabre
         guest_args:
           ptrace:
-            - README.md
+            - ./README.md
           sabre:
-            - README.md
+            - ./README.md
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately

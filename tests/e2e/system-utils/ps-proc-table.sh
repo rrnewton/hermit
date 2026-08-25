@@ -22,6 +22,7 @@ set -euo pipefail
 case ${1:-} in
     --prepare) exit 0 ;;
     --run)
+        E2E_TMPDIR=${E2E_TMPDIR:-.}
         # Walk the whole table. Sorted so the report does not depend on the
         # order /proc happens to enumerate, which is a separate contract.
         work="${E2E_TMPDIR:-/tmp}"
