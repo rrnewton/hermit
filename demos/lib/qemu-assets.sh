@@ -6,7 +6,9 @@ set -euo pipefail
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$LIB_DIR/../.." && pwd)"
 HERMIT_REPO="${HERMIT_REPO:-$ROOT/hermit}"
-ARTIFACT_DIR="${QEMU_ASSETS:-$ROOT/ignored/qemu-linux}"
+# shellcheck source=qemu-paths.sh
+source "$LIB_DIR/qemu-paths.sh"
+ARTIFACT_DIR="${QEMU_ASSETS:-$(qemu_default_assets "$ROOT")}"
 BUSYBOX="${BUSYBOX:-$(command -v busybox || true)}"
 KERNEL_SHA256="${QEMU_KERNEL_SHA256:-e4b1c0248a31c7e1f7cb31d82a1a03d4e7cab408ee1b8e622dd897c17eae46a2}"
 DEFAULT_KERNEL_URL="https://github.com/rrnewton/dev-hermit/releases/download/qemu-kernel-$KERNEL_SHA256/bzImage"

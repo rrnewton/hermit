@@ -23,10 +23,27 @@ import tempfile
 import time
 from typing import Iterator, Optional, Tuple
 
+from demo_common import hermit_tmp_args
+
 
 XZ_MAGIC = b"\xfd7zXZ\x00"
 ELF_MAGIC = b"\x7fELF"
 VMCOREINFO_MARKER = b"OSRELEASE="
+COMMAND_IMAGE_BYTES = 4096
+
+
+def _write_command_image(path: Path, command: str) -> None:
+    """Write the fixed-size command disk consumed by the resumed guest."""
+    if "\n" in command or "\r" in command:
+        raise ValueError("command-disk command must be one line")
+    payload = command.encode("utf-8") + b"\n"
+    if len(payload) > COMMAND_IMAGE_BYTES:
+        raise ValueError(
+            "guest command is {} bytes, over the {}-byte image".format(
+                len(payload), COMMAND_IMAGE_BYTES
+            )
+        )
+    path.write_bytes(payload + b"\0" * (COMMAND_IMAGE_BYTES - len(payload)))
 
 
 @dataclass(frozen=True)
@@ -39,6 +56,7 @@ class GuestConfig:
     vmlinux: Path
     snapshot_disk: Path
     snapshot_name: str
+    advance_command: str
     artifact_dir: Path
     qemu_bios: Optional[Path] = None
     qemu_library_path: Optional[Path] = None
@@ -601,6 +619,12 @@ class HermitGuestProgram:
             os.mkfifo(str(serial_pipe) + suffix)
         working_snapshot = self.run_dir / "snapshot.qcow2"
         shutil.copyfile(str(self.config.snapshot_disk), str(working_snapshot))
+        # Demo 5 records this virtio-blk device in the saved VM topology, and the
+        # current initramfs waits for its command here rather than on serial. Supply
+        # the real deterministic advance command before -loadvm, with the same
+        # fixed geometry used by Demos 5 and 6.
+        command_image = self.run_dir / "guest-command.img"
+        _write_command_image(command_image, self.config.advance_command)
 
         qemu_command = [
             str(self.config.qemu),
@@ -616,6 +640,10 @@ class HermitGuestProgram:
             "-drive", "if=none,id=hermit-snapshot-store,file={},format=qcow2".format(
                 working_snapshot
             ),
+            "-drive", "if=none,id=hermit-command,file={},format=raw,readonly=on".format(
+                command_image
+            ),
+            "-device", "virtio-blk-pci,drive=hermit-command",
             "-loadvm", self.config.snapshot_name,
             "-S",
             "-icount", "shift=0,sleep=off",
@@ -629,6 +657,7 @@ class HermitGuestProgram:
         command = [
             str(self.config.hermit),
             "run",
+            *hermit_tmp_args(self.config.root),
             "--strict",
             "--no-rcb-time",
             "--target-timeslice", "100000",
@@ -790,17 +819,18 @@ class HermitGuestProgram:
 
     def advance(self, command: str, marker: bytes) -> None:
         """Run one fixed guest command interval, then freeze at its marker."""
-        if not self._frozen or self._serial_write_fd is None or self._qmp is None:
+        if not self._frozen or self._qmp is None:
             raise RuntimeError("guest is not ready for deterministic advance")
         if self._tracer_tgid is None or self._qemu_pid is None:
             raise RuntimeError("traced processes are unavailable")
         if b"\n" in marker or "\n" in command or "\r" in command:
             raise ValueError("advance command and marker must each be one line")
+        if command != self.config.advance_command:
+            raise ValueError("advance command differs from the preloaded command disk")
 
-        # Queue the deterministic input while the tracee and tracer are frozen.
-        # Once the tracer resumes, QEMU can accept it but the vCPU remains paused
-        # until the explicit QMP cont below.
-        os.write(self._serial_write_fd, command.encode("utf-8") + b"\n")
+        # The deterministic input was preloaded on the command disk before QEMU
+        # restored the snapshot. Resume the frozen tracee, then wait on serial only
+        # for the guest's completion marker.
         os.kill(self._tracer_tgid, signal.SIGCONT)
         self._frozen = False
         self._qmp.execute("cont")
