@@ -1414,25 +1414,50 @@ land on no information at all.
 | hermit#2587 | `UNKNOWN/UNKNOWN` at t+0s, `MERGEABLE/CLEAN` by t+20s |
 | hermit#2588 | `UNKNOWN/UNKNOWN` at t+0, +20, +40, +60, +85, +110, +135s |
 
-⚠️ **And then hermit#2588 MERGED — at 17:41:08Z, merge commit `7ee6853ede0d` —
-while `mergeable` still read `UNKNOWN`, which it still reads on the merged pull
-request.** So the field is not merely slow. It can stay `UNKNOWN` through a
-successful merge and afterwards. A lander that waits for `MERGEABLE` before
-acting would have waited forever on a head that merged cleanly; a lander that
-read `UNKNOWN` as `CONFLICTING` would have reported a conflict that did not
-exist.
+⚠️ **And then hermit#2588 MERGED — at 17:41:08Z, landing commit `7ee6853ede0d` —
+while `mergeable` still read `UNKNOWN`.** So the field is not merely slow. It can
+stay `UNKNOWN` straight through a successful merge. A lander that waits for
+`MERGEABLE` before acting would have waited forever on a head that merged
+cleanly; a lander that read `UNKNOWN` as `CONFLICTING` would have reported a
+conflict that did not exist.
+
+A *landing* commit, not a merge commit: `7ee6853ede0d` has ONE parent, because
+merge commits are disabled here — the subject of "landing rewrites the SHA"
+above. The API field is spelled `mergeCommit` and returns the rewritten commit
+anyway (#2588's head was `4da9bdfaf843`), so its name is not evidence of a second
+parent. This section's own example is an instance of the rule two sections up.
+
+⚠️ **Reading it AFTER the merge proves nothing either — and specifically it is not
+evidence about #2588.** hermit#2587, which the table above shows reaching
+`MERGEABLE/CLEAN` at t+20s, ALSO reads `UNKNOWN` once merged. Both merged pull
+requests report `UNKNOWN`, including the one that resolved cleanly, so the
+post-merge reading is uniform across the set and discriminates nothing. A
+comparison over a uniform set is not a comparison. The finding is the PRE-merge
+column of the table: seven polls across 135s, merged straight through.
 
 Do not poll it unboundedly and do not infer from it. When it matters, **answer
 the question locally instead** — this needs no API and works from a
 proxy-blocked box:
 
 ```console
-git fetch -q <remote> refs/heads/<branch>:h refs/heads/main:m
+git fetch -q <remote> +refs/heads/<branch>:h +refs/heads/main:m
 git merge-tree --write-tree m h >/dev/null && echo MERGES-CLEAN || echo CONFLICTS
 ```
 
+⚠️ **The leading `+` on each refspec is load-bearing, not tidiness.** Without it
+the second run is REJECTED as non-fast-forward the moment the head has been
+rebased or force-pushed — which is the normal path to landing here, and therefore
+exactly the head you re-check most often. It fails loudly rather than returning a
+wrong answer, but it fails when you need it. Measured both ways on 2026-08-25:
+against a scratch remote the un-prefixed second fetch is rejected after a
+force-push; and the `+` form ran twice against hermit#2596 minutes apart, across
+a real rebase that moved that head from `660e5018e82d` to `8c91aa34cb83`, and
+answered both times without complaint.
+
 That computes the same thing GitHub is computing, from objects you already have,
-with an exit status you can read directly. `mergeable` is then a convenience to
+with an exit status you can read directly. It also fails for the reason it names
+— `git merge-tree --write-tree` exits 1 on a real conflict and 0 when clean,
+checked both directions on a constructed pair under git 2.53.0. `mergeable` is then a convenience to
 be believed when it says `MERGEABLE` or `CONFLICTING`, and ignored when it does
 not.
 
