@@ -37,10 +37,11 @@
 # CI already runs it as separate jobs: `build-debug` and `build-release` execute
 # the build-side node sets and publish a prebuilt tree, then the shard jobs
 # execute their own node sets against it. This script reads THE SAME KEYS with
-# THE SAME jq expressions as .github/workflows/ci-portable.yml, so the local
-# ordering cannot drift from the GitHub one. ci/check-shard-coverage.sh already
-# fails closed if that map drifts from ci/dag/portable.json, so the partition
-# stays total by construction.
+# THE SAME jq expressions as .github/workflows/ci-portable.yml. The
+# e2e.manifest_* nodes are intentionally outside that shard map; a full run
+# appends them directly from ci/dag/portable.json, in DAG order. Their selected
+# portable-cell count comes from ci/expected-e2e-plan.json. Nothing is duplicated
+# here, so node or cell additions cannot silently fall out of this path.
 #
 # THE PARTITION IS THE SHARD MAP, NOT THE `group` FIELD. A naive implementation
 # gets this wrong in both directions:
@@ -71,7 +72,8 @@
 #   usage: run-split-validate.sh [options]
 #     --lane LANE        portable (default) | privileged
 #     --out DIR          phase-boundary directory (default ignored/hermetic/split)
-#     --shards a,b,c     run only these test shard slugs (default: all)
+#     --shards a,b,c     partial/debug run: only these test shard slugs; skips
+#                        the full e2e.manifest_* population (default: all)
 #     --fetch-only       run the fetch phase and stop
 #     --offline-only     run the offline phase only (fetch must have run before)
 #     --seed-cargo DIR   warm-start the CARGO_HOME by reflink from DIR (usually
@@ -114,7 +116,14 @@ done
 }
 
 MAP="$ROOT/ci/portable-shards.json"
+DAG="$ROOT/ci/dag/portable.json"
+EXPECTED_E2E_PLAN="$ROOT/ci/expected-e2e-plan.json"
 [[ -f "$MAP" ]] || { echo "run-split-validate: missing $MAP" >&2; exit 2; }
+[[ -f "$DAG" ]] || { echo "run-split-validate: missing $DAG" >&2; exit 2; }
+[[ -f "$EXPECTED_E2E_PLAN" ]] || {
+    echo "run-split-validate: missing $EXPECTED_E2E_PLAN" >&2
+    exit 2
+}
 
 # The SAME jq expressions ci-portable.yml uses, so the two cannot disagree.
 build_nodes=$(jq -r '(.preflight_nodes + .build_debug_nodes + .build_dbt_nodes + .build_aux_nodes)|join(",")' "$MAP")
@@ -132,6 +141,67 @@ if [[ -n "$shards" ]]; then
 else
     test_nodes=$(jq -r '[ (.debug_shards[], .release_shards[]).nodes[] ]|join(",")' "$MAP")
 fi
+shard_node_count=$(tr ',' '\n' <<<"$test_nodes" | wc -l)
+
+# The shard map deliberately excludes manifest buckets because GitHub fans
+# those out as cells. Local split validation still has to run the complete
+# portable DAG, so append exactly the manifest nodes declared by that DAG. Keep
+# --shards useful for focused debugging by adding these only on the default full
+# run. jq preserves .steps order, which preserves the DAG's declared ordering.
+e2e_nodes=""
+e2e_node_count=0
+e2e_cell_count=0
+if [[ -z "$shards" ]]; then
+    e2e_nodes=$(jq -er '[
+        .steps[]
+        | "\(.group).\(.job)"
+        | select(startswith("e2e.manifest_"))
+    ] | if length > 0 then join(",") else error("no e2e.manifest_* nodes") end' "$DAG")
+    e2e_node_count=$(tr ',' '\n' <<<"$e2e_nodes" | wc -l)
+    e2e_cell_count=$(jq -er '
+        [.cells[] | select(.lane == "portable")] as $portable
+        | if (.schema == 1 and ($portable | length) > 0)
+          then $portable | length
+          else error("invalid or empty portable E2E plan")
+          end
+    ' "$EXPECTED_E2E_PLAN")
+    missing_e2e_categories=$(comm -23 \
+        <(jq -r '[.cells[] | select(.lane == "portable") | .category] | unique[]' \
+            "$EXPECTED_E2E_PLAN") \
+        <(jq -r '[
+            .steps[]
+            | select(("\(.group).\(.job)" | startswith("e2e.manifest_")))
+            | .manifest.category
+        ] | unique[]' "$DAG") || true)
+    [[ -z "$missing_e2e_categories" ]] || {
+        echo "run-split-validate: portable E2E plan categories have no manifest DAG node:" >&2
+        printf '  %s\n' $missing_e2e_categories >&2
+        exit 1
+    }
+    test_nodes="$test_nodes,$e2e_nodes"
+fi
+
+build_node_count=$(tr ',' '\n' <<<"$build_nodes" | wc -l)
+test_node_count=$(tr ',' '\n' <<<"$test_nodes" | wc -l)
+total_node_count=$((build_node_count + test_node_count))
+if [[ -z "$shards" ]]; then
+    selected_list=$(tr ',' '\n' <<<"$build_nodes,$test_nodes" | LC_ALL=C sort)
+    duplicate_nodes=$(uniq -d <<<"$selected_list" || true)
+    expected_list=$(jq -r '.steps[] | "\(.group).\(.job)"' "$DAG" | LC_ALL=C sort)
+    duplicate_dag_nodes=$(uniq -d <<<"$expected_list" || true)
+    selected_unique=$(uniq <<<"$selected_list")
+    expected_unique=$(uniq <<<"$expected_list")
+    missing_nodes=$(comm -23 <(printf '%s\n' "$expected_unique") <(printf '%s\n' "$selected_unique") || true)
+    extra_nodes=$(comm -13 <(printf '%s\n' "$expected_unique") <(printf '%s\n' "$selected_unique") || true)
+    if [[ -n "$duplicate_nodes" || -n "$duplicate_dag_nodes" || -n "$missing_nodes" || -n "$extra_nodes" ]]; then
+        echo "run-split-validate: full portable node selection does not exactly match $DAG." >&2
+        [[ -z "$duplicate_nodes" ]] || printf '  duplicate selection: %s\n' $duplicate_nodes >&2
+        [[ -z "$duplicate_dag_nodes" ]] || printf '  duplicate DAG node: %s\n' $duplicate_dag_nodes >&2
+        [[ -z "$missing_nodes" ]] || printf '  missing: %s\n' $missing_nodes >&2
+        [[ -z "$extra_nodes" ]] || printf '  extra: %s\n' $extra_nodes >&2
+        exit 1
+    fi
+fi
 
 cargo_home="$out/cargo"
 target_dir="$out/target"
@@ -139,8 +209,11 @@ target_dir="$out/target"
 echo "== phase boundary: $out"
 echo "== FETCH phase   (host, WITH network): cargo fetch --locked, no build output"
 echo "== OFFLINE phase (pinned root, NO network): build then test, in one place"
-echo "     build-side: $(tr ',' '\n' <<<"$build_nodes" | wc -l) node(s)"
-echo "     test-side:  $(tr ',' '\n' <<<"$test_nodes" | wc -l) node(s)"
+echo "     build-side: $build_node_count node(s)"
+echo "     test-side:  $test_node_count node(s) ($shard_node_count shard + $e2e_node_count manifest)"
+if [[ -n "$e2e_nodes" ]]; then
+    echo "     e2e cells:  $e2e_cell_count selected portable cell(s)"
+fi
 
 if [[ $dry -eq 1 ]]; then
     echo
@@ -148,6 +221,7 @@ if [[ $dry -eq 1 ]]; then
     echo "   CARGO_HOME=$cargo_home cargo fetch --locked"
     echo "-- offline phase would run, inside the pinned root, --network=none:"
     echo "   ci/hermetic/assert-no-network.sh"
+    echo "   verify pinned developer tools and required guest commands"
     echo "   ci/run-node.sh $lane $build_nodes"
     echo "   ci/run-node.sh $lane $test_nodes"
     exit 0
@@ -206,9 +280,48 @@ if [[ $do_offline -eq 1 ]]; then
         -- bash -c '
             set -euo pipefail
             /src/ci/hermetic/assert-no-network.sh
+
+            # Fail before a DAG node can report a misleading product failure.
+            # The image owns these pins; the runner verifies what it was given
+            # and names every executable required by the selected portable
+            # population, including commands reached inside shell fixtures.
+            command -v rust-script >/dev/null || {
+                echo "run-split-validate: pinned root is missing rust-script" >&2
+                exit 2
+            }
+            command -v cargo-nextest >/dev/null || {
+                echo "run-split-validate: pinned root is missing cargo-nextest" >&2
+                exit 2
+            }
+            rust_script_actual=$(rust-script --version)
+            [[ "$rust_script_actual" == *" ${HERMIT_RUST_SCRIPT_VERSION}"* ]] || {
+                echo "run-split-validate: rust-script version mismatch: $rust_script_actual" >&2
+                exit 2
+            }
+            nextest_actual=$(cargo-nextest --version)
+            [[ "$nextest_actual" == *" ${HERMIT_CARGO_NEXTEST_VERSION}"* ]] || {
+                echo "run-split-validate: cargo-nextest version mismatch: $nextest_actual" >&2
+                exit 2
+            }
+            for tool in ar bash cc c++ du find gawk hexdump jq lua m4 mcookie node \
+                        openssl perl ps python3 ruby rustc sqlite3 ssh-keygen tclsh \
+                        uuidgen zstd; do
+                command -v "$tool" >/dev/null || {
+                    echo "run-split-validate: pinned root is missing required tool: $tool" >&2
+                    exit 2
+                }
+            done
+            for path in /usr/bin/bash /usr/bin/date /usr/bin/du /usr/bin/find \
+                        /usr/bin/python3 /usr/bin/sort /usr/bin/tr; do
+                [[ -x "$path" ]] || {
+                    echo "run-split-validate: pinned root is missing required FHS path: $path" >&2
+                    exit 2
+                }
+            done
+
             echo ":: build-side nodes"
             /src/ci/run-node.sh '"$lane"' '"$build_nodes"'
-            echo ":: test-side nodes"
+            echo ":: test-side nodes ('"$shard_node_count"' shard + '"$e2e_node_count"' manifest; '"$e2e_cell_count"' selected portable cells)"
             exec /src/ci/run-node.sh '"$lane"' '"$test_nodes"'
         '
 fi

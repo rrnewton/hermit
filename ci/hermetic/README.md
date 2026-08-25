@@ -5,8 +5,12 @@ the default is stage 3 and the owner's call on the evidence this produces.
 
 ## What this is
 
-A nix-built OCI image that pins the toolchain and every system executable a
-manifest runs as a hermit guest, plus a runner that executes a command inside it.
+A nix-built OCI image that pins the toolchain, the exact `rust-script 0.36.0`
+and `cargo-nextest 0.9.100` developer tools used by portable CI, and every
+system executable a required portable manifest cell runs as a hermit guest,
+plus a runner that executes a command inside it. The guest-tool inventory was
+audited from the selected portable population, including commands reached
+through shell fixtures rather than only top-level `program` entries.
 The shape is stage 1's recommendation unchanged: the existing outer
 `systemd-run`, `validate-lock` and cgroup policy stay, and this adds only the
 filesystem mechanism — one privileged podman container pinned by digest,
@@ -66,11 +70,15 @@ compile of that same git dependency in 8.78s with no network.
 
 ### Where the phase node sets come from
 
-They are **not invented here.** `ci/portable-shards.json` already partitions the
-DAG, and GitHub CI already runs that partition as separate jobs. The split
-script reads the same keys with the same `jq` expressions as
-`.github/workflows/ci-portable.yml`, and `ci/check-shard-coverage.sh` fails
-closed if the map drifts from `ci/dag/portable.json`.
+They are **not invented here.** `ci/portable-shards.json` partitions the
+non-manifest DAG nodes, and GitHub CI runs that partition as separate jobs. The
+split script reads the same keys with the same `jq` expressions as
+`.github/workflows/ci-portable.yml`. On a default full run it then reads the
+`e2e.manifest_*` nodes directly from `ci/dag/portable.json`, in DAG order, and
+counts the selected portable cell population from `ci/expected-e2e-plan.json`
+at runtime. It exact-compares the combined build/test selection with every DAG
+node and rejects missing, extra or duplicate identities. `--shards` remains an
+explicit partial/debug mode and skips the manifest population.
 
 Two things worth knowing before touching this:
 
@@ -189,8 +197,11 @@ runner — is stage-3 integration work and is **not** done here.
 So what is proven today is the boundary and the toolchain, end to end:
 `assert-no-network.sh` passes inside the container, `cargo metadata` and a real
 compile of the pinned `reverie` git dependency succeed offline, and `cargo
-fetch` inside the phase is refused. What is **not** yet proven is a full
-39-node validate running to completion in the pinned root.
+fetch` inside the phase is refused. The split driver now selects the complete
+portable DAG and its selected portable cell population, with both counts derived
+from canonical repository data at runtime. What is **not** yet proven is that
+this full selection runs to completion in the pinned root; the cgroup
+integration limitation above still applies.
 
 ## Notes from building this
 
