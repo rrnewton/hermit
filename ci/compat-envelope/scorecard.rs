@@ -88,6 +88,11 @@ struct ManifestRow {
     enabled: bool,
     lane: String,
     mode: String,
+    /// Why this backend is not enabled for this mode, verbatim from the
+    /// manifest. Present exactly when `enabled` is false. See
+    /// [`CellStatus::NotApplicable`].
+    #[serde(default)]
+    not_applicable_reason: Option<String>,
     test: String,
 }
 
@@ -157,6 +162,10 @@ struct TrackedCell {
     status: CellStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ci_disabled_reason: Option<CiDisabledReasonData>,
+    /// Why this cell is [`CellStatus::NotApplicable`], verbatim from the
+    /// manifest. Present exactly when the status is `NotApplicable`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    not_applicable_reason: Option<String>,
     /// Last recorded exercise of this cell. See [`LastTested`] -- absence means
     /// no writer recorded one, NOT that the cell was never run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -200,6 +209,20 @@ struct CiDisabledReasonData {
 enum CellStatus {
     Green,
     Red,
+    /// The backend is not enabled for this test and mode, so the cell was never
+    /// asked to do anything and cannot have failed.
+    ///
+    /// ⚠️ THIS EXISTS BECAUSE `Red` WAS CARRYING THREE MEANINGS AT ONCE: it
+    /// failed, it was never measured, and it does not apply. Measured
+    /// 2026-08-25: of 5,317 red cells, exactly TWO carried any observation, and
+    /// 4,940 were cells whose backend is not enabled for their mode. A reader
+    /// seeing 5,317 reds was reading 93% not-applicable as failure.
+    ///
+    /// It is DERIVED FROM `enabled`, never asserted independently, and it always
+    /// carries the manifest's own reason string -- so it cannot drift from the
+    /// manifest and it cannot be set without saying why.
+    #[serde(rename = "not-applicable")]
+    NotApplicable,
 }
 
 /// WHICH MECHANISM produced an observation. Two mechanisms answer two different
@@ -976,6 +999,7 @@ struct Derived {
     population: BTreeSet<CellId>,
     enabled: BTreeSet<CellId>,
     ci_disabled_reasons: BTreeMap<CellId, CiDisabledReasonData>,
+    not_applicable_reasons: BTreeMap<CellId, String>,
     selected: BTreeSet<CellId>,
     green: BTreeSet<CellId>,
 }
@@ -1202,6 +1226,7 @@ fn derive(root: &Path) -> Result<Derived, String> {
     let mut enabled = BTreeSet::new();
     let mut ci_enabled = BTreeSet::new();
     let mut ci_disabled_reasons = BTreeMap::new();
+    let mut not_applicable_reasons = BTreeMap::new();
     for row in rows {
         let comparable = row.mode != "custom";
         let id = CellId {
@@ -1245,11 +1270,25 @@ fn derive(root: &Path) -> Result<Derived, String> {
                 })?;
                 ci_disabled_reasons.insert(id, reason);
             }
-        } else if row.ci_disabled_reason.is_some() {
-            return Err(format!(
-                "disabled cell carries ci_disabled_reason: {}",
-                display_id(&id)
-            ));
+        } else {
+            // A cell whose backend is not enabled for this mode is NOT
+            // APPLICABLE, not failing. It must say why, and the manifest already
+            // requires a reason for every disabled backend -- so an absent one
+            // here means the plan emitter dropped it, which is worth refusing
+            // rather than rendering as an unexplained red.
+            if row.ci_disabled_reason.is_some() {
+                return Err(format!(
+                    "disabled cell carries ci_disabled_reason: {}",
+                    display_id(&id)
+                ));
+            }
+            let reason = row.not_applicable_reason.ok_or_else(|| {
+                format!(
+                    "disabled cell has no not_applicable_reason: {}",
+                    display_id(&id)
+                )
+            })?;
+            not_applicable_reasons.insert(id, reason);
         }
     }
     let selected: BTreeSet<CellId> = expected.cells.into_iter().collect();
@@ -1275,6 +1314,7 @@ fn derive(root: &Path) -> Result<Derived, String> {
         population,
         enabled,
         ci_disabled_reasons,
+        not_applicable_reasons,
         selected,
         green,
     })
@@ -1334,10 +1374,11 @@ accepts a result only when the typed report says `verified=true`, `verdict=match
 `record_envelope`, and both INFO-message counts are nonzero. Bare `--verify` remains a Stripped \
 comparison when invoked directly and does not satisfy \
 this regression plan. These same-backend results do not establish cross-backend parity.\n\n\
-| Backend | Green | Red | Total |\n\
-| --- | ---: | ---: | ---: |\n",
+| Backend | Green | Red | Not applicable | Total |\n\
+| --- | ---: | ---: | ---: | ---: |\n",
     );
     let mut green_total = 0usize;
+    let mut na_total = 0usize;
     let mut total = 0usize;
     for backend in &ordered {
         let backend_total = derived
@@ -1350,16 +1391,25 @@ this regression plan. These same-backend results do not establish cross-backend 
             .iter()
             .filter(|id| id.backend == *backend)
             .count();
+        // NOT APPLICABLE IS SUBTRACTED FROM RED, NOT ADDED TO THE TOTAL. The
+        // population is unchanged; what changes is that a cell whose backend is
+        // not enabled for this mode stops being counted as a failure.
+        let backend_na = derived
+            .population
+            .iter()
+            .filter(|id| id.backend == *backend && !derived.enabled.contains(*id))
+            .count();
         green_total += backend_green;
+        na_total += backend_na;
         total += backend_total;
         out.push_str(&format!(
-            "| `{backend}` | {backend_green} | {} | {backend_total} |\n",
-            backend_total - backend_green
+            "| `{backend}` | {backend_green} | {} | {backend_na} | {backend_total} |\n",
+            backend_total - backend_green - backend_na
         ));
     }
     out.push_str(&format!(
-        "| **Total** | **{green_total}** | **{}** | **{total}** |\n\n",
-        total - green_total
+        "| **Total** | **{green_total}** | **{}** | **{na_total}** | **{total}** |\n\n",
+        total - green_total - na_total
     ));
     // DENOMINATOR PROVENANCE. Emitted from the derived population, never
     // hand-written, so it cannot go stale and cannot be forgotten.
@@ -1393,6 +1443,13 @@ Green is **{green_total} of {total}**, which is **{percent:.2}%** — over THIS 
 other. The population is every combination the manifest declares, and it is composed of:\n\n\
 - backends: {}\n\
 - modes: {}\n\n\
+⚠️ **{na} of those {total} cells are NOT APPLICABLE** — their backend is not enabled for their \
+mode, so they were never asked to run and cannot pass or fail. Over the {applicable} cells that \
+CAN run, green is **{applicable_percent:.2}%**.\n\n\
+⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same {green_total} green cells \
+measured against a smaller denominator. Nothing was fixed to produce it; it is what the first \
+figure always meant once the cells that cannot run are excluded. Quote both or neither, and never \
+compare one against the other as though something moved.\n\n\
 ⚠️ **Adding or removing a backend or mode changes this denominator and therefore the percentage, \
 without anything about the product changing.** Removing a backend whose cells are mostly red \
 RAISES the reported figure; adding honest red cells LOWERS it. Neither is progress. Before \
@@ -1408,6 +1465,13 @@ numbers are not comparable and the difference is not a result.\n\n",
             .map(|m| format!("`{m}`"))
             .collect::<Vec<_>>()
             .join(", "),
+        na = na_total,
+        applicable = total - na_total,
+        applicable_percent = if total == na_total {
+            0.0
+        } else {
+            100.0 * green_total as f64 / (total - na_total) as f64
+        },
     ));
     out.push_str(
         "The mode view makes the current order of work explicit: expand `verify` first, then \
@@ -1588,18 +1652,27 @@ fn tracked_from(
             // derivation recomputes STATUS from the manifest and the plan, and
             // must not discard measured evidence while doing so.
             let last_tested = previous.get(&id).and_then(|cell| cell.last_tested.clone());
-            let status = if derived.green.contains(&id) {
+            let enabled = derived.enabled.contains(&id);
+            // ORDER MATTERS: applicability is decided BEFORE pass/fail, because a
+            // cell whose backend is not enabled for this mode was never asked to
+            // run and so cannot be a failure. Deciding green/red first and then
+            // trying to except the not-applicable ones is how 4,940 cells came to
+            // be rendered as red.
+            let status = if !enabled {
+                CellStatus::NotApplicable
+            } else if derived.green.contains(&id) {
                 CellStatus::Green
             } else {
                 CellStatus::Red
             };
-            let enabled = derived.enabled.contains(&id);
             let ci_disabled_reason = derived.ci_disabled_reasons.get(&id).cloned();
+            let not_applicable_reason = derived.not_applicable_reasons.get(&id).cloned();
             TrackedCell {
                 id,
                 enabled,
                 status,
                 ci_disabled_reason,
+                not_applicable_reason,
                 last_tested,
                 observations,
                 measurement: MeasurementState::NeverMeasured,
@@ -1846,10 +1919,19 @@ fn update_tracked(
         .map_err(|e| format!("cannot write {SCORECARD}: {e}"))?;
     fs::write(root.join(CELLS), encoded_cells(&cells)?)
         .map_err(|e| format!("cannot write {CELLS}: {e}"))?;
+    // NOT APPLICABLE IS REPORTED SEPARATELY, NOT FOLDED INTO RED. This line is
+    // the number people quote; leaving it as "population minus green" is exactly
+    // how 4,940 never-applicable cells were read as failures.
+    let not_applicable = derived
+        .population
+        .iter()
+        .filter(|id| !derived.enabled.contains(*id))
+        .count();
     println!(
-        "compatibility scorecard: wrote {} green / {} red / {} total",
+        "compatibility scorecard: wrote {} green / {} red / {} not-applicable / {} total",
         derived.green.len(),
-        derived.population.len() - derived.green.len(),
+        derived.population.len() - derived.green.len() - not_applicable,
+        not_applicable,
         derived.population.len()
     );
     Ok(())
@@ -3331,6 +3413,7 @@ fn self_test() -> Result<(), String> {
         population: BTreeSet::from([id.clone()]),
         enabled: BTreeSet::from([id.clone()]),
         ci_disabled_reasons: BTreeMap::from([(id.clone(), visible_reason.clone())]),
+        not_applicable_reasons: BTreeMap::new(),
         selected: BTreeSet::new(),
         green: BTreeSet::new(),
     };
@@ -3348,6 +3431,7 @@ fn self_test() -> Result<(), String> {
             enabled: true,
             status: CellStatus::Green,
             ci_disabled_reason: None,
+            not_applicable_reason: None,
             last_tested: None,
             observations: Vec::new(),
             measurement: MeasurementState::NeverMeasured,
@@ -3357,6 +3441,7 @@ fn self_test() -> Result<(), String> {
         population: BTreeSet::from([id.clone()]),
         enabled: BTreeSet::from([id.clone()]),
         ci_disabled_reasons: BTreeMap::new(),
+        not_applicable_reasons: BTreeMap::new(),
         selected: BTreeSet::new(),
         green: BTreeSet::new(),
     };
@@ -3371,6 +3456,7 @@ fn self_test() -> Result<(), String> {
             enabled: true,
             status: CellStatus::Green,
             ci_disabled_reason: None,
+            not_applicable_reason: None,
             last_tested: None,
             observations: Vec::new(),
             measurement: MeasurementState::NeverMeasured,
@@ -3387,6 +3473,7 @@ fn self_test() -> Result<(), String> {
             enabled: false,
             status: CellStatus::Red,
             ci_disabled_reason: None,
+            not_applicable_reason: None,
             last_tested: None,
             observations: Vec::new(),
             measurement: MeasurementState::NeverMeasured,
@@ -3900,6 +3987,7 @@ fn self_test() -> Result<(), String> {
             enabled: true,
             status,
             ci_disabled_reason: None,
+            not_applicable_reason: None,
             last_tested: None,
             measurement: MeasurementState::NeverMeasured,
             observations,
@@ -4171,6 +4259,7 @@ fn self_test() -> Result<(), String> {
                 enabled: true,
                 status: CellStatus::Red,
                 ci_disabled_reason: None,
+                not_applicable_reason: None,
                 last_tested: None,
                 observations: Vec::new(),
                 measurement: MeasurementState::NeverMeasured,
@@ -4297,6 +4386,7 @@ fn self_test() -> Result<(), String> {
         population: BTreeSet::from([boundary_id.clone()]),
         enabled: BTreeSet::from([boundary_id.clone()]),
         ci_disabled_reasons: BTreeMap::new(),
+        not_applicable_reasons: BTreeMap::new(),
         selected: BTreeSet::from([boundary_id.clone()]),
         green: BTreeSet::new(),
     };

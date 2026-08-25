@@ -46,6 +46,19 @@ struct PlanRow {
     ci: bool,
     ci_disabled_reason: Option<CiDisabledReasonData>,
     enabled: bool,
+    /// Why this backend is not enabled for this mode, verbatim from the
+    /// manifest's `modes.<mode>.backends_disabled.<backend>`.
+    ///
+    /// ⚠️ THIS IS A DIFFERENT FACT FROM `ci_disabled_reason` AND THE TWO MUST NOT
+    /// BE MERGED. `ci_disabled_reason` explains why an ENABLED cell is left out
+    /// of ordinary CI; this explains why the cell is NOT APPLICABLE AT ALL. A
+    /// cell that was never asked to run cannot have failed, and until this was
+    /// carried the scorecard had nowhere to put that distinction, so it rendered
+    /// 4,940 never-applicable cells as red.
+    ///
+    /// `Some` exactly when `enabled` is false; the manifest already requires a
+    /// non-empty reason for every disabled backend, so this is never invented.
+    not_applicable_reason: Option<String>,
     timeout_seconds: i64,
     attempts: Option<i64>,
 }
@@ -211,6 +224,7 @@ fn main() {
                         "ci": row.ci,
                         "ci_disabled_reason": row.ci_disabled_reason,
                         "enabled": row.enabled,
+                        "not_applicable_reason": row.not_applicable_reason,
                         "timeout_seconds": row.timeout_seconds,
                         "attempts": row.attempts,
                     })
@@ -1074,11 +1088,15 @@ fn validate_mode(
             ci: selected,
             ci_disabled_reason,
             enabled: true,
+            not_applicable_reason: None,
             timeout_seconds,
             attempts,
         });
     }
-    for backend in disabled.keys() {
+    for (backend, reason) in disabled {
+        // The reason is already validated non-empty above, so this carries a
+        // fact the manifest states rather than synthesising one.
+        let not_applicable_reason = reason.as_str().map(str::to_string);
         rows.push(PlanRow {
             bucket: bucket.to_string(),
             id: id.to_string(),
@@ -1088,6 +1106,7 @@ fn validate_mode(
             ci: false,
             ci_disabled_reason: None,
             enabled: false,
+            not_applicable_reason,
             timeout_seconds,
             attempts,
         });
