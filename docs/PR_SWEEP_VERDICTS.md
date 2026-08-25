@@ -1581,6 +1581,61 @@ reviewed is normal; an author binding their own lane is not.
   agent supplied exactly that an hour later. On #2566 the lanes arrived in the
   other order. Neither needed a rebase, a receipt, or a policy change.
 
+## After you land: a merged flag says a merge happened, not that YOUR commit was in it
+
+⚠️ **A commit pushed to a branch that is already in the lander's hands is a
+SILENT loss.** The push succeeds. The pull request merges. The API reports
+`merged: true`. The commit is simply not in the outcome, and nothing anywhere
+reports that it was dropped.
+
+Measured 2026-08-25 on hermit#2577. Three commits were pushed to
+`ci/run-node-targeted-args`. The lander had already snapshotted and rebased the
+branch to `220946c4ab18` — its FIRST commit only — and merged that. The two later
+commits never reached `main`, while the pull request read as delivered.
+
+**The detection is to grep `main` for the change's OWN text**, not to read the
+merged flag:
+
+    git show origin/main:<file> | grep -F "<a distinctive string from the commit>"
+
+Run it once per commit, not once per pull request. On #2577 that produced:
+
+    "Node-command arguments must follow a literal"   run-node.sh: YES   <- landed
+    "exited 2 but for the wrong reason"              *** ABSENT ***
+    "lane CPU budget onto"                           *** ABSENT ***
+
+⚠️ **Choose the probe string carefully, or the check lies in the other
+direction.** A fourth probe on the same sweep, `"The cost is one string per
+check"`, reported ABSENT for text that had landed — the document says *"The fix
+is one string per check"*. Pick a string you can see in `git show HEAD:<file>`
+right now, and treat a single ABSENT as a prompt to re-probe before it is a
+finding. This check has the same failure mode as everything else it protects
+against.
+
+**Two symptoms show the race before the merge, and both are easy to explain
+away:**
+
+- `git ls-remote origin refs/heads/<branch>` and the API's `head.sha`
+  **disagree** — on #2577, branch ref `2bd6a473f3` against API head
+  `220946c4ab18`. Do not write this off as GitHub lag; it was stable across
+  re-reads twenty seconds apart. This is a second reason the standing rule is to
+  take the head from the branch ref AND confirm it against the API, requiring the
+  two to agree: the disagreement is itself the signal.
+- the API head's parent is not the base you pushed from.
+
+**Recovery is cheap if you catch it.** Cherry-pick the orphaned commits onto
+current `main` in a new pull request; they apply clean, because the lander's
+rebase carried the same base. Say in the description that this is not new work
+and show the grep, so a reviewer is not re-reviewing a change they believe they
+already approved.
+
+**And the task-hygiene corollary.** `implemented` plus a pull-request link goes
+stale the moment that pull request merges without your commit. The tags stay
+technically accurate — `implemented` was true, `landed` was never claimed — and
+the note still misleads, because a reader takes "PR #NNNN" next to a merged pull
+request as delivery. Re-verify against `main` before treating a merged pull
+request as delivery, and correct the note in place when it turns out not to be.
+
 ## A lenient reader turns a producer defect into an absence
 
 ⚠️ **Absence is indistinguishable from nothing-to-report.** A reader that skips
