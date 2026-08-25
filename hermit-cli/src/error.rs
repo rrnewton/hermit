@@ -17,19 +17,72 @@ pub use anyhow::Context;
 /// process. This works by converting an error into a string via its `Display`
 /// implementation. Although we lose type information in the process of
 /// converting to a string, this preserves the error message and its error chain.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub enum FailureKind {
+    /// The child reported a failure it decided to report.
+    #[default]
+    Error,
+    /// The child PANICKED and the panic was caught and reported.
+    ///
+    /// ⚠️ THIS IS THE ONE BIT THAT PROSE CANNOT CARRY. A caught panic and a
+    /// reported error arrive at the parent as the same shape -- a message and a
+    /// chain of causes -- so without a discriminant the parent must either
+    /// match on English or call them the same thing. It called them the same
+    /// thing, which is why a tracer panic and a bad flag were indistinguishable.
+    Panic,
+}
+
+/// ⚠️ THE `kind` FIELD IS THE THIRD AND LAST OF ONE CHAIN OF FLATTENINGS.
+/// The same property -- the failure's CLASS -- was destroyed at three different
+/// boundaries, in series on one path:
+///
+///   1. `main`'s `unwrap_or_else` mapped EVERY error to one exit code;
+///   2. `with_container` flattened reverie's typed `RunError::ExitStatus` into
+///      opaque prose with `.context(..)?`;
+///   3. THIS type crosses a process boundary carrying only strings.
+///
+/// They are three distinct boundaries with three mechanisms, but they answer one
+/// question, so one discriminant serves all three. Preserving it here is what
+/// lets the parent classify without parsing English.
+///
+/// Extending a serialized type is safe HERE specifically because the writer and
+/// the reader are the SAME BINARY IMAGE -- hermit's container child and its own
+/// parent -- so there is no cross-version compatibility surface. `serde(default)`
+/// is belt-and-braces so an older record still reads as an ordinary `Error`.
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SerializableError {
     /// The main error.
     error: String,
     /// The chain of causes. This is empty if there are no associated causes.
     context: Vec<String>,
+    /// What CLASS of failure this was. See [`FailureKind`].
+    #[serde(default)]
+    kind: FailureKind,
+}
+
+impl SerializableError {
+    /// The class this failure was reported as.
+    pub fn kind(&self) -> FailureKind {
+        self.kind
+    }
+
+    /// Re-tag an error as a caught panic. Called at the catch site, which is the
+    /// only place that still knows a panic is what happened.
+    pub fn into_panic(mut self) -> Self {
+        self.kind = FailureKind::Panic;
+        self
+    }
 }
 
 impl From<Error> for SerializableError {
     fn from(err: Error) -> Self {
         let error = err.to_string();
         let context = err.chain().skip(1).map(ToString::to_string).collect();
-        Self { error, context }
+        Self {
+            error,
+            context,
+            kind: FailureKind::Error,
+        }
     }
 }
 
@@ -65,6 +118,7 @@ mod tests {
             SerializableError {
                 error: "c".into(),
                 context: vec!["b".into(), "a".into(), "root cause".into(),],
+                kind: FailureKind::Error,
             }
         );
     }
@@ -74,6 +128,7 @@ mod tests {
         let error = Error::from(SerializableError {
             error: "c".into(),
             context: vec!["b".into(), "a".into(), "root cause".into()],
+            kind: FailureKind::Error,
         });
 
         assert_eq!(

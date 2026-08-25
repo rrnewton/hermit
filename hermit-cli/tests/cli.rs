@@ -3366,3 +3366,106 @@ fn hermit_dap_rejects_replay_options_without_replay() {
         String::from_utf8_lossy(&output.stderr),
     );
 }
+
+/// A container child that exits with a status IT DID NOT CHOOSE must be
+/// distinguishable from an ordinary CLI error, and neither may be confused with
+/// the guest's own exit.
+///
+/// ⚠️ MEASURED BEFORE THE FIX, at main `b92c2227fc`: all three arms returned 1
+/// and emitted NO classification at all, so `$?` and stderr agreed on nothing.
+/// The information was never missing — reverie hands hermit a typed
+/// `RunError::ExitStatus`, and `with_container` discarded it with
+/// `.context(..)?`. This test fails if that discard comes back.
+///
+/// It deliberately asserts on the TYPED classification rather than on an exit
+/// code: every value in `0..=255` is a legal guest status, so no exit code can
+/// separate these classes without colliding with some guest.
+#[test]
+fn container_child_exit_is_distinguishable_from_an_ordinary_cli_error() {
+    // (a) The container child dies of a fault `catch_unwind` cannot intercept,
+    // so reverie reports a real typed status rather than a reported error.
+    let child_exit = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .env("HERMIT_TEST_CONTAINER_CHILD_FAULT", "segv")
+        .args(["run", "--strict", "--", "/bin/true"])
+        .output()
+        .expect("failed to run the fault-injected container child");
+    let child_exit_stderr = String::from_utf8_lossy(&child_exit.stderr).into_owned();
+
+    // (c) An ordinary CLI failure: hermit cannot open the requested log file.
+    let cli_error = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log-file",
+            "/nonexistent-directory-for-hermit-cli-test/log",
+            "run",
+            "--strict",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .expect("failed to run the unwritable-log-path case");
+    let cli_error_stderr = String::from_utf8_lossy(&cli_error.stderr).into_owned();
+
+    assert!(
+        child_exit_stderr.contains("HERMIT_INTERNAL_FAILURE class=container-child-exit"),
+        "a container child that exited with an unchosen status must be classified as \
+         such\nstderr:\n{child_exit_stderr}"
+    );
+    assert!(
+        cli_error_stderr.contains("HERMIT_INTERNAL_FAILURE class=cli-error"),
+        "an ordinary CLI error must be classified as such\nstderr:\n{cli_error_stderr}"
+    );
+    // The whole point: the two must not read the same.
+    assert!(
+        !cli_error_stderr.contains("class=container-child-exit"),
+        "an ordinary CLI error must NOT be reported as a container child exit\nstderr:\n\
+         {cli_error_stderr}"
+    );
+
+    // The typed status must survive, not just the class. This is what
+    // `.context(..)?` used to destroy.
+    assert!(
+        child_exit_stderr.contains("status=Signaled(SIGSEGV"),
+        "the child's typed status must survive to the classification\nstderr:\n\
+         {child_exit_stderr}"
+    );
+
+    // (a2) A container-child panic that IS caught still reports the tracer
+    // breaking, not the CLI refusing. This is the third flattening: the panic
+    // crosses a process boundary through `SerializableError`, which carries
+    // only strings, so without the `kind` discriminant it arrives
+    // indistinguishable from an ordinary reported error.
+    let child_panic = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .env("HERMIT_TEST_CONTAINER_CHILD_FAULT", "panic")
+        .args(["run", "--strict", "--", "/bin/true"])
+        .output()
+        .expect("failed to run the panic-injected container child");
+    let child_panic_stderr = String::from_utf8_lossy(&child_panic.stderr).into_owned();
+    assert!(
+        child_panic_stderr.contains("HERMIT_INTERNAL_FAILURE class=container-child-panic"),
+        "a CAUGHT container-child panic must be classified as a panic, not as a CLI          error
+stderr:
+{child_panic_stderr}"
+    );
+    assert!(
+        !child_panic_stderr.contains("class=cli-error"),
+        "a caught container-child panic must NOT read as an ordinary CLI          error
+stderr:
+{child_panic_stderr}"
+    );
+
+    // (b) The guest's own exit is NOT an internal failure and must carry no
+    // marker at all — "hermit's exit IS the guest's exit" stays intact.
+    let guest_exit = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["run", "--strict", "--", "/bin/false"])
+        .output()
+        .expect("failed to run the guest-exit case");
+    assert_eq!(
+        guest_exit.status.code(),
+        Some(1),
+        "a guest exiting 1 must still surface as 1"
+    );
+    assert!(
+        !String::from_utf8_lossy(&guest_exit.stderr).contains("HERMIT_INTERNAL_FAILURE"),
+        "the guest's own exit must not be classified as a hermit-internal failure"
+    );
+}

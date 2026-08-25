@@ -111,6 +111,7 @@ pub use detcore_dbt::reverie_dbt_runtime_thread_init;
 pub use detcore_dbt::reverie_dbt_runtime_totals;
 pub use error::Context;
 pub use error::Error;
+pub use error::FailureKind;
 pub use error::SerializableError;
 use goblin::elf::Elf;
 use goblin::elf::header;
