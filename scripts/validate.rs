@@ -113,8 +113,10 @@ use dagrun::scheduler::STEP_STARTED_MONOTONIC_NS_ENV;
 use validate_plan::CompatMode;
 use validate_plan::CompatDisposition;
 
-/// Current receipt schema. Missing evidence is represented by explicit nulls;
-/// a new writer must never downgrade itself into the schema-4 grandfather.
+/// Current receipt schema. Unknown scalar evidence is represented by explicit
+/// nulls; optional collections stay type-safe by being omitted when inapplicable
+/// or serialized as `[]` when positively known empty. A new writer must never
+/// downgrade itself into the schema-4 grandfather.
 const COVERAGE_LEDGER_SCHEMA_VERSION: i64 = 5;
 
 /// Recorded in each row so a version-aware reader can tell which driver produced
@@ -5989,6 +5991,23 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
                 .and_then(|attempt| environmental_assessment(&spawn_unknown.attempts, attempt))
         ));
     }
+    let spawn_outcome = spawn_unknown
+        .outcomes
+        .iter()
+        .find(|outcome| outcome.tag == "fixture.spawn_unknown")
+        .ok_or("scheduler accounting: reported spawn failure disappeared")?;
+    let spawn_gate = ledger_gate_with_attempts(spawn_outcome, &spawn_unknown.attempts);
+    if !spawn_gate["result"].is_null()
+        || spawn_gate["reported"] != true
+        || spawn_gate["execution"] != "unknown"
+        || !spawn_gate["failure_origin"].is_null()
+        || spawn_gate.get("failed_substeps").is_some()
+    {
+        return Err(format!(
+            "scheduler accounting: reported-but-unexecuted spawn failure acquired false failure \
+             evidence: {spawn_gate}"
+        ));
+    }
 
     // ROUND-LOCAL MISSING OUTCOME. In round 1 the prerequisite and environmental
     // node run together; the latter fails after the prerequisite passes, leaving
@@ -6073,6 +6092,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         || !missing_gate["exit_code"].is_null()
         || !missing_gate["real_seconds"].is_null()
         || missing_gate["failure_origin"].is_string()
+        || missing_gate.get("failed_substeps").is_some()
         || missing_gate["attempts"][1]["attempt"] != 2
         || !missing_gate["attempts"][1]["result"].is_null()
         || !missing_first_render.contains("ENVIRONMENTAL UNCONFIRMED")
@@ -7482,20 +7502,32 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
     Ok(())
 }
 
+fn set_gate_failure_evidence(gate: &mut serde_json::Value, failed: bool) {
+    gate["failure_origin"] = serde_json::json!(failed.then_some("outer_gate"));
+    if failed {
+        // This producer schedules the named outer DAG node directly, so an
+        // atomic failure positively has zero failed lane substeps.
+        gate["failed_substeps"] = serde_json::json!([]);
+    } else {
+        // Absence means no failure evidence applies. Never serialize an unknown
+        // collection as null: the typed reader correctly rejects that shape.
+        gate.as_object_mut()
+            .expect("ledger gate must remain a JSON object")
+            .remove("failed_substeps");
+    }
+}
+
 fn ledger_gate(outcome: &StepOutcome) -> serde_json::Value {
-    serde_json::json!({
+    let mut gate = serde_json::json!({
         "name": outcome.tag,
         "result": ledger_gate_result(outcome),
         "exit_code": outcome.returncode,
         "reason": outcome.reason,
         "aborted": outcome.aborted,
         "real_seconds": outcome.duration_s,
-        // A StepOutcome is already the outer safe-ci DAG gate. Shell-era rows
-        // may bind a lane substep separately, but this producer never infers one
-        // from text after the fact.
-        "failure_origin": outcome_is_failure(outcome).then_some("outer_gate"),
-        "failed_substeps": serde_json::Value::Null,
-    })
+    });
+    set_gate_failure_evidence(&mut gate, outcome_is_failure(outcome));
+    gate
 }
 
 /// Serialize one gate from the attempt ledger, not merely cumulative `by_tag`.
@@ -7560,8 +7592,7 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
         gate["reason"] = serde_json::json!(attempt.reason);
         gate["aborted"] = serde_json::json!(attempt.aborted);
         gate["real_seconds"] = serde_json::json!(attempt.reported.then_some(attempt.duration_s));
-        gate["failure_origin"] =
-            serde_json::json!(attempt_is_failure(attempt).then_some("outer_gate"));
+        set_gate_failure_evidence(&mut gate, attempt_is_failure(attempt));
     }
     gate["attempts"] = serde_json::json!(node_attempts);
     gate["retries"] = serde_json::json!(node_attempts_raw.len().saturating_sub(1));
@@ -7584,16 +7615,151 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         aborted: false,
     };
     let row = ledger_gate(&failed);
-    if row["failure_origin"] != "outer_gate" || !row["failed_substeps"].is_null() {
-        return Err("ledger gate origin: failed outer gate was not bound synchronously".into());
+    if row["failure_origin"] != "outer_gate"
+        || row["failed_substeps"] != serde_json::json!([])
+    {
+        return Err(
+            "ledger gate origin: failed outer gate did not carry a known-empty substep list"
+                .into(),
+        );
     }
-    let mut passed = failed;
+    let mut passed = failed.clone();
     passed.ok = true;
+    passed.returncode = Some(0);
+    passed.reason.clear();
     let row = ledger_gate(&passed);
-    if !row["failure_origin"].is_null() {
-        return Err("ledger gate origin: passing gate claimed a failure origin".into());
+    if !row["failure_origin"].is_null() || row.get("failed_substeps").is_some() {
+        return Err("ledger gate origin: passing gate claimed failure evidence".into());
     }
-    println!("  ledger gate origin: failed outer gate bound; passing gate remained null");
+    let mut no_result = failed.clone();
+    no_result.returncode = Some(NO_RESULT_EXIT_CODE);
+    let row = ledger_gate(&no_result);
+    if row["result"] != "no_result"
+        || !row["failure_origin"].is_null()
+        || row.get("failed_substeps").is_some()
+    {
+        return Err("ledger gate origin: no-result gate claimed failure evidence".into());
+    }
+    let mut aborted = failed.clone();
+    aborted.aborted = true;
+    aborted.returncode = Some(-15);
+    let row = ledger_gate(&aborted);
+    if !row["failure_origin"].is_null() || row.get("failed_substeps").is_some() {
+        return Err("ledger gate origin: aborted gate claimed failure evidence".into());
+    }
+
+    // The stop-path integration test reaches the real write_ledger function but
+    // deliberately has no scheduler attempts. Bracket the production serializer's
+    // latest-attempt override separately, including stale cumulative outcomes.
+    let assert_attempt_gate =
+        |label: &str,
+         outcome: &StepOutcome,
+         attempts: &[NodeAttempt],
+         expected_result: Option<&str>,
+         expected_reported: bool,
+         expected_execution: &str,
+         expected_failure: bool|
+         -> Result<(), String> {
+            let row = ledger_gate_with_attempts(outcome, attempts);
+            let latest = row["attempts"]
+                .as_array()
+                .and_then(|attempts| attempts.last())
+                .ok_or_else(|| format!("ledger gate origin: {label} omitted attempt history"))?;
+            let result = row.get("result").and_then(serde_json::Value::as_str);
+            let origin = row
+                .get("failure_origin")
+                .and_then(serde_json::Value::as_str);
+            let failure_evidence_matches = if expected_failure {
+                origin == Some("outer_gate")
+                    && row.get("failed_substeps") == Some(&serde_json::json!([]))
+            } else {
+                origin.is_none() && row.get("failed_substeps").is_none()
+            };
+            if result != expected_result
+                || row["reported"].as_bool() != Some(expected_reported)
+                || row["execution"].as_str() != Some(expected_execution)
+                || latest.get("result").and_then(serde_json::Value::as_str) != expected_result
+                || latest["reported"].as_bool() != Some(expected_reported)
+                || latest["execution"].as_str() != Some(expected_execution)
+                || !failure_evidence_matches
+            {
+                return Err(format!(
+                    "ledger gate origin: {label} did not follow the latest attempt: {row}"
+                ));
+            }
+            Ok(())
+        };
+
+    let failed_attempt = reported_attempt(&failed, 1);
+    let passed_attempt = reported_attempt(&passed, 1);
+    let aborted_attempt = reported_attempt(&aborted, 1);
+    assert_attempt_gate(
+        "latest genuine failure",
+        &failed,
+        std::slice::from_ref(&failed_attempt),
+        Some("fail"),
+        true,
+        "completed",
+        true,
+    )?;
+    assert_attempt_gate(
+        "latest pass",
+        &passed,
+        std::slice::from_ref(&passed_attempt),
+        Some("pass"),
+        true,
+        "completed",
+        false,
+    )?;
+    assert_attempt_gate(
+        "latest aborted attempt",
+        &aborted,
+        std::slice::from_ref(&aborted_attempt),
+        None,
+        true,
+        "unknown",
+        false,
+    )?;
+
+    let mut passed_retry = passed_attempt.clone();
+    passed_retry.attempt = 2;
+    let fail_then_pass = [failed_attempt.clone(), passed_retry];
+    assert_attempt_gate(
+        "stale failure followed by pass",
+        &failed,
+        &fail_then_pass,
+        Some("pass"),
+        true,
+        "completed",
+        false,
+    )?;
+    let mut aborted_retry = aborted_attempt.clone();
+    aborted_retry.attempt = 2;
+    let fail_then_aborted = [failed_attempt.clone(), aborted_retry];
+    assert_attempt_gate(
+        "stale failure followed by abort",
+        &failed,
+        &fail_then_aborted,
+        None,
+        true,
+        "unknown",
+        false,
+    )?;
+    let mut failed_retry = failed_attempt;
+    failed_retry.attempt = 2;
+    let pass_then_failure = [passed_attempt, failed_retry];
+    assert_attempt_gate(
+        "stale pass followed by genuine failure",
+        &passed,
+        &pass_then_failure,
+        Some("fail"),
+        true,
+        "completed",
+        true,
+    )?;
+    println!(
+        "  ledger gate origin: fallback and latest-attempt failure evidence stayed typed"
+    );
     Ok(())
 }
 
@@ -7672,6 +7838,7 @@ fn no_result_propagation_bracket() -> Result<(), String> {
     if no_result_gate["result"] != "no_result"
         || no_result_gate["attempts"][0]["result"] != "no_result"
         || !no_result_gate["failure_origin"].is_null()
+        || no_result_gate.get("failed_substeps").is_some()
     {
         return Err(format!(
             "no-result propagation: exact-attempt ledger weakened exit 75: {no_result_gate}"

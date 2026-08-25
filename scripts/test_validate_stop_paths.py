@@ -95,6 +95,20 @@ def assert_schema5_contract(row: dict, *, admitted: bool = False) -> None:
     assert row["schema_version"] == 5, row
     assert row["repo"] == "hermit", row
     assert row["producer"] == "hermit-validate-rs", row
+    # Exercise write_ledger itself, not only validate.rs's synthetic helper.
+    # A real outer failure positively knows there are no failed lane substeps;
+    # gates that established no failure must omit the collection entirely.
+    for gate in row["gates"]:
+        origin = gate["failure_origin"]
+        if origin is None:
+            assert gate["failure_origin"] is None, gate
+            assert "failed_substeps" not in gate, gate
+        else:
+            assert not gate["aborted"], gate
+            assert gate["result"] == "fail", gate
+            assert origin == "outer_gate", gate
+            assert isinstance(gate["failed_substeps"], list), gate
+            assert gate["failed_substeps"] == [], gate
     expected_depth = int(
         subprocess.check_output(
             ["git", "rev-list", "--count", row["commit"]], cwd=ROOT, text=True
