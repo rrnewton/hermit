@@ -8,17 +8,17 @@ Every selected `verify` cell, and every seed in a selected `chaos` cell, runs th
 
 | Backend | Green | Red | Total |
 | --- | ---: | ---: | ---: |
-| `ptrace` | 226 | 809 | 1035 |
+| `ptrace` | 225 | 810 | 1035 |
 | `dbt` | 0 | 1035 | 1035 |
 | `kvm` | 0 | 1035 | 1035 |
 | `sabre` | 53 | 982 | 1035 |
 | `liteinst` | 0 | 1035 | 1035 |
 | `native` | 0 | 345 | 345 |
-| **Total** | **279** | **5241** | **5520** |
+| **Total** | **278** | **5242** | **5520** |
 
 ## Denominator, and why the percentage is not comparable across changes to it
 
-Green is **279 of 5520**, which is **5.05%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
+Green is **278 of 5520**, which is **5.04%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
 
 - backends: `ptrace`, `dbt`, `kvm`, `sabre`, `liteinst`, `native`
 - modes: `chaos`, `naked`, `replay`, `verify`
@@ -29,11 +29,11 @@ The mode view makes the current order of work explicit: expand `verify` first, t
 
 | Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `native` | Green | Red | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `verify` | 223 / 345 | 0 / 345 | 0 / 345 | 53 / 345 | 0 / 345 | — | 276 | 1449 | 1725 |
+| `verify` | 222 / 345 | 0 / 345 | 0 / 345 | 53 / 345 | 0 / 345 | — | 275 | 1450 | 1725 |
 | `replay` | 1 / 345 | 0 / 345 | 0 / 345 | 0 / 345 | 0 / 345 | — | 1 | 1724 | 1725 |
 | `chaos` | 2 / 345 | 0 / 345 | 0 / 345 | 0 / 345 | 0 / 345 | — | 2 | 1723 | 1725 |
 | `naked` | — | — | — | — | — | 0 / 345 | 0 | 345 | 345 |
-| **Total** | | | | | | | **279** | **5241** | **5520** |
+| **Total** | | | | | | | **278** | **5242** | **5520** |
 
 ## Cross-backend parity
 
@@ -54,9 +54,9 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | `debugger-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |
 | `determinism-stress` | 4 / 6 | 0 / 6 | 1 / 6 | 5 | 18 |
 | `determinism-stress-c` | 7 / 11 | 0 / 11 | 0 / 11 | 7 | 33 |
-| `language-runtimes` | 18 / 19 | 0 / 19 | 0 / 19 | 18 | 57 |
+| `language-runtimes` | 17 / 19 | 0 / 19 | 0 / 19 | 17 | 57 |
 | `shared-futex-c` | 0 / 4 | 0 / 4 | 0 / 4 | 0 | 12 |
 | `system-utils` | 26 / 28 | 1 / 28 | 0 / 28 | 27 | 84 |
 | `util-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |
 
-Ordinary full validation executes 281 selected regression cells: the 279 green compatibility cells above (including 2 chaos-mode race-exposure checks), and 2 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
+Ordinary full validation executes 280 selected regression cells: the 278 green compatibility cells above (including 2 chaos-mode race-exposure checks), and 2 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
