@@ -195,7 +195,7 @@ static int live_sibling_signal(int mode) {
   sigset_t original_mask;
   sigemptyset(&preserve_blocked);
   sigaddset(&preserve_blocked, SIGUSR2);
-  if (mode == 2) {
+  if (mode == 2 || mode == 3) {
     sigaddset(&preserve_blocked, SIGUSR1);
   }
   if (sigprocmask(SIG_BLOCK, &preserve_blocked, &original_mask) != 0) {
@@ -244,14 +244,16 @@ static int live_sibling_signal(int mode) {
 
   siginfo_t info;
   memset(&info, 0, sizeof info);
+  int wait_status = 0;
   errno = 0;
-  int rc = waitid(P_PID, target, &info, WEXITED);
+  int rc = mode == 3 ? waitpid(target, &wait_status, 0)
+                     : waitid(P_PID, target, &info, WEXITED);
   int saved_errno = errno;
   sigset_t current_mask;
   sigprocmask(SIG_BLOCK, NULL, &current_mask);
   sigset_t expected_mask = original_mask;
   sigaddset(&expected_mask, SIGUSR2);
-  if (mode == 2) {
+  if (mode == 2 || mode == 3) {
     sigaddset(&expected_mask, SIGUSR1);
   }
   int mask_preserved = 1;
@@ -287,6 +289,17 @@ static int live_sibling_signal(int mode) {
         info.si_status,
         mask_preserved,
         sender_live);
+  } else if (mode == 3) {
+    printf(
+        "wait4-live-sibling-blocked rc-ok=%d errno=%d handler=%d pid-match=%d exited=%d status=%d mask-preserved=%d sender-live=%d\n",
+        rc >= 0,
+        rc < 0 ? saved_errno : 0,
+        handler_before_restore,
+        rc == target,
+        WIFEXITED(wait_status),
+        WIFEXITED(wait_status) ? WEXITSTATUS(wait_status) : -1,
+        mask_preserved,
+        sender_live);
   } else {
     printf(
         "waitid-live-sibling rc=%d errno=%d handler=%d mask-preserved=%d sender-live=%d\n",
@@ -302,11 +315,19 @@ static int live_sibling_signal(int mode) {
   waitpid(signaler, NULL, 0);
   waitpid(target, NULL, 0);
   sigprocmask(SIG_SETMASK, &original_mask, NULL);
-  printf("waitid-live-sibling-done\n");
+  printf(mode == 3 ? "wait4-live-sibling-done\n"
+                   : "waitid-live-sibling-done\n");
 
   if (!mask_preserved || !sender_live ||
-      (mode == 2 ? handler_before_restore : !handler_before_restore)) {
+      ((mode == 2 || mode == 3) ? handler_before_restore
+                                : !handler_before_restore)) {
     return 2;
+  }
+  if (mode == 3) {
+    return rc == target && WIFEXITED(wait_status) &&
+                   WEXITSTATUS(wait_status) == 29
+               ? 0
+               : 3;
   }
   if (mode != 0) {
     return rc == 0 && info.si_pid == target && info.si_code == CLD_EXITED &&
@@ -336,6 +357,9 @@ int main(int argc, char **argv) {
   if (argc == 2 && strcmp(argv[1], "--live-sibling-signal-blocked") == 0) {
     return live_sibling_signal(2);
   }
-  fprintf(stderr, "usage: %s [--child-ready-wins|--signal-restart|--live-sibling-signal|--live-sibling-signal-restart|--live-sibling-signal-blocked]\n", argv[0]);
+  if (argc == 2 && strcmp(argv[1], "--wait4-live-sibling-signal-blocked") == 0) {
+    return live_sibling_signal(3);
+  }
+  fprintf(stderr, "usage: %s [--child-ready-wins|--signal-restart|--live-sibling-signal|--live-sibling-signal-restart|--live-sibling-signal-blocked|--wait4-live-sibling-signal-blocked]\n", argv[0]);
   return 64;
 }
