@@ -260,6 +260,32 @@ Neither is the pull request's fault, and neither should be recorded against it.
 This is the only check here about the ENVIRONMENT you are assessing in rather
 than about the branch or about main.
 
+#### A PRESENT backend does not make a red the branch's either
+
+Establishing that the backend exists closes only half of this. The reds can still
+belong to the box, to the binary, or to a standing defect — and then they look
+exactly like reds the branch caused, because the backend ran.
+
+**Run the control: the same cases, the same binary, on unmodified `main`.** Only
+the difference between the two runs is attributable to the branch.
+
+```console
+python3 tests/backend-parity/run_matrix.py --backend dbt --verify --hermit <dbt-capable-hermit>
+git stash && python3 tests/backend-parity/run_matrix.py --backend dbt --verify --hermit <same-binary>
+```
+
+Measured on hermit#2342: DynamoRIO was present and the binary genuinely ran under
+it, and the ported change produced **25 FAIL**. The control on unmodified `main`
+produced **the same 25 FAIL**. The change was responsible for none of them.
+Without the control the sweep would have published "this pull request turns 25
+DBT cases red" — a wrong verdict reached with the backend present, which check 7
+as written above would not have caught.
+
+Note also that a DBT-capable build may exist elsewhere on the box even when the
+one in your worktree reports `DBT support was not included in this build`. Probe
+the binaries you have before concluding a backend is unmeasurable; state which
+binary and which commit produced any number you report.
+
 ## Verdict vocabulary
 
 | verdict | meaning | action |
@@ -269,6 +295,7 @@ than about the branch or about main.
 | **partial** | mechanism landed, unique content remains | extract the residual; do NOT close |
 | **indeterminate** | rule cannot decide — no extractable symbols, or every symbol pre-existed | human read; do NOT guess |
 | **blocked on a cross-repo dependency** | content and mechanism both absent, but the capability its tests assert has not landed in `reverie` or `agent-utils`, or hermit's pin does not include it | LEAVE OPEN and NAME THE SUCCESSOR; landing it creates a red |
+| **blocked on a defect** | genuinely pending and wanted, and part of its claim is VERIFIED, but landing would make a gate ASSERT something a defect elsewhere makes measurably false | LEAVE OPEN and NAME THE DEFECT with its smallest reproduction; record which part of the claim is verified and which is not |
 | **supersede-and-regress** | landing would weaken newer invariants, remove a current dependency, or rely on a prerequisite that is now false | do NOT port; extract any residual, then close citing the newer mechanism or dependency |
 
 Docs-only and config-only pull requests add no symbols and land in
@@ -276,9 +303,9 @@ Docs-only and config-only pull requests add no symbols and land in
 the check, and those rows should be collected for one batched decision rather
 than guessed at individually.
 
-## Three dispositions, not two
+## Four dispositions, not two
 
-A sweep that can only close or land will record the third outcome as nothing,
+A sweep that can only close or land will record the other outcomes as nothing,
 and **four supersession chains dead-ended that way in one night** — each one a
 pull request whose real status was known by somebody and written down nowhere.
 
@@ -287,12 +314,55 @@ pull request whose real status was known by somebody and written down nowhere.
 | **close** | already landed, or abandoned and unsafe to port | the superseding commit, or why porting is unsafe |
 | **land** | genuinely pending and landing improves main | the usual receipt |
 | **correctly parked, with a NAMED SUCCESSOR** | real work, correctly blocked — a cross-repo dependency, an unlanded capability, a decision it waits on | **WHO or WHAT unblocks it**, by name |
+| **blocked on a NAMED DEFECT** | real work, correctly blocked by something BROKEN rather than something pending | **the defect, reduced to its smallest reproduction**, plus which part of the claim is already verified |
 
 The third is not a failure to decide. It is a decision, and it is only useful if
 the successor is named: "waiting on reverie#430 to land and hermit's pin to
 advance" is a disposition; "still open" is not. A parked pull request with no
 named successor is indistinguishable from a forgotten one, which is exactly how
 the four chains were lost.
+
+### The fourth: blocked on a defect, which is not the same as parked
+
+Parking waits for something **pending**. This waits for something **broken**, and
+the difference decides who can act. A parked row has a successor to watch. A
+defect-blocked row has nobody watching anything until the defect is written down,
+so the reproduction IS the disposition — without it the row is indistinguishable
+from "the author gave up".
+
+It is also not **supersede-and-regress**. There the port is wrong and should be
+abandoned. Here the port is RIGHT and wanted; it simply cannot be asserted yet,
+because a gate would state as true something that is measurably false.
+
+The distinguishing question: **would landing make a check CLAIM something?** A
+change that only alters behaviour can be judged on behaviour. A change that
+alters what a gate ASSERTS must be judged against whether the assertion holds on
+every backend or configuration it will now speak for.
+
+Measured, on [hermit#2342](https://github.com/rrnewton/hermit/pull/2342), which
+flips the backend-parity matrix from a `stripped` DETLOG comparison to canonical
+`--verify-strict` / `bitwise`:
+
+- **Verified for ptrace:** 28/28 cases reached bitwise, exit 0. The claim is true
+  where it could be measured.
+- **False for DBT, and not because of the pull request:** all 25 DBT cases failed
+  — *identically, with and without the change*. The two DBT logs were
+  byte-identical once large integers were normalised; the only difference was the
+  thread id. DBT emits the **host TID** where ptrace emits a virtualized
+  `DetPid` (`dettid 1163782` vs `1163891` across two runs of `/bin/true`, against
+  `dettid 3` twice under ptrace), so a DBT DETLOG can never match across runs
+  under *either* policy.
+- **Why that blocks landing:** `expected_non_kvm_tier` is one value for all
+  non-KVM backends, so landing puts "requested policy is L2" in the runner's own
+  banner for a backend measured unable to deliver it.
+
+Recording that as "still open" would have lost it. Recording it as
+`dbt-pid-virtualization`, reduced to a single-threaded `/bin/true`, makes it
+actionable by someone who never read the pull request.
+
+**Name the defect, not the symptom.** "DBT parity fails" is a symptom that
+invites a rebase. "DBT emits the host TID instead of a virtualized DetPid" is a
+defect somebody can fix.
 
 ## What sweeps have actually returned
 
