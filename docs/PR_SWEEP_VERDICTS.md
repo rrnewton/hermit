@@ -1415,6 +1415,71 @@ reviewed is normal; an author binding their own lane is not.
   agent supplied exactly that an hour later. On #2566 the lanes arrived in the
   other order. Neither needed a rebase, a receipt, or a policy change.
 
+## A lenient reader turns a producer defect into an absence
+
+⚠️ **Absence is indistinguishable from nothing-to-report.** A reader that skips
+what it cannot parse, instead of failing, converts every upstream defect into a
+clean, quiet, zero. The producer reports success, the reader reports success, and
+the evidence simply never appears — so the pipeline looks *idle* rather than
+*broken*, and idle is the one state nobody investigates.
+
+**Worked example, measured 2026-08-25 between two halves that landed hours apart
+the same night.** `ci/compat-envelope/pressure-test.rs` emits series rows;
+`scorecard.rs project-observations` reads them. One row was emitted in exactly
+the format the producer writes, and then:
+
+```console
+$ scorecard.rs project-observations --series-root <dir> --refreshed-at <stamp>
+compatibility scorecard: projected 0 cell(s) from 0 series row(s) under <dir>
+  note: the series is EMPTY, so every observation here remains PRE-SERIES evidence
+  skipped <dir>/series/hermit2/devbig014/2026-08.jsonl:1: unknown field `schema`,
+    expected one of `cell`, `first_divergent_scheduler_turn`, ...
+$ echo $?
+0
+```
+
+Two incompatibilities, either of which alone is fatal:
+
+- **Shape.** The producer emits an enveloped row —
+  `{schema, event_id, …, series:{cell, tree, run_index, outcome, coordinates}}`.
+  The reader's `SeriesRow` is **flat** — `{cell, first_divergent_*}` — with
+  `deny_unknown_fields`. No enveloped row can deserialize.
+- **Key.** Even with the shape fixed, the producer's `series_cell()` builds
+  `test/mode/backend` while the reader looks up `display_id()` =
+  `lane/category/test/mode@backend`. Those are never equal — and `@` is not in
+  the linter's `_CELL_RE`, so a row in the *reader's* key format could not pass
+  the write boundary at all.
+
+**What each layer said about it:** the producer succeeded. The reader exited **0**.
+The summary said *"the series is EMPTY"* — it was not; it held one row that could
+not be read. And the trailing advice, *"expected until plan step 4 lands a
+producer"*, was stale: step 4 had landed minutes earlier. Only one line was true,
+the `skipped` note, and it is a note rather than a failure.
+
+⚠️ **AND THE OBVIOUS TEST PASSES.** "Emit a row and confirm the projection block
+changes" is the natural check, and it **succeeds here** — the block is rewritten
+with `rows_read: 0, pre_series_corpus: true`. A projection *over nothing* is still
+a projection. The check that discriminates is narrower:
+
+```console
+# NOT sufficient — the block is written even when every row was skipped
+#   did cells.json change?            -> yes, and it means nothing
+# SUFFICIENT — assert on the destination, and on the skip count
+#   did the TARGET CELL gain an observation?   -> the actual question
+#   rows_read > 0, and skipped == 0            -> a skip is a failure, not a note
+```
+
+Here the target cell stayed `measurement: never-measured` with zero
+observations, and the population-wide count stayed at 2 — while every surface
+reported success.
+
+**The rule.** When a reader may skip, a zero from it is never evidence of
+absence. Either make the skip fail loudly, or assert on the *destination* rather
+than on the reader's own summary — and count the skips, because a skip is the
+defect wearing the costume of an empty input. This is the same family as check 12
+(a comparison over nothing is not agreement): in both, the mechanism ran, the
+exit code was clean, and the thing being asked about was never examined.
+
 ## Verdict vocabulary
 
 | verdict | meaning | action |
