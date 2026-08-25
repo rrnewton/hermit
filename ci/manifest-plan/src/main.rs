@@ -22,6 +22,9 @@ use hermit_manifest_plan::ci_selection::CiDisabledReasonData;
 use hermit_manifest_plan::ci_selection::CiDisabledReasonSpec;
 use hermit_manifest_plan::ci_selection::CiSelection;
 use hermit_manifest_plan::ci_selection::CiSelectionSpec;
+#[cfg(test)]
+use hermit_manifest_plan::runner::REQUIRES_VOCABULARY;
+use hermit_manifest_plan::runner::requires_capability;
 use hermit_manifest_plan::runner::validate_mode_workdir;
 use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
@@ -32,79 +35,12 @@ use manifest_value::Value;
 
 const KNOWN_BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
 const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
-// ------------------------------------------------------- `requires` vocabulary
-//
-// Every manifest cell already declares `requires`, and until now this validator
-// parsed it into `_requires` and threw it away: it was documentation, not a
-// gate. `backend-parity-c/cpuid-probe` has declared `"cpuid"` since it was
-// written, and on a machine without CPUID faulting it still ran, still saw the
-// real host CPU, and still failed — "this machine cannot run this" and "this ran
-// and it is broken" were the same record, which is the same defect hermit#2135,
-// hermit#2148 and hermit#2205 named at NODE granularity and hermit#2212 fixed
-// there.
-//
-// This table gives the declaration teeth at CELL granularity. It is the CLOSED
-// vocabulary of `requires` tokens, and the ONLY place a token can acquire the
-// power to withhold a cell. Two properties matter more than anything else here:
-//
-//  1. A token absent from this table REFUSES THE WHOLE RUN. Editing a manifest
-//     therefore cannot invent a new reason for a cell not to run; adding a
-//     reason is a reviewed source change in this file.
-//  2. A token whose second element is `None` can NEVER withhold anything. That
-//     is every token but one. `None` does not mean "assume the machine has it
-//     and skip the cell if it does not" — it means there is no absence proof, so
-//     the cell RUNS exactly as it does today and any failure is a real failure.
-//     Adding a `Some(...)` here is what would need review, and it is precisely
-//     the edit that could lower the bar.
-//
-// Deliberately NOT probed, though trivially probeable: `cc`, `python3`, `bash`,
-// `git`, and the rest of the tool tokens. A `command -v` miss from a broken PATH
-// would silently withhold 286 cells and hand back a green run, which is exactly
-// the bar-lowering this mechanism must not enable. They stay `None` until an
-// owner asks otherwise.
-const REQUIRES_VOCABULARY: &[(&str, Option<&str>)] = &[
-    ("ar", None),
-    ("bash", None),
-    ("cc", None),
-    // The one token with an absence proof. Resolved by
-    // `scripts/lib/validate_plan.rs::probe_host_capability`, the SAME probe
-    // hermit#2212 uses for the node, reached through
-    // `scripts/validate.rs --probe-host-capability`. There is one probe, not two.
-    ("cpuid", Some("cpuid-faulting")),
-    ("cxx", None),
-    ("date", None),
-    ("du", None),
-    ("find", None),
-    ("gawk", None),
-    ("git", None),
-    ("hexdump", None),
-    ("jq", None),
-    ("kvm", None),
-    ("linux", None),
-    ("lua5.4", None),
-    ("m4", None),
-    ("node", None),
-    ("openssl", None),
-    ("perl", None),
-    ("ptrace", None),
-    ("python3", None),
-    ("ruby", None),
-    ("rustc", None),
-    ("sqlite3", None),
-    ("tclsh", None),
-    ("userns", None),
-    ("x86_64", None),
-    ("zstd", None),
-];
+const MATRIX_SYMMETRY_BASELINE: &str = "ci/matrix-symmetry-baseline.json";
+const CI_REASON_BASELINE: &str = "ci/ci-reason-baseline.json";
+const TEST_INVENTORY: &str = "tests/e2e/manifests/inventory/test-files.json";
 
-/// Every (capability, test-id) pair the corpus declares, for the tokens that
-/// HAVE an absence proof.
-///
-/// PURE: it reads parsed manifests and nothing else — no probe, no machine, no
-/// cell output — so the two halves of the withholding decision stay separable
-/// and each is bracketed on its own. A test whose `requires` names only
-/// unprobeable tokens contributes nothing, which is what stops a cell that is
-/// merely broken from ever appearing here.
+/// Every `(capability, test-id)` pair whose manifest token has a reviewed
+/// absence proof. This reads declarations only; the machine probe is separate.
 fn host_requirement_pairs(documents: &[Value]) -> Result<Vec<(String, String)>, String> {
     let mut out = Vec::new();
     for document in documents {
@@ -132,29 +68,6 @@ fn host_requirement_pairs(documents: &[Value]) -> Result<Vec<(String, String)>, 
     out.dedup();
     Ok(out)
 }
-
-/// The host capability a `requires` token is probed as, or `None` when no
-/// absence proof exists for it.
-///
-/// `Err` means the token is outside the closed vocabulary, which is a refusal
-/// rather than a skip: a declaration nobody can evaluate must never be treated
-/// as a reason to omit work.
-fn requires_capability(token: &str) -> Result<Option<&'static str>, String> {
-    REQUIRES_VOCABULARY
-        .iter()
-        .find(|(name, _)| *name == token)
-        .map(|(_, capability)| *capability)
-        .ok_or_else(|| {
-            format!(
-                "unknown `requires` token `{token}`; the vocabulary is closed \
-                 (ci/manifest-plan/src/main.rs::REQUIRES_VOCABULARY) and an unrecognized name is \
-                 refused rather than treated as a reason to omit a cell"
-            )
-        })
-}
-const MATRIX_SYMMETRY_BASELINE: &str = "ci/matrix-symmetry-baseline.json";
-const CI_REASON_BASELINE: &str = "ci/ci-reason-baseline.json";
-const TEST_INVENTORY: &str = "tests/e2e/manifests/inventory/test-files.json";
 
 #[derive(Debug)]
 struct PlanRow {

@@ -17,7 +17,9 @@ use hermit_manifest_plan::runner::RunContext;
 use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 use hermit_manifest_plan::runner::Selection;
 use hermit_manifest_plan::runner::append_result;
+use hermit_manifest_plan::runner::host_inapplicable_result;
 use hermit_manifest_plan::runner::infrastructure_error_result;
+use hermit_manifest_plan::runner::requires_capability;
 use hermit_manifest_plan::runner::run_cell;
 use hermit_manifest_plan::runner::write_junit;
 use serde::Deserialize;
@@ -95,6 +97,127 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
         }
     }
     args
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HostCapabilityVerdict {
+    present: bool,
+    evidence: String,
+}
+
+fn parse_host_capability_verdict(stdout: &[u8]) -> Result<HostCapabilityVerdict, String> {
+    let text = std::str::from_utf8(stdout)
+        .map_err(|error| format!("host capability probe emitted non-UTF-8 output: {error}"))?
+        .trim_end();
+    let (state, evidence) = text
+        .split_once('\t')
+        .ok_or_else(|| format!("host capability probe emitted malformed output: {text:?}"))?;
+    if evidence.trim().is_empty() {
+        return Err("host capability probe emitted empty evidence".into());
+    }
+    let present = match state {
+        "PRESENT" => true,
+        "ABSENT" => false,
+        other => {
+            return Err(format!(
+                "host capability probe emitted unknown state {other:?}"
+            ));
+        }
+    };
+    Ok(HostCapabilityVerdict {
+        present,
+        evidence: evidence.to_string(),
+    })
+}
+
+fn probe_host_capability(root: &Path, capability: &str) -> HostCapabilityVerdict {
+    let output = Command::new(root.join("scripts/validate.rs"))
+        .args(["--probe-host-capability", capability])
+        .current_dir(root)
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            match parse_host_capability_verdict(&output.stdout) {
+                Ok(verdict) => verdict,
+                Err(error) => HostCapabilityVerdict {
+                    present: true,
+                    evidence: format!("probe output was unusable ({error}); doubt runs the cell"),
+                },
+            }
+        }
+        Ok(output) => HostCapabilityVerdict {
+            present: true,
+            evidence: format!(
+                "probe exited {}; doubt runs the cell ({})",
+                output
+                    .status
+                    .code()
+                    .map_or_else(|| "by signal".into(), |code| code.to_string()),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        },
+        Err(error) => HostCapabilityVerdict {
+            present: true,
+            evidence: format!("probe could not start ({error}); doubt runs the cell"),
+        },
+    }
+}
+
+fn resolve_host_capabilities(
+    root: &Path,
+    cells: &[hermit_manifest_plan::runner::SelectedCell],
+) -> BTreeMap<String, HostCapabilityVerdict> {
+    let capabilities = cells
+        .iter()
+        .flat_map(|cell| cell.test.requires.iter())
+        .filter_map(|token| requires_capability(token).ok().flatten())
+        .collect::<BTreeSet<_>>();
+    capabilities
+        .into_iter()
+        .map(|capability| {
+            let verdict = probe_host_capability(root, capability);
+            eprintln!(
+                "Host capability {capability}: {} — {}",
+                if verdict.present { "PRESENT" } else { "ABSENT" },
+                verdict.evidence
+            );
+            (capability.to_string(), verdict)
+        })
+        .collect()
+}
+
+fn host_inapplicable_reason(
+    requires: &[String],
+    verdicts: &BTreeMap<String, HostCapabilityVerdict>,
+) -> Option<(Vec<String>, String)> {
+    let mut absent = requires
+        .iter()
+        .filter_map(|token| requires_capability(token).ok().flatten())
+        .filter_map(|capability| {
+            verdicts
+                .get(capability)
+                .filter(|verdict| !verdict.present)
+                .map(|verdict| (capability.to_string(), verdict.evidence.clone()))
+        })
+        .collect::<Vec<_>>();
+    absent.sort();
+    absent.dedup();
+    if absent.is_empty() {
+        return None;
+    }
+    let capabilities = absent
+        .iter()
+        .map(|(capability, _)| capability.clone())
+        .collect::<Vec<_>>();
+    let reason = format!(
+        "NOT RUN, NOT a pass, no coverage: this machine lacks {}",
+        absent
+            .iter()
+            .map(|(capability, evidence)| format!("{capability} ({evidence})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Some((capabilities, reason))
 }
 
 fn scheduled_worker_capacity(args: &Args) -> ScheduledWorkerCapacity {
@@ -208,6 +331,7 @@ fn main() -> ExitCode {
             audit_expected_plan(&root, &manifests);
             ExitCode::SUCCESS
         }
+        "host-inapplicable-buckets" => host_inapplicable_buckets(&root, &manifests, &args),
         "build" => build(&root, &manifests, &args),
         "audit-compile" => audit_compile(&root, &manifests, &args),
         "run" => run(&root, &manifests, &args),
@@ -1052,6 +1176,36 @@ fn for_each_parallel<T: Send>(
     });
 }
 
+fn host_inapplicable_buckets(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
+    if !args.ci_only {
+        fail("host-inapplicable-buckets requires --ci-only");
+    }
+    let cells = manifests
+        .select(&args.selection)
+        .unwrap_or_else(|error| fail(error));
+    let verdicts = resolve_host_capabilities(root, &cells);
+    let mut buckets: BTreeMap<(String, String), (usize, usize, BTreeSet<String>)> = BTreeMap::new();
+    for cell in &cells {
+        let bucket = buckets
+            .entry((cell.test.lane.clone(), cell.category.clone()))
+            .or_default();
+        bucket.0 += 1;
+        if let Some((capabilities, _)) = host_inapplicable_reason(&cell.test.requires, &verdicts) {
+            bucket.1 += 1;
+            bucket.2.extend(capabilities);
+        }
+    }
+    for ((lane, category), (selected, withheld, capabilities)) in buckets {
+        let capabilities = if capabilities.is_empty() {
+            "-".to_string()
+        } else {
+            capabilities.into_iter().collect::<Vec<_>>().join(",")
+        };
+        println!("{lane}\t{category}\t{selected}\t{withheld}\t{capabilities}");
+    }
+    ExitCode::SUCCESS
+}
+
 fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     let mut selection = args.selection.clone();
     if selection.population.is_none() {
@@ -1062,6 +1216,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         });
     }
     let cells = manifests.select(&selection).unwrap_or_else(|e| fail(e));
+    let host_capabilities = resolve_host_capabilities(root, &cells);
     if cells.is_empty() && !args.allow_empty {
         fail("filters selected no cells");
     }
@@ -1091,9 +1246,15 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         capacity,
         |index| {
             let cell = &cells[index];
-            match run_cell(&context, cell) {
-                Ok(result) => result,
-                Err(error) => infrastructure_error_result(&context, cell, error),
+            if let Some((_, reason)) =
+                host_inapplicable_reason(&cell.test.requires, &host_capabilities)
+            {
+                host_inapplicable_result(&context, cell, reason)
+            } else {
+                match run_cell(&context, cell) {
+                    Ok(result) => result,
+                    Err(error) => infrastructure_error_result(&context, cell, error),
+                }
             }
         },
         |index, mut result| {
@@ -1138,6 +1299,11 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 // majority and carry nothing worth saying.
                 let located = if result.outcome == "PASS" {
                     String::new()
+                } else if result.outcome == "HOST-INAPPLICABLE" {
+                    format!(
+                        " {}",
+                        result.reason.as_deref().unwrap_or("host-inapplicable")
+                    )
                 } else {
                     let coords = [
                         ("turn", result.first_divergent_scheduler_turn),
@@ -1179,7 +1345,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                     result.backend.as_deref().unwrap_or("native"),
                     located
                 );
-                failed |= result.outcome != "PASS";
+                failed |= matches!(result.outcome.as_str(), "FAIL" | "ERROR");
             }
             indexed_results.push((index, result));
         },
@@ -1203,8 +1369,36 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             capacity.workers_for(expected)
         );
     }
+    let host_inapplicable = results
+        .iter()
+        .filter(|result| result.outcome == "HOST-INAPPLICABLE")
+        .count();
+    if expected > 0 && host_inapplicable == expected {
+        eprintln!(
+            "test-harness: every one of the {expected} selected cell(s) was host-inapplicable; \
+             a run that executed no cell is not a pass"
+        );
+        failed = true;
+    }
     write_junit(&junit, &results).unwrap();
-    let summary = serde_json::json!({"schema":1,"cells":results.len(),"passed":results.iter().filter(|r|r.outcome=="PASS").count(),"failed":results.iter().filter(|r|r.outcome=="FAIL").count(),"errors":results.iter().filter(|r|r.outcome=="ERROR").count()});
+    let summary = serde_json::json!({
+        "schema": 1,
+        "cells": results.len(),
+        "passed": results.iter().filter(|result| result.outcome == "PASS").count(),
+        "failed": results.iter().filter(|result| result.outcome == "FAIL").count(),
+        "errors": results.iter().filter(|result| result.outcome == "ERROR").count(),
+        "host_inapplicable": host_inapplicable,
+        "host_inapplicable_cells": results
+            .iter()
+            .filter(|result| result.outcome == "HOST-INAPPLICABLE")
+            .map(|result| serde_json::json!({
+                "test": result.test,
+                "mode": result.mode,
+                "backend": result.backend,
+                "reason": result.reason,
+            }))
+            .collect::<Vec<_>>(),
+    });
     fs::write(
         results_path.parent().unwrap().join("summary.json"),
         serde_json::to_vec_pretty(&summary).unwrap(),
@@ -1219,6 +1413,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
@@ -1226,11 +1421,67 @@ mod tests {
 
     use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 
+    use super::HostCapabilityVerdict;
     use super::audit_privileged_unboxed_guard;
     use super::command_jobs;
     use super::for_each_parallel;
+    use super::host_inapplicable_reason;
     use super::parse;
+    use super::parse_host_capability_verdict;
     use super::scheduled_worker_capacity;
+
+    #[test]
+    fn host_capability_output_is_closed_and_evidence_bearing() {
+        assert_eq!(
+            parse_host_capability_verdict(b"PRESENT\tkernel accepted the probe\n").unwrap(),
+            HostCapabilityVerdict {
+                present: true,
+                evidence: "kernel accepted the probe".into(),
+            }
+        );
+        assert_eq!(
+            parse_host_capability_verdict(b"ABSENT\tENODEV and no cpuinfo flag\n").unwrap(),
+            HostCapabilityVerdict {
+                present: false,
+                evidence: "ENODEV and no cpuinfo flag".into(),
+            }
+        );
+        for malformed in [
+            b"PRESENT\n".as_slice(),
+            b"PRESENT\t\n".as_slice(),
+            b"UNKNOWN\tevidence\n".as_slice(),
+        ] {
+            assert!(parse_host_capability_verdict(malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn only_a_declared_absent_capability_withholds_a_cell() {
+        let absent = BTreeMap::from([(
+            "cpuid-faulting".to_string(),
+            HostCapabilityVerdict {
+                present: false,
+                evidence: "planted absence".into(),
+            },
+        )]);
+        let requires = vec!["linux".to_string(), "cpuid".to_string()];
+        let (capabilities, reason) = host_inapplicable_reason(&requires, &absent).unwrap();
+        assert_eq!(capabilities, ["cpuid-faulting"]);
+        assert!(reason.contains("NOT RUN, NOT a pass, no coverage"));
+        assert!(reason.contains("planted absence"));
+
+        let undeclared = vec!["linux".to_string(), "ptrace".to_string()];
+        assert!(host_inapplicable_reason(&undeclared, &absent).is_none());
+
+        let present = BTreeMap::from([(
+            "cpuid-faulting".to_string(),
+            HostCapabilityVerdict {
+                present: true,
+                evidence: "planted presence".into(),
+            },
+        )]);
+        assert!(host_inapplicable_reason(&requires, &present).is_none());
+    }
 
     const GUARDED_WORKFLOW: &str = r#"    # --allow-cgroup-failure is documented here but not executed.
         if [[ ${GITHUB_ACTIONS:-} != true ]]; then

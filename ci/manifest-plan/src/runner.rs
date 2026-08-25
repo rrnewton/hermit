@@ -33,6 +33,56 @@ const BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
 const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
 pub const CELL_RESULT_SCHEMA: u64 = 4;
 
+/// Closed vocabulary for manifest `requires` tokens.
+///
+/// The optional value is the host capability whose proven absence may withhold
+/// a cell. A token mapped to `None` is still validated, but can never suppress
+/// execution. Keeping the mapping here gives the manifest validator and the
+/// executable harness one authority.
+pub const REQUIRES_VOCABULARY: &[(&str, Option<&str>)] = &[
+    ("ar", None),
+    ("bash", None),
+    ("cc", None),
+    ("cpuid", Some("cpuid-faulting")),
+    ("cxx", None),
+    ("date", None),
+    ("du", None),
+    ("find", None),
+    ("gawk", None),
+    ("git", None),
+    ("hexdump", None),
+    ("jq", None),
+    ("kvm", None),
+    ("linux", None),
+    ("lua5.4", None),
+    ("m4", None),
+    ("node", None),
+    ("openssl", None),
+    ("perl", None),
+    ("ptrace", None),
+    ("python3", None),
+    ("ruby", None),
+    ("rustc", None),
+    ("sqlite3", None),
+    ("tclsh", None),
+    ("userns", None),
+    ("x86_64", None),
+    ("zstd", None),
+];
+
+pub fn requires_capability(token: &str) -> Result<Option<&'static str>, String> {
+    REQUIRES_VOCABULARY
+        .iter()
+        .find(|(name, _)| *name == token)
+        .map(|(_, capability)| *capability)
+        .ok_or_else(|| {
+            format!(
+                "unknown `requires` token `{token}`; the vocabulary is closed and an unrecognized \
+                 name is refused rather than treated as a reason to omit a cell"
+            )
+        })
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestDocument {
@@ -335,6 +385,9 @@ fn validate_document(document: &ManifestDocument, stem: &str, root: &Path) -> Re
         }
         if !(1..=1800).contains(&test.timeout_seconds) {
             return Err(format!("{}: timeout_seconds must be 1..=1800", test.id));
+        }
+        for token in &test.requires {
+            requires_capability(token).map_err(|error| format!("{}.requires: {error}", test.id))?;
         }
         match (&test.program, &test.direct) {
             (Some(program), None) => {
@@ -1820,6 +1873,54 @@ pub fn infrastructure_error_result(
     }
 }
 
+/// Publish a typed result for a cell that provably cannot execute on this host.
+///
+/// No argv, environment, binary identity, or attempt is invented: the cell did
+/// not run. Its normal identity and source digest remain present so the row
+/// stays in the selected denominator and downstream completeness checks can
+/// distinguish explicit inapplicability from missing output.
+pub fn host_inapplicable_result(
+    context: &RunContext,
+    cell: &SelectedCell,
+    reason: String,
+) -> CellResult {
+    let dir = cell_artifact_dir(context, cell);
+    CellResult {
+        artifact_dir: dir.display().to_string(),
+        schema: CELL_RESULT_SCHEMA,
+        run_id: context.run_id.clone(),
+        hermit_sha: context.source_sha.clone(),
+        source_tree_dirty: context.source_dirty,
+        binary_sha256: None,
+        test_sha256: test_digest(&context.root, &cell.test).unwrap_or_default(),
+        test: cell.id.test.clone(),
+        category: cell.category.clone(),
+        lane: cell.test.lane.clone(),
+        mode: cell.id.mode.clone(),
+        backend: cell.id.backend.clone(),
+        classification: if cell.enabled { "required" } else { "disabled" }.into(),
+        outcome: "HOST-INAPPLICABLE".into(),
+        error_kind: None,
+        duration_ms: 0,
+        log_level: None,
+        effective_args: Vec::new(),
+        argv: Vec::new(),
+        guest_argv: Vec::new(),
+        env: BTreeMap::new(),
+        cwd: context.root.to_string_lossy().into_owned(),
+        shell_command: String::new(),
+        relaxations: cell_relaxations(cell),
+        execution_path: None,
+        diversity: None,
+        attempts: Vec::new(),
+        first_divergent_scheduler_turn: None,
+        first_divergent_virtual_nanoseconds: None,
+        first_divergent_record: None,
+        first_divergent_syscall: None,
+        reason: Some(reason),
+    }
+}
+
 /// Reduce per-attempt divergence positions to the cell-level pair.
 ///
 /// Same first-attempt rule as `reason`, and resolved PER COORDINATE rather than
@@ -2000,8 +2101,12 @@ pub fn write_junit(path: &Path, results: &[CellResult]) -> Result<(), String> {
         .iter()
         .filter(|result| result.outcome == "ERROR")
         .count();
+    let skipped = results
+        .iter()
+        .filter(|result| result.outcome == "HOST-INAPPLICABLE")
+        .count();
     let mut out = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuite name=\"hermit-e2e\" tests=\"{}\" failures=\"{failures}\" errors=\"{errors}\">\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuite name=\"hermit-e2e\" tests=\"{}\" failures=\"{failures}\" errors=\"{errors}\" skipped=\"{skipped}\">\n",
         results.len()
     );
     for result in results {
@@ -2023,6 +2128,12 @@ pub fn write_junit(path: &Path, results: &[CellResult]) -> Result<(), String> {
             out.push_str(&format!(
                 "<error>{}</error>",
                 xml(result.reason.as_deref().unwrap_or("error"))
+            ));
+        }
+        if result.outcome == "HOST-INAPPLICABLE" {
+            out.push_str(&format!(
+                "<skipped message=\"{}\"/>",
+                xml(result.reason.as_deref().unwrap_or("host-inapplicable"))
             ));
         }
         out.push_str("</testcase>\n");
@@ -2420,6 +2531,63 @@ mod tests {
             infrastructure_error_result(&context, &cell, "fixture".into()).classification,
             "required"
         );
+    }
+
+    #[test]
+    fn host_inapplicable_is_a_typed_nonpass_and_a_junit_skip() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-host-inapplicable-bracket-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut test = recipe(true);
+        test.requires = vec!["cpuid".into()];
+        let cell = SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: test.id.clone(),
+                mode: "verify".into(),
+                backend: Some("ptrace".into()),
+            },
+            test,
+            enabled: true,
+        };
+        let context = RunContext {
+            root: root.clone(),
+            hermit_bin: root.join("hermit"),
+            result_root: root.join("results"),
+            build_root: root.join("build"),
+            run_id: "fixture".into(),
+            source_sha: "0".repeat(40),
+            source_dirty: false,
+            prebuilt: false,
+            keep_logs: false,
+            run_verify_strict: false,
+            record_verify_strict: false,
+            scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
+            isolated_workdir: None,
+        };
+        let result = host_inapplicable_result(
+            &context,
+            &cell,
+            "NOT RUN, NOT a pass, no coverage: planted absence".into(),
+        );
+        assert_eq!(result.outcome, "HOST-INAPPLICABLE");
+        assert!(result.attempts.is_empty());
+        assert!(result.binary_sha256.is_none());
+        assert_eq!(result.error_kind, None);
+
+        let junit = root.join("junit.xml");
+        write_junit(&junit, &[result]).unwrap();
+        let xml = fs::read_to_string(&junit).unwrap();
+        assert!(xml.contains("tests=\"1\" failures=\"0\" errors=\"0\" skipped=\"1\""));
+        assert!(
+            xml.contains(
+                "<skipped message=\"NOT RUN, NOT a pass, no coverage: planted absence\"/>"
+            )
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -377,7 +377,7 @@ fn usage() -> &'static str {
      \n\
      --probe-host-capability <name> reports this machine's verdict for one\n\
      capability as PRESENT|ABSENT plus the observation behind it, and exits.\n\
-     It runs no gate. ci/test_harness.sh calls it so a withheld manifest CELL\n\
+     It runs no gate. target/debug/test-harness calls it so a withheld manifest CELL\n\
      and a withheld DAG node are decided by the same probe."
 }
 
@@ -3528,7 +3528,7 @@ fn withhold_host_inapplicable(root: &Path, plan: &mut Plan) -> Result<(), String
 // hermit#2214 withholds a manifest CELL whose own `requires` declaration names
 // one. Between them sits the case neither covers: a DAG node that declares
 // nothing itself, but whose entire cell population is withheld at cell level, so
-// it would spawn and have nothing at all to run. `ci/test_harness.sh` refuses
+// it would spawn and have nothing at all to run. `target/debug/test-harness` refuses
 // that with its vacuity guard — correctly, because `0/0` is not a passing
 // population — which leaves the run incomplete rather than recorded.
 //
@@ -3564,7 +3564,7 @@ fn withhold_host_inapplicable(root: &Path, plan: &mut Plan) -> Result<(), String
 //     `gates_expected`, named in the plan header, the cost table, the verdict
 //     detail and the ledger row, and never written into `gates[]`.
 
-/// One manifest bucket's cell accounting, exactly as `ci/test_harness.sh`
+/// One manifest bucket's cell accounting, exactly as `target/debug/test-harness`
 /// counts it for the run that bucket's node would perform.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BucketCells {
@@ -3607,7 +3607,7 @@ fn bucket_runs_nothing(bucket: &BucketCells) -> bool {
 /// a node selecting a wider population must not be matched against a narrower
 /// count.
 fn manifest_bucket_of(cmd: &str) -> Option<(String, String)> {
-    let tail = cmd.split_once("./ci/test_harness.sh run ")?.1;
+    let tail = cmd.split_once("target/debug/test-harness run ")?.1;
     let tokens: Vec<&str> = tail.split_whitespace().collect();
     let mut lane: Option<String> = None;
     let mut category: Option<String> = None;
@@ -3645,7 +3645,7 @@ fn manifest_bucket_of(cmd: &str) -> Option<(String, String)> {
     Some((lane?, category?))
 }
 
-/// Parse `ci/test_harness.sh host-inapplicable-buckets` output.
+/// Parse `target/debug/test-harness host-inapplicable-buckets` output.
 ///
 /// Strict: a malformed line is an error rather than a silently dropped bucket,
 /// and the caller turns any error into "withhold nothing".
@@ -3691,18 +3691,42 @@ fn parse_bucket_cells(text: &str) -> Result<Vec<BucketCells>, String> {
 /// selection here would create a second implementation that could drift from
 /// the one that actually runs.
 fn read_bucket_cells(root: &Path) -> Result<Vec<BucketCells>, String> {
-    let mut c = Command::new("timeout");
-    c.arg("600")
-        .arg(root.join("ci").join("test_harness.sh"))
-        .arg("host-inapplicable-buckets")
-        .arg("--ci-only")
-        .current_dir(root);
-    let out = c
+    let build = Command::new("timeout")
+        .arg("600")
+        .arg("cargo")
+        .args([
+            "build",
+            "--quiet",
+            "--locked",
+            "-p",
+            "hermit-manifest-plan",
+            "--bins",
+        ])
+        .current_dir(root)
         .output()
-        .map_err(|e| format!("could not run ci/test_harness.sh host-inapplicable-buckets: {e}"))?;
+        .map_err(|e| format!("could not build the current test-harness: {e}"))?;
+    if !build.status.success() {
+        return Err(format!(
+            "building the current test-harness exited {}: {}",
+            build
+                .status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".into()),
+            String::from_utf8_lossy(&build.stderr)
+                .lines()
+                .last()
+                .unwrap_or_default()
+        ));
+    }
+    let out = Command::new(root.join("target/debug/test-harness"))
+        .args(["host-inapplicable-buckets", "--ci-only"])
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("could not run target/debug/test-harness host-inapplicable-buckets: {e}"))?;
     if !out.status.success() {
         return Err(format!(
-            "ci/test_harness.sh host-inapplicable-buckets exited {}: {}",
+            "target/debug/test-harness host-inapplicable-buckets exited {}: {}",
             out.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
             String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or_default()
         ));
@@ -3786,7 +3810,7 @@ fn withhold_vacuous_manifest_nodes(
         let Some(evidence) = absent.get(&capability) else {
             println!(
                 "Host capability {name}: the driver's probe says PRESENT while \
-                 ci/test_harness.sh withheld cells for it; the sources disagree, so \
+                 target/debug/test-harness withheld cells for it; the sources disagree, so \
                  {tag} RUNS."
             );
             continue;
@@ -3820,7 +3844,7 @@ fn withhold_vacuous_manifest_nodes(
         ));
     }
     let drop_edge: BTreeSet<(String, String)> = droppable.iter().cloned().collect();
-    let mut apply = |cfg: &mut DagConfig| {
+    let apply = |cfg: &mut DagConfig| {
         cfg.steps.retain(|s| !gone.contains(&s.tag()));
         for step in cfg.steps.iter_mut() {
             let tag = step.tag();
@@ -5429,7 +5453,6 @@ fn verdict_refusals(
     out
 }
 
-<<<<<<< HEAD
 /// Execution completeness applies after profile-specific failure policy. A
 /// profile may allow a fully measured failing row, but no profile may turn a
 /// partial run into exit zero.
@@ -5454,7 +5477,8 @@ fn possible_missing_artifact_nodes<'a>(
         })
         .map(|outcome| outcome.tag.as_str())
         .collect()
-=======
+}
+
 /// Two-sided bracket for withholding a manifest bucket NODE whose entire cell
 /// population is withheld.
 ///
@@ -5524,7 +5548,7 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
     // THE NODE-TO-BUCKET BINDING, from the node's own command. A command with
     // any selection token this function does not model must NOT be matched
     // against the bucket accounting.
-    let shipped = "./ci/run-with-hermit-e2e-artifact.sh ./ci/test_harness.sh run \
+    let shipped = "./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run \
                    --lane privileged --category backend-parity-c --ci-only --allow-empty --prebuilt";
     if manifest_bucket_of(shipped)
         != Some(("privileged".to_string(), "backend-parity-c".to_string()))
@@ -5536,15 +5560,15 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
     }
     let unmodelled = [
         // A narrower selection than the accounting was taken with.
-        "./ci/test_harness.sh run --lane privileged --category backend-parity-c --ci-only --mode verify",
-        "./ci/test_harness.sh run --lane privileged --category backend-parity-c --ci-only --backend ptrace",
-        "./ci/test_harness.sh run --lane privileged --category backend-parity-c --ci-only --test backend-parity-c/cpuid-probe",
+        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --mode verify",
+        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --backend ptrace",
+        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --test backend-parity-c/cpuid-probe",
         // A WIDER selection than the accounting was taken with.
-        "./ci/test_harness.sh run --lane privileged --category backend-parity-c --ci-only --include-occasional",
-        "./ci/test_harness.sh run --lane privileged --category backend-parity-c",
+        "target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --include-occasional",
+        "target/debug/test-harness run --lane privileged --category backend-parity-c",
         // Not a bucket run at all.
-        "./ci/test_harness.sh validate",
-        "./ci/test_harness.sh build --lane privileged --ci-only --allow-empty",
+        "target/debug/test-harness validate",
+        "target/debug/test-harness build --lane privileged --ci-only --allow-empty",
         "cargo test -p hermit-detcore",
     ];
     for cmd in unmodelled {
@@ -5667,7 +5691,6 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
         bound.join(", ")
     );
     Ok(())
->>>>>>> 2d547bc5ec ([disclosure: automated agent commit; ./ci-hub/bin/who-am-i --tag --role impl REFUSED (owner unresolved: identity resolver returned UNRESOLVED; no DG_AGENT_NAME, no identity-bearing process ancestor, no active TaskGraph owner). Written by a Claude Code agent named claude-hostcap by its coordinator claude-coord-fable, working in registered slot claude-cellcap. Role: impl. DG_AGENT_NAME was deliberately NOT set by hand, because that is the one input the disclosure design keeps launch-injected.] Withhold a DAG node when every manifest cell it would run is withheld)
 }
 
 /// Two-sided bracket for the host-capability withholding decision.
@@ -5679,7 +5702,7 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
 /// withheld, whatever is absent.
 fn host_capability_bracket(root: &Path) -> Result<(), String> {
     use validate_plan::HostCapability;
-    let step = |group: &str, job: &str, deps: Vec<String>| safe_ci_dag_runner::model::Step {
+    let step = |group: &str, job: &str, deps: Vec<String>| dagrun::model::Step {
         group: group.into(),
         job: job.into(),
         desc: String::new(),
@@ -5687,13 +5710,18 @@ fn host_capability_bracket(root: &Path) -> Result<(), String> {
         cmd: "true".into(),
         deps,
         env: BTreeMap::new(),
-        hint: safe_ci_dag_runner::model::ResourceHint::default(),
+        hint: dagrun::model::ResourceHint::default(),
         networkonly: false,
         engine_only: false,
         timeout: 10,
         cpu_timeout: 10,
         jobs_flag: None,
+        jobs_env: None,
         skip_reason: None,
+        write_domains: None,
+        write_domain_guarantee: None,
+        explains: Vec::new(),
+        fail_fast_family: None,
     };
     let requirements: BTreeMap<String, HostCapability> =
         [("cpuid.faulting".to_string(), HostCapability::CpuidFaulting)].into_iter().collect();
@@ -10271,7 +10299,7 @@ fn print_run_summary(s: &RunSummary, started: std::time::Instant) {
 /// A read-only query seam, in the same class as `--show-plan`: it runs no gate,
 /// writes no ledger, and applies no label. It exists so a consumer that is not
 /// this driver can reuse the SAME probe. Today that consumer is
-/// `ci/test_harness.sh`, which withholds a manifest CELL the machine cannot run
+/// `target/debug/test-harness`, which withholds a manifest CELL the machine cannot run
 /// the way the driver withholds a NODE. Exposing the existing probe was the
 /// alternative to writing a second one, and two probes for one question would
 /// eventually disagree.

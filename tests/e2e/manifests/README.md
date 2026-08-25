@@ -81,6 +81,23 @@ test:
           liteinst: LiteInst coverage is owned by its compatibility partition
 ```
 
+
+### Host requirements are a closed, evidence-bearing gate
+
+Every test declares `requires`. The vocabulary is closed in
+`ci/manifest-plan/src/runner.rs`; an unknown token refuses manifest loading.
+Most tokens are descriptive prerequisites only and can never suppress a cell.
+The sole current host capability mapping is `cpuid` to `cpuid-faulting`.
+
+When that capability is provably absent, the harness records each selected cell
+as `HOST-INAPPLICABLE` with the probe evidence. The cell stays in the selected
+denominator, has no invented command or attempt, and appears as JUnit `skipped`;
+it is never a pass. Probe failure or disagreement runs the cell. If every
+selected cell is inapplicable, the direct harness invocation refuses rather
+than returning a vacuous green. The validation planner also computes whether a
+DAG bucket would contain no runnable cells and records that node with the same
+typed outcome instead of spawning a known-empty bucket.
+
 The mode contracts are:
 
 | Mode | Contract |
