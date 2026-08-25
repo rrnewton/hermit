@@ -1497,6 +1497,8 @@ fn self_test() -> Result<(), String> {
     no_result_propagation_bracket()?;
     selective_subset_bracket(&root)?;
     self_output_bracket()?;
+    product_front_door_bracket()?;
+    product_front_door_process_bracket()?;
     // ---- DAG-config carry + ungrantable-resource brackets -------------------
     // BOTH directions. A check that refuses everything would pass the negative
     // case alone, so the positive case (a real lane admits) is load-bearing.
@@ -3023,6 +3025,72 @@ fn find_parent(root: &Path) -> Option<PathBuf> {
         if !cur.pop() || cur.as_os_str().is_empty() {
             return None;
         }
+    }
+}
+
+/// Whether this invocation is real product work in a dev-hermit workspace and
+/// therefore needs canonical ci-hub admission.
+///
+/// A `.gitmodules` entry alone can describe a generic Hermit superproject. The
+/// ci-hub directory is the dev-hermit boundary; once that boundary exists, a
+/// missing or broken launcher is non-authorizing rather than an escape.
+fn product_front_door_applies(
+    parent_detected: bool,
+    ci_hub_dir_present: bool,
+    _nested: bool,
+    show_plan: bool,
+) -> bool {
+    parent_detected && ci_hub_dir_present && !show_plan
+}
+
+/// Construct the refusal for an unadmitted product run. Production supplies
+/// `canonically_admitted` only from [`canonical_validate_lock_admission`].
+fn product_front_door_refusal(
+    parent: &Path,
+    root: &Path,
+    commit: &str,
+    requested_args: &str,
+    ci_hub_launcher_available: bool,
+    canonically_admitted: bool,
+) -> Option<String> {
+    if canonically_admitted {
+        return None;
+    }
+    let ci_hub_path = parent.join("ci-hub/ci-hub");
+    let ci_hub = validate_plan::shell_quote(&ci_hub_path.to_string_lossy());
+    let checkout = validate_plan::shell_quote(&root.to_string_lossy());
+    let remediation = if ci_hub_launcher_available {
+        format!(
+            "Run through the canonical launcher instead:\n\n  {ci_hub} validate-run --checkout \
+             {checkout} --agent '<registered-agent-name>' --target {commit} -- {requested_args}"
+        )
+    } else {
+        format!(
+            "The canonical ci-hub launcher is unavailable at {ci_hub}. Repair or sync the parent \
+             checkout, then invoke validation through ci-hub; do not run this driver directly."
+        )
+    };
+    Some(format!(
+        "validate: REFUSED — product validation inside dev-hermit must enter through canonical \
+         ci-hub admission.\n\
+         A naked run from {checkout} can consume the validation box without exact commit, host, \
+         and live lock-owner ancestry authority, and can write an unadmitted ledger row.\n\
+         \n\
+         {remediation}"
+    ))
+}
+
+/// Reproduce the caller's validated argv after ci-hub's `--` separator. An
+/// empty argv means the driver's default full profile.
+fn requested_validate_args() -> String {
+    let args = std::env::args()
+        .skip(1)
+        .map(|arg| validate_plan::shell_quote(&arg))
+        .collect::<Vec<_>>();
+    if args.is_empty() {
+        "full".into()
+    } else {
+        args.join(" ")
     }
 }
 
@@ -7311,12 +7379,6 @@ fn canonical_validate_lock_admission(
     commit: &str,
     host: &str,
 ) -> bool {
-    fn object_string<'a>(
-        object: &'a serde_json::Map<String, serde_json::Value>,
-        key: &str,
-    ) -> Option<&'a str> {
-        object.get(key).and_then(serde_json::Value::as_str)
-    }
     let status = if env_flag("HERMIT_VALIDATE_STOP_TEST_MODE", "1") {
         let Ok(fixture) = std::env::var("VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON") else {
             return false;
@@ -7339,7 +7401,36 @@ fn canonical_validate_lock_admission(
         }
         output.stdout
     };
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&status) else {
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|id| id.trim().to_string());
+    canonical_validate_lock_status_admits(
+        &status,
+        commit,
+        host,
+        boot_id.as_deref(),
+        validate_runtime::identity_in_ancestry,
+    )
+}
+
+/// Parse and bind one canonical authority response. The injected identity
+/// predicate is the real `/proc` ancestry check in production and a planted,
+/// inert identity in `--self-test`; no caller-supplied environment marker can
+/// bypass these exact commit, host, boot, PID, and start-time checks.
+fn canonical_validate_lock_status_admits(
+    status: &[u8],
+    commit: &str,
+    host: &str,
+    boot_id: Option<&str>,
+    identity_in_ancestry: impl FnOnce(i32, u64) -> bool,
+) -> bool {
+    fn object_string<'a>(
+        object: &'a serde_json::Map<String, serde_json::Value>,
+        key: &str,
+    ) -> Option<&'a str> {
+        object.get(key).and_then(serde_json::Value::as_str)
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(status) else {
         return false;
     };
     let Some(holder) = value.get("holder").and_then(serde_json::Value::as_object) else {
@@ -7375,13 +7466,374 @@ fn canonical_validate_lock_admission(
     if pid <= 1 || start_ticks == 0 {
         return false;
     }
-    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .ok()
-        .map(|id| id.trim().to_string());
-    if boot_id.as_deref() != object_string(owner, "boot_id") {
+    if boot_id != object_string(owner, "boot_id") {
         return false;
     }
-    validate_runtime::identity_in_ancestry(pid, start_ticks)
+    identity_in_ancestry(pid, start_ticks)
+}
+
+/// Inert two-sided bracket for the front door and the canonical authority
+/// parser. It proves the new guard neither accepts missing/mismatched authority
+/// nor mistakes a generic superproject for dev-hermit. Nested payloads remain
+/// subject to the same authority, so their caller-supplied marker cannot become
+/// an admission bypass.
+fn product_front_door_bracket() -> Result<(), String> {
+    let policy_cases = [
+        (true, true, false, false, true, "dev-hermit top-level product run"),
+        (false, false, false, false, false, "standalone clone"),
+        (true, false, false, false, false, "generic Hermit superproject"),
+        (true, true, true, false, true, "nested focused payload"),
+        (true, true, false, true, false, "show-plan"),
+    ];
+    for (parent, ci_hub_dir, nested, show_plan, expected, label) in policy_cases {
+        let actual = product_front_door_applies(parent, ci_hub_dir, nested, show_plan);
+        if actual != expected {
+            return Err(format!(
+                "product front door classified {label} as applies={actual}, expected {expected}"
+            ));
+        }
+    }
+
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let host = "devbig014";
+    let boot_id = "11111111-2222-3333-4444-555555555555";
+    let authority = serde_json::json!({
+        "schema_version": 1,
+        "admissible": true,
+        "state": "held",
+        "reason_code": null,
+        "canonical_anchor_held": true,
+        "cleanup_state": "active-bound",
+        "holder": {"kind": "validate", "target": commit, "host": host},
+        "owner": {
+            "host": host,
+            "liveness": "alive",
+            "pid": 4242,
+            "start_ticks": 987654,
+            "boot_id": boot_id
+        }
+    });
+    let encode = |value: &serde_json::Value| serde_json::to_vec(value).unwrap();
+    if !canonical_validate_lock_status_admits(
+        &encode(&authority),
+        commit,
+        host,
+        Some(boot_id),
+        |pid, ticks| pid == 4242 && ticks == 987654,
+    ) {
+        return Err("product front door refused exact canonical authority".into());
+    }
+
+    // Goalpost safety: every case below weakens or changes an identity claim.
+    // Each must remain non-authorizing; improving diagnostics must never turn
+    // one into an exemption.
+    let mut weakened = Vec::new();
+    let mut value = authority.clone();
+    value["schema_version"] = serde_json::json!(2);
+    weakened.push(("wrong schema", value));
+    let mut value = authority.clone();
+    value["admissible"] = serde_json::json!(false);
+    weakened.push(("not admissible", value));
+    let mut value = authority.clone();
+    value["state"] = serde_json::json!("free");
+    weakened.push(("lock not held", value));
+    let mut value = authority.clone();
+    value["reason_code"] = serde_json::json!("owner-not-ancestor");
+    weakened.push(("non-null refusal reason", value));
+    let mut value = authority.clone();
+    value["canonical_anchor_held"] = serde_json::json!(false);
+    weakened.push(("canonical anchor absent", value));
+    let mut value = authority.clone();
+    value["cleanup_state"] = serde_json::json!("stale");
+    weakened.push(("invalid cleanup state", value));
+    let mut value = authority.clone();
+    value["holder"]["kind"] = serde_json::json!("other");
+    weakened.push(("wrong holder kind", value));
+    let mut value = authority.clone();
+    value["holder"]["target"] = serde_json::json!("different-commit");
+    weakened.push(("wrong commit", value));
+    let mut value = authority.clone();
+    value["holder"]["host"] = serde_json::json!("other-host");
+    weakened.push(("wrong holder host", value));
+    let mut value = authority.clone();
+    value["owner"]["host"] = serde_json::json!("other-host");
+    weakened.push(("wrong owner host", value));
+    let mut value = authority.clone();
+    value["owner"]["liveness"] = serde_json::json!("dead");
+    weakened.push(("owner not alive", value));
+    let mut value = authority.clone();
+    value["owner"]["pid"] = serde_json::json!(1);
+    weakened.push(("unsafe owner pid", value));
+    let mut value = authority.clone();
+    value["owner"]["start_ticks"] = serde_json::json!(0);
+    weakened.push(("zero owner start ticks", value));
+    let mut value = authority.clone();
+    value["owner"]["boot_id"] = serde_json::json!("other-boot");
+    weakened.push(("wrong boot", value));
+    for (label, value) in weakened {
+        if canonical_validate_lock_status_admits(
+            &encode(&value),
+            commit,
+            host,
+            Some(boot_id),
+            |pid, ticks| pid == 4242 && ticks == 987654,
+        ) {
+            return Err(format!("product front door accepted weakened authority: {label}"));
+        }
+    }
+    if canonical_validate_lock_status_admits(
+        &encode(&authority),
+        commit,
+        host,
+        Some(boot_id),
+        |_pid, _ticks| false,
+    ) {
+        return Err("product front door accepted authority outside owner ancestry".into());
+    }
+
+    // These were historical, forgeable authorization inputs. The canonical
+    // parser is deliberately pure with respect to the process environment; pin
+    // that property against all legacy spellings still present in old tests.
+    let legacy_env = [
+        ("CI_HUB_VALIDATE_PRODUCER", "forged"),
+        ("CI_HUB_VALIDATE_LOCK_OWNER_PID", "4242"),
+        ("CI_HUB_VALIDATE_LOCK_OWNER_FILE", "/tmp/forged-owner"),
+    ];
+    let saved = legacy_env.map(|(name, _)| (name, std::env::var_os(name)));
+    // SAFETY: this self-test is single-threaded at this point, and every value
+    // is restored before returning from the bracket.
+    for (name, value) in legacy_env {
+        unsafe { std::env::set_var(name, value) };
+    }
+    let forged_env_admitted = canonical_validate_lock_status_admits(
+        br#"{"schema_version":1,"admissible":false}"#,
+        commit,
+        host,
+        Some(boot_id),
+        |_pid, _ticks| true,
+    );
+    for (name, value) in saved {
+        match value {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+    }
+    if forged_env_admitted {
+        return Err("product front door trusted forged legacy owner environment".into());
+    }
+
+    let parent = PathBuf::from("/srv/dev-hermit");
+    let checkout = parent.join("worktrees/slot07/hermit");
+    let refusal = product_front_door_refusal(
+        &parent,
+        &checkout,
+        commit,
+        "--strict-compat-only",
+        true,
+        false,
+    )
+    .ok_or_else(|| "product front door omitted the naked-run refusal".to_string())?;
+    if !refusal.contains("unadmitted ledger row")
+        || !refusal.contains(commit)
+        || !refusal.contains("ci-hub/ci-hub validate-run")
+    {
+        return Err(format!("product front-door refusal lost remediation detail: {refusal}"));
+    }
+    if product_front_door_refusal(
+        &parent,
+        &checkout,
+        commit,
+        "--strict-compat-only",
+        true,
+        true,
+    )
+    .is_some()
+    {
+        return Err("product front door refused canonical admission".into());
+    }
+
+    let unavailable = product_front_door_refusal(
+        &parent,
+        &checkout,
+        commit,
+        "--strict-compat-only",
+        false,
+        false,
+    )
+    .ok_or_else(|| "product front door omitted the missing-launcher refusal".to_string())?;
+    if !unavailable.contains("launcher is unavailable")
+        || unavailable.contains("validate-run --checkout")
+    {
+        return Err(format!("missing-launcher refusal printed a false remedy: {unavailable}"));
+    }
+
+    println!(
+        "  product front door: parent+ci-hub and nested payloads require authority; generic/\
+         standalone/show-plan paths allowed; exact authority and diagnostics bracketed"
+    );
+    Ok(())
+}
+
+/// Drive this exact executable through the real `run()` entry path. The pure
+/// bracket above pins policy details; this process bracket pins the wiring and
+/// proves full, focused, and caller-marked nested work all stop before creating
+/// validation state when canonical authority is missing or malformed.
+fn product_front_door_process_bracket() -> Result<(), String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("front-door process bracket: current executable: {error}"))?;
+    let git_dir = sh("git", &["rev-parse", "--absolute-git-dir"])
+        .ok_or_else(|| "front-door process bracket: cannot resolve git dir".to_string())?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("front-door process bracket: system clock: {error}"))?
+        .as_nanos();
+    let tmp = std::env::temp_dir().join(format!(
+        "validate-front-door-process-{}-{nonce}",
+        std::process::id()
+    ));
+
+    let result = (|| {
+        let cases: [(&str, &[&str], bool, bool, &str); 3] = [
+            (
+                "top-level-missing-launcher",
+                &["full"],
+                false,
+                false,
+                "launcher is unavailable",
+            ),
+            (
+                "focused-invalid-authority",
+                &["--strict-compat-only"],
+                false,
+                true,
+                "Run through the canonical launcher",
+            ),
+            (
+                "nested-marker-invalid-authority",
+                &["--strict-compat-only"],
+                true,
+                true,
+                "Run through the canonical launcher",
+            ),
+        ];
+
+        for (label, args, nested, launcher_present, expected_remediation) in cases {
+            let parent = tmp.join(label);
+            let checkout = parent.join("hermit");
+            let ci_hub_dir = parent.join("ci-hub");
+            std::fs::create_dir_all(&checkout).map_err(|error| {
+                format!(
+                    "front-door process bracket: cannot create {}: {error}",
+                    checkout.display()
+                )
+            })?;
+            std::fs::create_dir_all(&ci_hub_dir).map_err(|error| {
+                format!(
+                    "front-door process bracket: cannot create {}: {error}",
+                    ci_hub_dir.display()
+                )
+            })?;
+            std::fs::write(
+                parent.join(".gitmodules"),
+                "[submodule \"hermit\"]\n\tpath = hermit\n\turl = self-test://unused\n",
+            )
+            .map_err(|error| {
+                format!("front-door process bracket: cannot write .gitmodules: {error}")
+            })?;
+            if launcher_present {
+                let launcher = ci_hub_dir.join("ci-hub");
+                std::fs::write(
+                    &launcher,
+                    "#!/bin/sh\nprintf '%s\\n' \
+                     '{\"schema_version\":1,\"admissible\":false}'\n",
+                )
+                .map_err(|error| {
+                    format!(
+                        "front-door process bracket: cannot write {}: {error}",
+                        launcher.display()
+                    )
+                })?;
+                std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
+                    .map_err(|error| {
+                        format!(
+                            "front-door process bracket: cannot chmod {}: {error}",
+                            launcher.display()
+                        )
+                    })?;
+            }
+
+            let mut command = Command::new(&executable);
+            command
+                .args(args)
+                .current_dir(&checkout)
+                .env("GIT_DIR", &git_dir)
+                .env("GIT_WORK_TREE", &checkout)
+                .env_remove("HERMIT_VALIDATE_STOP_TEST_MODE")
+                .env_remove("VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON")
+                .env_remove("HERMIT_VALIDATE_STOP_TEST_EXIT_EARLY")
+                .env_remove(PARENT_ENV)
+                .env_remove(validate_runtime::ACTIVE_ENV)
+                .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_PID")
+                .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_FILE");
+            if nested {
+                command
+                    .env(validate_runtime::ACTIVE_ENV, std::process::id().to_string())
+                    .env("CI_HUB_VALIDATE_LOCK_OWNER_PID", std::process::id().to_string())
+                    .env(
+                        "CI_HUB_VALIDATE_LOCK_OWNER_FILE",
+                        parent.join("caller-forged-owner"),
+                    );
+            }
+            let output = command.output().map_err(|error| {
+                format!("front-door process bracket: cannot launch {label}: {error}")
+            })?;
+            let rendered = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if output.status.code() != Some(4)
+                || !rendered.contains("product validation inside dev-hermit")
+                || !rendered.contains(expected_remediation)
+            {
+                return Err(format!(
+                    "front-door process bracket: {label} escaped/refused incorrectly: status={:?} \
+                     output={rendered}",
+                    output.status.code()
+                ));
+            }
+            for unexpected in [
+                checkout.join("target/validation"),
+                checkout.join("ignored/validate"),
+                parent.join("ledger"),
+            ] {
+                if unexpected.exists() {
+                    return Err(format!(
+                        "front-door process bracket: {label} created side effect before refusal: {}",
+                        unexpected.display()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    })();
+
+    let cleanup = std::fs::remove_dir_all(&tmp)
+        .map_err(|error| format!("front-door process bracket: cannot remove {}: {error}", tmp.display()));
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => {
+            println!(
+                "  product front door process: full/focused/nested missing-authority runs refused \
+                 before validation state"
+            );
+            Ok(())
+        }
+        (Err(problem), Ok(())) => Err(problem),
+        (Ok(()), Err(cleanup_problem)) => Err(cleanup_problem),
+        (Err(problem), Err(cleanup_problem)) => {
+            Err(format!("{problem}; cleanup also failed: {cleanup_problem}"))
+        }
+    }
 }
 
 /// Aggregate libtest `executed` / `filtered` counts from typed step outcomes.
@@ -8740,6 +9192,55 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // wedge a real run.
     if validate_runtime::stop_test_requested() {
         return stop_test_seam(&root, &profile_name, parent.as_deref());
+    }
+
+    // ---- dev-hermit product front door -------------------------------------
+    //
+    // Refuse real product work before the invocation lock, cache, cgroup boxing,
+    // durable log, ledger, or DAG can create side effects. A parent `ci-hub/`
+    // directory identifies dev-hermit; within that boundary, a missing or
+    // unreadable launcher/authority is a refusal rather than a standalone
+    // escape. Nested focused payloads are legitimate descendants of the same
+    // lock owner and pass that canonical check; they are not exempted based on
+    // their caller-supplied nesting marker.
+    // Help, self-test and the stop-test seam returned above; `--show-plan` is
+    // explicitly inert here.
+    let ci_hub_dir_present =
+        parent.as_ref().is_some_and(|candidate| candidate.join("ci-hub").is_dir());
+    if product_front_door_applies(
+        parent.is_some(),
+        ci_hub_dir_present,
+        nesting.nested,
+        args.show_plan,
+    ) {
+        let parent = parent.as_deref().expect("front-door predicate requires a parent");
+        let commit = git_sha();
+        let host = short_hostname();
+        let ci_hub_launcher_available = parent.join("ci-hub/ci-hub").is_file();
+        let admitted = canonical_validate_lock_admission(Some(parent), &commit, &host);
+        if let Some(refusal) = product_front_door_refusal(
+            parent,
+            &root,
+            &commit,
+            &requested_validate_args(),
+            ci_hub_launcher_available,
+            admitted,
+        ) {
+            eprintln!("{refusal}");
+            return RunSummary::refused(
+                4,
+                &profile_name,
+                "the dev-hermit product front door",
+                vec![
+                    "the dev-hermit boundary was detected, but exact-commit, exact-host, live \
+                     validate-lock owner ancestry was not established"
+                        .into(),
+                    "repair ci-hub if needed, then use its validate-run entry point; environment \
+                     markers cannot authorize product work"
+                        .into(),
+                ],
+            );
+        }
     }
 
     // Anchor the logical run before locks, freshness checks, plan construction, cgroup re-exec,
