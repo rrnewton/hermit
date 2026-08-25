@@ -1159,6 +1159,16 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                     if let Some(reason) = result.reason.as_deref() {
                         suffix.push_str(&format!(" {reason}"));
                     }
+                    // POINT AT THE EVIDENCE THAT ALREADY EXISTS.
+                    //
+                    // The per-cell artifacts are retained -- verify report,
+                    // captures, the whole directory -- and the bucket log was
+                    // the only thing standing between an investigator and them.
+                    // 28 failures across 305 runs were investigable all along
+                    // and were not investigated, because a FAIL line named the
+                    // cell and no path. The coordinates above say WHERE the
+                    // divergence is; this says WHAT ELSE IS AVAILABLE.
+                    suffix.push_str(&format!("\n    evidence: {}", result.artifact_dir));
                     suffix
                 };
                 println!(
