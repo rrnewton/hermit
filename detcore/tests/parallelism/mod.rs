@@ -6,8 +6,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#![feature(get_mut_unchecked)]
-#![feature(thread_id_value)]
 #![allow(
     unexpected_cfgs,
     reason = "`sanitized` is supplied by the internal sanitizer build"
@@ -53,16 +51,27 @@ mod mem_race {
         let shared_data: Arc<[u64]> = vec![0; NUM_ELEMENTS].into();
         let shared_idx = Arc::new(AtomicUsize::new(0));
 
-        fn worker(idx: Arc<AtomicUsize>, mut data: Arc<[u64]>) {
-            let tid = thread::current().id().as_u64().get();
-            // Get a mutable reference to the data. This is unsafe, but we guarantee the
-            // threads are always accesssing unique non-overlapping indices of the array.
-            let data = unsafe { Arc::get_mut_unchecked(&mut data) };
+        // `tag` is the distinct per-worker value written into the array. It used to
+        // be the thread id, but `ThreadId` has no stable numeric accessor and the
+        // test only ever needs the two workers to write DIFFERENT values --
+        // `count_switch_points` compares adjacent elements and never inspects the
+        // value itself.
+        fn worker(idx: Arc<AtomicUsize>, data: Arc<[u64]>, tag: u64) {
+            let len = data.len();
+            // SAFETY: the two workers only ever write to indices handed out by the
+            // shared atomic counter, so no two writes alias. This is the stable
+            // spelling of `Arc::get_mut_unchecked`: it rebuilds the same
+            // `&mut [u64]`, so indexing keeps its bounds check and the loop keeps
+            // the retired-conditional-branch profile the RCB preemption timer
+            // measures. Deliberately still a data race -- that is what mem_race
+            // exists to exercise -- so do NOT "fix" this with atomics.
+            let data: &mut [u64] =
+                unsafe { std::slice::from_raw_parts_mut(data.as_ptr() as *mut u64, len) };
 
             // Give each thread half of the fetch_add attempts.
             for _ in 0..(NUM_ELEMENTS / 2) {
                 let idx = idx.fetch_add(1, Ordering::SeqCst);
-                data[idx] = tid;
+                data[idx] = tag;
             }
         }
 
@@ -71,11 +80,11 @@ mod mem_race {
             let (idx, data) = (shared_idx.clone(), shared_data.clone());
             thread::spawn(move || {
                 // This exercises the futex_wait-called-by-kernel behavior, even on "bottom":
-                worker(idx, data)
+                worker(idx, data, 1)
             })
         };
         println!("Parent done spawning child thread and starting own work...");
-        worker(shared_idx, shared_data.clone());
+        worker(shared_idx, shared_data.clone(), 2);
 
         println!("Parent done with work and joining child thread..");
         handle.join().unwrap();
@@ -165,9 +174,16 @@ mod mem_print_race {
         let shared_data: Arc<[u64]> = vec![0; NUM_ELEMENTS].into();
         let shared_idx = Arc::new(AtomicUsize::new(0));
 
-        fn worker(idx: Arc<AtomicUsize>, mut data: Arc<[u64]>, rank: usize) {
-            let tid = thread::current().id().as_u64().get();
-            let data = unsafe { Arc::get_mut_unchecked(&mut data) };
+        fn worker(idx: Arc<AtomicUsize>, data: Arc<[u64]>, rank: usize) {
+            // Distinct nonzero value per worker; see the note in mem_race::worker.
+            let tid = rank as u64 + 1;
+            let len = data.len();
+            // SAFETY: as in mem_race::worker -- disjoint indices from the shared
+            // counter, and this is the stable spelling of `Arc::get_mut_unchecked`
+            // that keeps the bounds check, hence the RCB profile. Still a data
+            // race on purpose; do NOT "fix" it with atomics.
+            let data: &mut [u64] =
+                unsafe { std::slice::from_raw_parts_mut(data.as_ptr() as *mut u64, len) };
 
             for _i in 0..CHUNKS {
                 let s = format!("{} ", rank);
