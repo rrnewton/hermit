@@ -62441,7 +62441,7 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle."
+        "reason": "CASE 3: input edited AND generator run"
       },
       "observations": [],
       "measurement": "never-measured"

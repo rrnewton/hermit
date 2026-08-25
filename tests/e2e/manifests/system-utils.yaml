@@ -103,7 +103,7 @@ test:
         backends_enabled:
           - native
         backends_disabled: {}
-        ci_disabled_reason: 'CASE 2: input edited and generator never run'
+        ci_disabled_reason: 'CASE 3: input edited AND generator run'
       verify:
         ci: true
         backends_enabled:
