@@ -555,6 +555,10 @@ impl StartOpts {
                 // constant precisely so they cannot drift apart again. See its
                 // doc on `RECORD_REPLAY_HASHES_IO_BUFFERS`.
                 compare_io_buffers: hermit::RECORD_REPLAY_HASHES_IO_BUFFERS,
+                // Disclose the time policy this path actually runs under. It is
+                // the SAME constant `record_or_replay_config` uses, so the report
+                // cannot describe a policy the run did not use.
+                virtualize_time: hermit::RECORD_REPLAY_VIRTUALIZES_TIME,
                 keep_logs: false,
                 record_envelope: RecordEnvelope::all_records_v1(),
             },

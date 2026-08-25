@@ -3472,6 +3472,10 @@ impl RunOpts {
             ComparisonOptions {
                 verbose: self.verify_verbose,
                 strictness: self.verification_strictness(),
+                // Read from the LIVE config, not a constant: `--no-virtualize-time`
+                // makes this a real runtime choice on the run path, and a hard-coded
+                // `true` would publish a policy the run did not use.
+                virtualize_time: self.det_opts.det_config.virtualize_time,
                 // Every backend retains both logs, including KVM. Comparing
                 // them here is what makes `compare_io_buffers=true` truthful:
                 // otherwise the content hashes can differ in the retained

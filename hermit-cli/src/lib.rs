@@ -39,6 +39,22 @@ mod metadata;
 /// the decision once makes the pair impossible to desynchronize, and makes
 /// changing it a one-line edit in a place a reader can find.
 pub const RECORD_REPLAY_HASHES_IO_BUFFERS: bool = true;
+
+/// Whether record/replay virtualizes time. FALSE, DELIBERATELY, AND THAT IS WHY
+/// A GREEN RECORD/REPLAY VERDICT IS NOT A DETERMINISM RESULT.
+///
+/// Named for the same reason as [`RECORD_REPLAY_HASHES_IO_BUFFERS`] directly
+/// above: the decision was about to be carried twice. `metadata.rs`'s
+/// `record_or_replay_config` sets the config the recorder and replayer run
+/// under, and `record_start.rs`'s `ComparisonOptions` now discloses that setting
+/// in the verdict. If those two disagreed, the report would describe a time
+/// policy the run did not use — which is precisely the class of defect the
+/// disclosure exists to close, reintroduced one layer up.
+///
+/// `hermit run --verify` reads its value from the live `det_config` instead,
+/// because `--no-virtualize-time` makes it a genuine runtime choice there. Only
+/// the record/replay path is a fixed decision, so only it gets a constant.
+pub const RECORD_REPLAY_VIRTUALIZES_TIME: bool = false;
 mod record;
 mod recorder;
 mod replay;
