@@ -381,7 +381,8 @@ pub struct RunOpts {
     /// With --verify, write the verification verdict as a single JSON line to
     /// this path: `{"verified":bool,"bitwise_parity":bool,
     /// "verdict":"matched"|"diverged","comparison":{"strictness":
-    /// "stripped"|"canonical","compare_logs":bool,"compare_io_buffers":bool,
+    /// "stripped"|"canonical","display_name":str,
+    /// "compare_logs":bool,"compare_io_buffers":bool,
     /// "log_scope":
     /// "deterministic"|"info"|"full_trace","record_envelope":
     /// "all_records_v1","strip_lines":bool,
