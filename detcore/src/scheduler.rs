@@ -456,7 +456,12 @@ enum RemovalDisposition {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WaitidSignalRequest {
+    /// Parked in the legacy `waitid` kernel-polling loop, so the thread is
+    /// sitting in the run queue as a poller.
     Polling,
+    /// Parked on a scheduler-managed child-wait lifecycle resource. Such a
+    /// thread is blocked in `child_waiters`, not in the run queue.
+    BlockedChildWait,
     Pending(Vec<SigWrapper>),
 }
 
@@ -2589,6 +2594,18 @@ impl Scheduler {
         {
             return Some(WaitidSignalRequest::Polling);
         }
+        // A scheduler-managed child wait is the other way to be parked inside
+        // wait4/waitid. It blocks on a typed lifecycle resource instead of the
+        // polling loop, so it never enters the run queue and needs its own
+        // disposition. Without this arm a signal aimed at a thread waiting on a
+        // child that never exits is recorded nowhere and the wait hangs.
+        if resources
+            .resources
+            .keys()
+            .any(|resource| matches!(resource, ResourceID::WaitChild { .. }))
+        {
+            return Some(WaitidSignalRequest::BlockedChildWait);
+        }
         resources
             .resources
             .keys()
@@ -4133,6 +4150,18 @@ impl Scheduler {
                     if !self.run_queue.remove_tid(dettid) {
                         continue;
                     }
+                    signals.sort_by_key(|signal| *signal as libc::c_int);
+                    signals.dedup();
+                    let signals = signals.into_iter().map(SigWrapper).collect();
+                    let mut resources = Resources::new(dettid);
+                    resources.insert(ResourceID::WaitidSignals(signals), Permission::W);
+                    self.force_unblock_thread(dettid, resources);
+                }
+                Some(WaitidSignalRequest::BlockedChildWait) => {
+                    // The thread is in `blocked.child_waiters`, never the run
+                    // queue, so there is no `remove_tid` to perform first.
+                    // `force_unblock_thread` clears that blocking entry and
+                    // requeues it with the signals that woke it.
                     signals.sort_by_key(|signal| *signal as libc::c_int);
                     signals.dedup();
                     let signals = signals.into_iter().map(SigWrapper).collect();
@@ -5734,6 +5763,53 @@ mod test {
         assert!(scheduler.pending_waitid_signals.is_empty());
         assert!(scheduler.run_queue.contains_tid(target));
         assert!(scheduler.inbound_signals(target).is_empty());
+    }
+
+    /// A thread parked on a scheduler-managed child wait is blocked in
+    /// `child_waiters`, never in the run queue, so the run-queue removal the
+    /// polling disposition performs does not apply to it. Before this case was
+    /// handled, a signal aimed at such a thread was recorded nowhere and a wait
+    /// on a child that never exits could not be interrupted at all.
+    #[test]
+    fn pending_signal_unblocks_a_managed_child_waiter() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let target = DetTid::from_raw(100);
+        let parent = DetPid::from_raw(100);
+        register_known_thread(&mut scheduler, target);
+        let spec = ChildWaitSpec {
+            selector: ChildWaitSelector::Any,
+            owner: None,
+            exit_class: ChildWaitExitClass::Sigchld,
+        };
+        let mut waiting = Resources::new(target);
+        waiting.insert(ResourceID::WaitChild { parent, spec }, Permission::R);
+        waiting.fyi("wait-child-lifecycle");
+        scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(waiting));
+        // Parked, not runnable: exactly how `WaitChild` leaves a thread.
+        scheduler
+            .blocked
+            .child_waiters
+            .insert(target, (parent, spec));
+        assert!(!scheduler.run_queue.contains_tid(target));
+
+        scheduler.notify_signal_pending(target, Signal::SIGUSR1);
+        assert_eq!(scheduler.pending_waitid_signals[&target].len(), 1);
+
+        scheduler.drain_pending_waitid_signals();
+
+        assert!(
+            scheduler.run_queue.contains_tid(target),
+            "the signalled child waiter must be requeued"
+        );
+        assert!(
+            !scheduler.blocked.child_waiters.contains_key(&target),
+            "its child-wait blocking entry must be cleared"
+        );
+        assert_eq!(
+            scheduler.inbound_signals(target),
+            vec![SigWrapper(Signal::SIGUSR1)],
+            "the resume must name the signal that woke it"
+        );
     }
 
     #[test]

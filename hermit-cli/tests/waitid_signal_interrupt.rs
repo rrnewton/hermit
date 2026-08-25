@@ -615,3 +615,67 @@ fn waitid_ready_child_path_is_ptrace_l2() {
         );
     }
 }
+
+/// End-to-end proof that the watchdog is EFFECTIVE, not merely present.
+///
+/// The two tests above exercise `watchdog_limit_failure` and
+/// `drain_stderr_batch` in isolation: they prove the predicate *reports*. They
+/// do not prove that the surrounding loop ever escapes, that a live Hermit is
+/// actually killed, or that the diagnostic reaches the caller. A bound that
+/// fires into a loop that keeps waiting is the failure mode this guards.
+///
+/// The bound is shrunk until it MUST trigger against a real Hermit process, and
+/// the run is then required to come back — bounded — carrying a message that
+/// names the condition and the measured values.
+#[test]
+fn watchdog_escapes_and_reports_against_a_live_hermit() {
+    let limits = WatchdogLimits {
+        max_waitid_retries: usize::MAX,
+        // Deliberately far below any real run: this must fire on the first tick.
+        backstop: Duration::from_millis(1),
+        max_stderr_events_per_tick: 1,
+    };
+
+    let started = Instant::now();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_bounded_with_limits(&["--live-sibling-signal"], true, None, limits)
+    }));
+    let elapsed = started.elapsed();
+
+    // EFFECTIVE: the call returned instead of waiting on the guest.
+    let payload = match outcome {
+        Err(payload) => payload,
+        Ok(run) => panic!(
+            "a 1ms deadline against a live Hermit must abort the run, not complete it \
+             (hermit exited {}, {} retries observed)",
+            run.status, run.retries,
+        ),
+    };
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "the watchdog took {elapsed:?} to escape, so the bound is not enforced"
+    );
+
+    // REPORTED: the diagnostic names the bounded condition and its measurements.
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .expect("the watchdog failure must carry a string payload");
+    assert!(
+        message.contains("waitid watchdog wall-clock deadline exceeded"),
+        "the watchdog fired but did not name the condition: {message}"
+    );
+    assert!(
+        message.contains("limit 1ms") && message.contains("elapsed"),
+        "the watchdog must report the limit and the measured elapsed time: {message}"
+    );
+    assert!(
+        message.contains("process_exited=") && message.contains("stderr_eof="),
+        "the watchdog must report the lifecycle state it observed: {message}"
+    );
+    assert!(
+        message.contains("guest stdout:") && message.contains("hermit stderr:"),
+        "the watchdog must attach the captured diagnostics: {message}"
+    );
+}
