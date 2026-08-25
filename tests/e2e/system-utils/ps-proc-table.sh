@@ -24,11 +24,12 @@ case ${1:-} in
     --run)
         # Walk the whole table. Sorted so the report does not depend on the
         # order /proc happens to enumerate, which is a separate contract.
-        mkdir -p "$E2E_TMPDIR"
-        ps -eo pid,ppid,state,comm --no-headers | sort -n >"$E2E_TMPDIR/table.txt"
+        work="${E2E_TMPDIR:-/tmp}"
+        mkdir -p "$work"
+        ps -eo pid,ppid,state,comm --no-headers | sort -n >"$work/table.txt"
         printf 'PS-TABLE\n'
-        cat "$E2E_TMPDIR/table.txt"
-        rows=$(wc -l <"$E2E_TMPDIR/table.txt" | tr -d '[:space:]')
+        cat "$work/table.txt"
+        rows=$(wc -l <"$work/table.txt" | tr -d '[:space:]')
         printf 'PS-ROWS %s\n' "$rows"
 
         # The guest's own view of itself, via /proc through a second real

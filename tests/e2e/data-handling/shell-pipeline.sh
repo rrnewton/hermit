@@ -9,7 +9,7 @@ set -euo pipefail
 case ${1:-} in
     --prepare) exit 0 ;;
     --run)
-        work="$E2E_TMPDIR/shell-pipeline"
+        work="${E2E_TMPDIR:-/tmp}/shell-pipeline"
         rm -rf "$work"
         mkdir -p "$work"
         input="$work/words.txt"

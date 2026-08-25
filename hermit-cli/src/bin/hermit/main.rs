@@ -211,7 +211,7 @@ enum Subcommand {
 
     /// Record the execution of a program (EXPERIMENTAL).
     #[clap(name = "record", trailing_var_arg = true)]
-    Record(RecordOpts),
+    Record(Box<RecordOpts>),
 
     /// Replay the execution of a program.
     #[clap(name = "replay")]
@@ -552,10 +552,14 @@ mod tests {
     #[test]
     fn dbt_arm_has_a_channel_to_publish_a_verdict() {
         let source = include_str!("backends.rs");
-        let signatures: Vec<&str> = source
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("backends test module")
+            .0;
+        let signatures: Vec<&str> = production
             .match_indices("fn run_dbt(")
             .map(|(i, _)| {
-                let rest = &source[i..];
+                let rest = &production[i..];
                 &rest[..rest
                     .find(") -> Result<ExitStatus, Error>")
                     .expect("run_dbt signature")]

@@ -50,6 +50,7 @@ impl Replay {
         dir: &Path,
         capture_output: bool,
         gdbserver: Option<u16>,
+        mounts: &[Mount],
     ) -> Result<Self, Error> {
         let metadata_path = dir.join(METADATA_NAME);
 
@@ -81,6 +82,10 @@ impl Replay {
 
         let chroot =
             prepare_chroot(dir, &metadata).context("Failed to create chroot environment")?;
+
+        for mount in prepare_replay_mounts(&chroot, mounts)? {
+            command.mount(mount);
+        }
 
         // bind mount fbcode otherwise many program can fail to execve due to missing
         // shared libraries. This path only exists on Meta hosts; skip it elsewhere
@@ -142,6 +147,46 @@ impl Replay {
         global_state.clean_up(false, &None).await;
         Ok(output)
     }
+}
+
+fn prepare_replay_mounts(chroot: &TempChroot, mounts: &[Mount]) -> io::Result<Vec<Mount>> {
+    mounts
+        .iter()
+        .map(|mount| {
+            let target = chroot.relpath(mount.get_target());
+            let source_is_file = match mount.get_source() {
+                Some(source) => fs::metadata(source)?.is_file(),
+                None => false,
+            };
+            if source_is_file {
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                match fs::symlink_metadata(&target) {
+                    Ok(metadata) if metadata.file_type().is_file() => {}
+                    Ok(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            format!(
+                                "replay mount target {} is not a regular file",
+                                target.display()
+                            ),
+                        ));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&target)?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                fs::create_dir_all(&target)?;
+            }
+            Ok(mount.clone().target(target))
+        })
+        .collect()
 }
 
 /// Creates the temporary chroot directory.
@@ -262,4 +307,39 @@ fn populate_recorded_exec_paths(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn requested_mount_targets_are_rebased_into_the_replay_chroot() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let chroot = TempChroot::new_in(data_dir.path()).unwrap();
+        let mounts = prepare_replay_mounts(&chroot, &[Mount::tmpfs("/test")]).unwrap();
+
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].get_target(), chroot.path().join("test"));
+        assert!(chroot.path().join("test").is_dir());
+    }
+
+    #[test]
+    fn existing_regular_file_is_a_valid_replay_bind_target() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let source = data_dir.path().join("source");
+        fs::write(&source, b"source").unwrap();
+        let chroot = TempChroot::new_in(data_dir.path()).unwrap();
+        let target = chroot.path().join("mounted-file");
+        fs::write(&target, b"existing").unwrap();
+
+        let mounts =
+            prepare_replay_mounts(&chroot, &[Mount::bind(&source, "/mounted-file")]).unwrap();
+
+        assert_eq!(mounts[0].get_target(), target);
+        assert_eq!(
+            fs::read(chroot.path().join("mounted-file")).unwrap(),
+            b"existing"
+        );
+    }
 }

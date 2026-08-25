@@ -113,12 +113,13 @@
         lua5_4 gnum4 nodejs openssh ruby tcl util-linux procps
       ];
 
-      # Toolchain and native libraries needed to build Hermit and to compile the
-      # project's C fixtures INSIDE the root with the pinned compiler.
+      # Native libraries need both their runtime and development outputs. A Nix
+      # image does not populate FHS search paths, so the environment below makes
+      # these exact pinned outputs visible to build scripts and the C compiler.
+      nativeLibs = with pkgs; [ libunwind elfutils zlib openssl ];
       buildTools = with pkgs; [
-        rustToolchain gcc binutils gnumake cmake pkg-config
-        libunwind elfutils zlib openssl.dev rustScript cargoNextest
-      ];
+        rustToolchain gcc binutils gnumake cmake pkg-config rustScript cargoNextest
+      ] ++ nativeLibs ++ map (package: package.dev) nativeLibs;
     in
     {
       packages.${system} = {
@@ -141,21 +142,29 @@
           # rather than passing vacuously. That is the good failure mode, but the
           # directories have to exist. Sticky-bit 1777 as on a normal system.
           extraCommands = ''
-            mkdir -p tmp var/tmp usr/bin
+            mkdir -p tmp var/tmp usr/bin etc root lib64
             chmod 1777 tmp var/tmp
+            chmod 0700 root
+            printf 'root:x:0:0:root:/root:/bin/bash\nnobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n' > etc/passwd
+            printf 'root:x:0:\nnobody:x:65534:\n' > etc/group
+            ln -s "${pkgs.glibc}/lib/ld-linux-x86-64.so.2" lib64/ld-linux-x86-64.so.2
 
-            # Ten selected portable cells name these FHS paths literally. Nix
+            # Selected portable cells name these FHS paths literally. Nix
             # places their providers in /bin, while usrBinEnv creates only
             # /usr/bin/env; add exactly the audited compatibility paths.
-            for command in bash date du find python3 sort tr; do
+            for command in bash date df du find git node python3 sort tr; do
               ln -s "/bin/$command" "usr/bin/$command"
             done
+            ln -s /bin/node usr/bin/nodejs
           '';
           config = {
             Env = [
               "PATH=/bin:/usr/bin"
               "HERMIT_RUST_SCRIPT_VERSION=${rustScriptVersion}"
               "HERMIT_CARGO_NEXTEST_VERSION=${cargoNextestVersion}"
+              "PKG_CONFIG_PATH=${pkgs.lib.makeSearchPathOutput "dev" "lib/pkgconfig" nativeLibs}"
+              "CPATH=${pkgs.lib.makeSearchPathOutput "dev" "include" nativeLibs}"
+              "LIBRARY_PATH=${pkgs.lib.makeLibraryPath nativeLibs}"
               "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
               # The run is offline by construction; make a stray fetch fail loudly
               # rather than silently reach a network that a rebuild will not have.

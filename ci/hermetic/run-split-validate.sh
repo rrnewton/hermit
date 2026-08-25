@@ -280,6 +280,7 @@ if [[ $do_offline -eq 1 ]]; then
         -- bash -c '
             set -euo pipefail
             /src/ci/hermetic/assert-no-network.sh
+            export HERMIT_E2E_EMPTY_WORKDIR=/test
 
             # Fail before a DAG node can report a misleading product failure.
             # The image owns these pins; the runner verifies what it was given
@@ -311,7 +312,8 @@ if [[ $do_offline -eq 1 ]]; then
                     exit 2
                 }
             done
-            for path in /usr/bin/bash /usr/bin/date /usr/bin/du /usr/bin/find \
+            for path in /usr/bin/bash /usr/bin/date /usr/bin/df /usr/bin/du \
+                        /usr/bin/find /usr/bin/git /usr/bin/node /usr/bin/nodejs \
                         /usr/bin/python3 /usr/bin/sort /usr/bin/tr; do
                 [[ -x "$path" ]] || {
                     echo "run-split-validate: pinned root is missing required FHS path: $path" >&2

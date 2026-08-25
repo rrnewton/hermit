@@ -1,7 +1,7 @@
-# Hermetic validate — pinned root (stage 2, OPT-IN)
+# Hermetic validate - pinned root (v3 isolation, OPT-IN)
 
-Nothing here runs by default. The ordinary validate path is unchanged; flipping
-the default is stage 3 and the owner's call on the evidence this produces.
+Nothing here runs by default. The ordinary validate path is unchanged; this directory
+contains the pinned-root validate path and its v3 per-cell isolation contract.
 
 ## What this is
 
@@ -14,8 +14,10 @@ through shell fixtures rather than only top-level `program` entries.
 The shape is stage 1's recommendation unchanged: the existing outer
 `systemd-run`, `validate-lock` and cgroup policy stay, and this adds only the
 filesystem mechanism — one privileged podman container pinned by digest,
-`/dev/kvm` passed through, no runtime network, read-only source at `/src`,
-separate writable output and target volumes. No second cgroup layer.
+`/dev/kvm` passed through, no runtime network, and source at `/src`. The
+wrapper defaults that source bind to read-only; the combined offline
+build-and-test phase explicitly makes it writable. Output and target volumes
+are separate and writable. No second cgroup layer.
 
 ```
 ci/hermetic/build-image.sh                     # build from the lock, load, record the digest
@@ -23,6 +25,42 @@ ci/hermetic/run-in-pinned-root.sh --src DIR --out DIR -- CMD...
 ci/hermetic/run-split-validate.sh              # fetch (network) then build+test (no network)
 ci/hermetic/assert-no-network.sh               # the boundary check, with a negative control
 ```
+
+## V3 per-cell execution contract
+
+The offline phase selects one canonical execution root for every Hermit cell: a
+fresh private `tmpfs` mounted at `/test`, with the guest working directory set
+to `/test`. The outer podman root supplies an empty `/test` mountpoint; each
+verify, replay, chaos, or custom invocation overlays its own tmpfs there.
+A naked or DBT invocation fails closed because those paths cannot apply the
+mount. The default working directory and relative scratch namespace therefore
+cannot observe files or directory metadata written by sibling cells, even when every
+cell uses the same relative names. The combined offline build-and-test phase
+keeps `/src` writable and shared for build products and repository fixtures;
+that tree is an explicit input/output surface, not part of the per-cell isolation
+claim. Manifest repository inputs are resolved to absolute `/src/...` paths
+before the cwd changes, and fixture roots cross through the explicit
+`E2E_FIXTURE_DIR` argument.
+
+The same path uses Hermit's existing `--base-env=minimal` semantics rather than
+defining another environment. On top of that base the harness supplies
+deterministic `LC_ALL` and `TZ`, keeps `HOME` and `XDG_CONFIG_HOME` in unique
+per-cell directories, points `E2E_TMPDIR` at the private `/test`, and forwards
+the explicit fixture and scheduler inputs. No value is inherited from the
+launching shell. A raw guest reading `getenv("PWD")` or `getenv("OLDPWD")`
+receives null; a shell derives `PWD=/test` from `getcwd(2)`. No cell requires
+inherited `PWD`. Record and replay now accept the same base-environment, mount,
+and working-directory controls as `hermit run`, so replay cells obey the
+identical contract.
+
+The concurrency boundary was measured rather than inferred. Two hundred live
+children produced 200 distinct mount namespaces and 200 tmpfs mounts. The median
+metadata cost attributable to tmpfs was 278,528 bytes total (1.36 KiB per cell);
+writing 64 KiB in every mount charged approximately 12.5 MiB of file memory.
+After killing the run and waiting for the children, no guest process or mount
+survived and file memory returned to within 28 KiB of baseline. An integrated
+200-way Hermit run then completed 200/200. Every guest began in an empty
+`/test`, created the same relative `marker`, and observed a tmpfs filesystem.
 
 ## The network boundary — what is and is not claimed
 
@@ -47,7 +85,7 @@ surface than a build phase that merely happens to have network available.
 So, precisely:
 
 - **Claimed, and enforced:** the build and the tests cannot reach the network.
-  `--network=none`, asserted from *inside* the container by
+  `--network=none` and `--http-proxy=false`, asserted from *inside* the container by
   `assert-no-network.sh` as the phase's first act, aborting before anything runs.
 - **Claimed:** the compiler is pinned (the offline phase runs in the nix root)
   and the crates are pinned (`Cargo.lock` versions + checksums).

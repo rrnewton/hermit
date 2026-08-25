@@ -473,6 +473,44 @@ pub(super) fn parse_assignment(src: &str) -> Result<(String, Option<String>), Er
     }
 }
 
+pub(super) fn apply_base_environment(
+    command: &mut Command,
+    base_env: &BaseEnv,
+    env: &[(String, Option<String>)],
+) -> Result<(), Error> {
+    match base_env {
+        BaseEnv::Empty => {
+            command.env_clear();
+        }
+        BaseEnv::Minimal => {
+            command.env_clear();
+            command.env("HOSTNAME", "hermetic-container.local");
+            command.env(
+                "PATH",
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            );
+            command.env("HOME", "/root");
+        }
+        BaseEnv::Host => {}
+    }
+    for (name, value) in env {
+        if let Some(value) = value {
+            command.env(name, value);
+        } else if let Ok(value) = std::env::var(name) {
+            command.env(name, value);
+        } else {
+            anyhow::bail!(
+                "Attempt to pass through env var {}, but it is not set in the host environment",
+                name
+            );
+        }
+    }
+
+    command.env("ASAN_OPTIONS", "detect_leaks=0");
+    command.env("LSAN_OPTIONS", "detect_leaks=0");
+    Ok(())
+}
+
 #[derive(Debug, Default, Clone, Copy, Parser, Eq, PartialEq)]
 pub enum NetworkingMode {
     /// Create a local loopback device and allow local, intra-container network communication only.
@@ -537,7 +575,7 @@ impl VerifyAllow {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-enum BaseEnv {
+pub(super) enum BaseEnv {
     Empty,
     Minimal,
     Host,
@@ -1057,6 +1095,35 @@ fn guest_env_disables_sanitizer_leak_detection_on_every_backend() {
             "LSAN_OPTIONS not set for backend {backend}"
         );
     }
+}
+#[test]
+fn dbt_rejects_mount_and_workdir_options_it_cannot_apply() {
+    let mut with_mount = RunOpts::parse_from([
+        "fakehermit",
+        "--backend",
+        "dbt",
+        "--mount=type=tmpfs,target=/test",
+        "/bin/true",
+    ]);
+    let error = with_mount
+        .validate_args_with_perf_support(true)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("dbt backend cannot apply --mount"));
+
+    let mut with_workdir = RunOpts::parse_from([
+        "fakehermit",
+        "--backend",
+        "dbt",
+        "--workdir",
+        "/test",
+        "/bin/true",
+    ]);
+    let error = with_workdir
+        .validate_args_with_perf_support(true)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("dbt backend cannot apply --mount"));
 }
 
 #[test]
@@ -2326,6 +2393,14 @@ impl RunOpts {
                 backend.as_str()
             );
         }
+        if backend == Backend::Dbt
+            && (!self.mount.is_empty() || !self.bind.is_empty() || self.workdir.is_some())
+        {
+            anyhow::bail!(
+                "the dbt backend cannot apply --mount, --bind, or --workdir because its \
+                 DynamoRIO adapter does not enter the guest mount namespace"
+            );
+        }
         if self.image.is_some() && self.namespace_only {
             anyhow::bail!("--image cannot be combined with --namespace-only");
         }
@@ -3520,42 +3595,7 @@ impl RunOpts {
             return Ok(command);
         }
 
-        match self.base_env {
-            BaseEnv::Empty => {
-                command.env_clear();
-                self.merge_from_env_settings(&mut command)?
-            }
-            BaseEnv::Minimal => {
-                command.env_clear();
-                command.env("HOSTNAME", "hermetic-container.local");
-                command.env(
-                    "PATH",
-                    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                );
-                command.env("HOME", "/root");
-                self.merge_from_env_settings(&mut command)?
-            }
-            BaseEnv::Host => self.merge_from_env_settings(&mut command)?,
-        }
-
-        // Disable sanitizer leak detection in the guest for EVERY backend, so
-        // the guest environment is identical regardless of which backend runs
-        // it. The ptrace-family backends (ptrace, e9patch, sabre) already force
-        // this at spawn time in reverie-ptrace, because a sanitizer-built
-        // guest's at-exit leak check itself uses ptrace and would collide with
-        // the tracer. The out-of-process KVM backend has no such spawn hook, so
-        // without setting it here the guest would see two fewer variables under
-        // KVM than under ptrace/e9patch/sabre. That is a real cross-backend
-        // divergence: env-sensitive guests behave differently, and it is
-        // directly observable as a differing DETLOG `[env ...]` hash. Setting it
-        // in this single backend-independent place makes the guest env a
-        // deterministic function of the invocation alone. Leak detection is also
-        // inherently nondeterministic (it reports host addresses at exit), so
-        // forcing it off is the determinism-preserving choice for all backends.
-        // Applied after `--env` handling to match the pre-existing ptrace
-        // precedence, where the tracer overrides any user-supplied value.
-        command.env("ASAN_OPTIONS", "detect_leaks=0");
-        command.env("LSAN_OPTIONS", "detect_leaks=0");
+        apply_base_environment(&mut command, &self.base_env, &self.env)?;
 
         Ok(command)
     }

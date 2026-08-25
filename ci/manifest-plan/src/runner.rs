@@ -133,6 +133,8 @@ pub struct CellId {
 }
 
 const SCHEDULED_JOBS_ENV: &str = "HERMIT_E2E_SCHEDULED_JOBS";
+const ISOLATED_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
+const HERMETIC_TEST_WORKDIR: &str = "/test";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Population {
@@ -603,6 +605,7 @@ pub struct RunContext {
     pub run_verify_strict: bool,
     pub record_verify_strict: bool,
     pub scheduled_worker_capacity: ScheduledWorkerCapacity,
+    pub isolated_workdir: Option<PathBuf>,
 }
 
 impl RunContext {
@@ -636,6 +639,18 @@ impl RunContext {
         // the result row, so this bridge cannot hide the comparison policy.
         let run_verify_strict =
             command_help_contains(&hermit_bin, &["run", "--help"], "--verify-strict");
+        let isolated_workdir = match std::env::var_os(ISOLATED_WORKDIR_ENV) {
+            None => None,
+            Some(value) if value == HERMETIC_TEST_WORKDIR => {
+                Some(PathBuf::from(HERMETIC_TEST_WORKDIR))
+            }
+            Some(value) => {
+                return Err(format!(
+                    "{ISOLATED_WORKDIR_ENV} must be {HERMETIC_TEST_WORKDIR}, got {}",
+                    PathBuf::from(value).display()
+                ));
+            }
+        };
         let record_verify_strict = command_help_contains(
             &hermit_bin,
             &["record", "start", "--help"],
@@ -654,6 +669,7 @@ impl RunContext {
             run_verify_strict,
             record_verify_strict,
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
+            isolated_workdir,
         })
     }
 
@@ -758,7 +774,24 @@ pub fn prepare_test(
         _ => return Err(format!("{} has unsupported program kind", cell.test.id)),
     };
     guest.extend(guest_args);
+    if context.isolated_workdir.is_some() {
+        resolve_repo_guest_args(&context.root, &mut guest);
+    }
     Ok(guest)
+}
+
+fn resolve_repo_guest_args(root: &Path, argv: &mut [String]) {
+    for arg in argv {
+        let path = Path::new(arg);
+        if path.is_absolute() || arg == "." || arg == ".." {
+            continue;
+        }
+        let resolved = root.join(path);
+        let looks_like_repo_path = arg.starts_with("./") || arg.contains('/') || resolved.is_file();
+        if looks_like_repo_path && resolved.exists() {
+            *arg = resolved.to_string_lossy().into_owned();
+        }
+    }
 }
 
 fn require_executable_program(path: &Path, captures: &Path) -> Result<(), String> {
@@ -838,6 +871,9 @@ pub fn build_spec(
     let verdict = dir.join(format!("verify-{attempt}.json"));
     let mut verification_log_dir = None;
     let (argv, verdict_path) = match cell.id.mode.as_str() {
+        "naked" if context.isolated_workdir.is_some() => {
+            return Err("hermetic validation cannot isolate a naked cell at /test".into());
+        }
         "naked" => (guest_argv.clone(), None),
         "verify" => {
             let mut argv = vec![
@@ -868,8 +904,12 @@ pub fn build_spec(
                 ]);
                 verification_log_dir = Some(logs);
             }
-            append_workdir_arg(&mut argv, mode_recipe.workdir.as_deref());
-            append_guest_env_args(&mut argv, &env);
+            append_execution_root_args(
+                &mut argv,
+                context.isolated_workdir.as_deref(),
+                mode_recipe.workdir.as_deref(),
+            );
+            append_guest_env_args(&mut argv, &env, context.isolated_workdir.is_some());
             argv.push("--".into());
             argv.extend(guest_argv.clone());
             (argv, Some(verdict))
@@ -885,6 +925,9 @@ pub fn build_spec(
                 "start".into(),
                 "--strict".into(),
             ];
+            if context.isolated_workdir.is_some() {
+                argv.push("--base-env=minimal".into());
+            }
             if context.record_verify_strict {
                 argv.push("--verify-strict".into());
             }
@@ -897,7 +940,12 @@ pub fn build_spec(
                 "--record-timeout".into(),
                 cell.test.timeout_seconds.to_string(),
             ]);
-            append_guest_env_args(&mut argv, &env);
+            append_execution_root_args(
+                &mut argv,
+                context.isolated_workdir.as_deref(),
+                mode_recipe.workdir.as_deref(),
+            );
+            append_guest_env_args(&mut argv, &env, context.isolated_workdir.is_some());
             argv.push("--".into());
             argv.extend(guest_argv.clone());
             (argv, Some(verdict))
@@ -926,8 +974,12 @@ pub fn build_spec(
                 "--sched-heuristic=random".into(),
                 format!("--seed={seed}"),
             ]);
-            append_workdir_arg(&mut argv, mode_recipe.workdir.as_deref());
-            append_guest_env_args(&mut argv, &env);
+            append_execution_root_args(
+                &mut argv,
+                context.isolated_workdir.as_deref(),
+                mode_recipe.workdir.as_deref(),
+            );
+            append_guest_env_args(&mut argv, &env, context.isolated_workdir.is_some());
             argv.push("--".into());
             argv.extend(guest_argv.clone());
             (argv, Some(verdict))
@@ -942,8 +994,17 @@ pub fn build_spec(
                 backend.into(),
             ];
             argv.extend(cell.test.modes["custom"].args.clone());
-            append_scheduled_jobs_env_arg(&mut argv, &env);
-            append_workdir_arg(&mut argv, mode_recipe.workdir.as_deref());
+            if context.isolated_workdir.is_some() {
+                require_minimal_base_env(&mut argv)?;
+                append_guest_env_args(&mut argv, &env, true);
+            } else {
+                append_scheduled_jobs_env_arg(&mut argv, &env);
+            }
+            append_execution_root_args(
+                &mut argv,
+                context.isolated_workdir.as_deref(),
+                mode_recipe.workdir.as_deref(),
+            );
             argv.push("--".into());
             argv.extend(guest_argv.clone());
             (argv, None)
@@ -1922,10 +1983,10 @@ fn shell_quote(value: &str) -> String {
     }
 }
 
-fn append_guest_env_args(argv: &mut Vec<String>, env: &BTreeMap<String, String>) {
-    // `--base-env=minimal` intentionally removes the invoking host's ambient
-    // environment. These values are the manifest runner's explicit guest
-    // contract, so forward them literally instead of relying on inheritance.
+fn append_guest_env_args(argv: &mut Vec<String>, env: &BTreeMap<String, String>, isolated: bool) {
+    // Every forwarded value is harness-authored, never inherited ambient state.
+    // PWD and OLDPWD remain absent; E2E_TMPDIR joins the fresh /test mount while
+    // HOME/XDG retain their unique per-cell directories and seeded config.
     for name in [
         "LC_ALL",
         "TZ",
@@ -1935,9 +1996,12 @@ fn append_guest_env_args(argv: &mut Vec<String>, env: &BTreeMap<String, String>)
         "E2E_FIXTURE_DIR",
         SCHEDULED_JOBS_ENV,
     ] {
-        let value = env
-            .get(name)
-            .expect("cell environment contains every forwarded guest value");
+        let value = if isolated && name == "E2E_TMPDIR" {
+            HERMETIC_TEST_WORKDIR
+        } else {
+            env.get(name)
+                .expect("cell environment contains every forwarded guest value")
+        };
         argv.push("--env".into());
         argv.push(format!("{name}={value}"));
     }
@@ -1951,11 +2015,43 @@ fn append_scheduled_jobs_env_arg(argv: &mut Vec<String>, env: &BTreeMap<String, 
     argv.push(format!("{SCHEDULED_JOBS_ENV}={value}"));
 }
 
-/// Hermit resolves `--workdir` AFTER installing guest mounts, so an absolute
-/// path here starts the guest in the fresh private mount rather than whatever
-/// host directory the validation checkout occupied.
-fn append_workdir_arg(argv: &mut Vec<String>, workdir: Option<&str>) {
-    if let Some(workdir) = workdir {
+fn require_minimal_base_env(argv: &mut Vec<String>) -> Result<(), String> {
+    let mut values = Vec::new();
+    let mut index = 0;
+    while index < argv.len() {
+        if let Some(value) = argv[index].strip_prefix("--base-env=") {
+            values.push(value.to_owned());
+        } else if argv[index] == "--base-env" {
+            index += 1;
+            let value = argv.get(index).ok_or_else(|| {
+                "hermetic validation received --base-env without a value".to_string()
+            })?;
+            values.push(value.clone());
+        }
+        index += 1;
+    }
+    match values.as_slice() {
+        [] => argv.push("--base-env=minimal".into()),
+        [value] if value == "minimal" => {}
+        [value] => {
+            return Err(format!(
+                "hermetic validation requires --base-env=minimal, got {value}"
+            ));
+        }
+        _ => return Err("hermetic validation received repeated --base-env flags".into()),
+    }
+    Ok(())
+}
+
+fn append_execution_root_args(
+    argv: &mut Vec<String>,
+    isolated_workdir: Option<&Path>,
+    requested_workdir: Option<&str>,
+) {
+    if let Some(workdir) = isolated_workdir {
+        argv.push(format!("--mount=type=tmpfs,target={}", workdir.display()));
+        argv.extend(["--workdir".into(), workdir.to_string_lossy().into_owned()]);
+    } else if let Some(workdir) = requested_workdir {
         argv.extend(["--workdir".into(), workdir.into()]);
     }
 }
@@ -2139,6 +2235,7 @@ mod tests {
             run_verify_strict: false,
             record_verify_strict: false,
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
+            isolated_workdir: None,
         };
         assert_eq!(
             infrastructure_error_result(&context, &cell, "fixture".into()).classification,
@@ -2178,6 +2275,7 @@ mod tests {
             run_verify_strict: false,
             record_verify_strict: false,
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
+            isolated_workdir: None,
         };
         let path = root.join("results.jsonl");
         for expected in 1..=2 {
@@ -2336,6 +2434,7 @@ backends_disabled:
             run_verify_strict: true,
             record_verify_strict: true,
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
+            isolated_workdir: None,
         };
         let spec = build_spec(
             &context,
@@ -2353,6 +2452,207 @@ backends_disabled:
             .position(|args| args == ["--workdir", "/tmp"])
             .unwrap();
         assert!(workdir < separator);
+    }
+
+    #[test]
+    fn hermetic_spec_mounts_a_fresh_test_root_and_limits_guest_environment() {
+        let test = recipe(true);
+        let cell = SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: test.id.clone(),
+                mode: "verify".into(),
+                backend: Some("ptrace".into()),
+            },
+            test,
+            enabled: true,
+        };
+        let context = RunContext {
+            root: PathBuf::from("/repo"),
+            hermit_bin: PathBuf::from("/repo/hermit"),
+            result_root: PathBuf::from("/repo/results"),
+            build_root: PathBuf::from("/repo/build"),
+            run_id: "fixture".into(),
+            source_sha: "0".repeat(40),
+            source_dirty: false,
+            prebuilt: false,
+            keep_logs: false,
+            run_verify_strict: true,
+            record_verify_strict: true,
+            scheduled_worker_capacity: ScheduledWorkerCapacity::new(7),
+            isolated_workdir: Some(PathBuf::from("/test")),
+        };
+        let spec = build_spec(
+            &context,
+            &cell,
+            PathBuf::from("/repo/results/cell"),
+            vec!["/bin/true".into()],
+            "1",
+            None,
+        )
+        .unwrap();
+        let separator = spec.argv.iter().position(|arg| arg == "--").unwrap();
+        let mount = spec
+            .argv
+            .iter()
+            .position(|arg| arg == "--mount=type=tmpfs,target=/test")
+            .unwrap();
+        let workdir = spec
+            .argv
+            .windows(2)
+            .position(|args| args == ["--workdir", "/test"])
+            .unwrap();
+        assert!(mount < separator && workdir < separator);
+        for name in ["PWD", "OLDPWD"] {
+            assert!(
+                !spec
+                    .argv
+                    .iter()
+                    .any(|arg| arg.starts_with(&format!("{name}=")))
+            );
+        }
+        for value in [
+            "LC_ALL=C",
+            "TZ=UTC",
+            "HOME=/repo/results/cell/home",
+            "XDG_CONFIG_HOME=/repo/results/cell/xdg-config",
+            "E2E_TMPDIR=/test",
+        ] {
+            assert!(spec.argv.iter().any(|arg| arg == value));
+        }
+        for name in ["E2E_FIXTURE_DIR", SCHEDULED_JOBS_ENV] {
+            assert!(
+                spec.argv
+                    .iter()
+                    .any(|arg| arg.starts_with(&format!("{name}=")))
+            );
+        }
+
+        let mut replay_test = recipe(true);
+        let replay_mode = replay_test.modes.remove("verify").unwrap();
+        replay_test.modes.insert("replay".into(), replay_mode);
+        let replay_cell = SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: replay_test.id.clone(),
+                mode: "replay".into(),
+                backend: Some("ptrace".into()),
+            },
+            test: replay_test,
+            enabled: true,
+        };
+        let replay = build_spec(
+            &context,
+            &replay_cell,
+            PathBuf::from("/repo/results/replay"),
+            vec!["/bin/true".into()],
+            "1",
+            None,
+        )
+        .unwrap();
+        assert!(replay.argv.iter().any(|arg| arg == "--base-env=minimal"));
+        assert!(
+            replay
+                .argv
+                .iter()
+                .any(|arg| arg == "--mount=type=tmpfs,target=/test")
+        );
+
+        let mut custom_test = recipe(true);
+        let mut custom_mode = custom_test.modes.remove("verify").unwrap();
+        custom_mode.args = vec!["--base-env".into(), "minimal".into()];
+        custom_test.modes.insert("custom".into(), custom_mode);
+        let custom_cell = SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: custom_test.id.clone(),
+                mode: "custom".into(),
+                backend: Some("ptrace".into()),
+            },
+            test: custom_test,
+            enabled: true,
+        };
+        let custom = build_spec(
+            &context,
+            &custom_cell,
+            PathBuf::from("/repo/results/custom"),
+            vec!["/bin/true".into()],
+            "1",
+            None,
+        )
+        .unwrap();
+        assert!(
+            custom
+                .argv
+                .windows(2)
+                .any(|args| args == ["--base-env", "minimal"])
+        );
+        assert!(
+            custom
+                .argv
+                .iter()
+                .any(|arg| arg == "--mount=type=tmpfs,target=/test")
+        );
+        for value in [
+            "LC_ALL=C",
+            "TZ=UTC",
+            "HOME=/repo/results/custom/home",
+            "XDG_CONFIG_HOME=/repo/results/custom/xdg-config",
+            "E2E_TMPDIR=/test",
+        ] {
+            assert!(custom.argv.iter().any(|arg| arg == value));
+        }
+        let mut naked_test = recipe(true);
+        let naked_mode = naked_test.modes.remove("verify").unwrap();
+        naked_test.modes.insert("naked".into(), naked_mode);
+        let naked_cell = SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: naked_test.id.clone(),
+                mode: "naked".into(),
+                backend: None,
+            },
+            test: naked_test,
+            enabled: true,
+        };
+        let naked_error = build_spec(
+            &context,
+            &naked_cell,
+            PathBuf::from("/repo/results/naked"),
+            vec!["/bin/true".into()],
+            "1",
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            naked_error,
+            "hermetic validation cannot isolate a naked cell at /test"
+        );
+    }
+
+    #[test]
+    fn hermetic_guest_arguments_resolve_repo_inputs_but_keep_dot_local() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-repo-args-bracket-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("tests/e2e")).unwrap();
+        fs::write(root.join("README.md"), b"fixture").unwrap();
+        let mut argv = vec![
+            "tool".into(),
+            "tests/e2e".into(),
+            "README.md".into(),
+            ".".into(),
+            "missing/path".into(),
+        ];
+        resolve_repo_guest_args(&root, &mut argv);
+        assert_eq!(argv[0], "tool");
+        assert_eq!(argv[1], root.join("tests/e2e").to_string_lossy());
+        assert_eq!(argv[2], root.join("README.md").to_string_lossy());
+        assert_eq!(argv[3], ".");
+        assert_eq!(argv[4], "missing/path");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2381,6 +2681,7 @@ backends_disabled:
             run_verify_strict: true,
             record_verify_strict: true,
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(7),
+            isolated_workdir: None,
         };
         let spec = build_spec(
             &context,
@@ -2453,6 +2754,7 @@ backends_disabled:
         assert!(replay.argv.windows(2).any(|window| {
             window[0] == "--verify-json" && window[1] == "/repo/results/replay-cell/verify-1.json"
         }));
+        assert!(!replay.argv.iter().any(|arg| arg.starts_with("--base-env")));
         for name in [
             "LC_ALL",
             "TZ",
@@ -2889,6 +3191,7 @@ backends_disabled:
             run_verify_strict: false,
             record_verify_strict: false,
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
+            isolated_workdir: None,
         };
 
         fs::create_dir_all(cell_dir.join("fixtures")).unwrap();
