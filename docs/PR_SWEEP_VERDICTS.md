@@ -394,6 +394,51 @@ blocked row, and dispatching it burns an agent who cannot finish.
 Counting `test.strict_compat` — "skipped (dependency failed, never ran)" — as a
 sixth failure sends someone to investigate a node that never executed.
 
+## Before you BELIEVE a refusal test: an exit code is a claim about the environment
+
+**An assertion on an exit code alone is an assertion about the environment as
+much as about the code**, because every failure path in a shell tool shares the
+same small set of codes. A test that requires only "it exited 2" passes when the
+tool refused for the reason you meant, and equally when it could not run at all.
+
+Measured 2026-08-25 on `ci/run-node-args-test.sh`. Five checks asserted that
+`ci/run-node.sh` refuses a malformed invocation with exit 2. But exit 2 is also
+what that script returns for an unknown lane, an unwritable perf directory, and
+`dagrun not found`. Removing `ci/dag/portable.json` — standing in for a box where
+the runner is simply unavailable — produced:
+
+    exit-code-only:   ok / ok / ok / ok / ok          <- all five vacuous
+    reason-asserted:  ok / FAIL / ok / FAIL / FAIL
+
+The three that flipped were exiting 2 on "unknown lane" and being counted as
+proof that the CI refusal and the multi-node refusal worked. **A refusal test
+that passes when the thing it tests is absent cannot fail for the reason it
+names**, which makes it a member of the same family as a guard no node runs: a
+mechanism producing a value that reads as information and carries none.
+
+**The fix is one string per check.** Assert the refusal's own message alongside
+its code:
+
+    if [[ $output != *"$reason"* ]]; then
+        fail "$what: exited 2 but for the wrong reason — no '$reason' in the output.
+      This is what an environment failure (missing dagrun, bad lane) looks like."
+    fi
+
+That cost is what makes this adoptable rather than aspirational. Three
+consequences worth stating:
+
+- **Say which checks legitimately still pass.** Two of the five above were
+  argument-parsing refusals that run before the lane file is read, so they were
+  correctly unaffected. Naming them is the difference between a fixed test and a
+  test that merely got noisier.
+- **The same lens applies to diff assertions.** "Some steps changed" passes for
+  either of two edits going wrong. Check each by name — "56 undeclared step(s)
+  stamped 7200s; 0 declared step(s) left alone" — so a mutation that stamps the
+  wrong set fails instead of matching a vague predicate.
+- **Prove it by mutation.** Reword the refusal the test pins and confirm that
+  check, by name, goes red; restore it and confirm it goes green. A guard that
+  has never been observed failing is a guard whose failure path is unmeasured.
+
 ## The checks, in order
 
 ### 1. Content, anchored at the pull request's OWN merge base
