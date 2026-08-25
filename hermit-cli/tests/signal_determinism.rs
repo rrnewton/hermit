@@ -7,6 +7,9 @@
  */
 
 use std::fs;
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -22,6 +25,8 @@ use std::time::Instant;
 const DETERMINISM_RUNS: usize = 5;
 const DEADLOCK_RUNS: usize = 3;
 const DEADLOCK_BOUND: Duration = Duration::from_secs(5);
+const DEADLOCK_CLEANUP_BOUND: Duration = Duration::from_secs(1);
+const DEADLOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 static HERMIT_SIGNAL_LOCK: Mutex<()> = Mutex::new(());
 static SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -51,35 +56,79 @@ fn kill_created_process_group(pid: u32, label: &str) {
     }
 }
 
+fn reap_killed_child(child: &mut std::process::Child, label: &str) -> std::process::ExitStatus {
+    let deadline = Instant::now() + DEADLOCK_CLEANUP_BOUND;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status,
+            Ok(None) if Instant::now() >= deadline => {
+                panic!(
+                    "created {label} process group did not exit within {DEADLOCK_CLEANUP_BOUND:?} after SIGKILL"
+                );
+            }
+            Ok(None) => std::thread::sleep(DEADLOCK_POLL_INTERVAL),
+            Err(error) => panic!("failed to reap killed {label}: {error}"),
+        }
+    }
+}
+
 fn bounded_command_output(mut command: Command, label: &str) -> (Output, bool, Duration) {
+    let mut stdout = tempfile::tempfile()
+        .unwrap_or_else(|error| panic!("failed to create {label} stdout capture: {error}"));
+    let mut stderr = tempfile::tempfile()
+        .unwrap_or_else(|error| panic!("failed to create {label} stderr capture: {error}"));
     command
         .process_group(0)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(Stdio::from(stdout.try_clone().unwrap_or_else(|error| {
+            panic!("failed to clone {label} stdout capture: {error}")
+        })))
+        .stderr(Stdio::from(stderr.try_clone().unwrap_or_else(|error| {
+            panic!("failed to clone {label} stderr capture: {error}")
+        })));
     let rendered = format!("{command:?}");
     let started = Instant::now();
     let mut child = command
         .spawn()
         .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
-    let timed_out = loop {
+    let (status, process_timed_out) = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break false,
+            Ok(Some(status)) => break (status, false),
             Ok(None) if started.elapsed() >= DEADLOCK_BOUND => {
                 kill_created_process_group(child.id(), label);
-                break true;
+                break (reap_killed_child(&mut child, label), true);
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => std::thread::sleep(DEADLOCK_POLL_INTERVAL),
             Err(error) => {
                 kill_created_process_group(child.id(), label);
-                let _ = child.wait();
+                let _ = reap_killed_child(&mut child, label);
                 panic!("failed to poll {label}: {rendered}: {error}");
             }
         }
     };
-    let output = child
-        .wait_with_output()
-        .unwrap_or_else(|error| panic!("failed to collect {label}: {rendered}: {error}"));
-    (output, timed_out, started.elapsed())
+    stdout
+        .seek(SeekFrom::Start(0))
+        .unwrap_or_else(|error| panic!("failed to rewind {label} stdout capture: {error}"));
+    stderr
+        .seek(SeekFrom::Start(0))
+        .unwrap_or_else(|error| panic!("failed to rewind {label} stderr capture: {error}"));
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    stdout
+        .read_to_end(&mut stdout_bytes)
+        .unwrap_or_else(|error| panic!("failed to read {label} stdout capture: {error}"));
+    stderr
+        .read_to_end(&mut stderr_bytes)
+        .unwrap_or_else(|error| panic!("failed to read {label} stderr capture: {error}"));
+    let elapsed = started.elapsed();
+    (
+        Output {
+            status,
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
+        },
+        process_timed_out || elapsed >= DEADLOCK_BOUND,
+        elapsed,
+    )
 }
 
 fn hermit_signal_lock() -> MutexGuard<'static, ()> {
@@ -214,6 +263,14 @@ fn blocking_sigsuspend_releases_the_scheduler() {
     run_signal_scenario(
         "blocking-sigsuspend",
         "sigsuspend delivered\nsigsuspend restored=1 deliveries=1\n",
+    );
+}
+
+#[test]
+fn pending_signal_completes_sigsuspend_and_restores_mask() {
+    run_signal_scenario(
+        "pending-sigsuspend",
+        "sigsuspend delivered\npending sigsuspend restored=1 deliveries=1 pending=0\n",
     );
 }
 
