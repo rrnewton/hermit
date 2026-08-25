@@ -181,6 +181,35 @@ for source in "${entrypoints[@]}"; do
     fi
     if ! cargo clippy --manifest-path "$package/Cargo.toml" \
             -- -D warnings "${CLIPPY_WAIVERS[@]}" >"$tmp/check.out" 2>&1; then
+        # ⚠️ SAY WHICH FAILURE THIS IS. "does not compile" is a claim about the
+        # CODE; a path dependency Cargo cannot resolve is a claim about the
+        # CHECKOUT. Conflating them made this gate report, confidently and by
+        # name, that ci/compat-envelope/pressure-test.rs and scripts/validate.rs
+        # do not compile -- when both compile fine and the real cause was an
+        # unpopulated `agent-utils` submodule in a fresh worktree. That reading
+        # cost two separate diagnosis cycles and was published as a false
+        # "main is red" claim before anyone checked the underlying cargo error.
+        #
+        # The two need OPPOSITE actions from the reader: fix the script, versus
+        # `git submodule update --init`. A message that cannot tell them apart
+        # sends every reader down the wrong one.
+        if grep -qE 'failed to load source for dependency|unable to update .*/(agent-utils|rs)/' \
+                "$tmp/check.out"; then
+            missing_dep=$(grep -oE 'unable to update [^[:space:]]+' "$tmp/check.out" |
+                head -n1 | sed 's/^unable to update //')
+            echo "check-script-sigpipe.sh: REFUSED — cannot build $source because a path" >&2
+            echo "  dependency could not be resolved: ${missing_dep:-<see cargo output below>}" >&2
+            echo "  THIS IS NOT A COMPILE FAILURE and says nothing about the script." >&2
+            echo "  A submodule is almost certainly unpopulated in this checkout. Run:" >&2
+            echo "      git submodule update --init agent-utils" >&2
+            echo "  and re-run this gate. Reporting it as 'does not compile' previously" >&2
+            echo "  produced a false main-red claim about two scripts that build fine." >&2
+            grep -E '^(error|Caused by:)' -A2 "$tmp/check.out" >&2 || cat "$tmp/check.out" >&2
+            # Fail CLOSED: an unbuildable checkout has not established that these
+            # scripts are clean, so this must not exit 0. It simply must not lie
+            # about why.
+            exit 2
+        fi
         echo "check-script-sigpipe.sh: FAIL — $source does not compile cleanly under clippy" >&2
         grep -E '^(error|warning: unused)' -A4 "$tmp/check.out" >&2 || cat "$tmp/check.out" >&2
         broken+=("$source")
