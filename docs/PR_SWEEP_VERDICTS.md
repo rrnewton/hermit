@@ -142,6 +142,45 @@ reference predicate returned 26, and 36 where it returned 26 — a fifth to a
 quarter of them spurious. A claim check that cries wolf gets skipped, which
 returns you to the task filter that was insufficient in the first place.
 
+⚠️ **Both searches above read the TASK GRAPH. Run the pull-request side too,
+and order it by `updated_at`.**
+
+```console
+# 3. the pull-request side — comments and reviews, ordered by updated_at
+ci-hub/bin/gh-api "/repos/rrnewton/hermit/issues/<N>/comments?per_page=100" \
+  | jq -r 'sort_by(.updated_at) | reverse
+           | .[] | "\(.updated_at)  \(.user.login)  \(.body[0:120])"'
+```
+
+**`created_at` is the wrong key and it fails in the dangerous direction.** An
+edited comment keeps its original creation time, so ordering by `created_at`
+ranks LAST exactly the comments someone cared enough to keep current — which are
+the strongest evidence a row is owned. Measured on hermit#2407: two adversarial
+reviews reading `created_at 09:43:02Z / 09:44:11Z`, which with a holding task
+untouched since 08:56 made the row look abandoned and reclaimable. Both carried
+`updated_at 12:08:4xZ` — the reviewer had edited them in place to re-cite
+`exact head 323a87d1da5f against base e51f3303369b`, a base that landed at
+12:06:43Z. Thirty minutes stale, not three hours.
+
+⚠️ **The check that does not depend on trusting any timestamp:** if a signal
+references a commit, head or artifact that DID NOT EXIST when the signal was
+allegedly written, the signal was edited — re-read it as fresh, and discard any
+staleness conclusion drawn from its timestamp. That is what exposed #2407, and
+it generalises to every staleness argument: "nothing has happened here for three
+hours" is a claim about a proxy, "nothing here refers to anything that exists"
+is a claim about the content.
+
+⚠️ **Neither side is sufficient alone, and they are blind in OPPOSITE
+directions.** Check 14 below measures one direction: of 14 candidate heads
+TaskGraph reported free, **12 carried a live ownership signal visible only on
+the pull request**. This section measures the other: the protocol says claim on
+the task BEFORE touching the head, so a correctly-behaved claimant is INVISIBLE
+on the pull request during exactly the window when claiming matters — measured,
+a head whose task had been claimed 53 seconds earlier scanned clean PR-side. So
+the task graph misses the claimant who has already moved to the head, and the
+pull request misses the one who correctly has not touched it yet. Run both every
+time; a clean result from one side is not evidence.
+
 Measured on 2026-08-25: **four consecutive claims where search 2 caught what
 search 1 missed.** Three of them — hermit#2547, hermit#2546 and hermit#2460 —
 were reported FREE by the task filter and all three were already held. The
@@ -158,14 +197,202 @@ Two corollaries, both paid for:
 - **A closed task is not a released claim.** Work is routinely finished,
   recorded and closed while the pull request stays open on purpose. A closed
   task plus an open pull request means READ THE LAST NOTE, not "free".
-- **Claim on the pull request's OWN drain task, and re-read after claiming.**
-  A claim posted on a neighbouring task is invisible to the next agent's search,
-  which is how the duplicates happened. Create the row's own task, claim it,
-  then run both searches again before touching the head.
+- **A claim posted on a neighbouring task is invisible** to the next agent's
+  search, which is how the duplicates happened. The row gets its OWN task.
+
+### The claim is ADVISORY. Re-reading the owner field is the protocol
+
+`tg claim` **overwrites the owner field unconditionally, prints success to the
+second claimer, and warns neither party.** So a claim succeeding tells you
+nothing whatever about whether you were first, and the only operation that
+detects a loss is reading the owner field back. These are numbered steps, not
+advice:
+
+1. **Search** — the three searches above, task graph and pull request.
+2. **Claim** on the row's own drain task, and post the claim note.
+3. **RE-READ THE OWNER FIELD.** If it names someone else you lost the row:
+   yield, and hand over what you found. Do not claim back.
+4. **RE-READ IT AGAIN BEFORE THE IRREVERSIBLE STEP** — the close, the land, the
+   force-push. Checking only at step 3 catches the race you lost in the first
+   minute and misses the one you lost in the fortieth. Check 14 below is the
+   full treatment and its evidence; this step exists so the protocol is complete
+   where you read it.
+
+⚠️ **A published claim note does not prevent an overwrite.** Measured three
+times inside eight minutes on 2026-08-25, three different pairs of agents —
+53s, 32s and 11s after the prior claim, two of the three posting no note at all.
+In the 11-second case the canonical claim note had been published to the task
+before the overwrite; it was correct, visible, and changed nothing. A protocol
+that depends on the other party READING a note cannot survive a claimer that
+only WRITES an owner field: the note is a good record and a bad lock. Treat
+losing a row as routine, and yield with a handoff note rather than racing — a
+re-claim war over a thirty-second margin costs more than any row is worth.
+
+The durable fix is a first-writer-wins claim: refuse the overwrite when a task
+already has a different live owner, and require an explicit `--steal` carrying a
+reason that lands as a note. Until that exists, step 3 stands in for it.
 
 If both searches are clean and you still find the row held, say so — a claim
 that had nowhere to be recorded is a defect in the recording path, not a
 collision you caused.
+
+## Before you OPEN a row: deconflict by FILE and SYMBOL, not only by number
+
+⚠️ **This is a SECOND and separate rule, and it is kept separate deliberately.**
+The rule above asks *"does someone already hold this ROW?"* and searches by pull
+request number. It is measured four for four on exactly that question. This one
+asks a different question — *"is this DEFECT already being fixed?"* — and
+folding it under the same heading would make that four-for-four describe
+something it never tested. Separate predicate, separate evidence.
+
+**The number search cannot catch this shape, at any quality.** When two agents
+independently discover the same defect and open SEPARATE rows, there is no prior
+claim and no shared number for an ownership search to find. Nothing is wrong
+with the search; the duplicate is simply invisible to it.
+
+Before you open a row, ask what the CHANGE touches:
+
+```console
+# 1. who has touched this file recently on main
+git log --oneline -5 origin/main -- <the file you are about to change>
+
+# 2. which OPEN pull requests already touch it  -- the one that matters
+for pr in $(ci-hub/bin/gh-api '/repos/rrnewton/hermit/pulls?state=open&per_page=100' \
+              | jq -r '.[].number'); do
+    ci-hub/bin/gh-api "/repos/rrnewton/hermit/pulls/$pr/files?per_page=100" \
+      | jq -e --arg p '<path>' 'any(.[]; .filename==$p)' >/dev/null && echo "$pr"
+done
+
+# 3. for a DEFECT rather than a file, the symbol
+git grep -n '<the function or constant you are fixing>' origin/main
+```
+
+**Step 2 is the one nobody runs, and the stated reason — an API call per open
+pull request — does not survive measurement.** Enumerating files for 174 pull
+requests (38 open plus 136 recently merged) took 135 seconds, 0.8s each. The
+open queue alone is about 30 seconds. That is cheaper than one duplicated
+one-line fix.
+
+There is also a cheap approximation: search open pull-request TITLES and BODIES
+for the full path, and enumerate files only for the hits. On the four rows in
+the instances below, the full path appeared in title-plus-body every time, so on
+this corpus it loses nothing — this fleet's bodies name the paths they touch.
+Search the full path rather than the basename; `files.rs` matches half the tree.
+
+### The instances
+
+- **hermit#2520 and hermit#2521 — the same one-line fix, opened three seconds
+  apart, and BOTH LANDED.** Each is `+1/-1` to
+  `detcore/src/syscalls/files.rs`, restoring the same import order to unbreak
+  `lint.rustfmt` on main. Created `08:32:24Z` and `08:32:27Z` by two different
+  agents on two different branches (`fix-rustfmt-container-output-import`,
+  `fix-rustfmt-files-import-order`), merged 08:32:44 and 08:32:51. Neither
+  number appears in the other; no ownership search could have connected them.
+  A `git log` on that path would have.
+- **hermit#2537 / #2533 / #2539 — three agents on adjacent pipe2 capacity-pin
+  work inside about an hour**, all touching `detcore/src/syscalls/files.rs`.
+  #2539's author DID deconflict — against #2537, while missing #2533, which was
+  the actual duplicate of what remained after they reduced scope. The
+  number-level signal surfaced one of the three; a file-level signal surfaces
+  all three.
+- **This very section is the third instance.** hermit#2548 added the claim rule
+  above to this file and merged at `12:46:51Z`. The corrections now folded into
+  it were committed independently at `12:43:52Z`, three minutes earlier, by an
+  agent who never saw #2548 — it was OPEN and touching this exact path at the
+  time, and the file-level check would have surfaced it. What was written
+  instead was a second, parallel section on the same subject, which had to be
+  discarded and re-applied in place.
+
+### The SYMBOL half is weaker evidence than the FILE half, and is marked as such
+
+The file check has three confirmed instances above. **The symbol check (step 3) has none, and it is
+included on argument rather than on measurement.** Saying so is the point: a rule that presents its
+measured and its reasoned halves at equal strength invites the reader to discount both.
+
+The argument for keeping it is that the file check has a known blind spot, and check 13 below
+already establishes the mechanism: **a name is not a mechanism, and code moves.** If the work you
+are about to do has been done under a different function name, or in a different file after a move,
+two focused rows can share a defect and share no path — and step 2 sees nothing. Step 3 is the same
+predicate applied to the thing that survives a move.
+
+⚠️ **I looked for an instance of that shape tonight and did not find one — recorded so the search is
+not repeated blind.** Over the same 174-row corpus I compared every pair of focused rows with
+DISJOINT file sets, created within twelve hours, sharing two or more distinctive title tokens. It
+returned 86 pairs and every inspected one was a false positive, because the disclosure prefix
+(`[hermit2, <agent>, unresolved, devbig014, role=impl]`) supplies shared tokens to every row this
+fleet opens. **A title-token search cannot work on this corpus until the disclosure prefix is
+stripped first**, and even then titles are a poor proxy for a symbol. The measurement that would
+settle it is a symbol-level one: extract identifiers from each row's diff hunks and intersect those,
+rather than intersecting titles. Until someone runs that, step 3 is a cheap precaution with a sound
+mechanism behind it, not a measured rule.
+
+### Co-touching is not duplication
+
+Do not let this rule cry wolf. On the same corpus, 189 paths are touched by two
+or more pull requests, and filtering to focused rows (six files or fewer),
+non-generated paths, and a twelve-hour window still leaves 90 candidate pairs.
+Those are CANDIDATES; a duplicate is a subset you confirm by reading.
+
+hermit#2541 and hermit#2542 are the negative control: same file
+(`hermit-cli/src/bin/hermit/run.rs`), one minute apart, two agents — and not a
+duplicate at all. #2541's body names #2542 and says what each half does. That is
+what a deconflicted pair looks like, and it is what this check is FOR: it
+surfaces the neighbours so you can do exactly that.
+
+Generated artifacts are the other false-positive source and should be excluded
+outright: `ci/compat-envelope/cells.json` alone is touched by 40 pull requests,
+along with `SCORECARD.md`, `ci/expected-e2e-plan.json` and the manifests. Those
+are regenerated by nearly every coverage change and carry no signal about who is
+fixing what.
+
+## Before you PARALLELISE a failure set: triage it, because a node count is not a defect count
+
+Two agents on one cause, dispatched from opposite nodes, is the most expensive
+duplicate this queue produces — neither can see the other, because neither is
+looking at the same artifact. Triage costs one reading pass; the duplicate costs
+two investigations and is discovered late, if at all.
+
+**Open every node's actual failure text before dispatching anyone.** Not the node
+name — the assertion. Measured on a full validate at 2026-08-25T14:22Z, 62 nodes
+executed, five reported as blocking failures:
+
+| node | what the name suggests | what it actually was |
+| --- | --- | --- |
+| `test.regular_crates` | a crate test | `setpgid` escaping the DBT copied child |
+| `test.cli` | a CLI test | `prlimit64` refusing a virtualized self-pid |
+| `test.liteinst_strict` | a LiteInst strictness failure | `os.getpid()` returned 2, expected 3 |
+| `test.sabre_examples` | a SaBRe example | run-to-run divergence on `rand.py` |
+| `scorecard.compatibility` | a scorecard failure | **nothing failed** — "218 missing, 0 non-passing" |
+
+⚠️ **Three of the five names misdescribe the failure**, and one names a failure
+that did not happen. The `liteinst_strict` case is the sharpest: the test is
+called `..._python_entropy`, its entropy assertions all pass, and the failing
+line is the virtual pid.
+
+**The five resolved into four dispositions, only one of which was startable:**
+
+- **2 collapse into ONE cause** — `setpgid` and `prlimit64`-by-virtual-pid are two
+  faces of the same unbuilt process-identity model, already covered by an open
+  OWNER DECISION. Not fixable by whoever investigates them.
+- **1 adjacent but not the same** — the pid VALUE is wrong by one, where the other
+  two have no model at all. Same surface, different shape, different fix.
+- **1 genuinely separate** — SaBRe, unowned and unexplained.
+- **1 needs no investigation at all** — its own message says nothing failed.
+
+So **three of five investigations should never start**: two would have put agents
+on an owner-blocked question from opposite nodes, and one on a node reporting
+success. **Three investigations not started beats three duplicates caught later**,
+because the duplicate is only visible after both agents have paid.
+
+**The discriminating questions, in order.** Do two nodes name the same subsystem
+AND the same failure shape? Then one cause until shown otherwise. Does a node's
+own text say nothing failed? Then it is downstream — re-run it last. Is the fix a
+policy question someone else owns? Then it is not an investigation, it is a
+blocked row, and dispatching it burns an agent who cannot finish.
+
+⚠️ **And read whether a node RAN.** A dependency-skipped node is not a failure.
+Counting `test.strict_compat` — "skipped (dependency failed, never ran)" — as a
+sixth failure sends someone to investigate a node that never executed.
 
 ## The checks, in order
 
