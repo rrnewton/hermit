@@ -502,7 +502,7 @@
     {
       "group": "test", "job": "liteinst_strict",
       "desc": "Portable LiteInst strict compatibility",
-      "cmd": "HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test liteinst_advanced -j 1",
+      "cmd": "HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit ./ci/liteinst-strict-node.sh -- ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test liteinst_advanced -j 1",
       "deps": ["build.e2e_artifact", "build.liteinst_runtime_release", "setup.nextest"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
