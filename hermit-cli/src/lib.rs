@@ -1469,6 +1469,60 @@ fn resolve_kvm_shebang(
     Ok((load_path, argv, image))
 }
 
+/// The container replaces this host directory with a private, empty tmpfs, so
+/// nothing beneath it is visible to the guest. Kept next to the diagnostic that
+/// depends on it; `run.rs` has its own `TMP_DIR` for the mount itself.
+const CONTAINER_REPLACED_TMP: &str = "/tmp";
+
+/// Explain why a working directory that plainly exists on the host could not be
+/// resolved for the guest.
+///
+/// ⚠️ THIS FUNCTION EXISTS BECAUSE THE BARE ERROR CAUSED A MISDIAGNOSIS, not to
+/// be tidy. `fs::canonicalize` runs after the container's mounts are applied, and
+/// the container bind-mounts a fresh empty tmpfs over `/tmp`
+/// (`bin/hermit/container.rs`). So a cwd beneath `/tmp` is genuinely absent from
+/// the guest's mount namespace and `canonicalize` returns a perfectly correct
+/// `NotFound` -- for a directory the user can `ls`.
+///
+/// Reported 2026-08-25 as "run_kvm_ cli tests fail from a git worktree". They do
+/// not. Measured across five working directories with one binary: a PLAIN
+/// directory under `/tmp` with no git in it FAILS, and a linked git worktree
+/// under `/home` WORKS. The only property that tracks the failure is "the cwd is
+/// under /tmp"; `/tmp` itself resolves because the mount POINT exists. The git
+/// hypothesis cost real investigation time, and it came from this message saying
+/// only "No such file or directory".
+///
+/// It matters more than a stray report: the project's own landing recipe is
+/// `git worktree add --detach /tmp/<name> origin/main`, so an agent following the
+/// documented workflow lands in the one subtree where this fires.
+///
+/// The message names the mechanism and both ways out. It deliberately does NOT
+/// silently fall back to `/`: changing the guest's working directory out from
+/// under a caller who asked for a specific one would trade a loud, correct
+/// failure for a quiet, wrong success.
+fn kvm_cwd_resolution_error(requested_cwd: &Path, error: &std::io::Error) -> Error {
+    let under_replaced_tmp = requested_cwd.starts_with(CONTAINER_REPLACED_TMP)
+        && requested_cwd != Path::new(CONTAINER_REPLACED_TMP);
+    if error.kind() == std::io::ErrorKind::NotFound && under_replaced_tmp {
+        anyhow!(
+            "failed to resolve KVM guest working directory {:?}: {error}\n\
+             \n\
+             This directory may well exist on the host. The container replaces \
+             {CONTAINER_REPLACED_TMP} with a private, empty tmpfs, so nothing beneath \
+             {CONTAINER_REPLACED_TMP} is visible to the guest, and resolving the working \
+             directory happens inside that mount namespace.\n\
+             Either run from a directory outside {CONTAINER_REPLACED_TMP}, or pass \
+             --workdir with a path that exists inside the guest.",
+            requested_cwd
+        )
+    } else {
+        anyhow!(
+            "failed to resolve KVM guest working directory {:?}: {error}",
+            requested_cwd
+        )
+    }
+}
+
 /// Dispatch a command onto the real reverie-kvm Tool runtime.
 async fn run_kvm(
     command: &Command,
@@ -1483,12 +1537,8 @@ async fn run_kvm(
         .get_current_dir()
         .map(Path::to_owned)
         .unwrap_or(std::env::current_dir()?);
-    let cwd = fs::canonicalize(&requested_cwd).map_err(|error| {
-        anyhow!(
-            "failed to resolve KVM guest working directory {:?}: {error}",
-            requested_cwd
-        )
-    })?;
+    let cwd = fs::canonicalize(&requested_cwd)
+        .map_err(|error| kvm_cwd_resolution_error(&requested_cwd, &error))?;
     let program = command
         .get_program()
         .to_str()
@@ -2294,6 +2344,59 @@ pub async fn replay_with_output_and_mounts(dir: &Path, mounts: &[Mount]) -> Resu
 
 #[cfg(test)]
 mod tests {
+
+    /// ⚠️ The bare `NotFound` here was read as a git-worktree bug and cost real
+    /// investigation time. The message must name the mount namespace, because
+    /// the directory it is complaining about usually exists on the host.
+    #[test]
+    fn a_cwd_under_tmp_is_explained_by_the_container_tmpfs_not_by_a_missing_directory() {
+        let error = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let rendered = format!(
+            "{}",
+            super::kvm_cwd_resolution_error(std::path::Path::new("/tmp/agent-checkout"), &error)
+        );
+        assert!(
+            rendered.contains("private, empty tmpfs"),
+            "must name the mechanism: {rendered}"
+        );
+        assert!(
+            rendered.contains("--workdir"),
+            "must name a way out: {rendered}"
+        );
+        assert!(
+            rendered.contains("/tmp/agent-checkout"),
+            "must still name the path asked for: {rendered}"
+        );
+    }
+
+    /// The explanation must NOT be attached to failures it does not explain --
+    /// an error that volunteers the wrong cause is what produced the original
+    /// misdiagnosis, in the other direction.
+    #[test]
+    fn the_tmpfs_explanation_is_withheld_where_it_does_not_apply() {
+        let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let outside = format!(
+            "{}",
+            super::kvm_cwd_resolution_error(std::path::Path::new("/home/u/wt"), &not_found)
+        );
+        assert!(!outside.contains("tmpfs"), "not a /tmp path: {outside}");
+
+        // `/tmp` itself resolves in the guest -- the mount POINT exists -- so a
+        // failure there is something else and must not be mislabelled.
+        let tmp_itself = format!(
+            "{}",
+            super::kvm_cwd_resolution_error(std::path::Path::new("/tmp"), &not_found)
+        );
+        assert!(!tmp_itself.contains("tmpfs"), "/tmp itself: {tmp_itself}");
+
+        // A different errno under /tmp is a different fault (permissions, say).
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let other = format!(
+            "{}",
+            super::kvm_cwd_resolution_error(std::path::Path::new("/tmp/x"), &denied)
+        );
+        assert!(!other.contains("tmpfs"), "not NotFound: {other}");
+    }
 
     /// A build-flag message must not assert a machine condition it never tested.
     ///
