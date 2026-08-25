@@ -1345,7 +1345,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
                 // If we had mutable access to the parent state, we could update it here, but
                 // instead we leave that to the clone/fork handling.
-                let (child_pedigree, _parent) = pts.1.pedigree.fork();
+                let (_next_parent_pedigree, child_pedigree) = pts.1.pedigree.fork();
                 let child_logical_time = pts.1.thread_logical_time.clone();
                 let last_accounted_user_time = child_logical_time.user_cpu_time();
                 let last_accounted_system_time = child_logical_time.system_cpu_time();
@@ -1374,7 +1374,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                                 .clone(),
                         ))
                     },
-                    pedigree: child_pedigree,
+                    pedigree: child_pedigree.clone(),
                     stats: ThreadStats::new(),
                     file_metadata: {
                         debug!(
@@ -1437,9 +1437,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     clone_flags: None,
                     pending_vfork: pts.1.pending_vfork.clone(),
 
-                    // For a child thread, we use the parent to initialize our rng state:
-                    prng: thread_rng_from_parent("USER RAND", &pts.1.prng, dettid),
-                    chaos_prng: thread_rng_from_parent("CHAOSRAND", &pts.1.chaos_prng, dettid),
+                    // Child RNG identity follows the deterministic creation
+                    // pedigree, never the backend/host Tid. Guest-visible IDs
+                    // and scheduler targeting continue to use `dettid`.
+                    prng: tool_local::thread_rng_from_parent_pedigree(
+                        "USER RAND",
+                        &pts.1.prng,
+                        &child_pedigree,
+                        tool_local::ChildRngStream::User,
+                    ),
+                    chaos_prng: tool_local::thread_rng_from_parent_pedigree(
+                        "CHAOSRAND",
+                        &pts.1.chaos_prng,
+                        &child_pedigree,
+                        tool_local::ChildRngStream::Chaos,
+                    ),
 
                     // For comparing progress to other threads, it is important that our
                     // child thread start at a sensible place, rather than starting back
@@ -3047,6 +3059,89 @@ mod process_tree_guest_clock_tests {
         );
 
         assert!(Arc::ptr_eq(&parent.guest_clock, &child.guest_clock));
+    }
+}
+
+#[cfg(test)]
+mod child_rng_identity_tests {
+    use super::*;
+
+    fn child_state(
+        tool: &Detcore,
+        parent: &mut ThreadState<()>,
+        host_tid: i32,
+        clone_flags: CloneFlags,
+    ) -> ThreadState<()> {
+        parent.clone_flags = Some(clone_flags);
+        <Detcore as Tool>::init_thread_state(
+            tool,
+            Tid::from_raw(host_tid),
+            Some((Tid::from_raw(parent.dettid.as_raw()), parent)),
+        )
+    }
+
+    fn rng_sample(child: &ThreadState<()>) -> [u64; 4] {
+        let mut rng = child.prng.clone();
+        std::array::from_fn(|_| rng.random())
+    }
+
+    fn chaos_rng_sample(child: &ThreadState<()>) -> [u64; 4] {
+        let mut rng = child.chaos_prng.clone();
+        std::array::from_fn(|_| rng.random())
+    }
+
+    #[test]
+    fn common_child_rng_identity_ignores_backend_tid_for_every_clone_shape() {
+        let config = Config::default();
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
+        for (label, clone_flags) in [
+            ("fork", CloneFlags::empty()),
+            ("vfork", CloneFlags::CLONE_VM | CloneFlags::CLONE_VFORK),
+            ("clone-process", CloneFlags::CLONE_VM),
+            (
+                "clone-thread",
+                CloneFlags::CLONE_VM | CloneFlags::CLONE_THREAD,
+            ),
+        ] {
+            let mut low_tid_parent = ThreadState::new(DetPid::from_raw(1), &config, ());
+            let mut high_tid_parent = ThreadState::new(DetPid::from_raw(1), &config, ());
+            let low_tid_child = child_state(&tool, &mut low_tid_parent, 2, clone_flags);
+            let high_tid_child = child_state(&tool, &mut high_tid_parent, 42_002, clone_flags);
+
+            assert_eq!(format!("{}", low_tid_child.pedigree), "C", "{label}");
+            assert_eq!(low_tid_child.dettid.as_raw(), 2, "{label}");
+            assert_eq!(high_tid_child.dettid.as_raw(), 42_002, "{label}");
+            assert_eq!(
+                rng_sample(&low_tid_child),
+                rng_sample(&high_tid_child),
+                "{label} child RNG depended on the backend Tid"
+            );
+            assert_eq!(
+                chaos_rng_sample(&low_tid_child),
+                chaos_rng_sample(&high_tid_child),
+                "{label} child chaos RNG depended on the backend Tid"
+            );
+            assert_ne!(
+                rng_sample(&low_tid_child),
+                chaos_rng_sample(&low_tid_child),
+                "{label} child guest and chaos RNG streams were coupled"
+            );
+        }
+    }
+
+    #[test]
+    fn serialized_siblings_receive_distinct_child_rng_streams() {
+        let config = Config::default();
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
+        let mut parent = ThreadState::new(DetPid::from_raw(1), &config, ());
+
+        let first = child_state(&tool, &mut parent, 2, CloneFlags::empty());
+        let first_pedigree = parent.pedigree.fork_mut();
+        assert_eq!(format!("{}", first.pedigree), format!("{first_pedigree}"));
+        let second = child_state(&tool, &mut parent, 3, CloneFlags::empty());
+
+        assert_eq!(format!("{}", second.pedigree), "PC");
+        assert_ne!(rng_sample(&first), rng_sample(&second));
     }
 }
 

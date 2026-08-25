@@ -36,6 +36,8 @@ use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Syscall;
 use serde::Deserialize;
 use serde::Serialize;
+use sha2::Digest as _;
+use sha2::Sha256;
 use tracing::debug;
 
 use crate::config::Config;
@@ -3041,6 +3043,47 @@ mod timeslice_tests {
         let high_values: [u64; 4] = std::array::from_fn(|_| high.next_u64());
         assert_ne!(low_values, high_values);
     }
+
+    #[test]
+    fn child_rng_pedigree_uses_the_full_unbounded_path() {
+        let parent_rng = Pcg64Mcg::seed_from_u64(0);
+        let mut long_path = Pedigree::new();
+        for index in 0..2_048 {
+            let (parent, child) = long_path.fork();
+            long_path = if index % 2 == 0 { child } else { parent };
+        }
+        let (left, right) = long_path.fork();
+        let mut left_rng =
+            thread_rng_from_parent_pedigree("test", &parent_rng, &left, ChildRngStream::User);
+        let mut right_rng =
+            thread_rng_from_parent_pedigree("test", &parent_rng, &right, ChildRngStream::User);
+
+        let left_values: [u64; 4] = std::array::from_fn(|_| left_rng.next_u64());
+        let right_values: [u64; 4] = std::array::from_fn(|_| right_rng.next_u64());
+        assert_ne!(left_values, right_values);
+    }
+
+    #[test]
+    fn child_rng_pedigree_separates_user_and_chaos_streams() {
+        let parent_rng = Pcg64Mcg::seed_from_u64(0);
+        let (_, child) = Pedigree::new().fork();
+        let mut user_rng = thread_rng_from_parent_pedigree(
+            "same logging label",
+            &parent_rng,
+            &child,
+            ChildRngStream::User,
+        );
+        let mut chaos_rng = thread_rng_from_parent_pedigree(
+            "same logging label",
+            &parent_rng,
+            &child,
+            ChildRngStream::Chaos,
+        );
+
+        let user_values: [u64; 4] = std::array::from_fn(|_| user_rng.next_u64());
+        let chaos_values: [u64; 4] = std::array::from_fn(|_| chaos_rng.next_u64());
+        assert_ne!(user_values, chaos_values);
+    }
 }
 
 /// Generate a new thread-local PRNG from the parent's PRNG state, mixing in the
@@ -3049,6 +3092,79 @@ mod timeslice_tests {
 // TODO-HUMAN-REVIEW(PR-1052): Review collision-free child-thread PRNG seeding.
 pub fn thread_rng_from_parent(msg: &str, parent: &Pcg64Mcg, child: DetTid) -> Pcg64Mcg {
     thread_rng_from_parent_entropy_labeled(msg, parent, child.as_raw() as u32 as u128, "tid")
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ChildRngStream {
+    User,
+    Chaos,
+}
+
+impl ChildRngStream {
+    fn domain(self) -> &'static [u8] {
+        match self {
+            Self::User => b"user",
+            Self::Chaos => b"chaos",
+        }
+    }
+}
+
+// TODO-HUMAN-REVIEW(PR-1052): Review pedigree-derived child-thread PRNG seeding.
+pub(crate) fn thread_rng_from_parent_pedigree(
+    msg: &str,
+    parent: &Pcg64Mcg,
+    child: &Pedigree,
+    stream: ChildRngStream,
+) -> Pcg64Mcg {
+    let bits = child.raw();
+    let mut packed = Vec::with_capacity(bits.len().div_ceil(8));
+    let mut byte = 0_u8;
+    for (index, bit) in bits.iter().enumerate() {
+        if *bit {
+            byte |= 1 << (index % 8);
+        }
+        if index % 8 == 7 {
+            packed.push(byte);
+            byte = 0;
+        }
+    }
+    if !bits.len().is_multiple_of(8) {
+        packed.push(byte);
+    }
+
+    // Pedigrees are unbounded, while Pcg64Mcg has a 128-bit state. Hash the
+    // complete, length-delimited path instead of using the fallible compressed
+    // virtual-PID encoding, so child RNG identity has no artificial tree-depth
+    // boundary. The domain string prevents this digest from being confused
+    // with another future use of the same pedigree serialization. Pcg64Mcg
+    // forces its low state bit, so this retains 127 effective digest bits.
+    let mut hasher = Sha256::new();
+    hasher.update(b"hermit-child-rng-pedigree-v1\0");
+    hasher.update(stream.domain());
+    hasher.update([0]);
+    hasher.update((bits.len() as u64).to_le_bytes());
+    hasher.update(&packed);
+    let digest = hasher.finalize();
+
+    let mut seed = <Pcg64Mcg as SeedableRng>::Seed::default();
+    parent.clone().fill_bytes(seed.as_mut());
+    for (seed_byte, pedigree_byte) in seed.iter_mut().zip(digest) {
+        *seed_byte ^= pedigree_byte;
+    }
+    detlog!(
+        "RNG {} seeding child {:?} pedigree {}: {:?} from parent {:?}",
+        msg,
+        stream,
+        child,
+        seed,
+        parent
+    );
+    let mut rng = Pcg64Mcg::from_seed(seed);
+    rng.next_u64();
+    rng.next_u64();
+    rng.next_u64();
+    rng.next_u64();
+    rng
 }
 
 fn thread_rng_from_parent_entropy(msg: &str, parent: &Pcg64Mcg, entropy: u128) -> Pcg64Mcg {
