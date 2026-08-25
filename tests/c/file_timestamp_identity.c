@@ -39,14 +39,17 @@
  * different and worse bug, and printing the relation names it directly instead
  * of leaving a reader to compare two hex numbers.
  *
- * All paths are relative, so they land in the guest's own working directory and
- * the fixture never depends on host filesystem state.
+ * All paths are relative after entering E2E_TMPDIR. The manifest harness runs
+ * cells from the repository root, so writing into the inherited cwd would
+ * mutate that shared directory while sibling cells inspect it. Verified runs
+ * give each guest an isolated /tmp; naked runs receive a per-cell host path.
  */
 
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -103,7 +106,27 @@ static int mtime_le(const char* a, const char* b) {
   return sa.st_mtim.tv_nsec <= sb.st_mtim.tv_nsec;
 }
 
+static int enter_test_directory(void) {
+  const char* path = getenv("E2E_TMPDIR");
+  if (path == NULL || path[0] == '\0') {
+    path = "/tmp";
+  }
+  if (mkdir(path, 0755) != 0 && errno != EEXIST) {
+    printf("SETUP mkdir workdir FAILED %s\n", strerror(errno));
+    return -1;
+  }
+  if (chdir(path) != 0) {
+    printf("SETUP chdir workdir FAILED %s\n", strerror(errno));
+    return -1;
+  }
+  return 0;
+}
+
 int main(void) {
+  if (enter_test_directory() != 0) {
+    return 1;
+  }
+
   /* --- create, in a known order ------------------------------------------ */
   if (write_file("ts_first.txt", "first\n") != 0) {
     printf("SETUP write ts_first.txt FAILED %s\n", strerror(errno));
