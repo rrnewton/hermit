@@ -201,6 +201,36 @@ fn copy_timer_slack_output<M: MemoryAccess>(
 /// unprivileged capacity increase while the soft limit is active.
 const DETERMINISTIC_PIPE_CAPACITY_BYTES: i32 = 8 * 1024;
 
+/// Why the pin failed, and which descriptors Linux had already created when it did.
+///
+/// `pipe2` has already SUCCEEDED by the time the capacity is pinned, so the two descriptors
+/// exist in the guest whatever happens next. Carrying them alongside the errno is what makes
+/// releasing them possible; classifying separately from acting on it is what makes the
+/// classification unit-testable without a guest.
+#[derive(Debug, PartialEq, Eq)]
+struct PipeCapacityFailure {
+    created_fds: [i32; 2],
+    error: Errno,
+}
+
+/// Classify the result of pinning a pipe's capacity.
+///
+/// The ONLY success shape is Linux returning exactly the requested capacity. `F_SETPIPE_SZ`
+/// returns the capacity it actually applied, and it may round; a rounded value is a pipe whose
+/// size we did not choose, which is the host-dependent capacity this path exists to remove. It
+/// is not a kernel errno, so it is reported as `EIO` rather than dressed up as one.
+fn pipe_capacity_failure(
+    created_fds: [i32; 2],
+    capacity_result: Result<i64, Errno>,
+) -> Option<PipeCapacityFailure> {
+    let error = match capacity_result {
+        Ok(applied) if applied == i64::from(DETERMINISTIC_PIPE_CAPACITY_BYTES) => return None,
+        Ok(_) => Errno::EIO,
+        Err(error) => error,
+    };
+    Some(PipeCapacityFailure { created_fds, error })
+}
+
 fn should_tag_sabre_internal_pipe_io(
     discovers_live_metadata: bool,
     fd_type: FdType,
@@ -2954,32 +2984,60 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             call
         };
+        // NO PRE-CALL READ OF `pipefd`. This is load-bearing on three backends, not a style
+        // choice. `record_or_replay` below returns early on failure, so every guest memory
+        // access AFTER it runs only when pipe2 SUCCEEDED -- and a successful pipe2 means the
+        // kernel itself wrote two ints there, which proves the address valid. A pre-call
+        // snapshot would be the only access to a kernel-UNVALIDATED address, and `LocalMemory`
+        // (reverie-dbt, reverie-e9patch, reverie-liteinst) implements reads as an unsafe
+        // `copy_nonoverlapping` that always returns `Ok`: a bad pointer is a hardware fault
+        // that `Result::ok` cannot catch, so the guest would die with SIGSEGV before Linux
+        // could report EFAULT. Letting the kernel touch `pipefd` first is also what keeps its
+        // argument-validation precedence intact -- flags are checked before the pointer, so a
+        // bad pointer with bad flags is EINVAL and with good flags EFAULT.
+        // A C guest asserting that precedence directly is being added separately.
         let res = self.record_or_replay(guest, injected).await?;
         let memory = guest.memory();
 
         if let Some(pipefd) = call.pipefd() {
             let fds: [i32; 2] = memory.read_value(pipefd)?;
             if internally_nonblocking {
-                let actual_capacity = guest
+                let capacity_result = guest
                     .inject(
                         syscalls::Fcntl::new()
                             .with_fd(fds[0])
                             .with_cmd(F_SETPIPE_SZ(DETERMINISTIC_PIPE_CAPACITY_BYTES)),
                     )
-                    .await
-                    .map_err(|error| {
-                        Error::Tool(anyhow::anyhow!(
-                            "failed to pin internal pipe capacity to {} bytes: {}",
-                            DETERMINISTIC_PIPE_CAPACITY_BYTES,
-                            error
-                        ))
-                    })?;
-                if actual_capacity != i64::from(DETERMINISTIC_PIPE_CAPACITY_BYTES) {
-                    return Err(Error::Tool(anyhow::anyhow!(
-                        "kernel set internal pipe capacity to {} bytes instead of {}",
-                        actual_capacity,
-                        DETERMINISTIC_PIPE_CAPACITY_BYTES
-                    )));
+                    .await;
+                if let Some(failure) = pipe_capacity_failure(fds, capacity_result) {
+                    // Release the descriptors Linux already created, THEN stop the run.
+                    //
+                    // Returning `Err` here -- what this code did before -- unwinds without
+                    // closing them. `pipe2` has already succeeded, so both descriptors are
+                    // live in the guest and are not yet registered with `add_fd`, which means
+                    // Detcore's own bookkeeping never learns they exist. Closing them is the
+                    // only way the guest's descriptor table matches Detcore's model.
+                    //
+                    // We do NOT fabricate a `pipe2` errno. Linux leaves `pipefd` untouched
+                    // when `pipe2` fails, so inventing a failure would oblige us to restore
+                    // the caller's buffer, which needs the pre-call snapshot the comment above
+                    // explains we must never take. And returning success with an unpinned pipe
+                    // silently restores exactly the host-dependent capacity this path exists
+                    // to remove. An unpinnable pipe means determinism is unavailable for this
+                    // run, so fail closed and loudly rather than quietly.
+                    //
+                    // Defensive, not expected: pinning on a freshly created EMPTY pipe is a
+                    // shrink or a no-op. EBUSY needs buffered data and EPERM needs to exceed
+                    // `pipe-max-size`; neither can hold here.
+                    for fd in failure.created_fds {
+                        let _ = guest.inject(syscalls::Close::new().with_fd(fd)).await;
+                    }
+                    error!(
+                        "[detcore] cannot pin scheduler-managed pipe to {} bytes (fds {:?}): {}. \
+                         Determinism is unavailable for this run.",
+                        DETERMINISTIC_PIPE_CAPACITY_BYTES, failure.created_fds, failure.error,
+                    );
+                    unrecoverable_shutdown(guest).await;
                 }
             }
             self.add_fd(guest, fds[0], call.flags(), FdType::Pipe)
@@ -4069,6 +4127,7 @@ mod test {
     use reverie::syscalls::FromToRaw;
     use reverie::syscalls::Whence;
 
+    use super::DETERMINISTIC_PIPE_CAPACITY_BYTES;
     use super::Errno;
     use super::TimerSlackBinding;
     use super::UNIX_AUTOBIND_NAME_LEN;
@@ -4076,6 +4135,7 @@ mod test {
     use super::classify_timer_slack_binding;
     use super::is_inherited_container_output;
     use super::parse_timer_slack_write;
+    use super::pipe_capacity_failure;
     use super::random_device_lseek_result;
     use super::should_tag_sabre_internal_pipe_io;
     use super::unix_autobind_address;
@@ -4091,6 +4151,37 @@ mod test {
     fn linux_flags_assumptions() {
         assert_eq!(libc::SOCK_NONBLOCK, OFlag::O_NONBLOCK.bits());
         assert_eq!(libc::SOCK_CLOEXEC, OFlag::O_CLOEXEC.bits());
+    }
+
+    #[test]
+    fn pipe_capacity_failure_classifies_the_errno() {
+        let created = [17, 18];
+
+        // The only success shape: Linux applied EXACTLY the capacity we asked for.
+        assert_eq!(
+            pipe_capacity_failure(created, Ok(i64::from(DETERMINISTIC_PIPE_CAPACITY_BYTES))),
+            None
+        );
+
+        // Successful-but-wrong capacity is a pipe whose size we did not choose. That is not a
+        // kernel errno, so it is reported as EIO rather than dressed up as one.
+        let mismatch = pipe_capacity_failure(
+            created,
+            Ok(i64::from(DETERMINISTIC_PIPE_CAPACITY_BYTES) * 2),
+        )
+        .expect("a capacity Linux rounded away from the pin must not read as success");
+        assert_eq!(mismatch.created_fds, created);
+        assert_eq!(mismatch.error, Errno::EIO);
+
+        // A real kernel errno is preserved rather than rewritten.
+        let denied = pipe_capacity_failure(created, Err(Errno::EPERM))
+            .expect("a kernel refusal must not read as success");
+        assert_eq!(denied.created_fds, created);
+        assert_eq!(denied.error, Errno::EPERM);
+
+        // The descriptors are carried through every failure shape, because they are what the
+        // caller has to close; losing them here is how they would leak.
+        assert_eq!(denied.created_fds, created);
     }
 
     #[test]
