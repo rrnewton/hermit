@@ -18,6 +18,7 @@ use std::sync::OnceLock;
 use anyhow::anyhow;
 use hermit::Context;
 use hermit::Error;
+use hermit::FailureKind;
 use hermit::SerializableError;
 use nix::sched::CpuSet;
 use nix::sched::sched_getaffinity;
@@ -29,6 +30,7 @@ use nix::sys::signal::Signal;
 use nix::sys::signal::sigaction;
 use nix::unistd::Pid;
 use reverie::process::Container;
+use reverie::process::ExitStatus;
 use reverie::process::Mount;
 use reverie::process::MountFlags;
 use reverie::process::Namespace;
@@ -507,7 +509,10 @@ fn inject_test_fault() {
     }
 }
 
-fn catch_child_panic<F, T>(f: &mut F) -> Result<T, Error>
+/// Returns a [`SerializableError`] rather than a bare [`Error`] so the CLASS
+/// survives: a caught panic is tagged HERE, at the only point that still knows
+/// one happened, and the tag then crosses the process boundary with the message.
+fn catch_child_panic<F, T>(f: &mut F) -> Result<T, SerializableError>
 where
     F: FnMut() -> Result<T, Error>,
 {
@@ -516,13 +521,14 @@ where
         inject_test_fault();
         f()
     })) {
-        Ok(result) => result,
+        Ok(result) => result.map_err(SerializableError::from),
         Err(payload) => {
             let location = take_panic_location();
-            Err(anyhow!(
+            Err(SerializableError::from(anyhow!(
                 "panic in container child at {location}: {}",
                 panic_message(&*payload)
             ))
+            .into_panic())
         }
     }
 }
@@ -554,15 +560,62 @@ impl RunGuarded for Container {
                 f()
             })) {
                 Ok(result) => result,
+                // Tagged AT THE CATCH SITE, the only place that still knows a
+                // panic is what happened. Everything downstream sees prose.
                 Err(payload) => Err(SerializableError::from(anyhow!(
                     "panic in container child at {}: {}",
                     take_panic_location(),
                     panic_message(&*payload)
-                ))),
+                ))
+                .into_panic()),
             }
         })
     }
 }
+
+/// The container child exited with a status IT DID NOT CHOOSE.
+///
+/// ⚠️ THIS TYPE EXISTS BECAUSE THE STATUS USED TO BE THROWN AWAY HERE, and the
+/// information was never missing — only discarded. reverie reports the child's
+/// real status as a typed `RunError::ExitStatus(ExitStatus)`; `with_container`
+/// then wrote `.context("Sandbox container exited unexpectedly")?`, which turns
+/// that typed value into an opaque `anyhow::Error` whose exit code survives only
+/// inside Display prose. Nothing downstream could branch on it without parsing
+/// English, so a tracer panic (container child dies with Rust's 101) and an
+/// ordinary CLI error — a bad flag, an unwritable log path — became the same
+/// thing one layer up.
+///
+/// Carrying it as a downcastable type is the whole fix: no new plumbing, no new
+/// channel, just stopping the discard. `main` recovers it with
+/// `anyhow::Error::downcast_ref`.
+#[derive(Debug)]
+pub struct ContainerChildExit(pub ExitStatus);
+
+impl std::fmt::Display for ContainerChildExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Keep the human text the caller already saw. This type changes what is
+        // MACHINE-readable, not what an operator reads.
+        write!(f, "Sandbox container exited unexpectedly: {:?}", self.0)
+    }
+}
+
+impl std::error::Error for ContainerChildExit {}
+
+/// The container child PANICKED, and the panic was caught and reported.
+///
+/// Distinct from [`ContainerChildExit`], which is the child dying of something
+/// no handler caught. Both are "the tracer broke"; neither is an ordinary CLI
+/// error, and before this they were all three the same thing.
+#[derive(Debug)]
+pub struct ContainerChildPanic(pub Error);
+
+impl std::fmt::Display for ContainerChildPanic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for ContainerChildPanic {}
 
 /// Helper to run a function inside a container, taking care to display any
 /// errors and propagate the exit status.
@@ -571,13 +624,32 @@ where
     F: FnMut() -> Result<T, Error>,
     T: serde::Serialize + serde::de::DeserializeOwned,
 {
-    Ok(container
-        .run(|| {
-            // Runs in the freshly forked container init, not in the caller.
-            arm_container_init_guards()?;
-            catch_child_panic(&mut f).map_err(SerializableError::from)
-        })
-        .context("Sandbox container exited unexpectedly")??)
+    let ran = container.run(|| {
+        // Runs in the freshly forked container init, not in the caller.
+        arm_container_init_guards()?;
+        catch_child_panic(&mut f)
+    });
+    match ran {
+        // The child ran and REPORTED something. Whether that was a caught panic
+        // or an error it chose to return is exactly what `kind` preserves; both
+        // used to arrive as indistinguishable prose.
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(reported)) => {
+            let panicked = reported.kind() == FailureKind::Panic;
+            let error = Error::from(reported);
+            Err(if panicked {
+                Error::new(ContainerChildPanic(error))
+            } else {
+                error
+            })
+        }
+        // PRESERVED, not flattened: the child died with a status it did not pick.
+        Err(RunError::ExitStatus(status)) => Err(Error::new(ContainerChildExit(status))),
+        // A spawn failure is a genuine CLI-side failure and keeps its prose.
+        Err(error @ RunError::Spawn(_)) => {
+            Err(Error::new(error).context("Sandbox container failed to spawn"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -587,7 +659,15 @@ mod tests {
     #[test]
     fn child_panic_becomes_an_error_naming_message_and_location() {
         let mut f = || -> Result<(), Error> { panic!("divergence detail that must survive") };
-        let error = catch_child_panic(&mut f).expect_err("a panic must not be reported as success");
+        let reported =
+            catch_child_panic(&mut f).expect_err("a panic must not be reported as success");
+        // The discriminant is the point: prose alone could not say "panic".
+        assert_eq!(
+            reported.kind(),
+            FailureKind::Panic,
+            "a caught panic must be tagged as one at the catch site"
+        );
+        let error = Error::from(reported);
         let rendered = format!("{error:#}");
         assert!(
             rendered.contains("divergence detail that must survive"),
@@ -604,7 +684,13 @@ mod tests {
         let mut ok = || -> Result<u32, Error> { Ok(7) };
         assert_eq!(catch_child_panic(&mut ok).unwrap(), 7);
         let mut err = || -> Result<u32, Error> { Err(anyhow!("a plain error, not a panic")) };
-        let rendered = format!("{:#}", catch_child_panic(&mut err).unwrap_err());
+        let reported = catch_child_panic(&mut err).unwrap_err();
+        assert_eq!(
+            reported.kind(),
+            FailureKind::Error,
+            "an ordinary reported error must NOT be tagged as a panic"
+        );
+        let rendered = format!("{:#}", Error::from(reported));
         assert!(
             rendered.contains("a plain error, not a panic"),
             "{rendered}"
