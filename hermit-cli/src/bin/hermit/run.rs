@@ -579,6 +579,16 @@ impl VerifyAllow {
     }
 }
 
+fn describe_exit_status(status: ExitStatus) -> String {
+    match status {
+        ExitStatus::Exited(code) => format!("exited with code {code}"),
+        ExitStatus::Signaled(signal, core_dumped) => {
+            let core = if core_dumped { " (core dumped)" } else { "" };
+            format!("terminated by signal {} ({signal:?}){core}", signal as i32)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(super) enum BaseEnv {
     Empty,
@@ -3387,8 +3397,9 @@ impl RunOpts {
         }
 
         if !self.verify_allow.satisfies(out1.status) {
+            let status = describe_exit_status(out1.status);
             eprintln!(
-                "First run errored during --verify, not continuing to a second. Stdout:\n{}\nStderr:\n{}",
+                "First run errored during --verify, not continuing to a second.\nExit status: {status}\nStdout:\n{}\nStderr:\n{}",
                 String::from_utf8_lossy(&out1.stdout),
                 String::from_utf8_lossy(&out1.stderr),
             );
@@ -3421,7 +3432,7 @@ impl RunOpts {
             if self.keep_logs {
                 retain_verification_logs([("run 1", log1_path)])?;
             }
-            return Err(Error::msg("First run during --verify exited in error"));
+            return Err(Error::msg(format!("First run during --verify {status}")));
         }
 
         eprintln!(":: {}", "Run2...".yellow().bold());
@@ -3854,6 +3865,28 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    #[test]
+    fn exit_status_diagnostic_reports_guest_exit_code_and_signal() {
+        assert_eq!(
+            describe_exit_status(ExitStatus::Exited(23)),
+            "exited with code 23"
+        );
+        assert_eq!(
+            describe_exit_status(ExitStatus::Signaled(
+                reverie::process::Signal::SIGTERM,
+                false,
+            )),
+            "terminated by signal 15 (SIGTERM)"
+        );
+        assert_eq!(
+            describe_exit_status(ExitStatus::Signaled(
+                reverie::process::Signal::SIGSEGV,
+                true,
+            )),
+            "terminated by signal 11 (SIGSEGV) (core dumped)"
+        );
+    }
 
     #[test]
     fn verification_report_is_published_before_success_is_announced() {
