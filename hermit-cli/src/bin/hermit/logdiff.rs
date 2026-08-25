@@ -629,6 +629,7 @@ fn pending_json_report(
         first_divergent_virtual_nanoseconds: None,
         first_divergent_record: None,
         first_divergent_syscall: None,
+        refused: false,
     };
     let mut report = json_report(&summary, options, no_records(), record_envelope);
     report.verdict = JsonVerdict::NoResult;
@@ -952,6 +953,7 @@ mod tests {
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            refused: false,
         };
         let records = JsonRecords {
             compared: 40,
@@ -1021,6 +1023,7 @@ mod tests {
             // A different keyspace from the record index above, deliberately:
             // nine compared records in, only three syscalls completed.
             first_divergent_syscall: Some(3),
+            refused: false,
         };
         let value = serde_json::to_value(json_report(
             &summary,
@@ -1115,6 +1118,7 @@ mod tests {
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            refused: false,
         };
         write_json(
             &path,
