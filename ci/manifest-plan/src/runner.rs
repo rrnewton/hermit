@@ -131,6 +131,8 @@ pub struct CellId {
     pub backend: Option<String>,
 }
 
+const SCHEDULED_JOBS_ENV: &str = "HERMIT_E2E_SCHEDULED_JOBS";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Population {
     Required,
@@ -528,6 +530,24 @@ pub struct CellResult {
     pub reason: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScheduledWorkerCapacity(usize);
+
+impl ScheduledWorkerCapacity {
+    pub fn new(configured: usize) -> Self {
+        assert!(configured > 0, "scheduled worker capacity must be positive");
+        Self(configured)
+    }
+
+    pub fn configured(self) -> usize {
+        self.0
+    }
+
+    pub fn workers_for(self, count: usize) -> usize {
+        self.0.min(count)
+    }
+}
+
 pub struct RunContext {
     pub root: PathBuf,
     pub hermit_bin: PathBuf,
@@ -540,6 +560,7 @@ pub struct RunContext {
     pub keep_logs: bool,
     pub run_verify_strict: bool,
     pub record_verify_strict: bool,
+    pub scheduled_worker_capacity: ScheduledWorkerCapacity,
 }
 
 impl RunContext {
@@ -590,7 +611,16 @@ impl RunContext {
             keep_logs: std::env::var("E2E_KEEP_VERIFY_LOGS").as_deref() == Ok("1"),
             run_verify_strict,
             record_verify_strict,
+            scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
         })
+    }
+
+    pub fn with_scheduled_worker_capacity(
+        mut self,
+        scheduled_worker_capacity: ScheduledWorkerCapacity,
+    ) -> Self {
+        self.scheduled_worker_capacity = scheduled_worker_capacity;
+        self
     }
 }
 
@@ -748,7 +778,7 @@ pub fn build_spec(
     seed: Option<i64>,
 ) -> Result<CellRunSpec, String> {
     let backend = cell.id.backend.as_deref().unwrap_or("native");
-    let mut env = cell_env(&dir, cell.id.mode != "naked");
+    let mut env = execution_cell_env(context, &dir, cell.id.mode != "naked");
     let sabre_path_evidence = (backend == "sabre").then(|| {
         dir.join("captures")
             .join(format!("{}-{attempt}.sabre-path.jsonl", cell.id.mode))
@@ -867,6 +897,7 @@ pub fn build_spec(
                 backend.into(),
             ];
             argv.extend(cell.test.modes["custom"].args.clone());
+            append_scheduled_jobs_env_arg(&mut argv, &env);
             argv.push("--".into());
             argv.extend(guest_argv.clone());
             (argv, None)
@@ -1368,7 +1399,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
     let literal_env = attempts
         .first()
         .map(|attempt| attempt.env.clone())
-        .unwrap_or_else(|| cell_env(&dir, cell.id.mode != "naked"));
+        .unwrap_or_else(|| execution_cell_env(context, &dir, cell.id.mode != "naked"));
     let literal_cwd = attempts
         .first()
         .map(|attempt| attempt.cwd.clone())
@@ -1480,7 +1511,7 @@ pub fn infrastructure_error_result(
         effective_args: Vec::new(),
         argv: Vec::new(),
         guest_argv: Vec::new(),
-        env: cell_env(&dir, cell.id.mode != "naked"),
+        env: execution_cell_env(context, &dir, cell.id.mode != "naked"),
         cwd: context.root.to_string_lossy().into_owned(),
         shell_command: String::new(),
         relaxations: Vec::new(),
@@ -1771,6 +1802,19 @@ fn cell_env(dir: &Path, verified: bool) -> BTreeMap<String, String> {
     ])
 }
 
+fn execution_cell_env(
+    context: &RunContext,
+    dir: &Path,
+    verified: bool,
+) -> BTreeMap<String, String> {
+    let mut env = cell_env(dir, verified);
+    env.insert(
+        SCHEDULED_JOBS_ENV.into(),
+        context.scheduled_worker_capacity.configured().to_string(),
+    );
+    env
+}
+
 fn preparation_env(dir: &Path) -> BTreeMap<String, String> {
     let mut env = cell_env(dir, false);
     let ambient_home = std::env::var_os("HOME");
@@ -1832,7 +1876,7 @@ fn shell_quote(value: &str) -> String {
 
 fn append_guest_env_args(argv: &mut Vec<String>, env: &BTreeMap<String, String>) {
     // `--base-env=minimal` intentionally removes the invoking host's ambient
-    // environment. These six values are the manifest runner's explicit guest
+    // environment. These values are the manifest runner's explicit guest
     // contract, so forward them literally instead of relying on inheritance.
     for name in [
         "LC_ALL",
@@ -1841,6 +1885,7 @@ fn append_guest_env_args(argv: &mut Vec<String>, env: &BTreeMap<String, String>)
         "XDG_CONFIG_HOME",
         "E2E_TMPDIR",
         "E2E_FIXTURE_DIR",
+        SCHEDULED_JOBS_ENV,
     ] {
         let value = env
             .get(name)
@@ -1848,6 +1893,14 @@ fn append_guest_env_args(argv: &mut Vec<String>, env: &BTreeMap<String, String>)
         argv.push("--env".into());
         argv.push(format!("{name}={value}"));
     }
+}
+
+fn append_scheduled_jobs_env_arg(argv: &mut Vec<String>, env: &BTreeMap<String, String>) {
+    let value = env
+        .get(SCHEDULED_JOBS_ENV)
+        .expect("cell environment contains scheduled worker capacity");
+    argv.push("--env".into());
+    argv.push(format!("{SCHEDULED_JOBS_ENV}={value}"));
 }
 
 fn observation_hash(observation: &Observation, attempt: &AttemptResult, dir: &Path) -> String {
@@ -2028,6 +2081,7 @@ mod tests {
             keep_logs: false,
             run_verify_strict: false,
             record_verify_strict: false,
+            scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
         };
         assert_eq!(
             infrastructure_error_result(&context, &cell, "fixture".into()).classification,
@@ -2066,6 +2120,7 @@ mod tests {
             keep_logs: false,
             run_verify_strict: false,
             record_verify_strict: false,
+            scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
         };
         let path = root.join("results.jsonl");
         for expected in 1..=2 {
@@ -2181,6 +2236,7 @@ backends_disabled:
             keep_logs: false,
             run_verify_strict: true,
             record_verify_strict: true,
+            scheduled_worker_capacity: ScheduledWorkerCapacity::new(7),
         };
         let spec = build_spec(
             &context,
@@ -2193,6 +2249,10 @@ backends_disabled:
         .unwrap();
         assert!(spec.argv.iter().any(|arg| arg == "--verify-strict"));
         assert!(spec.argv.iter().any(|arg| arg == "--base-env=minimal"));
+        assert_eq!(
+            spec.env.get(SCHEDULED_JOBS_ENV).map(String::as_str),
+            Some("7")
+        );
         assert!(!spec.argv.iter().any(|arg| arg == "--no-virtualize-cpuid"));
         assert!(
             !spec
@@ -2207,6 +2267,7 @@ backends_disabled:
             "XDG_CONFIG_HOME",
             "E2E_TMPDIR",
             "E2E_FIXTURE_DIR",
+            "HERMIT_E2E_SCHEDULED_JOBS",
         ] {
             assert!(spec.argv.windows(2).any(|window| {
                 window[0] == "--env" && window[1].starts_with(&format!("{name}="))
@@ -2255,11 +2316,41 @@ backends_disabled:
             "XDG_CONFIG_HOME",
             "E2E_TMPDIR",
             "E2E_FIXTURE_DIR",
+            "HERMIT_E2E_SCHEDULED_JOBS",
         ] {
             assert!(replay.argv.windows(2).any(|window| {
                 window[0] == "--env" && window[1].starts_with(&format!("{name}="))
             }));
         }
+
+        let mut custom_test = recipe(true);
+        let mut custom_mode = custom_test.modes.remove("verify").unwrap();
+        custom_mode.args = vec!["--base-env=minimal".into()];
+        custom_test.modes.insert("custom".into(), custom_mode);
+        let custom_cell = SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: custom_test.id.clone(),
+                mode: "custom".into(),
+                backend: Some("ptrace".into()),
+            },
+            test: custom_test,
+            enabled: true,
+        };
+        let custom = build_spec(
+            &context,
+            &custom_cell,
+            PathBuf::from("/repo/results/custom-cell"),
+            vec!["/bin/true".into()],
+            "1",
+            None,
+        )
+        .unwrap();
+        assert!(
+            custom.argv.windows(2).any(|window| {
+                window[0] == "--env" && window[1] == "HERMIT_E2E_SCHEDULED_JOBS=7"
+            })
+        );
     }
 
     #[test]
@@ -2653,6 +2744,7 @@ backends_disabled:
             keep_logs: false,
             run_verify_strict: false,
             record_verify_strict: false,
+            scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
         };
 
         fs::create_dir_all(cell_dir.join("fixtures")).unwrap();

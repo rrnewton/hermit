@@ -53725,6 +53725,166 @@
     {
       "lane": "portable",
       "category": "system-utils",
+      "test": "system-utils/harness-width-contract",
+      "mode": "chaos",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/harness-width-contract",
+      "mode": "chaos",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/harness-width-contract",
+      "mode": "chaos",
+      "backend": "liteinst",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/harness-width-contract",
+      "mode": "chaos",
+      "backend": "ptrace",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/harness-width-contract",
+      "mode": "chaos",
+      "backend": "sabre",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/harness-width-contract",
+      "mode": "naked",
+      "backend": "native",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/harness-width-contract",
+      "mode": "replay",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/harness-width-contract",
+      "mode": "replay",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/harness-width-contract",
+      "mode": "replay",
+      "backend": "liteinst",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/harness-width-contract",
+      "mode": "replay",
+      "backend": "ptrace",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/harness-width-contract",
+      "mode": "replay",
+      "backend": "sabre",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/harness-width-contract",
+      "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/harness-width-contract",
+      "mode": "verify",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/harness-width-contract",
+      "mode": "verify",
+      "backend": "liteinst",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/harness-width-contract",
+      "mode": "verify",
+      "backend": "ptrace",
+      "enabled": true,
+      "status": "green",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/harness-width-contract",
+      "mode": "verify",
+      "backend": "sabre",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
       "test": "system-utils/mcookie-random",
       "mode": "chaos",
       "backend": "dbt",

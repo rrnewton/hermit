@@ -2660,6 +2660,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/e2e/system-utils/harness-width-contract.sh",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/*.yaml",
+      "why": "tests/e2e/system-utils/harness-width-contract.sh is owned by target/debug/test-harness via tests/e2e/manifests/*.yaml: Direct schema-v2 program; all modes and backend policy are centralized in the YAML bucket manifests"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/e2e/system-utils/mcookie-random.sh",
       "runner": "target/debug/test-harness via tests/e2e/manifests/*.yaml",
       "why": "tests/e2e/system-utils/mcookie-random.sh is owned by target/debug/test-harness via tests/e2e/manifests/*.yaml: Direct schema-v2 program; all modes and backend policy are centralized in the YAML bucket manifests"
