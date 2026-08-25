@@ -147,6 +147,38 @@ This check has already reversed a published verdict. A draft classified
 because porting it would have REGRESSED current accounting. The symbol verdict
 was right about the past fact and wrong as an action.
 
+### 6. A symbol absent from BOTH sides means the check cannot speak
+
+⚠️ **A marker absent at the merge base AND absent on main does not mean unlanded.
+It means the check could not decide.** Classifying those as absent manufactures
+confident wrong verdicts at scale, because check 2 above is exactly the case that
+produces them: the mechanism landed under a different symbol name, so no
+identifier is shared and both counts read zero.
+
+This is not hypothetical, and the abstract rule will not stop anyone. The example:
+
+    hermit#2422 added   detcore/src/consts.rs:45         pub const DET_PIPE_CAPACITY: i32 = 8192;
+    main already had    detcore/src/syscalls/files.rs:78 const DETERMINISTIC_PIPE_CAPACITY_BYTES: i32 = 8 * 1024;
+
+Same value. Same pipe-creation handler. Same `F_SETPIPE_SZ` on the read end. Same
+stated rationale, down to the same cause — Linux sizes a new pipe from the host's
+per-user `pipe-user-pages-soft` accounting, so a parallel validate crosses the
+threshold using only its own concurrent guests. **Both symbols count zero at the
+merge base and zero on main.** A pure symbol rule reads that as "genuinely
+unlanded, land candidate". It was already landed, and landing the pull request
+would have added a second constant and a second pin site for one property.
+hermit#2331 was the same shape against main's `sabre_backend_evidence_line`.
+
+So route both-sides-absent to **indeterminate**, never to *genuinely pending*, and
+resolve it by hand with a search for the **value and the rationale rather than the
+identifier**: grep main for the constant's value, the syscall it configures, and a
+distinctive phrase from its comment.
+
+Measured cost of getting this wrong: in the 2026-08-25 sweep of hermit's 46 open
+`[SALVAGE]` drafts, **21 of 46 — the largest bucket — landed in this state.** Had
+they been auto-classified as absent, 21 verdicts would have been wrong in the
+direction that wastes a receipt and re-lands existing work.
+
 ## Verdict vocabulary
 
 | verdict | meaning | action |
