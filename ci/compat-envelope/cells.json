@@ -32037,6 +32037,172 @@
     {
       "lane": "portable",
       "category": "c-programs",
+      "test": "c-programs/procfs-identity-agreement",
+      "mode": "chaos",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/procfs-identity-agreement",
+      "mode": "chaos",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/procfs-identity-agreement",
+      "mode": "chaos",
+      "backend": "liteinst",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/procfs-identity-agreement",
+      "mode": "chaos",
+      "backend": "ptrace",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/procfs-identity-agreement",
+      "mode": "chaos",
+      "backend": "sabre",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/procfs-identity-agreement",
+      "mode": "naked",
+      "backend": "native",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/procfs-identity-agreement",
+      "mode": "replay",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/procfs-identity-agreement",
+      "mode": "replay",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/procfs-identity-agreement",
+      "mode": "replay",
+      "backend": "liteinst",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/procfs-identity-agreement",
+      "mode": "replay",
+      "backend": "ptrace",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/procfs-identity-agreement",
+      "mode": "replay",
+      "backend": "sabre",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/procfs-identity-agreement",
+      "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/procfs-identity-agreement",
+      "mode": "verify",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/procfs-identity-agreement",
+      "mode": "verify",
+      "backend": "liteinst",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/procfs-identity-agreement",
+      "mode": "verify",
+      "backend": "ptrace",
+      "enabled": true,
+      "status": "red",
+      "ci_disabled_reason": {
+        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+      },
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/procfs-identity-agreement",
+      "mode": "verify",
+      "backend": "sabre",
+      "enabled": true,
+      "status": "red",
+      "ci_disabled_reason": {
+        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+      },
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
       "test": "c-programs/procfs-positioned-probe",
       "mode": "chaos",
       "backend": "dbt",

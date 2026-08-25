@@ -1,6 +1,70 @@
 schema: 2
 bucket: c-programs
 test:
+  - id: c-programs/procfs-identity-agreement
+    description: The guest sees ONE identity per file through stat, /proc/self/maps and fdinfo
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    timeout_seconds: 90
+    occasional: false
+    program: tests/c/procfs_identity_agreement.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: false
+        backends_enabled:
+          - ptrace
+          - sabre
+        backends_disabled:
+          dbt: "Not yet qualified for this memfd-backed procfs identity check"
+          liteinst: "Not yet qualified for this memfd-backed procfs identity check"
+          kvm: "Initial C-corpus migration preserves the established ptrace and SaBRe baseline; qualify KVM separately"
+        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (by design): this cell asserts the identity picture Detcore presents, and native presents none, so there is no naked oracle to run.'
+        backends_enabled: []
+        backends_disabled:
+          native: This cell asserts Detcore's sanitized identity picture; native has no such picture to assert
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this consistency check and has never been run for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is a separate exercise from this consistency check
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay qualification is a separate exercise from this consistency check
+          sabre: Record/replay qualification is a separate exercise from this consistency check
+          liteinst: Record/replay qualification is a separate exercise from this consistency check
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (by design): the guest is single-threaded, so chaos scheduling exercises nothing this cell asserts.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded identity check; chaos scheduling asserts nothing extra
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Single-threaded identity check; chaos scheduling asserts nothing extra
+          sabre: Single-threaded identity check; chaos scheduling asserts nothing extra
+          liteinst: Single-threaded identity check; chaos scheduling asserts nothing extra
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case arguments have been calibrated for this C guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
   - id: c-programs/acct-refusal-probe
     description: Strict verification for tests/c/acct_refusal_probe.c
     lane: portable
