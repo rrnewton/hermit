@@ -21,7 +21,8 @@
 //! outside one:
 //!
 //! ```text
-//!   AF_SPEC -> AF_INET6 -> IFLA_INET6_STATS   30 bytes
+//!   AF_SPEC -> AF_INET6 -> IFLA_INET6_STATS       30 bytes
+//!   AF_SPEC -> AF_INET6 -> IFLA_INET6_CACHEINFO     4 bytes (guest payload only)
 //!   IFLA_STATS64                               8 bytes
 //!   IFLA_STATS                                 8 bytes
 //! ```
@@ -57,6 +58,20 @@ const IFINFOMSG_LEN: usize = 16;
 /// `RTM_NEWLINK`, the reply type for an `RTM_GETLINK` dump.
 const RTM_NEWLINK: u16 = 16;
 
+/// `RTM_NEWADDR`, the reply type for an `RTM_GETADDR` dump. glibc's
+/// `getifaddrs` issues BOTH dumps, so a guest that enumerates interfaces
+/// receives both message types and both must be determinized.
+const RTM_NEWADDR: u16 = 20;
+
+/// `ifaddrmsg`, which follows the `nlmsghdr` in an `RTM_NEWADDR` message. It is
+/// EIGHT bytes, not the sixteen of `ifinfomsg` -- getting this wrong walks the
+/// attributes from the wrong offset and silently matches nothing.
+const IFADDRMSG_LEN: usize = 8;
+
+/// `ifa_cacheinfo`, carrying `cstamp` and `tstamp` -- timestamps in hundredths
+/// of a second since boot, which advance between runs.
+const IFA_CACHEINFO: u16 = 6;
+
 const IFLA_STATS: u16 = 7;
 const IFLA_STATS64: u16 = 23;
 const IFLA_AF_SPEC: u16 = 26;
@@ -64,6 +79,13 @@ const IFLA_AF_SPEC: u16 = 26;
 const AF_INET6: u16 = 10;
 const IFLA_INET6_STATS: u16 = 3;
 const IFLA_INET6_ICMP6STATS: u16 = 6;
+/// `ifla_cacheinfo`, which carries `tstamp` and `reachable_time`. MEASURED on
+/// the real guest payload: after zeroing the three statistics attributes, FOUR
+/// BYTES still differed between two runs and every one of them was here. The
+/// native host sample did not expose it -- those fields happened to match in
+/// that pair -- which is why the fix had to be tested against the ACTUAL
+/// failing buffer rather than a synthetic dump.
+const IFLA_INET6_CACHEINFO: u16 = 5;
 
 fn align_up(value: usize, align: usize) -> usize {
     value.div_ceil(align) * align
@@ -96,12 +118,22 @@ pub fn sanitize_route_link_stats(buf: &mut [u8]) -> bool {
             return modified;
         }
 
-        if msg_type == RTM_NEWLINK {
-            let body = offset + NLMSG_HDRLEN + IFINFOMSG_LEN;
-            let end = offset + len;
-            if body <= end {
-                zero_link_attrs(buf, body, end, &mut modified);
+        match msg_type {
+            RTM_NEWLINK => {
+                let body = offset + NLMSG_HDRLEN + IFINFOMSG_LEN;
+                let end = offset + len;
+                if body <= end {
+                    zero_link_attrs(buf, body, end, &mut modified);
+                }
             }
+            RTM_NEWADDR => {
+                let body = offset + NLMSG_HDRLEN + IFADDRMSG_LEN;
+                let end = offset + len;
+                if body <= end {
+                    zero_addr_attrs(buf, body, end, &mut modified);
+                }
+            }
+            _ => {}
         }
 
         offset += align_up(len, NLMSG_ALIGNTO);
@@ -133,6 +165,26 @@ fn zero_link_attrs(buf: &mut [u8], mut attr: usize, end: usize, modified: &mut b
     }
 }
 
+/// Walk the `IFA_*` attributes of one `RTM_NEWADDR` message, zeroing the cache
+/// timestamps. MEASURED on the real guest payload: a 156-byte reply held two
+/// `RTM_NEWADDR` messages and every one of its eight differing bytes was in
+/// `IFA_CACHEINFO`.
+fn zero_addr_attrs(buf: &mut [u8], mut attr: usize, end: usize, modified: &mut bool) {
+    while attr + RTA_HDRLEN <= end {
+        let (alen, atype) = match attr_header(buf, attr) {
+            Some(header) => header,
+            None => return,
+        };
+        if alen < RTA_HDRLEN || attr + alen > end {
+            return;
+        }
+        if atype == IFA_CACHEINFO {
+            zero_range(buf, attr + RTA_HDRLEN, attr + alen, modified);
+        }
+        attr += align_up(alen, RTA_ALIGNTO);
+    }
+}
+
 /// `IFLA_AF_SPEC` nests one block per address family; the IPv6 block carries the
 /// SNMP counter arrays. This is the largest source of drift and the one a
 /// stats-only fix misses.
@@ -157,7 +209,10 @@ fn zero_af_spec(buf: &mut [u8], mut fam: usize, end: usize, modified: &mut bool)
                 if ilen < RTA_HDRLEN || inner + ilen > inner_end {
                     return;
                 }
-                if matches!(itype, IFLA_INET6_STATS | IFLA_INET6_ICMP6STATS) {
+                if matches!(
+                    itype,
+                    IFLA_INET6_STATS | IFLA_INET6_ICMP6STATS | IFLA_INET6_CACHEINFO
+                ) {
                     zero_range(buf, inner + RTA_HDRLEN, inner + ilen, modified);
                 }
                 inner += align_up(ilen, RTA_ALIGNTO);
@@ -228,7 +283,7 @@ mod test {
     fn zeroes_legacy_link_stats() {
         let mut msg = newlink(&rtattr(IFLA_STATS, &[9u8; 12]));
         assert!(sanitize_route_link_stats(&mut msg));
-        assert!(!msg.iter().any(|b| *b == 9));
+        assert!(!msg.contains(&9));
     }
 
     /// THE CASE A STATS-ONLY FIX MISSES. IFLA_INET6_STATS lives two levels down,
@@ -241,7 +296,7 @@ mod test {
         let mut msg = newlink(&rtattr(IFLA_AF_SPEC, &family));
         assert!(sanitize_route_link_stats(&mut msg));
         assert!(
-            !msg.iter().any(|b| *b == 5),
+            !msg.contains(&5),
             "nested IPv6 SNMP counters were left undeterminized"
         );
     }
@@ -286,6 +341,6 @@ mod test {
         let mut msg = newlink(&rtattr(IFLA_STATS64, &[4u8; 16]));
         msg[4..6].copy_from_slice(&20u16.to_ne_bytes());
         assert!(!sanitize_route_link_stats(&mut msg));
-        assert!(msg.iter().any(|b| *b == 4));
+        assert!(msg.contains(&4));
     }
 }
