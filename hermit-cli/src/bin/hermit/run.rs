@@ -1001,6 +1001,62 @@ fn backend_values_parse_and_round_trip() {
     }
 }
 
+/// A PLAIN `--verify` CANNOT REACH THE CANONICAL COMPARATOR, AND `--verify-strict`
+/// ALWAYS CAN — ON EVERY BACKEND, INCLUDING KVM.
+///
+/// Ported from the superseded hermit#2217, which fixed
+/// `let kvm_output_only = self.selected_backend() == Backend::Kvm` by making the
+/// bypass conditional. Current main fixed it more strongly, by DELETING the
+/// backend term outright, so that pull request's own test could not be ported as
+/// written: it asserted on a `compare_verification_logs(backend, ..)` helper that
+/// main has no equivalent of, and re-creating one to test would have pinned the
+/// new helper rather than the shipped call sites.
+///
+/// ⚠️ THE HAZARD THIS ANSWERS: a removed branch leaves nothing behind to notice
+/// its return. `bitwise_parity_contract_accepts_only_named_canonical_envelopes`
+/// already pins that only a canonical envelope may claim parity, but nothing
+/// pinned WHICH REQUESTS REACH canonical — so re-introducing a backend term in
+/// `verification_strictness` would have restored the original defect silently.
+/// Iterating every `Backend` variant is what makes that impossible: a KVM-shaped
+/// special case fails here by name.
+#[test]
+fn comparator_choice_does_not_depend_on_the_backend() {
+    for (value, backend) in [
+        ("ptrace", Backend::Ptrace),
+        ("dbt", Backend::Dbt),
+        ("liteinst", Backend::Liteinst),
+        ("sabre", Backend::Sabre),
+        ("kvm", Backend::Kvm),
+        ("e9patch", Backend::E9patch),
+    ] {
+        let plain = RunOpts::parse_from(["fakehermit", "--backend", value, "--verify", "fakeprog"]);
+        assert_eq!(plain.selected_backend(), backend);
+        assert_eq!(
+            plain.verification_strictness(),
+            LogCompareStrictness::Stripped,
+            "plain --verify on {value} must stay on the lossy comparator, so it \
+             cannot claim canonical bitwise parity"
+        );
+
+        for flag in ["--verify-strict", "--verify-verbose"] {
+            let canonical = RunOpts::parse_from([
+                "fakehermit",
+                "--backend",
+                value,
+                "--verify",
+                flag,
+                "fakeprog",
+            ]);
+            assert_eq!(
+                canonical.verification_strictness(),
+                LogCompareStrictness::Canonical,
+                "{flag} on {value} must reach the canonical comparator; KVM \
+                 bypassing it unconditionally was the hermit#2217 defect"
+            );
+        }
+    }
+}
+
 #[test]
 fn e9patch_preserves_executable_identity_and_uses_ptrace_runtime() {
     let mut ro = RunOpts::parse_from(["fakehermit", "--backend", "e9patch", "/bin/echo", "hello"]);
@@ -2148,6 +2204,33 @@ impl RunOpts {
             Backend::Ptrace
         } else {
             self.selected_backend()
+        }
+    }
+
+    /// Which comparator a `--verify` run uses, as a function of the request
+    /// ALONE.
+    ///
+    /// DELIBERATELY BACKEND-INDEPENDENT, AND THAT IS THE PROPERTY UNDER GUARD.
+    /// This used to read `let kvm_output_only = self.selected_backend() ==
+    /// Backend::Kvm`, so plain KVM verification bypassed internal-log comparison
+    /// entirely and `--verify-strict` could not reach the canonical comparator on
+    /// that backend at all. The special case was not narrowed, it was removed:
+    /// every backend now retains both logs and picks its comparator here from
+    /// `verify_verbose`/`verify_strict` only.
+    ///
+    /// Removing a branch leaves nothing behind to notice its return, so
+    /// `comparator_choice_does_not_depend_on_the_backend` pins the absence
+    /// across every `Backend` variant. Re-introducing a backend term here is the
+    /// regression it exists to catch.
+    ///
+    /// `--verify-verbose` historically implied a bitwise compare (it flipped
+    /// `strip_lines` off and `FullTrace` on); that is preserved, and
+    /// `--verify-strict` selects the same comparison quietly.
+    fn verification_strictness(&self) -> LogCompareStrictness {
+        if self.verify_verbose || self.verify_strict {
+            LogCompareStrictness::Canonical
+        } else {
+            LogCompareStrictness::Stripped
         }
     }
 
@@ -3359,14 +3442,7 @@ impl RunOpts {
             },
             ComparisonOptions {
                 verbose: self.verify_verbose,
-                // --verify-verbose historically implied a bitwise compare (it
-                // flipped strip_lines off + FullTrace on); preserve that, and let
-                // --verify-strict select the same bitwise comparison quietly.
-                strictness: if self.verify_verbose || self.verify_strict {
-                    LogCompareStrictness::Canonical
-                } else {
-                    LogCompareStrictness::Stripped
-                },
+                strictness: self.verification_strictness(),
                 // Every backend retains both logs, including KVM. Comparing
                 // them here is what makes `compare_io_buffers=true` truthful:
                 // otherwise the content hashes can differ in the retained
@@ -3678,11 +3754,7 @@ impl RunOpts {
         // `log_file` by value. Guaranteed by caller to never panic.
         let log_file = log_file.take().unwrap();
 
-        let strictness = if self.verify_verbose || self.verify_strict {
-            LogCompareStrictness::Canonical
-        } else {
-            LogCompareStrictness::Stripped
-        };
+        let strictness = self.verification_strictness();
         let level = verification_log_level(global.log, strictness, self.verify_verbose);
 
         // Bound this log too. `hermit run --verify` opens its own file and
