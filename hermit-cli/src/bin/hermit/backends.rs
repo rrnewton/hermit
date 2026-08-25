@@ -1734,12 +1734,16 @@ mod tests {
         use reverie_dbt::backend_stats::encode_process_record;
 
         let capture = DbtStatsCapture::new().unwrap();
-        let mut root = DbtProcessRecord::default();
-        root.branches = 400;
-        root.syscalls = 7;
-        let mut child = DbtProcessRecord::default();
-        child.branches = 23;
-        child.syscalls = 2;
+        let root = DbtProcessRecord {
+            branches: 400,
+            syscalls: 7,
+            ..Default::default()
+        };
+        let child = DbtProcessRecord {
+            branches: 23,
+            syscalls: 2,
+            ..Default::default()
+        };
         let bytes = [encode_process_record(&root), encode_process_record(&child)].concat();
         fs::write(&capture.path, bytes).unwrap();
 
