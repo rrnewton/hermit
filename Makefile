@@ -114,14 +114,30 @@ check-skill-discovery: ## Verify Claude and stock Codex discover the same produc
 # current main (0/122 tracked scripts fail at error level) while 24 still carry
 # warning/style findings. Ratchet the severity down (warning -> style) as that
 # debt is retired rather than blocking the target on it today.
-lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, Reverie pin policy, nested lockfiles)
+# SPLIT INTO TWO PREREQUISITES so that CI can schedule the checkers as one node.
+# `make lint` is unchanged for humans. The split exists because a single DAG node
+# running the whole target would re-run `cargo clippy` -- a measured 300s in
+# ci/dag/portable.json's lint.clippy hint -- a second time per validate, and would
+# run it OUTSIDE ci/run-with-reverie-dbt-budget.sh, which that node wraps it in.
+# So lint-cargo holds exactly the two steps that already have byte-identical DAG
+# nodes (lint.rustfmt, lint.clippy) and stays unscheduled here; lint-checks holds
+# everything else and IS scheduled, as the single node check.lint_checks.
+#
+# ADD NEW CHECKERS TO lint-checks, NOT HERE. That is the whole point of the split:
+# a checker added to lint-checks is gated by CI automatically, whereas the previous
+# arrangement required someone to also hand-write a DAG node and six of the ten
+# checkers in this target had no such node (measured 2026-08-25 at a5fef7ff7623).
+lint: lint-checks lint-cargo ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, Reverie pin policy, nested lockfiles)
+
+lint-checks: ## The lint checkers CI schedules as one node (everything in `lint` except the two cargo passes)
 	./scripts/check-skill-discovery.rs
 	./scripts/test-required-check-outcomes.sh
 	./scripts/test-check-status-outcome.sh
 	./scripts/check-merge-gate-policy.sh
 	./scripts/test-configure-merge-gate-ruleset.sh
 	python3 ./scripts/test_pr_status.py
-	$(CARGO) fmt --all -- --check
+	./scripts/run-script-tests.sh
+	./ci/lint-checks-node.sh --self-test
 	@sh_files="$$(git ls-files '*.sh' ':!:third-party/**')"; \
 		if [ -z "$$sh_files" ]; then \
 			echo 'lint: no tracked shell scripts to check'; \
@@ -135,9 +151,12 @@ lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, c
 	./ci/verify-submodules.sh --self-test
 	./ci/verify-submodules.sh
 	python3 scripts/test_validate_stop_paths.py
-	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
 	$(SUBMODULE_PROXY) ./ci/run-reverie-pin-check.sh
 	$(SUBMODULE_PROXY) ./scripts/check-nested-lockfiles.rs
+
+lint-cargo: ## The two compile-heavy lint passes; CI runs these as lint.rustfmt and lint.clippy
+	$(CARGO) fmt --all -- --check
+	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
 
 help: ## Show this help (the list of make targets)
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z0-9_-]+:.*?## / {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
