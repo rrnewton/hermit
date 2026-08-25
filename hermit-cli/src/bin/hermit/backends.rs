@@ -58,6 +58,10 @@ use hermit::ExitStatus;
 use reverie_dbt::DbtEvidenceLogLevel;
 #[cfg(feature = "dbt")]
 use reverie_dbt::DbtRunner;
+#[cfg(feature = "dbt")]
+use reverie_dbt::backend_stats::DbtBackendStatsAggregator;
+#[cfg(feature = "dbt")]
+use reverie_dbt::backend_stats::DbtBackendStatsSnapshot;
 use tracing::metadata::LevelFilter;
 
 #[cfg(feature = "dbt")]
@@ -68,7 +72,13 @@ use super::verify::ComparedRun;
 #[cfg(feature = "dbt")]
 use super::verify::ComparisonOptions;
 #[cfg(feature = "dbt")]
+use super::verify::DbtCountedBranchComparison;
+#[cfg(feature = "dbt")]
 use super::verify::LogCompareStrictness;
+#[cfg(feature = "dbt")]
+use super::verify::Verdict;
+#[cfg(feature = "dbt")]
+use super::verify::VerificationOutcome;
 #[cfg(feature = "dbt")]
 use super::verify::announce_verification_outcome;
 #[cfg(feature = "dbt")]
@@ -95,12 +105,161 @@ struct DbtSummary {
 }
 
 #[cfg(feature = "dbt")]
+const DBT_SUMMARY_PREFIX: &str = "reverie-dbt: tool=Detcore ";
+
+#[cfg(feature = "dbt")]
 impl DbtSummary {
     fn same_observable_behavior(&self, other: &Self) -> bool {
+        // `branches` is deliberately absent here because the counted-branch
+        // clock is checked separately, with its own failure message. It is NOT
+        // excluded because a difference is tolerable: the DynamoRIO client
+        // advances the clock only at counted application branches, making it a
+        // deterministic function of the executed instruction stream.
         self.syscalls == other.syscalls
             && self.rewritten == other.rewritten
             && self.stdin_reads == other.stdin_reads
             && self.memory_hash == other.memory_hash
+    }
+}
+
+/// Describe a counted-branch-clock divergence without conflating it with the
+/// other native summary fields.
+#[cfg(feature = "dbt")]
+fn dbt_branch_clock_mismatch(first: u64, second: u64) -> Option<String> {
+    (first != second).then(|| {
+        format!(
+            "DBT verification failed: counted-branch clocks differed between runs ({first} != {second}); \
+             the clock is a deterministic function of the executed instruction stream"
+        )
+    })
+}
+
+#[cfg(feature = "dbt")]
+fn require_matching_dbt_branch_clocks(first: u64, second: u64) -> Result<(), Error> {
+    match dbt_branch_clock_mismatch(first, second) {
+        Some(message) => Err(Error::msg(message)),
+        None => Ok(()),
+    }
+}
+
+/// Add a backend-observed divergence to the typed verification verdict.
+///
+/// The canonical comparator may have matched its stdout, stderr, status, and
+/// INFO records, or it may have refused a truncated log. Neither can erase a
+/// separately observed difference in the deterministic counted-branch clock.
+/// Mutating the typed outcome before it is serialized ensures `--verify-json`
+/// says `diverged` with `verified=false` and `bitwise_parity=false`, rather than
+/// leaving a false match or the invocation's pending `no_result` record.
+#[cfg(feature = "dbt")]
+fn record_dbt_branch_clock_comparison(
+    outcome: &mut VerificationOutcome,
+    comparison: DbtCountedBranchComparison,
+) -> Option<String> {
+    match dbt_branch_clock_mismatch(comparison.left, comparison.right) {
+        Some(message) => {
+            outcome.dbt_counted_branches = Some(comparison);
+            outcome.verdict = Verdict::Diverged;
+            Some(message)
+        }
+        None if outcome.verdict == Verdict::NoResult => {
+            // Equal clocks do not turn a refused common comparison into a
+            // verdict. Keep the backend field absent so `no_result` does not
+            // claim that this one successful dimension authorized anything.
+            outcome.dbt_counted_branches = None;
+            None
+        }
+        None => {
+            outcome.dbt_counted_branches = Some(comparison);
+            None
+        }
+    }
+}
+
+/// Attach the DBT-specific comparison and publish the terminal typed verdict.
+///
+/// Returning the human-readable failure only after the JSON write preserves the
+/// report-first ordering: once a terminal branch-clock failure is announced,
+/// the artifact already names the same divergence and both compared values.
+#[cfg(feature = "dbt")]
+fn finalize_dbt_verification(
+    mut outcome: VerificationOutcome,
+    comparison: DbtCountedBranchComparison,
+    verify_json: Option<&Path>,
+) -> Result<(VerificationOutcome, Option<String>), Error> {
+    let failure = record_dbt_branch_clock_comparison(&mut outcome, comparison);
+    if let Some(path) = verify_json {
+        write_verification_json(path, &outcome)?;
+    }
+    Ok((outcome, failure))
+}
+
+/// Own the typed statistics stream for one complete DBT process tree.
+///
+/// Reverie's client writes one fixed-size record per process image at exit.
+/// The protected-evidence runner does not expose its convenience stats method,
+/// so this adapter uses the same public typed wire decoder and waits until the
+/// runner has reaped the whole isolated process group before reading it.
+#[cfg(feature = "dbt")]
+struct DbtStatsCapture {
+    _directory: tempfile::TempDir,
+    path: PathBuf,
+}
+
+#[cfg(feature = "dbt")]
+impl DbtStatsCapture {
+    fn new() -> Result<Self, Error> {
+        let directory = tempfile::Builder::new()
+            .prefix("hermit-dbt-verify-stats-")
+            .tempdir()
+            .map_err(|error| {
+                Error::msg(format!(
+                    "failed to create DBT whole-process statistics sink: {error}"
+                ))
+            })?;
+        let path = directory.path().join("records.bin");
+        Ok(Self {
+            _directory: directory,
+            path,
+        })
+    }
+
+    fn configure(&self, runner: DbtRunner) -> DbtRunner {
+        runner
+            .client_argument("-stats_path")
+            .client_argument(self.path.clone().into_os_string())
+    }
+
+    fn finish(self) -> Result<DbtBackendStatsSnapshot, Error> {
+        let bytes = match fs::read(&self.path) {
+            Ok(bytes) if !bytes.is_empty() => bytes,
+            Ok(_) => {
+                return Err(Error::msg(
+                    "DBT verification did not reach a verdict: typed whole-process statistics were empty",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::msg(
+                    "DBT verification did not reach a verdict: typed whole-process statistics were missing",
+                ));
+            }
+            Err(error) => {
+                return Err(Error::msg(format!(
+                    "DBT verification did not reach a verdict: failed to read typed whole-process statistics: {error}"
+                )));
+            }
+        };
+        let mut aggregator = DbtBackendStatsAggregator::new();
+        let records = aggregator.absorb_wire_stream(&bytes).map_err(|error| {
+            Error::msg(format!(
+                "DBT verification did not reach a verdict: typed whole-process statistics were unreadable: {error}"
+            ))
+        })?;
+        if records == 0 {
+            return Err(Error::msg(
+                "DBT verification did not reach a verdict: typed whole-process statistics contained no process records",
+            ));
+        }
+        Ok(aggregator.snapshot())
     }
 }
 
@@ -577,11 +736,11 @@ fn run_dbt_legacy_verify(
             "DBT verification failed: native Detcore summaries differed ({first_summary:?} != {second_summary:?})"
         )));
     }
-    if first_summary.branches != second_summary.branches {
-        eprintln!(
-            ":: DBT diagnostic branch counts differed at the last syscall: {} | {}",
-            first_summary.branches, second_summary.branches
-        );
+    if let Err(error) =
+        require_matching_dbt_branch_clocks(first_summary.branches, second_summary.branches)
+    {
+        write_output(&first)?;
+        return Err(error);
     }
 
     write_output(&first)?;
@@ -739,8 +898,9 @@ pub(super) fn run_dbt(
     let (log2_file, log2_path) = log2.into_parts();
     let evidence_level = dbt_evidence_log_level(log, verify_verbose);
     let mut evidence1 = tempfile::tempfile()?;
-    let runner1 = runner
-        .clone()
+    let stats1 = DbtStatsCapture::new()?;
+    let runner1 = stats1
+        .configure(runner.clone())
         .evidence_file(&evidence1)
         .map_err(|error| {
             Error::msg(format!(
@@ -749,7 +909,9 @@ pub(super) fn run_dbt(
         })?
         .evidence_log_level(evidence_level);
     let mut evidence2 = tempfile::tempfile()?;
-    let runner2 = runner
+    let stats2 = DbtStatsCapture::new()?;
+    let runner2 = stats2
+        .configure(runner)
         .evidence_file(&evidence2)
         .map_err(|error| {
             Error::msg(format!(
@@ -804,8 +966,8 @@ pub(super) fn run_dbt(
     if print_verify_logs {
         std::io::stderr().write_all(&fs::read(&log1_path)?)?;
     }
-    let first = dbt_verification_output(first_raw);
-    if !verify_allow.satisfies(first.status) {
+    if !verify_allow.satisfies(process_status(first_raw.status)) {
+        let first = dbt_verification_output(first_raw);
         eprintln!(
             "First run errored during --verify, not continuing to a second. Stdout:\n{}\nStderr:\n{}",
             String::from_utf8_lossy(&first.stdout),
@@ -816,6 +978,16 @@ pub(super) fn run_dbt(
         }
         return Err(Error::msg("First run during --verify exited in error"));
     }
+    let first_stats = match stats1.finish() {
+        Ok(stats) => stats,
+        Err(error) => {
+            if keep_logs {
+                retain_verification_logs([("run 1", log1_path)])?;
+            }
+            return Err(error);
+        }
+    };
+    let first = dbt_verification_output(first_raw);
 
     replay.seek(SeekFrom::Start(0))?;
     eprintln!(":: DBT Run2...");
@@ -843,8 +1015,22 @@ pub(super) fn run_dbt(
         }
         return Err(error);
     }
+    let second_stats = match stats2.finish() {
+        Ok(stats) => stats,
+        Err(error) => {
+            if keep_logs {
+                retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
+            }
+            return Err(error);
+        }
+    };
     let second = dbt_verification_output(second_raw);
 
+    let branch_clock_comparison = DbtCountedBranchComparison {
+        left: first_stats.counted_branches(),
+        right: second_stats.counted_branches(),
+    };
+    let branch_clock_diverged = !branch_clock_comparison.matched();
     let outcome = compare_two_runs(
         ComparedRun {
             output: &first,
@@ -860,7 +1046,9 @@ pub(super) fn run_dbt(
             compare_logs: true,
             diagnostic_full_trace: verify_verbose,
             compare_io_buffers: config.detlog_io_buffers,
-            keep_logs,
+            // A backend-observed divergence needs the same retained evidence
+            // as a divergence found by the ordinary comparator.
+            keep_logs: keep_logs || branch_clock_diverged,
             // Every decoded evidence record is compared, which is what this
             // adapter already did before the envelope was disclosed. Naming it
             // changes no record selection; it states the selection in the
@@ -882,8 +1070,13 @@ pub(super) fn run_dbt(
             record_envelope: RecordEnvelope::all_records_v1(),
         },
     )?;
-    if let Some(path) = verify_json {
-        write_verification_json(path, &outcome)?;
+    let (outcome, branch_clock_failure) =
+        finalize_dbt_verification(outcome, branch_clock_comparison, verify_json)?;
+    // Publish the typed record before announcing any terminal verdict. If the
+    // process is killed after this line, a reader still sees this invocation's
+    // divergence rather than the pending `no_result` stamp.
+    if let Some(message) = branch_clock_failure {
+        eprintln!(":: {message}");
     }
     let success_message = if config.detlog_io_buffers {
         "Success: deterministic. Determinism verified."
@@ -1057,7 +1250,7 @@ fn detcore_summary(output: &Output) -> Result<DbtSummary, Error> {
     let summary = stderr
         .lines()
         .rev()
-        .find(|line| line.starts_with("reverie-dbt: tool=Detcore "))
+        .find(|line| line.starts_with(DBT_SUMMARY_PREFIX))
         .ok_or_else(|| {
             Error::msg(
                 "DBT verification failed: native DynamoRIO summary did not report tool=Detcore",
@@ -1285,10 +1478,321 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "dbt")]
+    fn typed_outcome(verdict: Verdict, guest_exit: i32) -> VerificationOutcome {
+        use super::super::verify::ComparedLogCounts;
+        use super::super::verify::ComparisonSpec;
+
+        VerificationOutcome {
+            verdict,
+            guest_status: ExitStatus::Exited(guest_exit),
+            comparison: ComparisonSpec::new(
+                LogCompareStrictness::Canonical,
+                true,
+                false,
+                true,
+                RecordEnvelope::all_records_v1().policy(),
+            ),
+            compared_log_messages: Some(ComparedLogCounts { left: 4, right: 4 }),
+            dbt_counted_branches: None,
+            first_divergent_scheduler_turn: None,
+            first_divergent_virtual_nanoseconds: None,
+            first_divergent_record: None,
+            first_divergent_syscall: None,
+        }
+    }
+
     #[test]
     #[cfg(feature = "dbt")]
-    fn dbt_summary_treats_last_syscall_branch_count_as_telemetry() {
-        assert!(dbt_summary(563_145).same_observable_behavior(&dbt_summary(563_103)));
+    fn dbt_summary_keeps_branch_clock_out_of_the_other_summary_fields() {
+        let first = dbt_summary(563_145);
+        let different_clock = dbt_summary(563_103);
+
+        assert!(first.same_observable_behavior(&different_clock));
+        let message = dbt_branch_clock_mismatch(first.branches, different_clock.branches).unwrap();
+        assert!(
+            message.contains("counted-branch clocks differed"),
+            "{message}"
+        );
+        assert!(message.contains("563145 != 563103"), "{message}");
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn legacy_branch_clock_mismatch_is_a_hard_failure() {
+        let error = require_matching_dbt_branch_clocks(563_145, 563_103).unwrap_err();
+        let rendered = error.to_string();
+
+        assert!(
+            rendered.contains("counted-branch clocks differed"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Success"), "{rendered}");
+        assert!(require_matching_dbt_branch_clocks(563_145, 563_145).is_ok());
+    }
+
+    /// Pin the production control flow without launching DynamoRIO. This uses
+    /// the same source-order contract style as the CLI dispatch and report-first
+    /// tests: every slice ends before the test module, so its own needles cannot
+    /// satisfy the assertions.
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dbt_verification_run_path_binds_terminal_verdict_to_branch_stats() {
+        let source = include_str!("backends.rs");
+        let legacy = source
+            .split_once("fn run_dbt_legacy_verify(")
+            .expect("legacy DBT verifier")
+            .1
+            .split_once("/// Runs `program` through DynamoRIO")
+            .expect("end of legacy DBT verifier")
+            .0;
+        let legacy_guard = legacy
+            .find("require_matching_dbt_branch_clocks(")
+            .expect("legacy counted-branch guard");
+        let legacy_success = legacy
+            .find(":: Success: deterministic. Determinism verified.")
+            .expect("legacy success announcement");
+        assert!(
+            legacy_guard < legacy_success,
+            "legacy verification must reject a branch-clock mismatch before announcing success"
+        );
+
+        let finalizer = source
+            .split_once("fn finalize_dbt_verification(")
+            .expect("typed DBT finalizer")
+            .1
+            .split_once("/// Own the typed statistics stream")
+            .expect("end of typed DBT finalizer")
+            .0;
+        let attach = finalizer
+            .find("record_dbt_branch_clock_comparison(")
+            .expect("attach branch-clock comparison");
+        let publish = finalizer
+            .find("write_verification_json(path, &outcome)")
+            .expect("publish terminal typed verdict");
+        let return_outcome = finalizer
+            .find("Ok((outcome, failure))")
+            .expect("return finalized outcome");
+        assert!(
+            attach < publish && publish < return_outcome,
+            "the finalizer must attach the branch comparison and publish JSON before returning it"
+        );
+
+        let canonical = source
+            .split_once(
+                r#"#[cfg(feature = "dbt")]
+pub(super) fn run_dbt("#,
+            )
+            .expect("canonical DBT run path")
+            .1
+            .split_once(r#"#[cfg(not(feature = "dbt"))]"#)
+            .expect("end of canonical DBT run path")
+            .0;
+        let first_stats = canonical
+            .find("let first_stats = match stats1.finish()")
+            .expect("run-1 typed stats");
+        let second_stats = canonical
+            .find("let second_stats = match stats2.finish()")
+            .expect("run-2 typed stats");
+        let comparison = canonical
+            .find("let branch_clock_comparison = DbtCountedBranchComparison")
+            .expect("typed branch-clock comparison");
+        let force_logs = canonical
+            .find("keep_logs: keep_logs || branch_clock_diverged")
+            .expect("branch divergence forces log retention");
+        let finalize = canonical
+            .find("finalize_dbt_verification(outcome, branch_clock_comparison, verify_json)")
+            .expect("terminal typed finalization");
+        let announce = canonical
+            .find("if let Some(message) = branch_clock_failure")
+            .expect("branch-specific terminal announcement");
+        let exit = canonical
+            .find("return outcome.into_exit_status()")
+            .expect("terminal nonzero conversion");
+        assert!(
+            first_stats < second_stats
+                && second_stats < comparison
+                && comparison < force_logs
+                && force_logs < finalize
+                && finalize < announce
+                && announce < exit,
+            "canonical verification must collect both stats, compute the comparison, force logs, \
+             publish through the finalizer, and only then announce or convert the terminal status"
+        );
+
+        for (stats, next) in [
+            (
+                "let first_stats = match stats1.finish()",
+                "let first = dbt_verification_output",
+            ),
+            (
+                "let second_stats = match stats2.finish()",
+                "let second = dbt_verification_output",
+            ),
+        ] {
+            let failure_arm = canonical
+                .split_once(stats)
+                .expect("typed stats collection")
+                .1
+                .split_once(next)
+                .expect("end of typed stats failure arm")
+                .0;
+            assert!(failure_arm.contains("Err(error) =>"));
+            assert!(
+                failure_arm.contains("return Err(error);"),
+                "unreadable typed stats must return while the pre-stamped no_result is still current"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn equal_branch_clocks_do_not_authorize_a_no_result() {
+        let outcome = typed_outcome(Verdict::NoResult, 23);
+        let comparison = DbtCountedBranchComparison {
+            left: 563_145,
+            right: 563_145,
+        };
+        let verdict_file = tempfile::NamedTempFile::new().unwrap();
+
+        let (outcome, failure) =
+            finalize_dbt_verification(outcome, comparison, Some(verdict_file.path())).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&fs::read(verdict_file.path()).unwrap()).unwrap();
+
+        assert!(failure.is_none());
+        assert_eq!(outcome.verdict, Verdict::NoResult);
+        assert!(outcome.dbt_counted_branches.is_none());
+        assert_eq!(json["verdict"], "no_result");
+        assert_eq!(json["verified"], false);
+        assert!(json.get("dbt_counted_branches").is_none());
+        let error = outcome.into_exit_status().unwrap_err().to_string();
+        assert!(error.contains("did not reach a verdict"), "{error}");
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn branch_clock_divergence_is_retained_in_the_serialized_typed_verdict() {
+        use super::super::verify::ComparedLogCounts;
+
+        for initial_verdict in [Verdict::Matched, Verdict::NoResult] {
+            let outcome = typed_outcome(initial_verdict, 0);
+            let comparison = DbtCountedBranchComparison {
+                left: 563_145,
+                right: 563_103,
+            };
+            let verdict_file = tempfile::NamedTempFile::new().unwrap();
+            let (outcome, message) =
+                finalize_dbt_verification(outcome, comparison, Some(verdict_file.path())).unwrap();
+            let message = message.unwrap();
+            let json: serde_json::Value =
+                serde_json::from_slice(&fs::read(verdict_file.path()).unwrap()).unwrap();
+
+            assert!(message.contains("563145 != 563103"), "{message}");
+            assert_eq!(outcome.verdict, Verdict::Diverged);
+            assert_eq!(outcome.dbt_counted_branches, Some(comparison));
+            assert_eq!(json["verdict"], "diverged");
+            assert_eq!(json["verified"], false);
+            assert_eq!(json["bitwise_parity"], false);
+            assert_eq!(json["dbt_counted_branches"]["left"], 563_145);
+            assert_eq!(json["dbt_counted_branches"]["right"], 563_103);
+            assert_eq!(
+                outcome.compared_log_messages,
+                Some(ComparedLogCounts { left: 4, right: 4 })
+            );
+            let error = outcome.into_exit_status().unwrap_err().to_string();
+            assert!(error.contains("counted-branch clocks differed"), "{error}");
+            assert!(!error.contains("outputs"), "{error}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn equal_branch_clocks_preserve_match_and_nonzero_guest_status() {
+        let outcome = typed_outcome(Verdict::Matched, 23);
+        let comparison = DbtCountedBranchComparison {
+            left: 563_145,
+            right: 563_145,
+        };
+
+        let (outcome, failure) = finalize_dbt_verification(outcome, comparison, None).unwrap();
+        assert!(failure.is_none());
+        let report = super::super::verify::VerificationReport::from(&outcome);
+
+        assert_eq!(outcome.verdict, Verdict::Matched);
+        assert_eq!(report.dbt_counted_branches, Some(comparison));
+        assert!(report.verified);
+        assert!(report.bitwise_parity);
+        assert_eq!(outcome.into_exit_status().unwrap(), ExitStatus::Exited(23));
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn typed_stats_capture_aggregates_the_whole_process_tree() {
+        use reverie_dbt::backend_stats::DbtProcessRecord;
+        use reverie_dbt::backend_stats::encode_process_record;
+
+        let capture = DbtStatsCapture::new().unwrap();
+        let mut root = DbtProcessRecord::default();
+        root.branches = 400;
+        root.syscalls = 7;
+        let mut child = DbtProcessRecord::default();
+        child.branches = 23;
+        child.syscalls = 2;
+        let bytes = [encode_process_record(&root), encode_process_record(&child)].concat();
+        fs::write(&capture.path, bytes).unwrap();
+
+        let snapshot = capture.finish().unwrap();
+
+        assert_eq!(snapshot.process_images(), 2);
+        assert_eq!(snapshot.counted_branches(), 423);
+        assert_eq!(snapshot.intercepted_syscalls(), 9);
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn typed_stats_capture_refuses_missing_empty_or_truncated_evidence() {
+        let missing = DbtStatsCapture::new().unwrap();
+        let error = missing.finish().unwrap_err();
+        assert!(
+            error.to_string().contains("statistics were missing"),
+            "{error}"
+        );
+
+        let empty = DbtStatsCapture::new().unwrap();
+        fs::write(&empty.path, b"").unwrap();
+        let error = empty.finish().unwrap_err();
+        assert!(
+            error.to_string().contains("statistics were empty"),
+            "{error}"
+        );
+
+        let truncated = DbtStatsCapture::new().unwrap();
+        fs::write(&truncated.path, b"truncated").unwrap();
+        let error = truncated.finish().unwrap_err();
+        assert!(
+            error.to_string().contains("statistics were unreadable"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("truncated"), "{error}");
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn typed_stats_failure_leaves_the_pre_stamped_no_result() {
+        let verdict_file = tempfile::NamedTempFile::new().unwrap();
+        write_pending_verification_json(verdict_file.path()).unwrap();
+
+        let empty = DbtStatsCapture::new().unwrap();
+        fs::write(&empty.path, b"").unwrap();
+        assert!(empty.finish().is_err());
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&fs::read(verdict_file.path()).unwrap()).unwrap();
+        assert_eq!(json["verdict"], "no_result");
+        assert_eq!(json["verified"], false);
+        assert_eq!(json["bitwise_parity"], false);
+        assert!(json.get("dbt_counted_branches").is_none());
     }
 
     #[test]
