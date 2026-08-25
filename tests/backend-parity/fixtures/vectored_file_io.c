@@ -57,6 +57,7 @@ int main(void) {
   if (unlink(template) != 0)
     fail("unlink");
 
+  enum { EXPECTED_CHECKS = 6 };
   int ok = 0;
 
   /* writev gathers the three iovecs contiguously into the file. */
@@ -111,5 +112,14 @@ int main(void) {
 
   printf("vectored_file_io size=%ld checksum=%ld ok=%d\n", (long)st.st_size,
          checksum, ok);
+  /* Route a behavioural failure into the exit status. Without this the guest
+     exits 0 whatever `ok` reached, so a regression only lowered the printed
+     number -- and under --verify both runs lower it identically, so the
+     comparison still matches and the cell stays green. Every check above is
+     unchanged; this only requires all of them. */
+  if (ok != EXPECTED_CHECKS) {
+  	fprintf(stderr, "vectored_file_io completed %d of %d checks\n", ok, EXPECTED_CHECKS);
+  	return 1;
+  }
   return 0;
 }

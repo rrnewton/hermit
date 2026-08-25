@@ -111,6 +111,7 @@ int main(void) {
   int rd = fds[0];
   int wr = fds[1];
 
+  enum { EXPECTED_CHECKS = 8 };
   int ok = 0;
 
   /* Buffer some data so the read end becomes readable. */
@@ -155,5 +156,14 @@ int main(void) {
     fail("close rd");
 
   printf("poll_readiness ok=%d\n", ok);
+  /* Route a behavioural failure into the exit status. Without this the guest
+     exits 0 whatever `ok` reached, so a regression only lowered the printed
+     number -- and under --verify both runs lower it identically, so the
+     comparison still matches and the cell stays green. Every check above is
+     unchanged; this only requires all of them. */
+  if (ok != EXPECTED_CHECKS) {
+  	fprintf(stderr, "poll completed %d of %d checks\n", ok, EXPECTED_CHECKS);
+  	return 1;
+  }
   return 0;
 }
