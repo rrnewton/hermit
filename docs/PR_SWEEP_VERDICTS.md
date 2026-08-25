@@ -1414,13 +1414,44 @@ land on no information at all.
 | hermit#2587 | `UNKNOWN/UNKNOWN` at t+0s, `MERGEABLE/CLEAN` by t+20s |
 | hermit#2588 | `UNKNOWN/UNKNOWN` at t+0, +20, +40, +60, +85, +110, +135s |
 
-⚠️ **And then hermit#2588 MERGED — at 17:41:08Z, merge commit `7ee6853ede0d` —
-while `mergeable` still read `UNKNOWN`, which it still reads on the merged pull
-request.** So the field is not merely slow. It can stay `UNKNOWN` through a
-successful merge and afterwards. A lander that waits for `MERGEABLE` before
-acting would have waited forever on a head that merged cleanly; a lander that
-read `UNKNOWN` as `CONFLICTING` would have reported a conflict that did not
-exist.
+⚠️ **CORRECTED 2026-08-25, and the original error is instructive enough to keep
+in view.** This section first said that hermit#2588 "merged while `mergeable`
+still read `UNKNOWN`, which it still reads on the merged pull request", and
+concluded the field can persist as `UNKNOWN` *through* a successful merge. **That
+inference does not follow, and the disconfirming test was one command away.**
+
+```console
+gh pr list --state merged --limit 10 --json number   # then read .mergeable
+  #2595 #2592 #2591 #2590 #2588 #2587 #2586 #2585 #2584 #2583
+    -> 10 of 10 read UNKNOWN
+gh pr list --state open   --limit 8  --json number
+  #2599 #2598 #2597 #2596 #2594 #2593 #2589 #2578
+    ->  8 of 8 read MERGEABLE
+```
+
+**GitHub stops computing mergeability once a pull request closes**, so *every*
+merged PR reads `UNKNOWN`. The post-merge reading therefore carries no
+information about what the field said before the merge, and #2588's lander in
+fact polled `MERGEABLE CLEAN` immediately before merging it. The author read an
+accurate observation as support for an inference it could not support — which is
+[check 12](#the-checks-in-order)'s shape, committed inside a section about
+verifying claims.
+
+The honest and still-useful statement is narrower: **the field is not populated
+on a merged pull request, so it cannot be used as after-the-fact evidence of what
+was true at merge time.** If you need to know whether a head was mergeable before
+it landed, that answer no longer exists in the API — capture it while the pull
+request is open, or reconstruct it locally from the recorded shas.
+
+⚠️ **It also goes backwards on an OPEN pull request.** hermit#2587 read
+`MERGEABLE/CLEAN` and then `UNKNOWN/UNKNOWN` again minutes later while still open
+(`state=OPEN mergedAt=null`, checked immediately before the second read — so this
+is not the closed-PR effect above). Main had advanced to `1417d7ce` in between;
+that is the plausible cause but was not isolated, so treat the *observation* as
+measured and the *explanation* as inference. Either way a good reading is not
+durable: on a repository where main churns roughly one commit every two and a
+half minutes, a `MERGEABLE` fetched a minute ago describes a base that may no
+longer exist.
 
 Do not poll it unboundedly and do not infer from it. When it matters, **answer
 the question locally instead** — this needs no API and works from a
@@ -1443,6 +1474,10 @@ That computes the same thing GitHub is computing, from objects you already have,
 with an exit status you can read directly. `mergeable` is then a convenience to
 be believed when it says `MERGEABLE` or `CONFLICTING`, and ignored when it does
 not.
+
+The local check does not have either problem. Run at the same moment GitHub
+reported `UNKNOWN` for hermit#2587, against the same two refs, it returned
+MERGES-CLEAN — definitively, in one command. Cross-checked exactly that way.
 
 ⚠️ **THREE DETAILS OF THAT RECIPE ARE LOAD-BEARING, AND THE OBVIOUS SHORTER FORM
 LIES IN BOTH DIRECTIONS.** This section landed first with
