@@ -386,17 +386,47 @@ fn main() {
     // against the guest's fresh /tmp and silently discards the log.
     if let Err(err) = global.open_log_file() {
         display_error(err);
-        ExitStatus::Exited(1).raise_or_exit();
+        ExitStatus::Exited(HERMIT_INTERNAL_FAILURE_EXIT).raise_or_exit();
     }
 
     command
         .main(&global)
         .unwrap_or_else(|err| {
             display_error(err);
-            ExitStatus::Exited(1)
+            ExitStatus::Exited(HERMIT_INTERNAL_FAILURE_EXIT)
         })
         .raise_or_exit();
 }
+
+/// Exit status for a failure of HERMIT ITSELF, as distinct from the guest's.
+///
+/// ⚠️ EVERY CLI ERROR USED TO BE `Exited(1)`, WHICH IS THE SINGLE MOST COMMON
+/// GUEST FAILURE CODE. A tracer panic and a guest that exited 1 of its own
+/// accord were therefore INDISTINGUISHABLE from `$?` alone — and every harness,
+/// gate and script on this project decides pass/fail from exactly that value.
+/// The information was not missing, only discarded: reverie's container reports
+/// the child's real status as a typed `ExitStatus`, and hermit collapsed it to
+/// prose and then to `1`.
+///
+/// WHY THIS DOES NOT BREAK THE "hermit's exit IS the guest's exit" CONTRACT.
+/// That contract describes the case where the guest RAN AND EXITED, and it is
+/// untouched: a guest status still flows through `raise_or_exit` unchanged, and
+/// only the `Err` arm — where there is NO guest exit code, because hermit failed
+/// before or instead of producing one — uses this value. The contract did not
+/// cover that case; it does now.
+///
+/// WHY 125. It is the established convention for "the wrapper tool itself
+/// failed" — GNU `env`, `chroot` and `timeout` all reserve 125 for exactly this,
+/// leaving 126/127 for exec-level problems. It is not a value hermit emits
+/// anywhere else.
+///
+/// ⚠️ THIS REDUCES A COLLISION, IT DOES NOT REMOVE ONE. A guest is free to exit
+/// 125 deliberately, and every value in 0..=255 is a legal guest status, so no
+/// code can be reserved outright. What it removes is the GUARANTEED collision
+/// with the most common failure code. For an unambiguous signal, read the
+/// `HERMIT_TASK_PANIC` marker on stderr or the verification JSON; this makes the
+/// cheap check — `$?` — stop actively lying.
+const HERMIT_INTERNAL_FAILURE_EXIT: i32 = 125;
 
 fn display_error(error: Error) {
     let mut chain = error.chain();

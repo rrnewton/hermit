@@ -3366,3 +3366,63 @@ fn hermit_dap_rejects_replay_options_without_replay() {
         String::from_utf8_lossy(&output.stderr),
     );
 }
+
+/// A tracer panic and a guest that exited 1 must be distinguishable from `$?`
+/// ALONE, with no stderr parsing.
+///
+/// ⚠️ THIS IS THE WHOLE POINT AND IT IS EASY TO SATISFY BY ACCIDENT. Asserting
+/// only that the panic arm is 125 would still pass if hermit returned 125 for
+/// everything, so both arms are asserted together and the test is named for the
+/// DIFFERENCE rather than for either value.
+///
+/// Measured before the fix: both arms returned 1, with the `HERMIT_TASK_PANIC`
+/// marker present on stderr in the panic arm. The information existed and only
+/// `$?` could not carry it -- every harness and gate on this project decides
+/// pass/fail from exactly that value.
+///
+/// The panic is induced with reverie's own fault injector rather than a mock, so
+/// this exercises the real task-boundary path: the guest thread panics, reverie
+/// emits the marker and exits 101 inside the sandbox container, and hermit's CLI
+/// error arm is what turns that into a status.
+#[test]
+fn tracer_panic_and_guest_failure_have_different_exit_codes() {
+    let _guard = hermit_run_guard();
+
+    // A guest with enough retired conditional branches to reach the timer path;
+    // a trivial guest exits before the injected zero skid margin can bite.
+    let busy = "awk 'BEGIN{s=0;for(i=0;i<300000;i++)s+=i;print s}'";
+    let panicked = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["run", "--", "/bin/sh", "-c", busy])
+        .env("REVERIE_SKID_MARGIN_OVERRIDE", "0")
+        .output()
+        .expect("failed to run hermit under the skid injector");
+
+    let stderr = String::from_utf8_lossy(&panicked.stderr);
+    // If the injector stopped inducing a panic this test would silently become a
+    // comparison of two ordinary runs, so require the panic actually happened.
+    assert!(
+        stderr.contains("HERMIT_TASK_PANIC") || stderr.contains("panicked at"),
+        "the skid injector did not induce a tracer panic; this test is measuring nothing:\n{stderr}"
+    );
+
+    let guest_failed = hermit(&["run", "--", "/bin/sh", "-c", "exit 1"]);
+
+    let panic_code = panicked.status.code();
+    let guest_code = guest_failed.status.code();
+    assert_ne!(
+        panic_code, guest_code,
+        "a tracer panic and a guest exiting 1 are indistinguishable from $? alone \
+         (both {panic_code:?}); every gate reading the exit code cannot tell a crash \
+         from a failure"
+    );
+    assert_eq!(
+        guest_code,
+        Some(1),
+        "the guest's own exit status must pass through unchanged"
+    );
+    assert_eq!(
+        panic_code,
+        Some(125),
+        "hermit-internal failure should use the reserved wrapper code"
+    );
+}
