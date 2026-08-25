@@ -5,15 +5,26 @@ hermit `8bc26dba1d`; population, landing states, the scheduling finding and the
 verify-cannot-defend-a-control finding re-measured 2026-08-25 after #2396 and
 #2444 landed.
 
-Part 2 answers the three moves named on 2026-08-25 — min/max divergence
-tracking, moving records to the dev-hermit parent, and splitting validate from
-pressure-test output. See "The three moves, and where each is answered".
+Part 2 answers the moves named on 2026-08-25 — min/max divergence tracking,
+moving records to the dev-hermit parent, splitting validate from pressure-test
+output, giving the pressure test its OWN table, modelling the methodology as a
+DISTRIBUTION rather than a bound, making `hermit-repeat` say when every run
+errored, making empty readable from the row, and answering the open question of
+how validate can write divergence data when it only runs green cells. Start at
+"The three moves, and where each is answered", then the sections that follow it.
 
 Part 1 states the architecture as it actually is, measured rather than recalled,
 because an earlier description of it was wrong in a way that changed what kind
 of problem this is. Part 2 is the redesign proposal. Nothing in Part 2 is
 implemented; it is written so the owner can rule on a design rather than on a
 recollection.
+
+---
+
+**Reporting convention, per the owner's standing rule:** every result in this
+document names the cell it measured, as **test id by backend by mode**. A
+divergence figure quoted without its cell is not a result, because the reader
+cannot tell what it is a property of.
 
 ---
 
@@ -48,8 +59,8 @@ this is.
   (`validate.rs:3012`) — a verification path. The compat-envelope README states
   the same intent: "Normal validation changes no tracked scorecard file."
 
-So this is **not** two tools racing on a file. It is **one tool, two commands,
-two input sources, two different authorities** — which means the boundary is
+So this is **not** two tools racing on a file. It is **one tool, three commands,
+three input sources, three different authorities** — which means the boundary is
 enforceable in one place rather than being an architectural property that has to
 be negotiated between programs. That is a much cheaper problem than it looks.
 
@@ -131,7 +142,8 @@ its consequence named, rather than an accident of where each tool was written.
   larger, which strengthens rather than softens the point.
 - **`ObservedRange` is populated on 2 of 5584 cells**, and the precise version is
   worse than the round number: only **one** of those two carries an actual
-  divergence range (`data-handling/sqlite-query-determinism verify sabre`:
+  divergence range — `data-handling/sqlite-query-determinism` by `sabre` in
+  `verify` mode:
   record 93–94, scheduler turn 68–69, virtual nanoseconds …317250–…354000,
   `samples: 2`). The other is a `pass` with all four coordinates null.
   Re-measured on `main` after
@@ -246,6 +258,8 @@ adds `workdir: /tmp` to `applications/git-repository-workflow`, a control whose
 only job is to stop the guest observing a mutable host directory. Measured A/B,
 same box, back to back:
 
+Cell: `applications/git-repository-workflow` by `ptrace` in `verify` mode.
+
 ```
 control, no workdir :  8 PASS / 2 FAIL of 10
 with workdir:/tmp   : 10 PASS / 0 FAIL of 10
@@ -254,7 +268,9 @@ with workdir:/tmp   : 10 PASS / 0 FAIL of 10
 **Without the control the cell still passed 80% of the time.** A verify cell
 sampled a handful of times would have called that green and defended nothing.
 What actually proved the control was the mechanism, not the verdict:
-`newfstatat` calls on `/home/newton` went 24 → 0 across ten runs.
+for that same cell -- `applications/git-repository-workflow` by `ptrace` in
+`verify` mode -- `newfstatat` calls on `/home/newton` went 24 → 0 across ten runs
+per arm.
 
 **Where this bites the pressure test.** Its measurement is a pass/fail count
 across repetitions plus a divergence position, and `Observation` records
@@ -267,7 +283,7 @@ sample**. It records what the harness did, not what the host did. So an
 - this cell depends on external state that happened to be quiet while we sampled.
 
 Both are written identically. The live corpus already contains an example of the
-ambiguous form: `applications/example-timed-progress-bar verify/ptrace` carries
+ambiguous form: `applications/example-timed-progress-bar` by `ptrace` in `verify` mode carries
 `results: ['pass']` from a single sample with all four coordinates null. That row
 says "it passed once". It does not say "it is stable", and nothing in the schema
 marks the difference.
@@ -341,6 +357,147 @@ runs it once per commit to supply the regression signal.
 
 What is missing is only that the boundary is unenforced — nothing stops a future
 edit to `update` from touching `observations`. That is Phase 1, and it is small.
+
+## THE QUESTION THAT INVALIDATES PART OF THIS DESIGN
+
+> *"if validate is only active for green cells, how does it write the divergence
+> point data?"*
+
+**It cannot, and the number is absolute.** Measured on `main`
+`a841fb2440`:
+
+| | count |
+|---|---|
+| cells named in `ci/expected-e2e-plan.json` | 281 |
+| of those, green | **281** |
+| of those, red | **0** |
+| red cells NOT in the plan | **5,303** |
+
+The expected plan **is** the green set, exactly — not approximately. Validate
+runs the plan. So the only rows `observe-results` can ever write are:
+
+1. **`pass` rows with all four coordinates null** — a green cell passing has no
+   divergence to record, so the row carries no divergence information at all; and
+2. **a regression** — a green cell going red, which is rare by construction and
+   which fails validate.
+
+**Validate can therefore never supply the routine divergence distribution for
+the 5,303 red cells, which are precisely the cells the data is wanted for.**
+This is structural, not a scheduling gap: even if a trigger existed and fired
+every commit, `provenance: validate` would accumulate 281 null-coordinate pass
+rows per run and nothing else.
+
+Two consequences the plan must absorb:
+
+- **Any design that leans on validate to populate the series is wrong for
+  95% of the matrix** (5,303 of 5,584). Only the pressure test runs red cells,
+  via its exact-cell and `--probe-disabled` selectors.
+- **The two provenances are not symmetric peers.** Validate supplies the
+  *regression signal* over a small green set. The pressure test is the *only*
+  possible source of divergence distributions. That asymmetry is an argument for
+  giving the pressure test its own record rather than a shared column — see the
+  next section.
+
+The existing corpus already shows the shape: the one validate-provenance row
+that could exist does not, and the sole informative row is pressure-sourced —
+`data-handling/sqlite-query-determinism` by `sabre` in `verify` mode.
+
+## THE PRESSURE TEST SHOULD HAVE ITS OWN TABLE
+
+> *"maybe pressure test should indeed have a separate table and should be our
+> record of all stress testing and flakiness testing."*
+
+This is stronger than the split described earlier, and the measurement above
+argues for it. Not a partition of `cells.json` with a `provenance` discriminator,
+but a **distinct record** whose subject is stress and flakiness testing.
+
+Reasons it is the better shape, given what is now measured:
+
+- The two records have **different keys**. `cells.json` is keyed one row per
+  cell and is a RATCHET — its job is `status` and admission. A stress record is
+  keyed per `(cell, tree, run)` and is a SERIES — its job is accumulation.
+  Forcing a series into a ratchet's row is what produced the current
+  `observations: []` on 5,582 of 5,584 rows.
+- The two have **different lifetimes**. A ratchet row is rewritten by
+  `update`; a series row must never be rewritten.
+- The two have **different populations**, per the section above: the ratchet's
+  informative population is 281 green cells, the series' is the 5,303 red ones.
+- It removes the SHA-perturbation problem for the series without touching the
+  ratchet, because the two files can live in different repositories.
+
+`cells.json` then keeps `id`, `enabled`, `status`, `ci_disabled_reason` and, if
+wanted, a small derived projection with `last_tested`. Everything about stress
+and flakiness moves to the new record.
+
+## THE METHODOLOGY IS A DISTRIBUTION, NOT A MINIMUM
+
+> *"I really don't care that much about tracking some sequential node difference
+> in first divergence point. Our normal methodology should just be to do the
+> concurrent runs and use that distribution of divergence points."*
+
+The current schema stores `{earliest, latest, samples}` — a **bound**, not a
+distribution. It answers "how wide" and cannot answer "how shaped". Two cells
+with identical `earliest`/`latest`/`samples` can have completely different
+behaviour: one clustered at the low end with a single outlier, one bimodal.
+
+The store should therefore retain **the individual divergence positions**, per
+coordinate, per run — not only their extremes. `{earliest, latest}` is then a
+*derived view* of the series rather than the stored form, which is the right
+direction of dependency and costs little: one integer per coordinate per run.
+
+Two things follow, both stated by the owner:
+
+- **Higher counts approach the true minimum.** The minimum of N samples is a
+  biased estimator of the true minimum and the bias falls with N, so a bound
+  from 2 samples and a bound from 50 are not comparable claims. This is what
+  `samples` exists to expose, and it is why a bound must never be quoted without
+  it.
+- **Concurrent runs are the normal methodology.** The measurement is a
+  distribution over repeated concurrent execution, not a sequential diff between
+  two nodes.
+
+Note the interaction with requirement 6: this is four distributions per cell,
+one per keyspace, never merged into one.
+
+## `hermit-repeat` MUST SAY WHEN EVERY RUN ERRORED
+
+> *"your repeat script should catch when ALL runs error and make the output
+> clearly say that"*
+
+This is the silent-pass class **inside the measurement tool**, which is worse
+than the same defect in a test: a tool that reports "RUNS THAT PRODUCED NO
+DIVERGENCE" over a set of runs that all *errored* is not reporting a clean
+result, it is reporting total failure as cleanliness. Every consumer downstream
+then treats it as evidence of stability.
+
+It is the same shape as the counted-suite defect elsewhere in this workspace —
+a suite discovering tests and executing none while reporting PASS — and the same
+rule fixes it: **a zero must state which zero it is.** "No divergence observed
+across N runs" and "N runs produced no usable result" must not render alike.
+
+Any store built from this plan inherits the requirement: a row asserting no
+divergence must be distinguishable from a row asserting nothing.
+
+## EMPTY MUST BE READABLE FROM THE ROW
+
+> *"empty because no divergence would be a GREEN cell, not a red/yellow cell. It
+> should be very clear from other fields in that row."*
+
+Three states currently collapse into one empty field:
+
+| meaning | what the row should show |
+|---|---|
+| never measured | no observation for that `(tree, provenance)` at all; `last_tested` absent |
+| measured, and it PASSED — no divergence exists to record | `results: ['pass']`, coordinates null, and the cell is **green** |
+| measured, diverged, but the position could not be located | `results` names the failure, coordinates null, and the cell is **red** |
+
+The owner's correction is the discriminator: **empty-because-no-divergence is a
+GREEN cell.** So the reader must not have to infer state from the absence of a
+number — `status`, `results` and `last_tested` in the same row already carry it,
+and the schema's job is to make that legible rather than to add a fourth field.
+
+This is requirement 7 restated with a concrete rule: absence is not zero, and
+the row must say which absence it is without the reader consulting another file.
 
 ## What a solution has to satisfy
 
