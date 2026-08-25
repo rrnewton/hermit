@@ -331,23 +331,91 @@ fn diagnostic_blocks(lower: &str) -> Vec<Vec<&str>> {
 ///   measured miss; it covers the same denial arriving without the banner, which
 ///   is how the FS enforcer surfaces when it denies a child that captures its own
 ///   stderr.
+/// What ONE output showed about an environmental block, in THREE STATES.
+///
+/// ⚠️ NOT [`EnvBlockVerdict`], WHICH IS A DIFFERENT AXIS AND SITS RIGHT BELOW IT.
+/// That type settles whether a classification HYPOTHESIS survived a later
+/// re-execution (confirmed / refuted / unconfirmed). This one reports what a
+/// single captured region ACTUALLY CONTAINED. A run can be `Denied` here and
+/// `Refuted` there — observed a denial, then passed on rerun — and the two must
+/// not be read as the same fact. They are named apart deliberately; the earlier
+/// two-state form invited exactly that conflation by having no name at all.
+///
+/// ⚠️ TWO STATES CANNOT CARRY THREE FACTS, AND THIS IS WHERE THE THIRD GOT LOST.
+/// The old `Option<&str>` said `Some(class)` for a denial and `None` for
+/// everything else — collapsing "we looked and there was no denial" together with
+/// "there was nothing to look at". Those need opposite responses: the first is a
+/// real product failure, the second is a run that produced no evidence either way.
+/// The third state used to be expressed by the CALLER not calling the function at
+/// all, which works only for as long as every caller remembers to check first.
+///
+/// A unification is exactly where a distinction like this disappears, so it is in
+/// the type rather than in a convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvBlockObservation {
+    /// A denial FIRED, and this names its form.
+    Denied(&'static str),
+    /// Evidence was present and carried no denial. A product failure here is real.
+    NoDenial,
+    /// There was nothing to evaluate. NOT a statement that no denial occurred.
+    NothingObserved,
+}
+
+impl EnvBlockObservation {
+    /// The legacy two-state view, for callers that genuinely only ask "was it
+    /// blocked". `NotEvaluated` maps to `None` — correct for that question, and
+    /// the reason the three-state form exists for callers asking anything else.
+    pub fn class(self) -> Option<&'static str> {
+        match self {
+            Self::Denied(class) => Some(class),
+            Self::NoDenial | Self::NothingObserved => None,
+        }
+    }
+}
+
+/// Preserved two-state entry point. Every existing caller keeps working; anything
+/// that must tell "no denial" from "no evidence" calls
+/// [`environmental_block_observation`] instead.
 pub fn environmental_block_class(output: &str) -> Option<&'static str> {
+    environmental_block_observation(output).class()
+}
+
+pub fn environmental_block_observation(output: &str) -> EnvBlockObservation {
+    // NOTHING TO EVALUATE IS ITS OWN ANSWER. An empty region means the step
+    // produced no output, which is not evidence that it ran unblocked.
+    if output.trim().is_empty() {
+        return EnvBlockObservation::NothingObserved;
+    }
     let lower = output.to_ascii_lowercase();
     // Form 1: the canonical jail banner, anywhere in the region.
+    //
+    // ⚠️ `lower.contains("bpfjailer")` IS DELIBERATELY UNANCHORED, AND I TRIED TO
+    // ANCHOR IT AND WAS WRONG. A bare mention does read as DENIED under it —
+    // measured on three shapes, including a diagnostic that says "no bpfjailer
+    // denial was observed this run" — and a `Denied` verdict is EXCUSING, so a
+    // false positive is silent absolution rather than a loud false red. That
+    // argument is real but it is not new information: requiring a denial word on
+    // the same line breaks a case `self_test` ASSERTS must be accepted,
+    //     "[e2e.metadata] Bunnylol `scuba bpfjailer_enforce` for more details"
+    // which is a genuine jailer output line carrying no denial word of its own.
+    // The unanchored form is a DECLARED TRADE, recorded in the self-test: accept
+    // some mentions rather than miss the jailer's own pointer line. Narrowing it
+    // needs a replacement that keeps that case, and that is an owner decision
+    // about which error to prefer, not a repair.
     if lower.contains("blocked on this server based on a security policy")
-        || lower.contains("bpfjailer")
         || lower.contains("enforcer: fs, reason:")
         || lower.contains("enforcer: exec, reason:")
         || lower.contains("enforcer: net, reason:")
+        || lower.contains("bpfjailer")
     {
-        return Some("bpfjailer-banner");
+        return EnvBlockObservation::Denied("bpfjailer-banner");
     }
     // Form 4 (checked before the per-line scan because it is a whole-region
     // signature): the vendored third-party build script.
     if (lower.contains("failed to run custom build command for") && lower.contains("reverie-dbi"))
         || (lower.contains("panicked at") && lower.contains("reverie-dbi/build.rs"))
     {
-        return Some("third-party-build");
+        return EnvBlockObservation::Denied("third-party-build");
     }
     let mut vcs_hit = false;
     for line in lower.lines() {
@@ -362,13 +430,13 @@ pub fn environmental_block_class(output: &str) -> Option<&'static str> {
                 "failed to connect to fwdproxy",
             ],
         ) {
-            return Some("proxy-egress");
+            return EnvBlockObservation::Denied("proxy-egress");
         }
         // Form 2a: legacy same-line toolchain denial. The conjunction remains
         // same-line so generic product prose cannot borrow a denial from a later
         // indented line in its block.
         if has_denial(line) && has_toolchain_phrase(line) {
-            return Some("toolchain-eperm");
+            return EnvBlockObservation::Denied("toolchain-eperm");
         }
         // Form 5 (NEW): a banner-less git FS denial. Requires BOTH a git-fatal
         // shape and a denial on the same line, so a guest test that merely prints
@@ -401,12 +469,12 @@ pub fn environmental_block_class(output: &str) -> Option<&'static str> {
                 .iter()
                 .any(|line| has_cross_line_toolchain_phrase(line))
     }) {
-        return Some("toolchain-eperm");
+        return EnvBlockObservation::Denied("toolchain-eperm");
     }
     if vcs_hit {
-        return Some("vcs-fs-denial");
+        return EnvBlockObservation::Denied("vcs-fs-denial");
     }
-    None
+    EnvBlockObservation::NoDenial
 }
 
 /// What an actual re-execution established about an environmental classification.
@@ -1415,6 +1483,45 @@ pub fn enter_cleanup_critical_section() {
 /// registers a FAKE peer record held by a short-lived child of this process, which
 /// cannot authorize anything.
 pub fn self_test() -> Result<String, String> {
+    // ---- THREE STATES, because two cannot carry three facts ----
+    //
+    // ⚠️ THE MIDDLE AND LAST CASES ARE THE POINT. Both map to `None` through the
+    // legacy `environmental_block_class`, and they are opposite facts: "we read
+    // the evidence and there was no denial" versus "there was no evidence". The
+    // first makes a product failure real; the second makes it unproven. A
+    // unification that merges two classifiers is exactly where that distinction
+    // gets absorbed, so it is asserted here rather than left to callers.
+    for (want, label, text) in [
+        (
+            EnvBlockObservation::Denied("bpfjailer-banner"),
+            "a denial that FIRED",
+            "An action was blocked on this server based on a security policy!",
+        ),
+        (
+            EnvBlockObservation::NoDenial,
+            "evidence present, NO denial in it",
+            "assertion failed: left == right\n  left: 4\n right: 5",
+        ),
+        (
+            EnvBlockObservation::NothingObserved,
+            "NOTHING to evaluate — not a statement that no denial occurred",
+            "   \n\t\n",
+        ),
+    ] {
+        let got = environmental_block_observation(text);
+        if got != want {
+            return Err(format!(
+                "three-state: {label} must observe {want:?}, got {got:?}"
+            ));
+        }
+    }
+    // And the collapse is one-way ONLY: both non-denials read as `None` through
+    // the legacy view, which is why anything needing to tell them apart must not
+    // use it.
+    if environmental_block_class("   ").is_some() || environmental_block_class("plain failure").is_some() {
+        return Err("three-state: the legacy view must report neither non-denial as a class".into());
+    }
+
     // ---- environmental classification: qualifying cases must be ACCEPTED ----
     let accept: &[(&str, &str)] = &[
         (
