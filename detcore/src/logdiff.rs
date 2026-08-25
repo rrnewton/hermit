@@ -94,6 +94,35 @@ pub enum LogComparisonMode {
     FullTrace,
 }
 
+/// Reader-facing names for the two inputs to a log comparison.
+///
+/// Standalone `hermit log-diff` keeps the historical `run 1` / `run 2`
+/// vocabulary through [`Default`]. Verification callers override these names
+/// when the inputs are a recording and its replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComparisonSideLabels {
+    /// Name of the left comparison input.
+    pub left: String,
+    /// Name of the right comparison input.
+    pub right: String,
+}
+
+impl ComparisonSideLabels {
+    /// Construct labels for a caller that knows what each input represents.
+    pub fn new(left: impl Into<String>, right: impl Into<String>) -> Self {
+        Self {
+            left: left.into(),
+            right: right.into(),
+        }
+    }
+}
+
+impl Default for ComparisonSideLabels {
+    fn default() -> Self {
+        Self::new("run 1", "run 2")
+    }
+}
+
 /// Options for calling `log_diff`.
 #[derive(Debug, Parser, Clone)]
 pub struct LogDiffOpts {
@@ -135,6 +164,11 @@ pub struct LogDiffOpts {
     #[clap(skip)]
     pub comparison: LogComparisonMode,
 
+    /// Reader-facing names for the left and right inputs. Standalone callers
+    /// retain the historical defaults; verification paths bind their own.
+    #[clap(skip)]
+    pub side_labels: ComparisonSideLabels,
+
     /// Print both selected logs exactly as they are passed to the comparator.
     ///
     /// The output names the active comparison policy and reflects every
@@ -150,7 +184,7 @@ pub struct LogDiffOpts {
     #[clap(long)]
     pub ignore_lines: Vec<String>,
 
-    /// Show this many completed syscalls before each run-specific divergence point.
+    /// Show this many completed syscalls before each side-specific divergence point.
     /// Set to 0 to omit history.
     #[clap(long, default_value = "0")]
     pub syscall_history: u64,
@@ -901,12 +935,21 @@ fn syscall_at_or_before<'a>(
         .copied()
 }
 
+fn sentence_case_label(label: &str) -> String {
+    let mut characters = label.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+        None => String::new(),
+    }
+}
+
 fn write_syscall_context(
     w: &mut impl std::io::Write,
     left_index: usize,
     right_index: usize,
     left_syscalls: &[(usize, &str)],
     right_syscalls: &[(usize, &str)],
+    labels: &ComparisonSideLabels,
     history_count: u64,
 ) -> std::io::Result<()> {
     if history_count == 0 {
@@ -920,7 +963,10 @@ fn write_syscall_context(
     }
 
     writeln!(w, "Divergent syscall context:")?;
-    for (label, current) in [("run 1", left_current), ("run 2", right_current)] {
+    for (label, current) in [
+        (labels.left.as_str(), left_current),
+        (labels.right.as_str(), right_current),
+    ] {
         if let Some((index, syscall)) = current {
             writeln!(w, "  {label}, log message {index}: {syscall}")?;
         } else {
@@ -930,8 +976,8 @@ fn write_syscall_context(
 
     let history_limit = usize::try_from(history_count).unwrap_or(usize::MAX);
     for (label, index, syscalls) in [
-        ("run 1", left_index, left_syscalls),
-        ("run 2", right_index, right_syscalls),
+        (labels.left.as_str(), left_index, left_syscalls),
+        (labels.right.as_str(), right_index, right_syscalls),
     ] {
         let history_boundary =
             syscall_at_or_before(syscalls, index).map_or(index, |(current_index, _)| current_index);
@@ -1036,7 +1082,9 @@ fn diff_vecs(
 
         write!(
             w,
-            "({which}) Mismatch at log messages {left_index} (run 1) and {right_index} (run 2): {}",
+            "({which}) Mismatch at log messages {left_index} ({}) and {right_index} ({}): {}",
+            opts.side_labels.left,
+            opts.side_labels.right,
             Comparison::new(opts.no_color, left_compared, right_compared)
         )?;
         if opts.strip_lines || opts.canonicalize_addresses {
@@ -1052,6 +1100,7 @@ fn diff_vecs(
             *right_index,
             left_syscalls,
             right_syscalls,
+            &opts.side_labels,
             opts.syscall_history,
         )?;
 
@@ -1062,8 +1111,10 @@ fn diff_vecs(
         Ordering::Less => {
             writeln!(
                 w,
-                "Run 2 contains {} extra messages not matched in run 1. Displaying up to 10:",
-                v2.len() - v1.len()
+                "{} contains {} extra messages not matched in {}. Displaying up to 10:",
+                sentence_case_label(&opts.side_labels.right),
+                v2.len() - v1.len(),
+                opts.side_labels.left,
             )?;
             diff_count += 1;
             let start = v2.len() - std::cmp::min(10, v2.len() - v1.len());
@@ -1074,8 +1125,10 @@ fn diff_vecs(
         Ordering::Greater => {
             writeln!(
                 w,
-                "Run 1 contains {} extra messages not matched in run 2. Displaying up to 10:",
-                v1.len() - v2.len()
+                "{} contains {} extra messages not matched in {}. Displaying up to 10:",
+                sentence_case_label(&opts.side_labels.left),
+                v1.len() - v2.len(),
+                opts.side_labels.right,
             )?;
             diff_count += 1;
             let start = v1.len() - std::cmp::min(10, v1.len() - v2.len());
@@ -1104,14 +1157,15 @@ fn write_compared_logs(
     policy: LogComparisonPolicy,
     compared_left: &[String],
     compared_right: &[String],
+    labels: &ComparisonSideLabels,
 ) -> std::io::Result<()> {
     writeln!(writer, "Comparison policy: {}", policy.name())?;
-    writeln!(writer, "--- begin run 1 compared log ---")?;
+    writeln!(writer, "--- begin {} compared log ---", labels.left)?;
     write_compared_messages(writer, compared_left)?;
-    writeln!(writer, "--- end run 1 compared log ---")?;
-    writeln!(writer, "--- begin run 2 compared log ---")?;
+    writeln!(writer, "--- end {} compared log ---", labels.left)?;
+    writeln!(writer, "--- begin {} compared log ---", labels.right)?;
     write_compared_messages(writer, compared_right)?;
-    writeln!(writer, "--- end run 2 compared log ---")?;
+    writeln!(writer, "--- end {} compared log ---", labels.right)?;
     Ok(())
 }
 
@@ -1531,7 +1585,7 @@ pub fn log_diff_summary_from_strs_with_filter(
     let prepared_b = messages_for_comparison(compared_b, policy);
 
     if opts.print_logs {
-        write_compared_logs(w, policy, &prepared_a, &prepared_b)?;
+        write_compared_logs(w, policy, &prepared_a, &prepared_b, &opts.side_labels)?;
     }
 
     let first_different =
@@ -1651,8 +1705,10 @@ pub fn log_diff_summary_from_strs_with_filter(
             String::new()
         } else {
             format!(
-                " (run 1 {}, run 2 {})",
+                " ({} {}, {} {})",
+                opts.side_labels.left,
                 describe_maps_commit(first_left),
+                opts.side_labels.right,
                 describe_maps_commit(first_right),
             )
         };
@@ -2157,6 +2213,7 @@ mod test {
                 strip_lines: false,
                 canonicalize_addresses: false,
                 comparison: super::LogComparisonMode::Deterministic,
+                side_labels: super::ComparisonSideLabels::default(),
                 print_logs: false,
                 syscall_history: 5,
                 no_color: false,
@@ -2210,6 +2267,109 @@ mod test {
         assert!(output.contains("Prior completed syscalls for run 1:"));
         assert!(output.contains("Prior completed syscalls for run 2:"));
         assert_eq!(output.matches("finish syscall #1: read").count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn custom_side_labels_cover_mismatch_history_and_tail_diagnostics() -> std::io::Result<()> {
+        let left = format!(
+            "{}{}",
+            record(1, "DETLOG [syscall] finish syscall #1: read = Ok(1)"),
+            record(2, "DETLOG [syscall] finish syscall #2: write = Ok(1)"),
+        );
+        let right = format!(
+            "{}{}",
+            record(1, "DETLOG [syscall] finish syscall #1: read = Ok(1)"),
+            record(2, "DETLOG [syscall] finish syscall #2: write = Err(5)"),
+        );
+        let options = super::LogDiffOpts {
+            side_labels: super::ComparisonSideLabels::new("the recording", "the replay"),
+            syscall_history: 1,
+            no_color: true,
+            ..Default::default()
+        };
+        let mut output = Vec::new();
+        assert!(super::log_diff_from_strs(
+            &left,
+            &right,
+            &options,
+            &mut output
+        )?);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Mismatch at log messages 2 (the recording) and 2 (the replay)"));
+        assert!(output.contains("the recording, log message 2:"));
+        assert!(output.contains("the replay, log message 2:"));
+        assert!(output.contains("Prior completed syscalls for the recording:"));
+        assert!(output.contains("Prior completed syscalls for the replay:"));
+        assert!(!output.contains("run 1") && !output.contains("run 2"));
+
+        let left = record(1, "DETLOG stable");
+        let right = format!("{left}{}", record(2, "DETLOG extra"));
+        let mut output = Vec::new();
+        assert!(super::log_diff_from_strs(
+            &left,
+            &right,
+            &options,
+            &mut output
+        )?);
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains("The replay contains 1 extra messages not matched in the recording.")
+        );
+        assert!(!output.contains("run 1") && !output.contains("run 2"));
+
+        let mut output = Vec::new();
+        assert!(super::log_diff_from_strs(
+            &right,
+            &left,
+            &options,
+            &mut output
+        )?);
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains("The recording contains 1 extra messages not matched in the replay.")
+        );
+        Ok(())
+    }
+
+    fn printed_labeled_log<'a>(output: &'a str, label: &str) -> &'a str {
+        let start = format!("--- begin {label} compared log ---\n");
+        let end = format!("--- end {label} compared log ---\n");
+        output
+            .split_once(&start)
+            .expect("printed log start marker")
+            .1
+            .split_once(&end)
+            .expect("printed log end marker")
+            .0
+    }
+
+    #[test]
+    fn custom_side_labels_name_printed_logs() -> std::io::Result<()> {
+        let options = super::LogDiffOpts {
+            side_labels: super::ComparisonSideLabels::new("the recording", "the replay"),
+            print_logs: true,
+            no_color: true,
+            ..Default::default()
+        };
+        let mut output = Vec::new();
+        let summary = super::log_diff_summary_from_strs(
+            record(1, "DETLOG recorded"),
+            record(1, "DETLOG replayed"),
+            &options,
+            &mut output,
+        )?;
+        assert!(summary.diff_found);
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(
+            printed_labeled_log(&output, "the recording"),
+            "INFO detcore: DETLOG recorded\n"
+        );
+        assert_eq!(
+            printed_labeled_log(&output, "the replay"),
+            "INFO detcore: DETLOG replayed\n"
+        );
+        assert!(!output.contains("begin run 1") && !output.contains("begin run 2"));
         Ok(())
     }
 
@@ -3238,6 +3398,28 @@ Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar
             "2026-08-13T01:02:03.000000Z INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 10, dettid 3 using resources {{Path(\"/proc/self/maps\"): R}}, on previously committed {committed}\n\
 2026-08-13T01:02:03.000001Z INFO detcore::scheduler: [scheduler] run queue empty, exiting sched_loop."
         )
+    }
+
+    #[test]
+    fn custom_side_labels_name_the_maps_read_summary() -> std::io::Result<()> {
+        let scanned = log_with_maps_read("12.345_678_901s");
+        let options = super::LogDiffOpts {
+            comparison: super::LogComparisonMode::Info,
+            canonicalize_addresses: true,
+            side_labels: super::ComparisonSideLabels::new("the recording", "the replay"),
+            no_color: true,
+            ..Default::default()
+        };
+        let mut output = Vec::new();
+        let summary = super::log_diff_summary_from_strs(&scanned, &scanned, &options, &mut output)?;
+        assert!(summary.matched_with_evidence());
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains(
+            "(the recording first at turn 10, committed virtual time 12345678901ns, \
+             the replay first at turn 10, committed virtual time 12345678901ns)"
+        ));
+        assert!(!output.contains("run 1") && !output.contains("run 2"));
+        Ok(())
     }
 
     /// A matching pair discards its logs, so without this record there is no way

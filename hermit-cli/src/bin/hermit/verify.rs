@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use colored::Colorize;
 use detcore::logdiff;
+use detcore::logdiff::ComparisonSideLabels;
 use detcore::logdiff::LogComparisonMode;
 use hermit::Context;
 use hermit::Error;
@@ -31,6 +32,10 @@ use super::record_envelope::RecordEnvelopePolicy;
 pub(crate) struct ComparedRun<'a> {
     pub output: &'a Output,
     pub log: TempPath,
+    /// Reader-facing name for this side of the comparison. Run verification
+    /// compares two fresh executions; record verification compares one
+    /// recording with its replay.
+    pub label: &'a str,
 }
 
 pub(crate) struct ComparisonOptions {
@@ -478,6 +483,9 @@ pub struct VerificationOutcome {
     /// runs and produced readable statistics. `None` for non-DBT runs and when
     /// verification did not reach a verdict.
     pub dbt_counted_branches: Option<DbtCountedBranchComparison>,
+    /// Reader-facing names of the two compared sides, retained so terminal
+    /// diagnostics do not assume that every comparison was two fresh runs.
+    pub compared_labels: ComparisonSideLabels,
     /// Scheduler turn at the first log divergence, when a preceding COMMIT
     /// identified the turn.
     pub first_divergent_scheduler_turn: Option<u64>,
@@ -526,9 +534,10 @@ impl VerificationOutcome {
                     "DBT verification failed: counted-branch clocks differed between runs ({} != {}); logs retained",
                     branches.left, branches.right
                 ))),
-                _ => Err(Error::msg(
-                    "Verification found a mismatch between run 1 and run 2 (logs retained).",
-                )),
+                _ => Err(Error::msg(format!(
+                    "Verification found a mismatch between {} and {} (logs retained).",
+                    self.compared_labels.left, self.compared_labels.right,
+                ))),
             },
             // Reached when the comparator refused (a truncated log) and nothing
             // else was observed to differ. Still an error, so the historical
@@ -858,11 +867,14 @@ fn compare_two_runs_with_unsupported_scan(
     let ComparedRun {
         output: out1,
         log: log1,
+        label: label1,
     } = first;
     let ComparedRun {
         output: out2,
         log: log2,
+        label: label2,
     } = second;
+    let compared_labels = ComparisonSideLabels::new(label1, label2);
     let mut failed = false;
     // A difference that was actually OBSERVED, as opposed to a comparison that
     // was refused. Only an observed difference can justify a `Diverged`
@@ -893,7 +905,7 @@ fn compare_two_runs_with_unsupported_scan(
     if out1.stdout != out2.stdout {
         failed = true;
         observed_divergence = true;
-        eprintln!("Mismatch in stdout between run 1 and run 2:");
+        eprintln!("Mismatch in stdout between {label1} and {label2}:");
         let str1 = String::from_utf8_lossy(&out1.stdout);
         let str2 = String::from_utf8_lossy(&out2.stdout);
         if str1.lines().count() > 1 {
@@ -906,7 +918,7 @@ fn compare_two_runs_with_unsupported_scan(
     if out1.stderr != out2.stderr {
         failed = true;
         observed_divergence = true;
-        eprintln!("Mismatch in stderr between run 1 and run 2:");
+        eprintln!("Mismatch in stderr between {label1} and {label2}:");
         let str1 = String::from_utf8_lossy(&out1.stderr);
         let str2 = String::from_utf8_lossy(&out2.stderr);
         if str1.lines().count() > 1 {
@@ -935,6 +947,7 @@ fn compare_two_runs_with_unsupported_scan(
                 // addresses — the exact proxy/binding drift the spec exists to close.
                 canonicalize_addresses: spec.canonicalize_addresses,
                 comparison: spec.log_comparison_mode(),
+                side_labels: compared_labels.clone(),
                 syscall_history: if options.verbose { 10 } else { 5 },
                 // Thread the filter facts from the spec so what the verdict *reports*
                 // (`spec.skip_commit`/`spec.skip_detlog`) is exactly what the diff
@@ -989,7 +1002,12 @@ fn compare_two_runs_with_unsupported_scan(
                 first_divergent_record = summary.first_divergent_record;
                 first_divergent_syscall = summary.first_divergent_syscall;
                 if !summary.refused {
-                    eprintln!(":: {}", "Log differences found between runs.".red().bold());
+                    eprintln!(
+                        ":: {}",
+                        format!("Log differences found between {label1} and {label2}.")
+                            .red()
+                            .bold()
+                    );
                 }
             }
         } else {
@@ -1002,7 +1020,7 @@ fn compare_two_runs_with_unsupported_scan(
             failed = true;
             observed_divergence = true;
             eprintln!(
-                "Mismatch in exit status between run 1 and run 2: {}",
+                "Mismatch in exit status between {label1} and {label2}: {}",
                 Comparison::new(&out1.status, &out2.status)
             );
         }
@@ -1019,7 +1037,7 @@ fn compare_two_runs_with_unsupported_scan(
 
     if let Err(error) = log_processing_result {
         if options.keep_logs || failed {
-            retain_verification_logs([("run 1", log1), ("run 2", log2)])?;
+            retain_verification_logs([(label1, log1), (label2, log2)])?;
         }
         return Err(error);
     }
@@ -1028,7 +1046,7 @@ fn compare_two_runs_with_unsupported_scan(
     // that behavior to successful comparisons instead of changing the failure
     // path.
     if options.keep_logs || failed {
-        retain_verification_logs([("run 1", log1), ("run 2", log2)])?;
+        retain_verification_logs([(label1, log1), (label2, log2)])?;
     }
 
     if failed {
@@ -1049,6 +1067,7 @@ fn compare_two_runs_with_unsupported_scan(
             comparison: spec,
             compared_log_messages,
             dbt_counted_branches: None,
+            compared_labels: compared_labels.clone(),
             first_divergent_scheduler_turn,
             first_divergent_virtual_nanoseconds,
             first_divergent_record,
@@ -1061,6 +1080,7 @@ fn compare_two_runs_with_unsupported_scan(
             comparison: spec,
             compared_log_messages,
             dbt_counted_branches: None,
+            compared_labels: compared_labels.clone(),
             first_divergent_scheduler_turn,
             first_divergent_virtual_nanoseconds,
             first_divergent_record,
@@ -1249,10 +1269,12 @@ mod tests {
             ComparedRun {
                 output: left,
                 log: left_log,
+                label: "run 1",
             },
             ComparedRun {
                 output: right,
                 log: right_log,
+                label: "run 2",
             },
             ComparisonOptions {
                 verbose: false,
@@ -1447,6 +1469,104 @@ mod tests {
         assert_eq!(outcome.into_exit_status().unwrap(), ExitStatus::Exited(3));
     }
 
+    fn diverged_message(label1: &'static str, label2: &'static str) -> String {
+        let left = output(0, b"left-output", b"");
+        let right = output(0, b"right-output", b"");
+        let (left_log, right_log) = empty_logs();
+        let left_path = left_log.to_path_buf();
+        let right_path = right_log.to_path_buf();
+
+        let outcome = compare_two_runs(
+            ComparedRun {
+                output: &left,
+                log: left_log,
+                label: label1,
+            },
+            ComparedRun {
+                output: &right,
+                log: right_log,
+                label: label2,
+            },
+            ComparisonOptions {
+                verbose: false,
+                strictness: LogCompareStrictness::Stripped,
+                compare_logs: false,
+                diagnostic_full_trace: false,
+                compare_io_buffers: false,
+                keep_logs: false,
+                record_envelope: RecordEnvelope::all_records_v1(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.compared_labels,
+            ComparisonSideLabels::new(label1, label2)
+        );
+        assert!(left_path.exists(), "a divergence must retain the left log");
+        assert!(
+            right_path.exists(),
+            "a divergence must retain the right log"
+        );
+        fs::remove_file(left_path).unwrap();
+        fs::remove_file(right_path).unwrap();
+        outcome.into_exit_status().unwrap_err().to_string()
+    }
+
+    #[test]
+    fn divergence_terminal_message_names_the_sides_it_compared() {
+        let record = diverged_message("the recording", "the replay");
+        assert!(
+            record.contains("between the recording and the replay"),
+            "{record}"
+        );
+        assert!(!record.contains("run 1") && !record.contains("run 2"));
+
+        let run = diverged_message("run 1", "run 2");
+        assert!(run.contains("between run 1 and run 2"), "{run}");
+        assert!(!run.contains("recording") && !run.contains("replay"));
+    }
+
+    #[test]
+    fn production_comparison_callers_bind_truthful_side_labels() {
+        for (name, source, left, right) in [
+            ("generic run", include_str!("run.rs"), "run 1", "run 2"),
+            ("DBT run", include_str!("backends.rs"), "run 1", "run 2"),
+            (
+                "record/replay",
+                include_str!("record_start.rs"),
+                "the recording",
+                "the replay",
+            ),
+        ] {
+            let production = source
+                .rsplit_once("#[cfg(test)]")
+                .expect("production/test boundary")
+                .0;
+            for label in [left, right] {
+                let binding = format!("label: \"{label}\"");
+                assert_eq!(
+                    production.matches(&binding).count(),
+                    1,
+                    "{name} must bind {label:?} exactly once"
+                );
+            }
+        }
+
+        let production = include_str!("verify.rs")
+            .rsplit_once("#[cfg(test)]")
+            .expect("production/test boundary")
+            .0;
+        assert!(production.contains("side_labels: compared_labels.clone()"));
+        assert_eq!(
+            production
+                .matches("retain_verification_logs([(label1, log1), (label2, log2)])")
+                .count(),
+            2,
+            "both retained-log paths must use the caller-bound labels"
+        );
+    }
+
     #[test]
     fn output_only_mode_ignores_internal_log_order() {
         let left = output(0, b"console", b"warning");
@@ -1459,10 +1579,12 @@ mod tests {
             ComparedRun {
                 output: &left,
                 log: left_log,
+                label: "run 1",
             },
             ComparedRun {
                 output: &right,
                 log: right_log,
+                label: "run 2",
             },
             ComparisonOptions {
                 verbose: false,
@@ -1610,10 +1732,12 @@ mod tests {
             ComparedRun {
                 output: &out,
                 log: left,
+                label: "run 1",
             },
             ComparedRun {
                 output: &out,
                 log: right,
+                label: "run 2",
             },
             ComparisonOptions {
                 verbose: true,
@@ -1707,10 +1831,12 @@ mod tests {
                 ComparedRun {
                     output: &output,
                     log: left.into_temp_path(),
+                    label: "run 1",
                 },
                 ComparedRun {
                     output: &output,
                     log: right.into_temp_path(),
+                    label: "run 2",
                 },
                 ComparisonOptions {
                     verbose: false,
@@ -1747,10 +1873,12 @@ mod tests {
             ComparedRun {
                 output: &output,
                 log: left.into_temp_path(),
+                label: "run 1",
             },
             ComparedRun {
                 output: &output,
                 log: right.into_temp_path(),
+                label: "run 2",
             },
             ComparisonOptions {
                 verbose: false,
@@ -1806,10 +1934,12 @@ mod tests {
             ComparedRun {
                 output: &output,
                 log: left.into_temp_path(),
+                label: "run 1",
             },
             ComparedRun {
                 output: &output,
                 log: right.into_temp_path(),
+                label: "run 2",
             },
             ComparisonOptions {
                 verbose: false,
@@ -2264,6 +2394,7 @@ mod tests {
             comparison: full,
             compared_log_messages: Some(ComparedLogCounts { left: 9, right: 9 }),
             dbt_counted_branches: None,
+            compared_labels: ComparisonSideLabels::default(),
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,

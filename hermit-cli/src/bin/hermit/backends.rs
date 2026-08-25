@@ -1035,10 +1035,12 @@ pub(super) fn run_dbt(
         ComparedRun {
             output: &first,
             log: log1_path,
+            label: "run 1",
         },
         ComparedRun {
             output: &second,
             log: log2_path,
+            label: "run 2",
         },
         ComparisonOptions {
             verbose: verify_verbose,
@@ -1495,6 +1497,7 @@ mod tests {
             ),
             compared_log_messages: Some(ComparedLogCounts { left: 4, right: 4 }),
             dbt_counted_branches: None,
+            compared_labels: detcore::logdiff::ComparisonSideLabels::default(),
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
@@ -1578,11 +1581,9 @@ mod tests {
             "the finalizer must attach the branch comparison and publish JSON before returning it"
         );
 
+        let canonical_marker = concat!("#[cfg(feature = \"dbt\")]\n", "pub(super) fn ", "run_dbt(");
         let canonical = source
-            .split_once(
-                r#"#[cfg(feature = "dbt")]
-pub(super) fn run_dbt("#,
-            )
+            .split_once(canonical_marker)
             .expect("canonical DBT run path")
             .1
             .split_once(r#"#[cfg(not(feature = "dbt"))]"#)
