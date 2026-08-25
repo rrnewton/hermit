@@ -47,6 +47,7 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -82,7 +83,31 @@ static void observe_words(const char* label, const volatile unsigned long long* 
   observations++;
 }
 
+/* The manifest runner launches every cell from the repository root. Keep this
+ * fixture's backing file in the isolated guest /tmp (or the naked run's
+ * per-cell E2E_TMPDIR) so concurrent cells cannot change the shared cwd's
+ * directory metadata while another guest is inspecting it. */
+static int enter_test_directory(void) {
+  const char* path = getenv("E2E_TMPDIR");
+  if (path == NULL || path[0] == '\0') {
+    path = "/tmp";
+  }
+  if (mkdir(path, 0755) != 0 && errno != EEXIST) {
+    printf("SETUP mkdir workdir FAILED %s\n", strerror(errno));
+    return -1;
+  }
+  if (chdir(path) != 0) {
+    printf("SETUP chdir workdir FAILED %s\n", strerror(errno));
+    return -1;
+  }
+  return 0;
+}
+
 int main(void) {
+  if (enter_test_directory() != 0) {
+    return 2;
+  }
+
   /* --- A: MAP_SHARED anonymous, across fork ------------------------------ */
   volatile unsigned long long* anon =
       mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
