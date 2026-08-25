@@ -1051,6 +1051,27 @@
       "test": "c-programs/netns-cookie-udp4"
     },
     {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/name-to-handle-regular-eopnotsupp"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/name-to-handle-regular-eopnotsupp"
+    },
+    {
+      "backend": "sabre",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/name-to-handle-regular-eopnotsupp"
+    },
+    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -1492,6 +1513,27 @@
       "test": "c-programs/uname"
     },
     {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/unix-autobind-stream"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/unix-autobind-stream"
+    },
+    {
+      "backend": "sabre",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/unix-autobind-stream"
+    },
+    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -1560,6 +1602,27 @@
       "lane": "portable",
       "mode": "verify",
       "test": "data-handling/zstd-multithread"
+    },
+    {
+      "backend": "liteinst",
+      "category": "debugger-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "debugger-c/debuggee"
+    },
+    {
+      "backend": "ptrace",
+      "category": "debugger-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "debugger-c/debuggee"
+    },
+    {
+      "backend": "sabre",
+      "category": "debugger-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "debugger-c/debuggee"
     },
     {
       "backend": "ptrace",
