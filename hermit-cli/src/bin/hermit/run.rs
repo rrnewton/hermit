@@ -385,7 +385,13 @@ pub struct RunOpts {
     /// "stripped_prefixes":[str],"canonicalizations":[str],"ignore_lines":bool,
     /// "skip_commit":bool,"skip_detlog":bool},"guest_exit_code":int|null,
     /// "guest_signal":int|null,"first_divergent_scheduler_turn":int|null,
-    /// "first_divergent_virtual_nanoseconds":int|null}`. This is the
+    /// "first_divergent_virtual_nanoseconds":int|null,
+    /// "first_divergent_record":int|null,"first_divergent_syscall":int|null}`.
+    /// ALL FOUR divergence coordinates are emitted, and they are four
+    /// DIFFERENT KEYSPACES that must never be compared across axes: one real
+    /// divergence was record 7495, syscall 1074, scheduler turn 196 -- three
+    /// numbers for one event. A consumer that reads a subset silently drops
+    /// located evidence. This is the
     /// exit-code-independent verdict
     /// channel: `verified` reflects whether the two runs matched, regardless of
     /// what the guest exited with, so a caller need not (and must not) infer the
