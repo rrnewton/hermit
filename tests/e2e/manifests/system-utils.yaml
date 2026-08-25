@@ -1840,6 +1840,69 @@ test:
           sabre: The verify cell already self-asserts the mount; a custom arm adds no observation
           liteinst: The verify cell already self-asserts the mount; a custom arm adds no observation
         ci_disabled_reason: 'NOT-EXERCISED: the required verify cell owns the nscd neutralisation contract.'
+  - id: system-utils/sysfs-sanitized-prefixes
+    description: One guest asserts readable stable leaves under the eight previously untouched sanitized sysfs prefixes
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - bash
+    timeout_seconds: 60
+    occasional: false
+    program: tests/e2e/system-utils/sysfs-sanitized-prefixes.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: Native execution removes all eight sanitizers together and is the demonstrated red arm, not a green cell
+        ci_disabled_reason: 'NOT-EXERCISED: native execution removes every sanitizer under test and fails the guest assertion.'
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: The sysfs read sanitizers are backend-independent; ptrace is the canonical required witness
+          kvm: The sysfs read sanitizers are backend-independent; ptrace is the canonical required witness
+          sabre: The sysfs read sanitizers are backend-independent; ptrace is the canonical required witness
+          liteinst: The sysfs read sanitizers are backend-independent; ptrace is the canonical required witness
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The guest assertions and required verify cell own this sysfs readability contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: the required verify cell owns the sysfs readability and stability contract.'
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Sequential sysfs reads expose no scheduling surface for chaos to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: sequential sysfs reads expose no scheduling surface for chaos.'
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The verify guest already asserts all eight prefixes; custom arguments add no observation
+          dbt: The verify guest already asserts all eight prefixes; custom arguments add no observation
+          kvm: The verify guest already asserts all eight prefixes; custom arguments add no observation
+          sabre: The verify guest already asserts all eight prefixes; custom arguments add no observation
+          liteinst: The verify guest already asserts all eight prefixes; custom arguments add no observation
+        ci_disabled_reason: 'NOT-EXERCISED: the required verify cell already asserts every targeted sysfs prefix.'
   - id: system-utils/harness-width-contract
     description: The system-utils bucket runs at the measured deterministic worker width of one
     lane: portable
