@@ -131,16 +131,65 @@ pub enum SyscallPhase {
     Posthook,
 }
 
-/// Simply a type to hang Serialize/Deserialize instances off of.
-#[derive(PartialEq, Debug, Eq, Clone, Copy, Hash)]
-pub struct SigWrapper(pub Signal);
+/// A signal the scheduler can name, INCLUDING the realtime signals `nix` cannot.
+///
+/// ⚠️ WHY THIS IS A RAW `i32` AND NOT A `nix::Signal`. It used to be
+/// `SigWrapper(pub Signal)`, and `nix`'s `Signal` models only 1..=31. Every
+/// cross-task notification path gated on `Signal::try_from(raw)`, so a
+/// `tgkill`/`tkill`/`rt_tgsigqueueinfo`/`rt_sigqueueinfo` carrying
+/// `SIGRTMIN..SIGRTMAX` delivered the signal to the target and then SILENTLY
+/// skipped `NotifySignalPending`. Measured in-tree: the gate admitted exactly
+/// 1..=31 and ZERO of the 31 realtime signals. A thread parked on
+/// `ResourceID::WaitChild` was therefore never woken and the wait hung —
+/// permanently, until the child exited or the thread was killed.
+///
+/// The two `rt_*sigqueueinfo` sites are the sharp end: they are reached from
+/// `sigqueue()`/`pthread_sigqueue()`, which are used with realtime signals in
+/// essentially all real code, so those notification call sites were wired up
+/// and inert for their only normal use.
+///
+/// ⚠️ THE SERIALIZED FORM IS DELIBERATELY UNCHANGED FOR EVERY SIGNAL THAT COULD
+/// ALREADY BE REPRESENTED. 1..=31 still render as the `nix` name (`"SIGUSR1"`),
+/// byte-for-byte as before, so existing schedule files and DETLOG output do not
+/// move. Only the previously-impossible values gain a spelling, `"SIG<n>"`, and
+/// the deserializer accepts both. This is what keeps a model-type widening from
+/// becoming a schedule-compatibility break.
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Hash, PartialOrd, Ord)]
+pub struct SigWrapper(pub i32);
+
+impl SigWrapper {
+    /// The raw signal number, always available.
+    pub fn raw(&self) -> i32 {
+        self.0
+    }
+
+    /// The `nix` signal, when one exists. `None` for realtime signals: they are
+    /// real, deliverable, and simply unnamed by `nix`.
+    pub fn signal(&self) -> Option<Signal> {
+        Signal::try_from(self.0).ok()
+    }
+
+    /// How this signal is spelled in schedule files and DETLOG.
+    pub fn as_string(&self) -> String {
+        match self.signal() {
+            Some(signal) => signal.as_str().to_string(),
+            None => format!("SIG{}", self.0),
+        }
+    }
+}
+
+impl std::fmt::Display for SigWrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_string())
+    }
+}
 
 impl Serialize for SigWrapper {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        serializer.serialize_str(self.0.as_str())
+        serializer.serialize_str(&self.as_string())
     }
 }
 
@@ -151,24 +200,21 @@ impl<'de> de::Deserialize<'de> for SigWrapper {
     {
         struct SignalVisitor;
         impl<'de> de::Visitor<'de> for SignalVisitor {
-            type Value = Signal;
+            type Value = SigWrapper;
 
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                write!(f, "string representing a Signal")
+                write!(f, "string representing a signal")
             }
 
             fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
             where
                 E: serde::de::Error,
             {
-                let sig: Result<Signal, String> =
-                    FromStr::from_str(v).map_err(|e: nix::errno::Errno| e.to_string());
-                sig.map_err(serde::de::Error::custom)
+                SigWrapper::from_str(v).map_err(serde::de::Error::custom)
             }
         }
 
-        let sig = deserializer.deserialize_str(SignalVisitor)?;
-        Ok(SigWrapper(sig))
+        deserializer.deserialize_str(SignalVisitor)
     }
 }
 
@@ -176,13 +222,25 @@ impl FromStr for SigWrapper {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> anyhow::Result<Self> {
-        Ok(SigWrapper(Signal::from_str(s)?))
+        // The `nix` name first, so every previously-valid spelling keeps
+        // parsing exactly as it did.
+        if let Ok(signal) = Signal::from_str(s) {
+            return Ok(SigWrapper(signal as i32));
+        }
+        // Then the realtime spelling this type adds.
+        if let Some(rest) = s.strip_prefix("SIG")
+            && let Ok(raw) = rest.parse::<i32>()
+            && raw > 0
+        {
+            return Ok(SigWrapper(raw));
+        }
+        anyhow::bail!("not a signal: {s}")
     }
 }
 
 impl From<Signal> for SigWrapper {
     fn from(signal: Signal) -> Self {
-        Self(signal)
+        Self(signal as i32)
     }
 }
 

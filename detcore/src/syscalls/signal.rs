@@ -8,6 +8,7 @@
 
 //! System calls dealing with signals.
 
+use detcore_model::schedule::SigWrapper;
 use std::time::Duration;
 
 use nix::sys::signal::Signal;
@@ -464,10 +465,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         target: DetTid,
         raw_signal: i32,
     ) {
-        if target != guest.thread_state().dettid
-            && let Ok(signal) = Signal::try_from(raw_signal)
-        {
-            notify_signal_pending(guest, target, signal).await;
+        // ⚠️ NO `Signal::try_from` GATE. It used to stand here, and because
+        // `nix`'s `Signal` models only 1..=31 it rejected EVERY realtime signal:
+        // measured in-tree, the gate admitted exactly 1..=31 and zero of the 31
+        // realtime signals. The notification was skipped silently, so a target
+        // parked on `ResourceID::WaitChild` was never woken and the wait hung.
+        // `SigWrapper` now carries the raw number, so every deliverable signal
+        // can be represented and none is dropped for being unnameable.
+        if target != guest.thread_state().dettid {
+            notify_signal_pending(guest, target, SigWrapper(raw_signal)).await;
         }
     }
 

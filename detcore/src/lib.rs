@@ -1319,7 +1319,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             }
 
             let request = guest.thread_state_mut().mk_request(
-                ResourceID::InboundSignal(SigWrapper(signal)),
+                ResourceID::InboundSignal(SigWrapper::from(signal)),
                 Permission::RW,
             );
             resource_request(guest, request).await;
