@@ -151,6 +151,54 @@ moving parts:
   `scripts/validate.rs` flag. It mirrors `run_portable_envelope_levels` in `scripts/validate.rs`.
   If `ENVELOPE_PROBES` changes in `scripts/validate.rs`, update this node.
 
+## Before you add a gate: scope is where gates go blind
+
+Five gates in this repository have been found reporting nothing while looking
+like they passed. **Five different causes, one outcome.** Not one of them was
+disabled, and every one looked reasonable when it was written — which is the
+reason to read this list before adding the sixth.
+
+| # | Mechanism | What it looked like | What it actually covered |
+|---|-----------|---------------------|--------------------------|
+| 1 | **Trigger** | a portability workflow in `.github/workflows/` | `on: workflow_dispatch:` only, so it never fired |
+| 2 | **Coverage** | the DAG "runs the backends" | it never ran `third-party-backends` |
+| 3 | **Execution** | a budget wrapper around a command | the wrapped command never executed, for want of calibration |
+| 4 | **Feature** | `cargo clippy --workspace --all-targets` | default features, so it never linted `dbt`/`sabre`/`e9patch` — every feature in the workspace |
+| 5 | **Severity** | `cargo doc --workspace --no-deps` | exited 0 while emitting warnings; it rendered docs and could not fail on doc defects |
+
+The shape they share: **a gate's scope is narrower than the claim its name
+makes.** "Documentation", "Clippy", "portability" all sound total. Each was
+partial, and nothing in the output said so.
+
+### Four questions to answer for any new node
+
+1. **Does it run?** Check the trigger and that the command is actually reached —
+   not that the script containing it exists.
+2. **Does it cover everything its name implies?** Features (`--all-features`),
+   targets (`--all-targets`), workspace members, lanes. Note that
+   `cargo --workspace` does **not** reach nested workspaces or crates outside
+   `[workspace] members`, and no cargo gate reaches `scripts/*.rs` rust-scripts —
+   `scripts/check-script-sigpipe.sh` exists solely because of that last gap.
+3. **Can it fail?** A gate that only ever emits warnings, or whose exit status
+   comes from the last element of a pipeline, cannot refuse anything. Prefer
+   `-D warnings`; if you pipe, capture the status before the pipe.
+4. **Have you watched it fail?** Introduce a real defect — ideally one that
+   genuinely existed, recovered from history — and confirm the gate refuses it
+   **by name**. A gate demonstrated only against invented input is the fixture
+   trap, and a gate never demonstrated failing is indistinguishable from one that
+   cannot.
+
+### And two ordering rules, learned the expensive way
+
+- **Do not widen a gate and fix what it finds in the same change.** Enumerate
+  what turning it on surfaces, fix or waive each item and land that, then switch
+  the gate on. Switching first converts a silent gap into a standing red, and
+  main going red is a P0.
+- **Say plainly which half of a change closes a live gap and which is
+  precautionary.** When `--all-features` was added to `doc.rustdoc` it changed
+  nothing measurable — 13 crates and 920 pages either way. Recording that stopped
+  it being read as a fix for a gap that was not there.
+
 ## Resource model (outer + inner limits)
 
 The task's "outer + inner resource limits" map onto the runner's two knobs:
