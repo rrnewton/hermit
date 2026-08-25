@@ -1,8 +1,13 @@
 # Storage redesign: validate and pressure-test records
 
-Status: proposed plan. Part 1 measured 2026-08-24 against hermit `8bc26dba1d`;
-population, landing states and the scheduling finding re-measured 2026-08-25
-after #2396 and #2444 landed.
+Status: PROPOSAL, for the owner to rule on. Part 1 measured 2026-08-24 against
+hermit `8bc26dba1d`; population, landing states, the scheduling finding and the
+verify-cannot-defend-a-control finding re-measured 2026-08-25 after #2396 and
+#2444 landed.
+
+Part 2 answers the three moves named on 2026-08-25 — min/max divergence
+tracking, moving records to the dev-hermit parent, and splitting validate from
+pressure-test output. See "The three moves, and where each is answered".
 
 Part 1 states the architecture as it actually is, measured rather than recalled,
 because an earlier description of it was wrong in a way that changed what kind
@@ -51,7 +56,8 @@ be negotiated between programs. That is a much cheaper problem than it looks.
 | Command | Input source | Fields it owns |
 |---|---|---|
 | `scorecard.rs update` | the manifest + `ci/expected-e2e-plan.json` | `schema`, `id` (`lane`/`category`/`test`/`mode`/`backend`), `enabled`, `status`, `ci_disabled_reason` |
-| `scorecard.rs update-observations` | a pressure-test `summary.json` | `observations[]` in full |
+| `scorecard.rs update-observations` | a pressure-test `summary.json` | `observations[]`, tagged `provenance: pressure-test` |
+| `scorecard.rs observe-results` | a validate result directory | `observations[]`, tagged `provenance: validate` — landed with #2396; has written zero rows because nothing invokes it |
 
 The boundary is real and currently correct in behaviour. It is simply **not
 written down anywhere**, and nothing enforces that a future edit keeps it.
@@ -119,6 +125,10 @@ its consequence named, rather than an accident of where each tool was written.
   no mechanism behind it, which is why there is one entry.
 - **`nextest` has zero retries configured** anywhere in the tree. Nothing
   incidentally samples a cell more than once.
+- **`bin/hermit-repeat`'s unread output is GROWING**, not static: 19 directories
+  when first counted earlier the same evening, 51 by the time this was written,
+  all timestamped that night. A pile of measurements nothing reads is getting
+  larger, which strengthens rather than softens the point.
 - **`ObservedRange` is populated on 2 of 5584 cells**, and the precise version is
   worse than the round number: only **one** of those two carries an actual
   divergence range (`data-handling/sqlite-query-determinism verify sabre`:
@@ -165,6 +175,16 @@ outranks every schema question below.
 | systemd user timers | none; the only relevant timer is `hermit-health-tick` |
 | `ci-hub/health/tick-hub.yaml` gates | zero gates reference them (its six "observation" hits are the English word, in comments about the ledger spool and saturation gates) |
 
+**`ci-hub/health/tick-hub.yaml` is the file that WOULD schedule it.** It is a
+real scheduler, not just a reminder list: it declares 30 `cmd:`-bearing gates,
+each with its own cadence, driven every five minutes by
+`hermit-health-tick.timer`. Nothing about the mechanism prevents a campaign gate;
+there simply is not one. Note its standing admission test, which a campaign gate
+would have to answer: "CAN ORC OBSERVE THIS DIRECTLY? YES -> it does not belong
+here." A pressure campaign is a measurement job rather than an observation of
+fleet state, so it passes that test — but the cadence, cost and lock questions
+below still have to be answered before adding one.
+
 The code says the same thing in its own doc comment on `observations`:
 
 > ORDINARY VALIDATE STILL NEVER CHANGES THIS ARRAY. Two commands write it, both
@@ -208,6 +228,70 @@ None of those are schema questions, which is why they are stated here rather
 than in the schema sections. A durable series with a perfect schema and no
 trigger is still an empty table.
 
+## A VERIFY CELL CANNOT DEFEND A CONTROL THAT NEUTRALISES EXTERNAL STATE
+
+Established by `agent(hermit-005)` 2026-08-25, and it applies to the pressure
+test's own comparison, so it belongs in this plan rather than in a test note.
+
+**The shape.** When a control's job is to neutralise external state, a verify
+cell cannot defend that control, because the control's SUCCESS is exactly what
+makes the two runs agree. Remove the control and the runs may still agree —
+whenever the external state happened not to move during the window. So a
+green verify cell is consistent with both "the control is working" and "the
+control is absent and nothing happened".
+
+**It is not hypothetical; I measured it on my own change tonight.** PR #2454
+adds `workdir: /tmp` to `applications/git-repository-workflow`, a control whose
+only job is to stop the guest observing a mutable host directory. Measured A/B,
+same box, back to back:
+
+```
+control, no workdir :  8 PASS / 2 FAIL of 10
+with workdir:/tmp   : 10 PASS / 0 FAIL of 10
+```
+
+**Without the control the cell still passed 80% of the time.** A verify cell
+sampled a handful of times would have called that green and defended nothing.
+What actually proved the control was the mechanism, not the verdict:
+`newfstatat` calls on `/home/newton` went 24 → 0 across ten runs.
+
+**Where this bites the pressure test.** Its measurement is a pass/fail count
+across repetitions plus a divergence position, and `Observation` records
+`detcore_tree`, `provenance`, `depth`, `hermit_shas`, `results`, `invocations`
+and the four coordinates — **nothing about the state of the world during the
+sample**. It records what the harness did, not what the host did. So an
+`Observation` cannot distinguish:
+
+- this cell is deterministic; from
+- this cell depends on external state that happened to be quiet while we sampled.
+
+Both are written identically. The live corpus already contains an example of the
+ambiguous form: `applications/example-timed-progress-bar verify/ptrace` carries
+`results: ['pass']` from a single sample with all four coordinates null. That row
+says "it passed once". It does not say "it is stable", and nothing in the schema
+marks the difference.
+
+**Consequence for the design, not a defect to patch now.** A durable per-cell
+series built on this schema will report stability it has not measured. Two
+options, both cheap, neither adopted here because they are the owner's call:
+
+1. **Record the sampling conditions** alongside the result — at minimum a
+   coarse fingerprint of whether known-mutable inputs moved during the window.
+   Without something like it, `samples: N` is a count of runs, not of
+   independent evidence.
+2. **Deliberately perturb** during a campaign — the pressure test already
+   repeats a cell; varying the external state it is supposed to be immune to
+   turns a passive count into an actual test of the control.
+
+Option 2 is what would have caught the git-workflow cell without a mechanism
+audit. Option 1 is what makes an existing row honest about its own weight.
+
+**The narrow lesson, worth stating because it generalises:** when a change's
+purpose is to neutralise an input, prove it by showing the OBSERVATION
+disappears, not by showing the test passes. A passing test is the weakest
+evidence available for that class of change, and it is the evidence that is
+easiest to collect.
+
 ## The gap, stated exactly
 
 The gap is **not a measurer.** Three tools can already measure a flake rate,
@@ -227,6 +311,35 @@ the sequence of samples.
 ---
 
 # Part 2 — The redesign
+
+## The three moves, and where each is answered
+
+The owner named three moves. This section is the index; each is designed in full
+below.
+
+| Move | Answer | Where |
+|---|---|---|
+| **1. Min/max divergence tracking** | Already built and landed. `ObservedRange { earliest, latest, samples }` across four coordinates. The gap is not the type — it is that only 2 of 5584 cells carry an observation and only ONE carries a range, because nothing invokes the writer. | "NOTHING SCHEDULES THE PRODUCER", and requirement 4 below |
+| **2. Move records to the dev-hermit parent** | **Recommended: yes, for the SERIES.** Option C — an append-only per-cell series in the parent beside the existing ledger, with `cells.json`'s `observations` demoted to a derived projection in hermit. | "The proposal: a series in the parent, a projection in hermit" |
+| **3. Split validate from pressure-test output** | **Already split, and correctly.** The two provenances are never merged, and the boundary is enforceable in ONE place because it is two commands in one tool. The work is to ENFORCE and DOCUMENT it, not to build it. | "The single most important correction", and Phase 1 |
+
+**Move 3 is smaller than it looks, and that matters for sequencing.**
+`scorecard.rs` is the sole writer of `cells.json`. `pressure-test.rs` only reads
+the file and refuses a stale scorecard; `validate.rs` only invokes
+`verify-results`, which is read-only. So this is not two tools racing on a file
+— it is one tool with two commands, two input sources and two authorities:
+
+- `update` — manifest + `ci/expected-e2e-plan.json` → `id`, `enabled`, `status`, `ci_disabled_reason`
+- `update-observations` — a pressure-test `summary.json` → `observations[]`
+
+and since #2396 landed, a third, `observe-results`, taking a validate result
+directory to observations tagged `provenance: validate`. The two provenances
+answer different questions and the code already refuses to merge them: a
+pressure test repeats one cell at one tree to measure flakiness, while validate
+runs it once per commit to supply the regression signal.
+
+What is missing is only that the boundary is unenforced — nothing stops a future
+edit to `update` from touching `observations`. That is Phase 1, and it is small.
 
 ## What a solution has to satisfy
 
