@@ -78,6 +78,29 @@ fn replay_root(pid: Pid) -> Option<PathBuf> {
     std::fs::canonicalize(format!("/proc/{}/root", pid.as_raw())).ok()
 }
 
+fn same_guest_open_file_description(
+    pid: Pid,
+    left: libc::c_int,
+    right: libc::c_int,
+) -> io::Result<bool> {
+    const KCMP_FILE: libc::c_int = 0;
+    let comparison = unsafe {
+        libc::syscall(
+            libc::SYS_kcmp,
+            pid.as_raw(),
+            pid.as_raw(),
+            KCMP_FILE,
+            left,
+            right,
+        )
+    };
+    if comparison == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(comparison == 0)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ReplayFileIdentity {
     device: u64,
@@ -330,6 +353,7 @@ impl Tool for Replayer {
         // FIXME: Figure out a way to avoid duplicate code. (Merge record/replay
         // into a single tool?)
         Ok(match syscall {
+            // AUTONOMOUS-BOT-IMPLEMENTED
             Syscall::Execve(_) | Syscall::Execveat(_) => self.handle_exec(guest, syscall).await,
             Syscall::Brk(_) => self.let_through(guest, syscall).await,
             Syscall::Mprotect(_) => self.let_through(guest, syscall).await,
@@ -393,13 +417,8 @@ impl Tool for Replayer {
             Syscall::Getdents64(syscall) => self.handle_getdents64(guest, syscall).await,
             Syscall::Mmap(syscall) => self.handle_mmap(guest, syscall).await,
             Syscall::Munmap(_) => self.let_through(guest, syscall).await,
-            Syscall::Open(call) => {
-                self.handle_virtual_fd_create(guest, syscall, call.flags())
-                    .await
-            }
-            Syscall::Openat(call) => {
-                self.handle_virtual_fd_create(guest, syscall, call.flags())
-                    .await
+            Syscall::Open(_) | Syscall::Openat(_) => {
+                self.handle_virtual_fd_create(guest, syscall).await
             }
             Syscall::Openat2(call) => self.handle_openat2(guest, call).await,
             Syscall::Close(_) => self.handle_close(guest, syscall).await,
@@ -472,10 +491,10 @@ impl Tool for Replayer {
             Syscall::Getrandom(syscall) => self.handle_getrandom(guest, syscall).await,
             Syscall::Readlink(syscall) => self.handle_readlink(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#653)
             Syscall::Mkdir(_) => self.handle_mkdir(guest, syscall, false).await,
             Syscall::Unlink(_) => self.handle_optional_path_removal(guest, syscall).await,
             Syscall::Unlinkat(call) => self.handle_unlinkat(guest, call).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             Syscall::Mkdirat(_) => self.handle_mkdir(guest, syscall, true).await,
             Syscall::Mknodat(_)
             | Syscall::Fchownat(_)
@@ -491,6 +510,7 @@ impl Tool for Replayer {
         }?)
     }
 
+    // TODO-HUMAN-REVIEW(#2370)
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
         guest.thread_state_mut().bootstrapped = true;
         Ok(())
@@ -506,6 +526,7 @@ impl Tool for Replayer {
 }
 
 impl Replayer {
+    // TODO-HUMAN-REVIEW(#2370)
     async fn handle_exec<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -693,6 +714,205 @@ impl Replayer {
         }
     }
 
+    // TODO-HUMAN-REVIEW(#2370)
+    async fn preserve_materialized_exec_descriptor<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        descriptor: &crate::event::ExecDescriptor,
+        image: &crate::event::ExecImage,
+    ) -> io::Result<bool> {
+        let target_path = format!("/proc/{}/fd/{}", guest.pid().as_raw(), descriptor.target_fd);
+        let target_metadata = match std::fs::metadata(&target_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if !target_metadata.file_type().is_file()
+            || !materialized_file_is_registered(guest.pid(), &target_metadata)
+        {
+            return Ok(false);
+        }
+
+        let mut actual_status = guest
+            .inject_with_retry(
+                Fcntl::new()
+                    .with_fd(descriptor.target_fd)
+                    .with_cmd(FcntlCmd::F_GETFL),
+            )
+            .await
+            .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?
+            as libc::c_int;
+        const SETTABLE_STATUS_FLAGS: libc::c_int =
+            libc::O_APPEND | libc::O_ASYNC | libc::O_DIRECT | libc::O_NOATIME | libc::O_NONBLOCK;
+        if actual_status & !SETTABLE_STATUS_FLAGS
+            != descriptor.status_flags & !SETTABLE_STATUS_FLAGS
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "materialized exec descriptor immutable status flags differ: expected {:#x}, found {actual_status:#x}",
+                    descriptor.status_flags
+                ),
+            ));
+        }
+        if actual_status != descriptor.status_flags {
+            let normalized = (actual_status & !SETTABLE_STATUS_FLAGS)
+                | (descriptor.status_flags & SETTABLE_STATUS_FLAGS);
+            let result = guest
+                .inject_with_retry(
+                    Fcntl::new()
+                        .with_fd(descriptor.target_fd)
+                        .with_cmd(FcntlCmd::F_SETFL(normalized)),
+                )
+                .await;
+            if result != Ok(0) {
+                return Err(io::Error::other(format!(
+                    "could not restore materialized exec descriptor status flags: {result:?}"
+                )));
+            }
+            actual_status = guest
+                .inject_with_retry(
+                    Fcntl::new()
+                        .with_fd(descriptor.target_fd)
+                        .with_cmd(FcntlCmd::F_GETFL),
+                )
+                .await
+                .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?
+                as libc::c_int;
+            if actual_status != descriptor.status_flags {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "materialized exec descriptor status flags differ after F_SETFL: expected {:#x}, found {actual_status:#x}",
+                        descriptor.status_flags
+                    ),
+                ));
+            }
+        }
+
+        let actual_offset = guest
+            .inject_with_retry(
+                Lseek::new()
+                    .with_fd(descriptor.target_fd)
+                    .with_offset(0)
+                    .with_whence(Whence::SEEK_CUR),
+            )
+            .await;
+        match (descriptor.offset, actual_offset) {
+            (Some(expected), Ok(actual)) if actual == expected => {}
+            (Some(expected), Ok(actual)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "materialized exec descriptor offset differs: expected {expected}, found {actual}"
+                    ),
+                ));
+            }
+            (Some(_), Err(error)) => {
+                return Err(io::Error::from_raw_os_error(error.into_raw()));
+            }
+            (None, Err(Errno::EBADF | Errno::ESPIPE)) => {}
+            (None, Err(error)) => {
+                return Err(io::Error::from_raw_os_error(error.into_raw()));
+            }
+            (None, Ok(actual)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "materialized exec descriptor unexpectedly has seekable offset {actual}"
+                    ),
+                ));
+            }
+        }
+
+        let pinned = crate::record_replay_path::open_process_fd(guest.pid(), descriptor.target_fd)?;
+        let identity = crate::record_replay_path::file_identity(pinned.as_raw_fd())?;
+        if !crate::record_replay_path::is_regular_file(identity) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "materialized exec descriptor is not a regular file",
+            ));
+        }
+        if identity.mode & 0o7777 != image.mode {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "materialized exec descriptor mode differs: expected {:o}, found {:o}",
+                    image.mode,
+                    identity.mode & 0o7777
+                ),
+            ));
+        }
+        let actual_digest = detcore::Digest::digest_reader(
+            crate::record_replay_path::open_readable_fd(pinned.as_raw_fd())?,
+        )?;
+        if actual_digest != image.digest {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "materialized exec descriptor digest differs: expected {}, found {}",
+                    image.digest, actual_digest
+                ),
+            ));
+        }
+
+        let mut expected_aliases = descriptor
+            .aliases
+            .iter()
+            .map(|alias| (alias.fd, alias.descriptor_flags))
+            .collect::<Vec<_>>();
+        expected_aliases.sort_unstable();
+        let original_count = expected_aliases.len();
+        expected_aliases.dedup_by_key(|alias| alias.0);
+        if expected_aliases.len() != original_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "recorded exec descriptor contains duplicate aliases",
+            ));
+        }
+
+        let target_identity = ReplayFileIdentity::from_metadata(&target_metadata);
+        let mut actual_aliases = Vec::new();
+        for entry in std::fs::read_dir(format!("/proc/{}/fd", guest.pid().as_raw()))? {
+            let entry = entry?;
+            let Some(fd) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<libc::c_int>().ok())
+            else {
+                continue;
+            };
+            let metadata = match std::fs::metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if ReplayFileIdentity::from_metadata(&metadata) != target_identity {
+                continue;
+            }
+            if same_guest_open_file_description(guest.pid(), descriptor.target_fd, fd)? {
+                let descriptor_flags = guest
+                    .inject_with_retry(Fcntl::new().with_fd(fd).with_cmd(FcntlCmd::F_GETFD))
+                    .await
+                    .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?
+                    as libc::c_int;
+                actual_aliases.push((fd, descriptor_flags));
+            }
+        }
+        actual_aliases.sort_unstable();
+        if actual_aliases != expected_aliases {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "materialized exec descriptor aliases differ: expected {expected_aliases:?}, found {actual_aliases:?}"
+                ),
+            ));
+        }
+
+        Ok(true)
+    }
+
+    // TODO-HUMAN-REVIEW(#2370)
     async fn restore_exec_descriptor<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -725,6 +945,12 @@ impl Replayer {
                     ),
                 ));
             }
+        }
+        if self
+            .preserve_materialized_exec_descriptor(guest, descriptor, image)
+            .await?
+        {
+            return Ok(());
         }
 
         let root = crate::record_replay_path::open_process_root(guest.pid())?;
@@ -1020,23 +1246,39 @@ impl Replayer {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#662): Audit replay path confinement.
-    fn open_path_in_replay_root<G: Guest<Self>>(
+    fn open_request<G: Guest<Self>>(
         &self,
         guest: &G,
         syscall: Syscall,
-    ) -> Option<PathBuf> {
-        let (dirfd, path) = match syscall {
+    ) -> io::Result<(libc::c_int, PathBuf, OFlag)> {
+        let request = match syscall {
             Syscall::Open(call) => (
                 libc::AT_FDCWD,
-                call.path().and_then(|path| path.read(&guest.memory()).ok()),
+                call.path()
+                    .ok_or_else(|| io::Error::from_raw_os_error(libc::EFAULT))?
+                    .read(&guest.memory())
+                    .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?,
+                call.flags(),
             ),
             Syscall::Openat(call) => (
                 call.dirfd(),
-                call.path().and_then(|path| path.read(&guest.memory()).ok()),
+                call.path()
+                    .ok_or_else(|| io::Error::from_raw_os_error(libc::EFAULT))?
+                    .read(&guest.memory())
+                    .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?,
+                call.flags(),
             ),
-            _ => return None,
+            _ => unreachable!("open replay path requested for {syscall:?}"),
         };
-        let path = path?;
+        Ok(request)
+    }
+
+    fn open_path_in_replay_root<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        dirfd: libc::c_int,
+        path: &Path,
+    ) -> Option<PathBuf> {
         let root = replay_root(guest.pid())?;
 
         let candidate = if let Ok(relative) = path.strip_prefix(Path::new("/")) {
@@ -1064,49 +1306,100 @@ impl Replayer {
         resolved.starts_with(&root).then_some(resolved)
     }
 
+    fn materialize_recorded_directory<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        syscall: Syscall,
+        dirfd: libc::c_int,
+        path: &Path,
+        flags: OFlag,
+    ) -> io::Result<bool> {
+        let root = crate::record_replay_path::open_process_root(guest.pid())?;
+        let start = if path.is_absolute() {
+            crate::record_replay_path::open_process_root(guest.pid())?
+        } else if dirfd == libc::AT_FDCWD {
+            crate::record_replay_path::open_process_cwd(guest.pid())?
+        } else {
+            let start =
+                match crate::record_replay_path::open_process_directory_fd(guest.pid(), dirfd) {
+                    Ok(start) => start,
+                    Err(error) if error.raw_os_error() == Some(libc::ENOTDIR) => {
+                        tracing::debug!(
+                            ?syscall,
+                            "recorded open directory base is a virtual replay descriptor"
+                        );
+                        return Ok(false);
+                    }
+                    Err(error) => return Err(error),
+                };
+            match crate::record_replay_path::directory_is_beneath(&root, &start)? {
+                true => {}
+                false => {
+                    tracing::debug!(
+                        ?syscall,
+                        "recorded open directory base is not confined to replay root"
+                    );
+                    return Ok(false);
+                }
+            }
+            start
+        };
+        if flags.contains(OFlag::O_NOFOLLOW) {
+            crate::record_replay_path::ensure_directory_path(&root, &start, path)?;
+        } else {
+            crate::record_replay_path::ensure_directory_path_follow_final(&root, &start, path)?;
+        }
+        Ok(true)
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#662): Audit replay-root file and directory materialization.
     async fn handle_virtual_fd_create<G: Guest<Self>>(
         &self,
         guest: &mut G,
         syscall: Syscall,
-        flags: OFlag,
     ) -> Result<i64, Errno> {
         let event = next_event!(guest, Open)?;
         let recorded = event.result;
         if let Ok(fd) = recorded {
-            let candidate = (event.materialize != OpenMaterialization::None)
-                .then(|| self.open_path_in_replay_root(guest, syscall))
-                .flatten();
-            if let Some(candidate) = &candidate {
-                if event.materialize == OpenMaterialization::Directory {
-                    let _ = std::fs::create_dir_all(candidate);
-                } else if flags.contains(OFlag::O_CREAT)
-                    && let Some(parent) = candidate.parent()
-                {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-            }
-            let materialize = candidate.as_ref().is_some_and(|candidate| {
-                if flags.contains(OFlag::O_TMPFILE) {
-                    return candidate.is_dir();
-                }
-                match (event.materialize, std::fs::metadata(candidate)) {
-                    (OpenMaterialization::Directory, Ok(metadata)) => metadata.file_type().is_dir(),
-                    (OpenMaterialization::RegularFile, Ok(metadata))
-                        if metadata.file_type().is_file() =>
-                    {
-                        materialized_file_is_registered(guest.pid(), &metadata)
-                    }
-                    (OpenMaterialization::RegularFile, Err(error))
-                        if error.kind() == std::io::ErrorKind::NotFound
-                            && flags.contains(OFlag::O_CREAT) =>
-                    {
-                        true
-                    }
-                    _ => false,
-                }
+            let (dirfd, path, flags) = self.open_request(guest, syscall).unwrap_or_else(|error| {
+                panic!("could not decode successful recorded open: {error}")
             });
+            let candidate = (event.materialize == OpenMaterialization::RegularFile)
+                .then(|| self.open_path_in_replay_root(guest, dirfd, &path))
+                .flatten();
+            if let Some(candidate) = &candidate
+                && flags.contains(OFlag::O_CREAT)
+                && let Some(parent) = candidate.parent()
+            {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let materialize = if event.materialize == OpenMaterialization::Directory {
+                self.materialize_recorded_directory(guest, syscall, dirfd, &path, flags)
+                    .unwrap_or_else(|error| {
+                        panic!("failed to materialize recorded open directory: {error}")
+                    })
+            } else {
+                candidate.as_ref().is_some_and(|candidate| {
+                    if flags.contains(OFlag::O_TMPFILE) {
+                        return candidate.is_dir();
+                    }
+                    match (event.materialize, std::fs::metadata(candidate)) {
+                        (OpenMaterialization::RegularFile, Ok(metadata))
+                            if metadata.file_type().is_file() =>
+                        {
+                            materialized_file_is_registered(guest.pid(), &metadata)
+                        }
+                        (OpenMaterialization::RegularFile, Err(error))
+                            if error.kind() == std::io::ErrorKind::NotFound
+                                && flags.contains(OFlag::O_CREAT) =>
+                        {
+                            true
+                        }
+                        _ => false,
+                    }
+                })
+            };
             if materialize {
                 match guest.inject_with_retry(syscall).await {
                     Ok(actual) => {
@@ -1172,20 +1465,23 @@ impl Replayer {
         }
 
         let start = if dirfd == libc::AT_FDCWD {
-            crate::record_replay_path::open_process_cwd(guest.pid())
+            crate::record_replay_path::open_process_cwd(guest.pid())?
         } else {
-            crate::record_replay_path::open_process_directory_fd(guest.pid(), dirfd)
+            match crate::record_replay_path::open_process_directory_fd(guest.pid(), dirfd) {
+                Ok(start) => start,
+                Err(error) if error.raw_os_error() == Some(libc::ENOTDIR) => {
+                    tracing::debug!(
+                        ?syscall,
+                        "recorded mkdir directory base is a virtual replay descriptor"
+                    );
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            }
         };
-        let Ok(start) = start else {
-            tracing::debug!(
-                ?syscall,
-                "recorded mkdir directory has no live replay directory base"
-            );
-            return Ok(false);
-        };
-        match crate::record_replay_path::directory_is_beneath(&root, &start) {
-            Ok(true) => {}
-            Ok(false) | Err(_) => {
+        match crate::record_replay_path::directory_is_beneath(&root, &start)? {
+            true => {}
+            false => {
                 tracing::debug!(
                     ?syscall,
                     "recorded mkdir directory base is not confined to replay root"
@@ -1197,6 +1493,7 @@ impl Replayer {
         Ok(true)
     }
 
+    // TODO-HUMAN-REVIEW(#2370)
     /// Replays successful mkdir side effects exactly as before. For a recorded
     /// `EEXIST` caused by a directory, it reconstructs that directory in the
     /// fresh chroot while still returning the recorded error to the guest.

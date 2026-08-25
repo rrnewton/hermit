@@ -28,7 +28,6 @@ use reverie::process::Output;
 use reverie::process::Stdio;
 
 use crate::chroot::TempChroot;
-use crate::consts::EXE_NAME;
 use crate::consts::EXEC_FILES_NAME;
 use crate::consts::METADATA_NAME;
 use crate::error::Context;
@@ -97,12 +96,13 @@ impl Replay {
         let config = record_or_replay_config(dir);
         let sequentialize_threads = config.sequentialize_threads;
 
-        let (chroot, bootstrap_program, materialization_scope) =
-            prepare_chroot(dir, &metadata).context("Failed to create chroot environment")?;
+        let (chroot, bootstrap_program, materialization_scope, replay_mounts) =
+            prepare_chroot(dir, &metadata, mounts)
+                .context("Failed to create chroot environment")?;
         // `Command::program` resets argv[0], so restore the recorded value.
         command.program(&bootstrap_program).arg0(&metadata.arg0);
 
-        for mount in prepare_replay_mounts(&chroot, mounts)? {
+        for mount in replay_mounts {
             command.mount(mount);
         }
 
@@ -124,14 +124,8 @@ impl Replay {
         // Pre-creating the target keeps the child's pre-exec path allocation-free.
         let fbcode = Path::new("/usr/local/fbcode");
         if fbcode.exists() {
-            let replay_root = crate::record_replay_path::open_directory_path(chroot.path())
-                .context("Failed to pin replay root for fbcode mount target")?;
-            crate::record_replay_path::ensure_directory_path_follow_final(
-                &replay_root,
-                &replay_root,
-                fbcode,
-            )
-            .context("Failed to create fbcode bind-mount target in chroot")?;
+            // prepare_chroot created this target before recorded symlinks were
+            // installed, so the controller-visible mount path cannot escape.
             let target = chroot.path().join("usr/local/fbcode");
             command.mount(Mount::bind(fbcode, &target).readonly());
             command.mount(
@@ -229,12 +223,24 @@ fn prepare_replay_mounts(chroot: &TempChroot, mounts: &[Mount]) -> io::Result<Ve
 fn prepare_chroot(
     dir: &Path,
     metadata: &Metadata,
+    mounts: &[Mount],
 ) -> io::Result<(
     TempChroot,
     PathBuf,
     crate::replayer::ReplayMaterializationScope,
+    Vec<Mount>,
 )> {
     let chroot = TempChroot::new_in(dir)?;
+
+    // Mount targets must be created before recorded paths install symlinks.
+    // prepare_replay_mounts uses controller-side path traversal, which is safe
+    // only while this new chroot is empty; afterward a recorded absolute
+    // symlink could redirect target creation outside the replay root.
+    let replay_mounts = prepare_replay_mounts(&chroot, mounts)?;
+    let fbcode = Path::new("/usr/local/fbcode");
+    if fbcode.exists() {
+        chroot.create_dir_all(fbcode)?;
+    }
     let replay_root = crate::record_replay_path::open_directory_path(chroot.path())?;
     let materialization_scope =
         crate::replayer::ReplayMaterializationScope::new(replay_root.as_raw_fd())?;
@@ -254,7 +260,10 @@ fn prepare_chroot(
         ));
     };
     let target_path = PathBuf::from(OsString::from_vec(target.path.clone()));
-    let root_snapshot = fs::canonicalize(dir.join(EXE_NAME))?;
+    let root_snapshot = fs::canonicalize(
+        dir.join(EXEC_FILES_NAME)
+            .join(bootstrap.executable.digest.to_string()),
+    )?;
     let canonical_chroot = fs::canonicalize(chroot.path())?;
     let controller_relative =
         padded_bootstrap_path(&canonical_chroot, bootstrap.request.path.len())?;
@@ -283,7 +292,6 @@ fn prepare_chroot(
         &bootstrap.executable,
         true,
     )?;
-
     stage_recorded_exec_image(
         &replay_root,
         &replay_root,
@@ -332,7 +340,12 @@ fn prepare_chroot(
 
     ensure_replay_standard_directories(&replay_root)?;
 
-    Ok((chroot, bootstrap_program, materialization_scope))
+    Ok((
+        chroot,
+        bootstrap_program,
+        materialization_scope,
+        replay_mounts,
+    ))
 }
 
 /// Chooses a controller-visible pathname whose byte length is at least the
@@ -353,11 +366,9 @@ fn padded_bootstrap_path(chroot: &Path, minimum_absolute_len: usize) -> io::Resu
             relative.push("e".repeat(final_len));
             break;
         }
-
         let directory_len = (final_len - COMPONENT_LIMIT).min(COMPONENT_LIMIT);
         relative.push("p".repeat(directory_len));
     }
-
     let absolute_len = chroot.join(&relative).as_os_str().as_bytes().len();
     if absolute_len < minimum_absolute_len || absolute_len >= libc::PATH_MAX as usize {
         return Err(io::Error::new(
@@ -389,30 +400,29 @@ fn ensure_replay_standard_directories(replay_root: &OwnedFd) -> io::Result<()> {
     )
 }
 
-/// Reads the root thread's first event without consuming the stream used by the
-/// runtime replayer. The root DetTid is fixed by Detcore's namespace contract.
+/// Reads the root thread's first successful exec without consuming the stream
+/// used by the runtime replayer. Valid pre-exec events remain in that independent
+/// runtime stream. The first successful exec is validated immediately so a later
+/// exec cannot mask a corrupt bootstrap record.
 fn read_bootstrap_exec_event(dir: &Path, metadata: &Metadata) -> io::Result<ExecEvent> {
     let root_tid = Tid::from_raw(detcore::ROOT_DETPID.as_raw());
     let mut events = EventReader::open(dir, root_tid)?;
-    let event = events.next_event().map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("could not decode recorded bootstrap event: {error}"),
-        )
-    })?;
-    let exec = match event.event {
-        Ok(SyscallEvent::Exec(exec)) => exec,
-        Ok(other) => {
-            return Err(io::Error::new(
+    let mut count = 0_u64;
+    let exec = loop {
+        let event = events.next_event().map_err(|error| {
+            io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("first root event is not a successful exec: {other:?}"),
-            ));
-        }
-        Err(error) => {
-            return Err(io::Error::new(
+                format!("no successful root exec after {count} events: {error}"),
+            )
+        })?;
+        count = count.checked_add(1).ok_or_else(|| {
+            io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("recorded bootstrap exec failed: {error}"),
-            ));
+                "root event count overflow before successful exec",
+            )
+        })?;
+        if let Ok(SyscallEvent::Exec(exec)) = event.event {
+            break exec;
         }
     };
     let expected_path = metadata.exe.as_os_str().as_bytes();
@@ -637,6 +647,21 @@ mod tests {
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].get_target(), chroot.path().join("test"));
         assert!(chroot.path().join("test").is_dir());
+    }
+
+    #[test]
+    fn mount_targets_preempt_recorded_symlink_redirection() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let chroot = TempChroot::new_in(data_dir.path()).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let mounts = prepare_replay_mounts(&chroot, &[Mount::tmpfs("/work/inside")]).unwrap();
+
+        assert_eq!(mounts[0].get_target(), chroot.path().join("work/inside"));
+        assert!(chroot.path().join("work/inside").is_dir());
+        let error = std::os::unix::fs::symlink(outside.path(), chroot.path().join("work"))
+            .expect_err("a later recorded symlink must not replace a prepared mount path");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(!outside.path().join("inside").exists());
     }
 
     #[test]

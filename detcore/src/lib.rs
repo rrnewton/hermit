@@ -1570,6 +1570,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             guest.memory().write_value(ptr, &bytes)?;
         }
 
+        // Successful exec never returns through handle_syscall_event, so the
+        // nested recorder/replayer needs this callback to commit or retire its
+        // pending exec state before the replacement image issues another exec.
+        self.record_or_replay
+            .handle_post_exec(&mut guest.into_guest())
+            .await?;
+
         self.post_handler_hook(guest).await;
         Ok(())
     }

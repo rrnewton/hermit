@@ -345,6 +345,7 @@ fn canonical_record_replay_command(name: &str, program: &Path, args: &[&OsStr]) 
             "start",
             "--strict",
             "--verify",
+            "--verify-strict",
             "--record-timeout=30",
         ])
         .arg(format!("--verify-json={}", verdict_path.display()))
@@ -448,6 +449,43 @@ fn record_then_mutate_and_replay_command<F>(
     assert_eq!(
         record_output.stdout, replay_output.stdout,
         "replayed guest stdout did not match after host-path mutation for {name}"
+    );
+}
+
+#[test]
+fn record_rejects_initial_executable_without_shebang() {
+    let _guard = hermit_record_lock();
+    let fixture = tempfile::tempdir().expect("failed to create ENOEXEC fixture");
+    let executable = fixture.path().join("missing-shebang");
+    fs::write(&executable, "printf 'must-not-run\n'\n").expect("failed to write ENOEXEC fixture");
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+        .expect("failed to mark ENOEXEC fixture executable");
+    let data_dir = tempfile::tempdir().expect("failed to create recording directory");
+
+    let output = Command::new("timeout")
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "record", "start", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg("--")
+        .arg(&executable)
+        .output()
+        .expect("failed to start ENOEXEC recording");
+
+    assert!(
+        !output.status.success(),
+        "ENOEXEC recording unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("does not support execvpe shell fallback")
+            && stderr.contains("add an explicit shebang"),
+        "ENOEXEC recording did not explain the unsupported fallback:
+{stderr}"
+    );
+    assert!(
+        !data_dir.path().join("last").exists(),
+        "failed ENOEXEC recording was published as replayable"
     );
 }
 
@@ -1652,6 +1690,22 @@ fn record_poll_invalid_nfds_preserves_einval() {
         "poll and ppoll invalid nfds",
         &workload("c_record_replay_poll_partial_copyout").path,
         &[OsStr::new("invalid-nfds")],
+    );
+}
+
+/// Replayer substitutes an eventfd for this proc descriptor. The Detcore
+/// procfs layer must bind the live task incarnation named by an absolute or
+/// AT_FDCWD-relative path rather than the placeholder inode. Zero-length
+/// read/pread and pre-snapshot lseek must remain entirely virtual, then one
+/// timer-slack scalar must compose across proc read/write and prctl access in
+/// both phases.
+#[test]
+fn record_timer_slack_proc_read_write() {
+    let _guard = hermit_record_lock();
+    record_replay_strict_command(
+        "timer-slack-proc-read-write",
+        &workload("c_timerslack_proc_record_replay").path,
+        &[],
     );
 }
 

@@ -227,14 +227,23 @@ struct OutputIdentity {
 enum MkdirProbeDisposition {
     Directory(i64),
     NotDirectory,
-    Unavailable(Errno),
 }
 
-fn classify_mkdir_probe(result: Result<i64, Errno>) -> MkdirProbeDisposition {
+fn classify_mkdir_probe(result: Result<i64, Errno>) -> Result<MkdirProbeDisposition, Errno> {
     match result {
-        Ok(fd) => MkdirProbeDisposition::Directory(fd),
-        Err(Errno::ENOENT | Errno::ENOTDIR | Errno::ELOOP) => MkdirProbeDisposition::NotDirectory,
-        Err(error) => MkdirProbeDisposition::Unavailable(error),
+        Ok(fd) => Ok(MkdirProbeDisposition::Directory(fd)),
+        Err(Errno::ENOENT | Errno::ENOTDIR | Errno::ELOOP) => {
+            Ok(MkdirProbeDisposition::NotDirectory)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn require_mkdir_probe_closed(result: Result<i64, Errno>) -> Result<(), Errno> {
+    match result {
+        Ok(0) => Ok(()),
+        Ok(_) => Err(Errno::EIO),
+        Err(error) => Err(error),
     }
 }
 
@@ -437,6 +446,7 @@ impl Tool for Recorder {
         self.record_raw_syscall(guest, syscall);
 
         Ok(match syscall {
+            // AUTONOMOUS-BOT-IMPLEMENTED
             Syscall::Execve(_) | Syscall::Execveat(_) => self.handle_exec(guest, syscall).await,
             Syscall::Brk(_) => self.let_through(guest, syscall).await,
             Syscall::Mprotect(_) => self.let_through(guest, syscall).await,
@@ -509,6 +519,7 @@ impl Tool for Recorder {
             Syscall::Open(_) | Syscall::Openat(_) => self.handle_open(guest, syscall).await,
             Syscall::Close(_) => self.handle_fd_table_mutation(guest, syscall).await,
             Syscall::Openat2(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             Syscall::Mkdirat(_) => self.handle_mkdir(guest, syscall).await,
             Syscall::Mknodat(_)
             | Syscall::Fchownat(_)
@@ -557,6 +568,7 @@ impl Tool for Recorder {
             }
             Syscall::Getrandom(syscall) => self.handle_getrandom(guest, syscall).await,
             Syscall::Readlink(syscall) => self.handle_readlink(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             Syscall::Mkdir(_) => self.handle_mkdir(guest, syscall).await,
             Syscall::Unlink(_) => self.handle_simple(guest, syscall).await,
             Syscall::Unlinkat(_) => self.handle_simple(guest, syscall).await,
@@ -566,6 +578,7 @@ impl Tool for Recorder {
         }?)
     }
 
+    // TODO-HUMAN-REVIEW(#2370)
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
         let result = match guest.thread_state_mut().pending_exec.take() {
             Some(PreparedExec::Ready(event)) => {
@@ -631,6 +644,7 @@ impl Recorder {
         result
     }
 
+    // TODO-HUMAN-REVIEW(#2370)
     /// Records enough information to distinguish the two guest-visible
     /// `EEXIST` cases: an already-existing directory needs to be reconstructed
     /// in the fresh replay root, while a file or symlink must remain an error
@@ -641,8 +655,17 @@ impl Recorder {
         syscall: Syscall,
     ) -> Result<i64, Errno> {
         let result = guest.inject(syscall).await;
-        let existing_directory =
-            result == Err(Errno::EEXIST) && self.mkdir_target_is_directory(guest, syscall).await;
+        let existing_directory = if result == Err(Errno::EEXIST) {
+            self.mkdir_target_is_directory(guest, syscall)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "could not classify recorded mkdir EEXIST target without changing its meaning: {error}"
+                    )
+                })
+        } else {
+            false
+        };
         self.record_event(
             guest,
             Ok(SyscallEvent::Mkdir(MkdirEvent {
@@ -661,12 +684,10 @@ impl Recorder {
         &self,
         guest: &mut G,
         syscall: Syscall,
-    ) -> bool {
+    ) -> Result<bool, Errno> {
         let result = match syscall {
             Syscall::Mkdir(call) => {
-                let Some(path) = call.path() else {
-                    return false;
-                };
+                let path = call.path().ok_or(Errno::EFAULT)?;
                 guest
                     .inject_with_retry(
                         Openat::new()
@@ -682,9 +703,7 @@ impl Recorder {
                     .await
             }
             Syscall::Mkdirat(call) => {
-                let Some(path) = call.path() else {
-                    return false;
-                };
+                let path = call.path().ok_or(Errno::EFAULT)?;
                 guest
                     .inject_with_retry(
                         Openat::new()
@@ -701,29 +720,15 @@ impl Recorder {
             }
             _ => unreachable!("mkdir directory probe called for {syscall:?}"),
         };
-        match classify_mkdir_probe(result) {
+        match classify_mkdir_probe(result)? {
             MkdirProbeDisposition::Directory(fd) => {
                 let closed = guest
                     .inject_with_retry(Close::new().with_fd(fd as libc::c_int))
                     .await;
-                if closed == Ok(0) {
-                    true
-                } else {
-                    tracing::warn!(
-                        ?closed,
-                        "could not close mkdir EEXIST classification descriptor; leaving replay materialization disabled"
-                    );
-                    false
-                }
+                require_mkdir_probe_closed(closed)?;
+                Ok(true)
             }
-            MkdirProbeDisposition::NotDirectory => false,
-            MkdirProbeDisposition::Unavailable(error) => {
-                tracing::debug!(
-                    %error,
-                    "could not classify mkdir EEXIST target; leaving replay materialization disabled"
-                );
-                false
-            }
+            MkdirProbeDisposition::NotDirectory => Ok(false),
         }
     }
 
@@ -844,6 +849,7 @@ impl Recorder {
             .unwrap();
     }
 
+    // TODO-HUMAN-REVIEW(#2370)
     async fn handle_exec<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -865,10 +871,16 @@ impl Recorder {
 
         // A successful exec never returns here. Its pending event is committed
         // by handle_post_exec after Linux has replaced the image.
+        let initial_root_exec = guest.is_root_thread() && !guest.thread_state().bootstrapped;
         let result = guest.inject(syscall).await;
         let pending = guest.thread_state_mut().pending_exec.take();
         assert!(pending.is_some(), "failed exec lost its pending event");
         let error = result.expect_err("successful exec unexpectedly returned to syscall handler");
+        if initial_root_exec && error == Errno::ENOEXEC {
+            panic!(
+                "record/replay does not support execvpe shell fallback for an initial executable without a recognized format; add an explicit shebang"
+            );
+        }
         self.record_event(guest, Err(error));
         Err(error)
     }
@@ -1350,12 +1362,9 @@ mod mkdir_probe_tests {
     use super::*;
 
     #[test]
-    fn resource_and_permission_failures_disable_materialization_without_panicking() {
+    fn resource_and_permission_failures_are_not_classified_as_non_directories() {
         for error in [Errno::EMFILE, Errno::ENFILE, Errno::EACCES, Errno::EPERM] {
-            assert_eq!(
-                classify_mkdir_probe(Err(error)),
-                MkdirProbeDisposition::Unavailable(error)
-            );
+            assert_eq!(classify_mkdir_probe(Err(error)), Err(error));
         }
     }
 
@@ -1364,8 +1373,18 @@ mod mkdir_probe_tests {
         for error in [Errno::ENOENT, Errno::ENOTDIR, Errno::ELOOP] {
             assert_eq!(
                 classify_mkdir_probe(Err(error)),
-                MkdirProbeDisposition::NotDirectory
+                Ok(MkdirProbeDisposition::NotDirectory)
             );
         }
+    }
+
+    #[test]
+    fn probe_close_must_succeed_exactly() {
+        assert_eq!(require_mkdir_probe_closed(Ok(0)), Ok(()));
+        assert_eq!(require_mkdir_probe_closed(Ok(1)), Err(Errno::EIO));
+        assert_eq!(
+            require_mkdir_probe_closed(Err(Errno::EINTR)),
+            Err(Errno::EINTR)
+        );
     }
 }
