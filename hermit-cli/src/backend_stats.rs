@@ -19,9 +19,32 @@ use crate::Backend;
 const TARGET: &str = "hermit::backend_stats";
 
 pub(crate) fn request() -> BackendStatsRequest {
-    BackendStatsRequest::new(tracing::enabled!(target: TARGET, tracing::Level::INFO))
+    BackendStatsRequest::new(tracing::enabled!(target: TARGET, tracing::Level::DEBUG))
 }
 
+/// Report the selected backend's own run statistics.
+///
+/// ⚠️ THIS RECORD IS EMITTED AT DEBUG, NOT INFO, AND THAT IS LOAD-BEARING.
+/// `ComparedLogScope::Info` is the `BitwiseInfoV1` parity envelope — "every INFO
+/// message, exactly" — so anything emitted here at INFO is compared between two
+/// runs as though it were guest behaviour. This record is not guest behaviour:
+/// it is hermit describing its own harness, and BOTH its fields identify the
+/// harness rather than the guest. `backend` is the backend's name, and `stats`
+/// is that backend's own instrumentation (`metrics=none` for ptrace, patch-shape
+/// counters for e9patch, and so on).
+///
+/// Measured on a real `ptrace` run before this change: of 303 INFO records, this
+/// was the ONE record naming a backend. So two backends executing an identical
+/// guest could never agree under the Info envelope, however correct the backends
+/// were — a divergence by construction rather than a behavioural difference, and
+/// the only such record in the stream.
+///
+/// Same-backend verification prints the same values on both sides, so nothing
+/// was red; the ceiling was on any future cross-backend comparison. DEBUG keeps
+/// the record fully available to `--log debug` while removing it from the
+/// envelope that is compared, which is the narrow fix. Widening or renaming the
+/// Info scope itself would change what a published parity claim MEANS, and that
+/// is an owner decision, not this one.
 pub(crate) fn report<S>(selected_backend: Backend, request: BackendStatsRequest, source: &S)
 where
     S: BackendStatsSource,
@@ -34,7 +57,7 @@ where
         S::Snapshot::BACKEND_NAME,
         "backend statistics source does not match selected backend"
     );
-    tracing::info!(
+    tracing::debug!(
         target: TARGET,
         backend = %selected_backend.as_str(),
         stats = %snapshot,
