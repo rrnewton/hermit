@@ -500,6 +500,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/pipe_capacity_pin.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (ptrace verify; ci=true)",
+      "why": "tests/backend-parity/fixtures/pipe_capacity_pin.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml: canonical ptrace strict verification requires every Detcore-created scheduler pipe to expose the fixed 8192-byte capacity instead of the host default"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/pipe_ipc.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/pipe_ipc.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
