@@ -298,6 +298,36 @@ one in your worktree reports `DBT support was not included in this build`. Probe
 the binaries you have before concluding a backend is unmeasurable; state which
 binary and which commit produced any number you report.
 
+#### The feature-flag message is NOT DBT-specific, and it is nobody's fault
+
+The same wording appears for every gated backend, so do not read it as the
+manufactured-reds case. Measured 2026-08-25 on one box, two builds of the same
+repository:
+
+```
+hermit/target/debug/hermit   --backend sabre  ->  WARN hermit::sabre: :: Backend:
+                                                  sabre static rewriting + ptrace runtime
+hermit/target/release/hermit --backend sabre  ->  Error: backend `sabre` is
+                                                  unavailable: SaBRe support was
+                                                  not included in this build
+```
+
+**Same host, same source, opposite answers** — the difference is the feature flag
+the binary was built with, nothing else.
+
+This is the *inverse* of the trap above and needs saying because the next reader
+will meet the message and reach for the manufactured-reds explanation. Four wrong
+verdicts in one night came from an absent backend being read as failure; this is
+an absence with a **benign cause**, correctly attributable to **nobody** — not the
+branch, not `main`, not the host.
+
+Two consequences worth acting on:
+
+- **`unavailable: … not included in this build` is a statement about your binary.**
+  It is not evidence about the pull request and must never be recorded against it.
+- **Probe every hermit binary on the box before declaring a backend unmeasurable.**
+  The build that lacks the backend is often not the only one present.
+
 ### 8. Look for a policy that declares the thing intentional, before calling it a defect
 
 ⚠️ **A line read in isolation cannot tell you whether it is an oversight or a
@@ -442,6 +472,52 @@ the headline constant and its call site; the descriptor-cleanup path in the
 **error branch** was absent from `main` and was missed. Diff the error paths,
 and check distinctive string literals as well as symbols — on `#2436` that meant
 210 literals grepped against `main`, of which 0 were absent.
+
+### 11. What the change DEPENDS ON, not only what it changes
+
+Checks 1 to 3 ask what a change contains and whether `main` already has it. This
+one asks the opposite question about the residual you decided to extract: **does
+the piece you are lifting out still work once separated from the piece you left
+behind?**
+
+A salvage branch is usually assessed file by file, and extraction is proposed the
+same way — take the good test, drop the superseded code. That is exactly where
+this fails, because **a test and the change that makes it pass are one unit even
+when they sit in different files.**
+
+Measured on [hermit#2339](https://github.com/rrnewton/hermit/pull/2339). Its
+residual contained a genuinely valuable test strengthening: `main` already asserts
+*exactly one* `scheduler-empty` and *exactly one* `fallback-completed`, and the
+branch adds the same for `SCHEDULER_FIZZLE` and `BACKEND_EVIDENCE` plus a four-way
+ordering assertion. Clean, self-contained, 13 lines, an obvious extract.
+
+**It is not extractable alone.** The exactly-once-fizzle assertion is true only
+because of the branch's *other* change — relocating the empty-system diagnostic
+out of `step2_process_blocked` to the scheduler loop's single terminal exit. That
+code change is superseded (`main` resolved the same double-emission by keeping the
+`step2` site instead) and should NOT be ported. Lift the test out on its own and
+you assert a property whose cause you deliberately left behind.
+
+The failure mode is quiet: the extracted piece reviews well, merges cleanly, and
+reds the suite on a claim nobody connected to the omitted half.
+
+So before extracting a residual, ask:
+
+- **Does this assert or rely on behaviour the SAME BRANCH introduced elsewhere?**
+  Grep the branch's other files for the symbol, log string, or constant the piece
+  keys on. A test naming `SCHEDULER_FIZZLE` wants whatever emits it.
+- **Is the thing it depends on part of what you are dropping?** If yes, the
+  residual is not two items, it is one item with a decision attached.
+- **Can you establish the dependency holds on `main` as-is?** If you cannot
+  measure it, say so rather than extracting hopefully. On #2339 that question was
+  left open honestly: `/bin/true` under SaBRe never reaches the fizzle path, so
+  settling it needs the test's own example guest.
+
+This is check 8's cousin. Check 8 stops you calling an intentional line a defect;
+this stops you lifting a correct line away from the thing that makes it correct.
+
+Record the coupling in the disposition. "Extract the test" is not a disposition;
+"extract the test **once the emission-site question is settled**" is.
 
 ## Verdict vocabulary
 
