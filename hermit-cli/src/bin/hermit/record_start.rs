@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[cfg(test)]
+use std::ffi::OsStr;
 use std::fs;
 use std::num::NonZeroU64;
 use std::path::Path;
@@ -41,6 +43,8 @@ use super::container::RunGuarded;
 use super::container::deterministic_container;
 use super::global_opts::GlobalOpts;
 use super::record_envelope::RecordEnvelope;
+use super::run::BaseEnv;
+use super::run::apply_base_environment;
 use super::run::is_elf_file;
 use super::run::parse_assignment;
 use super::run::path_resolution_visits_prefix;
@@ -198,6 +202,20 @@ pub struct StartOpts {
     #[clap(short = 'e', long, value_parser = parse_assignment, value_name = "name[=val]")]
     env: Vec<(String, Option<String>)>,
 
+    /// The base environment presented to the recorded guest. This uses the
+    /// same contract as `hermit run`; record and replay must not diverge merely
+    /// because the manifest selected a different front door.
+    #[clap(long, default_value = "host", value_name = "str")]
+    base_env: BaseEnv,
+
+    /// Mount a file, directory, or fresh filesystem for recording and an immediate verify replay.
+    #[clap(long)]
+    mount: Vec<Mount>,
+
+    /// Set the working directory for both recording and replay after mounts apply.
+    #[clap(long, value_name = "path")]
+    workdir: Option<String>,
+
     /// Directory where recorded syscall data is stored.
     #[clap(long, value_name = "DIR", env = "HERMIT_DATA_DIR")]
     data_dir: Option<PathBuf>,
@@ -288,18 +306,10 @@ impl StartOpts {
     fn guest_command(&self) -> Result<Command, Error> {
         let mut command = Command::new(self.program());
         command.args(&self.args);
-        for (name, value) in &self.env {
-            if let Some(value) = value {
-                command.env(name, value);
-            } else if let Ok(value) = std::env::var(name) {
-                command.env(name, value);
-            } else {
-                anyhow::bail!(
-                    "Attempt to pass through env var {}, but it is not set in the host environment",
-                    name
-                );
-            }
+        if let Some(workdir) = &self.workdir {
+            command.current_dir(workdir);
         }
+        apply_base_environment(&mut command, &self.base_env, &self.env)?;
         Ok(command)
     }
 
@@ -379,12 +389,21 @@ impl StartOpts {
         )
     }
 
+    fn configured_container(&self) -> Result<(Container, IdentityGuard), Error> {
+        let (mut container, identity_guard) = deterministic_container()?;
+        container.mounts(self.mount.clone());
+        if let Some(workdir) = &self.workdir {
+            container.current_dir(workdir);
+        }
+        Ok((container, identity_guard))
+    }
+
     fn recording_container(
         &self,
         global: &GlobalOpts,
     ) -> Result<(Container, IdentityGuard), Error> {
         let overlay = self.prepare_e9patch_overlay(global)?;
-        let (mut container, identity_guard) = deterministic_container()?;
+        let (mut container, identity_guard) = self.configured_container()?;
         if let Some(overlay) = overlay {
             container.mount(Mount::bind(&overlay.source, &overlay.target).readonly());
             container.mount(
@@ -500,13 +519,14 @@ impl StartOpts {
         eprintln!(":: {}", "Replaying...".yellow().bold());
 
         // Replay the recording.
-        let (mut replay_container, _replay_identity_guard) = deterministic_container()?;
+        let (mut replay_container, _replay_identity_guard) = self.configured_container()?;
         let replay = replay_container
             .run_guarded(|| {
                 // Namespace init: arm the stop guards before anything else.
                 crate::container::arm_container_init_guards()?;
                 let _guard = global2.init_tracing();
-                hermit::replay_with_output(data_dir).map_err(SerializableError::from)
+                hermit::replay_with_output_and_mounts(data_dir, &self.mount)
+                    .map_err(SerializableError::from)
             })
             .context("Container exited unexpectedly")??;
 
@@ -618,13 +638,13 @@ impl StartOpts {
         // to initialize logging inside the container because it may spawn a
         // thread. If we can guarantee that tracing won't spawn a thread, then
         // that restriction be lifted.
-        let (mut container, _identity_guard) = deterministic_container()?;
+        let (mut container, _identity_guard) = self.configured_container()?;
         let result = container
             .run_guarded(|| {
                 // Namespace init: arm the stop guards before anything else.
                 crate::container::arm_container_init_guards()?;
                 let _guard = global.init_tracing();
-                hermit::replay_with_gdbserver(data_dir, gdbserver_port)
+                hermit::replay_with_gdbserver_and_mounts(data_dir, gdbserver_port, &self.mount)
                     .map_err(SerializableError::from)
             })
             .context("Container exited unexpectedly")??;
@@ -659,6 +679,9 @@ mod tests {
             _strict: false,
             args: Vec::new(),
             env,
+            base_env: BaseEnv::Host,
+            mount: Vec::new(),
+            workdir: None,
             data_dir: None,
             record_timeout: None,
             verify: false,
@@ -678,6 +701,32 @@ mod tests {
                 .iter()
                 .any(|(name, value)| name == "RECORD_ENV_FIXTURE" && value == "value")
         );
+    }
+
+    #[test]
+    fn record_guest_command_can_use_the_run_minimal_environment_and_workdir() {
+        let mut options = start_options(Vec::new());
+        options.base_env = BaseEnv::Minimal;
+        options.workdir = Some("/test".into());
+        let command = options.guest_command().unwrap();
+        let env = command.get_captured_envs();
+        assert_eq!(command.get_current_dir(), Some(Path::new("/test")));
+        assert_eq!(
+            env.get(OsStr::new("HOME")).and_then(|value| value.to_str()),
+            Some("/root")
+        );
+        assert_eq!(
+            env.get(OsStr::new("HOSTNAME"))
+                .and_then(|value| value.to_str()),
+            Some("hermetic-container.local")
+        );
+        assert_eq!(
+            env.get(OsStr::new("ASAN_OPTIONS"))
+                .and_then(|value| value.to_str()),
+            Some("detect_leaks=0")
+        );
+        assert!(!env.contains_key(OsStr::new("PWD")));
+        assert!(!env.contains_key(OsStr::new("OLDPWD")));
     }
 
     #[test]
@@ -741,6 +790,9 @@ mod tests {
             _strict: false,
             args: Vec::new(),
             env: Vec::new(),
+            base_env: BaseEnv::Host,
+            mount: Vec::new(),
+            workdir: None,
             data_dir: None,
             record_timeout: None,
             verify: false,

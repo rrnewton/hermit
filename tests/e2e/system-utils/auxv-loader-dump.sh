@@ -24,23 +24,24 @@ case ${1:-} in
     --run)
         # /bin/true is the smallest real dynamically-linked binary; the work
         # under test is the loader's, not the program's.
-        mkdir -p "$E2E_TMPDIR"
-        LD_SHOW_AUXV=1 /bin/true 2>&1 | sort >"$E2E_TMPDIR/auxv.txt"
+        work="${E2E_TMPDIR:-/tmp}"
+        mkdir -p "$work"
+        LD_SHOW_AUXV=1 /bin/true 2>&1 | sort >"$work/auxv.txt"
 
         # The whole dump, verbatim: every key and value must repeat exactly.
         printf 'AUXV-DUMP\n'
-        cat "$E2E_TMPDIR/auxv.txt"
+        cat "$work/auxv.txt"
 
         # Structural checks make a truncated or empty dump fail, rather than
         # merely producing the same incomplete output twice.
-        keys=$(grep -c '^AT_' "$E2E_TMPDIR/auxv.txt" || true)
+        keys=$(grep -c '^AT_' "$work/auxv.txt" || true)
         printf 'AUXV-KEYS %s\n' "$keys"
         if [ "$keys" -lt 5 ]; then
             echo "auxv dump is incomplete: found $keys AT_ entries" >&2
             exit 1
         fi
         for key in AT_RANDOM AT_SYSINFO_EHDR AT_PAGESZ AT_SECURE AT_CLKTCK; do
-            matches=$(grep -c "^$key:" "$E2E_TMPDIR/auxv.txt" || true)
+            matches=$(grep -c "^$key:" "$work/auxv.txt" || true)
             printf 'HAS %s %s\n' "$key" "$matches"
             if [ "$matches" -ne 1 ]; then
                 echo "auxv key $key occurred $matches times, want exactly once" >&2

@@ -21,7 +21,7 @@ set -euo pipefail
 case ${1:-} in
     --prepare) exit 0 ;;
     --run)
-        work="$E2E_TMPDIR/dd-partial"
+        work="${E2E_TMPDIR:-/tmp}/dd-partial"
         rm -rf "$work"; mkdir -p "$work"
         src="$work/src.bin"
         # Deterministic, compressible-but-not-uniform 4096-byte payload.

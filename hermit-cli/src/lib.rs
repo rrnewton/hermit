@@ -2164,20 +2164,45 @@ pub async fn record_with_output(mut command: Command, dir: &Path) -> Result<Outp
 /// Replays from the specified directory.
 #[tokio::main(flavor = "current_thread")]
 pub async fn replay_from(dir: &Path) -> Result<ExitStatus, Error> {
-    Ok(Replay::spawn(dir, false, None).await?.wait().await?)
+    Ok(Replay::spawn(dir, false, None, &[]).await?.wait().await?)
 }
 
 /// Replays with a gdb server.
 #[tokio::main(flavor = "current_thread")]
 pub async fn replay_with_gdbserver(dir: &Path, port: u16) -> Result<ExitStatus, Error> {
-    Ok(Replay::spawn(dir, false, Some(port)).await?.wait().await?)
+    Ok(Replay::spawn(dir, false, Some(port), &[])
+        .await?
+        .wait()
+        .await?)
+}
+
+/// Replays with a gdb server and applies mounts inside the replay chroot.
+#[tokio::main(flavor = "current_thread")]
+pub async fn replay_with_gdbserver_and_mounts(
+    dir: &Path,
+    port: u16,
+    mounts: &[Mount],
+) -> Result<ExitStatus, Error> {
+    Ok(Replay::spawn(dir, false, Some(port), mounts)
+        .await?
+        .wait()
+        .await?)
 }
 
 /// Replays from the specified directory which must already exist. The
 /// stderr/stdout of the replay is captured in `Output`.
 #[tokio::main(flavor = "current_thread")]
 pub async fn replay_with_output(dir: &Path) -> Result<Output, Error> {
-    Ok(Replay::spawn(dir, true, None)
+    Ok(Replay::spawn(dir, true, None, &[])
+        .await?
+        .wait_with_output()
+        .await?)
+}
+
+/// Replays with captured output and applies the requested mounts inside the replay chroot.
+#[tokio::main(flavor = "current_thread")]
+pub async fn replay_with_output_and_mounts(dir: &Path, mounts: &[Mount]) -> Result<Output, Error> {
+    Ok(Replay::spawn(dir, true, None, mounts)
         .await?
         .wait_with_output()
         .await?)

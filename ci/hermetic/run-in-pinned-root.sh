@@ -6,7 +6,8 @@
 # systemd-run, validate-lock and cgroup policy stay exactly as they are; this is
 # only the filesystem mechanism, and it deliberately adds no second resource or
 # cgroup layer. The payload is one privileged podman container pinned BY DIGEST,
-# with /dev/kvm passed through, no runtime network, read-only source at /src,
+# with /dev/kvm passed through, no runtime network, source at /src
+# (read-only by default, explicitly writable for the combined build-and-test phase),
 # and separate writable output and target volumes.
 #
 # WHY BY DIGEST AND NOT BY TAG. A tag is mutable; a digest is the artifact that
@@ -74,6 +75,32 @@ fi
 mkdir -p "$out/target" "$out/home"
 
 cargo_mount=(); cargo_home_in=/build/.cargo
+git_mounts=()
+if [[ -f "$src/.git" ]]; then
+    git_common_dir=$(git -C "$src" rev-parse --path-format=absolute --git-common-dir)
+    git_mounts+=(--mount "type=bind,source=$git_common_dir,destination=$git_common_dir,ro=true")
+
+    # A linked worktree gives each initialized submodule a relative .git file.
+    # Relocating the source to /src changes what that relative path means, so
+    # reproduce both the resolved git-dir and its configured worktree path.
+    while IFS= read -r submodule_path; do
+        submodule_root="$src/$submodule_path"
+        [[ -f "$submodule_root/.git" ]] || continue
+        submodule_git_dir=$(git -C "$submodule_root" rev-parse --path-format=absolute --git-dir)
+        raw_git_dir=$(sed -n "s/^gitdir: //p" "$submodule_root/.git")
+        if [[ $raw_git_dir == /* ]]; then
+            guest_git_dir=$raw_git_dir
+        else
+            guest_git_dir=$(realpath -m "/src/$submodule_path/$raw_git_dir")
+        fi
+        git_mounts+=(--mount "type=bind,source=$submodule_git_dir,destination=$guest_git_dir,ro=true")
+        core_worktree=$(git -C "$submodule_root" config --local --get core.worktree || true)
+        if [[ -n $core_worktree ]]; then
+            guest_worktree=$(realpath -m "$guest_git_dir/$core_worktree")
+            git_mounts+=(--mount "type=bind,source=$submodule_root,destination=$guest_worktree,$src_mode")
+        fi
+    done < <(git -C "$src" submodule foreach --quiet 'printf "%s\n" "$sm_path"')
+fi
 if [[ -n "$cargo_home" ]]; then
     [[ -d "$cargo_home" ]] || {
         echo "run-in-pinned-root: --cargo-home '$cargo_home' is not a directory." >&2
@@ -92,10 +119,13 @@ exec podman run --rm \
     --privileged \
     --device /dev/kvm \
     --network=none \
+    --http-proxy=false \
+    --tmpfs /test:rw,nosuid,nodev,mode=1777 \
     --mount "type=bind,source=$src,destination=/src,$src_mode" \
     --mount "type=bind,source=$out/target,destination=/out/target" \
     --mount "type=bind,source=$out/home,destination=/build" \
     "${cargo_mount[@]}" \
+    "${git_mounts[@]}" \
     -e HOME=/build \
     -e CARGO_HOME="$cargo_home_in" \
     -e CARGO_TARGET_DIR=/out/target \
