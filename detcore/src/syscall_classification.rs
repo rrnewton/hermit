@@ -493,10 +493,11 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // callers take their portable read/write fallback.
         | Sysno::copy_file_range
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-855): Strict-mode ENOSYS for zero-copy pipe
+        // TODO-HUMAN-REVIEW(PR-855): Fail-closed ENOSYS for zero-copy pipe
         // transfers. Detcore does not model kernel pipe-buffer ownership or
         // vmsplice page pinning. Fail-closed runs expose the portable fallback
-        // boundary; legacy non-strict runs retain record/replay pass-through.
+        // boundary; the explicit compatibility opt-out retains record/replay
+        // pass-through.
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::splice
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1216,12 +1217,12 @@ pub(crate) const fn is_host_security_identity_probe_syscall(sysno: Sysno) -> boo
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-855): Strict zero-copy pipe fallback set.
+// TODO-HUMAN-REVIEW(PR-855): Fail-closed zero-copy pipe fallback set.
 /// Linux zero-copy pipe transfers. Their observable blocking and buffer
 /// ownership depend on kernel pipe state, while `vmsplice` can additionally
-/// pin guest pages beyond the syscall boundary. Strict/fail-closed runs return
+/// pin guest pages beyond the syscall boundary. Fail-closed runs return
 /// `ENOSYS`, the documented signal for callers to use read/write fallbacks.
-/// Non-strict runs retain legacy record/replay forwarding for compatibility.
+/// The explicit compatibility opt-out retains host forwarding.
 pub(crate) const fn is_zero_copy_pipe_syscall(sysno: Sysno) -> bool {
     matches!(
         sysno,
@@ -1291,15 +1292,16 @@ pub(crate) const fn is_host_kernel_probe_syscall(sysno: Sysno) -> bool {
 // TODO-HUMAN-REVIEW(PR-978): Review the aggregate deterministic-refusal
 // boundary used to enforce the same fixed refusal in backends that execute
 // guest syscalls outside Detcore's `handle_syscall_event` dispatcher.
-/// True for every syscall Detcore refuses with a fixed errno in the strict
-/// dispatcher *without consulting the host* -- the deterministic-refusal
+/// True for every syscall Detcore refuses with a fixed errno under the
+/// fail-closed dispatcher policy *without consulting the host* -- the
+/// deterministic-refusal
 /// boundary. Classifying a syscall this way in the ptrace path only enforces the
 /// isolation boundary where the shared Detcore dispatcher runs. A backend that
 /// lets a guest execute a syscall natively outside that dispatcher (most
 /// importantly the DBT copied pre-exec child fast path, which runs on the
 /// DynamoRIO client stack with no Detcore tool) would otherwise reach the host
 /// and leak or mutate the very state the classification is meant to hide. Such a
-/// backend must fail closed for these syscalls in strict mode instead.
+/// backend must enforce the same refusal whenever fail-closed policy is active.
 ///
 /// This is the union of the individual family predicates whose dispatch arm in
 /// `Detcore::handle_syscall_event` returns `Err(Error::Errno(..))` unconditionally
@@ -1309,8 +1311,8 @@ pub(crate) const fn is_host_kernel_probe_syscall(sysno: Sysno) -> bool {
 /// copied child closed for an emulated syscall would diverge from the ptrace
 /// path rather than match it. Keep this in sync with those dispatch arms.
 pub(crate) const fn is_strict_only_deterministic_refusal_syscall(sysno: Sysno) -> bool {
-    // These families preserve native behavior outside strict mode for rr and
-    // application compatibility, but fail closed under strict execution.
+    // These families preserve native behavior only under the explicit
+    // compatibility opt-out, and fail closed otherwise.
     matches!(sysno, Sysno::rseq)
         || is_zero_copy_pipe_syscall(sysno)
         || is_kernel_keyring_syscall(sysno)
@@ -2709,7 +2711,8 @@ mod tests {
     #[test]
     fn deterministic_refusal_aggregate_includes_fixed_error_families() {
         // The aggregate predicate is the union of the fixed-ENOSYS/EPERM refusal
-        // families the strict dispatcher rejects without consulting the host.
+        // families the fail-closed dispatcher rejects without consulting the
+        // host.
         // Backends that execute guest syscalls outside Detcore's dispatcher
         // (the DBT copied-child fast path, the KVM executor) consult this
         // predicate to enforce the same fixed refusal, so representative members

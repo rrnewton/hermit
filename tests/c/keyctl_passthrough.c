@@ -9,10 +9,11 @@
 /*
  * Reports whether `keyctl(KEYCTL_GET_KEYRING_ID, ...)` returned ENOSYS,
  * without asserting a particular outcome. Its purpose is a host-independent
- * parity check: run natively and again under non-strict `hermit run` and
- * compare the reported flag. Non-strict Hermit must pass the keyring syscall
- * through to the host (matching native), rather than forcing the deterministic
- * ENOSYS boundary that only applies to strict/fail-closed mode.
+ * parity check: run natively and again under
+ * `hermit run --allow-unsupported-syscalls`, then compare the reported flag.
+ * That explicit compatibility opt-out must pass the keyring syscall through to
+ * the host (matching native), while ordinary runs keep the deterministic
+ * fail-closed ENOSYS boundary.
  */
 
 #define _GNU_SOURCE
