@@ -3767,6 +3767,16 @@ fn a_guest_side_fault_is_not_reported_as_a_hermit_internal_failure() {
         Some(125),
         "a failure before dispatch must still be 125\nstderr:\n{pre_dispatch_stderr}"
     );
+    // ⚠️ THE NEGATIVE CLASS ASSERTION BELONGS ON THIS PATH TOO, NOT ONLY ON THE
+    // injected-fault arm above. The exit code alone does not distinguish a
+    // pre-dispatch failure from a guest-side one: both can be 125 while the
+    // classification is wrong. This arm previously carried it, and it was lost
+    // when the assertion migrated to the injected-segv invocation -- the text
+    // survived branch-wide while its coverage of THIS path did not.
+    assert!(
+        !pre_dispatch_stderr.contains("guest-program"),
+        "a pre-dispatch failure must not be classified guest-side\nstderr:\n{pre_dispatch_stderr}"
+    );
 
     // And the guest's own exit is untouched by any of this.
     let guest = Command::new(env!("CARGO_BIN_EXE_hermit"))
