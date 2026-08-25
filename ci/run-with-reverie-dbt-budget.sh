@@ -25,16 +25,16 @@ fi
 # --print-pin is deliberately offline: the separate latest-main gate owns the
 # network authority, while this check prevents a pin bump from silently reusing
 # an earlier revision's clamp and measured threshold.
-# CALIBRATED FOR 13cf8bcb BY DBT RECIPE IDENTITY, which is the same evidence this
-# budget has been carried on four times before. Between 3798935e and 13cf8bcb the
-# inputs the recipe key is computed over are BYTE-IDENTICAL by git object id:
+# CALIBRATED FOR f4152f8f BY DBT RECIPE IDENTITY, the same evidence used
+# for earlier carried calibrations. Between 13cf8bcb and f4152f8f every input
+# included in the native DynamoRIO recipe key is BYTE-IDENTICAL by git object id:
 #     reverie-dbt/vendor/dynamorio  de352475846e -> de352475846e
 #     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
 #     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
-# The only reverie-dbt change is src/launcher.rs (+118/-11), Rust source compiled
-# by Cargo and not an input to the DynamoRIO build, so the recipe cannot have
-# changed and the measured budget carries.
-expected_pin=13cf8bcb5fd167e79bedc6496b5104354c2835c6
+# The intervening changes are Rust source and tests outside those recipe-key
+# inputs, so the native build recipe cannot have changed and the measured budget
+# carries.
+expected_pin=f4152f8fd3a6d234e9ba4946ef3f9fa27aa7f8a7
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
