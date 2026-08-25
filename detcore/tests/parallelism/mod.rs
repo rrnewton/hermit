@@ -11,21 +11,88 @@
     reason = "`sanitized` is supplied by the internal sanitizer build"
 )]
 
+use std::cell::UnsafeCell;
 use std::sync::Arc;
 
 #[global_allocator]
 static ALLOC: test_allocator::Global = test_allocator::Global;
 
+/// A shared array the workers mutate concurrently through `&self`.
+///
+/// WHY `UnsafeCell` AND NOT A RAW POINTER. `Arc` hands out shared access only, so
+/// a pointer derived from it carries read-only provenance and no cast adds write
+/// provenance to it -- that is a language rule, not a lint, and miri rejects the
+/// write. `UnsafeCell` is the sanctioned way to mutate through a shared
+/// reference. Two earlier spellings of these loops were both unsound:
+///
+/// ```text
+/// Arc::get_mut_unchecked(&mut data)                   UB: data race between the
+///                                                         non-atomic write and the
+///                                                         other thread's retag
+/// from_raw_parts_mut(data.as_ptr() as *mut u64, len)  UB: retag for Unique from a
+///                                                         tag granting only
+///                                                         SharedReadOnly
+/// ```
+///
+/// WHY `Arc<[UnsafeCell<u64>]>` AND NOT `Arc<Vec<UnsafeCell<u64>>>`. The elements
+/// of an `Arc<[T]>` live inside the `Arc` allocation, so reaching one is a single
+/// indirection -- exactly what `Arc<[u64]>` cost before. An `Arc<Vec<T>>` stores a
+/// `Vec` header in that slot and the elements elsewhere, adding a load to a loop
+/// that runs millions of times per thread. These arrays are the subject of the
+/// weekly `mem_race` PMU gates, whose premise is that preemption is driven by
+/// retired conditional branches, so an extra load or a dropped bounds check moves
+/// the numbers they pin.
+pub(crate) struct SharedCells(Arc<[UnsafeCell<u64>]>);
+
+// SAFETY: the workers only ever write cells whose index came from the shared
+// atomic counter, so no two threads touch the same cell, and every read happens
+// after `join()`. Sharing the handle is therefore sound; the type cannot enforce
+// that discipline, which is why this impl is unsafe and why the invariant is
+// stated here rather than assumed.
+unsafe impl Send for SharedCells {}
+unsafe impl Sync for SharedCells {}
+
+impl Clone for SharedCells {
+    fn clone(&self) -> Self {
+        SharedCells(Arc::clone(&self.0))
+    }
+}
+
+impl SharedCells {
+    pub(crate) fn zeroed(len: usize) -> Self {
+        let cells: Vec<UnsafeCell<u64>> = (0..len).map(|_| UnsafeCell::new(0)).collect();
+        SharedCells(cells.into())
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Read a cell. Callers must have established happens-before with the writers.
+    pub(crate) fn get(&self, i: usize) -> u64 {
+        // SAFETY: indexing keeps its bounds check; the caller has joined the workers.
+        unsafe { *self.0[i].get() }
+    }
+
+    /// Write a cell. Callers must own `i` exclusively.
+    pub(crate) fn set(&self, i: usize, v: u64) {
+        // SAFETY: `i` came from the shared counter, so this worker owns it. `self.0[i]`
+        // is a bounds-checked index -- do NOT replace it with `get_unchecked`, the
+        // branch it emits is part of what the RCB preemption timer measures.
+        unsafe { *self.0[i].get() = v }
+    }
+}
+
 /// Calculate the number of switch points. E.g. the number of times we observed interleaved
 /// writes between the threads.
-fn count_switch_points(shared_data: &Arc<[u64]>) -> u64 {
+fn count_switch_points(shared_data: &SharedCells) -> u64 {
     // Calculate the number of switch points. E.g. the number of times we observed interleaved
     // writes between the threads.
     let mut switch_points = 0;
-    let mut prev = shared_data[0];
+    let mut prev = shared_data.get(0);
     for i in 1..shared_data.len() {
-        if prev != shared_data[i] {
-            prev = shared_data[i];
+        if prev != shared_data.get(i) {
+            prev = shared_data.get(i);
             switch_points += 1;
         }
     }
@@ -48,30 +115,28 @@ mod mem_race {
     /// value. The threads grab indices through an atomic int. For sufficiently large arrays we expect
     /// the thread ids to show up interleaved.
     fn raw() -> u64 {
-        let shared_data: Arc<[u64]> = vec![0; NUM_ELEMENTS].into();
+        let shared_data = super::SharedCells::zeroed(NUM_ELEMENTS);
         let shared_idx = Arc::new(AtomicUsize::new(0));
 
         // `tag` is the distinct per-worker value written into the array. It used to
         // be the thread id, but `ThreadId` has no stable numeric accessor and the
         // test only ever needs the two workers to write DIFFERENT values --
         // `count_switch_points` compares adjacent elements and never inspects the
-        // value itself.
-        fn worker(idx: Arc<AtomicUsize>, data: Arc<[u64]>, tag: u64) {
-            let len = data.len();
-            // SAFETY: the two workers only ever write to indices handed out by the
-            // shared atomic counter, so no two writes alias. This is the stable
-            // spelling of `Arc::get_mut_unchecked`: it rebuilds the same
-            // `&mut [u64]`, so indexing keeps its bounds check and the loop keeps
-            // the retired-conditional-branch profile the RCB preemption timer
-            // measures. Deliberately still a data race -- that is what mem_race
-            // exists to exercise -- so do NOT "fix" this with atomics.
-            let data: &mut [u64] =
-                unsafe { std::slice::from_raw_parts_mut(data.as_ptr() as *mut u64, len) };
-
+        // value itself. They must nevertheless stay DISTINCT and nonzero: give both
+        // workers the same tag and the switch-point count collapses to zero, which
+        // is the test measuring nothing while still compiling and running.
+        fn worker(idx: Arc<AtomicUsize>, data: super::SharedCells, tag: u64) {
+            // The contention is the point of this test and must survive any tidy-up:
+            // two threads interleaving writes into ONE array, ordered only by the
+            // shared counter, is what produces switch points at all. What must NOT
+            // survive is undefined behaviour -- the elements never raced (the counter
+            // hands out disjoint indices); what raced was the construction of the
+            // `&mut`. So do NOT "fix" this with atomics: that changes the memory
+            // operations the test exists to exercise, and it is not what was wrong.
             // Give each thread half of the fetch_add attempts.
             for _ in 0..(NUM_ELEMENTS / 2) {
                 let idx = idx.fetch_add(1, Ordering::SeqCst);
-                data[idx] = tag;
+                data.set(idx, tag);
             }
         }
 
@@ -171,26 +236,21 @@ mod mem_print_race {
     const CHUNKS: usize = 5;
 
     fn raw() -> u64 {
-        let shared_data: Arc<[u64]> = vec![0; NUM_ELEMENTS].into();
+        let shared_data = super::SharedCells::zeroed(NUM_ELEMENTS);
         let shared_idx = Arc::new(AtomicUsize::new(0));
 
-        fn worker(idx: Arc<AtomicUsize>, data: Arc<[u64]>, rank: usize) {
+        fn worker(idx: Arc<AtomicUsize>, data: super::SharedCells, rank: usize) {
             // Distinct nonzero value per worker; see the note in mem_race::worker.
             let tid = rank as u64 + 1;
-            let len = data.len();
-            // SAFETY: as in mem_race::worker -- disjoint indices from the shared
-            // counter, and this is the stable spelling of `Arc::get_mut_unchecked`
-            // that keeps the bounds check, hence the RCB profile. Still a data
-            // race on purpose; do NOT "fix" it with atomics.
-            let data: &mut [u64] =
-                unsafe { std::slice::from_raw_parts_mut(data.as_ptr() as *mut u64, len) };
-
+            // As in mem_race::worker: disjoint indices from the shared counter, the
+            // contention is deliberate, and the bounds check is load-bearing for the
+            // RCB profile. Do NOT "fix" it with atomics.
             for _i in 0..CHUNKS {
                 let s = format!("{} ", rank);
                 eprint!("{}", s);
                 for _ in 0..(NUM_ELEMENTS / 2 / CHUNKS) {
                     let idx = idx.fetch_add(1, Ordering::SeqCst);
-                    data[idx] = tid;
+                    data.set(idx, tid);
                 }
             }
             std::io::Write::flush(&mut std::io::stderr()).unwrap();
