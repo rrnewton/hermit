@@ -105,7 +105,11 @@ if ! git -C "$worktree" -c core.hooksPath=/dev/null merge --no-edit --no-ff HEAD
 fi
 
 echo "check-derived-current-after-merge: evaluating the MERGED tree, not the branch head"
-if git -C "$worktree" "./$GENERATOR" check; then
+# Run the generator IN the merged worktree. Note this is a plain subshell cd, not
+# `git -C`: the generator is not a git subcommand, and invoking it that way fails
+# with "is not a git command" -- which this script would then have reported as
+# STALE, refusing every applicable branch for the wrong reason. Caught in test.
+if (cd "$worktree" && "./$GENERATOR" check); then
     echo "check-derived-current-after-merge: derived artifacts are current after merge"
     exit 0
 fi
