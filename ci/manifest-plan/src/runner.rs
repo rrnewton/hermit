@@ -1,10 +1,15 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::ffi::CString;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::fs::{self};
 use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -32,6 +37,94 @@ use crate::ci_selection::CiSelectionSpec;
 const BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
 const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
 pub const CELL_RESULT_SCHEMA: u64 = 4;
+
+/// Watches the shared repository root for direct child entry creation,
+/// deletion, or rename while one cell is running.
+///
+/// Those operations change the directory's guest-visible `st_size`. Reading a
+/// snapshot before and after is insufficient because fixtures commonly clean
+/// up the file they created. Inotify retains both events, including that
+/// create-then-delete case.
+struct DirectoryEntryWatcher {
+    fd: OwnedFd,
+}
+
+impl DirectoryEntryWatcher {
+    fn new(path: &Path) -> Result<Self, String> {
+        let path_bytes = path.as_os_str().as_bytes();
+        let path_c = CString::new(path_bytes)
+            .map_err(|_| format!("cannot watch path containing NUL: {}", path.display()))?;
+        let raw_fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        if raw_fd == -1 {
+            return Err(format!(
+                "cannot watch shared repository root {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let mask = libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_FROM | libc::IN_MOVED_TO;
+        if unsafe { libc::inotify_add_watch(fd.as_raw_fd(), path_c.as_ptr(), mask) } == -1 {
+            return Err(format!(
+                "cannot watch shared repository root {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Self { fd })
+    }
+
+    fn changed_entries(&self) -> Result<BTreeSet<String>, String> {
+        let mut changed = BTreeSet::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let count = unsafe {
+                libc::read(
+                    self.fd.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            if count == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    break;
+                }
+                return Err(format!(
+                    "cannot read shared repository root changes: {error}"
+                ));
+            }
+            if count == 0 {
+                break;
+            }
+            let count = count as usize;
+            let mut offset = 0;
+            while offset + std::mem::size_of::<libc::inotify_event>() <= count {
+                let event = unsafe {
+                    std::ptr::read_unaligned(
+                        buffer[offset..].as_ptr().cast::<libc::inotify_event>(),
+                    )
+                };
+                if event.mask & libc::IN_Q_OVERFLOW != 0 {
+                    return Err("shared repository root watch overflowed".into());
+                }
+                let name_start = offset + std::mem::size_of::<libc::inotify_event>();
+                let name_end = (name_start + event.len as usize).min(count);
+                let name = &buffer[name_start..name_end];
+                let name_len = name.iter().position(|byte| *byte == 0).unwrap_or(name.len());
+                if name_len > 0 {
+                    changed.insert(
+                        OsStr::from_bytes(&name[..name_len])
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+                offset = name_end;
+            }
+        }
+        Ok(changed)
+    }
+}
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1227,6 +1320,39 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         .join("runs")
         .join(&context.run_id)
         .join(slug);
+    prepare_dirs(&context.root, &dir)?;
+    let root_writes = DirectoryEntryWatcher::new(&context.root)?;
+    let result = run_cell_with_dir(context, cell, dir);
+    let changed_entries = root_writes.changed_entries()?;
+    if changed_entries.is_empty() {
+        return result;
+    }
+    let identity = format!(
+        "{} ({}/{})",
+        cell.id.test,
+        cell.id.mode,
+        cell.id.backend.as_deref().unwrap_or("native")
+    );
+    let reason = format!(
+        "{identity}: fixture changed entries in the shared repository root: {}",
+        changed_entries.into_iter().collect::<Vec<_>>().join(", ")
+    );
+    match result {
+        Ok(mut result) => {
+            result.outcome = "ERROR".into();
+            result.error_kind = Some("infrastructure".into());
+            result.reason = Some(reason);
+            Ok(result)
+        }
+        Err(error) => Err(format!("{reason}; cell also failed: {error}")),
+    }
+}
+
+fn run_cell_with_dir(
+    context: &RunContext,
+    cell: &SelectedCell,
+    dir: PathBuf,
+) -> Result<CellResult, String> {
     let started = Instant::now();
     let binary_before = fs::read(&context.hermit_bin)
         .ok()
@@ -2402,6 +2528,48 @@ backends_disabled:
             .status()
             .unwrap();
         assert!(status.success(), "recorded command failed: {literal}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_root_write_is_refused_by_cell_name_even_when_removed() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-shared-root-write-bracket-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let cell_dir = root.join("cell");
+        fs::create_dir_all(&cell_dir).unwrap();
+        let spec = CellRunSpec {
+            id: CellId {
+                test: "fixture/writes-shared-root".into(),
+                mode: "naked".into(),
+                backend: None,
+            },
+            lane: "portable".into(),
+            category: "fixture".into(),
+            cwd: root.clone(),
+            env: BTreeMap::new(),
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "touch forbidden-relative-write; rm forbidden-relative-write".into(),
+            ],
+            guest_argv: vec!["fixture".into()],
+            timeout_seconds: 5,
+            verdict_path: None,
+            verification_log_dir: None,
+            sabre_path_evidence: None,
+            cell_dir: cell_dir.clone(),
+        };
+
+        let result = execute_spec(&spec, "1").unwrap();
+        assert_eq!(result.outcome, "ERROR");
+        assert_eq!(result.error_kind.as_deref(), Some("shared-root-write"));
+        let reason = result.reason.unwrap();
+        assert!(reason.contains("fixture/writes-shared-root"), "{reason}");
+        assert!(reason.contains("forbidden-relative-write"), "{reason}");
+        assert!(!root.join("forbidden-relative-write").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
