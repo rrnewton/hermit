@@ -25,12 +25,38 @@ fi
 # --print-pin is deliberately offline: the separate latest-main gate owns the
 # network authority, while this check prevents a pin bump from silently reusing
 # an earlier revision's clamp and measured threshold.
-expected_pin=3798935e38ee0d85a2f2e3b91572280cb337af07
+# CALIBRATED FOR 13cf8bcb BY DBT RECIPE IDENTITY, which is the same evidence this
+# budget has been carried on four times before. Between 3798935e and 13cf8bcb the
+# inputs the recipe key is computed over are BYTE-IDENTICAL by git object id:
+#     reverie-dbt/vendor/dynamorio  de352475846e -> de352475846e
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+#     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
+# The only reverie-dbt change is src/launcher.rs (+118/-11), Rust source compiled
+# by Cargo and not an input to the DynamoRIO build, so the recipe cannot have
+# changed and the measured budget carries.
+expected_pin=13cf8bcb5fd167e79bedc6496b5104354c2835c6
+
+# TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
+#
+# This captured the whole of `--print-pin` and compared it. A later change made
+# that command also emit a pin-uniformity report on stdout, so the capture became
+# 941 characters over 8 lines and the comparison below COULD NEVER SUCCEED FOR
+# ANY PIN, including a correctly calibrated one. Every node behind this wrapper
+# then failed closed in about a second, and updating `expected_pin` could not fix
+# it because the recorded side was never a sha. The producer is fixed too -- its
+# report now goes to stderr -- but a value parsed out of a shared stream should
+# be validated by the consumer rather than trusted to stay clean.
 recorded_pin=$(
-    "$ROOT_DIR/ci/run-reverie-pin-check.sh" --repo "$ROOT_DIR" --print-pin
+    "$ROOT_DIR/ci/run-reverie-pin-check.sh" --repo "$ROOT_DIR" --print-pin | head -n 1
 )
+if [[ ! $recorded_pin =~ ^[0-9a-f]{40}$ ]]; then
+    echo "run-with-reverie-dbt-budget.sh: --print-pin did not yield a 40-hex revision; got ${#recorded_pin} char(s): ${recorded_pin:0:80}" >&2
+    echo "run-with-reverie-dbt-budget.sh: NOT RUNNING '$*' against an unidentified Reverie pin" >&2
+    exit 2
+fi
 if [[ $recorded_pin != "$expected_pin" ]]; then
     echo "run-with-reverie-dbt-budget.sh: no calibrated budget for Reverie pin $recorded_pin (expected $expected_pin)" >&2
+    echo "run-with-reverie-dbt-budget.sh: NOT RUNNING '$*'. To recalibrate, confirm reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs and third-party/ are unchanged between the pins, then update expected_pin here." >&2
     exit 2
 fi
 REVERIE_DBT_BUDGET_BOUND_PIN=$recorded_pin
