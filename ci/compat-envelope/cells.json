@@ -30395,6 +30395,166 @@
     {
       "lane": "portable",
       "category": "c-programs",
+      "test": "c-programs/prctl-option-policy",
+      "mode": "chaos",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/prctl-option-policy",
+      "mode": "chaos",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/prctl-option-policy",
+      "mode": "chaos",
+      "backend": "liteinst",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/prctl-option-policy",
+      "mode": "chaos",
+      "backend": "ptrace",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/prctl-option-policy",
+      "mode": "chaos",
+      "backend": "sabre",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/prctl-option-policy",
+      "mode": "naked",
+      "backend": "native",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/prctl-option-policy",
+      "mode": "replay",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/prctl-option-policy",
+      "mode": "replay",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/prctl-option-policy",
+      "mode": "replay",
+      "backend": "liteinst",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/prctl-option-policy",
+      "mode": "replay",
+      "backend": "ptrace",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/prctl-option-policy",
+      "mode": "replay",
+      "backend": "sabre",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/prctl-option-policy",
+      "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/prctl-option-policy",
+      "mode": "verify",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/prctl-option-policy",
+      "mode": "verify",
+      "backend": "liteinst",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/prctl-option-policy",
+      "mode": "verify",
+      "backend": "ptrace",
+      "enabled": true,
+      "status": "green",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/prctl-option-policy",
+      "mode": "verify",
+      "backend": "sabre",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
       "test": "c-programs/pread64-nostdlib",
       "mode": "chaos",
       "backend": "dbt",

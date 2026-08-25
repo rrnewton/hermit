@@ -5068,6 +5068,69 @@ test:
           kvm: No custom edge-case arguments have been calibrated for this C guest
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
+  - id: c-programs/prctl-option-policy
+    description: Strict verification for tests/c/prctl_option_policy.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    timeout_seconds: 90
+    occasional: false
+    program: tests/c/prctl_option_policy.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Only ptrace was qualified when this cell was added; qualify DBT separately rather than asserting it untested
+          kvm: Only ptrace was qualified when this cell was added; qualify KVM separately rather than asserting it untested
+          sabre: Only ptrace was qualified when this cell was added; qualify SaBRe separately rather than asserting it untested
+          liteinst: Only ptrace was qualified when this cell was added; qualify LiteInst separately rather than asserting it untested
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: THIS GUEST IS EXPECTED TO FAIL NATIVELY AND THAT IS THE POINT. It asserts that Hermit refuses PR_SET_NO_NEW_PRIVS with ENOSYS; Linux accepts it and returns 0, so a native run exits 1. That measured native failure is the cell's negative control, not a gap to be closed.
+        ci_disabled_reason: Permanently off by design. The guest asserts a Hermit-specific refusal, so naked/native is its negative control and must stay red; selecting it in CI would assert the opposite of the contract.
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from this cell's strict-verification contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+        ci_disabled_reason: Off pending its own qualification. This cell's contract is the prctl option policy under strict verification; record/replay of that contract has not been measured and asserting it untested would be a false claim.
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle; this guest is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+        ci_disabled_reason: Off by design. The guest is single-threaded with no schedule-diversity oracle, so chaos scheduling exercises nothing this cell asserts.
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+        ci_disabled_reason: Off because no custom arguments exist. The guest takes no arguments; there is no edge-case variant to calibrate.
   - id: c-programs/pread64-nostdlib
     description: Strict verification for tests/c/simple/pread64_nostdlib.c
     lane: portable
