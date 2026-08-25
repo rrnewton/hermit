@@ -256,7 +256,13 @@ before reading source:
   The `DETLOG` lines record syscalls, scheduling, and virtualized time.
 - Reproduce nondeterminism with `hermit run --strict --verify --verify-strict`,
   which runs the guest twice under the L2 comparison policy and reports the
-  first divergence.
+  first divergence. **Before triaging what it reports, read
+  [docs/DIVERGENCE_CLASSES.md](docs/DIVERGENCE_CLASSES.md).** There are three
+  classes, they need different fixes, and identical DETLOG counts does NOT mean
+  the difference is a clock — the third class has identical counts and no clock
+  involvement. Classify on what differs AT the divergent record: a time field, a
+  control-flow difference visible in the counts, or payload bytes with
+  everything else identical.
 - For record/replay problems use
   `hermit record start --verify --verify-strict -- <program>`,
   which records then replays and diffs the two logs; a divergence names the
