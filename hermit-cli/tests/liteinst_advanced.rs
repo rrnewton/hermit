@@ -741,7 +741,9 @@ fn liteinst_strict_verify_python_entropy() {
     let stdout = String::from_utf8(output.stdout).expect("Python output should be UTF-8");
     let fields = stdout.split_whitespace().collect::<Vec<_>>();
     assert_eq!(fields.len(), 3, "stdout={stdout:?}");
-    assert_eq!(fields[0], "3", "stdout={stdout:?}");
+    // PID 1 belongs to the container init; LiteInst launches its root guest as
+    // deterministic virtual PID 2.
+    assert_eq!(fields[0], "2", "stdout={stdout:?}");
     assert_eq!(fields[1], "8", "stdout={stdout:?}");
     assert_eq!(fields[2].len(), 16, "stdout={stdout:?}");
     assert!(
