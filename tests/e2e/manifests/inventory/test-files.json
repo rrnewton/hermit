@@ -1657,6 +1657,12 @@
       "why": "tests/c/simple/hello_nostdlib.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/simple/hermit_log_env.c",
+      "runner": "hermit-cli/tests/cli.rs run_dbt_keeps_diagnostics_out_of_guest_stderr",
+      "why": "tests/c/simple/hermit_log_env.c is owned by hermit-cli/tests/cli.rs run_dbt_keeps_diagnostics_out_of_guest_stderr: the DBT protected-evidence diagnostic runs this self-execing guest with HERMIT_LOG unset and caller-supplied, proving controller logging does not overwrite the guest environment across exec."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/simple/nanosleep-threads-nocrash.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
@@ -1679,6 +1685,12 @@
       "path": "tests/c/simple/racewrite_nostdlib.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/simple/racewrite_nostdlib.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/simple/stderr_nostdlib.c",
+      "runner": "hermit-cli/tests/cli.rs run_dbt_keeps_diagnostics_out_of_guest_stderr",
+      "why": "tests/c/simple/stderr_nostdlib.c is owned by hermit-cli/tests/cli.rs run_dbt_keeps_diagnostics_out_of_guest_stderr: the DBT diagnostic compiles this no-libc raw-syscall guest and proves guest fd 2 remains separate from protected controller evidence during canonical verification."
     },
     {
       "disposition": "manifest-test",
