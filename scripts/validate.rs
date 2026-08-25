@@ -1618,6 +1618,7 @@ fn self_test() -> Result<(), String> {
         nested_scope_self_test()?,
         scheduler_accounting_bracket()?,
         budget_reason_bracket()?,
+        summary_listing_bracket()?,
         validate_super::self_test(&root)?,
         validate_envelope::self_test()?,
         validate_history::self_test()?,
@@ -5370,6 +5371,169 @@ fn outcome_is_no_result(outcome: &StepOutcome) -> bool {
 
 fn outcome_is_failure(outcome: &StepOutcome) -> bool {
     !outcome.ok && !outcome.aborted && !outcome_is_no_result(outcome)
+}
+
+/// The blocking-failure headline: the count and the names, from ONE collection.
+///
+/// ⚠️ THIS EXISTS BECAUSE THE COUNT AND THE LIST DISAGREED IN PRODUCTION. On the
+/// owner's run at `4e168f2aa5b9` the verdict read `9 blocking failure(s):` and
+/// then named EIGHT — the list was built with a bare `.take(8)` while the count
+/// came from `.count()` on the same filter. The dropped node,
+/// `test.sabre_examples`, is not an excused cell, so an operator who fixed the
+/// eight they were shown would re-run into a red nobody had named.
+///
+/// Pure, and returns both halves together, so a caller cannot print one without
+/// the other and `summary_listing_bracket` can pin every case without a DAG.
+fn blocking_listing<'a>(
+    outcomes: &'a [StepOutcome],
+    nonblocking: &BTreeSet<String>,
+    effective_failures: usize,
+) -> (Vec<&'a str>, String) {
+    let named: Vec<&str> = outcomes
+        .iter()
+        .filter(|o| outcome_is_failure(o) && !nonblocking.contains(&o.tag))
+        .map(|o| o.tag.as_str())
+        .collect();
+    // A cap is defensible; a SILENT cap is not. Name the remainder as a number.
+    const NAMED_CAP: usize = 12;
+    let shown = named.len().min(NAMED_CAP);
+    let elided = named.len() - shown;
+    let mut listing = if named.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ": {}{}",
+            named[..shown].join(", "),
+            if elided == 0 {
+                String::new()
+            } else {
+                format!(" (+{elided} more, see the node table above)")
+            }
+        )
+    };
+    // ⚠️ A HEADLINE LARGER THAN ITS OWN LIST MEANS SOMETHING BLOCKING IS
+    // UNCOUNTABLE FROM THIS SET, and that is how a timed-out node vanished from
+    // this run. `effective_failures` legitimately exceeds `named` for the compat
+    // and super profiles, which add their own blocking rows — so this does not
+    // refuse, it SAYS SO. Silence was the only unacceptable option.
+    if effective_failures > named.len() {
+        listing.push_str(&format!(
+            " ⚠️ {} counted blocking node(s) are NOT NAMEABLE from the failure set; \
+             the node table is authoritative",
+            effective_failures - named.len()
+        ));
+    }
+    // ⚠️ AND THE OTHER DIRECTION, WHICH IS THE ONE THAT ACTUALLY BIT US: A NODE
+    // THAT IS NOT OK AND IS NOT A `FAILURE` EITHER.
+    //
+    // On `4e168f2aa5b9` TEN nodes printed `✗ FAIL` and the headline said NINE.
+    // The tenth, `privileged-e2e.manifest_backend_parity_c`, hit its 120s wall.
+    // A budget kill is neither `ok` nor a `failure` by `outcome_is_failure`, and
+    // its reason did not match the budget prefixes either, so it was invisible to
+    // the failure count AND to `timed_out_nodes` — it had no class at all, and a
+    // state with no value for it is a state that does not get reported.
+    //
+    // ⚠️ IT IS DELIBERATELY NOT FOLDED INTO THE FAILURE COUNT. A timeout is "ran
+    // and produced no verdict", and calling it a failure would assert a product
+    // claim the run never established — the same distinction, destroyed in the
+    // other direction. It gets its OWN count and its OWN names, which is what
+    // "not a pass, not a failure, and not nothing" requires.
+    let unclassified: Vec<&str> = outcomes
+        .iter()
+        .filter(|o| !o.ok && !nonblocking.contains(&o.tag))
+        .map(|o| o.tag.as_str())
+        .filter(|tag| !named.contains(tag))
+        .collect();
+    if !unclassified.is_empty() {
+        listing.push_str(&format!(
+            " ⚠️ plus {} node(s) that did NOT pass and produced NO VERDICT (budget kill, \
+             abort, or an unclassified exit) and are therefore in NEITHER the count above \
+             nor any failure class: {}",
+            unclassified.len(),
+            unclassified.join(", ")
+        ));
+    }
+    (named, listing)
+}
+
+/// Pin the count-versus-enumeration invariant that broke on `4e168f2aa5b9`.
+///
+/// The regression it exists to catch is a cap that drops names silently. Case 2
+/// is the exact production shape: NINE blocking failures, of which the old
+/// `.take(8)` named eight and said nothing about the ninth.
+fn summary_listing_bracket() -> Result<String, String> {
+    let row = |tag: &str, ok: bool| StepOutcome {
+        tag: tag.to_string(),
+        ok,
+        duration_s: 0.0,
+        summary: String::new(),
+        executed_tests: None,
+        filtered_tests: None,
+        returncode: Some(if ok { 0 } else { 1 }),
+        reason: String::new(),
+        aborted: false,
+    };
+    let none: BTreeSet<String> = BTreeSet::new();
+
+    // 1. Every failure is named when the set is small.
+    let small: Vec<StepOutcome> = (0..3).map(|i| row(&format!("n{i}"), false)).collect();
+    let (named, listing) = blocking_listing(&small, &none, 3);
+    if named.len() != 3 || !listing.contains("n2") {
+        return Err(format!("small set lost a name: {listing}"));
+    }
+
+    // 2. THE PRODUCTION CASE. Nine failures must yield nine names, not eight.
+    let nine: Vec<StepOutcome> = (0..9).map(|i| row(&format!("f{i}"), false)).collect();
+    let (named, listing) = blocking_listing(&nine, &none, 9);
+    if named.len() != 9 {
+        return Err(format!("nine failures produced {} names", named.len()));
+    }
+    for i in 0..9 {
+        if !listing.contains(&format!("f{i}")) {
+            return Err(format!("f{i} was counted but not named: {listing}"));
+        }
+    }
+
+    // 3. Above the cap the remainder is STATED, never dropped in silence.
+    let many: Vec<StepOutcome> = (0..15).map(|i| row(&format!("m{i}"), false)).collect();
+    let (named, listing) = blocking_listing(&many, &none, 15);
+    if named.len() != 15 || !listing.contains("(+3 more") {
+        return Err(format!("cap did not declare its remainder: {listing}"));
+    }
+
+    // 4. A headline larger than its own list ANNOUNCES the gap. This is the
+    //    timed-out-node shape: counted somewhere, nameable from nothing.
+    let (_n, listing) = blocking_listing(&nine, &none, 10);
+    if !listing.contains("NOT NAMEABLE") {
+        return Err(format!("count exceeding the list was not announced: {listing}"));
+    }
+
+    // 5. THE OTHER PRODUCTION SHAPE: ten nodes not ok, nine classified as
+    //    failures, one a budget kill. The tenth must be COUNTED AND NAMED in its
+    //    own right, and must NOT be silently absorbed into the failure count.
+    let mut ten = nine.clone();
+    let mut killed = row("privileged-e2e.manifest_backend_parity_c", false);
+    killed.aborted = true; // a budget kill: not ok, and not a `failure` either
+    ten.push(killed);
+    let (named, listing) = blocking_listing(&ten, &none, 9);
+    if named.len() != 9 {
+        return Err(format!("budget kill was absorbed into the failure count: {}", named.len()));
+    }
+    if !listing.contains("NO VERDICT") || !listing.contains("manifest_backend_parity_c") {
+        return Err(format!("a node that did not pass went unreported: {listing}"));
+    }
+
+    // 6. A nonblocking row is excluded from BOTH halves, not just one.
+    let excused: BTreeSet<String> = BTreeSet::from(["f0".to_string()]);
+    let (named, listing) = blocking_listing(&nine, &excused, 8);
+    if named.len() != 8 || listing.contains("f0") {
+        return Err(format!("nonblocking row leaked into the list: {listing}"));
+    }
+
+    Ok("summary listing: count and enumeration agree across 6 cases (the 9-failure \
+shape named in full, the cap states its remainder, and a budget kill is counted \
+and named without being folded into the failure count)"
+        .to_string())
 }
 
 fn ledger_gate_result(outcome: &StepOutcome) -> &'static str {
@@ -12232,16 +12396,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             no_result_nodes.join(", ")
         ));
     } else {
-        let named: Vec<&str> = outcomes
-            .iter()
-            .filter(|o| outcome_is_failure(o) && !plan.nonblocking.contains(&o.tag))
-            .map(|o| o.tag.as_str())
-            .take(8)
-            .collect();
-        detail.push(format!(
-            "{effective_failures} blocking failure(s){}",
-            if named.is_empty() { String::new() } else { format!(": {}", named.join(", ")) }
-        ));
+        let (_named, listing) = blocking_listing(&outcomes, &plan.nonblocking, effective_failures);
+        detail.push(format!("{effective_failures} blocking failure(s){listing}"));
     }
     if exit_code != NO_RESULT_EXIT_CODE as u8 && no_results > 0 {
         detail.push(format!(
