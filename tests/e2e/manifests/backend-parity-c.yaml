@@ -5169,6 +5169,74 @@ test:
           kvm: No custom edge-case arguments have been calibrated for this C guest
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
+  - id: backend-parity-c/pipe-capacity-pin
+    description: Detcore-created pipes expose the fixed 8192-byte scheduler capacity instead of the host default
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    timeout_seconds: 90
+    occasional: false
+    program: tests/backend-parity/fixtures/pipe_capacity_pin.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -D_GNU_SOURCE
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        assert:
+          bitwise_parity: true
+        backends_disabled:
+          dbt: Canonical DBT verification has not been qualified for this environment-control fixture
+          kvm: KVM verification does not yet compare canonical non-vacuous INFO evidence
+          sabre: Canonical SaBRe verification has not been qualified for this environment-control fixture
+          liteinst: LiteInst canonical verification remains blocked by guest-visible startup mapping identity
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (by design): native Linux exposes the host pipe default, while this fixture asserts Detcore policy.'
+        backends_enabled: []
+        backends_disabled:
+          native: Native Linux intentionally exposes the host-dependent default rather than the Detcore pin
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is separate from the initial strict-verification regression cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from this strict-verification regression cell
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (by design): this fixed-value environment oracle has no schedule-diversity contract.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: A fixed-value environment oracle has no schedule-diversity contract
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case arguments are needed for the exact 8192-byte contract.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The exact 8192-byte contract needs no custom arguments
+          dbt: The exact 8192-byte contract needs no custom arguments
+          kvm: The exact 8192-byte contract needs no custom arguments
+          sabre: The exact 8192-byte contract needs no custom arguments
+          liteinst: The exact 8192-byte contract needs no custom arguments
   - id: backend-parity-c/record-lock
     description: Strict verification for tests/backend-parity/fixtures/record_lock.c
     lane: portable

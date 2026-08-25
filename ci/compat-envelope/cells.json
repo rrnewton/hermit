@@ -10250,6 +10250,166 @@
     {
       "lane": "portable",
       "category": "backend-parity-c",
+      "test": "backend-parity-c/pipe-capacity-pin",
+      "mode": "chaos",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/pipe-capacity-pin",
+      "mode": "chaos",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/pipe-capacity-pin",
+      "mode": "chaos",
+      "backend": "liteinst",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/pipe-capacity-pin",
+      "mode": "chaos",
+      "backend": "ptrace",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/pipe-capacity-pin",
+      "mode": "chaos",
+      "backend": "sabre",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/pipe-capacity-pin",
+      "mode": "naked",
+      "backend": "native",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/pipe-capacity-pin",
+      "mode": "replay",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/pipe-capacity-pin",
+      "mode": "replay",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/pipe-capacity-pin",
+      "mode": "replay",
+      "backend": "liteinst",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/pipe-capacity-pin",
+      "mode": "replay",
+      "backend": "ptrace",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/pipe-capacity-pin",
+      "mode": "replay",
+      "backend": "sabre",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/pipe-capacity-pin",
+      "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/pipe-capacity-pin",
+      "mode": "verify",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/pipe-capacity-pin",
+      "mode": "verify",
+      "backend": "liteinst",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/pipe-capacity-pin",
+      "mode": "verify",
+      "backend": "ptrace",
+      "enabled": true,
+      "status": "green",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/pipe-capacity-pin",
+      "mode": "verify",
+      "backend": "sabre",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
       "test": "backend-parity-c/pipe-ipc",
       "mode": "chaos",
       "backend": "dbt",
