@@ -102,4 +102,45 @@ case "$verdict" in
         ;;
 esac
 
+# SECOND SETUP PRECONDITION, same class and same spelling as the submodule check
+# above: scripts/test_validate_stop_paths.py's canonical-adapter contract exercises
+# the REAL dev-hermit parent adapter, found by walking ROOT.parents for
+# ci-hub/ledger/validate_rows.py. From the canonical layout
+# ~/work/dev-hermit/hermit that resolves; from a detached worktree under /tmp --
+# which is the layout agents are TOLD to land from, so it is the COMMON case --
+# the ancestors are only /tmp and /, and the contract cannot be tested at all.
+#
+# ⚠️ AND THE COST OF GETTING THIS WRONG IS ASYMMETRIC. Reported as a failure it
+# manufactures a MAIN-RED, which is a standing P0 here, from the DEFAULT working
+# layout -- so the false reading was the common one and the true one the exception.
+# Measured 2026-08-25 on clean main from /tmp: a bare StopIteration with no message
+# and no path, surfaced by make as `Error 1`. Telling a precondition from a finding
+# required reading the test's source.
+#
+# Checked HERE rather than only inside the test because make maps ANY nonzero recipe
+# status to its own error -- `exit 75` from a recipe becomes `make: *** Error 75`,
+# rc=2 -- so a no_result cannot be expressed through the make layer. The node is the
+# outermost place that can still say 75 and have validate.rs classify it no_result.
+if [ ! -f ../ci-hub/ledger/validate_rows.py ] \
+   && ! git rev-parse --show-superproject-working-tree 2>/dev/null | grep -q .; then
+    parent_found=
+    probe=$PWD
+    while [ "$probe" != "/" ]; do
+        probe=$(dirname "$probe")
+        if [ -f "$probe/ci-hub/ledger/validate_rows.py" ]; then parent_found=$probe; break; fi
+    done
+    if [ -z "$parent_found" ]; then
+        echo 'lint-checks: NO RESULT -- the dev-hermit parent adapter is not reachable.' >&2
+        echo '  ci-hub/ledger/validate_rows.py is on no ancestor of' >&2
+        echo "    $PWD" >&2
+        echo '  This is a SETUP condition, not a lint failure: the canonical-adapter' >&2
+        echo '  contract in scripts/test_validate_stop_paths.py exercises the REAL parent' >&2
+        echo '  adapter, and there is none to exercise here. Every other checker in this' >&2
+        echo '  target is unaffected and would have run.' >&2
+        echo '  Run the node from a checkout nested under the dev-hermit parent' >&2
+        echo '  (canonically ~/work/dev-hermit/hermit), not from a detached worktree.' >&2
+        exit 75
+    fi
+fi
+
 exec make lint-checks
