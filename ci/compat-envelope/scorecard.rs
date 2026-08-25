@@ -2827,12 +2827,17 @@ fn project_observations(
     let (rows, skipped) = read_series_rows(series_root)?;
     let mut by_cell: BTreeMap<String, Vec<&SeriesRow>> = BTreeMap::new();
     for row in &rows {
-        by_cell.entry(row.cell.clone()).or_default().push(row);
+        by_cell.entry(row.cell().to_string()).or_default().push(row);
     }
 
     let mut projected = 0usize;
     for cell in &mut tracked.cells {
-        let Some(cell_rows) = by_cell.get(&display_id(&cell.id)) else {
+        // ⚠️ KEYED ON `test/mode/backend`, NOT `display_id`. display_id renders
+        // `lane/category/test/mode@backend`; the producer's `series_cell()` and the
+        // schema's `_CELL_RE` both use `test/mode/backend`, and `@` is not a legal
+        // character there -- so a row in display_id form could never pass the write
+        // boundary. Measured: `test/mode/backend` is UNIQUE across all 5712 cells.
+        let Some(cell_rows) = by_cell.get(&series_cell_key(&cell.id)) else {
             continue;
         };
         for observation in &mut cell.observations {
@@ -2850,16 +2855,16 @@ fn project_observations(
             for row in cell_rows {
                 observation
                     .first_divergent_scheduler_turn
-                    .record(row.first_divergent_scheduler_turn);
+                    .record(row.coordinate("first_divergent_scheduler_turn"));
                 observation
                     .first_divergent_virtual_nanoseconds
-                    .record(row.first_divergent_virtual_nanoseconds);
+                    .record(row.coordinate("first_divergent_virtual_nanoseconds"));
                 observation
                     .first_divergent_record
-                    .record(row.first_divergent_record);
+                    .record(row.coordinate("first_divergent_record"));
                 observation
                     .first_divergent_syscall
-                    .record(row.first_divergent_syscall);
+                    .record(row.coordinate("first_divergent_syscall"));
             }
         }
         projected += 1;
@@ -2899,11 +2904,10 @@ fn project_observations(
     Ok(())
 }
 
-/// One divergence-position row as the series store carries it.
-#[derive(Clone, Debug, Deserialize)]
+/// The four divergence positions, as the store nests them.
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SeriesRow {
-    cell: String,
+struct SeriesCoordinates {
     #[serde(default)]
     first_divergent_scheduler_turn: Option<u64>,
     #[serde(default)]
@@ -2912,6 +2916,56 @@ struct SeriesRow {
     first_divergent_record: Option<u64>,
     #[serde(default)]
     first_divergent_syscall: Option<u64>,
+}
+
+/// The `series` payload inside an envelope.
+///
+/// ⚠️ `coordinates` IS OPTIONAL AND ITS ABSENCE IS MEANINGFUL. A `diverged` row
+/// that located no position omits the object entirely; that is the store's
+/// `diverged-unlocated` state, not a malformed row. Requiring it would force a
+/// producer to invent a position it does not have.
+#[derive(Clone, Debug, Deserialize)]
+struct SeriesPayload {
+    cell: String,
+    #[serde(default)]
+    coordinates: Option<SeriesCoordinates>,
+}
+
+/// One row as the series store ACTUALLY carries it: an envelope wrapping a
+/// `series` payload.
+///
+/// ⚠️ THIS USED TO BE A FLAT STRUCT WITH `deny_unknown_fields`, AND IT COULD NOT
+/// READ A SINGLE REAL ROW. `ci-hub/series/series.py` is the schema authority and
+/// it validates an ENVELOPE -- schema, event_id, event_type, producer,
+/// emitted_at, host, team, run_id, plus a nested `series` object. Every such row
+/// failed to deserialize here on `unknown field \`schema\``, and because a
+/// failed line is skipped rather than fatal, the projection reported "the series
+/// is EMPTY" and exited 0. Measured 2026-08-25: one row in the producer's own
+/// format projected 0 cells, the target cell kept `never-measured`, and every
+/// surface reported success.
+///
+/// Envelope fields are accepted and ignored, so this deliberately does NOT carry
+/// `deny_unknown_fields`: the envelope is the producer's to extend, and rejecting
+/// a field this consumer does not need is what created the outage.
+#[derive(Clone, Debug, Deserialize)]
+struct SeriesRow {
+    series: SeriesPayload,
+}
+
+impl SeriesRow {
+    fn cell(&self) -> &str {
+        &self.series.cell
+    }
+    fn coordinate(&self, key: &str) -> Option<u64> {
+        let c = self.series.coordinates.as_ref()?;
+        match key {
+            "first_divergent_scheduler_turn" => c.first_divergent_scheduler_turn,
+            "first_divergent_virtual_nanoseconds" => c.first_divergent_virtual_nanoseconds,
+            "first_divergent_record" => c.first_divergent_record,
+            "first_divergent_syscall" => c.first_divergent_syscall,
+            _ => None,
+        }
+    }
 }
 
 /// Read every series shard under `series_root`.
@@ -3238,6 +3292,16 @@ fn require_sha256(label: &str, value: &str) -> Result<(), String> {
         return Err(format!("has no valid {label} SHA-256 identity"));
     }
     Ok(())
+}
+
+/// The cell key as the SERIES STORE spells it: `test/mode/backend`.
+///
+/// Distinct from [`display_id`], which renders `lane/category/test/mode@backend`.
+/// The store's schema (`ci-hub/series/series.py`, `_CELL_RE`) permits neither `@`
+/// nor the lane/category prefix, so the two are not interchangeable and using the
+/// wrong one silently matches nothing at all.
+fn series_cell_key(id: &CellId) -> String {
+    format!("{}/{}/{}", id.test, id.mode, id.backend)
 }
 
 fn display_id(id: &CellId) -> String {
