@@ -223,10 +223,12 @@ fn is_full_sha(value: &str) -> bool {
 /// redirected a fetch and left a Hermit checkout sitting at Reverie's HEAD with
 /// 3,615 apparently-dirty paths.
 fn git_root() -> Result<PathBuf, String> {
-    let output = isolated_git_command()?
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .map_err(|error| format!("could not run git rev-parse: {error}"))?;
+    let output = under_git_env(|| {
+        isolated_git_command()?
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .map_err(|error| format!("could not run git rev-parse: {error}"))
+    })?;
     if !output.status.success() {
         return Err(format!(
             "git rev-parse failed: {}",
@@ -663,11 +665,13 @@ fn reverie_graph(root: &Path, remote: &str) -> Result<GuardedGitRepo, String> {
         CacheState::Absent => {
             fs::create_dir_all(cache.parent().unwrap_or(&cache))
                 .map_err(|error| format!("could not create the Reverie graph cache: {error}"))?;
-            let init = isolated_git_command()?
-                .args(["init", "--bare", "--quiet"])
-                .arg(&cache)
-                .output()
-                .map_err(|error| format!("could not run git init: {error}"))?;
+            let init = under_git_env(|| {
+                isolated_git_command()?
+                    .args(["init", "--bare", "--quiet"])
+                    .arg(&cache)
+                    .output()
+                    .map_err(|error| format!("could not run git init: {error}"))
+            })?;
             if !init.status.success() {
                 return Err(format!(
                     "git init --bare failed: {}",
@@ -866,10 +870,12 @@ fn query_main(remote: &str) -> Result<String, String> {
     // The tip this returns IS the authority: every later comparison is against
     // it. Prove the URL is the one named before asking it anything.
     refuse_rewritten_authority_url(remote)?;
-    let output = authority_git_command()?
-        .args(["ls-remote", "--exit-code", remote, MAIN_REF])
-        .output()
-        .map_err(|error| format!("could not run git ls-remote: {error}"))?;
+    let output = under_git_env(|| {
+        authority_git_command()?
+            .args(["ls-remote", "--exit-code", remote, MAIN_REF])
+            .output()
+            .map_err(|error| format!("could not run git ls-remote: {error}"))
+    })?;
     if !output.status.success() {
         return Err(format!(
             "git ls-remote {remote} {MAIN_REF} failed: {}",
@@ -894,7 +900,24 @@ fn query_main(remote: &str) -> Result<String, String> {
 fn git_local_env_vars() -> Result<&'static [OsString], String> {
     static LOCAL_ENV_VARS: OnceLock<Result<Vec<OsString>, String>> = OnceLock::new();
     let vars = LOCAL_ENV_VARS.get_or_init(|| {
+        // ⚠️ THIS FORK RUNS UNDERNEATH `under_git_env` -- `clear_git_local_env`
+        // calls it -- so it must NOT take the lock. That would be a recursive
+        // read acquisition on one thread. It is made immune instead:
+        // `rev-parse --local-env-vars` needs no configuration whatsoever, so the
+        // numbered-override spelling is stripped from the child outright and it
+        // cannot observe a half-published `GIT_CONFIG_COUNT` with no matching
+        // `GIT_CONFIG_KEY_0`. (`KEY_n`/`VALUE_n` without a `COUNT` are ignored by
+        // Git, so removing the count is what closes it.)
+        //
+        // This site matters more than the others: the result is memoised in a
+        // `OnceLock`, and so is the `Err`. A single transient failure here would
+        // be cloned back to every later caller for the lifetime of the process,
+        // and since `clear_git_local_env` depends on it, EVERY isolated Git
+        // command in the run would fail from then on -- including the ones the
+        // lock protects.
         let output = Command::new("git")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_CONFIG_PARAMETERS")
             .args(["rev-parse", "--local-env-vars"])
             .output()
             .map_err(|error| format!("could not enumerate Git local environment variables: {error}"))?;
@@ -1106,12 +1129,15 @@ fn refuse_rewritten_authority_url(remote: &str) -> Result<(), String> {
 }
 
 fn isolated_git_in(dir: &Path, args: &[&str]) -> Result<Output, String> {
-    isolated_git_command()?
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .map_err(|error| format!("could not run isolated git {}: {error}", args.join(" ")))
+    // The twin of `git_in`, and it needs the same guard for the same reason.
+    under_git_env(|| {
+        isolated_git_command()?
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .map_err(|error| format!("could not run isolated git {}: {error}", args.join(" ")))
+    })
 }
 
 fn canonical_git_path(repo: &Path, selector: &str) -> Result<PathBuf, String> {
@@ -1191,12 +1217,16 @@ impl GuardedGitRepo {
         // sitting at Reverie's HEAD, reporting 3,615 apparently-dirty paths.
         // Nothing above proves bareness: distinctness from the product only
         // establishes that it is a DIFFERENT repository, not a safe one.
-        let bare = isolated_git_command()?
-            .arg("--git-dir")
-            .arg(&cache_git_dir)
-            .args(["rev-parse", "--is-bare-repository"])
-            .output()
-            .map_err(|error| format!("could not query the graph cache repository kind: {error}"))?;
+        let bare = under_git_env(|| {
+            isolated_git_command()?
+                .arg("--git-dir")
+                .arg(&cache_git_dir)
+                .args(["rev-parse", "--is-bare-repository"])
+                .output()
+                .map_err(|error| {
+                    format!("could not query the graph cache repository kind: {error}")
+                })
+        })?;
         if !bare.status.success() {
             return Err(format!(
                 "could not determine whether the Reverie graph cache {} is bare: {}",
@@ -1258,12 +1288,14 @@ impl GuardedGitRepo {
         // value, and a repository that also sets `core.worktree` has a worktree
         // regardless of what it claims -- which restores exactly the
         // checked-out-HEAD hazard the bareness check exists to exclude.
-        let worktree = isolated_git_command()?
-            .arg("--git-dir")
-            .arg(&cache_git_dir)
-            .args(["config", "--get", "core.worktree"])
-            .output()
-            .map_err(|error| format!("could not query the graph cache worktree: {error}"))?;
+        let worktree = under_git_env(|| {
+            isolated_git_command()?
+                .arg("--git-dir")
+                .arg(&cache_git_dir)
+                .args(["config", "--get", "core.worktree"])
+                .output()
+                .map_err(|error| format!("could not query the graph cache worktree: {error}"))
+        })?;
         let configured_worktree = String::from_utf8_lossy(&worktree.stdout).trim().to_owned();
         if !configured_worktree.is_empty() {
             return Err(format!(
@@ -1282,12 +1314,14 @@ impl GuardedGitRepo {
     /// computed with replacement refs and grafts disabled -- see
     /// [`authority_git_command`]. This is the method that decides the verdict.
     fn run(&self, args: &[&str]) -> Result<Output, String> {
-        authority_git_command()?
-            .arg("--git-dir")
-            .arg(&self.git_dir)
-            .args(args)
-            .output()
-            .map_err(|error| format!("could not run isolated git {}: {error}", args.join(" ")))
+        under_git_env(|| {
+            authority_git_command()?
+                .arg("--git-dir")
+                .arg(&self.git_dir)
+                .args(args)
+                .output()
+                .map_err(|error| format!("could not run isolated git {}: {error}", args.join(" ")))
+        })
     }
 }
 
@@ -1300,19 +1334,69 @@ impl GuardedGitRepo {
 /// another. Every caller here aims at a specific checkout, so every caller wants
 /// the isolated form.
 fn git_in(dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    // ⚠️ READ SIDE OF THE ENVIRONMENT LOCK, AT THE CHOKEPOINT.
-    // Guarding one call site is not enough -- measured: guarding only
-    // init_fixture_repo took 8 failing tests across 8 runs down to 2, which is
-    // worse than leaving it, because it looks fixed. Every test reader reaches
-    // git through here, so here is where the guard belongs.
+    under_git_env(|| {
+        isolated_git_command()?
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .map_err(|error| format!("could not run git {}: {error}", args.join(" ")))
+    })
+}
+
+/// Hold the read side of the environment lock across `body`.
+///
+/// ⚠️ `body` MUST BUILD THE COMMAND AS WELL AS FORK IT. There are two reads of
+/// the ambient environment at two different instants, and a guard around only
+/// one of them admits a mismatched pair:
+///
+/// * `clear_git_local_env` SNAPSHOTS `GIT_CONFIG_COUNT` (via
+///   `CONFIG_OVERRIDE_ENV_VARS`) while building the command, and pins that value
+///   onto the child.
+/// * `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` are not in that list at all. They
+///   are neither preserved nor removed, so the child INHERITS them at the fork.
+///
+/// Build outside and fork inside and you can pin `COUNT=1` from before a
+/// writer's restore and then inherit no `KEY_0` after it, handing the child a
+/// count and keys from two different instants. That spelling looks correct and
+/// is not; it was proposed during review of this change and caught before it
+/// landed.
+///
+/// ⚠️ HOW MUCH THIS IS WORTH, STATED HONESTLY. The mismatched pair is real, but
+/// **no git available here rejects one.** Measured 2026-08-25 on devbig014, with
+/// a positive control confirming the overrides were honoured (`zzz.probe=HIT`
+/// present in `config --list`):
+///
+/// | condition | git 2.52.0 | git 2.53.0-Meta |
+/// | --- | --- | --- |
+/// | `COUNT=1`, no `KEY_0` | exit 0 | exit 0 |
+/// | `COUNT=1`, `KEY_0` set, no `VALUE_0` | exit 0 | exit 0 |
+/// | `COUNT=2`, only pair 0 present | exit 0, pair 0 applied | same |
+/// | `KEY_0` empty | exit 128 `empty config key` | exit 128 |
+/// | `COUNT` non-numeric | exit 128 `bogus count` | exit 128 |
+///
+/// A count larger than the keys present is silently ignored. `with_config_override`
+/// restores with `remove_var` and never writes an empty key or a non-numeric
+/// count, so it cannot produce either failing condition. The suite was run 30x
+/// with NO guard at all (10 at default thread count, 20 at `--test-threads=32`)
+/// and failed 0 times.
+///
+/// So this guard is **hardening against a real non-atomicity, not a reproduced
+/// failure.** It is kept because the two-instant read is genuinely there and a
+/// stricter git would reject it; do not cite it as a fix for observed flakiness
+/// without re-measuring first.
+///
+/// ⚠️ DO NOT NEST. Two read acquisitions on one thread is recursive read
+/// locking, which `std::sync::RwLock` does not promise is safe -- a writer
+/// queued between them deadlocks a writer-preferring implementation, and
+/// `RwLock::read` documents that it may panic when the lock is already held by
+/// the current thread. Every guarded site is therefore a leaf with respect to
+/// the others. `git_local_env_vars` runs UNDERNEATH these and deliberately takes
+/// no guard; it is made config-independent instead.
+fn under_git_env<T>(body: impl FnOnce() -> T) -> T {
     #[cfg(test)]
     let _env_guard = tests::env_read_guard();
-    isolated_git_command()?
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .map_err(|error| format!("could not run git {}: {error}", args.join(" ")))
+    body()
 }
 
 fn unique_pin(scan: &PinScan) -> Result<&str, String> {
@@ -2555,31 +2639,35 @@ mod tests {
                 .success()
         );
         let victim_git_dir = root.join(".git");
-        let vulnerable = Command::new("git")
-            .env("GIT_DIR", &victim_git_dir)
-            .arg("-C")
-            .arg(&cache)
-            .args([
-                "fetch",
-                "--no-tags",
-                "--quiet",
-                "--force",
-                remote.to_str().expect("UTF-8 fixture path"),
-                "+refs/heads/main:refs/heads/main",
-            ])
-            .output()
-            .expect("run vulnerable fetch");
+        let vulnerable = under_git_env(|| {
+            Command::new("git")
+                .env("GIT_DIR", &victim_git_dir)
+                .arg("-C")
+                .arg(&cache)
+                .args([
+                    "fetch",
+                    "--no-tags",
+                    "--quiet",
+                    "--force",
+                    remote.to_str().expect("UTF-8 fixture path"),
+                    "+refs/heads/main:refs/heads/main",
+                ])
+                .output()
+                .expect("run vulnerable fetch")
+        });
         assert!(
             vulnerable.status.success(),
             "the regression bracket must reproduce the import: {}",
             String::from_utf8_lossy(&vulnerable.stderr)
         );
-        let imported = Command::new("git")
-            .arg("--git-dir")
-            .arg(&victim_git_dir)
-            .args(["rev-parse", "refs/heads/main"])
-            .output()
-            .expect("read imported main");
+        let imported = under_git_env(|| {
+            Command::new("git")
+                .arg("--git-dir")
+                .arg(&victim_git_dir)
+                .args(["rev-parse", "refs/heads/main"])
+                .output()
+                .expect("read imported main")
+        });
         assert_eq!(
             String::from_utf8_lossy(&imported.stdout).trim(),
             foreign_main,
@@ -2589,48 +2677,49 @@ mod tests {
         // Restore only the disposable fixture, then run the same fetch after
         // applying the production environment isolation. The foreign ref must
         // land in the cache and the product main must remain unchanged.
-        assert!(
-            Command::new("git")
-                .arg("--git-dir")
-                .arg(&victim_git_dir)
-                .args(["update-ref", "refs/heads/main", &victim_main])
-                .status()
-                .expect("restore fixture main")
-                .success()
-        );
-        assert!(
-            Command::new("git")
-                .arg("--git-dir")
-                .arg(&victim_git_dir)
-                .args(["config", "core.bare", "false"])
-                .status()
-                .expect("restore fixture core.bare")
-                .success()
-        );
-        let init = isolated_git_command()
-            .expect("build isolated init")
-            .args(["init", "--bare", "--quiet"])
-            .arg(&cache)
-            .output()
-            .expect("initialize cache");
+        assert!(under_git_env(|| Command::new("git")
+            .arg("--git-dir")
+            .arg(&victim_git_dir)
+            .args(["update-ref", "refs/heads/main", &victim_main])
+            .status()
+            .expect("restore fixture main")
+            .success()));
+        assert!(under_git_env(|| Command::new("git")
+            .arg("--git-dir")
+            .arg(&victim_git_dir)
+            .args(["config", "core.bare", "false"])
+            .status()
+            .expect("restore fixture core.bare")
+            .success()));
+        let init = under_git_env(|| {
+            isolated_git_command()
+                .expect("build isolated init")
+                .args(["init", "--bare", "--quiet"])
+                .arg(&cache)
+                .output()
+                .expect("initialize cache")
+        });
         assert!(init.status.success());
 
-        let mut safe = Command::new("git");
-        safe.env("GIT_DIR", &victim_git_dir);
-        clear_git_local_env(&mut safe).expect("isolate cache fetch");
-        let safe_fetch = safe
-            .arg("--git-dir")
-            .arg(&cache)
-            .args([
-                "fetch",
-                "--no-tags",
-                "--quiet",
-                "--force",
-                remote.to_str().expect("UTF-8 fixture path"),
-                "+refs/heads/main:refs/heads/main",
-            ])
-            .output()
-            .expect("run isolated fetch");
+        // `clear_git_local_env` is called explicitly here, so the guard has to
+        // span it as well as the fork -- that snapshot is half of the race.
+        let safe_fetch = under_git_env(|| {
+            let mut safe = Command::new("git");
+            safe.env("GIT_DIR", &victim_git_dir);
+            clear_git_local_env(&mut safe).expect("isolate cache fetch");
+            safe.arg("--git-dir")
+                .arg(&cache)
+                .args([
+                    "fetch",
+                    "--no-tags",
+                    "--quiet",
+                    "--force",
+                    remote.to_str().expect("UTF-8 fixture path"),
+                    "+refs/heads/main:refs/heads/main",
+                ])
+                .output()
+                .expect("run isolated fetch")
+        });
         assert!(safe_fetch.status.success());
         assert_eq!(
             String::from_utf8_lossy(
@@ -3860,24 +3949,53 @@ mod tests {
     /// other tests, which take no lock and cannot be made to. Rust runs tests as
     /// threads of ONE process, so `env::set_var` publishes to every thread at
     /// once; a child forked during the window between setting GIT_CONFIG_COUNT
-    /// and setting GIT_CONFIG_KEY_0 inherits a count with no key and dies with
-    /// `error: missing config key GIT_CONFIG_KEY_0`, exit 128.
+    /// and setting GIT_CONFIG_KEY_0 inherits a count with no key.
     ///
-    /// DEMONSTRATED, not argued -- a standalone harness with one writer doing
-    /// exactly what `with_config_override` does and four threads shelling out to
-    /// git: 83 of 600 invocations observed the partial state. Reordering the
-    /// writes (keys before count) narrowed the window but did NOT close it: 8
-    /// failing tests across 8 runs became roughly 2, which is worse than either
-    /// extreme because it looks fixed.
+    /// The partial state is real and observable -- a standalone harness with one
+    /// writer doing exactly what `with_config_override` does and four threads
+    /// shelling out to git saw it in 83 of 600 invocations.
     ///
-    /// The write side takes the WRITE lock; every test that shells out to git
-    /// takes the READ lock. Readers still run concurrently with each other -- the
-    /// file is not serialised -- and no reader can be mid-fork while a writer is
-    /// mid-publish.
+    /// ⚠️ WHAT THAT PARTIAL STATE DOES **NOT** DO, RE-MEASURED 2026-08-25 ON
+    /// devbig014: it does not make git fail. Neither git on this host rejects a
+    /// count with no key -- both exit 0 and ignore the surplus. An earlier
+    /// revision of this comment said such a child "dies with `error: missing
+    /// config key GIT_CONFIG_KEY_0`, exit 128", and that is not reproducible
+    /// here; the only conditions that do exit 128 are an EMPTY key and a
+    /// non-numeric count, neither of which `with_config_override` can produce
+    /// (it restores with `remove_var`). An earlier revision also reported "8
+    /// failing tests across 8 runs" without the guard; re-measured, the suite
+    /// ran 30 times with no guard at all and failed 0 times. See
+    /// [`under_git_env`] for the full table and the positive control.
+    ///
+    /// The lock is kept as hardening for the genuine two-instant read, not as a
+    /// fix for observed flakiness.
+    ///
+    /// The write side takes the WRITE lock; the read side is taken by
+    /// [`under_git_env`], and readers still run concurrently with each other --
+    /// the file is not serialised.
+    ///
+    /// COVERAGE, counted rather than asserted. At the time of writing this file
+    /// forks 27 child processes; 23 of them are `git` and 4 are not (`cargo` x2,
+    /// `/bin/sh`, `env`, none of which read `GIT_CONFIG_*`). **22 of the 23 git
+    /// forks run inside `under_git_env`.** The 23rd is the
+    /// `git rev-parse --local-env-vars` call in `git_local_env_vars`, which runs
+    /// UNDERNEATH the guard and so cannot take it; that one is made immune by
+    /// stripping `GIT_CONFIG_COUNT` from the child instead. See the comment
+    /// there.
+    ///
+    /// ⚠️ An earlier revision of this change guarded ONE of the 23 and said in a
+    /// comment that it had guarded them all. Do not restate the coverage without
+    /// recounting it: the failure mode of a partial guard is that it looks like
+    /// a total one.
     static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
     /// Hold the read side across a git invocation, so no writer can publish a
-    /// partial GIT_CONFIG_* set while this thread forks.
+    /// partial GIT_CONFIG_* set while this thread builds or forks.
+    ///
+    /// ⚠️ Call this only through [`under_git_env`]. Taking it directly invites
+    /// the two mistakes that matter: holding it around the fork but not around
+    /// the command construction, and holding it at a level that nests with
+    /// another acquisition.
     pub(super) fn env_read_guard() -> std::sync::RwLockReadGuard<'static, ()> {
         ENV_LOCK
             .read()
@@ -3886,6 +4004,12 @@ mod tests {
 
     /// Set the numbered Git config override variables, run `body`, and restore
     /// the previous values whatever happens.
+    ///
+    /// ⚠️ `body` MUST NOT INVOKE GIT. This holds the WRITE lock across `body`,
+    /// and every git invocation in this file takes the READ lock through
+    /// `under_git_env`; write-then-read on one thread is not reentrant and will
+    /// hang the test with no message. Today both callers only read `GIT_CONFIG_*`
+    /// through `env::var`, which is why this is a warning and not a bug.
     fn with_config_override<T>(pairs: &[(&str, &str)], body: impl FnOnce() -> T) -> T {
         let _guard = ENV_LOCK
             .write()
@@ -4062,12 +4186,17 @@ mod tests {
 
         // The unguarded answer, in this same test, so the guarded one below is
         // demonstrably different rather than merely correct.
-        let unguarded = Command::new("git")
-            .arg("-C")
-            .arg(&source)
-            .args(["merge-base", "--is-ancestor", &off, &b])
-            .status()
-            .expect("run unguarded merge-base");
+        // "Unguarded" here means without `--no-replace-objects`, which is the
+        // point of the assertion. It still takes the ENVIRONMENT guard -- that
+        // is a different mechanism and does not affect what this test measures.
+        let unguarded = under_git_env(|| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&source)
+                .args(["merge-base", "--is-ancestor", &off, &b])
+                .status()
+                .expect("run unguarded merge-base")
+        });
         assert!(
             unguarded.success(),
             "precondition: without the guard the replacement must fake the ancestry, \
@@ -4075,19 +4204,17 @@ mod tests {
         );
 
         fs::create_dir_all(&cache).expect("create cache dir");
-        assert!(
-            isolated_git_command()
-                .unwrap()
-                .args(["init", "--bare", "--quiet"])
-                .arg(&cache)
-                .status()
-                .unwrap()
-                .success()
-        );
+        assert!(under_git_env(|| isolated_git_command()
+            .unwrap()
+            .args(["init", "--bare", "--quiet"])
+            .arg(&cache)
+            .status()
+            .unwrap()
+            .success()));
         // Bring the objects AND the replacement ref across, the way an attacker
         // who can write the cache would.
         assert!(
-            isolated_git_command()
+            under_git_env(|| isolated_git_command()
                 .unwrap()
                 .arg("--git-dir")
                 .arg(&cache)
@@ -4099,7 +4226,7 @@ mod tests {
                 ])
                 .status()
                 .unwrap()
-                .success(),
+                .success()),
             "fixture fetch must succeed"
         );
 
@@ -4131,15 +4258,13 @@ mod tests {
         init_fixture_repo(&root);
         commit_file(&root, "p", "product\n");
         fs::create_dir_all(&elsewhere).expect("create the redirect target");
-        assert!(
-            isolated_git_command()
-                .unwrap()
-                .args(["init", "--bare", "--quiet"])
-                .arg(&elsewhere)
-                .status()
-                .unwrap()
-                .success()
-        );
+        assert!(under_git_env(|| isolated_git_command()
+            .unwrap()
+            .args(["init", "--bare", "--quiet"])
+            .arg(&elsewhere)
+            .status()
+            .unwrap()
+            .success()));
 
         let cache = root.join("target/ci/reverie-graph.git");
         fs::create_dir_all(&cache).expect("create cache dir");
@@ -4201,15 +4326,13 @@ mod tests {
 
         // A real bare repository at the path is recognized.
         let bare = root.join("bare.git");
-        assert!(
-            isolated_git_command()
-                .unwrap()
-                .args(["init", "--bare", "--quiet"])
-                .arg(&bare)
-                .status()
-                .unwrap()
-                .success()
-        );
+        assert!(under_git_env(|| isolated_git_command()
+            .unwrap()
+            .args(["init", "--bare", "--quiet"])
+            .arg(&bare)
+            .status()
+            .unwrap()
+            .success()));
         assert!(matches!(
             classify_cache_path(&bare).expect("a bare repository is recognized"),
             CacheState::BareCache
@@ -4248,15 +4371,13 @@ mod tests {
         let real = temp_path("path-identity-real");
         init_fixture_repo(&product);
         commit_file(&product, "p", "product\n");
-        assert!(
-            isolated_git_command()
-                .unwrap()
-                .args(["init", "--bare", "--quiet"])
-                .arg(&real)
-                .status()
-                .unwrap()
-                .success()
-        );
+        assert!(under_git_env(|| isolated_git_command()
+            .unwrap()
+            .args(["init", "--bare", "--quiet"])
+            .arg(&real)
+            .status()
+            .unwrap()
+            .success()));
         fs::create_dir_all(&cache).expect("create the carrier directory");
         fs::write(cache.join(".git"), format!("gitdir: {}\n", real.display()))
             .expect("write the .git carrier");
@@ -4298,17 +4419,15 @@ mod tests {
         init_fixture_repo(&product);
         commit_file(&product, "p", "product\n");
         fs::create_dir_all(&tree).expect("create the worktree");
+        assert!(under_git_env(|| isolated_git_command()
+            .unwrap()
+            .args(["init", "--bare", "--quiet"])
+            .arg(&cache)
+            .status()
+            .unwrap()
+            .success()));
         assert!(
-            isolated_git_command()
-                .unwrap()
-                .args(["init", "--bare", "--quiet"])
-                .arg(&cache)
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            isolated_git_command()
+            under_git_env(|| isolated_git_command()
                 .unwrap()
                 .arg("--git-dir")
                 .arg(&cache)
@@ -4316,7 +4435,7 @@ mod tests {
                 .arg(&tree)
                 .status()
                 .unwrap()
-                .success(),
+                .success()),
             "fixture must be able to configure core.worktree"
         );
 
