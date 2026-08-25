@@ -3791,39 +3791,78 @@ fn a_guest_side_fault_is_not_reported_as_a_hermit_internal_failure() {
 }
 
 /// `hermit record` must classify a container-child failure the same way
-/// `hermit run` does.
+/// `hermit run` does -- IN EVERY SPELLING THAT ENTERS A CONTAINER, not just the
+/// bare one.
 ///
-/// ⚠️ THIS IS THE CALL SITE THE FIX ORIGINALLY MISSED. `record` -- every
-/// spelling -- calls `RunGuarded::run_guarded` directly at six sites in
-/// `record_start.rs` and never goes through `with_container`, so the
-/// `.context(..)??` discard survived there and BOTH container-child classes
-/// surfaced as `class=cli-error`. A wrong machine-readable class is worse than
-/// none, because a gate believes it.
+/// ⚠️ THIS IS THE CALL SITE THE FIX ORIGINALLY MISSED. `record` calls
+/// `RunGuarded::run_guarded` directly at six sites in `record_start.rs` and
+/// never goes through `with_container`, so the `.context(..)??` discard survived
+/// there and BOTH container-child classes surfaced as `class=cli-error`. A wrong
+/// machine-readable class is worse than none, because a gate believes it.
+///
+/// ⚠️ AND ONE SPELLING IS NOT SIX. The first version of this test drove only
+/// `record -- prog`, which reaches exactly one of the six sites; adversarial
+/// review pointed out that the other five could be reverted to the old
+/// flattening with this test still green, so the "every spelling" claim in the
+/// paragraph above was not the claim being tested. Four of the six are now
+/// driven, one per entry point that can be reached with the guest's FIRST
+/// container:
+///
+/// | spelling | site |
+/// | --- | --- |
+/// | `record -- prog` | `main`, no deadline |
+/// | `record --record-timeout N -- prog` | `main`, deadline armed |
+/// | `record --verify -- prog` | `record_verify`, record stage |
+/// | `record --verify-with-gdbex ... -- prog` | `record_verify_debug`, record stage |
+///
+/// ⚠️ THE REMAINING TWO ARE THE REPLAY STAGES OF THOSE LAST TWO, AND THIS
+/// MECHANISM CANNOT REACH THEM -- said here rather than left to be rediscovered.
+/// `inject_test_fault` is a process-local environment check with no notion of
+/// which stage it is in, so with the variable set the RECORD stage faults first
+/// and the replay stage is never entered. Covering them needs a fault injector
+/// that can name a stage; filed rather than bodged, and the two sites are
+/// identical in shape to the four that are covered.
 #[test]
 fn record_classifies_a_container_child_failure_the_same_way_run_does() {
     let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("failed to create a recording dir");
-    let case = |fault: &str| -> String {
+    let case = |fault: &str, extra: &[&str]| -> String {
+        let mut args = vec!["record"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--", "/bin/true"]);
         let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
             .env("HERMIT_TEST_CONTAINER_CHILD_FAULT", fault)
             .env("HERMIT_DATA_DIR", data_dir.path())
-            .args(["record", "--", "/bin/true"])
+            .args(&args)
             .output()
-            .expect("failed to run the fault-injected recording");
+            .unwrap_or_else(|error| panic!("failed to run {args:?}: {error}"));
         String::from_utf8_lossy(&output.stderr).into_owned()
     };
 
-    let segv = case("segv");
-    assert!(
-        segv.contains("HERMIT_INTERNAL_FAILURE class=container-child-exit"),
-        "a record-path container child that exited with an unchosen status must be \
-         classified as such, not as a CLI error\nstderr:\n{segv}"
-    );
+    // One entry point per row of the table above. Each is asserted for BOTH
+    // classes, because the two travel different paths out of the child: an
+    // unchosen exit status is observed by reverie, a caught panic is reported
+    // through `SerializableError`'s discriminant.
+    let spellings: [(&str, &[&str]); 4] = [
+        ("bare", &[]),
+        ("with a recording deadline", &["--record-timeout", "600"]),
+        ("with --verify", &["--verify"]),
+        ("with --verify-with-gdbex", &["--verify-with-gdbex", "quit"]),
+    ];
 
-    let panicked = case("panic");
-    assert!(
-        panicked.contains("HERMIT_INTERNAL_FAILURE class=container-child-panic"),
-        "a record-path CAUGHT container-child panic must be classified as a panic, not \
-         as a CLI error\nstderr:\n{panicked}"
-    );
+    for (name, extra) in spellings {
+        let segv = case("segv", extra);
+        assert!(
+            segv.contains("HERMIT_INTERNAL_FAILURE class=container-child-exit"),
+            "a record-path container child that exited with an unchosen status must be \
+             classified as such, not as a CLI error -- spelling: {name}\nstderr:\n{segv}"
+        );
+
+        let panicked = case("panic", extra);
+        assert!(
+            panicked.contains("HERMIT_INTERNAL_FAILURE class=container-child-panic"),
+            "a record-path CAUGHT container-child panic must be classified as a panic, \
+             not as a CLI error -- spelling: {name}\nstderr:\n{panicked}"
+        );
+    }
 }
