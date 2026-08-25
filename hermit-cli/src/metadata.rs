@@ -232,7 +232,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         // semantics begin in v0x102.
         passthru_opt: true,
         deterministic_io: false,
-        virtualize_time: false,
+        virtualize_time: crate::RECORD_REPLAY_VIRTUALIZES_TIME,
         virtualize_metadata: false,
         virtualize_cpuid: true,
         cpuid_virtualized_by_backend: false,
@@ -339,6 +339,36 @@ mod tests {
         assert_eq!(
             record_or_replay_config(Path::new("replay-data")).memory,
             run_default.memory
+        );
+    }
+
+    /// RECORDING DOES NOT VIRTUALIZE TIME, AND THE VERDICT NOW SAYS SO.
+    ///
+    /// `virtualize_time: false` here is deliberate (see the rationale block on
+    /// `record_or_replay_config`), and it is what makes a green
+    /// `record start --verify` mean something weaker than a green
+    /// `run --verify`: the replay reproduced *that recording*, not that the guest
+    /// is deterministic across invocations. Ported from the residual of
+    /// hermit#2269.
+    ///
+    /// Pinned against the shared constant rather than a literal, because the
+    /// value is now read in two places — the config the run uses, and the
+    /// `ComparisonOptions` that discloses it in the report. If those drifted, the
+    /// report would describe a time policy the run did not use, which is the very
+    /// defect the disclosure exists to close.
+    #[test]
+    fn recording_does_not_virtualize_time_as_documented() {
+        let config = record_or_replay_config(Path::new("replay-data"));
+        assert!(
+            !config.virtualize_time,
+            "record/replay must not virtualize time; a green replay verdict would \
+             otherwise be mistaken for a determinism result"
+        );
+        assert_eq!(
+            config.virtualize_time,
+            crate::RECORD_REPLAY_VIRTUALIZES_TIME,
+            "the config the run uses and the constant the report discloses must be \
+             the same decision, not two that happen to agree"
         );
     }
 

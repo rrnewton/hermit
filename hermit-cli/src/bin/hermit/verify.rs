@@ -69,6 +69,10 @@ pub(crate) struct ComparisonOptions {
     /// Typed, versioned record envelope applied before selecting messages.
     /// Its policy identity is serialized beside the verdict.
     pub record_envelope: RecordEnvelope,
+    /// Whether the Detcore configuration under which BOTH sides ran virtualized
+    /// time. See [`ComparisonSpec::virtualize_time`] for what it changes about
+    /// the meaning of a match.
+    pub virtualize_time: bool,
 }
 
 /// How strictly two runs' internal logs are compared — the condition a
@@ -207,6 +211,29 @@ pub struct ComparisonSpec {
     /// envelope. A caller-defined predicate is disclosed but cannot qualify for
     /// parity.
     pub record_envelope: RecordEnvelopePolicy,
+    /// Whether the Detcore configuration under which BOTH sides ran virtualized
+    /// time.
+    ///
+    /// ⚠️ A `bitwise_parity: true` FROM A COMPARISON WITH `virtualize_time:
+    /// false` IS NOT A DETERMINISM RESULT, and a consumer must not read it as
+    /// one. It says the second side reproduced the first. If the guest read a
+    /// host-derived value such as the real monotonic clock, that value was
+    /// captured and faithfully reproduced, and a separate invocation would
+    /// capture a different one.
+    ///
+    /// This is not hypothetical. `hermit run --verify` executes the guest twice
+    /// with virtual time on, so a match is evidence about the guest; `hermit
+    /// record start --verify` runs under
+    /// `hermit_cli::metadata::record_or_replay_config`, which deliberately sets
+    /// `virtualize_time: false`, so a match says only that the replay reproduced
+    /// that recording. Both previously reported `bitwise_parity: true` with
+    /// nothing in the report to tell them apart, which is what this field fixes.
+    ///
+    /// It lives on [`ComparisonSpec`] rather than on the report so it is absent
+    /// exactly when there was no comparison: `VerificationReport::comparison` is
+    /// `None` for [`Verdict::NoResult`], so a run that never compared anything
+    /// cannot publish a time policy describing a comparison that did not happen.
+    pub virtualize_time: bool,
     /// Concrete: were numeric values, addresses, tmp paths, and timestamps
     /// normalized away wholesale before diffing (the lossy [`Stripped`] path)?
     ///
@@ -260,6 +287,7 @@ impl ComparisonSpec {
         diagnostic_full_trace: bool,
         compare_io_buffers: bool,
         record_envelope: RecordEnvelopePolicy,
+        virtualize_time: bool,
     ) -> Self {
         // Map the strictness label onto the concrete diff flags AND the versioned
         // policy tokens in one place, so the flags the engine sees, the tokens
@@ -304,6 +332,7 @@ impl ComparisonSpec {
             compare_io_buffers,
             log_scope,
             record_envelope,
+            virtualize_time,
             strip_lines,
             canonicalize_addresses,
             full_trace,
@@ -942,6 +971,7 @@ fn compare_two_runs_with_unsupported_scan(
         options.diagnostic_full_trace,
         options.compare_io_buffers,
         options.record_envelope.policy(),
+        options.virtualize_time,
     );
 
     if out1.stdout != out2.stdout {
@@ -1326,6 +1356,7 @@ mod tests {
                 compare_io_buffers: true,
                 keep_logs: false,
                 record_envelope,
+                virtualize_time: true,
             },
         )
     }
@@ -1537,6 +1568,7 @@ mod tests {
                 compare_io_buffers: false,
                 keep_logs: false,
                 record_envelope: RecordEnvelope::all_records_v1(),
+                virtualize_time: true,
             },
         )
         .unwrap();
@@ -1636,6 +1668,7 @@ mod tests {
                 compare_io_buffers: false,
                 keep_logs: false,
                 record_envelope: RecordEnvelope::all_records_v1(),
+                virtualize_time: true,
             },
         )
         .unwrap();
@@ -1680,6 +1713,7 @@ mod tests {
             false,
             false,
             RecordEnvelopePolicy::AllRecordsV1,
+            true,
         );
         assert!(stripped.strip_lines);
         assert!(!stripped.full_trace);
@@ -1694,6 +1728,7 @@ mod tests {
             false,
             true,
             RecordEnvelopePolicy::AllRecordsV1,
+            true,
         );
         assert!(!canonical.strip_lines);
         assert!(canonical.canonicalize_addresses);
@@ -1708,6 +1743,7 @@ mod tests {
             true,
             true,
             RecordEnvelopePolicy::AllRecordsV1,
+            true,
         );
         assert_eq!(diagnostic.log_scope, ComparedLogScope::FullTrace);
         assert_eq!(
@@ -1789,6 +1825,7 @@ mod tests {
                 compare_io_buffers: false,
                 keep_logs: false,
                 record_envelope: RecordEnvelope::all_records_v1(),
+                virtualize_time: true,
             },
         )
         .unwrap();
@@ -1888,6 +1925,7 @@ mod tests {
                     compare_io_buffers: false,
                     keep_logs,
                     record_envelope: RecordEnvelope::all_records_v1(),
+                    virtualize_time: true,
                 },
             )
             .unwrap();
@@ -1930,6 +1968,7 @@ mod tests {
                 compare_io_buffers: false,
                 keep_logs: true,
                 record_envelope: RecordEnvelope::all_records_v1(),
+                virtualize_time: true,
             },
             |_| Err(io::Error::other("injected unsupported-syscall scan error")),
         )
@@ -1991,6 +2030,7 @@ mod tests {
                 compare_io_buffers: false,
                 keep_logs: true,
                 record_envelope: RecordEnvelope::all_records_v1(),
+                virtualize_time: true,
             },
         );
 
@@ -2348,6 +2388,63 @@ mod tests {
     // record envelope and reject every weaker or opaque policy. This brackets
     // both sides: each canonical envelope fires, while stripped, output-only,
     // caller-defined, and ad hoc ignore/skip variants are refused.
+    /// A GREEN REPORT SAYS WHAT IT COMPARED AND WHETHER TIME WAS VIRTUAL — AND A
+    /// REPORT THAT COMPARED NOTHING SAYS NEITHER.
+    ///
+    /// Ported from the residual of hermit#2269. `bitwise_parity: true` meant two
+    /// different things depending on the subcommand and the report could not tell
+    /// them apart: `run --verify` executes the guest twice with virtual time on,
+    /// so a match is evidence about the guest, while `record start --verify` runs
+    /// with `virtualize_time: false`, so a match says only that the replay
+    /// reproduced that recording. The prose in `record start --help` says this;
+    /// until now the ARTIFACT did not.
+    ///
+    /// ⚠️ THE FIRST ASSERTION IS THE POINT: parity and virtual time are
+    /// INDEPENDENT. A comparison can qualify for bitwise parity with
+    /// `virtualize_time: false`, and that combination is exactly the one a
+    /// consumer must not read as a determinism result.
+    ///
+    /// The second half is why the field lives on `ComparisonSpec` and not on the
+    /// report: `comparison` is `None` for `NoResult`, so a run that compared
+    /// nothing cannot publish a time policy describing a comparison that did not
+    /// happen. Putting it on the report would have re-created, one field over, the
+    /// "value present, meaning absent" defect that hermit#2498's typed
+    /// `no_result_reason` had just closed.
+    #[test]
+    fn a_green_report_says_what_it_compared_and_whether_time_was_virtual() {
+        for virtualize_time in [true, false] {
+            let spec = ComparisonSpec::new(
+                LogCompareStrictness::Canonical,
+                true,
+                false,
+                true,
+                RecordEnvelopePolicy::AllRecordsV1,
+                virtualize_time,
+            );
+            assert!(
+                spec.is_bitwise_parity(),
+                "parity must not depend on the time policy: the record/replay path \
+                 qualifies for parity while running with virtualize_time false"
+            );
+            let json = serde_json::to_value(spec).unwrap();
+            assert_eq!(
+                json["virtualize_time"],
+                serde_json::json!(virtualize_time),
+                "a comparison that ran must publish the time policy it ran under"
+            );
+        }
+
+        let nothing_compared = serde_json::to_value(VerificationReport::no_result()).unwrap();
+        assert!(
+            nothing_compared["comparison"].is_null(),
+            "no verdict was reached, so no comparison may be described"
+        );
+        assert!(
+            nothing_compared.get("virtualize_time").is_none(),
+            "a run that compared nothing must not publish a time policy at all"
+        );
+    }
+
     #[test]
     fn bitwise_parity_contract_accepts_only_named_canonical_envelopes() {
         // Positive: the exact qualifying comparison the `--verify-strict` path
@@ -2358,6 +2455,7 @@ mod tests {
             false,
             true,
             RecordEnvelopePolicy::AllRecordsV1,
+            true,
         );
         assert!(
             full.is_bitwise_parity(),
@@ -2380,6 +2478,7 @@ mod tests {
             false,
             false,
             RecordEnvelopePolicy::AllRecordsV1,
+            true,
         );
         assert!(
             !stripped.is_bitwise_parity(),
