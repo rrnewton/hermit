@@ -89,6 +89,9 @@ pub enum SyscallEvent {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#662): Audit the replay filesystem event schema.
     Open(OpenEvent),
+    /// Result of `mkdir`/`mkdirat` plus the physical side effect replay must
+    /// reconstruct when the recorded call found an existing directory.
+    Mkdir(MkdirEvent),
     // TODO-HUMAN-REVIEW(#557): Audit the V2 record/replay event schema.
     WriteV2(WriteEvent),
     ReadV2(ReadEvent),
@@ -96,6 +99,9 @@ pub enum SyscallEvent {
     FtruncateV2(FtruncateEvent),
     /// Destination length after a successful clone ioctl.
     FileClone(FileCloneEvent),
+    /// A successful exec and the executable images required immediately before
+    /// replaying it. Failed execs use the enclosing [`Event::event`] error.
+    Exec(ExecEvent),
     /// The result and mutable output fields of a raw `ppoll` call.
     Ppoll(PpollEvent),
 }
@@ -162,8 +168,105 @@ pub enum ReplayFdKind {
 pub struct OpenEvent {
     /// Recorded syscall result.
     pub result: Result<i64, Errno>,
-    /// Whether recording resolved the descriptor to a regular file or directory.
-    pub materialize: bool,
+    /// Which filesystem object must exist physically during replay.
+    pub materialize: OpenMaterialization,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum OpenMaterialization {
+    None,
+    RegularFile,
+    Directory,
+}
+
+/// Recorded result and replay-side materialization policy for `mkdir` and
+/// `mkdirat`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MkdirEvent {
+    /// Recorded syscall result returned unchanged to the replayed guest.
+    pub result: Result<i64, Errno>,
+    /// True only when an `EEXIST` result was caused by a directory at the final
+    /// path component (not by a regular file or symlink).
+    pub existing_directory: bool,
+}
+
+/// A successful `execve`/`execveat` attempt. The event is written only from the
+/// post-exec callback, so its presence is proof that Linux replaced the image.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExecEvent {
+    pub(crate) request: ExecRequest,
+    pub(crate) executable: ExecImage,
+    pub(crate) target: ExecTarget,
+    pub(crate) dependencies: Vec<ExecDependency>,
+}
+
+/// Raw pathname bytes and lookup context supplied to `execveat`. Detcore
+/// canonicalizes `execve` into this form before the recorder sees it.
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct ExecRequest {
+    pub(crate) dirfd: libc::c_int,
+    pub(crate) path: Vec<u8>,
+    pub(crate) flags: libc::c_int,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct ExecImage {
+    pub(crate) digest: detcore::Digest,
+    pub(crate) mode: u32,
+}
+
+/// Guest-visible state of a descriptor used as an executable object. Replay
+/// restores this descriptor from the recorded image before asking Linux to
+/// resolve an `AT_EMPTY_PATH` or procfs-fd exec request.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct ExecDescriptor {
+    /// Descriptor named by the exec request.
+    pub(crate) target_fd: libc::c_int,
+    pub(crate) status_flags: libc::c_int,
+    pub(crate) offset: Option<libc::off_t>,
+    /// Every descriptor that shared the target's open-file description before
+    /// exec. `FD_CLOEXEC` belongs to each descriptor rather than the shared
+    /// open-file description, so it is captured per alias.
+    pub(crate) aliases: Vec<ExecDescriptorAlias>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct ExecDescriptorAlias {
+    pub(crate) fd: libc::c_int,
+    pub(crate) descriptor_flags: libc::c_int,
+}
+
+/// How the main target is reconstructed. Ordinary paths are materialized using
+/// their recorded symlink topology. Procfs/fd magic links and `AT_EMPTY_PATH`
+/// must already resolve to the recorded live object and are verified instead.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) enum ExecTarget {
+    Materialize(ExecMaterialization),
+    VerifyLive,
+    RestoreDescriptor(ExecDescriptor),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct ExecMaterialization {
+    pub(crate) base: ExecMaterializationBase,
+    pub(crate) path: Vec<u8>,
+    pub(crate) symlinks: Vec<crate::record_replay_path::ResolvedSymlink>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub(crate) enum ExecMaterializationBase {
+    Root,
+    Cwd,
+    DirectoryFd(libc::c_int),
+}
+
+/// A shebang or ELF interpreter required by the recorded image.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct ExecDependency {
+    pub(crate) base: ExecMaterializationBase,
+    pub(crate) path: Vec<u8>,
+    pub(crate) image: ExecImage,
+    pub(crate) symlinks: Vec<crate::record_replay_path::ResolvedSymlink>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -227,27 +330,18 @@ pub struct TimespecEvent {
     pub timespec: Timespec,
 }
 
-/// Records the guest-visible outputs of a `poll` call.
+/// Records every guest-visible output of a raw `poll` call.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct PollEvent {
     /// The exact return value or errno observed while recording.
-    ///
-    /// Carried INSIDE the event, not outside it. Previously an error return was
-    /// recorded as a bare `Err` with no event at all, so replay had nothing to
-    /// restore and returned the errno before writing anything back. Linux can
-    /// write some `revents` entries and THEN fault, and those writes are
-    /// guest-visible, so the outputs have to survive an error result.
     pub result: Result<i64, Errno>,
 
     /// Whether the guest supplied a non-null pollfd pointer.
     pub fds_pointer_present: bool,
 
-    /// The complete post-kernel pollfd output when the guest supplied a non-null
-    /// pollfd pointer and Linux reached pollfd copyout. Early errors retain the
-    /// pointer-presence field above but store no pollfd values.
-    ///
-    /// Only the `revents` field is an output, but the whole array is stored so
-    /// replay is one `process_vm_writev`.
+    /// The post-kernel pollfd output. Successful calls contain the complete
+    /// array. An EFAULT may contain only the readable prefix because Linux can
+    /// fault after writing earlier `revents` entries.
     pub fds: Option<Vec<PollFd>>,
 }
 
@@ -267,14 +361,15 @@ pub struct PpollEvent {
     /// Whether the guest supplied a non-null pollfd pointer.
     pub fds_pointer_present: bool,
 
-    /// The complete post-kernel pollfd output when the guest supplied a non-null
-    /// pollfd pointer and Linux reached pollfd copyout. Early errors retain the
-    /// pointer-presence field above but store no pollfd values.
+    /// Complete output on success or the readable output prefix on EFAULT.
     pub fds: Option<Vec<PollFd>>,
 
-    /// The exact readable raw timeout value after the kernel call, or `None`
-    /// when the guest supplied a null timeout pointer. This may be present for
-    /// either a successful or error result.
+    /// Whether the guest supplied a non-null raw timeout pointer.
+    pub timeout_pointer_present: bool,
+
+    /// The exact remaining timeout after the kernel call. Raw `ppoll` mutates
+    /// this continuously; replay must restore the captured value without
+    /// rounding, freezing, or synthesizing it.
     pub timeout: Option<Timespec>,
 }
 
@@ -320,5 +415,85 @@ mod tests {
         let request = ioctl::Request::Other(SIOCETHTOOL - 1, 0x1234);
 
         assert_eq!(deterministic_ioctl_error(&request), None);
+    }
+
+    #[test]
+    fn mkdir_event_schema_preserves_directory_classification() {
+        let events = vec![
+            Event {
+                event: Ok(SyscallEvent::Mkdir(MkdirEvent {
+                    result: Err(Errno::EEXIST),
+                    existing_directory: true,
+                })),
+            },
+            Event {
+                event: Ok(SyscallEvent::Mkdir(MkdirEvent {
+                    result: Err(Errno::ENOENT),
+                    existing_directory: false,
+                })),
+            },
+        ];
+        let encoded = bincode::serde::encode_to_vec(&events, bincode::config::legacy()).unwrap();
+        let (decoded, consumed): (Vec<Event>, usize) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::legacy()).unwrap();
+
+        assert_eq!(consumed, encoded.len());
+        let [first, second] = decoded.as_slice() else {
+            panic!("unexpected mkdir event count")
+        };
+        assert!(matches!(
+            &first.event,
+            Ok(SyscallEvent::Mkdir(MkdirEvent {
+                result: Err(Errno::EEXIST),
+                existing_directory: true,
+            }))
+        ));
+        assert!(matches!(
+            &second.event,
+            Ok(SyscallEvent::Mkdir(MkdirEvent {
+                result: Err(Errno::ENOENT),
+                existing_directory: false,
+            }))
+        ));
+    }
+
+    #[test]
+    fn exec_event_schema_preserves_non_utf8_paths_and_topology() {
+        let event = Event {
+            event: Ok(SyscallEvent::Exec(ExecEvent {
+                request: ExecRequest {
+                    dirfd: libc::AT_FDCWD,
+                    path: b"relative/\xff-program".to_vec(),
+                    flags: 0,
+                },
+                executable: ExecImage {
+                    digest: detcore::Digest::new(b"program"),
+                    mode: 0o751,
+                },
+                target: ExecTarget::Materialize(ExecMaterialization {
+                    base: ExecMaterializationBase::Cwd,
+                    path: b"relative/\xff-program".to_vec(),
+                    symlinks: vec![crate::record_replay_path::ResolvedSymlink {
+                        lookup_index: 1,
+                        target: b"target-\xfe".to_vec(),
+                    }],
+                }),
+                dependencies: Vec::new(),
+            })),
+        };
+        let encoded = bincode::serde::encode_to_vec(&event, bincode::config::legacy()).unwrap();
+        let (decoded, consumed): (Event, usize) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::legacy()).unwrap();
+
+        assert_eq!(consumed, encoded.len());
+        let Ok(SyscallEvent::Exec(decoded)) = decoded.event else {
+            panic!("unexpected exec event")
+        };
+        assert_eq!(decoded.request.path, b"relative/\xff-program");
+        let ExecTarget::Materialize(materialization) = decoded.target else {
+            panic!("unexpected exec target policy")
+        };
+        assert_eq!(materialization.path, b"relative/\xff-program");
+        assert_eq!(materialization.symlinks[0].target, b"target-\xfe");
     }
 }

@@ -56,6 +56,7 @@ pub const RECORD_REPLAY_HASHES_IO_BUFFERS: bool = true;
 /// the record/replay path is a fixed decision, so only it gets a constant.
 pub const RECORD_REPLAY_VIRTUALIZES_TIME: bool = false;
 mod record;
+mod record_replay_path;
 mod recorder;
 mod replay;
 mod replayer;
