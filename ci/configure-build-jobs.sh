@@ -115,9 +115,16 @@ fi
 # `return 2` -- which looks identical to the refusal the wrapper was just fixed
 # to stop emitting. ci/run-with-reverie-dbt-budget-test.sh exists because that is
 # exactly what happened; it runs the wrapper end to end and so sees this layer.
+# ⚠️ 75, NOT 2, AND IT MUST MOVE WITH THE WRAPPER. The comment above already
+# records that updating only the wrapper leaves this child "failing at `return 2`
+# -- which looks identical to the refusal the wrapper was just fixed to stop
+# emitting". The same is true of the exit code: a wrapper that declines with 75
+# while this layer declines with 2 reports the SAME condition as two different
+# things depending on which guard fired first. Both are "could not determine",
+# which is what EX_TEMPFAIL means to scripts/validate.rs.
 if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != b0c3cfe4c0797445dedda93774db552edf96f62b ]]; then
-    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie b0c3cfe4c0797445dedda93774db552edf96f62b (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
-    return 2
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to calibrated Reverie b0c3cfe4c0797445dedda93774db552edf96f62b (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+    return 75
 fi
 
 if [[ -n ${CARGO_BUILD_JOBS:-} ]]; then

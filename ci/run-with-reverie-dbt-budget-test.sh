@@ -154,6 +154,77 @@ printf '\nfor _ in {1..2048}; do printf "%%064d" 0; done\nprintf "\\n"\n' \
     >>"$copy/ci/run-reverie-pin-check.sh"
 expect_unparseable_pin_refusal large "$work/large-must-not-exist" "$work/stderr4"
 
+# ---------------------------------------------------------------------------
+# THE EXIT CODE IS THE VERDICT, AND BOTH DIRECTIONS ARE ASSERTED.
+#
+# A declining wrapper and a genuinely broken build were both recorded as gate
+# result "fail" with a bare `exit N` reason, so a node that compiled NOTHING was
+# indistinguishable in the ledger from one that compiled and broke. 75 is
+# EX_TEMPFAIL, which `scripts/validate.rs` defines as the only nonzero code that
+# is not a product failure, and which it maps to "no_result".
+#
+# ⚠️ ASSERTING ONLY THE REFUSAL WOULD BE HALF A TEST. If a real breakage started
+# reporting no_result, one silent failure would have been traded for another --
+# a build failure that reads as "could not determine" is WORSE than one that
+# reads as a fast fail. So the pass-through direction is asserted too, with the
+# code cargo actually returns for a compile error, which is 101 and not 2.
+
+expect_exit() {
+    local label=$1 want=$2 marker=$3
+    shift 3
+    local rc=0
+    "./$WRAPPER" "$@" >/dev/null 2>&1 || rc=$?
+    if ((rc != want)); then
+        echo "FAIL: $label exited $rc, expected $want" >&2
+        failures=$((failures + 1))
+        return
+    fi
+    if [ -n "$marker" ] && [ ! -f "$marker" ]; then
+        echo "FAIL: $label exited $want but the wrapped command never ran" >&2
+        failures=$((failures + 1))
+        return
+    fi
+    echo "PASS: $label exits $want"
+}
+
+# Direction 1 -- a refusal declines with 75 and runs nothing. Covered above for
+# the message; here for the CODE, which is what every consumer branches on.
+rc=0
+sed -i 's/^expected_pin=.*/expected_pin=0000000000000000000000000000000000000000/' \
+    "$copy/$WRAPPER"
+(cd "$copy" && "./$WRAPPER" /bin/sh -c "printf ok > '$work/declined-must-not-exist'") \
+    >/dev/null 2>&1 || rc=$?
+if ((rc != 75)); then
+    echo "FAIL: a pin-mismatch refusal exited $rc, expected 75 (EX_TEMPFAIL/no_result)" >&2
+    failures=$((failures + 1))
+elif [ -e "$work/declined-must-not-exist" ]; then
+    echo "FAIL: the refusal exited 75 but still ran the command" >&2
+    failures=$((failures + 1))
+else
+    echo "PASS: a pin-mismatch refusal exits 75 and runs nothing"
+fi
+cp -p "$ROOT_DIR/$WRAPPER" "$copy/$WRAPPER"
+
+# Direction 2 -- at the recorded pin the wrapper `exec`s, so the wrapped
+# command's status is the node's status, UNCHANGED. 101 is cargo's compile-error
+# code; 2 is what the old refusal used and must no longer be produced by a
+# refusal; 0 must survive.
+expect_exit "a wrapped compile-failure status (101)" 101 "$work/ran-101" \
+    /bin/sh -c "printf ok > '$work/ran-101'; exit 101"
+expect_exit "a wrapped generic failure (1)" 1 "" /bin/sh -c "exit 1"
+expect_exit "a wrapped success" 0 "$work/ran-0" \
+    /bin/sh -c "printf ok > '$work/ran-0'"
+
+# The caller-bug path stays LOUD. Supplying no command is not a node declining.
+rc=0
+"./$WRAPPER" >/dev/null 2>&1 || rc=$?
+if ((rc != 2)); then
+    echo "FAIL: the usage error exited $rc, expected 2 -- a caller bug is not a no_result" >&2
+    failures=$((failures + 1))
+else
+    echo "PASS: the usage error still exits 2"
+fi
+
 if ((failures != 0)); then
     echo "run-with-reverie-dbt-budget-test.sh: $failures check(s) failed" >&2
     exit 1
