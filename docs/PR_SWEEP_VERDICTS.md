@@ -1859,6 +1859,174 @@ This is check 12's cousin. Check 12 catches a comparison over an empty set —
 agreement asserted about nothing. This catches a comparison over a set that is
 non-empty but uniform: many observations of one case, reported as many cases.
 
+### 20. Counting a marker's TEXT counts the arguments about it, not the marker
+
+⚠️ **A grep for a marker matches every sentence that mentions it** — the request
+asking someone to post one, the review quoting one, the correction explaining why
+one did not bind. Those are discussion *about* the marker. The marker is a
+binding. A count that cannot tell them apart reports the loudest thread as the
+strongest evidence, and threads are loudest exactly where the situation is
+contested.
+
+**Measured 2026-08-25, twice, in unrelated contexts.**
+
+On [hermit#2176](https://github.com/rrnewton/hermit/pull/2176) a lander checked
+whether the codex lane had approved the current head:
+
+```console
+$ grep -ic "APPROVED-AT: codex $HEAD" bodies.txt
+3
+```
+
+Three matches, and the head was one lane from landing. All three were prose
+*requesting* the lane — `**Codex lane: please emit, alone on its own line,
+`APPROVED-AT: codex b3ca4e15…`**` — plus a checklist item repeating it. Exact
+whole-line matches: **0**. Worse, the same pull request carried a codex
+*refusal*, so acting on the count would have solicited an approval from a
+reviewer who had already said no.
+
+The sibling instance is the merge-base symbol rule (check 3): a symbol counted on
+`main` is not evidence of landing if it was already present at the merge base.
+Same defect — a token counted in a context that does not mean what the count is
+being used to mean.
+
+**The check is one word: whole-line.** A binding is a complete line in a fixed
+grammar, and a mention is not. Two greps show you the gap:
+
+```console
+grep -ci 'APPROVED-AT'                                bodies.txt   # mentions
+grep -cE '^APPROVED-AT: (claude|codex) [0-9a-f]{40}$' bodies.txt   # NOT the bindings
+```
+
+⚠️ **When those two numbers differ, the gap is the finding, not noise.** It is
+where people are arguing about a verdict that does not exist yet. On #2176 the
+gap was 3 versus 0.
+
+⚠️ **BUT NEITHER NUMBER IS THE BINDING COUNT, AND THE SECOND ONE IS LABELLED
+ABOVE AS WHAT IT IS NOT.** This is the correction the check earned on itself.
+The first draft of this section presented that anchored pattern as `# bindings`.
+Three independent reviewers blocked on it, and they were right: **a pattern
+stricter than the parser reports false absence** — the exact direction the third
+bullet below warns about, committed by the recipe printed next to the warning.
+
+`ci-hub/health/approval_binding.py` normalises before it matches. It strips
+block-level prefixes (`#{1,6} `, `> `, and any of `-`, `+`, `*` as a list marker)
+and wrapping emphasis or backticks **to a fixpoint**, then applies
+`^APPROVED-AT:\s*(claude|codex)\s+[0-9a-f]{40}$` **case-insensitively**. Measured
+against `strip_decoration` + `parse_marker` at `origin/main`, with a plain line
+and a prose mention as controls in both directions — and replayed through the
+route that actually decides, `marker_lines` → `_undecorate_block` →
+`parse_marker`, because a table derived from a function pair nothing calls would
+describe nothing; **10 of 10 rows agree between the two routes**:
+
+| line, all naming the same head        | the grep | the parser |
+| ------------------------------------- | -------- | ---------- |
+| `APPROVED-AT: claude <sha>` (control)  | match    | **binds**  |
+| `**APPROVED-AT: claude <sha>**`        | —        | **binds**  |
+| `` `APPROVED-AT: claude <sha>` ``      | —        | **binds**  |
+| `## APPROVED-AT: claude <sha>`         | —        | **binds**  |
+| `- APPROVED-AT: claude <sha>`          | —        | **binds**  |
+| `> APPROVED-AT: claude <sha>`          | —        | **binds**  |
+| `APPROVED-AT:  claude <sha>` (2 spaces)| —        | **binds**  |
+| `APPROVED-AT: CLAUDE <sha>`            | —        | **binds**  |
+| `CODEX-LANE APPROVED-AT: codex <sha>`  | —        | —          |
+| prose quoting the line (control)       | —        | —          |
+
+**Seven real bindings missed, by four distinct mechanisms** — decoration, block
+prefix, inner whitespace, and case. A reader following the old recipe on
+[hermit#2608](https://github.com/rrnewton/hermit/pull/2608) got **0** on a head
+that carries a valid exact-head claude approval, and would have concluded no lane
+had approved.
+
+**So the fix is not a better regex — it is not restating the grammar at all:**
+
+```console
+ci-hub/health/approval_binding.py --repo rrnewton/hermit --pr <n>   # bindings
+```
+
+⚠️ **A second copy of a grammar is check 14, and this document was the second
+copy.** The parser's own header says a lander had duplicated this parsing, that
+there were two parsers for one grammar, and that *"they had already drifted"*.
+Writing the pattern into a checklist made a third. Policy may differ between a
+board and a lander; the grammar may not. Keep the greps for the loose-versus-
+strict *contrast* that exposes the mention/binding gap, and get the binding count
+from the parser.
+
+Four consequences worth keeping:
+
+- **A quotation is not a retraction and not a re-assertion.** Deciding which
+  requires reading, so a counter must not guess; it reports the whole-line count
+  and the gap, and a human reads the gap.
+- **This applies to absence too.** "Zero refusals" from a loose grep is as
+  unsound as "three approvals" — a refusal written in a variant the pattern does
+  not match is counted as absent, which reads as permission. Absence claims need
+  the *authoritative* instrument, not merely a stricter one: strictness beyond
+  the parser manufactures absence rather than proving it.
+- **A tightening needs a control that must still match.** The old recipe's
+  defect is invisible without one — every row above except the first and the
+  last two is a silent miss, seven of them, and only the plain control
+  distinguishes "this pattern is precise" from "this pattern matches nothing".
+  The last two rows are not misses: the grep and the parser *agree* there, and
+  the `CODEX-LANE` row is the case **neither** catches, so a bullet that swept
+  it in would tell a reader the parser handles a variant it does not.
+- **Say which instrument produced the number.** "2 of 185" means nothing without
+  "whole-line match on raw comment text, not through the parser". A count is a
+  measurement and carries its method or it carries nothing.
+
+### 21. A new refusal needs a NEW exit code, or an explicit argument for sharing one
+
+⚠️ **Borrowing a nearby exit code is locally plausible and globally wrong.** The
+condition you are adding resembles one already on the list, the code is right
+there, and reusing it costs nothing to write. What it costs is the caller's
+ability to act: two conditions behind one code cannot be reacted to differently,
+and if they could be reacted to identically they would not be two conditions.
+
+**An exit code passed on from an INNER call carries the inner meaning, not the
+outer one.** This is the specific trap. A guard that cannot resolve its input
+says "could not determine" — truthfully, about itself. The caller reads that code
+as the *tool's* could-not-determine, which is about something else entirely. Same
+code, two meanings, one boundary.
+
+**Measured 2026-08-25, three instances in one night, two of them added by the
+same agent in the act of fixing the first.**
+
+| condition | shared code | should be |
+| --- | --- | --- |
+| stale-TOOL refusal (the lander is not current) | 6 | 7 |
+| stale-LABEL refusal (approval bound to another sha) | 6 | 6 |
+| admission cannot resolve comments | 4 | 8 |
+| merge outcome cannot be determined | 4 | 4 |
+
+The second pair is the costly one, because the reactions are **opposite**:
+
+- after an admission failure the merge was **never attempted**, so a plain re-run
+  is safe;
+- after a merge-outcome failure the merge **was** attempted and may have
+  succeeded, so re-running risks a second landing.
+
+A caller that treats them alike either re-merges something already on `main`, or
+refuses to retry something that never ran.
+
+⚠️ **And a shared code hides a dead code path.** While admission-cannot-resolve
+and merge-cannot-determine both exited 4, three race cases in
+`gh-merge-verified-test` passed on an exit 4 produced by the *admission guard* —
+the race they claimed to exercise never ran. The assertion checking the CODE
+passed; the two assertions checking the REASON failed. The code was right and
+meant nothing. That is check 20's error inside a test suite.
+
+**The rule, in enforceable form.** When you add a refusal:
+
+- give it its own code, **or** write down why sharing is correct — and "they are
+  both failures" is not a reason, it is a restatement;
+- say what a caller should DO with it, not only what it means. A code without an
+  action is a label;
+- state which side of the retry boundary it falls on. *Can I re-run this safely?*
+  is the only question most callers actually ask.
+
+**The tell that you are about to do this:** you are adding a `die(N, ...)` and
+you picked `N` by looking at the line above. Reaching for a neighbouring code is
+the moment to check whether the neighbour means what you mean.
+
 ## A guard keyed on a PROXY rejects the safest cases first
 
 ⚠️ **When you enforce a rule, write down the PROPERTY you want, then check whether
