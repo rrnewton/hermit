@@ -59,6 +59,7 @@ use crate::resources::SABRE_INTERNAL_PIPE_IO_FYI;
 use crate::scheduler::runqueue::LAST_PRIORITY;
 use crate::stat::*;
 use crate::tool_global::*;
+use crate::tool_local::CapturedDetFdInstallError;
 use crate::tool_local::Detcore;
 use crate::tool_local::finish_partial_record_or_replay_write;
 use crate::types::*;
@@ -3857,19 +3858,22 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// caller that aliases `targetfd` in the target process. The source pidfd
     /// names one specific process fixed at `pidfd_open` time, the returned
     /// descriptor number is chosen through record/replay (so it is stable across
-    /// runs), and the operation executes inside this thread's serialized turn, so
-    /// the result is deterministic. Detcore fails closed with `EBADF` unless it
-    /// models the descriptor as a pidfd, and requires the kernel-reserved `flags`
-    /// to be zero (`EINVAL` otherwise).
+    /// runs), and a successful modeled operation executes inside this thread's
+    /// serialized turn, so the result is deterministic. For zero flags, Detcore
+    /// fails closed with `EBADF` unless it models the descriptor as a pidfd.
+    /// Linux checks the kernel-reserved `flags` first, however, so a nonzero
+    /// value takes the raw record/replay path and preserves the kernel's exact
+    /// `EINVAL` across valid and invalid descriptor combinations.
     ///
-    /// For a pidfd that names this process, `targetfd` is in this descriptor table,
-    /// so the returned descriptor is modeled as a real alias of the source open
-    /// file description. That is required for `flock`: either alias may change the
-    /// one kernel lock, and both must observe the same cached authority. A pidfd
-    /// targeting another process is refused with `EOPNOTSUPP`; Detcore currently
-    /// has no cross-process channel that can invalidate the source task's cache if
-    /// the returned alias later mutates the shared open file description. Failed
-    /// calls leave all descriptor state unchanged.
+    /// The modeled path is narrower than "same process": the caller must be the
+    /// thread-group leader named by the pidfd. `CLONE_THREAD` does not imply
+    /// `CLONE_FILES`, so a nonleader can share the target's TGID while using a
+    /// different descriptor table. Requiring `target == getpid() == gettid()`
+    /// proves that `targetfd` is resolved in the caller's exact table. The
+    /// returned descriptor is then modeled as a real alias of the source open
+    /// file description. Broader support needs a cross-task OFD channel that
+    /// Detcore does not have today, so every other target is refused with
+    /// `EOPNOTSUPP`. Failed calls leave descriptor state unchanged.
     pub async fn handle_pidfd_getfd<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -3879,33 +3883,69 @@ impl<T: RecordOrReplay> Detcore<T> {
         flags: u32,
     ) -> Result<i64, Error> {
         if flags != 0 {
-            return Err(Errno::EINVAL.into());
-        }
-        let (is_pidfd, target) = guest.thread_state().with_detfd(pidfd, |detfd| {
-            (matches!(detfd.ty(), FdType::Pidfd), detfd.pidfd_target())
-        })?;
-        if !is_pidfd {
-            return Err(Errno::EBADF.into());
-        }
-        // `guest.pid()` is the backend's physical process identity for DBT,
-        // while pidfd_open receives Hermit's guest-visible PID. Ask the backend
-        // for that same guest-visible identity before deciding this is a
-        // self-targeting pidfd.
-        let current = DetPid::from_raw(guest.inject(syscalls::Getpid::new()).await? as i32);
-        if target != Some(current) {
-            return Err(Errno::EOPNOTSUPP.into());
+            return match self.record_or_replay(guest, call).await {
+                Err(error) => Err(error.into()),
+                Ok(fd) => {
+                    let fd = fd as RawFd;
+                    let close_result = guest.inject(syscalls::Close::new().with_fd(fd)).await;
+                    Err(Error::Tool(anyhow::anyhow!(
+                        "pidfd_getfd unexpectedly accepted reserved flags and returned fd {fd}; cleanup close result: {close_result:?}"
+                    )))
+                }
+            };
         }
 
-        // Prove the source model before the kernel call. A successful self
-        // pidfd_getfd aliases this exact descriptor; if Detcore cannot identify
-        // it, permitting the call would create mutable OFD state with no sound
-        // cache relationship.
-        guest.thread_state().with_detfd(targetfd, |_| ())?;
-        let fd = self.record_or_replay(guest, call).await? as RawFd;
+        if !guest.config().sequentialize_threads {
+            return self
+                .refuse_unserviceable_operation(guest, Sysno::pidfd_getfd, Errno::EOPNOTSUPP)
+                .await;
+        }
+
+        let current_tgid = DetPid::from_raw(guest.inject(syscalls::Getpid::new()).await? as i32);
+        let current_tid = DetTid::from_raw(guest.inject(syscalls::Gettid::new()).await? as i32);
+        let source = guest.thread_state().capture_pidfd_getfd_source(
+            pidfd,
+            targetfd,
+            current_tgid,
+            current_tid,
+        )?;
+        let fd = match self.record_or_replay(guest, call).await {
+            Ok(fd) => fd as RawFd,
+            Err(error) => {
+                if let Some(open_file_id) = guest.thread_state().abandon_captured_fd(source) {
+                    self.release_port_for_open_file(guest, open_file_id).await;
+                }
+                return Err(error.into());
+            }
+        };
         // pidfd_getfd always sets FD_CLOEXEC on the returned descriptor.
-        let replaced = guest
-            .thread_state_mut()
-            .dup_fd(targetfd, fd, OFlag::O_CLOEXEC)?;
+        let replaced = match guest.thread_state_mut().install_captured_fd(
+            source,
+            fd,
+            OFlag::O_CLOEXEC,
+        ) {
+            Ok(replaced) => replaced,
+            Err(error @ CapturedDetFdInstallError { .. }) => {
+                let expected_files_id = error.expected_files_id;
+                let actual_files_id = error.actual_files_id;
+                let cleanup = error.into_cleanup();
+                let close_result = guest
+                    .inject(syscalls::Close::new().with_fd(cleanup.close_fd))
+                    .await;
+                if let Some(open_file_id) = cleanup.release_open_file {
+                    self.release_port_for_open_file(guest, open_file_id).await;
+                }
+                if let Err(close_error) = close_result {
+                    return Err(Error::Tool(anyhow::anyhow!(
+                        "pidfd_getfd returned fd {fd}, but its captured source table changed from {expected_files_id:?} to {actual_files_id:?}; cleanup close failed with {close_error}"
+                    )));
+                }
+                warn!(
+                    "pidfd_getfd returned fd {fd}, but its captured source table changed from {expected_files_id:?} to {actual_files_id:?}; closed the result and refusing with EOPNOTSUPP"
+                );
+                return Err(Errno::EOPNOTSUPP.into());
+            }
+        };
         if let Some(open_file_id) = replaced {
             self.release_port_for_open_file(guest, open_file_id).await;
         }

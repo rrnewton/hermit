@@ -57,6 +57,9 @@
  *              failed duplication and duplication of an unrelated fd must not
  *              discard still-authoritative state.
  *
+ *   pidfd-getfd-record  Record/replay reissues a self pidfd_getfd alias and
+ *              preserves both its shared OFD and reserved-flags errors.
+ *
  *   sent-after-fork  Transfer a lock acquired after fork, let the receiver
  *              unlock it, and prove the sender does not restore stale state.
  *
@@ -71,6 +74,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/sched.h>
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -670,6 +674,57 @@ static int scenario_pidfd_getfd(void) {
   }
   printf("flock-pidfd-failed-getfd-preserved errno=%d\n", EBADF);
   flock(failed_source, LOCK_UN);
+
+  if (flock(failed_source, LOCK_SH | LOCK_NB) != 0) {
+    printf("FAIL: could not establish invalid-flags source lock (errno=%d)\n",
+           errno);
+    return HARNESS_FAILURE;
+  }
+  errno = 0;
+  if (syscall(SYS_pidfd_getfd, pidfd, failed_source, 1) != -1 ||
+      errno != EINVAL) {
+    printf("FAIL: nonzero-flags valid-pidfd/valid-targetfd pidfd_getfd did not return EINVAL (errno=%d)\n",
+           errno);
+    return 1;
+  }
+  printf("flock-pidfd-valid-pidfd-valid-targetfd-flags-precedence errno=%d\n",
+         EINVAL);
+
+  errno = 0;
+  if (syscall(SYS_pidfd_getfd, pidfd, -1, 1) != -1 || errno != EINVAL) {
+    printf("FAIL: nonzero-flags valid-pidfd/invalid-targetfd pidfd_getfd did not return EINVAL (errno=%d)\n",
+           errno);
+    return 1;
+  }
+  printf("flock-pidfd-valid-pidfd-invalid-targetfd-flags-precedence errno=%d\n",
+         EINVAL);
+
+  errno = 0;
+  if (syscall(SYS_pidfd_getfd, -1, failed_source, 1) != -1 ||
+      errno != EINVAL) {
+    printf("FAIL: nonzero-flags invalid-pidfd/valid-targetfd pidfd_getfd did not return EINVAL (errno=%d)\n",
+           errno);
+    return 1;
+  }
+  printf("flock-pidfd-invalid-pidfd-valid-targetfd-flags-precedence errno=%d\n",
+         EINVAL);
+
+  errno = 0;
+  if (syscall(SYS_pidfd_getfd, -1, -1, 1) != -1 || errno != EINVAL) {
+    printf("FAIL: nonzero-flags invalid-pidfd/invalid-targetfd pidfd_getfd did not preserve EINVAL precedence (errno=%d)\n",
+           errno);
+    return 1;
+  }
+  printf("flock-pidfd-invalid-pidfd-invalid-targetfd-flags-precedence errno=%d\n",
+         EINVAL);
+
+  if (flock(failed_source, LOCK_EX) != 0) {
+    printf("FAIL: invalid-flags pidfd_getfd discarded source authority (errno=%d)\n",
+           errno);
+    return 1;
+  }
+  printf("flock-pidfd-recorded-failure-preserved errno=%d\n", EINVAL);
+  flock(failed_source, LOCK_UN);
   close(failed_source);
 
   const char *unrelated_path = lock_path("pidfd-getfd-unrelated");
@@ -764,6 +819,68 @@ static int scenario_pidfd_getfd(void) {
   close(release[1]);
   close(pidfd);
   printf("flock-pidfd-getfd-ok\n");
+  return 0;
+}
+
+static int scenario_pidfd_getfd_record(void) {
+  int source = open_lock(lock_path("pidfd-getfd-record"));
+  if (source < 0 || lseek(source, 17, SEEK_SET) != 17) {
+    printf("FAIL: could not prepare recorded pidfd_getfd source (errno=%d)\n",
+           errno);
+    return HARNESS_FAILURE;
+  }
+
+  int pidfd = (int)syscall(SYS_pidfd_open, getpid(), 0);
+  if (pidfd < 0) {
+    printf("FAIL: recorded pidfd_open self failed (errno=%d)\n", errno);
+    return HARNESS_FAILURE;
+  }
+  int duplicate = (int)syscall(SYS_pidfd_getfd, pidfd, source, 0);
+  if (duplicate < 0 || lseek(duplicate, 0, SEEK_CUR) != 17 ||
+      lseek(duplicate, 31, SEEK_SET) != 31 ||
+      lseek(source, 0, SEEK_CUR) != 31) {
+    printf("FAIL: recorded pidfd_getfd did not reproduce one OFD (errno=%d)\n",
+           errno);
+    return HARNESS_FAILURE;
+  }
+  printf("flock-pidfd-record-success-shared-ofd\n");
+  close(duplicate);
+
+  errno = 0;
+  if (syscall(SYS_pidfd_getfd, pidfd, -1, 0) != -1 || errno != EBADF) {
+    printf("FAIL: recorded invalid targetfd did not return EBADF (errno=%d)\n",
+           errno);
+    return 1;
+  }
+  printf("flock-pidfd-record-validation-failure errno=%d\n", EBADF);
+
+  const int pidfds[] = {pidfd, pidfd, -1, -1};
+  const int targets[] = {source, -1, source, -1};
+  for (size_t i = 0; i < sizeof(pidfds) / sizeof(pidfds[0]); ++i) {
+    errno = 0;
+    if (syscall(SYS_pidfd_getfd, pidfds[i], targets[i], 1) != -1 ||
+        errno != EINVAL) {
+      printf("FAIL: recorded reserved flags case %zu did not return EINVAL (errno=%d)\n",
+             i, errno);
+      return 1;
+    }
+  }
+  printf("flock-pidfd-record-flags-failures errno=%d count=4\n", EINVAL);
+
+  close(pidfd);
+  close(source);
+  printf("flock-pidfd-record-ok\n");
+  return 0;
+}
+
+static int scenario_pidfd_getfd_relaxed_refusal(void) {
+  errno = 0;
+  if (syscall(SYS_pidfd_getfd, -1, -1, 0) != -1 || errno != EOPNOTSUPP) {
+    printf("FAIL: relaxed pidfd_getfd did not fail before validation (errno=%d)\n",
+           errno);
+    return 1;
+  }
+  printf("flock-pidfd-relaxed-refused errno=%d\n", errno);
   return 0;
 }
 
@@ -978,7 +1095,89 @@ static int scenario_vfork_no_flock_state(void) {
              : HARNESS_FAILURE;
 }
 
-static int scenario_vfork_upgrade(int make_unknown) {
+enum vfork_form {
+  VFORK_SYSCALL,
+  CLONE_VFORK_SYSCALL,
+  CLONE3_VFORK_SYSCALL,
+};
+
+enum clone_files_form {
+  CLONE_FILES_SYSCALL,
+  CLONE3_FILES_SYSCALL,
+};
+
+static pid_t start_clone_files_process(enum clone_files_form form) {
+  if (form == CLONE_FILES_SYSCALL)
+    return (pid_t)syscall(SYS_clone, (unsigned long)(CLONE_FILES | SIGCHLD),
+                          NULL, NULL, NULL, 0);
+  struct clone_args args = {
+      .flags = CLONE_FILES,
+      .exit_signal = SIGCHLD,
+  };
+  return (pid_t)syscall(SYS_clone3, &args, sizeof(args));
+}
+
+static int scenario_clone_files_process(enum clone_files_form form) {
+  const char *name = form == CLONE_FILES_SYSCALL ? "clone-files-process"
+                                                 : "clone3-files-process";
+  char target_path[256];
+  char replacement_path[256];
+  snprintf(target_path, sizeof(target_path), "/tmp/hermit-%s-target", name);
+  snprintf(replacement_path, sizeof(replacement_path),
+           "/tmp/hermit-%s-replacement", name);
+  int target = open(target_path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+  int replacement = open(replacement_path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+  if (target < 0 || replacement < 0 || write(replacement, "R", 1) != 1 ||
+      lseek(replacement, 0, SEEK_SET) != 0) {
+    printf("FAIL: could not prepare %s descriptors (errno=%d)\n", name, errno);
+    return HARNESS_FAILURE;
+  }
+
+  fflush(stdout);
+  pid_t child = start_clone_files_process(form);
+  if (child < 0) {
+    printf("flock-%s-refused errno=%d\n", name, errno);
+    return errno == EOPNOTSUPP ? 0 : HARNESS_FAILURE;
+  }
+  if (child == 0) {
+    if (close(target) != 0 || dup2(replacement, target) != target)
+      _exit(HARNESS_FAILURE);
+    _exit(0);
+  }
+
+  int status = 0;
+  if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+      WEXITSTATUS(status) != 0) {
+    printf("FAIL: %s child failed (status=%d errno=%d)\n", name, status,
+           errno);
+    return HARNESS_FAILURE;
+  }
+  char observed = 0;
+  if (read(target, &observed, 1) != 1 || observed != 'R') {
+    printf("FAIL: %s did not share the replaced descriptor slot (byte=%d errno=%d)\n",
+           name, observed, errno);
+    return 1;
+  }
+  printf("flock-%s-shared-mutation-observed\n", name);
+  close(target);
+  close(replacement);
+  return 0;
+}
+
+static pid_t start_vfork_form(enum vfork_form form) {
+  if (form == VFORK_SYSCALL)
+    return vfork();
+  if (form == CLONE_VFORK_SYSCALL)
+    return (pid_t)syscall(SYS_clone, (unsigned long)(CLONE_VFORK | SIGCHLD),
+                          NULL, NULL, NULL, 0);
+  struct clone_args args = {
+      .flags = CLONE_VFORK,
+      .exit_signal = SIGCHLD,
+  };
+  return (pid_t)syscall(SYS_clone3, &args, sizeof(args));
+}
+
+static int scenario_vfork_upgrade(int make_unknown, enum vfork_form form) {
   const char *path = lock_path("vfork-upgrade");
   int inherited = open_lock(path);
   int contender = open_lock(path);
@@ -1003,7 +1202,7 @@ static int scenario_vfork_upgrade(int make_unknown) {
   }
 
   fflush(stdout);
-  pid_t child = vfork();
+  pid_t child = start_vfork_form(form);
   if (child < 0) {
     printf("FAIL: vfork failed (errno=%d)\n", errno);
     return HARNESS_FAILURE;
@@ -1069,6 +1268,12 @@ int main(int argc, char **argv) {
   if (strcmp(scenario, "pidfd-getfd") == 0) {
     return scenario_pidfd_getfd();
   }
+  if (strcmp(scenario, "pidfd-getfd-record") == 0) {
+    return scenario_pidfd_getfd_record();
+  }
+  if (strcmp(scenario, "pidfd-getfd-relaxed-refusal") == 0) {
+    return scenario_pidfd_getfd_relaxed_refusal();
+  }
   if (strcmp(scenario, "sent-after-fork") == 0) {
     return scenario_sent_after_fork(scenario, 0);
   }
@@ -1085,10 +1290,22 @@ int main(int argc, char **argv) {
     return scenario_vfork_no_flock_state();
   }
   if (strcmp(scenario, "vfork-upgrade") == 0) {
-    return scenario_vfork_upgrade(0);
+    return scenario_vfork_upgrade(0, VFORK_SYSCALL);
   }
   if (strcmp(scenario, "vfork-unknown-upgrade") == 0) {
-    return scenario_vfork_upgrade(1);
+    return scenario_vfork_upgrade(1, VFORK_SYSCALL);
+  }
+  if (strcmp(scenario, "clone-vfork-upgrade") == 0) {
+    return scenario_vfork_upgrade(0, CLONE_VFORK_SYSCALL);
+  }
+  if (strcmp(scenario, "clone3-vfork-upgrade") == 0) {
+    return scenario_vfork_upgrade(0, CLONE3_VFORK_SYSCALL);
+  }
+  if (strcmp(scenario, "clone-files-process") == 0) {
+    return scenario_clone_files_process(CLONE_FILES_SYSCALL);
+  }
+  if (strcmp(scenario, "clone3-files-process") == 0) {
+    return scenario_clone_files_process(CLONE3_FILES_SYSCALL);
   }
   if (strcmp(scenario, "holder") == 0) {
     return scenario_holder();

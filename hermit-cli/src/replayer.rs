@@ -193,6 +193,17 @@ fn materialized_file_is_registered(pid: Pid, metadata: &std::fs::Metadata) -> bo
         .is_some_and(|files| files.contains_key(&ReplayFileIdentity::from_metadata(metadata)))
 }
 
+fn unexpected_pidfd_getfd_fd(
+    recorded: &Result<i64, Errno>,
+    actual: &Result<i64, Errno>,
+) -> Option<libc::c_int> {
+    if recorded == actual {
+        None
+    } else {
+        actual.as_ref().ok().map(|fd| *fd as libc::c_int)
+    }
+}
+
 fn remember_materialized_file(pid: Pid, fd: libc::c_int) {
     let Ok(metadata) = std::fs::metadata(format!("/proc/{}/fd/{fd}", pid.as_raw())) else {
         return;
@@ -506,6 +517,11 @@ impl Tool for Replayer {
             | Syscall::Utimensat(_) => self.handle_confined_path_mutation(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             Syscall::Other(Sysno::close_range, _) => self.handle_close_range(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#2407): pidfd_getfd is raw in the pinned
+            // Reverie. Replay must materialize its real OFD alias and validate
+            // both successful fd allocation and failure errno.
+            Syscall::Other(Sysno::pidfd_getfd, _) => self.handle_pidfd_getfd(guest, syscall).await,
             unsupported => return Ok(guest.inject_with_retry(unsupported).await?),
         }?)
     }
@@ -1953,6 +1969,28 @@ impl Replayer {
         recorded
     }
 
+    async fn handle_pidfd_getfd<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let recorded = next_event!(guest, Return);
+        let actual = guest.inject_with_retry(syscall).await;
+        if let Some(fd) = unexpected_pidfd_getfd_fd(&recorded, &actual) {
+            let cleanup = guest.inject_with_retry(Close::new().with_fd(fd)).await;
+            assert_eq!(
+                cleanup,
+                Ok(0),
+                "pidfd_getfd replay diverged and cleanup of unexpected fd {fd} failed"
+            );
+        }
+        assert_eq!(
+            actual, recorded,
+            "pidfd_getfd side effects diverged: replay observed {actual:?}, recording observed {recorded:?}"
+        );
+        recorded
+    }
+
     // TODO-HUMAN-REVIEW(#557): Audit close_range fd-table replay semantics.
     async fn handle_close_range<G: Guest<Self>>(
         &self,
@@ -2062,5 +2100,29 @@ mod exec_snapshot_tests {
 
         drop(scope);
         assert_eq!(registered_materialized_count(root.as_raw_fd()), 0);
+    }
+}
+
+#[cfg(test)]
+mod pidfd_getfd_replay_tests {
+    use super::*;
+
+    #[test]
+    fn exact_success_and_errno_need_no_cleanup() {
+        assert_eq!(unexpected_pidfd_getfd_fd(&Ok(7), &Ok(7)), None);
+        assert_eq!(
+            unexpected_pidfd_getfd_fd(&Err(Errno::EBADF), &Err(Errno::EBADF)),
+            None
+        );
+    }
+
+    #[test]
+    fn unexpected_success_is_owned_for_cleanup_before_refusal() {
+        assert_eq!(
+            unexpected_pidfd_getfd_fd(&Err(Errno::EBADF), &Ok(9)),
+            Some(9)
+        );
+        assert_eq!(unexpected_pidfd_getfd_fd(&Ok(7), &Ok(9)), Some(9));
+        assert_eq!(unexpected_pidfd_getfd_fd(&Ok(7), &Err(Errno::EPERM)), None);
     }
 }
