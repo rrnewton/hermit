@@ -15,7 +15,7 @@ RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 .DEFAULT_GOAL := build
 
 .PHONY: build install-deps install-hooks release-core prune-stale-release help checkout-all check-build-tools \
-	install-build-tools check-submodules check-skill-discovery validate validate-plan \
+	install-build-tools check-submodules verify-submodules check-skill-discovery validate validate-plan \
 	validate-self-test validate-timeout-layers-test lint \
 	validate-kvm validate-dbt validate-sabre validate-liteinst validate-e9patch
 
@@ -89,7 +89,7 @@ prune-stale-release: ## Remove target/release/hermit if stale (not built from cu
 
 # Keep `validate` as an explicit .PHONY convenience target for the sole Rust
 # validation entrypoint.
-validate: check-submodules ## Run the full validation suite (Rust driver; pass flags via ARGS)
+validate: verify-submodules ## Run the full validation suite (Rust driver; pass flags via ARGS)
 	./scripts/validate.rs $(ARGS)
 
 validate-plan: ## Print the boxed DAG plan (nodes, wall/CPU/memory caps, deps) without running it
@@ -132,6 +132,8 @@ lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, c
 			exit 1; \
 		fi
 	@git diff --check
+	./ci/verify-submodules.sh --self-test
+	./ci/verify-submodules.sh
 	python3 scripts/test_validate_stop_paths.py
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
 	$(SUBMODULE_PROXY) ./ci/run-reverie-pin-check.sh
@@ -213,22 +215,26 @@ install-build-tools: ## Best-effort install of cmake + a C/C++ toolchain via the
 		fi
 
 checkout-all: check-build-tools ## Initialize every pinned submodule before builds and validation
-	@$(SUBMODULE_GIT) submodule update --init --recursive
+	@before="$$($(SUBMODULE_GIT) submodule status --recursive 2>/dev/null || true)"; \
+		$(SUBMODULE_GIT) submodule update --init --recursive; \
+		inited="$$(printf '%s\n' "$$before" | grep -E '^-' | awk '{print $$2}' | tr '\n' ' ')"; \
+		repaired="$$(printf '%s\n' "$$before" | grep -E '^[+U]' | awk '{print $$2}' | tr '\n' ' ')"; \
+		if [ -n "$$inited" ] || [ -n "$$repaired" ]; then \
+			[ -n "$$inited" ] && echo "make: checkout-all: INITIALIZED (were absent): $$inited"; \
+			if [ -n "$$repaired" ]; then \
+				echo "make: checkout-all: REPAIRED DRIFT (were at a different revision): $$repaired"; \
+				echo "  this is a SILENT CORRECTION on the build path -- run 'make verify-submodules'"; \
+				echo "  to see drift REFUSED instead of repaired."; \
+			fi; \
+		else \
+			echo "make: checkout-all: nothing to initialize or repair (all submodules already at their pins)"; \
+		fi
 
-check-submodules: checkout-all ## Verify every pinned submodule is checked out at its recorded revision
-	@status="$$($(SUBMODULE_GIT) submodule status --recursive)"; \
-		printf '%s\n' "$$status"; \
-		total=$$(printf '%s\n' "$$status" | grep -c .); \
-		bad=$$(printf '%s\n' "$$status" | grep -Ec '^[-+U]' || true); \
-		if [ "$$bad" -gt 0 ]; then \
-			echo "error: $$bad of $$total submodule(s) missing or not at the pinned revision:" >&2; \
-			printf '%s\n' "$$status" | grep -E '^[-+U]' >&2; \
-			echo "  leading '-' = not initialized, '+' = checked out at a different revision, 'U' = merge conflict" >&2; \
-			exit 1; \
-		fi; \
-		echo "make: submodules OK -- $$total/$$total at their pinned revision"
-	@test -f agent-utils/README.md || { echo 'error: agent-utils submodule is missing' >&2; exit 1; }
-	@test -f third-party/rr/CMakeLists.txt || { echo 'error: rr submodule is missing' >&2; exit 1; }
+verify-submodules: ## Verify submodule pins without initializing or repairing them
+	@SUBMODULE_GIT='$(SUBMODULE_GIT)' ./ci/verify-submodules.sh
+
+check-submodules: checkout-all ## Initialize if needed, then verify (build path)
+	@$(MAKE) --no-print-directory verify-submodules
 
 # ---------------------------------------------------------------------------
 # Per-backend validation targets.

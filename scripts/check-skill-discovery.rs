@@ -22,6 +22,7 @@ const PACKAGED_SKILLS: &[&str] = &[
     "benchmark",
     "backend-reality-reviewer",
     "ci-debugging",
+    "code-elegance",
     "continuous-virtual-time-is-sacred",
     "deadlock-debugging",
     "determinism-regression-debugging",

@@ -328,10 +328,10 @@ pub fn shell_join<I: IntoIterator<Item = S>, S: AsRef<str>>(argv: I) -> String {
 
 /// The always-on preflight gates and the manifest-audit binary producer, as DAG nodes.
 ///
-/// `validate.sh` runs these before every profile and fails fast if either of the
-/// first two fails (validate.sh:4745-4752); the dependency edges below reproduce
-/// that fail-fast structurally — a failed dependency SKIPS its dependents, which
-/// the runner reports as `skipped` rather than as passes.
+/// Submodule verification is deliberately non-mutating and first. Initializing
+/// or repairing a checkout before observing it would erase the exact drift this
+/// gate exists to detect. A caller with an uninitialized checkout must run
+/// `make checkout-all` explicitly, then retry validation.
 pub fn preflight_nodes(root: &Path, with_proxy: bool) -> Vec<Step> {
     let proxy = if with_proxy { "with-proxy " } else { "" };
     // The Reverie-pin launcher is bound to THIS repository explicitly, never left
@@ -357,13 +357,8 @@ pub fn preflight_nodes(root: &Path, with_proxy: bool) -> Vec<Step> {
         node(
             "pre",
             "submodules",
-            "Initialize repository submodules",
-            format!(
-                "{proxy}git submodule update --init --recursive && \
-                 status=$(git submodule status --recursive) && printf '%s\\n' \"$status\" && \
-                 ! printf '%s\\n' \"$status\" | grep -Eq '^[-+U]' && \
-                 test -f agent-utils/README.md && test -f third-party/rr/CMakeLists.txt"
-            ),
+            "Verify repository submodules without initializing or repairing them",
+            "./ci/verify-submodules.sh --self-test && ./ci/verify-submodules.sh".to_string(),
             vec![],
             PREFLIGHT_TIMEOUT_S,
             PREFLIGHT_CPU_TIMEOUT_S,

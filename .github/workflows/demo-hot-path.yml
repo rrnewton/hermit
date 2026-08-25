@@ -18,6 +18,10 @@ name: P0 Demo Gate (Hermit hot paths)
 # trigger and the requirement stay consistent. Hot-path gating is UNCHANGED for
 # detcore*/**, hermit-cli/**, tests/c/** (guest programs), and everything else.
 on:
+  # Exercise the cache-bypassing calibration path deliberately instead of
+  # waiting for an accidental cache miss to discover that it is broken.
+  schedule:
+    - cron: "43 09 * * 0"
   workflow_dispatch:
     inputs:
       sha:
@@ -28,6 +32,13 @@ on:
           ref's tip.
         required: false
         type: string
+      force_cold_calibration:
+        description: >-
+          Remove the restored Demo 8 crash-seed hint and exercise the full cold
+          calibration path. Scheduled runs always enable this.
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   # Group each ref's runs, but NEVER cancel a RUNNING main demo (owner directive
@@ -242,6 +253,7 @@ jobs:
           unshare --user --map-root-user --pid --fork true
 
       - name: Restore pinned heavy-demo assets
+        id: demo08-cache
         uses: actions/cache@v4
         with:
           path: |
@@ -249,7 +261,25 @@ jobs:
             dev-hermit-demo-suite/ignored/demo08-build/btrfs-progs-v7.1
           key: hermit-demo-assets-v1-${{ runner.os }}-${{ runner.arch }}
 
+      - name: Select the Demo 8 calibration path
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.demo08-cache.outputs.cache-hit }}
+          FORCE_COLD: ${{ github.event_name == 'schedule' || inputs.force_cold_calibration }}
+        run: |
+          set -euo pipefail
+          seed_file="$SUITE_DIR/ignored/demo08-btrfs/.crash-seed"
+          if [[ "$FORCE_COLD" == true ]]; then
+            rm -f -- "$seed_file"
+            selected=forced-cold-calibration
+          else
+            selected=default-parent-behavior
+          fi
+          echo "DEMO08_SELECTED_PATH=$selected" >>"$GITHUB_ENV"
+          echo "::notice title=Demo 8 calibration path::$selected; cache_hit=${CACHE_HIT:-false}"
+
       - name: Run demos 1-8 at the exact Hermit SHA
+        id: demo-sweep
         working-directory: dev-hermit-demo-suite
         run: |
           set -euo pipefail
@@ -259,6 +289,33 @@ jobs:
           fi
           timeout --foreground --kill-after=60s 21000s \
             "${command[@]}" 2>&1 | tee demo-sweep-validation.log
+
+      - name: Verify the selected Demo 8 calibration path
+        if: always()
+        shell: bash
+        env:
+          DEMO_SWEEP_OUTCOME: ${{ steps.demo-sweep.outcome }}
+          FORCE_COLD: ${{ github.event_name == 'schedule' || inputs.force_cold_calibration }}
+        run: |
+          set -euo pipefail
+          log="$SUITE_DIR/demo-sweep-validation.log"
+          actual=no-evidence
+          if [[ -r "$log" ]] && grep -q 'Demo 8 crash seed calibrated:' "$log"; then
+            actual=cold-calibration
+          elif [[ -r "$log" ]] && grep -q 'Demo 8 crash seed ready (cached seed' "$log"; then
+            actual=cached-seed-shortcut
+          fi
+          {
+            echo "## Demo 8 calibration path"
+            echo
+            echo "- selected path: ${DEMO08_SELECTED_PATH:-unknown}"
+            echo "- observed path: $actual"
+            echo "- demo sweep outcome: ${DEMO_SWEEP_OUTCOME:-unknown}"
+          } >>"$GITHUB_STEP_SUMMARY"
+          if [[ "$FORCE_COLD" == true && "$actual" != cold-calibration ]]; then
+            echo "::error title=Demo 8 cold calibration NO-RESULT::forced cold run did not publish the calibration-success marker"
+            exit 1
+          fi
 
       - name: Upload per-demo diagnostics
         if: always()
