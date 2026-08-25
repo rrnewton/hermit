@@ -109,7 +109,6 @@
     "c-programs/epoll-determinism::custom",
     "c-programs/epoll-determinism::naked",
     "c-programs/epoll-determinism::replay",
-    "c-programs/fp-reduction-nondeterminism::chaos",
     "c-programs/fp-reduction-nondeterminism::custom",
     "c-programs/fp-reduction-nondeterminism::naked",
     "c-programs/fp-reduction-nondeterminism::replay",
