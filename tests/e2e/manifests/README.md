@@ -94,7 +94,10 @@ as `HOST-INAPPLICABLE` with the probe evidence. The cell stays in the selected
 denominator, has no invented command or attempt, and appears as JUnit `skipped`;
 it is never a pass. Probe failure or disagreement runs the cell. If every
 selected cell is inapplicable, the direct harness invocation refuses rather
-than returning a vacuous green. The validation planner also computes whether a
+than returning a vacuous green. `ci/expected-e2e-plan.json` carries each
+selected cell's generated `requires_host_capabilities` metadata, and `audit-ci`
+checks it against the live manifest; the validation planner reads that bounded,
+checked-in population without compiling or running a second driver. It computes whether a
 DAG bucket would contain no runnable cells and records that node with the same
 typed outcome instead of spawning a known-empty bucket.
 

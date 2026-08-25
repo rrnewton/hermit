@@ -2098,7 +2098,10 @@
       "category": "backend-parity-c",
       "lane": "privileged",
       "mode": "verify",
-      "test": "backend-parity-c/cpuid-probe"
+      "test": "backend-parity-c/cpuid-probe",
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ]
     }
   ],
   "schema": 1

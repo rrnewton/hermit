@@ -331,7 +331,6 @@ fn main() -> ExitCode {
             audit_expected_plan(&root, &manifests);
             ExitCode::SUCCESS
         }
-        "host-inapplicable-buckets" => host_inapplicable_buckets(&root, &manifests, &args),
         "build" => build(&root, &manifests, &args),
         "audit-compile" => audit_compile(&root, &manifests, &args),
         "run" => run(&root, &manifests, &args),
@@ -485,7 +484,28 @@ fn audit_expected_plan(root: &Path, manifests: &ManifestSet) -> usize {
             ..Selection::default()
         })
         .unwrap_or_else(|e| fail(e));
-    let actual = cells.iter().map(|cell| serde_json::json!({"test":cell.id.test,"category":cell.category,"lane":cell.test.lane,"mode":cell.id.mode,"backend":cell.id.backend})).collect::<Vec<_>>();
+    let actual = cells
+        .iter()
+        .map(|cell| {
+            let capabilities = cell
+                .test
+                .requires
+                .iter()
+                .filter_map(|token| requires_capability(token).ok().flatten())
+                .collect::<BTreeSet<_>>();
+            let mut row = serde_json::json!({
+                "test": cell.id.test,
+                "category": cell.category,
+                "lane": cell.test.lane,
+                "mode": cell.id.mode,
+                "backend": cell.id.backend,
+            });
+            if !capabilities.is_empty() {
+                row["requires_host_capabilities"] = serde_json::json!(capabilities);
+            }
+            row
+        })
+        .collect::<Vec<_>>();
     let expected: serde_json::Value =
         serde_json::from_slice(&fs::read(root.join("ci/expected-e2e-plan.json")).unwrap()).unwrap();
     let expected = expected["cells"].as_array().cloned().unwrap_or_default();
@@ -1174,36 +1194,6 @@ fn for_each_parallel<T: Send>(
             consume(index, value);
         }
     });
-}
-
-fn host_inapplicable_buckets(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
-    if !args.ci_only {
-        fail("host-inapplicable-buckets requires --ci-only");
-    }
-    let cells = manifests
-        .select(&args.selection)
-        .unwrap_or_else(|error| fail(error));
-    let verdicts = resolve_host_capabilities(root, &cells);
-    let mut buckets: BTreeMap<(String, String), (usize, usize, BTreeSet<String>)> = BTreeMap::new();
-    for cell in &cells {
-        let bucket = buckets
-            .entry((cell.test.lane.clone(), cell.category.clone()))
-            .or_default();
-        bucket.0 += 1;
-        if let Some((capabilities, _)) = host_inapplicable_reason(&cell.test.requires, &verdicts) {
-            bucket.1 += 1;
-            bucket.2.extend(capabilities);
-        }
-    }
-    for ((lane, category), (selected, withheld, capabilities)) in buckets {
-        let capabilities = if capabilities.is_empty() {
-            "-".to_string()
-        } else {
-            capabilities.into_iter().collect::<Vec<_>>().join(",")
-        };
-        println!("{lane}\t{category}\t{selected}\t{withheld}\t{capabilities}");
-    }
-    ExitCode::SUCCESS
 }
 
 fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {

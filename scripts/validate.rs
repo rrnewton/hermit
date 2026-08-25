@@ -3555,8 +3555,8 @@ fn withhold_host_inapplicable(root: &Path, plan: &mut Plan) -> Result<(), String
 //     `empty-manifest-bucket` condition and is explicitly excluded, so this
 //     mechanism can never absorb a bucket that simply has no cells.
 //  5. IT FAILS CLOSED TOWARD RUNNING at every step. A command it cannot fully
-//     model, a bucket it cannot find, an accounting query that fails or times
-//     out, or a capability the two probes disagree about all leave the node
+//     model, a bucket missing from the audited required plan, malformed plan
+//     metadata, or an uncertain capability probe all leave the node
 //     RUNNING — where the harness's own vacuity guard still refuses a vacuous
 //     pass.
 //  6. THE DENOMINATOR STILL GOES UP. A node withheld here goes into
@@ -3645,93 +3645,85 @@ fn manifest_bucket_of(cmd: &str) -> Option<(String, String)> {
     Some((lane?, category?))
 }
 
-/// Parse `target/debug/test-harness host-inapplicable-buckets` output.
+
+/// Read the exact checked-in required cell population and aggregate it by
+/// manifest bucket for the already-resolved absent capabilities.
 ///
-/// Strict: a malformed line is an error rather than a silently dropped bucket,
-/// and the caller turns any error into "withhold nothing".
-fn parse_bucket_cells(text: &str) -> Result<Vec<BucketCells>, String> {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            continue;
+/// `test-harness audit-ci` regenerates this shape from the live YAML manifests
+/// and compares it by normalized rows. Keeping the capability on the required
+/// cell row means plan construction does not compile or run a second validation
+/// driver before dagrun starts. A stale file still fails the mandatory manifest
+/// gate, so it can never qualify a receipt.
+fn read_bucket_cells(
+    root: &Path,
+    absent: &BTreeMap<validate_plan::HostCapability, String>,
+) -> Result<Vec<BucketCells>, String> {
+    let path = root.join("ci/expected-e2e-plan.json");
+    let document: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?,
+    )
+    .map_err(|e| format!("invalid JSON in {}: {e}", path.display()))?;
+    let cells = document
+        .get("cells")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("{} has no cells array", path.display()))?;
+    let mut buckets: BTreeMap<(String, String), BucketCells> = BTreeMap::new();
+    for cell in cells {
+        let lane = cell
+            .get("lane")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("{} contains a cell without a lane", path.display()))?;
+        let category = cell
+            .get("category")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("{} contains a cell without a category", path.display()))?;
+        let bucket = buckets
+            .entry((lane.to_string(), category.to_string()))
+            .or_insert_with(|| BucketCells {
+                lane: lane.to_string(),
+                category: category.to_string(),
+                selected: 0,
+                withheld: 0,
+                capabilities: Vec::new(),
+            });
+        bucket.selected += 1;
+        let mut cell_absent = BTreeSet::new();
+        if let Some(values) = cell.get("requires_host_capabilities") {
+            let values = values.as_array().ok_or_else(|| {
+                format!(
+                    "{} contains a non-array requires_host_capabilities field",
+                    path.display()
+                )
+            })?;
+            for value in values {
+                let name = value.as_str().ok_or_else(|| {
+                    format!("{} contains a non-string host capability", path.display())
+                })?;
+                let capability = validate_plan::HostCapability::from_value(name).ok_or_else(|| {
+                    format!(
+                        "{} contains unknown host capability {name:?}",
+                        path.display()
+                    )
+                })?;
+                if absent.contains_key(&capability) {
+                    cell_absent.insert(name.to_string());
+                }
+            }
         }
-        let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() != 5 {
-            return Err(format!("expected 5 tab-separated fields, got {line:?}"));
+        if !cell_absent.is_empty() {
+            bucket.withheld += 1;
+            bucket.capabilities.extend(cell_absent);
         }
-        let selected: usize = fields[2]
-            .parse()
-            .map_err(|_| format!("unparseable selected count in {line:?}"))?;
-        let withheld: usize = fields[3]
-            .parse()
-            .map_err(|_| format!("unparseable withheld count in {line:?}"))?;
-        if withheld > selected {
-            return Err(format!("withheld exceeds selected in {line:?}"));
-        }
-        let capabilities: Vec<String> = if fields[4] == "-" {
-            Vec::new()
-        } else {
-            fields[4].split(',').map(str::to_string).collect()
-        };
-        out.push(BucketCells {
-            lane: fields[0].to_string(),
-            category: fields[1].to_string(),
-            selected,
-            withheld,
-            capabilities,
-        });
+    }
+    let mut out = buckets.into_values().collect::<Vec<_>>();
+    for bucket in &mut out {
+        bucket.capabilities.sort();
+        bucket.capabilities.dedup();
     }
     Ok(out)
-}
-
-/// Ask the harness for the per-bucket cell accounting, bounded in time.
-///
-/// The harness is the ONLY source used, because it is the same code that will
-/// select and withhold the cells when the bucket's node runs. Re-deriving the
-/// selection here would create a second implementation that could drift from
-/// the one that actually runs.
-fn read_bucket_cells(root: &Path) -> Result<Vec<BucketCells>, String> {
-    let build = Command::new("timeout")
-        .arg("600")
-        .arg("cargo")
-        .args([
-            "build",
-            "--quiet",
-            "--locked",
-            "-p",
-            "hermit-manifest-plan",
-            "--bins",
-        ])
-        .current_dir(root)
-        .output()
-        .map_err(|e| format!("could not build the current test-harness: {e}"))?;
-    if !build.status.success() {
-        return Err(format!(
-            "building the current test-harness exited {}: {}",
-            build
-                .status
-                .code()
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "signal".into()),
-            String::from_utf8_lossy(&build.stderr)
-                .lines()
-                .last()
-                .unwrap_or_default()
-        ));
-    }
-    let out = Command::new(root.join("target/debug/test-harness"))
-        .args(["host-inapplicable-buckets", "--ci-only"])
-        .current_dir(root)
-        .output()
-        .map_err(|e| format!("could not run target/debug/test-harness host-inapplicable-buckets: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "target/debug/test-harness host-inapplicable-buckets exited {}: {}",
-            out.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
-            String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or_default()
-        ));
-    }
-    parse_bucket_cells(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// Withhold every planned manifest bucket node whose entire cell population is
@@ -3756,7 +3748,7 @@ fn withhold_vacuous_manifest_nodes(
     if candidates.is_empty() {
         return Ok(());
     }
-    let buckets = match read_bucket_cells(root) {
+    let buckets = match read_bucket_cells(root, absent) {
         Ok(buckets) => buckets,
         Err(why) => {
             // FAIL CLOSED TOWARD RUNNING. Without the accounting there is no
@@ -3801,20 +3793,15 @@ fn withhold_vacuous_manifest_nodes(
         let Some(capability) = validate_plan::HostCapability::from_value(name) else {
             return Err(format!(
                 "manifest bucket {lane}/{category} was withheld by capability '{name}', which \
-                 the driver's closed vocabulary does not know; the two vocabularies disagree"
+                 the driver's closed vocabulary does not know"
             ));
         };
-        // The driver probed this capability itself. If ITS probe said PRESENT
-        // while the harness's said ABSENT, the sources disagree, and
-        // disagreement runs the work.
-        let Some(evidence) = absent.get(&capability) else {
-            println!(
-                "Host capability {name}: the driver's probe says PRESENT while \
-                 target/debug/test-harness withheld cells for it; the sources disagree, so \
-                 {tag} RUNS."
-            );
-            continue;
-        };
+        let evidence = absent.get(&capability).ok_or_else(|| {
+            format!(
+                "manifest bucket {lane}/{category} named capability '{name}' without an absent \
+                 verdict; refusing inconsistent host-capability accounting"
+            )
+        })?;
         withheld.push(validate_plan::HostInapplicableNode {
             tag: tag.clone(),
             capability,
@@ -5580,27 +5567,32 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
         }
     }
 
-    // THE ACCOUNTING PARSER — a malformed record must be an error, so the caller
-    // withholds nothing, rather than a silently dropped or mis-read bucket.
-    let good = "privileged\tbackend-parity-c\t1\t1\tcpuid-faulting\nportable\tapplications\t3\t0\t-\n";
-    let parsed = parse_bucket_cells(good)?;
-    if parsed.len() != 2 || !bucket_runs_nothing(&parsed[0]) || bucket_runs_nothing(&parsed[1]) {
-        return Err(format!("node vacuity: accounting parse is wrong: {parsed:?}"));
-    }
-    if parsed[0].capabilities != vec!["cpuid-faulting".to_string()]
-        || !parsed[1].capabilities.is_empty()
+    // THE CHECKED-IN ACCOUNTING — the required plan itself carries the host
+    // capability metadata generated from the live YAML manifests. This must be
+    // enough to withhold the one current privileged bucket without compiling or
+    // invoking another validation driver before dagrun starts.
+    let absent = BTreeMap::from([(
+        validate_plan::HostCapability::CpuidFaulting,
+        "planted absence".to_string(),
+    )]);
+    let parsed = read_bucket_cells(root, &absent)?;
+    let privileged = parsed
+        .iter()
+        .find(|bucket| bucket.lane == "privileged" && bucket.category == "backend-parity-c")
+        .ok_or("node vacuity: required plan lost the privileged backend-parity-c bucket")?;
+    if privileged.selected != 1
+        || !bucket_runs_nothing(privileged)
+        || privileged.capabilities != vec!["cpuid-faulting".to_string()]
     {
-        return Err("node vacuity: the accounting must carry which capability withheld".into());
+        return Err(format!(
+            "node vacuity: checked-in host-capability accounting is wrong: {privileged:?}"
+        ));
     }
-    for bad in [
-        "privileged\tbackend-parity-c\t1\t1\n",
-        "privileged\tbackend-parity-c\tmany\t1\tcpuid-faulting\n",
-        // withheld > selected cannot happen and must not be silently accepted.
-        "privileged\tbackend-parity-c\t1\t2\tcpuid-faulting\n",
-    ] {
-        if parse_bucket_cells(bad).is_ok() {
-            return Err(format!("node vacuity: malformed accounting {bad:?} must be refused"));
-        }
+    let present = read_bucket_cells(root, &BTreeMap::new())?;
+    if present.iter().any(|bucket| bucket.withheld != 0) {
+        return Err(
+            "node vacuity: no bucket may be withheld when no capability is absent".into(),
+        );
     }
 
     // THE RETAINED DEPENDENT. A result consumer keeps running with the edge
