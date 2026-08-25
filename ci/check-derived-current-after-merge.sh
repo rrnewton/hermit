@@ -96,8 +96,16 @@ worktree="$scratch/merged"
 cleanup() { git worktree remove --force "$worktree" >/dev/null 2>&1 || true; rm -rf "$scratch"; }
 trap cleanup EXIT
 
+# Resolve HEAD to a SHA in THIS repo before handing it to the scratch worktree.
+# `git -C "$worktree" merge HEAD` resolves HEAD *inside that worktree*, where it is
+# the base commit -- so the merge is a no-op and the script silently checks the BASE
+# instead of the merge result. That defect made this script report the base's status
+# for every branch; it was caught only because a correctly-regenerated branch was
+# refused. Pass the SHA, never the symbolic name.
+head_sha=$(git rev-parse HEAD)
+
 git worktree add --quiet --detach "$worktree" "$BASE_REF"
-if ! git -C "$worktree" -c core.hooksPath=/dev/null merge --no-edit --no-ff HEAD >/dev/null 2>&1; then
+if ! git -C "$worktree" -c core.hooksPath=/dev/null merge --no-edit --no-ff "$head_sha" >/dev/null 2>&1; then
     echo "check-derived-current-after-merge: HEAD does not merge cleanly onto $BASE_REF." >&2
     echo "  Rebase first; the derived artifacts cannot be judged against a tree that" >&2
     echo "  does not exist." >&2
