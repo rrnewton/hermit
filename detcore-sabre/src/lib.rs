@@ -25,6 +25,7 @@ use std::sync::atomic::Ordering;
 pub use detcore::CONFIG_FINGERPRINT_ENV;
 use detcore::Detcore;
 use detcore::config_wire_fingerprint;
+use reverie::Signal;
 use reverie_memory::LocalMemory;
 use reverie_memory::MemoryAccess;
 use reverie_sabre as sabre;
@@ -381,6 +382,38 @@ impl reverie_sabre::Tool for Plugin {
     // TODO-HUMAN-REVIEW(PR-755): Review SaBRe time VDSO virtualization.
     fn vdso_time(&self, tloc: *mut libc::time_t) -> i32 {
         self.handle_vdso(Sysno::time, SyscallArgs::new(tloc as usize, 0, 0, 0, 0, 0))
+    }
+
+    /// Tell Detcore a signal arrived, before the guest's handler runs.
+    ///
+    /// Reverie's central handler delivers the signal, but nothing forwarded
+    /// that fact to the tool: this method was the default empty one, and the
+    /// remote adapter carried syscalls, RDTSC and lifecycle events but no
+    /// signals. So Detcore never recorded a `SignalReceived` event and never
+    /// made the `ResourceID::InboundSignal` request its scheduler needs
+    /// (`detcore/src/lib.rs:1228`), and under this backend its model of the
+    /// guest simply had no signals in it.
+    ///
+    /// Detcore answers with the signal to deliver, or `None` to suppress it.
+    /// Suppression is not actionable from here -- Reverie's central handler has
+    /// already committed to running the guest action by the time it calls this
+    /// -- so a suppressed or failed forward is reported rather than dropped.
+    fn handle_signal_event(&self, signal: i32) {
+        let Ok(signal) = Signal::try_from(signal) else {
+            return;
+        };
+        match self.adapter.handle_signal(signal) {
+            Ok(Some(_)) => {}
+            Ok(None) => sabre::eprintln!(
+                "detcore-sabre: Detcore suppressed signal {}, but Reverie's central handler has already committed to the guest action",
+                signal
+            ),
+            Err(error) => sabre::eprintln!(
+                "detcore-sabre: forwarding signal {} to Detcore failed: {}",
+                signal,
+                error
+            ),
+        }
     }
 
     fn on_thread_start(&self, thread_id: u32) {
