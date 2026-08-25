@@ -772,6 +772,56 @@ asserts `injected == requested + 1`, a tighter invariant the branch never had.
 Final verdict on `#2178`: **fully superseded, zero residual** — closed, not
 rebased. The 14 conflicts were never worth resolving.
 
+### 14. Re-read the owner field at BOTH ends — a claim can be overwritten after you take it
+
+The landed rule says re-read the owner field **after** claiming, because `tg claim`
+overwrites unconditionally and tells neither party. That is necessary and it is not
+sufficient: nothing about the overwrite is limited to the moment you claim. A claim
+you verified on acquisition can be taken from you at any point while you work, and
+the first you would learn of it is a second agent's verdict landing on the same
+head.
+
+**So check at acquisition AND immediately before you act.** The second read costs
+one query and it is the one that protects the irreversible step — the close, the
+land, the force-push. A stale `owner` is harmless while you are only reading; it is
+expensive exactly when you stop reading and start writing.
+
+    tg claim <task>
+    # re-read #1 -- did my claim actually take?
+    sqlite3 ... "SELECT owner FROM tasks WHERE local_id='<task>'"
+    ... do the work ...
+    # re-read #2 -- do I still hold it, now that I am about to close/land?
+    sqlite3 ... "SELECT owner FROM tasks WHERE local_id='<task>'"
+
+**And the ownership signal is not in TaskGraph alone.** Measured across two sweep
+rounds on 14 candidate heads that TaskGraph reported free: **12 of 14 carried a
+live ownership signal visible only on the pull request** — an author still pushing
+after review (`#2478`), a landing-order-coupled pair one agent held both halves of
+(`#2549`/`#2550`), `Claimed this head to take it end to end` in a comment
+(`#2304`), two published verdicts (`#2551`), a terminal disposition (`#2368`,
+`#2425`), a reviewer's `TAKING` note (`#2178`). A task-only view was wrong **most
+of the time, not occasionally**.
+
+The cheap form of the PR-side check, sorted newest first because a claim from
+fourteen days ago and one from four minutes ago are not the same fact:
+
+    gh pr view <n> --json assignees,labels,reviews,comments \
+      --jq '.comments | sort_by(.createdAt) | reverse | .[0:3]'
+
+Sort the candidate queue on `updatedAt`, never `createdAt`: a head created a week
+ago and touched four minutes ago is the one most likely to have someone on it, and
+creation order hides exactly that.
+
+⚠️ **A closed duplicate task does not remove the head from routing.** Measured on
+`#2327`: an agent closed a duplicate task as a duplicate, the routing layer handed
+it out again anyway, and two agents ended up on the same head simultaneously — one
+of them landing the content before the stand-down reached it. In that agent's own
+words, *"closing a duplicate task does not stop the routing layer from handing it
+out again. A closed task is not the same as a removed one, and I assumed it was."*
+Neither agent was careless. **Do not treat an assignment reaching you as evidence
+that the head is free** — claim-check the pull request itself.
+
+
 ## Verdict vocabulary
 
 | verdict | meaning | action |
