@@ -1140,11 +1140,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // NOTE: `all_pinned_syscalls()`, not `Sysno::iter()`. The latter
             // stops one short of the end of the table, which silently dropped
             // `lsm_list_modules` out of this sweep.
-            subscription.syscalls(
-                crate::all_pinned_syscalls().filter(|sysno| {
-                    crate::is_determinized_syscall(*sysno) || crate::is_unsupported_syscall(*sysno)
-                }),
-            );
+            subscription.syscalls(crate::all_pinned_syscalls().filter(|sysno| {
+                crate::is_determinized_syscall(*sysno) || crate::is_unsupported_syscall(*sysno)
+            }));
 
             // Make sure we also intercept everything that the record-or-replay tool
             // wants.
