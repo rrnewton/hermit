@@ -281,6 +281,10 @@ struct TrackedCell {
     id: CellId,
     enabled: bool,
     status: String,
+    /// Why a `not-applicable` cell is not applicable, verbatim from the
+    /// manifest. Absent for `green` and `red`.
+    #[serde(default)]
+    not_applicable_reason: Option<String>,
 }
 
 struct PressureCells {
@@ -1808,6 +1812,24 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 selected_cells.push(cell);
             }
             "green" => {}
+            // NOT APPLICABLE IS NOT A CANDIDATE, AND SAYING SO IS THE POINT. The
+            // backend is not enabled for this mode, so there is nothing to
+            // pressure-test: repeating a cell that was never asked to run
+            // measures the harness, not the cell. Before the scorecard could say
+            // `not-applicable` these 4,940 cells were `red`, and an unfiltered
+            // run offered to pressure-test every one of them.
+            "not-applicable" if selected && selection.is_exact() => {
+                return Err(format!(
+                    "{}/{}/{} is NOT APPLICABLE, not red: {}",
+                    cell.id.test,
+                    cell.id.mode,
+                    cell.id.backend,
+                    cell.not_applicable_reason.as_deref().unwrap_or(
+                        "its backend is not enabled for this mode, so it has no guest command"
+                    )
+                ));
+            }
+            "not-applicable" => {}
             other => return Err(format!("unknown cell status `{other}`")),
         }
     }
@@ -4931,35 +4953,49 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
 
     let unfiltered = pressure_cells(root, &CellSelection::default())?;
-    let unavailable_id = unfiltered
-        .unavailable
-        .first()
-        .ok_or("self-test needs at least one red chaos cell without seeds")?
-        .id
+    // A NOT-APPLICABLE CELL MUST NEITHER RUN NOR BE SILENTLY IGNORED. This
+    // bracket previously keyed on "a red chaos cell without seeds", which was
+    // the same population under its old name: before the scorecard could say
+    // `not-applicable`, a cell whose backend is not enabled for its mode was
+    // recorded as red. The invariant is unchanged -- such a cell must stay out
+    // of the executable population, and an exact request for it must be refused
+    // WITH THE MANIFEST'S OWN REASON rather than a bare "not red".
+    let tracked_text = fs::read_to_string(root.join(TRACKED_CELLS))
+        .map_err(|e| format!("cannot read tracked cells: {e}"))?;
+    let tracked: TrackedCells = serde_json::from_str(&tracked_text)
+        .map_err(|e| format!("invalid tracked cells: {e}"))?;
+    let not_applicable = tracked
+        .cells
+        .iter()
+        .find(|cell| cell.status == "not-applicable")
+        .ok_or("self-test needs at least one not-applicable cell")?
         .clone();
-    if unavailable_id.mode != "chaos"
-        || unfiltered
-            .selected
-            .iter()
-            .any(|tracked| tracked.id == unavailable_id)
+    if not_applicable.not_applicable_reason.is_none() {
+        return Err(format!(
+            "{}/{}/{} is not-applicable but states no reason",
+            not_applicable.id.test, not_applicable.id.mode, not_applicable.id.backend
+        ));
+    }
+    if unfiltered
+        .selected
+        .iter()
+        .any(|tracked| tracked.id == not_applicable.id)
     {
-        return Err(
-            "a red chaos cell without seeds entered the executable pressure population".into(),
-        );
+        return Err("a not-applicable cell entered the executable pressure population".into());
     }
     let unavailable_selection = CellSelection {
-        test: Some(unavailable_id.test.clone()),
-        mode: Some(unavailable_id.mode.clone()),
-        backend: Some(unavailable_id.backend.clone()),
+        test: Some(not_applicable.id.test.clone()),
+        mode: Some(not_applicable.id.mode.clone()),
+        backend: Some(not_applicable.id.backend.clone()),
         run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
         ..CellSelection::default()
     };
     let unavailable_error = pressure_cells(root, &unavailable_selection)
         .err()
-        .ok_or("an exact no-seed chaos cell was accepted for execution")?;
-    if !unavailable_error.contains("no chaos seeds") {
+        .ok_or("an exact not-applicable cell was accepted for execution")?;
+    if !unavailable_error.contains("NOT APPLICABLE") {
         return Err(format!(
-            "exact no-seed chaos refusal lost its actionable explanation: {unavailable_error}"
+            "exact not-applicable refusal lost its actionable explanation: {unavailable_error}"
         ));
     }
     let exact_id = unfiltered

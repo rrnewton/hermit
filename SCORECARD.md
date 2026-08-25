@@ -8,15 +8,15 @@ This table is derived from the manifest, not from a separately maintained parent
 
 Every selected `verify` cell, and every seed in a selected `chaos` cell, runs the same backend twice. The manifest runner adds `--verify-strict` when the selected Hermit binary supports it, and accepts a result only when the typed report says `verified=true`, `verdict=matched`, `bitwise_parity=true`, `strictness=canonical`, `compare_logs=true`, a named canonical `record_envelope`, and both INFO-message counts are nonzero. Bare `--verify` remains a Stripped comparison when invoked directly and does not satisfy this regression plan. These same-backend results do not establish cross-backend parity.
 
-| Backend | Green | Red | Total |
-| --- | ---: | ---: | ---: |
-| `ptrace` | 231 | 822 | 1053 |
-| `dbt` | 0 | 1053 | 1053 |
-| `kvm` | 0 | 1053 | 1053 |
-| `sabre` | 53 | 1000 | 1053 |
-| `liteinst` | 0 | 1053 | 1053 |
-| `native` | 0 | 351 | 351 |
-| **Total** | **284** | **5332** | **5616** |
+| Backend | Green | Red | Not applicable | Total |
+| --- | ---: | ---: | ---: | ---: |
+| `ptrace` | 231 | 121 | 701 | 1053 |
+| `dbt` | 0 | 60 | 993 | 1053 |
+| `kvm` | 0 | 23 | 1030 | 1053 |
+| `sabre` | 53 | 89 | 911 | 1053 |
+| `liteinst` | 0 | 51 | 1002 | 1053 |
+| `native` | 0 | 33 | 318 | 351 |
+| **Total** | **284** | **377** | **4955** | **5616** |
 
 ## Denominator, and why the percentage is not comparable across changes to it
 
@@ -24,6 +24,10 @@ Green is **284 of 5616**, which is **5.06%** — over THIS population and no oth
 
 - backends: `ptrace`, `dbt`, `kvm`, `sabre`, `liteinst`, `native`
 - modes: `chaos`, `naked`, `replay`, `verify`
+
+⚠️ **4955 of those 5616 cells are NOT APPLICABLE** — their backend is not enabled for their mode, so they were never asked to run and cannot pass or fail. Over the 661 cells that CAN run, green is **42.97%**.
+
+⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same 284 green cells measured against a smaller denominator. Nothing was fixed to produce it; it is what the first figure always meant once the cells that cannot run are excluded. Quote both or neither, and never compare one against the other as though something moved.
 
 ⚠️ **Adding or removing a backend or mode changes this denominator and therefore the percentage, without anything about the product changing.** Removing a backend whose cells are mostly red RAISES the reported figure; adding honest red cells LOWERS it. Neither is progress. Before comparing this percentage against an earlier one, diff the two lists above: if they differ, the numbers are not comparable and the difference is not a result.
 
