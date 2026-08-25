@@ -56,5 +56,12 @@ if [[ $mode == run ]]; then
     uniformity="$compile_dir/uniformity"
     RUSTUP_TOOLCHAIN=stable rustc --edition=2021 \
         scripts/check-git-pin-uniformity.rs -o "$uniformity"
-    "$uniformity"
+    # STDOUT OF THIS SCRIPT IS MACHINE-READABLE: `--print-pin` callers capture it
+    # with $(...) and compare the result to a 40-hex sha. The uniformity check
+    # reports with `println!`, so running it on stdout appended eight lines of
+    # scope commentary to that value and made every such comparison
+    # unsatisfiable -- the pin was never the string being compared. Its findings
+    # belong on stderr, where they are still shown and still gate via the exit
+    # status, without corrupting a value another program parses.
+    "$uniformity" >&2
 fi

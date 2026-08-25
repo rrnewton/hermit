@@ -92,8 +92,15 @@ fi
 # itself is unchanged; see the carry chain below. The portable wrapper obtains
 # the repository's recorded pin through the canonical checker and carries it
 # here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 3798935e38ee0d85a2f2e3b91572280cb337af07 ]]; then
-    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie 3798935e38ee0d85a2f2e3b91572280cb337af07" >&2
+# CARRY TO 13cf8bcb (2026-08-25), on the same recipe-identity evidence as the
+# carries above. 3798935e..13cf8bcb leaves every input of the recipe key
+# byte-identical by git object id: reverie-dbt/vendor/dynamorio de352475846e,
+# reverie-dbt/build.rs 0ff8ae24b974, third-party/ fb49c0ba7a9a. The only
+# reverie-dbt change is src/launcher.rs (+118/-11) -- Rust source compiled by
+# Cargo, not an input to the DynamoRIO build -- and the MAX_PARALLEL_JOBS=16
+# clamp is unchanged, so the measured budget carries.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 13cf8bcb5fd167e79bedc6496b5104354c2835c6 ]]; then
+    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie 13cf8bcb5fd167e79bedc6496b5104354c2835c6 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 2
 fi
 
