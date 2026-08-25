@@ -42,7 +42,7 @@ use std::os::fd::AsRawFd;
 #[cfg(feature = "dbt")]
 use std::os::fd::FromRawFd;
 use std::os::unix::fs::PermissionsExt;
-#[cfg(feature = "dbt")]
+#[cfg(any(feature = "dbt", test))]
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::Path;
 #[cfg(feature = "dbt")]
@@ -1245,7 +1245,19 @@ fn dbt_run_error(drrun: &Path, error: std::io::Error) -> Error {
     }
 }
 
-#[cfg(feature = "dbt")]
+// ⚠️ `test` AS WELL AS `dbt`, AND THE REASON IS THAT THE BRACKETS BELOW MUST RUN.
+// `dbt` is not in `default` (hermit-cli/Cargo.toml: `default = []`), so under
+// `#[cfg(feature = "dbt")]` alone this function and any test of it compile only in
+// a build validation does not perform. Measured on main before this change:
+//
+//     $ cargo test -p hermit --bin hermit dbt_status
+//     running 0 tests
+//
+// Zero -- so the only check that a signalled death is not reported as a normal exit
+// contributed nothing to any receipt. Adding `test` keeps the symbol out of a
+// feature-off PRODUCTION build, where `clippy -D warnings` would call the import
+// dead, while letting the brackets execute wherever tests do.
+#[cfg(any(feature = "dbt", test))]
 fn process_status(status: std::process::ExitStatus) -> ExitStatus {
     ExitStatus::from_raw(status.into_raw())
 }
@@ -2120,5 +2132,52 @@ mod tests {
             rendered.contains("protected evidence failed"),
             "the underlying error must be preserved in full: {rendered}"
         );
+    }
+
+    /// A signalled death must not be reported as a normal exit.
+    ///
+    /// Ported from hermit#1689's fifth commit as the one free-standing piece of
+    /// that head: the behaviour it brackets (`ExitStatus::from_raw` preserving
+    /// exited-versus-signalled) is ALREADY on main -- that head's claim 2 landed
+    /// via `b441950f72` -- while its bracket never did. Landed code with no
+    /// coverage, which is the pairing worth closing first.
+    #[test]
+    fn dbt_status_preserves_normal_exit_codes() {
+        for code in [0, 1, 42, 255] {
+            let raw = std::process::ExitStatus::from_raw(code << 8);
+            assert_eq!(
+                process_status(raw),
+                ExitStatus::Exited(code),
+                "a normal exit with code {code} must round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn dbt_status_preserves_death_by_signal() {
+        for (signum, signal) in [
+            (libc::SIGABRT, reverie::Signal::SIGABRT),
+            (libc::SIGSEGV, reverie::Signal::SIGSEGV),
+            (libc::SIGFPE, reverie::Signal::SIGFPE),
+            (libc::SIGILL, reverie::Signal::SIGILL),
+            (libc::SIGTERM, reverie::Signal::SIGTERM),
+            (libc::SIGKILL, reverie::Signal::SIGKILL),
+            (libc::SIGTRAP, reverie::Signal::SIGTRAP),
+        ] {
+            // without a core dump
+            let raw = std::process::ExitStatus::from_raw(signum);
+            assert_eq!(
+                process_status(raw),
+                ExitStatus::Signaled(signal, false),
+                "death by signal {signum} must be reported as Signaled, not Exited"
+            );
+            // with the core-dump flag set (bit 0x80 of the wait status)
+            let raw = std::process::ExitStatus::from_raw(signum | 0x80);
+            assert_eq!(
+                process_status(raw),
+                ExitStatus::Signaled(signal, true),
+                "the core-dump flag for signal {signum} must survive the conversion"
+            );
+        }
     }
 }
