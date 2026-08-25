@@ -1308,47 +1308,6 @@ pub unsafe extern "C" fn reverie_dbt_runtime_exec_failed(_scratch: *mut c_void, 
     resume_paused_runtime();
 }
 
-/// Observes the kernel result of a process-creating clone-family syscall.
-///
-/// Reverie's DBT client gained this ABI-v3 callback in `eb682dc2`
-/// ("reverie-dbt: report process clone results to runtimes") so an external
-/// runtime can tell a failed clone from a successful one before copied process
-/// state changes. `fork`, `clone` and `clone3` deliver both the parent and the
-/// child result; `vfork` delivers only the parent's.
-///
-/// DELIBERATELY INERT, AND THE ABI IS WHY IT CANNOT SIMPLY BE OMITTED. Hermit's
-/// `reverie_dbt_runtime_abi_version` and `reverie_dbt_runtime_callbacks_size`
-/// both derive from the pinned Reverie, so advancing the pin makes Hermit
-/// advertise ABI v3 immediately. The client then calls every v3 callback
-/// unconditionally, and a callback Hermit does not define is not a soft
-/// degradation: DynamoRIO fails to resolve the symbol at load and the run dies
-/// with `<ERROR: using undefined symbol!>` and exit 255, taking every DBT cell
-/// with it. Defining it restores exactly the behavior Detcore had at the
-/// previous pin, where this notification did not exist at all.
-///
-/// Consuming the result is a SEPARATE decision and is not made here. Detcore
-/// already learns about new tasks through
-/// `reverie_dbt_runtime_thread_created_v2`, and giving this callback semantics
-/// would change how process creation is determinized, which is a
-/// determinization change requiring human review rather than something to
-/// smuggle into a pin bump.
-///
-/// # Safety
-///
-/// `_scratch` must be the counters pointer supplied by the native DBT callback.
-/// It is never dereferenced. The client clears its own
-/// `pending_process_clone_result` flag before invoking this, so an inert body
-/// leaves no client-side state outstanding.
-#[unsafe(no_mangle)]
-// TODO-HUMAN-REVIEW(PR-2440): Decide whether Detcore should consume the clone
-// result rather than only completing the ABI.
-pub unsafe extern "C" fn reverie_dbt_runtime_process_clone_result(
-    _scratch: *mut c_void,
-    _sysnum: i64,
-    _result: i64,
-) {
-}
-
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review fork-safe policy enforcement before copied children bypass.
 // TODO-HUMAN-REVIEW(PR-978): Review extending the copied-child gate from the
