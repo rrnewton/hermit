@@ -45,18 +45,25 @@ KERNEL_IMAGE=/path/to/bzImage \
 The higher-level `05-qemu-busybox.sh` uses the same launcher while adding asset
 construction, timeouts, live serial output, log capture, and result checks.
 
-Run Hermit's two-execution Stripped comparison. This is a useful fast
-diagnostic, but it does not establish L2:
+Run Hermit's two-execution canonical comparison, which is what establishes L2:
 
 ```bash
 VERIFY=1 DEMO_TIMEOUT_SECONDS=900 ./demos/05-qemu-busybox.sh
 ```
 
-`VERIFY=1` adds `--verify` and requires Hermit's explicit
-`Determinism verified` marker. It can take several minutes because QEMU's host
-threads execute under the strict ptrace scheduler. Hermit captures guest output
-internally in this mode so it can compare both executions; the verification
-summary is saved as `hermit-stderr.log` instead of replaying the serial console.
+`VERIFY=1` adds `--verify --verify-strict --verify-json` and reads the typed
+verdict rather than a banner, requiring `verified=true`, `verdict=matched`,
+`bitwise_parity=true`, a canonical log comparison with no filtering, and equal
+positive compared-INFO-message counts on both sides. `--verify-strict` is
+required for that: a plain `--verify` stays on the lossy Stripped comparator and
+cannot establish L2. It needs `jq`, which the demo preflights before booting.
+
+It can take several minutes because QEMU's host threads execute under the strict
+ptrace scheduler. Hermit captures guest output internally so it can compare both
+executions, then replays the first run's stdout and stderr on exit, so the
+serial console still reaches `console.log` and the workload marker and
+rejected-clock checks apply in this mode too. The verification summary is also
+saved as `hermit-stderr.log`.
 
 The ptrace PMU skid margin is processor-specific. If Reverie reports that its
 perf counter exceeded the single-step target, measure the host and pass the
