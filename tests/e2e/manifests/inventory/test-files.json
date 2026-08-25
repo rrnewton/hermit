@@ -1604,6 +1604,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/session_identity.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "tests/c/session_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: pins the container's observed session and process-group identity under ptrace verification"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/shm_coherency_identity.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/system-utils.yaml",
       "why": "tests/c/shm_coherency_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: forks a writer and samples MAP_SHARED anonymous, MAP_SHARED file-backed and memfd mappings without any added barrier, printing the observed words and the branch taken including whether a partial update was caught, plus MAP_PRIVATE COW isolation and msync writeback, so verify's double run asserts that what each process OBSERVES is reproducible"
