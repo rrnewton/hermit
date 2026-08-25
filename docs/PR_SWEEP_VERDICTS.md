@@ -1629,6 +1629,89 @@ This is check 12's cousin. Check 12 catches a comparison over an empty set —
 agreement asserted about nothing. This catches a comparison over a set that is
 non-empty but uniform: many observations of one case, reported as many cases.
 
+## A guard keyed on a PROXY rejects the safest cases first
+
+⚠️ **When you enforce a rule, write down the PROPERTY you want, then check whether
+you are testing it or testing something correlated with it.** A proxy is chosen
+because it holds for the cases you had in mind. The cases you did *not* have in
+mind are the ones that satisfy the property by a different route — and those are
+usually the ones that satisfy it *more strongly*, because they got there
+deliberately rather than by convention. So a proxy-keyed guard does not fail
+randomly: **it rejects the safest inputs first.**
+
+That is the opposite of how a guard is expected to fail, which is why it reads as
+the guard working rather than the guard being wrong.
+
+**Worked example, measured 2026-08-25, and it deadlocked the fleet.**
+`ci-hub/bin/tg-note-verified` grew a rule against cross-agent note collisions:
+`/tmp` is shared by every agent and the staging names are predictable
+(`/tmp/note.txt`, `/tmp/ask030.txt`), so two agents can pick the same path and one
+silently overwrites the other. The rule required a `--file` path under `/tmp` to
+carry the calling agent's id.
+
+- **The property:** *no other agent can have written this file.*
+- **The proxy:** *the agent id appears in the filename.*
+
+The proxy is sound for hand-written staging paths — agent ids are unique. But
+`ci-hub/bin/close-task` stages its closure note through
+`tempfile.NamedTemporaryFile(suffix=".note")`, which lands at
+`/tmp/tmpXXXXXXXX.note`: a random name, created `O_EXCL`. That satisfies the
+property **more strongly than namespacing does** — no other writer can have
+produced or collided with it at all — and it contains no agent id, so the guard
+refused it:
+
+```console
+$ ./ci-hub/bin/close-task <task> --disposition "..."
+tg-note-verified: REFUSED -- unnamespaced staging path in a shared directory.
+```
+
+Every closure in the fleet died at the note write. **No task could be closed by
+any agent**, and the landed-but-not-closed population started growing again by a
+new route. Both guards were individually correct; the defect was in the
+composition, and specifically in the proxy.
+
+The repair is not to weaken the rule but to let a caller assert the property
+directly: `TG_NOTE_PRIVATE_TEMP=1` is a claim only the process that created the
+file can honestly make. A hand-written `/tmp/note.txt` still has no such creator
+and is still refused.
+
+**What to ask before shipping a guard.** For each rule, name the property and the
+test, then find one input that has the property *without* passing the test. If you
+cannot construct one, the test may be the property. If you can, that input is your
+first false refusal and it is probably a tool, not a person — tools reach the safe
+state deliberately and by an unusual route.
+
+## After guarding a shared path, run the OTHER tools that use it
+
+⚠️ **A guard is tested against the case that motivated it. Its blast radius is
+every OTHER caller of the same path, and those are exactly the callers nobody
+re-runs.** The motivating case is the one input guaranteed to be exercised; a
+sibling tool that happens to use the same directory, filename convention, or
+subcommand is guaranteed *not* to be, because it has nothing to do with the bug
+you were fixing.
+
+Measured 2026-08-25: two guards went into the task-note path within one hour —
+one refusing unnamespaced `/tmp` staging paths, one requiring closures to go
+through the verifier. Each was tested against its own motivating case and neither
+was run against the other's caller. Together they deadlocked every closure in the
+fleet, as described in the section above. The check that would have caught it was
+one command: run `close-task` after installing the staging guard.
+
+**The rule.** Before installing enforcement on a shared resource — a directory, a
+CLI subcommand, a PATH shim, a file-naming convention — enumerate the other
+programs that touch it and run one end-to-end invocation of each. `grep` the tree
+for the path or subcommand you just constrained; the callers are the list.
+
+This is the operational form of the proxy rule above. The proxy rule says your
+guard will reject the safest inputs; this says the safest inputs belong to your
+neighbours, so go and run your neighbours.
+
+⚠️ **And install enforcement where it can be withdrawn in one command.** Both
+guards live in a PATH shim installed as a *copy* at `/home/newton/orc-bin/tg`,
+removable with `rm`. A guard that cannot be pulled quickly turns a false refusal
+into an outage of unbounded length, and the deadlock above lasted only as long as
+it took to diagnose because pulling it was always available.
+
 ## Verdict vocabulary
 
 | verdict | meaning | action |
