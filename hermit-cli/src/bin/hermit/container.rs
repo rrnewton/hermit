@@ -624,11 +624,23 @@ where
     F: FnMut() -> Result<T, Error>,
     T: serde::Serialize + serde::de::DeserializeOwned,
 {
-    let ran = container.run(|| {
+    classify_container_result(container.run(|| {
         // Runs in the freshly forked container init, not in the caller.
         arm_container_init_guards()?;
         catch_child_panic(&mut f)
-    });
+    }))
+}
+
+/// Turn a `Container::run` / [`RunGuarded::run_guarded`] outcome into an error
+/// whose CLASS is still readable by `classify_failure`.
+///
+/// ⚠️ SHARED BECAUSE `with_container` IS NOT THE ONLY BOUNDARY. `hermit record`
+/// -- every spelling -- calls [`RunGuarded::run_guarded`] directly at six sites
+/// in `record_start.rs`, so a discard there loses exactly what this change
+/// exists to preserve and the failure surfaces as `class=cli-error`.
+pub fn classify_container_result<T>(
+    ran: Result<Result<T, SerializableError>, RunError>,
+) -> Result<T, Error> {
     match ran {
         // The child ran and REPORTED something. Whether that was a caught panic
         // or an error it chose to return is exactly what `kind` preserves; both
@@ -649,6 +661,18 @@ where
         Err(error @ RunError::Spawn(_)) => {
             Err(Error::new(error).context("Sandbox container failed to spawn"))
         }
+    }
+}
+
+/// Postfix spelling of [`classify_container_result`], so a direct
+/// `run_guarded` call site reads the same way `with_container` does.
+pub trait Classified<T> {
+    fn classified(self) -> Result<T, Error>;
+}
+
+impl<T> Classified<T> for Result<Result<T, SerializableError>, RunError> {
+    fn classified(self) -> Result<T, Error> {
+        classify_container_result(self)
     }
 }
 
