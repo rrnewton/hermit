@@ -356,6 +356,60 @@ makes the flag and the claim it licenses move together, so no one can quietly
 upgrade a comparator without upgrading the assurance claim. That is the opposite
 of a gate that passes without looking.
 
+### 9. Read the MERGE BASE, not only the diff — a draft can revert what it never touched
+
+⚠️ **The other eight checks read the diff. This one reads the base, and it is the
+only one that catches a draft reverting work its diff never mentions.**
+
+What a merge writes is not the branch's diff. For a file both sides changed and
+git cannot auto-merge, the resolution decides which side survives — and if the
+branch's base predates a fix that landed in that file, taking the branch's side
+silently reverts it. **Nothing in the diff shows this.** The reviewer reads a
+change about one subject and lands a revert of another.
+
+The case:
+
+hermit#2426 is a compat-envelope draft. Asked what it does with a first-verify
+run that produced no output, the answer is *nothing* — the only first-run
+language anywhere in its diff is an unrelated fixture string,
+`collect2: error: ld returned 1 exit status`. By diff, it is irrelevant to that
+subject.
+
+But its merge base is `770b95c505`, before the typed `no_result` /
+`guest_exit_code` / `guest_signal` reporting landed. Counting those symbols:
+
+| file | main | the draft |
+| --- | --- | --- |
+| `scripts/validate.rs` | **65** | 7 |
+| `scripts/lib/validate_runtime.rs` | **2** | **0** |
+
+and **both files are in that draft's conflict set.** A take-the-branch resolution
+drops 58 matching lines from one and all of them from the other, undoing the
+change that stopped a zero-byte first run being silent — a result reached only
+after eight candidates were ruled out.
+
+**The precise hazard, because "old base" alone is not it.** A rebase or
+cherry-pick replays only the branch's changes, so it cannot revert content the
+branch never touched. The danger is specifically **a conflicted file resolved
+toward the branch**. So the test is not "is the base old" but:
+
+> Does this draft **conflict** in a file that has gained something since its base?
+
+**What to do.** Rebase rather than merge, so conflicts surface hunk by hunk
+instead of as one take-a-side. Then assert the survivors mechanically, against
+the merged tree rather than the intent:
+
+```console
+git grep -c -E 'guest_exit_code|no_result' -- scripts/validate.rs scripts/lib/validate_runtime.rs
+# must not fall below main's counts
+```
+
+**Why this is acute right now.** Every draft in the queue was written before
+tonight, and the typed no-result reason, the capture fix, the KVM comparator fix,
+the RNG determinism fix and the format gate all landed in the last hours. Any of
+them can be reverted by a draft whose diff looks unrelated. Pick the symbols that
+matter for the files in the conflict set, and count them before and after.
+
 ## Verdict vocabulary
 
 | verdict | meaning | action |
