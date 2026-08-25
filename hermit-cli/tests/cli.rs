@@ -3426,3 +3426,85 @@ fn tracer_panic_and_guest_failure_have_different_exit_codes() {
         "hermit-internal failure should use the reserved wrapper code"
     );
 }
+
+/// A guest must not be able to escape the deterministic pipe-capacity pin, and
+/// must not be able to read the host's ceiling.
+///
+/// ⚠️ THIS IS THE WIRING TEST, AND IT EXISTS BECAUSE THE UNIT TESTS DO NOT COVER
+/// IT. `pipe_capacity_request` is unit-tested in `detcore`, but deleting the
+/// `F_SETPIPE_SZ` arm from `handle_fcntl` entirely leaves every one of those
+/// unit tests green while restoring the escape in full — measured. Only an
+/// end-to-end run catches that, so this asserts through a real guest.
+///
+/// ⚠️ AND IT IS A DETERMINISM TEST, NOT A POLICY PREFERENCE. Before the fix the
+/// request was forwarded to the host, so the guest-visible answer was decided by
+/// `/proc/sys/fs/pipe-max-size`: on this host (ceiling 1048576) the guest got
+/// success and a 1 MiB pipe; on a host with the common hardened 65536 the same
+/// guest got EPERM and kept 8192. Same binary, same `--strict`, different answer
+/// per host.
+#[test]
+fn a_guest_cannot_escape_the_deterministic_pipe_capacity_pin() {
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("pipe-capacity-pin");
+    fs::create_dir_all(&build_root).expect("failed to create the pipe-capacity build root");
+    let source = build_root.join("pipecap.c");
+    fs::write(
+        &source,
+        r#"
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+int main(void) {
+    int fd[2];
+    if (pipe(fd)) return 1;
+    printf("initial=%d\n", fcntl(fd[0], F_GETPIPE_SZ));
+    printf("grow=%d\n", fcntl(fd[0], F_SETPIPE_SZ, 1 << 20));
+    printf("after=%d\n", fcntl(fd[0], F_GETPIPE_SZ));
+    char buf[64] = {0};
+    FILE *f = fopen("/proc/sys/fs/pipe-max-size", "r");
+    if (f && fgets(buf, sizeof buf, f)) printf("ceiling=%s", buf);
+    if (f) fclose(f);
+    return 0;
+}
+"#,
+    )
+    .expect("failed to write the pipe-capacity guest");
+    let guest = build_root.join("pipecap");
+    let built = Command::new("cc")
+        .args(["-O2", "-Wall", "-Wextra", "-Werror", "-o"])
+        .arg(&guest)
+        .arg(&source)
+        .output()
+        .expect("failed to invoke cc for the pipe-capacity guest");
+    assert!(
+        built.status.success(),
+        "failed to build the pipe-capacity guest:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["run", "--strict", "--"])
+        .arg(&guest)
+        .output()
+        .expect("failed to run the pipe-capacity guest under hermit");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    assert!(
+        stdout.contains("initial=8192"),
+        "the creation-time pin must still apply\nstdout:\n{stdout}"
+    );
+    // -1 is EPERM: exactly what Linux returns when the request exceeds the
+    // ceiling, except the ceiling is now one Detcore owns.
+    assert!(
+        stdout.contains("grow=-1"),
+        "a guest must not be able to grow a pipe past the pinned capacity\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("after=8192"),
+        "the pinned capacity must survive the guest's own F_SETPIPE_SZ\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("ceiling=8192"),
+        "the guest must read the enforced ceiling, not the host's\nstdout:\n{stdout}"
+    );
+}
