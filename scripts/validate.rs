@@ -3556,7 +3556,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
     // of THIS run's own boxed DAG.
     //
     // This used to synthesise one `shard.<lane>_<node>` wrapper whose command was
-    // `./ci/run-node.sh <lane> <nodes>`, i.e. a SECOND `safe-ci-dag-runner`
+    // `./ci/run-node.sh <lane> <nodes>`, i.e. a SECOND `dagrun`
     // underneath the one already driving this run. That nesting broke `--only`
     // outright, in two separate ways:
     //
@@ -4624,7 +4624,7 @@ fn nsswitch_fixture_node(path: &Path) -> dagrun::model::Step {
 
 // `shard_node` used to live here: it wrapped the selected node in a synthetic
 // `shard.*` step whose command was `./ci/run-node.sh`, nesting a second
-// safe-ci-dag-runner under this one. See the `Focused::Only` branch in
+// dagrun under this one. See the `Focused::Only` branch in
 // `build_plan` for why that broke `--only` and what replaced it. `ci/run-node.sh`
 // itself is UNCHANGED and still serves the hosted GitHub fan-out, which really
 // does need a standalone runner per shard job.
