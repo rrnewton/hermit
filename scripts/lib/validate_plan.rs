@@ -486,6 +486,15 @@ pub fn lane_nodes(
     let mut out = Vec::with_capacity(cfg.steps.len());
     for s in &cfg.steps {
         let mut step = s.clone();
+        // All buckets in one validate share E2E_RUN_ID, so the harness defaults
+        // would make concurrent processes truncate the same result files.
+        // Keep one run identity while isolating storage by lane and bucket.
+        if s.group == "e2e" && s.job.starts_with("manifest_") {
+            step.cmd.push_str(&format!(
+                " --results \"$E2E_RESULT_ROOT/{lane}/{}/results.jsonl\" --junit \"$E2E_RESULT_ROOT/{lane}/{}/junit.xml\"",
+                s.job, s.job
+            ));
+        }
         step.group = retag(&s.group);
         step.deps = s
             .deps
