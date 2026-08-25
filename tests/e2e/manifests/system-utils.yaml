@@ -1777,3 +1777,66 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this entry
           liteinst: No custom edge-case arguments have been calibrated for this entry
         ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+  - id: system-utils/harness-width-contract
+    description: The system-utils bucket runs at the measured deterministic worker width of one
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - bash
+    timeout_seconds: 60
+    occasional: false
+    program: tests/e2e/system-utils/harness-width-contract.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: The contract describes test-harness scheduling, not native guest behavior
+        ci_disabled_reason: 'NOT-EXERCISED: the required verify cell owns the harness-width contract.'
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: The harness control is backend-independent; ptrace is the canonical required witness
+          kvm: The harness control is backend-independent; ptrace is the canonical required witness
+          sabre: The harness control is backend-independent; ptrace is the canonical required witness
+          liteinst: The harness control is backend-independent; ptrace is the canonical required witness
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Replay does not strengthen the harness-width assertion
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: the required verify cell owns the harness-width contract.'
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is unrelated to the harness worker-pool width
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: the required verify cell owns the harness-width contract.'
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The exact verify cell already self-asserts the configured width
+          dbt: The exact verify cell already self-asserts the configured width
+          kvm: The exact verify cell already self-asserts the configured width
+          sabre: The exact verify cell already self-asserts the configured width
+          liteinst: The exact verify cell already self-asserts the configured width
+        ci_disabled_reason: 'NOT-EXERCISED: the required verify cell owns the harness-width contract.'

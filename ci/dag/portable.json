@@ -300,11 +300,13 @@
     {
       "group": "e2e", "job": "manifest_system_utils",
       "desc": "Portable manifest bucket: system-utils",
+      "description": "WORKER-WIDTH DERIVATION 2026-08-24: a current-main sweep of the 28 ptrace cells found 0 failures at --jobs 1 and 2, then rotating failures at every wider sampled setting: 2 at 8, 2 at 16, 6 at 28, and 3 at 64; system-utils/mktemp-name failed in the 28- and 64-wide buckets and passed alone at width 1. The counts are intentionally not treated as monotonic or stable; the durable fact is that widening manufactures contention-sensitive reds while the production width of 1 is clean. Keep --jobs 1 explicit until the cells are made concurrency-safe; system-utils/harness-width-contract reads the exact parsed worker capacity and fails if this control changes without a new measurement.",
       "manifest": {"lane": "portable", "category": "system-utils"},
-      "cmd": "./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category system-utils --ci-only --allow-empty --prebuilt",
+      "cmd": "./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category system-utils --ci-only --allow-empty --prebuilt --jobs 1",
       "deps": ["build.e2e_artifact", "build.manifest_guests", "e2e.metadata"],
       "timeout": 600,
-      "hint": {"resources": {"manifest_guest": 1}, "est_duration_s": 120,
+      "jobs_flag": "",
+      "hint": {"resources": {"manifest_guest": 1}, "preferred_inner_jobs": 1, "est_duration_s": 120,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
                "classification": "latency-bound"}
     },
