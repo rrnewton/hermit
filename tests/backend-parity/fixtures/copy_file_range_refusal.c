@@ -72,6 +72,7 @@ int main(void) {
   if (write(src_fd, PAYLOAD, PAYLOAD_LEN) != PAYLOAD_LEN)
     fail("write payload");
 
+  enum { EXPECTED_CHECKS = 3 };
   int ok = 0;
 
   /* copy_file_range must be refused deterministically with ENOSYS. */
@@ -113,5 +114,14 @@ int main(void) {
 
   printf("copy_file_range_refusal src=%ld dst=%ld checksum=%ld ok=%d\n",
          src_size, dst_size, checksum, ok);
+  /* Route a behavioural failure into the exit status. Without this the guest
+     exits 0 whatever `ok` reached, so a regression only lowered the printed
+     number -- and under --verify both runs lower it identically, so the
+     comparison still matches and the cell stays green. Every check above is
+     unchanged; this only requires all of them. */
+  if (ok != EXPECTED_CHECKS) {
+  	fprintf(stderr, "copy_file_range completed %d of %d checks\n", ok, EXPECTED_CHECKS);
+  	return 1;
+  }
   return 0;
 }

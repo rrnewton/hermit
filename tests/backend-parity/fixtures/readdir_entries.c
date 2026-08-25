@@ -38,6 +38,7 @@ static int make_file(const char *path) {
 }
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 3 };
   int ok = 0;
   char joined[JOIN_CAP] = {0};
 
@@ -112,5 +113,14 @@ int main(void) {
   rmdir(root);
 
   printf("readdir ok=%d names=%s\n", ok, joined);
+  /* Route a behavioural failure into the exit status. Without this the guest
+     exits 0 whatever `ok` reached, so a regression only lowered the printed
+     number -- and under --verify both runs lower it identically, so the
+     comparison still matches and the cell stays green. Every check above is
+     unchanged; this only requires all of them. */
+  if (ok != EXPECTED_CHECKS) {
+  	fprintf(stderr, "readdir completed %d of %d checks\n", ok, EXPECTED_CHECKS);
+  	return 1;
+  }
   return 0;
 }
