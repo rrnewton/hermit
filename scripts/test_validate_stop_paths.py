@@ -557,6 +557,19 @@ def main() -> None:
         # make() cannot carry a no-result status (any nonzero recipe exit becomes
         # `make: *** Error N`), so the distinction has to leave this process as
         # text and be turned back into an exit code one layer out.
+        # ⚠️ FLUSH STDOUT FIRST, so the marker is guaranteed to START A LINE.
+        # ci/lint-checks-node.sh matches this marker ANCHORED (`grep -q "^..."`),
+        # because the token is tracked text in this repo and an unanchored match
+        # turns any checker that merely mentions it into a false no_result. The
+        # cost of anchoring is that a marker which does NOT begin a line is missed
+        # -- and that direction is the dangerous one, because a real no_result
+        # would be silently reported as a pass. The node merges streams with
+        # `2>&1`, and stdout is block-buffered when piped while stderr is not, so
+        # an unterminated stdout line could otherwise still be open when this
+        # writes and the marker would land mid-line. Flushing closes that window
+        # here, at the source, rather than loosening the pattern there to
+        # compensate.
+        sys.stdout.flush()
         for item in unevaluated:
             print(f"{NO_RESULT_MARKER} {item}", file=sys.stderr)
         print(

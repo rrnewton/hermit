@@ -43,6 +43,48 @@ classify_inventory() {
     echo 'ok'
 }
 
+NO_RESULT_MARKER='NO-RESULT-CASE:'
+
+# ⚠️ THE MARKER MATCH IS ANCHORED, and the anchor is the whole correctness argument.
+#
+# `NO-RESULT-CASE:` is now TRACKED TEXT in this repository -- it appears in this
+# file and in scripts/test_validate_stop_paths.py. An unanchored `grep -q` matches
+# the token ANYWHERE on ANY line of the target's combined output, so any checker
+# that SUCCEEDS while echoing a line that merely mentions the marker would convert
+# a fully green run into a no_result. A no_result on this node is invisible by
+# design, so that failure mode is silent in the reassuring direction.
+#
+# Latent rather than live today: no current checker prints the token on a success
+# path. The reason to anchor now is that the most likely next addition to this
+# target is a test OF THIS FEATURE, which would quote the marker while passing.
+#
+# ⚠️ AND THE ANCHOR MUST NOT MISS A GENUINE EMISSION, which is the trade an anchor
+# usually gets wrong. The producer prints `f"{NO_RESULT_MARKER} {item}"` to stderr,
+# at column 0, and `make` does not prefix recipe output -- so column 0 is where a
+# real marker lands. The one way it could not is interleaving: this node merges
+# streams with `2>&1`, so an unterminated stdout line from an earlier writer could
+# leave the marker appended mid-line. scripts/test_validate_stop_paths.py therefore
+# flushes stdout before emitting, which closes that window at the source rather
+# than widening the pattern here to compensate. Both halves are covered by
+# --self-test below, including the case that must NOT match.
+classify_run() {
+    # $1 = make's exit code, $2 = file holding the target's combined output.
+    # Echoes exactly one of: "fail <rc>", "no_result", "pass".
+    local make_rc="$1" out="$2"
+    # A REAL FAILURE ALWAYS WINS. A no_result must never be able to swallow a red,
+    # which is the defect this whole marker channel is downstream of.
+    if [ "$make_rc" -ne 0 ]; then
+        echo "fail ${make_rc}"
+        return 0
+    fi
+    if grep -q "^${NO_RESULT_MARKER}" "$out"; then
+        echo 'no_result'
+        return 0
+    fi
+    echo 'pass'
+}
+
+
 self_test() {
     local got failures=0
     check_case() {
@@ -71,11 +113,63 @@ self_test() {
     check_case 'mixed uninit+drift' 'uninitialized 1' '+abc123 agent-utils
 -def456 third-party/rr'
 
+    # ---- classify_run: the pass / no_result / fail split -------------------
+    #
+    # This branch decides what the NODE REPORTS, and until now it was the one
+    # thing in this target not covered by anything. Each case below is planted so
+    # that it FAILS if the classification regresses -- in particular the first two
+    # fail under the unanchored `grep -q "$NO_RESULT_MARKER"` this replaced, and
+    # the last two fail if a no_result is ever allowed to outrank a real failure.
+    local tmp
+    tmp="$(mktemp)" || return 1
+    check_run() {
+        local name="$1" want="$2" rc="$3" body="$4"
+        printf '%s\n' "$body" > "$tmp"
+        got="$(classify_run "$rc" "$tmp")"
+        if [ "$got" != "$want" ]; then
+            echo "FAIL: ${name}: expected '${want}', got '${got}'" >&2
+            failures=$((failures + 1))
+        fi
+    }
+
+    # ⚠️ THE CASE THAT MUST NOT MATCH. A checker that SUCCEEDS while echoing a line
+    # that merely mentions the marker -- scanning a source file, quoting the
+    # convention, or testing this very feature -- must stay a pass. Unanchored,
+    # this returns no_result and silently converts a green run into an invisible
+    # one.
+    check_run 'marker quoted mid-line is not a no_result' 'pass' 0 \
+        "shellcheck: scanning ci/lint-checks-node.sh for NO-RESULT-CASE: handling
+lint-checks: OK"
+    check_run 'marker indented is not a no_result' 'pass' 0 \
+        "    NO-RESULT-CASE: quoted inside an indented block"
+    # ⚠️ AND THE CASE THAT MUST MATCH, so the anchor cannot be "fixed" by making it
+    # never fire. This is the exact shape the producer emits: column 0, on its own
+    # line, with make's recipe echo above it.
+    check_run 'genuine emission at column 0 is a no_result' 'no_result' 0 \
+        "python3 scripts/test_validate_stop_paths.py
+NO-RESULT-CASE: canonical adapter contract, accept arm: no parent adapter
+PARTIAL: every evaluable assertion passed"
+    check_run 'clean run is a pass' 'pass' 0 "lint-checks: everything passed"
+    # ⚠️ A NO_RESULT MUST NEVER SWALLOW A RED. Both arms: a plain failure, and a
+    # failure that ALSO carries a genuine marker. The second is the one that
+    # matters -- if the order of these two tests is ever inverted, a real red is
+    # reported as an invisible no_result, which is the defect this entire marker
+    # channel is downstream of.
+    check_run 'a failure is a failure' 'fail 2' 2 "make: *** [lint-checks] Error 1"
+    check_run 'a failure outranks a genuine marker' 'fail 2' 2 \
+        "NO-RESULT-CASE: canonical adapter contract, accept arm: no parent adapter
+make: *** [lint-checks] Error 1"
+    check_run 'a failure outranks it whatever the code' 'fail 75' 75 \
+        "NO-RESULT-CASE: something unevaluable"
+    rm -f "$tmp"
+
     if [ "$failures" -ne 0 ]; then
         echo "lint-checks-node --self-test: ${failures} case(s) failed" >&2
         return 1
     fi
-    echo 'PASS: lint-checks-node classifies uninitialized as no_result, and drift/conflict as failure'
+    echo 'PASS: lint-checks-node classifies uninitialized as no_result, drift/conflict as failure,'
+    echo '      a quoted marker as pass, a column-0 marker as no_result, and never lets a marker'
+    echo '      outrank a real failure'
 }
 
 if [ "${1:-}" = '--self-test' ]; then
@@ -126,21 +220,24 @@ esac
 # about not collapsing two conditions into one code is stated in
 # ci-hub/bin/gh-merge-verified in the DEV-HERMIT PARENT repository; this repository
 # has no ci-hub/ directory, so that path does not resolve from here.)
-NO_RESULT_MARKER='NO-RESULT-CASE:'
+
 node_out=$(mktemp) || exit 1
 trap 'rm -f "$node_out"' EXIT
 set +e
 make lint-checks 2>&1 | tee "$node_out"
 make_rc=${PIPESTATUS[0]}
 set -e
-if [ "$make_rc" -ne 0 ]; then
-    exit "$make_rc"
-fi
-if grep -q "$NO_RESULT_MARKER" "$node_out"; then
-    echo "lint-checks: NO RESULT -- the target PASSED, and at least one case could not be" >&2
-    echo '  evaluated from this checkout. Every checker ran; the unevaluable cases are' >&2
-    echo '  listed above, each on a line beginning with the marker below.' >&2
-    grep "$NO_RESULT_MARKER" "$node_out" | sed 's/^/    /' >&2
-    exit 75
-fi
+verdict="$(classify_run "$make_rc" "$node_out")"
+case "$verdict" in
+    fail*)
+        exit "${verdict#fail }"
+        ;;
+    no_result)
+        echo "lint-checks: NO RESULT -- the target PASSED, and at least one case could not be" >&2
+        echo '  evaluated from this checkout. Every checker ran; the unevaluable cases are' >&2
+        echo '  listed above, each on a line beginning with the marker below.' >&2
+        grep "^${NO_RESULT_MARKER}" "$node_out" | sed 's/^/    /' >&2
+        exit 75
+        ;;
+esac
 exit 0
