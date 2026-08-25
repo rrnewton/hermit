@@ -223,7 +223,7 @@ presupposes the ones below it:
 | --- | --- | --- |
 | L0 | Builds and unit/integration tests pass | `cargo test` exits 0 |
 | L1 | Runs deterministically under strict mode | `hermit run --strict` |
-| L2 | Canonical full-observation repeat parity (non-KVM) | `hermit run --strict --verify --verify-strict --verify-json <path> -- ...` and require JSON `bitwise_parity: true` |
+| L2 | Canonical full-observation repeat parity | `hermit run --strict --verify --verify-strict --verify-json <path> -- ...` and require JSON `bitwise_parity: true` with nonzero compared INFO-message counts |
 | L3 | Memory determinism | Add `--detlog-heap --detlog-stack` to the L2 command |
 | L4 | Stress-hardened | L2/L3 repeated 20x with no divergence |
 
