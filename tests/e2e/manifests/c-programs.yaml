@@ -28,7 +28,7 @@ test:
           dbt: "Not yet qualified for this memfd-backed procfs identity check"
           liteinst: "Not yet qualified for this memfd-backed procfs identity check"
           kvm: "Initial C-corpus migration preserves the established ptrace and SaBRe baseline; qualify KVM separately"
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason: 'MAIN ADVANCED: its own input edit'
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (by design): this cell asserts the identity picture Detcore presents, and native presents none, so there is no naked oracle to run.'

@@ -38442,7 +38442,7 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "reason": "MAIN ADVANCED: its own input edit"
       },
       "observations": [],
       "measurement": "never-measured"
@@ -38456,7 +38456,7 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "reason": "MAIN ADVANCED: its own input edit"
       },
       "observations": [],
       "measurement": "never-measured"
