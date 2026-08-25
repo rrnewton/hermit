@@ -110,3 +110,34 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
     }
     Some(String::from_utf8(output.stdout).ok()?.trim().to_owned())
 }
+
+/// The Reverie revision this tree pins, read from the canonical manifest.
+///
+/// `detcore/Cargo.toml` is the source of truth the pin checker uses; every other
+/// site restates it. Returns `unknown` rather than failing the build, because a
+/// missing pin must not stop a developer compiling -- the loader treats
+/// `unknown` as "cannot verify" and says so instead of asserting a match.
+pub fn reverie_pin() -> String {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(|root| root.join("detcore/Cargo.toml"));
+    let Some(manifest) = manifest else {
+        return "unknown".into();
+    };
+    let Ok(text) = std::fs::read_to_string(&manifest) else {
+        return "unknown".into();
+    };
+    for line in text.lines() {
+        if !line.contains("rrnewton/reverie") {
+            continue;
+        }
+        if let Some(rest) = line.split("rev = \"").nth(1)
+            && let Some(rev) = rest.split('"').next()
+            && rev.len() == 40
+            && rev.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return rev.to_string();
+        }
+    }
+    "unknown".into()
+}

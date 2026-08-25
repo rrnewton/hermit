@@ -305,6 +305,19 @@ fn build_liteinst_runtime(
         runtime.display()
     );
     replace_copy(&runtime, &resources.join("libreverie_liteinst.so"));
+    // RECORD THE PIN THE ARTIFACT WAS BUILT FROM, AND MEAN IT.
+    //
+    // `sabre.revision` established this shape and is read by nothing, so it is
+    // provenance rather than authority. This one IS read: hermit compares it
+    // against the pin compiled into the binary when it resolves the staged
+    // runtime, and refuses a mismatch. That is what makes staleness loud instead
+    // of silent -- see the loader in hermit-cli/src/lib.rs.
+    let pin = reverie_pin(repository);
+    fs::write(
+        resources.join("libreverie_liteinst.so.revision"),
+        format!("{pin}\n"),
+    )
+    .unwrap_or_else(|error| panic!("failed to record the LiteInst runtime revision: {error}"));
 }
 
 fn main() {
@@ -314,6 +327,14 @@ fn main() {
     println!("cargo:rerun-if-changed=../scripts/stage-liteinst-runtime.sh");
     println!("cargo:rerun-if-changed=native-client/CMakeLists.txt");
     println!("cargo:rerun-if-changed=native-client/detcore_dbt_link_stub.c");
+    // ⚠️ THE PIN FILES. Without these the staged runtime NEVER REBUILDS WHEN THE
+    // REVERIE PIN MOVES: none of the triggers above changes when a pin bump
+    // lands, so Cargo considers this script fresh and the stale `.so` stays.
+    // A cell then measures the old binary and reports a verdict about the new
+    // pin.
+    println!("cargo:rerun-if-changed=../detcore/Cargo.toml");
+    println!("cargo:rerun-if-changed=../liteinst-runtime-build/Cargo.lock");
+    println!("cargo:rerun-if-changed=../liteinst-runtime-build/runtime/Cargo.toml");
 
     let profile = env::var("PROFILE");
     if profile.as_deref() != Ok("release")
@@ -380,4 +401,24 @@ fn main() {
         "Hermit release staging package. Copy with symlink dereferencing (for example, cp -aL) to create a standalone installation.\n",
     )
     .expect("failed to write install package README");
+}
+
+/// The Reverie revision this tree pins, read from the canonical manifest.
+fn reverie_pin(repository: &Path) -> String {
+    let Ok(text) = fs::read_to_string(repository.join("detcore/Cargo.toml")) else {
+        return "unknown".into();
+    };
+    for line in text.lines() {
+        if !line.contains("rrnewton/reverie") {
+            continue;
+        }
+        if let Some(rest) = line.split("rev = \"").nth(1)
+            && let Some(rev) = rest.split('"').next()
+            && rev.len() == 40
+            && rev.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return rev.to_string();
+        }
+    }
+    "unknown".into()
 }
