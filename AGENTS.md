@@ -337,6 +337,14 @@ correct home, then commit.
 
 ## Contributing And Pull Requests
 
+**Before sweeping the open-pull-request queue to decide what is already landed,
+read [docs/PR_SWEEP_VERDICTS.md](docs/PR_SWEEP_VERDICTS.md).** Merge commits are
+disabled here, so EVERY LANDING REWRITES THE SHA and a comparison by identity,
+ancestry or tree reports landed work as absent. Three sweeps reached a wrong
+verdict first. A wrong "already landed" closes work that is not on main and is
+the only outcome in that drain that loses something.
+
+
 Primary development happens in the `rrnewton/hermit` fork. Configure `origin`
 for that fork and `upstream` for `facebookexperimental/hermit`. Meta's internal
 source uses Buck and is exported upstream; this team develops and runs CI on
