@@ -756,6 +756,33 @@ fn run_dbt_legacy_verify(
     Ok(output_status(&first))
 }
 
+/// The DBT `--log-file` refusal message, named so a test can assert the exact text
+/// rather than a paraphrase of it.
+#[cfg(any(feature = "dbt", test))]
+pub(super) const DBT_LOG_FILE_REFUSAL: &str =
+    "DBT --log-file is unavailable on the ordinary single-run adapter";
+
+/// Is `--log-file` refused for this DBT invocation?
+///
+/// ⚠️ EXTRACTED SO THE POLICY IS DEFENDED. Before this, `git grep 'log-file is
+/// unavailable'` returned exactly ONE hit tree-wide -- the error string itself --
+/// with no test asserting when it fires. An undefended refusal can be reversed by
+/// accident, and there is a live proposal to reverse this one: hermit#1689's first
+/// claim implements DBT `--log-file`, and main adopted the opposite policy in
+/// `f0584c1aac` about four minutes after that branch forked, inside a commit about
+/// verification verdicts rather than as the subject of a decision.
+///
+/// This does NOT take a side on which policy is right -- that is an owner ruling.
+/// It pins what main does TODAY, so reversing it means deleting a test, which is
+/// visible in a diff, instead of editing one condition, which is not.
+///
+/// The rule: a requested log file is refused on the ordinary single-run adapter,
+/// and permitted under `--verify`, where the verification adapter owns the sink.
+#[cfg(any(feature = "dbt", test))]
+fn dbt_log_file_is_refused(log_file_requested: bool, verify: bool) -> bool {
+    log_file_requested && !verify
+}
+
 /// Runs `program` through DynamoRIO with the real Detcore Tool.
 ///
 /// When `--verify-json` requests a durable report, verification obtains
@@ -789,10 +816,8 @@ pub(super) fn run_dbt(
     if let Some(path) = verify_json.filter(|_| verify) {
         write_pending_verification_json(path)?;
     }
-    if log_file.is_some() && !verify {
-        return Err(Error::msg(
-            "DBT --log-file is unavailable on the ordinary single-run adapter",
-        ));
+    if dbt_log_file_is_refused(log_file.is_some(), verify) {
+        return Err(Error::msg(DBT_LOG_FILE_REFUSAL));
     }
     // The DBT backend drives a single Detcore external scheduler, so it cannot
     // honor a request to relax thread sequentialization. Fail loudly rather
@@ -2179,5 +2204,38 @@ mod tests {
                 "the core-dump flag for signal {signum} must survive the conversion"
             );
         }
+    }
+
+    /// Pins main's CURRENT DBT `--log-file` policy, which was undefended.
+    ///
+    /// hermit#1689 claim 1 would reverse this. That reversal may well be correct --
+    /// it is an owner ruling, and this test takes no side on it. What it removes is
+    /// the possibility of reversing it SILENTLY: before this, the refusal existed
+    /// only as an error string with no assertion, so flipping the condition changed
+    /// behaviour without changing any test.
+    #[test]
+    fn dbt_log_file_is_refused_on_the_single_run_adapter_and_permitted_under_verify() {
+        // the refusal: a log file was asked for, and this is not a verification run
+        assert!(
+            dbt_log_file_is_refused(true, false),
+            "a requested --log-file must be refused on the ordinary single-run adapter"
+        );
+        // --verify owns its own sink, so the request is honoured there
+        assert!(
+            !dbt_log_file_is_refused(true, true),
+            "--verify must keep accepting --log-file; the verification adapter owns the sink"
+        );
+        // no request, nothing to refuse, either way
+        assert!(!dbt_log_file_is_refused(false, false));
+        assert!(!dbt_log_file_is_refused(false, true));
+    }
+
+    /// The refusal text is what a caller greps for, so pin it exactly.
+    #[test]
+    fn dbt_log_file_refusal_names_the_adapter_it_is_about() {
+        assert_eq!(
+            DBT_LOG_FILE_REFUSAL,
+            "DBT --log-file is unavailable on the ordinary single-run adapter"
+        );
     }
 }
