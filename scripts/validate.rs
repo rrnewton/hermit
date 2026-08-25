@@ -1203,6 +1203,64 @@ fn self_test() -> Result<(), String> {
     if scope_grace_s(600) != 60 || 600 + scope_grace_s(600) >= 720 {
         return Err("run-timeout scope backstop no longer satisfies 600 < 660 < 720".into());
     }
+    // A node the scheduler NAMED in `not_launched` is accounted for; one it did not
+    // name is a mystery. Collapsing the two is what made a long history of deliberate
+    // fail-fast skips read as if work had silently vanished.
+    {
+        let unreported = vec![
+            "e2e.manifest_applications".to_string(),
+            "test.detcore_misc".to_string(),
+        ];
+        let named: BTreeSet<String> = ["e2e.manifest_applications".to_string()]
+            .into_iter()
+            .collect();
+        let (skipped, unaccounted) = partition_unreported(&unreported, &named);
+        if skipped != vec!["e2e.manifest_applications".to_string()] {
+            return Err(format!(
+                "a node named in not_launched must read as an accounted-for fail-fast skip, \
+                 got {skipped:?}"
+            ));
+        }
+        if unaccounted != vec!["test.detcore_misc".to_string()] {
+            return Err(format!(
+                "a node absent from not_launched must stay UNACCOUNTED FOR, got {unaccounted:?}"
+            ));
+        }
+        if skipped.len() + unaccounted.len() != unreported.len() {
+            return Err("partitioning unreported nodes must not drop any of them".into());
+        }
+        // The pre-fix behaviour: with nothing named, every node is still a mystery.
+        let (none_named, all_unaccounted) = partition_unreported(&unreported, &BTreeSet::new());
+        if !none_named.is_empty() || all_unaccounted.len() != 2 {
+            return Err(
+                "an empty not_launched must leave every unreported node unaccounted for".into(),
+            );
+        }
+        // ...UNLESS the lane was refused before launching. A refusal empties all
+        // three collections on purpose, so without this third state a refusal would
+        // report every planned node as unaccounted for directly below a refusal that
+        // states the reason -- the unaccounted signal failing exactly when loudest.
+        if !scheduler_refused_before_launching(193, 0, 0, 0) {
+            return Err("a lane that produced no outcome, skip or not-launched entry must be \
+                        recognised as refused before launching"
+                .into());
+        }
+        // A lane that ran and merely lost nodes is NOT a refusal, and must keep
+        // reporting them as unaccounted for.
+        if scheduler_refused_before_launching(54, 40, 0, 0)
+            || scheduler_refused_before_launching(54, 0, 7, 0)
+            || scheduler_refused_before_launching(54, 0, 0, 7)
+        {
+            return Err(
+                "a lane that produced outcomes, skips or not-launched entries is not a pre-flight \
+                 refusal and must not be excused as one"
+                    .into(),
+            );
+        }
+        if scheduler_refused_before_launching(0, 0, 0, 0) {
+            return Err("an empty plan is not a refusal".into());
+        }
+    }
     let cold_compat = build_release_hermit_node("gate.manifest", "/tmp/target/release/hermit");
     if cold_compat.hint.preferred_inner_jobs != Some(8)
         || cold_compat.hint.classification != dagrun::model::StepClass::CpuBound
@@ -5584,6 +5642,38 @@ fn remaining_budget_s(deadline_ns: Option<u64>) -> Option<i64> {
 }
 
 /// Planned runnable steps absent from both scheduler result collections.
+/// Whether the scheduler refused the whole lane before starting any node.
+///
+/// Every pre-flight refusal path returns empty outcomes, empty skips AND an empty
+/// `not_launched` -- deliberately, because nothing was left unlaunched *by a
+/// failure*. A planned lane that produced none of the three therefore never
+/// started, and its nodes are explained by the refusal, not unaccounted for.
+fn scheduler_refused_before_launching(
+    planned: usize,
+    outcomes: usize,
+    skipped: usize,
+    not_launched: usize,
+) -> bool {
+    planned > 0 && outcomes == 0 && skipped == 0 && not_launched == 0
+}
+
+/// Split nodes that produced no outcome into the two states they actually occupy:
+/// those the scheduler DECIDED not to launch after a failure cut their fail-fast
+/// scope short (accounted for, and it names why), and those nothing explains.
+///
+/// Both still block a green lane. The distinction is diagnostic, and it is the
+/// whole point: a deliberate skip that reads identically to a vanished node makes
+/// every deliberate skip look like a defect and hides the real ones among them.
+fn partition_unreported(
+    unreported: &[String],
+    not_launched: &BTreeSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    unreported
+        .iter()
+        .cloned()
+        .partition(|tag| not_launched.contains(tag))
+}
+
 fn unreported_non_intentional_steps(
     cfg: &DagConfig,
     by_tag: &BTreeMap<String, StepOutcome>,
@@ -7043,6 +7133,26 @@ fn run_lane_with_env_retries(
         forward_step_profiles(&first, jobs);
     }
     let mut run_timed_out = first.run_timed_out;
+    // The scheduler already NAMES the steps it deliberately never launched, in
+    // `RunResult::not_launched`. Carrying it here is what lets a deliberate
+    // fail-fast skip read differently from a node that vanished for a reason
+    // nothing can account for. Both still block a green lane; only the report
+    // distinguishes them.
+    let mut deliberately_not_launched: BTreeSet<String> =
+        first.not_launched.iter().cloned().collect();
+    // A PRE-FLIGHT REFUSAL is a third state and must not be mistaken for the
+    // mystery. Every refusal path in the scheduler returns empty outcomes, empty
+    // skips AND an empty `not_launched` -- deliberately, since nothing was left
+    // unlaunched *by a failure*. Without this, refusing a lane would report every
+    // planned node as unaccounted for on the line directly below a refusal that
+    // states the reason, which would make the unaccounted signal useless exactly
+    // when it is loudest.
+    let refused_before_launching = scheduler_refused_before_launching(
+        cfg.steps.len(),
+        first.outcomes.len(),
+        first.skipped.len(),
+        first.not_launched.len(),
+    );
     let mut order: Vec<String> = first.outcomes.iter().map(|o| o.tag.clone()).collect();
     let mut by_tag: BTreeMap<String, StepOutcome> =
         first.outcomes.iter().map(|o| (o.tag.clone(), o.clone())).collect();
@@ -7216,6 +7326,7 @@ fn run_lane_with_env_retries(
             forward_step_profiles(&again, jobs);
         }
         run_timed_out = run_timed_out || again.run_timed_out;
+        deliberately_not_launched.extend(again.not_launched.iter().cloned());
         // Compute absent work from THIS retry result before cumulative `by_tag`
         // can make an old outcome look current. `RunResult::not_launched` carries
         // the same fact, but recomputing from the two round-local collections
@@ -7290,13 +7401,40 @@ fn run_lane_with_env_retries(
         unreported_non_intentional_steps(cfg, &by_tag, &skipped).into_iter().collect();
     unreported.extend(latest_unreported);
     let unreported: Vec<String> = unreported.into_iter().collect();
-    if !unreported.is_empty() {
+    // Two states, not one. A node the scheduler DECIDED not to launch after a
+    // failure is accounted for -- it names why it did not run. A node absent from
+    // that list is unaccounted for, and that is the only part that is a mystery.
+    // Collapsing them is what made an eleven-day history of deliberate fail-fast
+    // skips read as if work had silently vanished.
+    let (skipped_by_fail_fast, unaccounted) =
+        partition_unreported(&unreported, &deliberately_not_launched);
+    if !skipped_by_fail_fast.is_empty() {
         eprintln!(
-            "validate: ERROR: scheduler returned without an outcome or dependency-skip for {} \
-             non-intentional planned node(s): {}. The lane is incomplete and cannot be green.",
-            unreported.len(),
-            unreported.join(", ")
+            "validate: {} planned node(s) DID NOT RUN because an earlier failure cut their \
+             fail-fast scope short; the scheduler named them and they are accounted for: {}. \
+             The lane is still incomplete and cannot be green.",
+            skipped_by_fail_fast.len(),
+            skipped_by_fail_fast.join(", ")
         );
+    }
+    if !unaccounted.is_empty() {
+        if refused_before_launching {
+            eprintln!(
+                "validate: {} planned node(s) DID NOT RUN because the scheduler REFUSED the lane \
+                 before launching anything; the refusal above states the reason. The lane is \
+                 incomplete and cannot be green.",
+                unaccounted.len()
+            );
+        } else {
+            eprintln!(
+                "validate: ERROR: scheduler returned without an outcome, a dependency-skip, or a \
+                 fail-fast skip for {} non-intentional planned node(s): {}. These are UNACCOUNTED \
+                 FOR -- unlike a fail-fast skip or a pre-flight refusal, nothing explains why \
+                 they did not run. The lane is incomplete and cannot be green.",
+                unaccounted.len(),
+                unaccounted.join(", ")
+            );
+        }
     }
     // Raw failure policy may still treat an aborted peer as neutral, but execution
     // completeness may not: dependency-skipped, aborted, timed-out, or unreported
