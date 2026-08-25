@@ -1418,6 +1418,53 @@ fn successful_process_clone_result(sysnum: i64, result: i64) -> bool {
         )
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ProcessCloneProperties {
+    blocks_parent: bool,
+    shares_files_without_thread: bool,
+}
+
+/// Decode process-lifecycle properties that must be decided before a copy.
+///
+/// clone3 stores its flags in guest memory, so the caller supplies a
+/// fault-safe reader instead of dereferencing the guest pointer.
+fn process_clone_properties(
+    sysnum: i64,
+    args: &[u64],
+    mut read: impl FnMut(usize, &mut [u8]) -> bool,
+) -> ProcessCloneProperties {
+    const CLONE_ARGS_SIZE_VER0: u64 = 64;
+
+    let flags = match sysnum {
+        libc::SYS_fork => Some(0),
+        libc::SYS_vfork => Some(libc::CLONE_VFORK as u64),
+        libc::SYS_clone => args.first().copied(),
+        libc::SYS_clone3 => {
+            let Some((&address, &size)) = args.first().zip(args.get(1)) else {
+                return ProcessCloneProperties::default();
+            };
+            if address == 0 || size < CLONE_ARGS_SIZE_VER0 {
+                return ProcessCloneProperties::default();
+            }
+            let mut bytes = [0_u8; std::mem::size_of::<u64>()];
+            if !read(address as usize, &mut bytes) {
+                return ProcessCloneProperties::default();
+            }
+            Some(u64::from_ne_bytes(bytes))
+        }
+        _ => None,
+    };
+
+    let Some(flags) = flags else {
+        return ProcessCloneProperties::default();
+    };
+    ProcessCloneProperties {
+        blocks_parent: flags & libc::CLONE_VFORK as u64 != 0,
+        shares_files_without_thread: flags & libc::CLONE_FILES as u64 != 0
+            && flags & libc::CLONE_THREAD as u64 == 0,
+    }
+}
+
 /// Applies the result of a native process-clone syscall after the kernel returns.
 ///
 /// Successful process clones share inherited open file descriptions, while the
@@ -1768,7 +1815,17 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
         return 1;
     }
-    if sysnum == libc::SYS_vfork
+    let clone_properties = process_clone_properties(sysnum, raw_args, |address, bytes| unsafe {
+        read_memory(address, bytes.as_mut_ptr(), bytes.len()) != 0
+    });
+    if clone_properties.shares_files_without_thread {
+        emit_lifecycle_marker(
+            emit,
+            b"detcore-dbt: refusing process clone with CLONE_FILES without CLONE_THREAD; copied child cannot share descriptor-table provenance\n",
+        );
+        return -1;
+    }
+    if clone_properties.blocks_parent
         && !scratch.runtime_state.is_null()
         && unsafe { &*scratch.runtime_state }
             .state
@@ -1776,7 +1833,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
     {
         emit_lifecycle_marker(
             emit,
-            b"detcore-dbt: refusing vfork while an open file description may hold a flock\n",
+            b"detcore-dbt: refusing vfork/CLONE_VFORK while an open file description may hold a flock\n",
         );
         return -1;
     }
@@ -2365,6 +2422,72 @@ mod tests {
                 -libc::EINVAL as i64
             ));
         }
+    }
+
+    #[test]
+    fn process_clone_properties_cover_vfork_and_shared_files_forms() {
+        let empty = [0; 6];
+        assert_eq!(
+            process_clone_properties(libc::SYS_fork, &empty, |_, _| {
+                panic!("fork has no clone flags in guest memory")
+            }),
+            ProcessCloneProperties::default()
+        );
+        assert_eq!(
+            process_clone_properties(libc::SYS_vfork, &empty, |_, _| {
+                panic!("vfork has no clone flags in guest memory")
+            }),
+            ProcessCloneProperties {
+                blocks_parent: true,
+                shares_files_without_thread: false,
+            }
+        );
+
+        let mut clone = [0; 6];
+        clone[0] = libc::CLONE_FILES as u64;
+        assert!(
+            process_clone_properties(libc::SYS_clone, &clone, |_, _| false)
+                .shares_files_without_thread
+        );
+        clone[0] = (libc::CLONE_FILES | libc::CLONE_THREAD) as u64;
+        assert!(
+            !process_clone_properties(libc::SYS_clone, &clone, |_, _| false)
+                .shares_files_without_thread
+        );
+        clone[0] = libc::CLONE_VFORK as u64;
+        assert!(process_clone_properties(libc::SYS_clone, &clone, |_, _| false).blocks_parent);
+
+        let address = 0x2345;
+        let mut clone3 = [0; 6];
+        clone3[0] = address;
+        clone3[1] = 64;
+        assert!(
+            process_clone_properties(libc::SYS_clone3, &clone3, |observed, bytes| {
+                assert_eq!(observed, address as usize);
+                bytes.copy_from_slice(&(libc::CLONE_FILES as u64).to_ne_bytes());
+                true
+            })
+            .shares_files_without_thread
+        );
+        assert!(
+            process_clone_properties(libc::SYS_clone3, &clone3, |_, bytes| {
+                bytes.copy_from_slice(&(libc::CLONE_VFORK as u64).to_ne_bytes());
+                true
+            })
+            .blocks_parent
+        );
+        clone3[1] = 63;
+        assert_eq!(
+            process_clone_properties(libc::SYS_clone3, &clone3, |_, _| {
+                panic!("short clone3 input must not be read")
+            }),
+            ProcessCloneProperties::default()
+        );
+        clone3[1] = 64;
+        assert_eq!(
+            process_clone_properties(libc::SYS_clone3, &clone3, |_, _| false),
+            ProcessCloneProperties::default()
+        );
     }
 
     #[test]

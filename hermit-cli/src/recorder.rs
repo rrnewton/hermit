@@ -413,6 +413,7 @@ impl Tool for Recorder {
             Sysno::dup3,
             Sysno::ioctl,
             Sysno::socket,
+            Sysno::pidfd_getfd,
             Sysno::clock_gettime,
             Sysno::gettimeofday,
             Sysno::settimeofday,
@@ -574,6 +575,12 @@ impl Tool for Recorder {
             Syscall::Unlinkat(_) => self.handle_simple(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             Syscall::Other(Sysno::close_range, _) => self.handle_close_range(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#2407): Preserve pidfd_getfd's returned
+            // descriptor and errno in the record stream.
+            Syscall::Other(Sysno::pidfd_getfd, _) => {
+                self.handle_fd_table_mutation(guest, syscall).await
+            }
             unsupported => return Ok(guest.inject(unsupported).await?),
         }?)
     }

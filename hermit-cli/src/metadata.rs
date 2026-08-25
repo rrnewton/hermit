@@ -84,7 +84,16 @@ impl RecordVersion {
 // recording made here would claim 0x10c while containing a `Ppoll` event the
 // 0x10c reader does not know -- exactly the desynchronization the paragraph
 // above exists to prevent. The version must go FORWARD once more.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x10e);
+//
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#2407)
+// 0x10e -> 0x10f: pidfd_getfd(2) is now explicitly subscribed and recorded.
+// Earlier builds let the syscall bypass the recorder, so a successful call
+// changed the guest descriptor table without a corresponding stream event.
+// The replayer now consumes one exact pidfd_getfd event and reissues the
+// syscall to reproduce the kernel side effect; accepting a 0x10e stream would
+// therefore consume the next event at every pidfd_getfd call.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x10f);
 
 /// Metadata associated with the recording. This is serialized as a JSON file.
 #[derive(Debug, Serialize, Deserialize)]

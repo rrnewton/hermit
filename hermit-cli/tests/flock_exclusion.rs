@@ -26,8 +26,12 @@
 //! | [`pidfd_getfd_alias_mutation_invalidates_source_flock_authority`] | a pidfd_getfd duplicate unlocked its source OFD while the source cache stayed stale and restored the released lock |
 //! | [`transferred_lock_state_is_unknown_to_the_sender`] | the sender restored stale state after the receiver unlocked the OFD |
 //! | [`dbt_vfork_child_flock_fails_closed_without_deadlock`] | a copied vfork child blocked in the kernel while its parent was suspended |
+//! | [`dbt_clone_vfork_forms_fail_closed_before_copy`] | clone and clone3 with `CLONE_VFORK` bypassed the vfork pre-copy guard |
+//! | [`dbt_process_clone_files_is_refused_before_copied_child_mutation`] | a copied process shared the kernel fd table while Detcore copied its metadata |
 //! | [`replay_reissues_every_flock_for_a_materialized_file`] | replay consumed the recorded return and took no lock |
 //! | [`replay_refuses_flock_for_a_non_materialized_file`] | replay reported success while locking only a placeholder |
+//! | [`replay_reissues_pidfd_getfd_success_and_failure`] | replay consumed pidfd_getfd results without reproducing descriptor side effects |
+//! | [`recording_refuses_a_contended_blocking_flock`] | record mode silently accepted the ordinary-run compatibility fallback |
 //! | [`pre_flock_recordings_are_refused_by_the_version_gate`] | a 0x10b recording has no flock event and desynchronized |
 
 use std::fs;
@@ -42,6 +46,12 @@ use std::sync::OnceLock;
 /// `hermit record` writes to shared per-run state; serialize the record/replay
 /// cases the same way `record_replay.rs` does.
 static RECORD_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(feature = "dbt")]
+const DBT_VFORK_FLOCK_REFUSAL: &str =
+    "detcore-dbt: refusing vfork/CLONE_VFORK while an open file description may hold a flock";
+#[cfg(feature = "dbt")]
+const DBT_PROCESS_CLONE_FILES_REFUSAL: &str =
+    "detcore-dbt: refusing process clone with CLONE_FILES without CLONE_THREAD";
 
 fn record_lock() -> MutexGuard<'static, ()> {
     RECORD_LOCK
@@ -196,7 +206,7 @@ fn flock_excludes_a_second_open_and_a_second_process() {
 /// `FAIL: the refused upgrade destroyed this process's shared lock`.
 #[test]
 fn contended_blocking_upgrade_is_refused_without_losing_the_shared_lock() {
-    let run = hermit_run("off", &[], "upgrade");
+    let run = hermit_run("off", &["--allow-unsupported-syscalls"], "upgrade");
     assert!(
         run.status.success(),
         "non-strict upgrade run failed\n{}",
@@ -263,7 +273,7 @@ fn contended_blocking_upgrade_is_fail_closed_under_strict() {
 /// a fresh open file description after the refusal.
 #[test]
 fn blocking_upgrade_on_received_fd_preserves_unknown_lock_state() {
-    let run = hermit_run("error", &[], "received");
+    let run = hermit_run("error", &["--allow-unsupported-syscalls"], "received");
     assert!(
         run.status.success(),
         "received-fd upgrade run failed\n{}",
@@ -459,7 +469,12 @@ fn dbt_failed_process_clone_preserves_known_flock_state() {
 }
 
 fn assert_pidfd_getfd_alias_mutation_invalidates_source_flock_authority(backend: &str) {
-    let run = hermit_run_backend(backend, "error", &[], "pidfd-getfd");
+    let run = hermit_run_backend(
+        backend,
+        "error",
+        &["--allow-unsupported-syscalls"],
+        "pidfd-getfd",
+    );
     assert!(
         run.status.success(),
         "{backend} pidfd_getfd flock-alias run failed\n{}",
@@ -470,6 +485,11 @@ fn assert_pidfd_getfd_alias_mutation_invalidates_source_flock_authority(backend:
         "flock-pidfd-source-upgrade-refused errno=37",
         "flock-pidfd-stale-restore-absent",
         "flock-pidfd-failed-getfd-preserved errno=9",
+        "flock-pidfd-valid-pidfd-valid-targetfd-flags-precedence errno=22",
+        "flock-pidfd-valid-pidfd-invalid-targetfd-flags-precedence errno=22",
+        "flock-pidfd-invalid-pidfd-valid-targetfd-flags-precedence errno=22",
+        "flock-pidfd-invalid-pidfd-invalid-targetfd-flags-precedence errno=22",
+        "flock-pidfd-recorded-failure-preserved errno=22",
         "flock-pidfd-unrelated-authority-preserved",
         "flock-pidfd-foreign-source-refused errno=95",
         "flock-pidfd-getfd-ok",
@@ -492,9 +512,34 @@ fn pidfd_getfd_alias_mutation_invalidates_source_flock_authority() {
     assert_pidfd_getfd_alias_mutation_invalidates_source_flock_authority("ptrace");
 }
 
+#[test]
+fn pidfd_getfd_relaxed_mode_refuses_before_kernel_injection() {
+    let run = hermit_run(
+        "debug",
+        &["--no-sequentialize-threads", "--allow-unsupported-syscalls"],
+        "pidfd-getfd-relaxed-refusal",
+    );
+    assert!(
+        run.status.success() && run.stdout.contains("flock-pidfd-relaxed-refused errno=95"),
+        "relaxed-mode pidfd_getfd did not return EOPNOTSUPP and continue\n{}",
+        run.combined()
+    );
+    assert!(
+        !run.stderr
+            .contains("beginning inject of syscall: pidfd_getfd"),
+        "relaxed-mode pidfd_getfd reached the kernel\n{}",
+        run.combined()
+    );
+}
+
 fn assert_transferred_lock_state_is_unknown_to_the_sender(backend: &str) {
     for scenario in ["sent-after-fork", "sent-after-fork-mmsg"] {
-        let run = hermit_run_backend(backend, "error", &[], scenario);
+        let run = hermit_run_backend(
+            backend,
+            "error",
+            &["--allow-unsupported-syscalls"],
+            scenario,
+        );
         assert!(
             run.status.success(),
             "{backend} transferred-lock run failed\n{}",
@@ -551,7 +596,11 @@ fn failed_send_preserves_known_flock_state() {
 /// deschedule. The conservative rule makes all cached flock modes unknown.
 #[test]
 fn partial_sendmmsg_invalidates_all_flock_state() {
-    let run = hermit_run("error", &[], "partial-sendmmsg");
+    let run = hermit_run(
+        "error",
+        &["--allow-unsupported-syscalls"],
+        "partial-sendmmsg",
+    );
     assert!(
         run.status.success(),
         "partial-sendmmsg run failed\n{}",
@@ -586,9 +635,7 @@ fn dbt_vfork_child_flock_fails_closed_without_deadlock() {
         run.combined()
     );
     assert!(
-        run.stderr.contains(
-            "detcore-dbt: refusing vfork while an open file description may hold a flock"
-        ),
+        run.stderr.contains(DBT_VFORK_FLOCK_REFUSAL),
         "copied DBT vfork did not report the flock refusal\n{}",
         run.combined()
     );
@@ -608,9 +655,7 @@ fn dbt_vfork_with_unknown_flock_state_fails_closed_without_deadlock() {
         run.combined()
     );
     assert!(
-        run.stderr.contains(
-            "detcore-dbt: refusing vfork while an open file description may hold a flock"
-        ),
+        run.stderr.contains(DBT_VFORK_FLOCK_REFUSAL),
         "DBT vfork with unknown flock state missed its refusal diagnostic\n{}",
         run.combined()
     );
@@ -628,6 +673,65 @@ fn dbt_vfork_without_flock_state_still_runs() {
         "DBT vfork without possible flock state must remain available\n{}",
         run.combined()
     );
+}
+
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_clone_vfork_forms_fail_closed_before_copy() {
+    for scenario in ["clone-vfork-upgrade", "clone3-vfork-upgrade"] {
+        let run = hermit_run_backend_timeout("dbt", "info", &[], scenario, "5s");
+        assert_eq!(
+            run.status.code(),
+            Some(101),
+            "DBT {scenario} must fail closed before copying, not time out or return\n{}",
+            run.combined()
+        );
+        assert!(
+            run.stderr.contains(DBT_VFORK_FLOCK_REFUSAL),
+            "DBT {scenario} missed the vfork-family refusal diagnostic\n{}",
+            run.combined()
+        );
+    }
+}
+
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_process_clone_files_is_refused_before_copied_child_mutation() {
+    for scenario in ["clone-files-process", "clone3-files-process"] {
+        let native = finish(
+            Command::new(guest())
+                .arg(scenario)
+                .output()
+                .unwrap_or_else(|error| panic!("failed to start native {scenario}: {error}")),
+        );
+        assert!(
+            native.status.success()
+                && native
+                    .stdout
+                    .contains(&format!("flock-{scenario}-shared-mutation-observed")),
+            "native {scenario} did not prove CLONE_FILES table sharing\n{}",
+            native.combined()
+        );
+
+        let run = hermit_run_backend_timeout("dbt", "info", &[], scenario, "5s");
+        assert_eq!(
+            run.status.code(),
+            Some(101),
+            "DBT {scenario} must fail closed before copying\n{}",
+            run.combined()
+        );
+        assert!(
+            run.stderr.contains(DBT_PROCESS_CLONE_FILES_REFUSAL),
+            "DBT {scenario} missed the shared-files pre-copy diagnostic\n{}",
+            run.combined()
+        );
+        assert!(
+            !run.stdout
+                .contains(&format!("flock-{scenario}-shared-mutation-observed")),
+            "DBT {scenario} executed the copied child's descriptor mutation\n{}",
+            run.combined()
+        );
+    }
 }
 
 /// Replay must take the kernel lock again for a materialized file, not merely
@@ -718,6 +822,72 @@ fn replay_reissues_every_flock_for_a_materialized_file() {
     }
 }
 
+/// pidfd_getfd creates a real descriptor alias, so replay must both consume an
+/// exact recorded result and execute the syscall again. The guest proves that
+/// the successful duplicate shares one file offset with its source, then
+/// brackets four nonzero-flags failures and one pre-injection validation error.
+#[test]
+fn replay_reissues_pidfd_getfd_success_and_failure() {
+    let _guard = record_lock();
+    let data_dir =
+        tempfile::tempdir().expect("failed to create the pidfd_getfd recording directory");
+
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after", "10s", "180s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "record", "start", "--record-timeout=120"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .args(["--"])
+        .arg(guest())
+        .arg("pidfd-getfd-record");
+    let recorded = finish(
+        record
+            .output()
+            .expect("failed to start pidfd_getfd recording"),
+    );
+    assert!(
+        recorded.status.success(),
+        "recording pidfd_getfd failed\n{}",
+        recorded.combined()
+    );
+    assert!(recorded.stdout.contains("flock-pidfd-record-ok"));
+
+    let mut replay = Command::new("timeout");
+    replay
+        .args(["--kill-after", "10s", "180s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=debug", "replay", "--autopilot"])
+        .arg(format!("--data-dir={}", data_dir.path().display()));
+    let replayed = finish(replay.output().expect("failed to start pidfd_getfd replay"));
+    assert!(
+        replayed.status.success(),
+        "replaying pidfd_getfd failed\n{}",
+        replayed.combined()
+    );
+    for marker in [
+        "flock-pidfd-record-success-shared-ofd",
+        "flock-pidfd-record-validation-failure errno=9",
+        "flock-pidfd-record-flags-failures errno=22 count=4",
+        "flock-pidfd-record-ok",
+    ] {
+        assert!(
+            replayed.stdout.contains(marker),
+            "replayed pidfd_getfd scenario missed {marker}\n{}",
+            replayed.combined()
+        );
+    }
+    assert_eq!(
+        replayed
+            .stderr
+            .matches("beginning inject of syscall: pidfd_getfd")
+            .count(),
+        5,
+        "replay must re-execute the successful pidfd_getfd call and all four flags-first EINVAL calls\n{}",
+        replayed.combined()
+    );
+}
+
 /// Replay cannot reproduce the lock side effect for an external file that was
 /// not materialized in the replay root. It must fail closed rather than replay
 /// the recorded success while holding no lock.
@@ -769,21 +939,12 @@ fn replay_refuses_flock_for_a_non_materialized_file() {
     );
 }
 
-/// A contended blocking conversion is two physical nonblocking operations:
-/// the substituted `LOCK_EX|LOCK_NB` probe and, after `EWOULDBLOCK`, one
-/// `LOCK_SH|LOCK_NB` restore. Record and replay must agree on both operations
-/// while exposing only the deterministic `ENOLCK` refusal to the guest.
-///
-/// This is deliberately separate from the ordinary-run upgrade test above.
-/// A record/replay implementation can pass that test yet consume only the
-/// probe's event, inject the guest's original blocking request, omit or double
-/// consume the restore event, or return the recorded probe errno. Any of those
-/// mistakes either wedges replay, desynchronizes its event stream, or changes
-/// the guest-visible errno. The debug-log count binds the internal restore:
-/// this scenario has one more kernel `flock` injection than guest `flock`
-/// requests, on both record and replay.
+/// Record/replay is fail-closed and has no compatibility opt-out. A contended
+/// blocking flock therefore invalidates the recording after Detcore restores
+/// the shared lock that its nonblocking probe temporarily displaced. It must
+/// not silently record the compatibility-mode `ENOLCK` fallback.
 #[test]
-fn replay_preserves_contended_blocking_upgrade_event_shape_and_errno() {
+fn recording_refuses_a_contended_blocking_flock() {
     let _guard = record_lock();
     let data_dir = tempfile::tempdir().expect("failed to create the flock recording directory");
 
@@ -791,64 +952,39 @@ fn replay_preserves_contended_blocking_upgrade_event_shape_and_errno() {
     record
         .args(["--kill-after", "10s", "180s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=debug", "record", "start", "--record-timeout=120"])
+        .args(["--log=error", "record", "start", "--record-timeout=120"])
         .arg(format!("--data-dir={}", data_dir.path().display()))
         .args(["--"])
         .arg(guest())
         .arg("upgrade");
     let recorded = finish(record.output().expect("failed to start hermit record"));
-    assert!(
-        recorded.status.success(),
-        "recording the contended flock upgrade failed or wedged\n{}",
+    assert_ne!(
+        recorded.status.code(),
+        Some(124),
+        "recording the contended flock upgrade wedged\n{}",
         recorded.combined()
     );
-
-    let mut replay = Command::new("timeout");
-    replay
-        .args(["--kill-after", "10s", "180s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=debug", "replay", "--autopilot"])
-        .arg(format!("--data-dir={}", data_dir.path().display()));
-    let replayed = finish(replay.output().expect("failed to start hermit replay"));
     assert!(
-        replayed.status.success(),
-        "replaying the contended flock upgrade failed, wedged, or desynchronized\n{}",
-        replayed.combined()
+        !recorded.status.success(),
+        "recording accepted a deterministic fallback that record/replay's fail-closed policy forbids\n{}",
+        recorded.combined()
     );
-
-    for (phase, run) in [("record", &recorded), ("replay", &replayed)] {
-        for marker in [
-            "flock-upgrade-parent-holds-shared",
-            "flock-upgrade-contender-holds-shared",
-            "flock-upgrade-refused errno=37",
-            "flock-upgrade-preserved-shared-lock",
-            "flock-upgrade-ok",
-        ] {
-            assert!(
-                run.stdout.contains(marker),
-                "{phase} missed {marker}; the guest-visible refusal or restored lock changed\n{}",
-                run.combined()
-            );
-        }
-
-        let requested = run.stderr.matches("inbound syscall: flock").count();
-        let injected = run
-            .stderr
-            .matches("beginning inject of syscall: flock")
-            .count();
+    for marker in [
+        "flock-upgrade-parent-holds-shared",
+        "flock-upgrade-contender-holds-shared",
+    ] {
         assert!(
-            requested > 0,
-            "{phase} observed no guest flock requests; the event-shape bracket is inert\n{}",
-            run.combined()
-        );
-        assert_eq!(
-            injected,
-            requested + 1,
-            "{phase} must inject every guest flock request plus exactly one internal restore; \
-             requested={requested}, injected={injected}\n{}",
-            run.combined()
+            recorded.stdout.contains(marker),
+            "recording never reached the contended conversion; refusal would prove nothing\n{}",
+            recorded.combined()
         );
     }
+    assert!(
+        !recorded.stdout.contains("flock-upgrade-refused errno=37")
+            && recorded.stderr.contains("unsupported syscall: flock"),
+        "recording did not fail closed at the unsupported blocking flock\n{}",
+        recorded.combined()
+    );
 }
 
 /// A recording made before flock forwarding must be refused, not replayed.
@@ -912,8 +1048,8 @@ fn pre_flock_recordings_are_refused_by_the_version_gate() {
         .as_u64()
         .expect("recording metadata has no numeric version");
     assert_eq!(
-        current, 0x10c,
-        "RECORD_VERSION moved; point this test at the new pre-flock predecessor"
+        current, 0x10f,
+        "RECORD_VERSION moved; point this test at the current and pre-flock epochs"
     );
     metadata["version"] = serde_json::json!(0x10b);
     fs::write(
