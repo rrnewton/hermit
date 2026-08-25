@@ -39,3 +39,22 @@ else
 fi
 
 "$checker" "$@"
+
+# The Reverie checker above enforces uniformity for REVERIE ONLY. Hermit pins
+# three git dependencies, and until this ran, two of them -- liteinst2 and
+# rust-shed -- could have been split at two revisions with nothing detecting it.
+# A split pin lets a mechanism be half present: the build succeeds, the tests
+# pass, and the half that actually runs is the wrong one.
+#
+# Run in the SAME preflight node rather than as a new one, because
+# scripts/validate.rs asserts the preflight node set by exact tag and a new node
+# would change that contract for a check that shares this one's subject.
+#
+# Compiled the same dependency-free way, for the same reason: CI images provide
+# rustc but not rust-script.
+if [[ $mode == run ]]; then
+    uniformity="$compile_dir/uniformity"
+    RUSTUP_TOOLCHAIN=stable rustc --edition=2021 \
+        scripts/check-git-pin-uniformity.rs -o "$uniformity"
+    "$uniformity"
+fi
