@@ -234,7 +234,8 @@ mod tests {
             "comparison":{"strictness":"canonical","compare_logs":true,"record_envelope":"all_records_v1"},"compared_log_messages":{"left":180,"right":180},
             "first_divergent_scheduler_turn":4,
             "first_divergent_virtual_nanoseconds":1767225600002825515,
-            "first_divergent_record":108}"#;
+            "first_divergent_record":108,
+            "first_divergent_syscall":37}"#;
         let report = VerificationReport::from_json_slice(json).expect("diverged report parses");
         assert_eq!(report.first_divergent_scheduler_turn, Some(4));
         assert_eq!(
@@ -242,6 +243,12 @@ mod tests {
             Some(1_767_225_600_002_825_515)
         );
         assert_eq!(report.first_divergent_record, Some(108));
+        // THE FOURTH COORDINATE, asserted because it was the one that could
+        // stop arriving unnoticed. Demonstrated 2026-08-25: with this line
+        // absent, renaming the field so no real report could populate it left
+        // all 11 tests in this module GREEN. A struct field nothing asserts is
+        // indistinguishable from one nothing populates.
+        assert_eq!(report.first_divergent_syscall, Some(37));
     }
 
     /// The record index is the only coordinate that LOCATES the divergence;
@@ -258,6 +265,7 @@ mod tests {
         assert_eq!(report.first_divergent_record, Some(3));
         assert_eq!(report.first_divergent_scheduler_turn, None);
         assert_eq!(report.first_divergent_virtual_nanoseconds, None);
+        assert_eq!(report.first_divergent_syscall, None);
     }
 
     /// An EARLIER divergence must report a SMALLER value in both units. This is
@@ -366,7 +374,8 @@ mod tests {
         r#"{"verified":false,"bitwise_parity":false,"verdict":"no_result","#,
         r#""comparison":null,"compared_log_messages":null,"guest_exit_code":null,"#,
         r#""guest_signal":null,"first_divergent_scheduler_turn":null,"#,
-        r#""first_divergent_virtual_nanoseconds":null,"first_divergent_record":null}"#,
+        r#""first_divergent_virtual_nanoseconds":null,"first_divergent_record":null,"#,
+        r#""first_divergent_syscall":null}"#,
     );
 
     #[test]
