@@ -3253,13 +3253,20 @@ fn classify_result(
         } else {
             "infrastructure-error"
         }
-    } else if runner.timed_out || !verification_evidence_valid {
-        "infrastructure-error"
     } else if reason_reports_timeout(reason) {
+        // The harness reached its own inner deadline and published a terminal
+        // row. The missing verify/replay report is caused by that measured
+        // timeout; it is not evidence that the attempt failed to launch.
         "timeout"
-    } else if mode == "verify"
-        && matches!(verification_verdict, Some("matched" | "diverged"))
-        && !verification_logs_retained
+    } else if runner.timed_out
+        || !verification_evidence_valid
+        // Merged with the arm above rather than left adjacent to it: both yield
+        // the same bucket, so ordering between them is unobservable, and once
+        // the timeout arm moved ahead of them they became neighbours with
+        // identical blocks.
+        || (mode == "verify"
+            && matches!(verification_verdict, Some("matched" | "diverged"))
+            && !verification_logs_retained)
     {
         "infrastructure-error"
     } else if row_valid && mode == "verify" && verification_verdict == Some("diverged") {
@@ -5859,9 +5866,13 @@ fn self_test(root: &Path) -> Result<(), String> {
                 "test fixture/verify/ptrace exceeded 1 s in attempt 1 (innermost E2E timeout: deadline reached (exit 124))",
             ),
             "verify",
-            Some("no_result"),
-            true,
-            true,
+            // A run killed at its inner deadline never reached comparison, so
+            // it has no verdict, retained no verification logs, and carries no
+            // valid verification evidence. Asserting otherwise made this case
+            // agree under either branch order and so tested nothing.
+            None,
+            false,
+            false,
         ),
         classify_result(
             runner_failed,
