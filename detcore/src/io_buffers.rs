@@ -46,13 +46,14 @@
 use reverie::Error;
 use reverie::Guest;
 use reverie::Tool;
+use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 
-use crate::procmaps::compute_hash_range;
+use crate::digest::Digest;
 use crate::types::DetTid;
 
 /// One contiguous run of guest bytes a completed syscall moved.
@@ -372,6 +373,79 @@ fn direction(call: &Syscall) -> Direction {
 
 /// Emit one deterministic record per buffer a completed syscall moved.
 ///
+/// Digests that LOCATE a divergence instead of only detecting one.
+///
+/// The whole-extent digest says two buffers differ and nothing else -- not
+/// which bytes, not which field. Comparing two logs of per-chunk digests names
+/// the FIRST DIFFERING CHUNK, which is the offset and a bounded window around
+/// it. That is what a content divergence needs to be classifiable, and it costs
+/// no retained bytes: the guest's data never leaves the guest.
+///
+/// ⚠️ ONE GUEST READ, NOT ONE PER CHUNK. Reading guest memory is the expensive
+/// half of this check -- `compute_hash_range` does a `read_values` per call --
+/// so the extent is read ONCE and every digest is taken from that local copy.
+/// The guest-memory cost is therefore identical to the single-digest version
+/// this replaces; only local hashing and log width grow.
+///
+/// The chunk count is CAPPED so a large buffer cannot produce an unbounded log
+/// line: at most [`CHUNK_CAP`] digests always span the whole extent, so the
+/// window is `max(CHUNK_MIN, ceil(len / CHUNK_CAP))`. A buffer that fits in one
+/// chunk emits no chunk list, because a single chunk repeats what the
+/// whole-extent digest already said.
+const CHUNK_CAP: usize = 8;
+const CHUNK_MIN: usize = 256;
+
+fn extent_digests<G, T>(
+    guest: &mut G,
+    addr: u64,
+    len: u64,
+) -> Result<(Digest, usize, Vec<String>), Error>
+where
+    G: Guest<T>,
+    T: Tool,
+{
+    let size = len as usize;
+    let mut buf = vec![0u8; size];
+    if size > 0 {
+        let start = Addr::<u8>::from_raw(addr as usize).ok_or(Errno::EFAULT)?;
+        guest.memory().read_values(start, buf.as_mut_slice())?;
+    }
+    let whole = Digest::new(buf.as_slice());
+    let (chunk, chunks) = chunk_digests(buf.as_slice());
+    Ok((whole, chunk, chunks))
+}
+
+/// The locating half, split out from the guest read so it can be bracketed.
+///
+/// Returns the chunk width and one short digest per chunk, or an empty vector
+/// when the extent fits in a single chunk and the list would only repeat the
+/// whole-extent digest.
+fn chunk_digests(buf: &[u8]) -> (usize, Vec<String>) {
+    let size = buf.len();
+    let chunk = std::cmp::max(CHUNK_MIN, size.div_ceil(CHUNK_CAP));
+    if size <= chunk {
+        return (chunk, Vec::new());
+    }
+    let chunks = buf
+        .chunks(chunk)
+        // Short prefix per chunk: this locates a window, it does not
+        // authenticate one, and eight full SHA-256 digests per buffer would
+        // dominate the line without making the location any sharper. Truncated
+        // explicitly rather than with a `{:.8}` precision, which `Digest`'s
+        // Display does not honour -- it delegates to LowerHex and ignores the
+        // formatter's precision, so the specifier silently printed the full
+        // digest.
+        .map(|c| {
+            Digest::new(c)
+                .to_string()
+                .chars()
+                .take(8)
+                .collect::<String>()
+        })
+        .collect();
+    (chunk, chunks)
+}
+
 /// ⚠️ THE GUARD IS FIRST AND THAT IS THE POINT. Everything below it touches
 /// guest memory: for `recvmsg` the extents cannot even be computed without
 /// reading a `msghdr` and an `iovec` array out of the guest. That is
@@ -415,15 +489,22 @@ where
         None => "-".to_string(),
     };
     for extent in extents(guest, call, ret)? {
+        let (whole, chunk, chunks) = extent_digests(guest, extent.addr, extent.len)?;
+        let located = if chunks.is_empty() {
+            String::new()
+        } else {
+            format!(" chunks={}:{}", chunk, chunks.join(","))
+        };
         crate::detlog!(
-            "[iobuf][dtid {}] {} {} fd={} {:#x}+{}->{}",
+            "[iobuf][dtid {}] {} {} fd={} {:#x}+{}->{}{}",
             dettid,
             name,
             dir,
             fd,
             extent.addr,
             extent.len,
-            compute_hash_range(guest, extent.addr, extent.addr + extent.len)?
+            whole,
+            located
         );
     }
     Ok(())
@@ -432,6 +513,60 @@ where
 #[cfg(test)]
 mod tests {
     use reverie::syscalls;
+
+    /// A divergence must be LOCATED, not merely detected -- that is the whole
+    /// reason the chunk list exists, so it is asserted rather than assumed.
+    #[test]
+    fn chunk_digests_name_the_first_differing_window() {
+        let len = 1468; // the real netlink dump size
+        let left = vec![0xABu8; len];
+        let mut right = left.clone();
+        let offset = 900;
+        right[offset] ^= 0xFF; // one flipped byte, nothing else
+        let (chunk, l) = chunk_digests(&left);
+        let (_, r) = chunk_digests(&right);
+        assert_eq!(chunk, 256);
+        assert_eq!(l.len(), r.len());
+        let first_diff = l.iter().zip(&r).position(|(a, b)| a != b);
+        assert_eq!(
+            first_diff,
+            Some(offset / chunk),
+            "must name the window holding the flip"
+        );
+        // and ONLY that window: a single-byte change must not smear.
+        assert_eq!(l.iter().zip(&r).filter(|(a, b)| a != b).count(), 1);
+    }
+
+    #[test]
+    fn identical_buffers_produce_identical_chunk_lists() {
+        let buf = vec![7u8; 1468];
+        assert_eq!(chunk_digests(&buf).1, chunk_digests(&buf.clone()).1);
+    }
+
+    /// A buffer that fits in one chunk gets no list: it would only repeat the
+    /// whole-extent digest, and this check is always on.
+    #[test]
+    fn a_single_chunk_extent_emits_no_list() {
+        assert!(chunk_digests(&vec![0u8; CHUNK_MIN]).1.is_empty());
+        assert!(chunk_digests(&[]).1.is_empty());
+    }
+
+    /// The log line must stay bounded however large the buffer is.
+    #[test]
+    fn the_chunk_count_is_capped_and_still_spans_the_extent() {
+        for len in [2048usize, 65536, 1 << 20] {
+            let (chunk, chunks) = chunk_digests(&vec![0u8; len]);
+            assert!(
+                chunks.len() <= CHUNK_CAP,
+                "len {len} produced {} chunks",
+                chunks.len()
+            );
+            assert!(
+                chunk * chunks.len() >= len,
+                "chunks must span the whole extent"
+            );
+        }
+    }
 
     use super::*;
 
