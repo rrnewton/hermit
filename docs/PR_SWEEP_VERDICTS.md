@@ -1351,6 +1351,70 @@ placed in the BUILD cannot be forgotten or enumerated wrong, whereas the same
 guarantee in a test can be both. A diagnostic cannot be moved into the build, so
 here the remedy is the checklist above rather than a stronger mechanism.
 
+## Landing a two-lane head: the ordering
+
+⚠️ **Deliberately not a numbered check.** Numbered additions collide by
+construction — one was renumbered three times in a single night — and four heads
+need this by name rather than by number.
+
+An `APPROVED-AT` line names a sha. A push changes the sha. So a two-lane head can
+be pushed out from under its own approvals faster than the second lane arrives:
+measured on hermit#2478, **28 `APPROVED-AT: codex` lines in seven hours, none
+naming the current head**, the most recent killed by a **pure rebase** whose
+changed lines were byte-identical (8 files, 932 lines, each head against its own
+merge base).
+
+**That is an ordering failure, not an impossibility.** Two facts decide it, and
+both are counter-intuitive enough to be worth measuring rather than assuming:
+
+- **A head does not need rebasing to be mergeable.** hermit#2549 sat *two commits
+  behind* `main` at `mergeable_state: clean`. Being behind is not an obstacle;
+  only a **conflict** is.
+- **`main` advancing does not invalidate an approval. Only a push to the branch
+  does.** Conflating those two is what makes this look unsolvable.
+
+### The ordering
+
+1. **Rebase first, while the head is still unapproved.** There is nothing to lose
+   at that point, and it is the only moment a rebase is free.
+2. **Do not pursue a validate receipt.** It is the sole forcing function for a
+   *later* rebase, and it is unsatisfiable under contention anyway — measured
+   `wall=914s` queued, then `REFUSE` on freshness, because the target is fixed at
+   submission while freshness is re-checked after an unbounded wait.
+3. **Collect both lanes at that one sha, with no push to the branch between
+   them.** Labels and comments do not move the sha; confirm that after any label
+   edit rather than assuming it.
+4. **Merge with `gh pr merge --rebase`.** It rebases *server-side* and never
+   pushes the branch, so the bindings survive the merge itself.
+
+### Verify before you merge, and record which signal you relied on
+
+Check all three and require them to **agree**; do not treat any one as
+authoritative while the head-versus-content ruling is open.
+
+| signal | where | fails |
+| --- | --- | --- |
+| binding | newest `APPROVED-AT: <lane> <40-hex>` per lane, equal to the head | **closed** — a push makes it `SUPERSEDED` by construction |
+| label | `passed-review-<lane>` | **open** — carries no sha, cannot expire; nothing strips it on push today |
+| independence | the disclosure tag inside each binding comment | nothing checks it at all |
+
+⚠️ **The independence check is yours to run by hand.** No gate performs it, and
+the GitHub author is a shared machine identity, so only the tag in the comment
+body distinguishes agents. **Pushing a head — even a purely mechanical rebase —
+makes you an author of it for this purpose.** A reviewer landing a head they
+reviewed is normal; an author binding their own lane is not.
+
+### Evidence that this works
+
+- **Existence:** hermit#2236 held both lanes at one sha (`dc8738bebc80`).
+- **Single-lane, executed:** #2563, #2564, #2553, #2550 — rebase first, no
+  receipt, poll to clean, merge directly.
+- **Two-lane, executed end to end:** #2549 and #2566. On #2549 one agent supplied
+  the claude lane at `45a96114aa8c` and flagged on the pull request that one
+  codex line at the *same* sha with no push between would complete it; a second
+  agent supplied exactly that an hour later. On #2566 the lanes arrived in the
+  other order. Neither needed a rebase, a receipt, or a policy change.
+
 ## Verdict vocabulary
 
 | verdict | meaning | action |
