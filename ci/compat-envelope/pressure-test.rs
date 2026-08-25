@@ -833,8 +833,20 @@ struct InvocationAttempt {
     shell_command: String,
 }
 
+/// A coordinate that must be PRESENT and may be NULL.
+///
+/// ⚠️ NOT `#[serde(transparent)]`, and that is the entire point. Transparent
+/// made this newtype inherit `Option`'s implicit-optional rule, so a MISSING key
+/// deserialised to `None` and the "required" half of required-nullable never
+/// held. Measured 2026-08-25 against the real struct: with transparent, a report
+/// with ALL FOUR coordinate keys deleted parsed successfully, while a plain
+/// non-Option field (`verdict`) was correctly rejected -- so the guarantee the
+/// doc comments below claim has never been enforced.
+///
+/// Without transparent the newtype still deserialises from the bare inner value,
+/// so `null` and `7` both work and no report format changes; only ABSENCE is now
+/// refused, which is what these fields were added to catch.
 #[derive(Debug, Deserialize)]
-#[serde(transparent)]
 struct RequiredNullableU64(Option<u64>);
 
 #[derive(Debug, Deserialize)]
@@ -861,6 +873,30 @@ struct VerificationEvidence {
     /// exists, which is the failure mode this whole test guards against.
     #[allow(dead_code)]
     first_divergent_record: RequiredNullableU64,
+    /// The FOURTH coordinate, required-nullable for the same reason as its
+    /// three siblings above: this test sets `E2E_RESULT_ROOT` itself, so it only
+    /// ever reads reports it just produced, and requiring the key catches a
+    /// producer that silently stops emitting it.
+    ///
+    /// It was the one coordinate this struct did not require, while
+    /// `detcore/src/logdiff.rs` has emitted all four since the field was added.
+    /// That asymmetry mattered: the scorecard's series projection takes ALL FOUR
+    /// COORDINATES OR NONE -- a subset leaves one observation holding
+    /// series-derived bounds beside pre-series ones with nothing saying which is
+    /// which -- so a producer that could not see the fourth could never satisfy
+    /// the consumer.
+    ///
+    /// Measured 2026-08-25 against reports from the run at 0d8e3ab9db06: a
+    /// `matched` cell carries all four keys as null, and a `diverged` cell
+    /// carries all four populated (language-runtimes/python-dict-hash-iteration:
+    /// turn 196, record 7495, syscall 1074). The key is always present because
+    /// the report struct sets no `skip_serializing_if`, so requiring it here
+    /// cannot reject a well-formed report.
+    ///
+    /// NEVER READ, deliberately, exactly as above: the assertion happens at
+    /// DESERIALIZATION.
+    #[allow(dead_code)]
+    first_divergent_syscall: RequiredNullableU64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
