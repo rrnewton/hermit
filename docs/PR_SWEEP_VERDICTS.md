@@ -963,6 +963,167 @@ mechanism was present and the *predicate* was wrong — a name, an empty set, a
 spelling, a variable. A check whose predicate is a string will keep exiting 0
 while measuring something nobody asked about.
 
+### 17. A rejection set enumerated as VALUES silently narrows every time the value advances
+
+An assertion of the form "reject these specific inputs" is a test that stops
+testing. Each time the thing it guards moves, the listed values drift further
+from the boundary that matters, and the test keeps passing while checking less.
+It cannot fail for the reason its name gives, and nothing announces the moment
+it went quiet.
+
+**Derive the rejection set from the compatibility rule instead of listing it.**
+
+Measured on `hermit-cli/src/metadata.rs`, the record/replay version gate — which
+exists precisely to stop a build replaying a stream whose schema it does not
+understand. Two instances, which is what makes it a pattern rather than a bug:
+
+| where | assertion | what it actually says at `RECORD_VERSION = 0x10e` |
+|---|---|---|
+| `main` | rejects `0x10a`, `0x10c`, `0x105`, `0x110` | four fixed points, none near the boundary |
+| `#2176` | rejects `0x109` only | true for **every** version except `0x109` |
+
+`#2176`'s is the clearer illustration: `!compatible_with(0x109)` passes at
+`0x10a`, `0x10e`, `0x10f`, `0x999`. The moment the constant leaves `0x109` the
+test runs, passes, and asserts nothing about the schema advance it is named for.
+
+The comparison rule is exact equality, so the property to assert is *every other
+version is refused*. Re-derive the cases from the constant and the window travels
+with it:
+
+```rust
+let current = RECORD_VERSION.0;
+for delta in 1..=16u32 {
+    assert!(!RECORD_VERSION.compatible_with(&RecordVersion(current - delta)));
+    assert!(!RECORD_VERSION.compatible_with(&RecordVersion(current + delta)));
+}
+```
+
+⚠️ **But check what the list was doing BY ACCIDENT before you delete it.**
+`!compatible_with(0x10a)` also fails if someone *sets* `RECORD_VERSION` to
+`0x10a`. A derived window cannot catch that — it re-derives from whatever the
+constant currently says. Replacing the list without replacing that second job
+trades a stale check for a weaker one, which is check-list-shaped goalpost
+moving. Restore it explicitly, and prefer a **compile-time** assertion where both
+sides are constants, because it cannot be skipped, filtered or left unrun:
+
+```rust
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x10e;
+const _: () = assert!(RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION, "...");
+```
+
+⚠️ **And the floor is itself an enumerated value sitting beside a moving one —
+this check prescribes a weaker form of the disease it diagnoses.** Measured by
+agent(hermit-007) against `#2549`, which implements exactly the guard above:
+
+| step | build errors |
+| --- | ---: |
+| advance `RECORD_VERSION` to `0x112`, leave the floor at `0x10e` | **0** — silently accepted |
+| then regress `0x112` to `0x10f` | **0** — the backward move is **NOT** caught |
+
+After one missed update the floor guards below the last value someone remembered
+to write down rather than below the current one, and nothing announces that it
+went quiet — which is this check's own sentence, turned on its own remedy. The
+floor is still strictly better than nothing: `#2549` does break the build on a
+straight `0x10e -> 0x10b` regression. But prefer the DERIVED form. The highest
+shipped version is recoverable from history as the maximum `RECORD_VERSION` ever
+on `main`, so a CI assertion that the literal equals that maximum makes the floor
+travel with the constant instead of with someone's memory.
+
+The two guards are complementary, and each was demonstrated able to fail at
+exactly what the other misses: regressing the constant `0x10e -> 0x10a` breaks
+the **build** while the derived window passes; relaxing `compatible_with` to
+tolerate one version of drift fails the **window** while the floor passes. If a
+replacement guard cannot be shown to fail where the old one did, it is weaker,
+whatever else it improves.
+
+The hazard is not hypothetical. A long-stale branch that bumped `0x109 -> 0x10a`
+against a base predating `main`'s advance to `0x10e` regresses the constant the
+moment its conflict is resolved by taking the branch side — **and the same hunk
+deletes the enumerated assertion that would have caught it.** The regression and
+the loss of its detector arrive together, neither visible in the other's diff.
+
+Generalises past version gates: any allowlist, denylist, skip list, or
+`backends_disabled` map enumerated as values has this shape.
+
+#### The merge rule this implies: constant FORWARD, set as a UNION
+
+The two halves above are one finding seen from two directions, and the merge rule
+falls out of it. When a branch and `main` have both edited a **monotonic
+constant** and the **set that pins it**:
+
+> Merge the constant **FORWARD** — to the maximum of the two, plus one if either
+> side's schema changed. Merge the pinning set as a **UNION** — every value
+> either side rejects, plus the other side's current value.
+
+Taking one side of *both* is the failure, and it is worse than either alone
+because **it loses a regression and its detector together**. The branch's
+constant is lower, so "theirs" regresses it; the branch's rejection set predates
+`main`'s recent values, so the same resolution deletes precisely the assertion
+that would have gone red. Neither half is visible in the other's diff hunk, and
+the merge is clean — no tool flags it.
+
+Concretely, for the pair above: `0x10f`, not `0x10a`; and a rejection set that
+still refuses `0x10a` and `0x10c` from `main` **and** now refuses `0x10e`.
+Resolving that test by taking either side wholesale is wrong in both directions.
+
+⚠️ **The same shape applies to a rationale comment.** A conflict can resolve
+cleanly while deleting the paragraph that records *why* a value is what it is —
+including an owner ruling written into the code after the branch forked. That is
+not a merge error any tool reports; the result compiles, passes, and has quietly
+lost the reason. When resolving a conflict in a file whose comments carry
+decisions, diff the comment block separately from the code and carry it forward
+deliberately.
+
+### 18. A diagnostic makes CLAIMS — moving where it fires can falsify them silently
+
+A log line is not decoration; in this project it is compared evidence. Its text
+asserts two things beyond the words: **where it came from**, and **what was true
+at the moment it fired**. Moving the emission site can falsify either without
+touching a character of the message, and nothing fails.
+
+Both halves, from one hunk in `#2304`:
+
+```rust
+// text unchanged, now emitted from `sched_loop_inner`:
+info!("scheduler (step2_process_blocked): zero threads left anywhere, fizzling.");
+```
+
+1. **Wrong origin.** The message names `step2_process_blocked` and no longer
+   comes from it. Anyone grepping the string to find the emitter — which is the
+   normal way to trace a line back — lands in the wrong function. The string was
+   accurate when written and became a lie by being moved.
+2. **Narrowed predicate.** At the old site the condition was
+   `futex_empty && timed_empty && blockers_empty`. The new site additionally
+   requires `pending_run_queue_admissions.is_empty()` and
+   `pending_run_queue_removals.is_empty()`. **That is not a pure move.** The line
+   now means something stricter than it did, under the same words, so a reader
+   comparing two runs across the change is comparing two different propositions.
+
+There is a third effect worth separating, because it is the one that looks like
+an improvement: the old site could fire MORE THAN ONCE per run; the new one fires
+at most once, and the accompanying test asserts exactly one. **Collapsing a count
+to a constant makes the evidence stream stable without making the system
+deterministic.** Whether that is a fix or a loss depends on whether the count was
+carrying information — here it was measured to be, so it became an owner
+question rather than a review verdict.
+
+**What to check when a diagnostic moves:**
+
+- Does the message still name its actual emitter? Grep the string; land where you
+  expect.
+- Is the guarding condition the same, or has it gained or lost a conjunct?
+- Can it still fire the same NUMBER of times? A per-occurrence line and a
+  once-per-run line are different instruments even with identical text.
+
+This is the same family as checks 12 and 14, and tonight it was the fourth
+instance: a comparator over an empty set reporting agreement, two version gates
+whose enumerated rejection sets had stopped covering the boundary, and this. Each
+is **a check that runs, passes, and asserts less than its name says.** The
+version-gate case suggests the general remedy where it is available — a guarantee
+placed in the BUILD cannot be forgotten or enumerated wrong, whereas the same
+guarantee in a test can be both. A diagnostic cannot be moved into the build, so
+here the remedy is the checklist above rather than a stronger mechanism.
+
 ## Verdict vocabulary
 
 | verdict | meaning | action |
