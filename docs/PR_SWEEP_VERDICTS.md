@@ -812,6 +812,56 @@ lost the reason. When resolving a conflict in a file whose comments carry
 decisions, diff the comment block separately from the code and carry it forward
 deliberately.
 
+### 15. A diagnostic makes CLAIMS — moving where it fires can falsify them silently
+
+A log line is not decoration; in this project it is compared evidence. Its text
+asserts two things beyond the words: **where it came from**, and **what was true
+at the moment it fired**. Moving the emission site can falsify either without
+touching a character of the message, and nothing fails.
+
+Both halves, from one hunk in `#2304`:
+
+```rust
+// text unchanged, now emitted from `sched_loop_inner`:
+info!("scheduler (step2_process_blocked): zero threads left anywhere, fizzling.");
+```
+
+1. **Wrong origin.** The message names `step2_process_blocked` and no longer
+   comes from it. Anyone grepping the string to find the emitter — which is the
+   normal way to trace a line back — lands in the wrong function. The string was
+   accurate when written and became a lie by being moved.
+2. **Narrowed predicate.** At the old site the condition was
+   `futex_empty && timed_empty && blockers_empty`. The new site additionally
+   requires `pending_run_queue_admissions.is_empty()` and
+   `pending_run_queue_removals.is_empty()`. **That is not a pure move.** The line
+   now means something stricter than it did, under the same words, so a reader
+   comparing two runs across the change is comparing two different propositions.
+
+There is a third effect worth separating, because it is the one that looks like
+an improvement: the old site could fire MORE THAN ONCE per run; the new one fires
+at most once, and the accompanying test asserts exactly one. **Collapsing a count
+to a constant makes the evidence stream stable without making the system
+deterministic.** Whether that is a fix or a loss depends on whether the count was
+carrying information — here it was measured to be, so it became an owner
+question rather than a review verdict.
+
+**What to check when a diagnostic moves:**
+
+- Does the message still name its actual emitter? Grep the string; land where you
+  expect.
+- Is the guarding condition the same, or has it gained or lost a conjunct?
+- Can it still fire the same NUMBER of times? A per-occurrence line and a
+  once-per-run line are different instruments even with identical text.
+
+This is the same family as checks 12 and 14, and tonight it was the fourth
+instance: a comparator over an empty set reporting agreement, two version gates
+whose enumerated rejection sets had stopped covering the boundary, and this. Each
+is **a check that runs, passes, and asserts less than its name says.** The
+version-gate case suggests the general remedy where it is available — a guarantee
+placed in the BUILD cannot be forgotten or enumerated wrong, whereas the same
+guarantee in a test can be both. A diagnostic cannot be moved into the build, so
+here the remedy is the checklist above rather than a stronger mechanism.
+
 ## Verdict vocabulary
 
 | verdict | meaning | action |
