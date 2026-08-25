@@ -1116,20 +1116,66 @@ fn run_liteinst_verifies_detcore_backend() {
     );
 }
 
+/// Backend statistics are a HARNESS record and must stay out of the INFO parity
+/// envelope, while remaining available to anyone who asks for DEBUG.
+///
+/// ⚠️ WHY THE LEVEL IS THE POINT, not a formatting preference.
+/// `ComparedLogScope::Info` is `BitwiseInfoV1` — "every INFO message, exactly" —
+/// so an INFO record is compared between two runs as if it were guest behaviour.
+/// This record is hermit describing its own harness, and both of its fields say
+/// which harness: `backend=<NAME>`, and `stats=` carrying that backend's own
+/// instrumentation. Measured before the change, it was the ONE record of 303 in
+/// a real ptrace INFO stream that named a backend — so two backends running an
+/// identical guest could not agree under that envelope however correct they
+/// were. Putting it back at INFO restores a divergence by construction.
 #[test]
-fn backend_stats_are_info_gated_for_ptrace() {
+fn backend_stats_are_debug_gated_and_absent_from_the_info_envelope() {
     let default_args = ["run", "--strict", "--", "/bin/true"];
     let default_output = hermit(&default_args);
     assert_success(&default_output, &default_args);
     assert!(!stderr(&default_output).contains("backend run complete"));
 
+    // THE REGRESSION THIS GUARDS: not merely that the record is absent, but that
+    // the INFO envelope names no backend at all. A future record reintroducing a
+    // backend name at INFO fails here even if it is spelled differently.
     let info_args = ["--log", "info", "run", "--strict", "--", "/bin/true"];
     let info_output = hermit(&info_args);
     assert_success(&info_output, &info_args);
+    let info_stderr = stderr(&info_output);
     assert!(
-        stderr(&info_output).contains("backend run complete backend=ptrace stats=metrics=none"),
+        !info_stderr.contains("backend run complete"),
+        "the backend-stats record must not be in the INFO parity envelope:\n{info_stderr}"
+    );
+    let naming_a_backend: Vec<&str> = info_stderr
+        .lines()
+        .filter(|line| line.contains(" INFO "))
+        .filter(|line| {
+            [
+                "backend=ptrace",
+                "backend=dbt",
+                "backend=sabre",
+                "backend=liteinst",
+                "backend=kvm",
+            ]
+            .iter()
+            .any(|needle| line.contains(needle))
+        })
+        .collect();
+    assert!(
+        naming_a_backend.is_empty(),
+        "no INFO record may name the backend -- it cannot agree across backends by \
+         construction, so it caps cross-backend parity:\n{naming_a_backend:#?}"
+    );
+
+    // POSITIVE, so this cannot pass by the record having been deleted: it is
+    // still emitted, with both fields, one level down.
+    let debug_args = ["--log", "debug", "run", "--strict", "--", "/bin/true"];
+    let debug_output = hermit(&debug_args);
+    assert_success(&debug_output, &debug_args);
+    assert!(
+        stderr(&debug_output).contains("backend run complete backend=ptrace stats=metrics=none"),
         "{}",
-        stderr(&info_output)
+        stderr(&debug_output)
     );
 }
 
