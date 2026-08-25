@@ -690,6 +690,13 @@
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
+      "mode": "chaos",
+      "test": "c-programs/fp-reduction-nondeterminism"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
       "mode": "verify",
       "test": "c-programs/fp-reduction-nondeterminism"
     },
