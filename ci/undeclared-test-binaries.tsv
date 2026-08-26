@@ -75,7 +75,7 @@ socket_cookie_determinism	none-recorded	No reason was recorded when this binary 
 socket_ioctl_timestamp_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 socket_timestamp_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 sqlite_veryquick	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
-stress_suite	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+stress_suite	measured-green-pending-registration	Measured 2026-08-26 on hermit@a787a547ea: 6 tests in three tiers. Default tier (2 tests) green in 9 consecutive runs, 20.9-22.4s. Fast tier (targeted_chaos_finds_order_violation_at_least_as_often, fast_chaos_matrix) green in 29.4s. The remaining two are #[ignore = "explicit slow stress tier"] and "explicit PMU-dependent slow stress tier" and belong in super. Default+fast belong in the DAG at ~51s, pending an rss_baseline_bytes sample. Note its Some(1) is the GUEST'S signal (GuestOutcome::Exposed) and must never be swept to 125.
 syscall_file_io	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 syscall_file_metadata	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 syscall_quick_wins	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
