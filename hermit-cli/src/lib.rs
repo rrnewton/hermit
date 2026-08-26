@@ -2041,11 +2041,28 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
 }
 
 // TODO-HUMAN-REVIEW(PR-736): Review reserved LiteInst runtime failure statuses.
+//
+// ⚠️ THIS PREDICATE AND THE CLASSIFIER MUST COVER THE SAME STATUSES, AND A
+// HARD-CODED RANGE CANNOT. When the reserved set grew to include the signal
+// band, `Exited(130)` fell outside `122..=127` and is NOT `Signaled(_, _)` --
+// it is a status hermit CHOSE, not an actual signal death -- so LiteInst
+// skipped the forced shutdown and `clean_up` could wait forever on
+// `handle.await` (detcore/src/tool_global.rs). The reserved set had grown past
+// the range this hard-coded, and nothing connected the two.
+//
+// Keying the signal half on `signal_from_exit_status` -- the same predicate
+// `classify_container_result` uses to recognise these statuses -- is what stops
+// them drifting again: a future band change moves both or neither.
 fn liteinst_requires_forced_shutdown(status: ExitStatus) -> bool {
-    matches!(
-        status,
-        ExitStatus::Exited(122..=127) | ExitStatus::Signaled(_, _)
-    )
+    match status {
+        // A real signal death: the process never chose a status at all.
+        ExitStatus::Signaled(_, _) => true,
+        ExitStatus::Exited(code) => {
+            // The 122..=127 reserved band, plus any status hermit emits to mean
+            // "killed by signal N".
+            (122..=127).contains(&code) || detcore_model::signal_from_exit_status(code).is_some()
+        }
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -2550,6 +2567,54 @@ pub async fn replay_with_output_and_mounts(dir: &Path, mounts: &[Mount]) -> Resu
 
 #[cfg(test)]
 mod tests {
+    /// ⚠️ THE REGRESSION agent(hermit-007)'s CODEX LANE CAUGHT, PINNED SO IT
+    /// CANNOT RETURN. `liteinst_requires_forced_shutdown` hard-coded
+    /// `Exited(122..=127)`. When the reserved set grew to include the signal
+    /// band, `Exited(130)` fell outside it and is not `Signaled(_, _)` -- it is a
+    /// status hermit CHOSE -- so LiteInst skipped the forced shutdown and
+    /// `clean_up` could wait forever on `handle.await`. A reachable hang,
+    /// introduced by widening the reserved set in one place and not the other.
+    ///
+    /// The 130 and 143 rows are the ones with teeth: revert the predicate to the
+    /// bare range and they fail.
+    #[test]
+    fn liteinst_forced_shutdown_covers_every_status_hermit_reserves() {
+        // The signal band. Not `Signaled`: hermit CHOSE these codes, because a
+        // namespace init cannot produce a genuine signalled wait status.
+        assert!(
+            liteinst_requires_forced_shutdown(ExitStatus::Exited(130)),
+            "128+SIGINT"
+        );
+        assert!(
+            liteinst_requires_forced_shutdown(ExitStatus::Exited(143)),
+            "128+SIGTERM"
+        );
+        assert!(
+            liteinst_requires_forced_shutdown(ExitStatus::Exited(129)),
+            "128+SIGHUP"
+        );
+
+        // The pre-existing reserved band, unchanged.
+        assert!(liteinst_requires_forced_shutdown(ExitStatus::Exited(122)));
+        assert!(liteinst_requires_forced_shutdown(ExitStatus::Exited(125)));
+        assert!(liteinst_requires_forced_shutdown(ExitStatus::Exited(127)));
+
+        // A real signal death still forces shutdown.
+        assert!(liteinst_requires_forced_shutdown(ExitStatus::Signaled(
+            nix::sys::signal::Signal::SIGKILL,
+            false
+        )));
+
+        // ⚠️ CONTROLS, so a predicate that simply returned `true` would fail
+        // this test rather than pass it. An ordinary guest exit must NOT force a
+        // shutdown; 128 is excluded because there is no signal 0, and 200 is
+        // above SIGRTMAX so it is a guest's own number.
+        assert!(!liteinst_requires_forced_shutdown(ExitStatus::Exited(0)));
+        assert!(!liteinst_requires_forced_shutdown(ExitStatus::Exited(1)));
+        assert!(!liteinst_requires_forced_shutdown(ExitStatus::Exited(121)));
+        assert!(!liteinst_requires_forced_shutdown(ExitStatus::Exited(128)));
+        assert!(!liteinst_requires_forced_shutdown(ExitStatus::Exited(200)));
+    }
 
     /// ⚠️ The bare `NotFound` here was read as a git-worktree bug and cost real
     /// investigation time. The message must name the mount namespace, because

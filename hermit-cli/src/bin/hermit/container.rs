@@ -805,6 +805,62 @@ impl<T> Classified<T> for Result<Result<T, SerializableError>, RunError> {
 mod tests {
     use super::*;
 
+    /// ⚠️ THE RECOGNITION HALF, WHICH THE END-TO-END TEST DOES NOT WITNESS.
+    /// `a_guest_exiting_a_reserved_status_is_not_reported_as_hermit` in
+    /// `tests/cli.rs` runs real guests, so every status it sees arrives through
+    /// the `Ok(Ok(..))` arm and it never reaches the classifier at all --
+    /// agent(hermit-007)'s codex lane proved that by mutation: it still passed
+    /// with the signal classifier deleted outright. That test establishes a
+    /// guest's own 122/130 is still reported as the guest, which is real and is
+    /// the gap hermit#2659 left, but it cannot witness this.
+    ///
+    /// Feeding the classifier a synthesized `Exited(130)` directly is what
+    /// witnesses it, and needs no signal delivery -- which matters because the
+    /// end-to-end SIGINT path may not be observable from outside at all: the
+    /// outer process can die of the same signal before the child's status is
+    /// ever classified.
+    ///
+    /// Delete the signal arm in `classify_container_result` and this fails.
+    #[test]
+    fn a_container_child_exiting_in_the_signal_band_is_not_an_internal_failure() {
+        use reverie::process::ExitStatus;
+
+        let signal_death = classify_container_result::<()>(Err(RunError::ExitStatus(
+            ExitStatus::Exited(detcore_model::HERMIT_SIGINT_DEATH_EXIT),
+        )))
+        .expect_err("a signal death is not a success");
+        assert!(
+            signal_death.downcast_ref::<SignalDeath>().is_some(),
+            "Exited(130) must classify as a signal death, not as an unchosen child \
+             exit -- LiteInst and the exit-code path both key on this distinction"
+        );
+        assert!(
+            signal_death.downcast_ref::<ContainerChildExit>().is_none(),
+            "a signal death must not also read as an unaccounted container exit"
+        );
+
+        // The refusal arm must still win for 122: the two arms are adjacent and
+        // ordering decides meaning.
+        let refusal = classify_container_result::<()>(Err(RunError::ExitStatus(
+            ExitStatus::Exited(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        )))
+        .expect_err("a refusal is not a success");
+        assert!(refusal.downcast_ref::<PolicyRefusal>().is_some());
+        assert!(
+            refusal.downcast_ref::<SignalDeath>().is_none(),
+            "122 must not parse as a signal death; the const-assert pins them disjoint"
+        );
+
+        // ⚠️ CONTROL: a status in neither reserved set must STILL be an unchosen
+        // child exit. Without this, a classifier that returned SignalDeath for
+        // everything would pass the rows above.
+        let unchosen =
+            classify_container_result::<()>(Err(RunError::ExitStatus(ExitStatus::Exited(7))))
+                .expect_err("an unaccounted exit is not a success");
+        assert!(unchosen.downcast_ref::<ContainerChildExit>().is_some());
+        assert!(unchosen.downcast_ref::<SignalDeath>().is_none());
+    }
+
     #[test]
     fn child_panic_becomes_an_error_naming_message_and_location() {
         let mut f = || -> Result<(), Error> { panic!("divergence detail that must survive") };
