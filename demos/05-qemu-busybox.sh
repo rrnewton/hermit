@@ -101,6 +101,18 @@ initramfs_image=${INITRAMFS_IMAGE:-$output_dir/initramfs-busybox.cpio.gz}
 console_log=$output_dir/console.log
 info_log=$output_dir/hermit-info.log
 stderr_log=$output_dir/hermit-stderr.log
+verify_json=$output_dir/verify.json
+
+# Preflight the verdict reader BEFORE the boot, which costs several minutes.
+# `jq` is the only external dependency VERIFY=1 adds, and it is exactly the
+# binary a host BPF FILE_OPEN policy has been observed to deny
+# (ai_docs/bpf-file-open-retry-measurement-20260817.md), so a missing or
+# unreadable jq must be reported as a setup fault here rather than surface as a
+# verification failure after a 900-second run.
+if [[ $verify == 1 ]]; then
+  command -v jq >/dev/null 2>&1 \
+    || fail "VERIFY=1 requires 'jq' to read the typed verdict; install jq or run without VERIFY=1"
+fi
 
 if [[ -z ${INITRAMFS_IMAGE:-} ]]; then
   "$script_dir/qemu-busybox/build-initramfs.sh" "$initramfs_image"
@@ -120,7 +132,14 @@ if [[ -n $skid_margin ]]; then
   hermit_args+=(--skid-margin="$skid_margin")
 fi
 if [[ $verify == 1 ]]; then
-  hermit_args+=(--verify)
+  # ⚠️ `--verify-strict` IS LOAD-BEARING FOR THE L2 LABEL PRINTED BELOW.
+  # A plain `--verify` stays on the lossy Stripped comparator on every backend
+  # -- `RunOpts::verification_strictness` returns `Canonical` only under
+  # `--verify-strict`/`--verify-verbose`, and
+  # `comparator_choice_does_not_depend_on_the_backend` pins that. AGENTS.md is
+  # explicit that default `--verify` "cannot establish L2", so requesting it
+  # while printing `level=L2` claimed a tier the run never reached.
+  hermit_args+=(--verify --verify-strict --verify-json "$verify_json")
 fi
 hermit_args+=(--)
 
@@ -130,6 +149,9 @@ printf 'pmu_skid_margin=%s\n' "${skid_margin:-auto}"
 printf 'hermit=%s\nqemu=%s\nkernel=%s\ninitramfs=%s\nconsole=%s\ninfo=%s\nstderr=%s\n' \
   "$hermit_bin" "$qemu_bin" "$kernel_image" "$initramfs_image" \
   "$console_log" "$info_log" "$stderr_log"
+if [[ $verify == 1 ]]; then
+  printf 'verify_json=%s\n' "$verify_json"
+fi
 printf 'kernel_sha256=%s\ninitramfs_sha256=%s\n' \
   "$(sha256sum "$kernel_image" | cut -d' ' -f1)" \
   "$(sha256sum "$initramfs_image" | cut -d' ' -f1)"
@@ -137,6 +159,11 @@ printf 'kernel_sha256=%s\ninitramfs_sha256=%s\n' \
 : >"$console_log"
 : >"$info_log"
 : >"$stderr_log"
+if [[ $verify == 1 ]]; then
+  # Truncate any verdict left by an earlier run: a stale `verify.json` that
+  # happened to say `matched` would otherwise certify THIS run.
+  : >"$verify_json"
+fi
 set +e
 timeout --signal=TERM --kill-after=10 "${timeout_seconds}s" \
   "$hermit_bin" "${hermit_args[@]}" "${guest_command[@]}" \
@@ -149,18 +176,61 @@ if ((status != 0)); then
   fail "Hermit/QEMU exited with status $status; inspect $console_log, $info_log, and $stderr_log"
 fi
 
+# ⚠️ THE WORKLOAD CHECKS BELOW RUN IN BOTH MODES, AND THAT IS DELIBERATE.
+# They used to be skipped under VERIFY=1, which meant the stronger mode
+# checked strictly LESS about the guest: a BusyBox userspace that never
+# reached its marker, or a nested Linux that rejected its clocksource, passed
+# unnoticed as long as the two runs agreed. Two runs can agree perfectly on a
+# workload that did not do its job -- determinism is not success.
+#
+# Verify mode CAN see this output: `hermit run --verify` replays the first
+# run's captured stdout/stderr to the real descriptors before exiting
+# (`run.rs`, `std::io::stdout().write_all(&out1.stdout)`), and the demo tees
+# those into $console_log. Only the `--log` DETLOG stream is diverted.
 marker=HERMIT-QEMU-BUSYBOX-PASS
-if [[ $verify == 0 ]]; then
-  grep -Fq "$marker" "$console_log" || fail \
-    "guest exited without marker $marker; inspect $console_log"
-  clock_failures='Unable to calibrate against PIT|Clocksource .* skewed|Marking TSC unstable|No current clocksource'
-  if grep -Eq "^\[[[:space:]]*[0-9]+\.[0-9]+\].*($clock_failures)" "$console_log"; then
-    fail "nested Linux reported a rejected clock failure; inspect $console_log"
+grep -Fq "$marker" "$console_log" || fail \
+  "guest exited without marker $marker; inspect $console_log"
+clock_failures='Unable to calibrate against PIT|Clocksource .* skewed|Marking TSC unstable|No current clocksource'
+if grep -Eq "^\[[[:space:]]*[0-9]+\.[0-9]+\].*($clock_failures)" "$console_log"; then
+  fail "nested Linux reported a rejected clock failure; inspect $console_log"
+fi
+printf 'console_sha256=%s\n' \
+  "$(sha256sum "$console_log" | cut -d' ' -f1)"
+
+if [[ $verify == 1 ]]; then
+  # Read the TYPED verdict, not the banner. ":: Success: deterministic.
+  # Determinism verified." is printed by a run whose own --verify-json says
+  # `bitwise_parity: false`, so scraping it cannot tell a stripped match from a
+  # canonical one -- which is precisely how this demo used to certify L2.
+  #
+  # These conjuncts mirror `verify_tier_from_json` in
+  # tests/backend-parity/run_matrix.py, the repository's enforcing definition of
+  # the `bitwise` tier. Keep the two in step. The counts are not redundant: an
+  # empty-vs-empty comparison reports "no difference" under the strictest
+  # possible spec, so without a positive count a run that produced no DETLOG at
+  # all would certify as parity.
+  [[ -s $verify_json ]] || fail \
+    "VERIFY=1 produced no typed verdict at $verify_json; inspect $stderr_log"
+  if ! jq -e '
+    .verified == true and
+    .verdict == "matched" and
+    .bitwise_parity == true and
+    .comparison.strictness == "canonical" and
+    .comparison.compare_logs == true and
+    .comparison.strip_lines == false and
+    .comparison.ignore_lines == false and
+    .comparison.skip_commit == false and
+    .comparison.skip_detlog == false and
+    (.compared_log_messages.left | type) == "number" and
+    (.compared_log_messages.right | type) == "number" and
+    .compared_log_messages.left > 0 and
+    .compared_log_messages.right > 0 and
+    .compared_log_messages.left == .compared_log_messages.right
+  ' "$verify_json" >/dev/null; then
+    fail "Hermit did not emit a matched non-vacuous canonical verdict; inspect $verify_json and $stderr_log"
   fi
-  printf 'console_sha256=%s\n' \
-    "$(sha256sum "$console_log" | cut -d' ' -f1)"
-elif ! grep -Fq 'Determinism verified' "$stderr_log"; then
-  fail "Hermit exited without the L2 verification marker; inspect $stderr_log"
+  printf 'compared_info_messages=%s\n' \
+    "$(jq -r '.compared_log_messages.left' "$verify_json")"
 fi
 
 printf 'PASS: BusyBox userspace completed under Hermit/QEMU (%s, ptrace backend)\n' \
