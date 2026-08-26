@@ -1362,21 +1362,48 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
 /// is not; it was proposed during review of this change and caught before it
 /// landed.
 ///
-/// ⚠️ HOW MUCH THIS IS WORTH, STATED HONESTLY. The mismatched pair is real, but
-/// **no git available here rejects one.** Measured 2026-08-25 on the measurement
-/// host, with
-/// a positive control confirming the overrides were honoured (`zzz.probe=HIT`
-/// present in `config --list`):
+/// ⚠️ RETRACTED 2026-08-26, AND THE RETRACTION IS LEFT VISIBLE ON PURPOSE. This
+/// paragraph previously read "the mismatched pair is real, but **no git
+/// available here rejects one**", over a table whose first three rows said
+/// `exit 0`. THAT WAS FALSE, and it was mine -- landed in `cec4602d32`.
 ///
-/// | condition | git 2.52.0 | git 2.53.0-Meta |
-/// | --- | --- | --- |
-/// | `COUNT=1`, no `KEY_0` | exit 0 | exit 0 |
-/// | `COUNT=1`, `KEY_0` set, no `VALUE_0` | exit 0 | exit 0 |
-/// | `COUNT=2`, only pair 0 present | exit 0, pair 0 applied | same |
-/// | `KEY_0` empty | exit 128 `empty config key` | exit 128 |
-/// | `COUNT` non-numeric | exit 128 `bogus count` | exit 128 |
+/// EVERY condition in the table is REJECTED, on BOTH gits, with exit 128:
 ///
-/// A count larger than the keys present is silently ignored. `with_config_override`
+/// | condition | git 2.52.0 | git 2.53.0-Meta | message |
+/// | --- | --- | --- | --- |
+/// | `COUNT=1`, no `KEY_0` | **128** | **128** | `missing config key GIT_CONFIG_KEY_0` |
+/// | `COUNT=1`, `KEY_0` set, no `VALUE_0` | **128** | **128** | `missing config value GIT_CONFIG_VALUE_0` |
+/// | `COUNT=2`, only pair 0 present | **128** | **128** | `missing config key GIT_CONFIG_KEY_1` |
+/// | `KEY_0` empty | 128 | 128 | `empty config key` |
+/// | `COUNT` non-numeric | 128 | 128 | `bogus count` |
+///
+/// Re-measured 2026-08-26 with `GIT_CONFIG_COUNT` and every `KEY_n`/`VALUE_n`
+/// explicitly unset before each probe, on `/usr/bin/git` (2.52.0) and
+/// `/usr/local/bin/git.meta.real` (2.53.0-Meta) -- the real binary, because
+/// `/usr/local/bin/git` is a wrapper.
+///
+/// ⚠️ WHY THE FIRST MEASUREMENT WAS WRONG: THE PROBE INHERITED WHAT IT CLAIMED
+/// WAS ABSENT. This host's shells export the git wrapper's URL rewrites --
+/// `GIT_CONFIG_COUNT=3` with `KEY_0..KEY_2` all set to
+/// `url.https://github.com/.insteadOf`. Running `env GIT_CONFIG_COUNT=1 git ...`
+/// overrides only the COUNT; `KEY_0` is still there, so git found a key and
+/// exited 0. Measured both ways in the same shell, 20 runs each: with `KEY_0`
+/// inherited, 0/20 non-zero; with it unset, 20/20 non-zero.
+///
+/// ⚠️ AND THE POSITIVE CONTROL PASSED, BOTH THEN AND NOW. `zzz.probe=HIT`
+/// appearing in `config --list` proved the overrides were HONOURED. It never
+/// tested that `KEY_0` was ABSENT, which is the precondition the whole table
+/// rested on. A control adjacent to the precondition looks exactly like a
+/// control, and having run one is not the same as having run the right one.
+///
+/// WHAT THIS CHANGES ABOUT THE ARGUMENT. The mismatched pair is still real, and
+/// it is NOT silently tolerated -- it is a hard 128 with a named message. So the
+/// hazard is a loud failure at the fork, not a misconfigured child that runs on
+/// with the wrong settings. That is a better failure than the one this paragraph
+/// used to describe, and the guard's value has to be argued on those terms
+/// rather than on "git will not notice".
+///
+/// `with_config_override`
 /// restores with `remove_var` and never writes an empty key or a non-numeric
 /// count, so it cannot produce either failing condition. The suite was run 30x
 /// with NO guard at all (10 at default thread count, 20 at `--test-threads=32`)
