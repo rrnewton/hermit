@@ -111,6 +111,24 @@ pub const RECORD_REPLAY_VIRTUALIZES_TIME: bool = false;
 /// SHOULD BE REFUSED ON SIGHT AND QUESTIONED.
 pub const HERMIT_INTERNAL_FAILURE_EXIT: i32 = 125;
 
+/// A deadline hermit itself was asked to enforce expired: **124**.
+///
+/// The status the container init exits with when a hermit-owned bound ends the
+/// run -- `run --timeout`'s SIGALRM fallback here, and `record --record-timeout`'s
+/// handler in `record_start.rs`, which has always used this value. 124 is the
+/// established code for "a deadline fired" across GNU `timeout`, `safehermit`'s
+/// wall bound and both hermit spellings, so this names an existing convention
+/// rather than claiming a new number.
+///
+/// ⚠️ IT MUST BE READ AT THE CONTAINER BOUNDARY OR IT IS SILENTLY REWRITTEN TO
+/// 125. Found only by forcing the fallback to fire, 2026-08-26: the init exited
+/// 124, `classify_container_result` had no arm for it, and it fell through to
+/// `ContainerChildExit` -- so the run reported `exit 125` and
+/// `class=container-child-exit`, "the child died with a status it did not
+/// pick", for a deadline hermit chose to enforce. Identical in shape to the
+/// refusal that arrives as 122 and needs its own arm for the same reason.
+pub const HERMIT_DEADLINE_EXIT: i32 = 124;
+
 /// The guest program could not be found at all: **127**.
 ///
 /// Exported for the same reason as [`HERMIT_INTERNAL_FAILURE_EXIT`] and with the
@@ -2209,8 +2227,49 @@ where
         Ok(result) => result,
         // The future has already been dropped by `timeout` at this point; every
         // destructor in the guest stack has run before we get here.
-        Err(_elapsed) => Err(Error::new(GuestTimedOut { limit })),
+        Err(_elapsed) => {
+            stall_the_unwind_if_asked();
+            Err(Error::new(GuestTimedOut { limit }))
+        }
     }
+}
+
+/// Test-only: hold the post-expiry path open past the grace so the SIGALRM
+/// fallback is the thing that ends the run.
+///
+/// ⚠️ THIS EXISTS BECAUSE THE FALLBACK COULD NOT BE MADE TO FIRE ANY OTHER WAY,
+/// AND AN UNEXERCISED SAFETY PATH IS THE FAILURE MODE THIS PROJECT KEEPS
+/// FINDING. Measured 2026-08-26 at this commit: the primary path fired at
+/// exactly the bound for a userspace spinner, a guest blocked reading a pipe
+/// with no writer, a guest that `SIGSTOP`s itself, an eight-thread guest
+/// ignoring `SIGTERM`, and a multi-process guest ignoring `SIGTERM` -- five
+/// shapes, five clean unwinds, no wedge. That is a good result for the primary
+/// path and it leaves the fallback with zero executions, which is exactly the
+/// mechanism-that-has-never-run shape.
+///
+/// ⚠️ WHAT THIS DOES AND DOES NOT REPRODUCE, stated precisely rather than
+/// implied. It reproduces the CONDITION the fallback is specified against --
+/// the post-expiry path not completing within `RUN_TIMEOUT_UNWIND_GRACE` -- and
+/// it exercises the real alarm, the real inherited-mask handling, the real
+/// handler, the real message and the real `_exit`. It does NOT reproduce any
+/// particular upstream CAUSE of a slow unwind, because none is known; the delay
+/// is here, after the drop, rather than inside a wedged destructor. A future
+/// reader must not read a passing fallback test as evidence that some specific
+/// teardown hang is handled.
+///
+/// Deliberately keyed off an environment variable named like the existing
+/// `HERMIT_INTERNAL_LITEINST_ACTIVATION_PROBE` rather than a `cfg(test)` gate:
+/// the fallback lives in the shipped binary and must be exercised there, not in
+/// a differently-compiled one.
+fn stall_the_unwind_if_asked() {
+    const STALL_ENV: &str = "HERMIT_INTERNAL_RUN_TIMEOUT_STALL_UNWIND";
+    if std::env::var_os(STALL_ENV).as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return;
+    }
+    // Comfortably past the grace, so the alarm -- not this sleep -- ends the
+    // process. If the fallback is broken this returns and the caller sees an
+    // ordinary timeout, which is what makes the test able to fail.
+    std::thread::sleep(RUN_TIMEOUT_UNWIND_GRACE + Duration::from_secs(5));
 }
 
 static RUN_TIMEOUT_MESSAGE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
@@ -2241,7 +2300,7 @@ extern "C" fn run_timeout_fallback_handler(_signal: libc::c_int) {
     // Exiting the namespace init tears down the container and its tracees.
     // SAFETY: _exit(2) is async-signal-safe and runs no Rust destructors --
     // which is precisely why this is the fallback and not the primary path.
-    unsafe { libc::_exit(124) }
+    unsafe { libc::_exit(HERMIT_DEADLINE_EXIT) }
 }
 
 struct RunTimeoutFallback {

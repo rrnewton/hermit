@@ -24,7 +24,7 @@ agreeing with each other.
 | `hermit run --timeout N` | **one hermit invocation** = one guest execution | the caller's argument | hermit drops the guest future and unwinds its own container | exit 124, `HERMIT_RUN_TIMEOUT class=run-timeout` |
 | hermit's unwind fallback | the same invocation, `N + 10s` | `RUN_TIMEOUT_UNWIND_GRACE` in `hermit-cli/src/lib.rs` | `_exit(124)` from a `SIGALRM` handler; no destructors | exit 124, `HERMIT_RUN_TIMEOUT_FALLBACK` |
 | `hermit record --record-timeout N` | one recording | the caller's argument | `_exit(124)` from a `SIGALRM` handler | exit 124 |
-| nextest `slow-timeout` | **one cargo test process**, which may invoke hermit zero or many times | `.config/nextest.toml`: 15s default, one named 30s override | `SIGTERM` to the test binary, 2s grace, then `SIGKILL` | wrapper exit 100, test named by nextest |
+| nextest `slow-timeout` | **one cargo test process**, which may invoke hermit zero or many times | `.config/nextest.toml`: 15s default, two named 30s overrides | `SIGTERM` to the test binary, 2s grace, then `SIGKILL` | wrapper exit 100, test named by nextest |
 | manifest cell `timeout_seconds` | **one manifest cell** | `tests/e2e/manifests/*.yaml`, per cell | `timeout --kill-after=10s Ns` around the cell command | exit 124 |
 | dagrun step `timeout` | **one DAG node**, i.e. a whole batch of cells or tests | `ci/dag/{portable,privileged}.json` | dagrun stops the step | node failure |
 | validate's nested limits | the validate run and its scope | `VALIDATE_GATE_TIMEOUT_SECONDS`, `HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS`, the scope, the node | see `ci/validate-timeout-layers-test.sh` | ladder `480 < 600 < 660 < 720` |

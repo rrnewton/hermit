@@ -7134,8 +7134,19 @@ mod scheduler_explanation_tests {
 
 #[cfg(test)]
 mod nextest_timeout_tests {
+    /// The per-test cap stays at 15s, and every exemption from it is named,
+    /// measured, and justified IN PLACE.
+    ///
+    /// ⚠️ WIDENED FROM ONE OVERRIDE TO TWO, DELIBERATELY AND WITHOUT WEAKENING.
+    /// This gate is a ratchet against exemptions accumulating quietly, so adding
+    /// one had to be a visible edit here rather than a silently passing config
+    /// change -- which is exactly what it did: the second override failed this
+    /// test first. It is now STRICTER than before, not looser: it pins both
+    /// filters and requires each override's justification text to be present, so
+    /// a third exemption still cannot appear without an author changing this
+    /// list and supplying a reason. The count alone was the weaker check.
     #[test]
-    fn nextest_uses_the_measured_default_and_one_named_override() {
+    fn nextest_uses_the_measured_default_and_only_named_justified_overrides() {
         let config = include_str!("../.config/nextest.toml");
         let timeouts: Vec<&str> = config
             .lines()
@@ -7147,14 +7158,28 @@ mod nextest_timeout_tests {
             vec![
                 "slow-timeout = { period = \"15s\", terminate-after = 1, grace-period = \"2s\" }",
                 "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
+                "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
             ],
-            "the per-test timeout must stay at 15s with exactly one measured 30s override"
+            "the per-test timeout must stay at 15s, with exactly the two measured \
+             30s overrides below and no others"
         );
+
+        // Override 1: the source-audit test that launches 12 Hermit processes.
         assert!(config.contains(
             "filter = \"test(/(^|::)every_record_container_site_classifies_a_child_fault_by_name$/)\""
         ));
         assert!(config.contains("12 separate Hermit processes"));
         assert!(config.contains("25.98-26.30s while passing"));
+
+        // Override 2: the cell that forces hermit's own `--timeout` SIGALRM
+        // fallback, whose runtime is the smallest expressible bound plus
+        // RUN_TIMEOUT_UNWIND_GRACE and therefore cannot be reduced without
+        // ceasing to exercise the shipped constant.
+        assert!(config.contains(
+            "filter = \"test(/(^|::)run_timeout_fallback_fires_when_the_unwind_does_not_finish$/)\""
+        ));
+        assert!(config.contains("RUN_TIMEOUT_UNWIND_GRACE"));
+        assert!(config.contains("11.2s"));
     }
 }
 

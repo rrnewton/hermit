@@ -41,6 +41,22 @@ max-threads = 1
 filter = "test(/(^|::)every_record_container_site_classifies_a_child_fault_by_name$/)"
 slow-timeout = { period = "30s", terminate-after = 1, grace-period = "2s" }
 
+# This cell forces hermit's `--timeout` SIGALRM fallback to fire, so its runtime
+# is a SUM OF TWO DELIBERATE CONSTANTS, not a measurement that might drift: the
+# smallest expressible bound (1s, the flag takes a NonZeroU64) plus
+# RUN_TIMEOUT_UNWIND_GRACE (10s, hermit-cli/src/lib.rs). It measured 11.2s inside
+# a 13.46s three-cell run. Against the 15s default that is a 1.36x margin, which
+# is how a correct bound becomes an intermittent red under load; 30s restores
+# real headroom without widening any other test.
+#
+# It cannot be made faster without making the grace itself configurable, which
+# would mean the cell no longer exercises the shipped constant. See
+# docs/TIMEOUT_LADDER.md -- an inner bound that is not comfortably smaller than
+# its outer bound is exactly the failure this override avoids.
+[[profile.default.overrides]]
+filter = "test(/(^|::)run_timeout_fallback_fires_when_the_unwind_does_not_finish$/)"
+slow-timeout = { period = "30s", terminate-after = 1, grace-period = "2s" }
+
 [[profile.default.overrides]]
 filter = "package(=hermit) & kind(=test)"
 test-group = "hermit-serialized"
