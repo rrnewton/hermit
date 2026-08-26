@@ -438,7 +438,33 @@ fn runner_flag_path(text: &str, path: &str) -> bool {
     ///   `-D` exits after dumping translatable strings without running it.
     /// Deliberately ABSENT: `-l -e -u -x -p -c`, every one of which RAN the
     /// script, so the token after them can be a genuine invocation.
-    const SHELL_VALUE_FLAGS: [&str; 4] = ["-o", "-O", "--rcfile", "-D"];
+    const SHELL_VALUE_FLAGS: [&str; 3] = ["-o", "-O", "--rcfile"];
+    /// Options after which the shell PARSES THE SCRIPT AND EXECUTES NOTHING.
+    ///
+    /// ⚠️ `-D` WAS IN THE VALUE TABLE ABOVE AND THAT ENCODED THE WRONG REASON.
+    /// It does not consume a value; bash documents it as implying `-n`, and `-n`
+    /// itself was modelled nowhere. Measured 2026-08-26 with a marker file rather
+    /// than by output, because both spellings exit 0 and print nothing:
+    ///
+    ///   bash    ./c.sh   marker PRESENT   <- control, it really ran
+    ///   bash -l ./c.sh   marker PRESENT
+    ///   bash -n ./c.sh   marker ABSENT    <- nothing executed
+    ///   bash -D ./c.sh   marker ABSENT    <- nothing executed
+    ///
+    /// A recipe may name a checker as the shell's INPUT while running none of its
+    /// checks. Reporting that as SCHEDULED is a false green in the silent
+    /// direction -- the one failure this file's docstring calls unacceptable.
+    /// Treating `-D` as value-taking got the single-flag case right by accident
+    /// and still failed on `bash -D -x <checker>`, because the "value" it ate was
+    /// the next FLAG and the scan then landed on the script.
+    const SHELL_NO_EXEC_FLAGS: [&str; 2] = ["-n", "-D"];
+
+    fn no_exec_flags_for(runner: &str) -> &'static [&'static str] {
+        match runner {
+            "bash" | "sh" => &SHELL_NO_EXEC_FLAGS,
+            _ => &[],
+        }
+    }
 
     fn value_flags_for(runner: &str) -> &'static [&'static str] {
         match runner {
@@ -456,15 +482,31 @@ fn runner_flag_path(text: &str, path: &str) -> bool {
                 continue;
             }
             let value_flags = value_flags_for(token);
+            let no_exec = no_exec_flags_for(token);
             let mut next = index + 1;
+            let mut executes = true;
             while next < tokens.len() && tokens[next].starts_with('-') {
+                let flag = tokens[next];
+                // Bundled short options are one token: `bash -nx <script>` parses
+                // and runs nothing exactly as `-n` does, so match on the letters.
+                let bundled = !flag.starts_with("--")
+                    && no_exec
+                        .iter()
+                        .any(|f| f.len() == 2 && flag[1..].contains(&f[1..]));
+                if no_exec.contains(&flag) || bundled {
+                    executes = false;
+                }
                 // A flag that takes a separate value consumes the token after it,
                 // so skip both. An attached form (`--edition=2021`, `-Dwarnings`)
                 // is a single token and is handled by the plain skip.
-                if value_flags.contains(&tokens[next]) {
+                if value_flags.contains(&flag) {
                     next += 1;
                 }
                 next += 1;
+            }
+            // The script is this runner's INPUT but nothing in it will run.
+            if !executes {
+                continue;
             }
             if next < tokens.len() && (tokens[next] == path || tokens[next] == dotted) {
                 return true;
@@ -493,7 +535,26 @@ fn runner_flag_path(text: &str, path: &str) -> bool {
 /// Erring toward a FALSE ORPHAN is the safe direction: it is loud and a human fixes
 /// it in one line, whereas a false "scheduled" is silent and defeats the guard.
 fn is_invoked(text: &str, path: &str) -> bool {
-    if text.contains(&format!("./{path}")) {
+    // ⚠️ THIS CLAUSE USED TO BE AN UNCONDITIONAL `text.contains("./{path}")`, AND
+    // BECAUSE IT RETURNS FIRST IT MADE EVERY LATER NARROWING UNREACHABLE FOR THE
+    // DOTTED SPELLING. `python3 -c ./scripts/check-z.py` and `bash -D ./x.sh` were
+    // both reported SCHEDULED however carefully the flag tables below were written:
+    // neither runner executes the file, and the flag tables never got to say so.
+    // Measured 2026-08-26 on main -- five spellings, every one a false SCHEDULED,
+    // which is the SILENT direction this guard exists to prevent.
+    //
+    // The narrowing is deliberately the smallest one that closes it: a dotted path
+    // still counts wherever it counted before, EXCEPT when a runner governs it in
+    // the same command, in which case the runner's own flag rules decide below.
+    // ⚠️ It is NOT routed through `invokes_on_line`, which would require the token
+    // to start a command -- `$(SUBMODULE_PROXY) ./ci/run-reverie-pin-check.sh` in
+    // the Makefile does not, and two genuinely scheduled checkers would have gone
+    // ORPHAN and turned main red.
+    let dotted = format!("./{path}");
+    if text
+        .lines()
+        .any(|line| line.contains(&dotted) && !dotted_is_runner_governed(line, &dotted))
+    {
         return true;
     }
     // `rustc` is a runner here too: ci/run-reverie-pin-check.sh COMPILES
@@ -549,6 +610,33 @@ fn is_invoked(text: &str, path: &str) -> bool {
 /// a line or follows a shell operator (`;`, `&`, `|`, `(`, backtick) or `$(`. A quote
 /// before it means the text is data -- an echoed diagnostic, or a fixture standing in
 /// for output. Erring toward FALSE ORPHAN stays the safe direction.
+/// Is every occurrence of `dotted` on this line governed by a RUNNER in the same
+/// command? If so the runner's flag rules decide whether the script is executed,
+/// so the caller must not short-circuit to "scheduled".
+///
+/// Segments split on `;`, `&`, `|`, `(` and a backtick, so a runner in an EARLIER
+/// command does not capture a later direct invocation: in
+/// `bash -n a.sh; ./scripts/check-z.sh` the second command has no runner and is a
+/// genuine invocation.
+fn dotted_is_runner_governed(line: &str, dotted: &str) -> bool {
+    const RUNNERS: [&str; 5] = ["python3", "python", "bash", "sh", "rustc"];
+    let mut from = 0;
+    let mut seen = false;
+    while let Some(hit) = line[from..].find(dotted) {
+        let at = from + hit;
+        seen = true;
+        let segment = line[..at]
+            .rsplit(|c| matches!(c, ';' | '&' | '|' | '(' | '`'))
+            .next()
+            .unwrap_or("");
+        if !segment.split_whitespace().any(|t| RUNNERS.contains(&t)) {
+            return false;
+        }
+        from = at + 1;
+    }
+    seen
+}
+
 fn invokes_on_line(line: &str, needle: &str) -> bool {
     let mut from = 0;
     while let Some(hit) = line[from..].find(needle) {
@@ -647,6 +735,71 @@ fn self_test() {
     assert!(
         !is_checker_path("scripts/lib/helper.sh"),
         "the population must not swallow libraries"
+    );
+
+
+    // ⚠️ NO-EXECUTION OPTIONS. `agent(codex-rev-2674)` and `agent(hermit-dbg)` each
+    // reproduced these independently against hermit#2674; both were live on main.
+    // A checker named as the shell's INPUT while nothing in it runs is a FALSE
+    // SCHEDULED -- silent, and the one failure this file must never have.
+    assert!(
+        !is_invoked("bash -n scripts/check-z.sh", "scripts/check-z.sh"),
+        "bash -n parses and executes nothing; that is not scheduled coverage"
+    );
+    assert!(
+        !is_invoked("bash -D scripts/check-z.sh", "scripts/check-z.sh"),
+        "bash -D implies -n, so nothing executes"
+    );
+    assert!(
+        !is_invoked("sh -n scripts/check-z.sh", "scripts/check-z.sh"),
+        "sh -n executes nothing either"
+    );
+    // ⚠️ THE COMBINATION IS WHY `-D` COULD NOT STAY IN THE VALUE TABLE. As a
+    // value-taking flag it ate the NEXT FLAG and the scan landed on the script.
+    assert!(
+        !is_invoked("bash -D -x scripts/check-z.sh", "scripts/check-z.sh"),
+        "a second flag after -D must not restore a false SCHEDULED"
+    );
+    assert!(
+        !is_invoked("bash -nx scripts/check-z.sh", "scripts/check-z.sh"),
+        "bundled short options are one token and -n still means no execution"
+    );
+
+    // ⚠️ THE DOTTED SPELLING, WHICH BYPASSED EVERY FLAG TABLE. The first clause of
+    // is_invoked returned on a bare `./<path>` substring, so these were SCHEDULED
+    // no matter what the tables said.
+    assert!(
+        !is_invoked("python3 -c ./scripts/check-z.py", "scripts/check-z.py"),
+        "python -c takes CODE; the dotted spelling must not bypass the flag table"
+    );
+    assert!(
+        !is_invoked("bash -D ./scripts/check-z.sh", "scripts/check-z.sh"),
+        "the dotted spelling must not bypass no-execution options either"
+    );
+
+    // ⚠️ CONTROLS THAT MUST KEEP PASSING, or the narrowing above has gone too far
+    // and turns genuinely scheduled checkers into ORPHANS.
+    assert!(
+        is_invoked("./scripts/check-z.sh", "scripts/check-z.sh"),
+        "a direct dotted invocation is still an invocation"
+    );
+    assert!(
+        is_invoked("$(SUBMODULE_PROXY) ./scripts/check-z.sh", "scripts/check-z.sh"),
+        "a make variable prefix is not a runner -- this is the real Makefile form, \
+         and requiring command position here would have RED-ed main"
+    );
+    assert!(
+        is_invoked("bash -c ./scripts/check-z.sh", "scripts/check-z.sh"),
+        "the shells EXECUTE the token after -c; this must stay scheduled"
+    );
+    assert!(
+        is_invoked("bash -l ./scripts/check-z.sh", "scripts/check-z.sh"),
+        "-l is a login shell and runs the script"
+    );
+    // A runner in an EARLIER command must not capture a later direct invocation.
+    assert!(
+        is_invoked("bash -n a.sh; ./scripts/check-z.sh", "scripts/check-z.sh"),
+        "segment scoping: the second command has no runner and genuinely runs it"
     );
 
     // Comment stripping is what separates a real invocation from a mention.
