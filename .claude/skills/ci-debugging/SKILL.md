@@ -59,13 +59,14 @@ be reported as such; they are not permission to weaken assertions.
 - A stale receipt, dirty worktree, wrong profile, skipped node, or zero-test run
   is an evidence defect. Repair the run rather than relabeling it green.
 
-For non-KVM determinism or parity failures, use `--verify-strict` and require a
-`--verify-json` verdict with `bitwise_parity: true`. That compares exit status,
-stdout, and stderr byte-for-byte and INFO events under `BitwiseInfoV1`, which
-retains numeric payloads while removing only wall-clock prefixes and
-ordinalizing host addresses. Default `--verify`, KVM's output-only fallback,
-and more aggressively normalized logs cannot establish L2 INFO parity; they
-may only help localize the first divergence.
+For determinism or parity failures on any backend, use `--verify-strict` and
+require a `--verify-json` verdict with `bitwise_parity: true` and nonzero
+compared INFO-message counts. That compares exit status, stdout, and stderr
+byte-for-byte and INFO events under `BitwiseInfoV1`, which retains numeric
+payloads while removing only wall-clock prefixes and ordinalizing host
+addresses. Default `--verify`, any output-only comparison, and more
+aggressively normalized logs cannot establish canonical full-observation
+parity; they may only help localize the first divergence.
 
 ## Requalify the final head once
 

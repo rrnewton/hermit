@@ -1,47 +1,38 @@
 ---
 name: hermit-debugging
-description: "Debug Hermit and Detcore test cells, validation failures, nondeterminism, hangs, syscall gaps, and scheduling from exact-SHA evidence and Hermit's logs before reading source. Use whenever a guest behaves unexpectedly, a check or --verify result is suspicious, a run hangs, or tests/DEBUGGING.md needs a current investigation entry."
+description: "Debug Hermit and Detcore nondeterminism from exact-SHA run evidence and Hermit's logs. Use when repeated guest runs disagree, --verify reports a divergence, or tests/DEBUGGING.md needs a current investigation entry."
 ---
 
 # Debugging Hermit Runs
 
-> **Don't break the demos.** If a fix touches a demo, verify the demo still runs
-> GREEN before landing — demo-touching commits require an adversarial green-demo
-> review, not just code-review.
-
-**Thesis: reach for hermit's logs before you reach for the source.** Detcore
+**Thesis: reach for Hermit's logs before you reach for the source.** Detcore
 emits a rich, structured trace of every scheduling decision, syscall, and
-virtual-time advance. Most "why did this diverge / hang / behave oddly?"
-questions are answered by reading that trace or diffing two of them — *not* by
-reading `scheduler.rs`. Read the code only once the log has told you *where* to
-look.
+virtual-time advance. Locate nondeterminism by finding the first divergent
+COMMIT or DETLOG record before reading `scheduler.rs`. Read the code only once
+the log has told you *where* to look.
 
 All commands below assume the repo root and the release binary
 `target/release/hermit` (use `target/debug/hermit` if that is what you built).
-On Meta devservers prefix network-touching commands with `with-proxy`.
 
 ## Establish what actually failed
 
-Start from one exact cell: lane, manifest bucket, test id, mode, and backend.
-Bind every observation to the full Hermit SHA and tree, the binary path,
-`binary_build_sha` and binary hash when available, `run_id`, UTC time,
+Start from the exact failing observation. For a manifest cell, record its lane,
+manifest bucket, test id, mode, and backend. For a direct `hermit run`, record
+the literal guest command and the applicable mode and backend; do not invent a
+manifest identity that the run does not have. Bind every observation to the
+full Hermit SHA and tree, the binary path, `binary_build_sha` and binary hash
+when available, `run_id`, the evidence source's timestamp,
 host/kernel/toolchain, exact command, working directory, environment, timeout,
 exit status, and retained result/log paths. If the binary may be stale, rebuild
 it in the checkout at that SHA before attributing behavior to the source. For a
 claimed regression, run the same bounded probe against a clean current-main
 control.
 
-Read existing evidence before rerunning. In a `dev-hermit` workspace, use the
-timestamped validate LEDGER and `ci-hub validate-status` for run-level evidence.
-Use `ci/compat-envelope/cells.json` for the cell's checked-in status,
-`last_tested`, measurement state, and pressure/validate observations; remember
-that this file is a projection and its own `projection.refreshed_at` and
-`rows_read` say whether it is current. If the optional `projection` block is
-absent, freshness is unknown; use the LEDGER rather than assuming the file is
-current. `last_tested` has no timestamp and cannot replace the LEDGER clock.
-Join run-level and per-cell evidence by `run_id` plus the full cell identity.
-Follow the artifact directory named by a non-PASS harness line for the typed
-result, verify report, captures, and logs.
+Read existing evidence before rerunning. For a manifest run, read the run-level
+`results.jsonl` first for the typed cell result. When the harness outcome names
+an artifact directory, follow it for the verify report, captures, and logs. Do
+not assume every non-PASS outcome has one: `HOST-INAPPLICABLE` may report only
+its reason.
 
 Keep the repository's outcomes distinct. `FAIL`, `ERROR`, `HOST-INAPPLICABLE`,
 `never-measured`, `measured-no-verdict`, a missing row, and an incomplete run do
@@ -54,44 +45,11 @@ Use the project's existing vocabulary and exact identifiers. If the repository
 has no established term for an observation, describe it in plain language; do
 not coin a new class or mechanism name.
 
-## Prove that the check observes its claim
-
-Before trusting a test, assertion, gate, watcher, or metric, ask: **can this
-check fail for the reason its name gives?** Trace its input through selection,
-execution, and verdict, then exercise both directions:
-
-1. State the exact behavior the check claims to distinguish.
-2. Prove the check is enabled, selected, schedulable, and reaches the relevant
-   assertion. A disabled/manual-only dependency, early return, skip, missing
-   backend, empty selection, or allowlist exemption is a coverage gap, not a
-   green result.
-3. Make one controlled mutation that violates the named property. Require the
-   check to fail at the intended assertion with the intended reason, rather than
-   during setup or for an unrelated error.
-4. Restore the property and require the positive control to pass after doing
-   real work. Inspect counts and typed rows so zero execution cannot pass.
-5. Check bounds arithmetically: the watcher's poll count, interval, startup
-   allowance, and outer timeout must permit the awaited event to occur.
-6. Check metric direction and denominator. Progress toward the stated goal must
-   move the metric in the direction its label implies, without dropping rows or
-   moving work outside the measured population.
-
-This catches the recurring failures seen in this project: a test asserting the
-opposite of its name, an assertion passing through the wrong path, a gate
-demanding a system that is disabled, a watcher whose own bound makes completion
-impossible, a checker exempted as unschedulable, and a metric that gets worse in
-meaning while its number improves. Treat each as a defect in the evidence until
-the negative control demonstrates otherwise. Never make a red check green by
-weakening an assertion, comparator, timeout, required population, or failure
-classification.
-
 ## Maintain `tests/DEBUGGING.md` as current state
 
 `tests/DEBUGGING.md` is the human-readable index of investigations that are
-active now. It complements rather than copies the immutable validate LEDGER and
-the per-cell metadata in `ci/compat-envelope/cells.json`. If the file does not
-yet exist, create it only when there is a current misbehavior to record and add
-its required `support-data` entry to
+active now. If the file does not yet exist, create it only when there is a
+current misbehavior to record and add its required `support-data` entry to
 `tests/e2e/manifests/inventory/test-files.json` in the same change.
 
 - Use one H1 heading for every current manifest `bucket` from
@@ -102,17 +60,18 @@ its required `support-data` entry to
   **currently** misbehaving. Use the manifest test id verbatim. If several
   mode/backend cells fail for that test, keep them in the same H2 and identify
   each complete cell separately.
-- Add evidence as timestamped H3 entries. Use UTC and the exact recorded outcome
-  (`PASS`, `FAIL`, `ERROR`, `HOST-INAPPLICABLE`, a typed verdict such as
-  `no_result`, or `mixed PASS/FAIL` for a repeated sample); do not invent a
-  replacement label. Record the full SHA and tree, cell, command and exit,
-  result class, first divergent coordinates when present, contention/host facts,
-  retained evidence paths, current hypothesis, what the observation ruled out,
-  and the next discriminating check. Link large logs; do not paste them into the
-  journal.
+- Add evidence as timestamped H3 entries. Preserve the timestamp reported by
+  the evidence source and use the exact per-run outcome (`PASS`, `FAIL`,
+  `ERROR`, `HOST-INAPPLICABLE`, or a typed verdict such as `no_result`); do not
+  invent a replacement label. For a repeated sample that contains both PASS and
+  FAIL observations, use the project's existing `flaky` classification and
+  record the PASS and FAIL counts separately. Record the full SHA and tree,
+  cell, command and exit, result class, first divergent coordinates when
+  present, contention/host facts, retained evidence paths, current hypothesis,
+  what the observation ruled out, and the next discriminating check. Link large
+  logs; do not paste them into the journal.
 - The journal describes the present investigation, not its archive. Git history
-  preserves removed prose; the validate LEDGER preserves run history; per-cell
-  metadata preserves the latest checked-in cell evidence.
+  preserves removed prose.
 
 Use this shape:
 
@@ -121,11 +80,11 @@ Use this shape:
 
 ## system-utils/mktemp-name
 
-### 2026-08-26T19:42:10Z — portable / verify / ptrace — FAIL
+### 2026-08-26T12:42:10-07:00 — portable / verify / ptrace — FAIL
 
 - Hermit: `<40-hex SHA>`; tree: `<40-hex tree>`; binary: `<path, binary_build_sha, sha256>`
 - Command: `<literal command>`; exit: `<status>`; contention: `<jobs/load>`
-- Evidence: `<validate run handle, result directory, verify report, log>`
+- Evidence: `<run handle, result directory, verify report, log>`
 - Observed: `<first divergent record/turn/syscall or last progress>`
 - Current explanation: `<what the evidence supports, in project vocabulary>`
 - Ruled out / next: `<negative result>; <next check that can distinguish causes>`
@@ -135,23 +94,24 @@ Use this shape:
 it is green and non-flaky. Do not leave a `resolved` section, tombstone, or old
 hypothesis in the live journal: stale failures read as current and are worse
 than no journal. A retry that fails and then passes is evidence of flakiness,
-not grounds for deletion. `cells.json` status alone is not enough. For a cell in
-the current selected plan, require its typed contract to pass in a complete
-exact-head validation run; a focused pass alone is not enough. For a manual or
-CI-disabled cell, require an exact-head typed probe that exercises its declared
-mode/backend contract; do not require promotion into ordinary validation merely
-to prune the journal. If the product gap that keeps it disabled still exists,
-the test is still misbehaving and its H2 stays.
+not grounds for deletion. For every cell named in the H2, require an exact-head
+typed result that exercises its declared mode/backend contract. A missing or
+untyped result, zero selected or executed tests, a stale binary, or a probe of a
+different mode/backend cannot justify deletion. If the product gap that keeps a
+cell disabled still exists, the test is still misbehaving and its H2 stays.
 
 For a previously flaky determinism cell, also require the same source and
 binary identity to complete a fixed-tree repeat sample with no FAIL, ERROR,
-`no_result`, timeout, or mixed outcomes (L4's 20 successful repetitions unless
-a stricter test-specific policy applies), and clear any corresponding
-measured-flaky registry entry under that registry's evidence rule. If any cell
-named in the H2 remains red, flaky, unobserved, or `no_result`, keep the H2 and
-update its newest timestamped entry. Do not delete the H2 until the check has
-also passed the negative- and positive-control requirements above; an
-untrustworthy green cannot prove that the misbehavior is gone.
+`no_result`, timeout, or other non-PASS observation: 20 successful repetitions
+unless a stricter test-specific policy applies. If any cell named in the H2
+remains red, flaky, unobserved, or `no_result`, keep the H2 and update its newest
+timestamped entry.
+
+While the journal exists, retain every current bucket H1 even when that bucket
+has no H2. When the last H2 in the whole file is deleted, delete
+`tests/DEBUGGING.md` and its `support-data` entry from
+`tests/e2e/manifests/inventory/test-files.json` in the same change. Do not keep
+an all-empty journal: it would imply that a current investigation exists.
 
 ## 0. First move, always
 
@@ -275,7 +235,7 @@ elapsed-time fields makes it a diagnostic aid only. The final fix must
 produce `bitwise_parity: true` through `--verify-json`, with nonzero compared
 INFO-message counts. Apply the same requirement to KVM; backend capability or
 output/status repeatability alone is not evidence that a particular KVM cell
-reached L2.
+reached canonical full-observation parity.
 
 ```bash
 target/release/hermit --log info run -- <program> 2>/tmp/a.log
@@ -306,10 +266,7 @@ but a syscall returned different data — an unvirtualized source.
 | --- | --- | --- |
 | First diff is a `COMMIT` line — different `(turn, dettid)` order between runs | **Thread-interleaving nondeterminism.** Often from `--no-sequentialize-threads`, or a futex/blocking-IO race. | `detcore/src/scheduler.rs`; check for relaxation flags. |
 | DETLOG syscall result differs; value looks like a live host reading (time, meminfo, rand) | **Unvirtualized time / entropy source** falling through to the host. | `detcore/src/time.rs`, the relevant `detcore/src/syscalls/` handler. |
-| `WARN`/`ERROR` "unsupported syscall" or a syscall returning `ENOSYS` unexpectedly | **Unhandled syscall falling through.** Add `--panic-on-unsupported-syscalls` to make it fatal + get a backtrace. | `detcore/src/syscalls/`. |
 | `cpuid` in the trace and behavior varies by host | **CPUID leaking real hardware.** Try `--no-virtualize-cpuid` to confirm it's CPUID-related; the host may lack CPUID faulting. | `detcore/src/cpuid.rs`. |
-| Run *hangs* with no forward progress; last lines are `[sched-step*]` / quiescence waits | Scheduler waiting on a wakeup that never causally pairs (e.g. FIFO open rendezvous), **or** a long syscall-free loop being precise-preemption single-stepped (slow, not hung). | `detcore/src/scheduler.rs`; try `--debug-futex-mode polling`. |
-| `--verify` aborts before run 2 | Run 1 exited via a **signal** (verify needs a clean exit to compare two runs). | Use plain `--strict` x3 instead. |
 
 ## 4. Debugging-specific CLI flags
 
@@ -317,45 +274,25 @@ Global (before the subcommand): `--log`, `--log-file`, `--backend <ptrace|dbt|kv
 
 On `run` (see `hermit run --help`), the internal/debug flags:
 
-- `--panic-on-unsupported-syscalls` — turn a silent fallthrough into a fatal
-  error with a backtrace (debugging detcore itself; do not use in production).
 - `--stacktrace-event <index[,path]>` — print the guest stack at a given
   schedule event; pairs with record/replay.
 - `--preemption-stacktrace[-log-file <f>]` — dump a stack at each preemption
   (chaos mode).
-- `--debug-futex-mode <precise|polling|external>` — switch the futex model when
-  diagnosing a futex-related hang.
 - `--debug-externalize-sockets` — treat all sockets as external/nondeterministic
   to isolate socket-driven nondeterminism.
 - `--detlog-heap` / `--detlog-stack` — log hashes of heap/stack maps for
-  memory-determinism (L3) checking.
+  memory-determinism checking.
 - `--stop-after-turn <N>` / `--stop-after-iter <N>` — halt after a scheduler
   turn/loop iteration (requires `--sequentialize-threads`) to bisect a schedule.
 - `--imprecise-timers` / RCB-count knobs — change how logical time is derived
   when the PMU is unavailable or noisy.
-- `--gdbserver` — start a gdbserver for remote debugging.
 
 Higher-level analysis subcommands: `hermit log-diff` (above),
 `hermit analyze` (analyze passing vs failing runs), and `hermit bisect`
 (`--good <schedule> --bad <schedule>` to localize a race between two recorded
 schedules).
 
-## 5. Assurance ladder (name the level you reached)
-
-Per `AGENTS.md`, never say "works". State the level, backend, log level, and
-relaxations:
-
-- **L1** deterministic: `hermit run --strict` completes.
-- **L2** canonical full-observation parity:
-  `hermit run --strict --verify --verify-strict --verify-json <path> -- ...`,
-  with JSON `bitwise_parity: true` and nonzero compared INFO-message counts.
-- **L3** memory determinism: add `--detlog-heap --detlog-stack` to L2.
-- **L4** stress-hardened: L2/L3 repeated 20 times with no divergence.
-
-Example of a correct report: "passes at L2 (ptrace backend, `--log` default,
-relaxations: none)".
-
-## 6. Source-code map (read *after* the log points you here)
+## 5. Source-code map (read *after* the log points you here)
 
 - `detcore/src/scheduler.rs` — the sched loop; `[scheduler]`, `[sched-step*]`,
   and COMMIT emission (`info!`/`debug!`/`trace!`). The COMMIT point is step 4.
@@ -368,3 +305,27 @@ relaxations: none)".
 - `detcore/src/tool_local.rs` / `tool_global.rs` — per-task events vs shared
   deterministic state (they talk over RPC).
 - `docs/Developers/Architecture.md` — architecture overview.
+
+## If in a `dev-hermit` multi-worktree space
+
+This section is optional. The Hermit debugging method above does not assume the
+parent repository or its coordination tools.
+
+- For a red validation receipt or failed DAG node, start with
+  [`ci-debugging`](../ci-debugging/SKILL.md). Use this skill when that
+  investigation reaches the behavior of a guest run.
+- Use the timestamped validate LEDGER and `ci-hub validate-status` for run-level
+  evidence. Use `ci/compat-envelope/cells.json` for the cell's checked-in
+  status, `last_tested`, measurement state, and pressure/validate observations;
+  its optional `projection.refreshed_at` and `rows_read` fields say whether the
+  projection is current. If the projection block is absent, freshness is
+  unknown. Join run-level and per-cell evidence by `run_id`, full cell identity,
+  source SHA, and binary identity.
+- Journal pruning does not authorize changing
+  `ci-hub/validate/flaky-cells.json`. That registry is keyed by validate DAG-node
+  names rather than manifest cell identities, and it defines how to add entries
+  but not how to remove them. If an entry appears stale, record the exact node
+  mapping and evidence in a separate TaskGraph task. Never remove a registry
+  entry because one `tests/DEBUGGING.md` H2 became green.
+- Use TaskGraph for durable coordination. On Meta devservers, prefix commands
+  that need the public internet with `with-proxy`.
