@@ -1893,13 +1893,20 @@ fn run_kvm_executes_dynamic_guest() {
 /// same run with the bit already set -- was deterministic, which is the whole
 /// demonstration.
 ///
+/// ⚠️ THE `run_kvm_` PREFIX IS LOAD-BEARING, NOT DECORATION. `ci/dag/privileged.json`
+/// selects this suite with `-E 'test(/^run_kvm_/)'`, and that is the only lane with
+/// /dev/kvm. Without the prefix the test is selected on PORTABLE instead, where there
+/// is no /dev/kvm, so its own guard returns early and it reports a silent pass -- the
+/// twenty-third instance of the hazard that node's own description warns about. The
+/// name is what schedules it.
+///
 /// ⚠️ THIS DRIVES THE BIT DIRECTLY RATHER THAN THROUGH awk, AND THAT IS THE
 /// POINT. `run_kvm_awk_mincore_probe_terminates` catches this only by accident,
 /// because awk happens to set the flag conditionally; a future awk that always
 /// set it, or never did, would leave that test green with the defect present.
 /// This guest states the property it is testing.
 #[test]
-fn verify_is_deterministic_when_the_guest_mutates_hermit_stderr_flags() {
+fn run_kvm_verify_is_deterministic_when_the_guest_mutates_hermit_stderr_flags() {
     if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/awk").exists() {
         return;
     }
