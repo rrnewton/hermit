@@ -49,6 +49,7 @@ use reverie::process::Namespace;
 use reverie::process::Output;
 
 use super::container::IdentityGuard;
+use super::container::PolicyRefusal;
 use super::container::apply_affinity;
 use super::container::default_container;
 use super::container::identity_hardening_mounts;
@@ -2628,6 +2629,14 @@ impl RunOpts {
         // preprocessor and probes its ptrace runtime and tool separately.
         self.validate_mount_sources()?;
         self.validate_program()?;
+        // ⚠️ HERE, NOT IN `run()`. The DBT arm below RETURNS `run_dbt(..)` and
+        // never reaches `RunOpts::run`, so a check placed there covers every
+        // backend except the one measured furthest from working. Same shape as
+        // the `--namespace-only` second launch path documented in `run()`: the
+        // first placement worked and was not yet complete. Measured: with the
+        // check in `run()`, `--backend dbt --timeout 3` still accepted the flag
+        // and ran unbounded.
+        self.ensure_timeout_supported()?;
         if self.hb_list_events {
             return self.list_happens_before_events();
         }
@@ -4074,6 +4083,55 @@ impl RunOpts {
     fn run_timeout(&self) -> Option<Duration> {
         self.timeout
             .map(|seconds| Duration::from_secs(seconds.get()))
+    }
+
+    /// Refuse `--timeout` on a backend where it has not been shown to bound the
+    /// run, instead of accepting a flag that does nothing.
+    ///
+    /// ⚠️ MEASURED PER BACKEND, 2026-08-26, `--timeout 3` against a guest that
+    /// never exits, two runs each and reproducible:
+    ///
+    /// | backend    | elapsed | marker                        |
+    /// |------------|---------|-------------------------------|
+    /// | `ptrace`   | 3s      | `class=run-timeout`           |
+    /// | `liteinst` | 3s      | `class=run-timeout`           |
+    /// | `kvm`      | 13s     | `HERMIT_RUN_TIMEOUT_FALLBACK` |
+    /// | `sabre`    | 40s     | none -- killed by the harness |
+    /// | `dbt`      | 20s     | none -- killed by the harness |
+    ///
+    /// `sabre` and `dbt` DID NOT BOUND THE RUN AT ALL: the elapsed times are the
+    /// outer harness's own deadline, and the absence of a marker is precisely
+    /// the "exit 124 with no marker means no inner bound fired" reading in
+    /// docs/TIMEOUT_LADDER.md. Both run fine WITHOUT the flag, so this is the
+    /// bound failing, not the backend. `sabre` additionally panicked in
+    /// reverie's blocking RPC transport after 69 seconds.
+    ///
+    /// `kvm` is excluded for a different and softer reason: it does bound the
+    /// run, but ONLY through the hard `_exit` fallback, ten seconds late and
+    /// with no unwind. Allowing it would mean the marker that is supposed to
+    /// mean "the unwind failed" fires on every single KVM timeout, which
+    /// destroys the signal the marker exists to carry. Qualify it by finding out
+    /// why the runtime never reaches the timer, not by widening this list.
+    ///
+    /// Fail-closed, so a NEW backend must be qualified deliberately rather than
+    /// inheriting a guarantee nobody measured for it.
+    fn ensure_timeout_supported(&self) -> Result<(), Error> {
+        if self.timeout.is_none() {
+            return Ok(());
+        }
+        let backend = self.runtime_backend();
+        if matches!(backend, Backend::Ptrace | Backend::Liteinst) {
+            return Ok(());
+        }
+        Err(Error::new(PolicyRefusal).context(format!(
+            "--timeout is not qualified on the `{backend:?}` backend and hermit will not \
+             accept a bound it cannot enforce. Measured 2026-08-26 with `--timeout 3` on a \
+             guest that never exits: ptrace and liteinst stopped at 3s and reported \
+             `class=run-timeout`; kvm stopped only via the hard fallback at 13s; sabre and \
+             dbt did not stop the run at all. Use an outer bound (the cell's \
+             `timeout_seconds`, or `bin/safehermit --sh-deadline`) on this backend, and see \
+             docs/TIMEOUT_LADDER.md."
+        )))
     }
 
     fn run_in_container(
