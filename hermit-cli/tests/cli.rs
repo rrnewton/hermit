@@ -4803,6 +4803,18 @@ fn sigint_instakill_reports_a_signal_death_not_a_policy_refusal() {
         Some(detcore_model::HERMIT_SIGINT_DEATH_EXIT),
         "sigint_instakill must report 128 + SIGINT, not a policy refusal\nstderr:\n{stderr}"
     );
+    // ⚠️ THE MARKER, NOT ONLY THE CODE, AND THE PAIR IS THE POINT. Asserting
+    // exit 130 alone leaves the marker free to disappear: every value in
+    // `0..=255` is a legal guest status, which is exactly why this change
+    // introduced a marker at all. agent(hermit-007)'s codex lane proved the gap
+    // by mutation -- the producer mutation failed this test, but a MARKER-only
+    // mutation left it green, so the machine-readable half was unpinned. That is
+    // the same shape as the defect this PR exists to fix: an outcome
+    // distinguishable only by a channel nobody checks.
+    assert!(
+        stderr.contains("HERMIT_SIGNAL_DEATH"),
+        "a signal death must be machine-readable as one, not only exit 130\nstderr:\n{stderr}"
+    );
     assert!(
         !stderr.contains("HERMIT_POLICY_REFUSAL"),
         "an operator interrupt is not a policy refusal -- hermit refused nothing\n{stderr}"
