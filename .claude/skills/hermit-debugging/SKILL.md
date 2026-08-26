@@ -292,7 +292,32 @@ Higher-level analysis subcommands: `hermit log-diff` (above),
 (`--good <schedule> --bad <schedule>` to localize a race between two recorded
 schedules).
 
-## 5. Source-code map (read *after* the log points you here)
+## 5. Report validation levels precisely
+
+- **L1:** `hermit run --strict` exits 0 for one fail-closed execution. One run
+  does not establish repeatability.
+- **L2:** two strict runs on the same backend have identical exit status,
+  stdout, stderr, and canonical INFO events. Current evidence requires
+  `hermit run --strict --verify --verify-strict --verify-json <path> -- ...`,
+  JSON `bitwise_parity: true`, and nonzero compared INFO-message counts. L2 is
+  not cross-backend parity; `Parity vs ptrace` is a separate axis.
+- **L3:** L2 with `--detlog-heap --detlog-stack`, so heap and stack hashes are
+  also compared between the two runs. L2 can pass while L3 fails.
+- **L4:** run the stated L2 or L3 command 20 times and require 20/20 successful
+  repetitions. State whether L2 or L3 was repeated; an L4 record that omits
+  that fact is ambiguous.
+
+The evidence accepted for L2 changed on 2026-08-05 in
+https://github.com/rrnewton/hermit/commit/806b6766551dd23b6549e8d56b76419164665bf7,
+and remaining documentation was corrected on 2026-08-12 in
+https://github.com/rrnewton/hermit/commit/d2790d99d7f96363283ca9287ed79217d3503a4f.
+Pre-2026-08-05 L2 records attest the old bare-`--verify` definition unless their
+retained evidence independently satisfies the current requirements. KVM became
+eligible for the same L2 evidence on 2026-08-25 in
+https://github.com/rrnewton/hermit/commit/50794c05b1a020240759d6afeaa9f14ee5ba8f29;
+that did not make cross-backend parity part of L2.
+
+## 6. Source-code map (read *after* the log points you here)
 
 - `detcore/src/scheduler.rs` — the sched loop; `[scheduler]`, `[sched-step*]`,
   and COMMIT emission (`info!`/`debug!`/`trace!`). The COMMIT point is step 4.
