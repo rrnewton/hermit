@@ -4815,6 +4815,18 @@ fn sigint_instakill_reports_a_signal_death_not_a_policy_refusal() {
         stderr.contains("HERMIT_SIGNAL_DEATH"),
         "a signal death must be machine-readable as one, not only exit 130\nstderr:\n{stderr}"
     );
+    // ⚠️ AND THE OPERATOR-FACING HALF, WHICH IS A SEPARATE CHANNEL FROM THE MARKER.
+    // agent(hermit-dbg) withdrew an approval over this and proved it with a
+    // DIFFERENT mutation than the marker one: gutting `SignalDeath`'s `Display` to
+    // `write!(f, "")` leaves the marker intact, so a test checking only
+    // `HERMIT_SIGNAL_DEATH` stays green while the sentence the operator actually
+    // reads disappears. Two halves, two mutations, two assertions -- the machine
+    // channel and the human channel fail independently.
+    assert!(
+        stderr.contains("not a hermit failure and not a refusal"),
+        "the operator must be told this was not a hermit failure; the marker alone is \
+         machine-readable but says nothing to a person\nstderr:\n{stderr}"
+    );
     assert!(
         !stderr.contains("HERMIT_POLICY_REFUSAL"),
         "an operator interrupt is not a policy refusal -- hermit refused nothing\n{stderr}"
