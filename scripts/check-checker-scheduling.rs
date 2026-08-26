@@ -103,11 +103,19 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ),
 ];
 
-/// Is this tracked path a checker entrypoint by convention?
+/// Is this tracked path a checker entrypoint?
 fn is_checker_path(path: &str) -> bool {
-    CHECKER_PREFIXES.iter().any(|pre| path.starts_with(pre))
+    CHECKER_PATHS.contains(&path)
+        || CHECKER_PREFIXES.iter().any(|pre| path.starts_with(pre))
         || CHECKER_SUFFIXES.iter().any(|suf| path.ends_with(suf))
 }
+
+/// Checker entrypoints whose filenames do not match the repository conventions.
+///
+/// Keep this exact rather than treating every `*-probe.rs` as a checker: most probes
+/// are tools, while `bisect-probe.rs --self-test` is the assertion-bearing entrypoint
+/// that `lint-checks` must run.
+const CHECKER_PATHS: &[&str] = &["scripts/bisect-probe.rs"];
 
 /// Directory/prefix pairs that identify a checker entrypoint by convention.
 const CHECKER_PREFIXES: &[&str] = &[
@@ -985,6 +993,10 @@ fn self_test() {
         is_checker_path("ci/test_audit_test_binary_registration.py"),
         "ci/test_ must be recognised, as scripts/test_ already was"
     );
+    assert!(
+        is_checker_path("scripts/bisect-probe.rs"),
+        "bisect-probe --self-test must stay in the checker population"
+    );
     // ⚠️ AND THE LIMIT, MEASURED RATHER THAN ASSUMED. Widening the population to every
     // tracked executable under scripts/ and ci/ was measured 2026-08-26 at 32 checkers
     // scheduled by NOTHING -- runners, libraries and probes, not checkers. That is a
@@ -993,6 +1005,10 @@ fn self_test() {
     assert!(
         !is_checker_path("scripts/lib/helper.sh"),
         "the population must not swallow libraries"
+    );
+    assert!(
+        !is_checker_path("scripts/other-probe.rs"),
+        "one self-testing probe must not make every probe a checker"
     );
 
     // Comment stripping is what separates a real invocation from a mention.
