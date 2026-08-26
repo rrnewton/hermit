@@ -266,6 +266,18 @@ fn main() {
 /// and verify by MUTATION that removing the shape fails your new case -- a test
 /// that passes both ways pins nothing.
 ///
+/// ⚠️ AND FOR A WINDOW, SWEEP THE RANGE -- ONE MUTATION IS NOT ENOUGH. Three of
+/// these cases were written far from the boundary they guard, so each caught only
+/// the most extreme narrowing and left every intermediate value green: the
+/// forward window passed at `i + 6` down to `i + 2`, the downward declaration
+/// window at `i + 3` through `i + 7`, the upward one at `i - 4` through `i - 6`.
+/// Each assertion message named a range the fixture did not hold.
+/// `agent(hermit-007)`'s codex lane found the first by sweeping instead of
+/// spot-checking; the other two came out of the same sweep. **A boundary test
+/// belongs ON the boundary** -- at the nearest position the window excludes -- so
+/// that any change to it fails. All four windows are now swept end to end and
+/// every step fails.
+///
 /// If you are here because a test failed after you edited the matcher: that is
 /// the test working. Decide whether the shape should still be caught, and if it
 /// should not, delete the case DELIBERATELY and say why in the commit.
@@ -381,12 +393,23 @@ mod tests {
 
     #[test]
     fn a_declaration_far_above_the_site_does_not_satisfy_it() {
+        // ⚠️ FOUR LINES ABOVE, NOT SIX, AND THE DISTANCE IS THE TEST. `clo =
+        // i - 3` admits from `i - 3`, so `i - 4` is the nearest position it
+        // excludes. At six lines this passed with `clo` widened to `i - 4`,
+        // `i - 5` and `i - 6` -- it caught only a widening past six. Third
+        // instance of the boundary-test-off-the-boundary defect in this module,
+        // found by sweeping the range after `agent(hermit-007)`'s codex lane
+        // found the first.
         let mut body = String::from("// EXIT-CLASS: guest\n");
-        for _ in 0..6 {
+        for _ in 0..3 {
             body.push_str("// filler\n");
         }
         body.push_str("assert_eq!(output.status.code(), Some(1));");
-        assert_eq!(count(&body), 1, "a distant declaration must not carry");
+        assert_eq!(
+            count(&body),
+            1,
+            "a declaration above the site must not carry"
+        );
     }
 
     // ---- the exemption is exactly one file, and it is load-bearing -----------
@@ -464,8 +487,21 @@ mod tests {
     /// `i + 1` untouched. This is expected-first ordering, which is ordinary Rust.
     #[test]
     fn catches_the_status_mention_below_the_value() {
+        // ⚠️ THE STATUS MENTION IS SIX LINES BELOW THE VALUE, AND THE PADDING IS
+        // THE TEST. A fixture with the mention one line below still passes with
+        // `hi` collapsed to `i + 2`, so it caught only the jump to `i + 1` and the
+        // assertion message claimed a range it did not hold -- measured by
+        // agent(hermit-007) and reproduced: `i + 6` through `i + 2` all stayed
+        // green. That is this module's own defect recurring inside its fix, which
+        // is why the distance is now the largest the window admits: any narrowing
+        // below `i + 7` drops the mention out of the window and fails here.
         let body = r#"assert_eq!(
     Some(1),
+    //
+    //
+    //
+    //
+    //
     output.status.code(),
 );"#;
         assert_eq!(count(body), 1, "the forward window must stay >= 6 lines");
@@ -475,13 +511,25 @@ mod tests {
     /// `a_declaration_far_above_the_site_does_not_satisfy_it` pins only the
     /// upward side, so widening `chi` downward let a distant declaration satisfy
     /// a site it does not describe.
+    ///
+    /// ⚠️ THE DECLARATION SITS AT THE NEAREST POSITION THE WINDOW EXCLUDES, WHICH
+    /// IS THE WHOLE POINT. `chi = i + 2` admits through `i + 1`, so a declaration
+    /// at `i + 2` is the first one outside. Putting it further away — this case
+    /// used seven lines — catches only a widening past seven and leaves `i + 3`
+    /// through `i + 7` green. That is the same defect
+    /// `agent(hermit-007)`'s codex lane found in the forward-window case above,
+    /// and sweeping the range rather than testing one point is what found this
+    /// second instance. A boundary test belongs ON the boundary.
     #[test]
     fn a_declaration_far_below_the_site_does_not_satisfy_it() {
         let mut body = String::from("assert_eq!(output.status.code(), Some(1));");
-        for _ in 0..7 {
-            body.push('\n');
-        }
+        body.push('\n');
+        body.push('\n');
         body.push_str("// EXIT-CLASS: guest");
-        assert_eq!(count(&body), 1, "a distant declaration must not carry");
+        assert_eq!(
+            count(&body),
+            1,
+            "a declaration below the site must not carry"
+        );
     }
 }
