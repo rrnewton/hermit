@@ -274,6 +274,14 @@ before reading source:
 - Prefer the smallest guest that reproduces the issue; the `tests` and
   `flaky-tests` members already contain minimal time, futex, pipe, signal, and
   scheduling programs to start from.
+- **If a run was KILLED rather than failing, read
+  [docs/TIMEOUT_LADDER.md](docs/TIMEOUT_LADDER.md) before changing any timeout.**
+  Several nested mechanisms can stop a run and they do not bound the same
+  quantity, so the same number means different things at different rungs. Five
+  of them exit **124**, which is why the exit code cannot tell you which one
+  fired and the stderr class line is the contract instead. Bound `N` at an inner
+  rung that is not strictly smaller than its outer rung is dead configuration
+  that reads as protection, and it presents as an intermittently killed test.
 
 When a symptom depends on PMU access, CPUID interception, or specific CPU
 features, capture the host environment in the report; those are host

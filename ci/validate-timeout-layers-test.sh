@@ -8,6 +8,14 @@
 # Live, on-demand bracket for validate's nested wall-time limits. This is not a
 # default portable test: it deliberately requires a working systemd --user
 # manager and cgroup-v2 delegation so a configuration-only pass is impossible.
+#
+# This checks the FOUR validate rungs. The full ladder has more rungs than these
+# -- hermit's own `run --timeout`, the nextest per-test cap, the manifest cell
+# `timeout_seconds`, the dagrun step timeout, and safehermit's cgroup deadline --
+# and they do NOT bound the same quantity. Before changing any timeout anywhere,
+# read docs/TIMEOUT_LADDER.md: it says what each rung bounds, why the exit code
+# cannot tell you which one fired, and the strict-inequality invariant that makes
+# an inner bound dead configuration when it is set too high.
 
 set -euo pipefail
 
