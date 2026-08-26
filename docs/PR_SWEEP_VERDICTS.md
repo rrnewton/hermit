@@ -2293,3 +2293,61 @@ lies -- it is that the question a reviewer is asking is one step further on than
 the question the field answers.** So the check is the same in all four cases:
 name the question you actually need answered, and confirm the field answers
 *that* one, rather than one adjacent to it.
+
+### 22. Run the merge gate by hand, because nothing else runs it
+
+⚠️ **`scripts/core-review-protocol-lint.sh` enforces the `post-facto-human-review`
+protocol and executes in NO job.** Not a workflow, not a Makefile recipe, not a DAG
+node. Measured 2026-08-26: a tree-wide search for `core-review-protocol-lint`
+returns exactly two files — `.github/workflows/merge-gate.yml`, whose `on:` block
+contains only `workflow_dispatch:` and therefore cannot fire on a pull request, and
+the gate's own test. Its only production caller is the one workflow that cannot
+trigger.
+
+**It is not dead code. It works, and it would have refused most of a night's core
+changes.** Of 240 pull requests merged from 2026-08-25, twelve carried
+`post-facto-human-review`. Driven from their real labels and bodies:
+
+| outcome | count | pull requests |
+| --- | --- | --- |
+| would have been BLOCKED | **9 of 12** | #2568 #2517 #2486 #2434 #2407 #2312 #2236 #2172 #2150 |
+| would have passed | 3 | #2534 #2373 #2370 |
+
+Seven of the nine failed on **missing or incomplete adversarial review**, not on
+prose: five had *no claude round label at all*, four had *no codex round label at
+all*, and two had a review that ran whose approval label was gone — the case the
+gate itself describes as "it approved an earlier revision and a later push
+invalidated the label". Only two of the nine failed on body sections alone.
+
+**So run it yourself, before you bind a lane on a labelled head or land one.** It
+takes about a second and needs no infrastructure:
+
+```console
+PR_NUMBER=<n> \
+PR_LABELS="$(gh pr view <n> --json labels -q '.labels[].name')" \
+PR_BODY="$(gh pr view <n> --json body -q .body)" \
+  ./scripts/core-review-protocol-lint.sh
+```
+
+Exit 0 means satisfied *or* the head is not labelled; exit 1 means the protocol is
+violated and landing should be blocked; exit 2 is usage or internal error, which is
+**not** a pass.
+
+⚠️ **THIS HOLDS ONLY WHERE AGENTS HOLD IT, AND YOU SHOULD READ IT THAT WAY.** There
+is no workflow behind it, no required status check behind that, and `main` has no
+branch protection — the one ruleset named for check gating has been empty since
+2026-08-09. A raw `gh pr merge` bypasses every word of this section. It is a
+convention, and its failure mode is silent: the first person who skips it merges
+successfully and nothing anywhere reports that a step was missed. Write down that
+you ran it, in the lane, so the next reader can tell "ran and passed" from "nobody
+looked".
+
+⚠️ **AND DO NOT ARM IT UNILATERALLY.** Re-adding a `pull_request` trigger would
+contradict the standing directive that CI must not run automatically, and a trigger
+without a `required_status_checks` rule — or a rule without a trigger — gives you
+one of the two failure modes rather than a gate: **a check that gates nothing, or a
+requirement nothing can satisfy.** Both layers or neither, and that pairing is an
+owner ruling. The asymmetry that makes it a ruling rather than a task: this
+convention fails **open, per pull request**, and is recoverable by fix-forward;
+enforcement fails **closed, repo-wide, at once**, and with no bypass actor
+configured it is recoverable only by editing repository settings.
