@@ -83,11 +83,34 @@ pub fn truncated(width: usize, mut s: String) -> String {
 /// would busy-spin against a full pipe, so it blocks in `poll(POLLOUT)`.
 pub struct RetryingStderr;
 
+/// Total wall-clock a single diagnostic write may spend waiting for a reader.
+///
+/// ⚠️ WITHOUT A CEILING THIS LOOP NEVER ENDS, AND IT RUNS WHILE HERMIT IS ALREADY
+/// FAILING. `EAGAIN` -> `poll(POLLOUT, 1s)` -> retry is correct for a reader that
+/// is SLOW and unbounded for a reader that is STOPPED. Measured 2026-08-26 on a
+/// 4096-byte pipe filled to 3900 with `O_NONBLOCK` set, where nothing ever reads:
+///
+/// ```text
+///   before RetryingStderr (eprintln!)   EXITED rc=101 immediately
+///   RetryingStderr, no ceiling          STILL RUNNING after 25s, no exit
+/// ```
+///
+/// The first is wrong loudly; the second does not return at all, on the path that
+/// reports why hermit is stopping. A supervisor that hangs while reporting an
+/// error is harder to diagnose than one that dies reporting it badly.
+///
+/// Five seconds is far above any real drain and far below "never". On expiry the
+/// write returns `WouldBlock`, `writeln!` gives up, the caller's `let _ =` drops
+/// that line, and hermit exits — which is the pre-existing contract for a
+/// diagnostic that cannot be delivered.
+const STDERR_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl std::io::Write for RetryingStderr {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
+        let started = std::time::Instant::now();
         loop {
             // SAFETY: `write(2)` on fd 2 reads `buf.len()` bytes from `buf`,
             // which is valid for that length, and writes no memory.
@@ -99,6 +122,12 @@ impl std::io::Write for RetryingStderr {
             match err.kind() {
                 std::io::ErrorKind::Interrupted => continue,
                 std::io::ErrorKind::WouldBlock => {
+                    // ⚠️ BOUNDED. Waiting for a slow reader is the point; waiting
+                    // for a stopped one is a hang on hermit's exit path. Give up
+                    // and let the caller drop the line rather than never return.
+                    if started.elapsed() >= STDERR_WRITE_DEADLINE {
+                        return Err(err);
+                    }
                     // Block until the reader makes room. A failed or timed-out
                     // poll falls through to another write attempt rather than
                     // dropping the bytes.
