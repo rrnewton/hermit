@@ -8228,15 +8228,29 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     // retry round 2. The explicit latest-unreported set must carry
     // `multi_missing` into that round, where both nodes actually pass. Looking
     // only at cumulative `by_tag` would omit it and strand the lane incomplete.
+    // The prerequisite's dependent writes the FIFO only after the scheduler has
+    // recorded the prerequisite as complete. Waiting on that write keeps the
+    // first failure from racing a fixed delay against prerequisite completion.
     let multi_missing_log = tmp.join("multi-round-missing.log");
     let multi_missing_first = tmp.join("multi-round-missing-first");
     let multi_trigger_first = tmp.join("multi-round-trigger-first");
+    let multi_prerequisite_completed = tmp.join("multi-prerequisite-completed");
+    let multi_prerequisite_dependent_first = tmp.join("multi-prerequisite-dependent-first");
+    let mkfifo = Command::new("mkfifo")
+        .arg(&multi_prerequisite_completed)
+        .status()
+        .map_err(|e| format!("scheduler accounting: cannot create prerequisite fifo: {e}"))?;
+    if !mkfifo.success() {
+        return Err(format!("scheduler accounting: mkfifo failed with {mkfifo}"));
+    }
     let multi_missing_cmd = format!(
-        "if test ! -e {first}; then : > {first}; printf '%s\\n' \
+        "if test ! -e {first}; then : > {first}; read prerequisite_complete < {completed}; \
+         printf '%s\\n' \
          '[fixture.multi_missing] ----- detail -----' \
          '[fixture.multi_missing] Enforcer: FS, Reason: FILE_OPEN' \
-         '[fixture.multi_missing] ----- end detail -----' > {log}; sleep 0.3; exit 1; fi",
+         '[fixture.multi_missing] ----- end detail -----' > {log}; exit 1; fi",
         first = validate_plan::shell_quote(&multi_missing_first.to_string_lossy()),
+        completed = validate_plan::shell_quote(&multi_prerequisite_completed.to_string_lossy()),
         log = validate_plan::shell_quote(&multi_missing_log.to_string_lossy()),
     );
     let multi_trigger_cmd = format!(
@@ -8254,10 +8268,23 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     multi_trigger_step.deps = vec!["fixture.multi_prerequisite".into()];
     multi_trigger_step.hint.est_duration_s = 20.0;
     multi_trigger_step.hint.resources.insert("serial".into(), 1);
+    let mut multi_prerequisite_dependent = step(
+        "multi_prerequisite_dependent",
+        &format!(
+            "if test ! -e {first}; then : > {first}; printf '%s\\n' complete > {completed}; fi",
+            first = validate_plan::shell_quote(
+                &multi_prerequisite_dependent_first.to_string_lossy()
+            ),
+            completed =
+                validate_plan::shell_quote(&multi_prerequisite_completed.to_string_lossy())
+        ),
+    );
+    multi_prerequisite_dependent.deps = vec!["fixture.multi_prerequisite".into()];
     let mut multi_missing_cfg = DagConfig {
         steps: vec![
             multi_missing_step,
             step("multi_prerequisite", "true"),
+            multi_prerequisite_dependent,
             multi_trigger_step,
         ],
         ..Default::default()
@@ -8285,6 +8312,16 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         .iter()
         .filter(|attempt| attempt.tag == "fixture.multi_trigger")
         .collect();
+    let multi_prerequisite_attempts: Vec<&NodeAttempt> = multi_missing
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.tag == "fixture.multi_prerequisite")
+        .collect();
+    let multi_prerequisite_dependent_attempts: Vec<&NodeAttempt> = multi_missing
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.tag == "fixture.multi_prerequisite_dependent")
+        .collect();
     if !multi_missing.complete
         || !multi_missing.ok
         || multi_missing.env_retries != 2
@@ -8298,6 +8335,12 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         || multi_trigger_attempts[0].execution != AttemptExecution::Unknown
         || multi_trigger_attempts[1].ok != Some(false)
         || multi_trigger_attempts[2].ok != Some(true)
+        || multi_prerequisite_attempts.len() != 1
+        || multi_prerequisite_attempts[0].execution != AttemptExecution::Completed
+        || multi_prerequisite_attempts[0].ok != Some(true)
+        || multi_prerequisite_dependent_attempts.last().is_none_or(|attempt| {
+            attempt.execution != AttemptExecution::Completed || attempt.ok != Some(true)
+        })
         || environmental_assessment(&multi_missing.attempts, multi_missing_attempts[0])
             != Some((validate_runtime::EnvBlockVerdict::Confirmed, None))
         || environmental_assessment(&multi_missing.attempts, multi_trigger_attempts[1])
@@ -8305,7 +8348,8 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     {
         return Err(format!(
             "scheduler accounting: a later trigger did not carry an earlier round's missing node \
-             into the next retry: complete={} ok={} retries={} missing={:?} trigger={:?}",
+             into the next retry: complete={} ok={} retries={} missing={:?} trigger={:?} \
+             prerequisite={:?} prerequisite_dependent={:?}",
             multi_missing.complete,
             multi_missing.ok,
             multi_missing.env_retries,
@@ -8314,6 +8358,14 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
                 .map(|attempt| (attempt.attempt, attempt.reported, attempt.execution, attempt.ok))
                 .collect::<Vec<_>>(),
             multi_trigger_attempts
+                .iter()
+                .map(|attempt| (attempt.attempt, attempt.reported, attempt.execution, attempt.ok))
+                .collect::<Vec<_>>(),
+            multi_prerequisite_attempts
+                .iter()
+                .map(|attempt| (attempt.attempt, attempt.reported, attempt.execution, attempt.ok))
+                .collect::<Vec<_>>(),
+            multi_prerequisite_dependent_attempts
                 .iter()
                 .map(|attempt| (attempt.attempt, attempt.reported, attempt.execution, attempt.ok))
                 .collect::<Vec<_>>()
