@@ -69,6 +69,18 @@ pub const CLIENT_EXITED_BEFORE_CONNECTING: &str = "the gdb client hermit spawned
 /// release cannot be a single attempt.
 const RELEASE_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 
+/// How long the watcher waits, after a successful release connect, for the
+/// container to finish before concluding it connected to the wrong listener.
+///
+/// ⚠️ THIS IS THE DIFFERENCE BETWEEN "WE CONNECTED" AND "WE RELEASED OURS". The
+/// port is guessable and shared, so a successful connect can mean a stranger
+/// accepted. The container finishing is the only observable effect that
+/// distinguishes the two, and it needs a window in which to happen.
+///
+/// 25 × 20ms = 500ms: long enough for a released gdbserver to unwind and return,
+/// short enough that a stranger is re-probed promptly rather than abandoned.
+const RELEASE_GRACE_TICKS: u32 = 25;
+
 /// How often the watcher asks whether the client has exited.
 ///
 /// ⚠️ THIS EXISTS BECAUSE A BLOCKING `wait()` CANNOT BE INTERRUPTED, and that is
@@ -216,7 +228,28 @@ impl GdbClientWatch {
                     // We released a pending accept, so the container WAS waiting
                     // for a client that had already gone. Now the report is earned.
                     exited_early.store(true, Ordering::SeqCst);
-                    return;
+
+                    // ⚠️ BUT A SUCCESSFUL CONNECT IS AN ATTEMPT, NOT A CONCLUSION,
+                    // AND RETURNING HERE RESTORED THE HANG. If the peer was the
+                    // stranger the block above describes, then OUR gdbserver is
+                    // still blocked in accept() with nobody coming — and this
+                    // thread, the one thing that would have released it, has just
+                    // stopped watching. The failure the watcher exists to prevent,
+                    // reintroduced by the watcher reporting success.
+                    //
+                    // The only evidence that OUR accept was released is the
+                    // container finishing. So wait a grace period for `done`; if
+                    // it arrives, we caused it and we are finished. If it does not,
+                    // the peer was not ours — keep trying. This also rate-limits
+                    // contact with a stranger to one connect per grace period
+                    // rather than one every RELEASE_RETRY_INTERVAL.
+                    for _ in 0..RELEASE_GRACE_TICKS {
+                        if done.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        thread::sleep(RELEASE_RETRY_INTERVAL);
+                    }
+                    continue;
                 }
                 thread::sleep(RELEASE_RETRY_INTERVAL);
             }
@@ -325,6 +358,61 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    /// Connecting to a listener that is not ours must not end the watch.
+    ///
+    /// ⚠️ THIS IS THE HANG, RESTORED BY A SUCCESSFUL CONNECT. The release port is
+    /// guessable (`16384 + tid % 1024`, or 1234 for `replay`), so an unrelated
+    /// process can own it in exactly the window this loop exists for. A watcher
+    /// that concludes on the first successful connect then stops watching while
+    /// our own gdbserver is still blocked in `accept()` with nobody coming.
+    ///
+    /// The discriminator is the RETRY, not the flag: a single attempt is what a
+    /// stranger absorbs silently. Bounded, and asserts a count rather than
+    /// blocking, so a regression is a named red and not a wedged runner.
+    #[test]
+    fn a_connect_to_a_stranger_is_not_treated_as_a_release() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind");
+        let port = listener.local_addr().expect("no local addr").port();
+
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        drop(stream);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let client = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("failed to spawn the stand-in client");
+        // Let it exit first, so the watcher observes the exit rather than racing.
+        thread::sleep(Duration::from_millis(200));
+
+        let mut watch = GdbClientWatch::spawn(client, port);
+        // The container is DELIBERATELY never marked done: the stranger did not
+        // release our accept, because it never had it.
+        thread::sleep(RELEASE_RETRY_INTERVAL * (RELEASE_GRACE_TICKS + 10));
+        let attempts = accepted.load(Ordering::SeqCst);
+
+        // Let the watcher thread finish before asserting, so a failure reports a
+        // count rather than leaving a thread running under the test harness.
+        watch.container_done.store(true, Ordering::SeqCst);
+        let _ = watch.finish();
+
+        assert!(
+            attempts >= 2,
+            "the watcher made {attempts} connection(s) to a peer that never released \
+             anything; a successful connect must be an ATTEMPT, not a conclusion, or a \
+             stranger on a guessable port silently restores the hang"
+        );
+    }
 
     /// A client that exits without connecting must release an accept that is
     /// already waiting.
