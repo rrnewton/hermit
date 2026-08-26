@@ -3982,13 +3982,31 @@ mod tests {
     /// twenty runs each and no pipe between the command and `$?`:
     ///
     /// ```text
-    /// GIT_CONFIG_COUNT=1 git rev-parse --show-toplevel     (no GIT_CONFIG_KEY_0)
+    /// env -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 \
+    ///     GIT_CONFIG_COUNT=1 git rev-parse --show-toplevel
     ///   git 2.52.0        exit 128 in 20/20
     ///   git 2.53.0-Meta   exit 128 in 20/20
     ///   error: missing config key GIT_CONFIG_KEY_0
     ///   fatal: unable to parse command-line config
-    /// CONTROL, same command with no GIT_CONFIG_COUNT: non-zero in 0/20
+    /// CONTROL that DISCRIMINATES -- a bogus count must also fail:
+    ///   GIT_CONFIG_COUNT=notanumber git ...   exit 128, "bogus count"
     /// ```
+    ///
+    /// ⚠️ THE `env -u` IS LOAD-BEARING AND AN EARLIER VERSION OF THIS RECIPE
+    /// OMITTED IT, so the recipe did not reproduce on the host it names. Some
+    /// shells here already export the `GIT_CONFIG_*` family -- the Meta git
+    /// wrapper's `insteadOf` rewrites, documented at `CONFIG_OVERRIDE_ENV_VARS`
+    /// in this same file -- and with `GIT_CONFIG_KEY_0` already set,
+    /// `GIT_CONFIG_COUNT=1` finds a key and SUCCEEDS. A reviewer ran the recipe
+    /// verbatim, got 0 of 20, and was about to file a refutation.
+    ///
+    /// ⚠️ AND THE OLD CONTROL COULD NOT HAVE CAUGHT THAT, WHICH IS WHY IT IS
+    /// REPLACED. "same command with no GIT_CONFIG_COUNT: non-zero in 0/20" shows
+    /// only that the command normally succeeds -- it passes identically in a
+    /// clean environment and a contaminated one, so it cannot tell them apart.
+    /// The bogus-count control above MUST exit 128; it proves the probe can see
+    /// the failure it is looking for. That reviewer ran exactly that control,
+    /// which is what told them the instrument was wrong rather than the claim.
     ///
     /// ⚠️ SO THE REVISION THIS COMMENT "CORRECTED" WAS RIGHT. It said such a
     /// child "dies with `error: missing config key GIT_CONFIG_KEY_0`, exit 128".
@@ -4012,12 +4030,33 @@ mod tests {
     /// suite ran 30 times with no guard at all and failed 0 times. See
     /// [`under_git_env`] for the full table and the positive control.
     ///
-    /// ⚠️ "Neither git there ... both" HAD NO ANTECEDENT AND NEVER DID. A review
-    /// lane read the missing subject as provenance destroyed by an edit, which
-    /// was a reasonable inference on this file and is wrong: `git log -S` shows
-    /// the phrase entering as "Neither git on this host" and no revision ever
-    /// naming the two. The versions are stated above now, so the sentence says
-    /// what it always meant to. Recorded because "the identity was deleted" and
+    /// ⚠️ "Neither git there ... both" LOST ITS ANTECEDENT TO ONE OF THE FOUR
+    /// DELETIONS, AND MY PREVIOUS NOTE HERE DENIED IT. I wrote that the phrase
+    /// "had no antecedent and never did". `git log -S` says otherwise:
+    ///
+    ///   cec4602d32  + "<host>: ... Neither git ON THIS HOST rejects a"
+    ///   89c06d0389  - "<host>: ... Neither git on this host rejects a"
+    ///               + "on the measurement host: ... Neither git THERE"
+    ///
+    /// (the `<host>` elision is this gate's own doing -- see below.)
+    ///
+    /// "Neither git ON THIS HOST ... BOTH" parses, because the recorded host has
+    /// two gits. `89c06d0389` -- which is hermit#2647, ONE OF THE FOUR DELETIONS this
+    /// gate's failure message now indicts -- replaced the hostname and stranded
+    /// `both`. So it is a FIFTH casualty of those commits and the strongest
+    /// instance of the class: not a host string erased, but a SENTENCE whose
+    /// meaning depended on one. The damage outlived the string it came from.
+    /// ⚠️ AND I COULD NOT QUOTE THE DELETED LINE HERE, WHICH IS THE POINT MADE
+    /// TWICE OVER. Spelling the hostname to show what was erased reddens
+    /// `check-portable-paths.sh` -- I tripped it writing this paragraph, the
+    /// third time tonight -- so the evidence for the erasure is itself elided,
+    /// and the host lives in `docs/TESTING_ENVIRONMENTS.md` where the checker
+    /// permits it. That is the correct remedy and it is also exactly the pressure
+    /// that produced the four deletions: the cheapest way to satisfy the gate is
+    /// to remove the identity rather than relocate it.
+    ///
+    /// Found by a review lane running `git log -S` on my claim rather than
+    /// accepting it. Recorded because "the identity was deleted" and
     /// "the identity was never written down" look identical afterwards, and only
     /// one of them is tonight's story.
     ///
