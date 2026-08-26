@@ -237,9 +237,34 @@ fn main() {
         .filter(|p| is_executable(p) || p.ends_with(".py"))
         .cloned()
         .collect();
+    // ⚠️ A FLOOR, NOT A ZERO CHECK, AND THE DIFFERENCE IS THE FAILURE THAT MATTERS.
+    // `!is_empty()` catches discovery going to NOTHING. It cannot catch discovery
+    // COLLAPSING -- and a collapse reports HEALTHY, because everyone left in the
+    // shrunken population still passes. "OK, 7 checker entrypoints, 7 scheduled" is
+    // rc=0 in exactly the confident tone this guard exists to avoid, and nobody reads
+    // a green line for a number that used to be larger.
+    //
+    // Sized against real predicate slips rather than chosen, measured 2026-08-26 at
+    // `origin/main` 96ca7b1d51 where the population is 32:
+    //
+    //   one prefix typo'd away (`scripts/check-`)   18   <- caught, rc=101
+    //   prefix list emptied, suffix only             7   <- caught
+    //   suffix arm dropped (pre-#2684 behaviour)    26   <- NOT caught
+    //   `.py` arm dropped from the exec filter      29   <- NOT caught
+    //
+    // ⚠️ SO IT IS DELIBERATELY A BLUNT INSTRUMENT AND THE LIMIT IS STATED RATHER THAN
+    // IMPLIED: it catches a category disappearing, not a narrowing. A 32 -> 26 slip
+    // passes this and must be caught by the semantic assertions in `self_test`, which
+    // pin named files rather than a count. Both are needed; neither subsumes the
+    // other. 25 leaves room for seven genuine deletions before the guard refuses.
+    const POPULATION_FLOOR: usize = 25;
     assert!(
-        !checkers.is_empty(),
-        "discovered no checker entrypoints; the naming convention or this filter moved"
+        checkers.len() >= POPULATION_FLOOR,
+        "discovered {} checker entrypoint(s), fewer than the floor of {POPULATION_FLOOR}; \
+         the naming convention or this filter moved and the guard is now reading a \
+         collapsed population -- which would otherwise report OK, because everything \
+         left in it still passes",
+        checkers.len()
     );
     // A rename must not silently re-enable the self-reference described on
     // `expands_frontier`. If SELF_PATH stops naming a tracked file the exclusion
