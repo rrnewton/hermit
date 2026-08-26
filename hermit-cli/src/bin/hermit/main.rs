@@ -508,18 +508,33 @@ fn classify_failure(error: &Error) -> String {
 }
 
 fn display_error(error: Error) {
-    // Emitted BEFORE the prose so a reader piping stderr sees the class first,
-    // and so a truncated capture still carries it.
-    eprintln!("{}", classify_failure(&error));
+    // NOT `eprintln!` on any of these three.
+    //
+    // ⚠️ THIS IS THE LAST THING HERMIT SAYS, AND A GUEST CAN CUT IT OFF. fd 2 is
+    // an open file description shared with the guest, so `fcntl(2, F_SETFL,
+    // O_NONBLOCK)` in the guest makes these writes fail with EAGAIN once the
+    // reader is slow. `eprintln!` calls `write_all`, `write_all` does not retry
+    // EAGAIN, and the print macro panics -- taking the rest of this report with
+    // it. Measured 2026-08-26 against a 4096-byte pipe with 196 bytes free: 170
+    // of 2240 bytes arrived, the process exited 101 instead of 127, and the
+    // delivered text was not even a prefix of the truth -- the first 92 bytes of
+    // this report were followed by the tail of the panic message, so it read as
+    // a complete short error rather than a severed one.
+    //
+    // The ordering below (class first) was already written for a truncated
+    // capture. Ordering limits the damage; it does not prevent it.
+    use std::io::Write;
+    let mut out = detcore::util::RetryingStderr;
+    let _ = writeln!(out, "{}", classify_failure(&error));
 
     let mut chain = error.chain();
 
     if let Some(error) = chain.next() {
-        eprintln!("{}: {}", "Error".red().bold(), error);
+        let _ = writeln!(out, "{}: {}", "Error".red().bold(), error);
     }
 
     for cause in chain {
-        eprintln!("     {} {}", ">".dimmed().bold(), cause);
+        let _ = writeln!(out, "     {} {}", ">".dimmed().bold(), cause);
     }
 }
 
