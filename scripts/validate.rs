@@ -8417,10 +8417,20 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     // WHAT IS STILL ASSERTED, and is the part worth keeping: the lane is STILL NOT
     // ok. Retrying a genuine red three times must return the same red, never a
     // pass. The cost changed by directive; the verdict must not.
-    if ordinary_only.ok || ordinary_only.env_retries != 2 || ordinary_only.attempts.len() != 3 {
+    // ⚠️ THIS NOW PINS THE STRUCTURAL SUPPRESSION, and the numbers are the point.
+    // The fixture fails the same way every time. Always-eligible retry alone would
+    // spend the whole budget on it -- 2 retries, 3 attempts at the max=2 passed
+    // above -- and stamp a retry_class on each, so a flakiness timeline would read
+    // a permanently broken test as flaky every run. `already_failed_identically`
+    // stops after the failure reproduces its own reason once: ONE retry, TWO
+    // attempts. The saving is real and so is the record: one occurrence, not three.
+    //
+    // The verdict is unchanged and that is the other half: retrying a genuine red,
+    // whether once or three times, must return the same red.
+    if ordinary_only.ok || ordinary_only.env_retries != 1 || ordinary_only.attempts.len() != 2 {
         return Err(format!(
-            "scheduler accounting: an always-eligible unclassified failure must exhaust its \
-             retries and STILL be red: ok={} retries={} attempts={}",
+            "scheduler accounting: a structurally-repeating failure must be retried ONCE, then \
+             suppressed, and STILL be red: ok={} retries={} attempts={}",
             ordinary_only.ok,
             ordinary_only.env_retries,
             ordinary_only.attempts.len()
@@ -8801,7 +8811,15 @@ fn run_lane_with_env_retries(
                     // a failure whose prerequisite did not complete is dropped by
                     // `retry_steps_with_satisfied_prerequisites` below, and the whole
                     // loop is bounded by `max` rounds.
-                    .or_else(|| Some(format!("always-eligible: {}", o.reason.trim())))
+                    // STRUCTURAL SUPPRESSION on the blanket arm only. The three
+                    // grounds above are unaffected: an environmental block that
+                    // repeats may still clear, so it keeps its retry. A failure
+                    // that reproduces its own reason exactly has told us what a
+                    // third attempt will say.
+                    .or_else(|| {
+                        (!already_failed_identically(&attempts, &o.tag, &o.reason))
+                            .then(|| format!("always-eligible: {}", o.reason.trim()))
+                    })
                     .map(|class| (o.tag.clone(), class))
             })
             .collect();
@@ -11170,6 +11188,34 @@ impl RunSummary {
         self.epilogue = epilogue;
         self
     }
+}
+
+/// Has this node ALREADY failed with this exact reason earlier in this run?
+///
+/// ⚠️ A 0-PASS IDENTITY IS STRUCTURAL, NOT FLAKY, AND RETRYING IT RETURNS THE SAME
+/// ANSWER. The registry reader has always known this -- `measured_unstable_nodes`
+/// rejects a one-sided sample with "0 pass / 5 fail ... rather than measured
+/// instability" -- but it DISCARDS those entries, so the retry loop never learns
+/// which identities they are. Making every cell always eligible therefore handed
+/// the full budget to exactly the cells the registry had already judged
+/// unretryable.
+///
+/// TWO COSTS, AND THE SECOND IS THE WORSE ONE. It burns the budget on a node that
+/// cannot recover; and it stamps a `retry_class` on every one of those attempts,
+/// so a multi-week flakiness timeline reads a permanently broken test as flaky
+/// every single run. That corrupts the record the retry work exists to produce.
+///
+/// The in-run test is used rather than the registry because the registry holds
+/// ONE cell, measured 2026-08-04, and cannot speak for the rest of the manifest.
+/// An identical reason on a second attempt is direct evidence from this run that
+/// a third attempt returns the same answer.
+fn already_failed_identically(attempts: &[NodeAttempt], tag: &str, reason: &str) -> bool {
+    let reason = reason.trim();
+    attempts
+        .iter()
+        .filter(|a| a.tag == tag && a.ok == Some(false) && a.reason.trim() == reason)
+        .count()
+        >= 2
 }
 
 /// Cap for every id list in the end-of-run summary, so the block stays roughly
