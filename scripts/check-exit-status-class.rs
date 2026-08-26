@@ -24,14 +24,38 @@
 //! execution will ever observe a stale assertion in those 85. A source check does
 //! not care whether the test runs, which is the only way this class can be gated.
 //!
-//! ⚠️ WHY ONLY FOUR VALUES. Counted before the key was chosen: 62 exit-status
+//! ⚠️ THE SET GREW TO SIX, AND THE GATE WAS BLIND TO BOTH ADDITIONS FOR AS LONG AS
+//! THEY EXISTED. hermit#2659 made 122 mean "hermit refused" and a later head made
+//! 130 mean "128 + SIGINT". Both are values hermit's own reporting CHOOSES, which is
+//! the entire membership rule below -- and neither was added here, so a bare
+//! `Some(122)` in a test carried exactly the ambiguity this gate exists to refuse
+//! and was waved through.
+//!
+//! ⚠️ A GATE WITH A BLIND SPOT REPORTS CLEAN THROUGH IT. Demonstrated by planting one
+//! file with three bare literals and running the checker before and after:
+//!
+//!   before   Some(125) flagged;  Some(122) and Some(130) invisible   18 sites
+//!   after    all three flagged                                       20 sites
+//!
+//! Adding them cost NOTHING on the current tree -- still 17 undeclared, baseline 17 --
+//! because every existing 122 and 130 site already spells the constant. That is the
+//! cheap moment to close a blind spot: before anything drifts into it.
+//!
+//! ⚠️ THE BAND IS NOT ADDED WHOLESALE, and that is a judgement worth stating. 130 is
+//! the only signal-band value hermit emits from a policy decision; 129 and 143 come
+//! from `on_container_init_stop_signal` and are ordinary signal reports. Adding
+//! 129..=192 would demand a declaration at sites carrying no ambiguity, and a noisy
+//! gate is exempted into uselessness -- the same reasoning that keeps the 44 below
+//! out. If hermit starts choosing another band value, it belongs here then.
+//!
+//! ⚠️ WHY NOT MORE THAN SIX. Counted before the key was chosen: 62 exit-status
 //! integer literals live in these tests, and 44 of them cannot be confused with a
 //! hermit code -- 12x `Some(0)` success, 6x `Some(2)` clap usage (hermit never
 //! chooses 2), 17x `Some(124)` the `timeout(1)` convention, 4x `Some(101)` Rust
 //! panic, 1x `Some(20)` fixture. Demanding a declaration at those 44 is friction
 //! with no risk behind it, and a noisy gate is exempted into uselessness. The
-//! colliding set is the values hermit's own `failure_exit_code` can produce, plus
-//! the one it USED to produce before hermit#2558:
+//! colliding set is the values hermit's own reporting can produce, plus the one it
+//! USED to produce before hermit#2558:
 //!
 //!   1    the pre-#2558 hermit failure code -- AMBIGUOUS, and the entire family
 //!   125  HERMIT_INTERNAL_FAILURE_EXIT -- should be the constant, not a literal
@@ -48,7 +72,7 @@ use std::process::Command;
 
 /// Exit-status values whose meaning is contested. See the module docs for why the
 /// other 44 literals are deliberately out of scope.
-const COLLIDING: [(u32, &str); 4] = [
+const COLLIDING: [(u32, &str); 6] = [
     (
         1,
         "pre-#2558 hermit failure code: guest exit OR stale hermit code",
@@ -56,6 +80,14 @@ const COLLIDING: [(u32, &str); 4] = [
     (125, "HERMIT_INTERNAL_FAILURE_EXIT: use the constant"),
     (126, "GuestProgramFault: found but not executable"),
     (127, "GuestProgramFault: not found"),
+    (
+        122,
+        "HERMIT_POLICY_REFUSAL_EXIT: hermit refused, or the guest chose 122",
+    ),
+    (
+        130,
+        "128 + SIGINT: hermit's signal-death report, or the guest chose 130",
+    ),
 ];
 
 /// A site is satisfied when it names the channel the number came from.
@@ -322,6 +354,39 @@ mod tests {
     }
 
     // ---- the guards that keep it from over-reading ---------------------------
+
+    /// ⚠️ THE TWO VALUES THE GATE WAS BLIND TO WHILE THEY WERE LIVE. 122 became
+    /// "hermit refused" at hermit#2659 and 130 became "128 + SIGINT" shortly after;
+    /// neither was added to `COLLIDING`, so a bare literal at either carried the
+    /// exact ambiguity this checker exists to refuse and was waved through.
+    /// Measured before the fix by planting one file with all three: `Some(125)`
+    /// fired, `Some(122)` and `Some(130)` did not.
+    ///
+    /// Remove either entry from `COLLIDING` and the matching row here fails.
+    #[test]
+    fn catches_the_two_codes_hermit_reporting_chose_after_the_key_was_written() {
+        assert_eq!(
+            count("assert_eq!(run.status.code(), Some(122));"),
+            1,
+            "122 is HERMIT_POLICY_REFUSAL_EXIT and a guest may also choose it; a bare \
+             literal cannot say which, which is the whole membership rule"
+        );
+        assert_eq!(
+            count("assert_eq!(run.status.code(), Some(130));"),
+            1,
+            "130 is 128 + SIGINT from hermit's own reporting, and equally a legal \
+             guest status"
+        );
+        // ⚠️ CONTROLS, so this cannot pass by the set having been widened to
+        // everything. These carry no hermit meaning and demanding a declaration at
+        // them is friction with no risk behind it -- 124 is `timeout(1)`'s
+        // convention, 2 is clap usage, and hermit never chooses either.
+        assert_eq!(count("assert_eq!(run.status.code(), Some(124));"), 0);
+        assert_eq!(count("assert_eq!(run.status.code(), Some(2));"), 0);
+        // 129 and 143 are in the signal band but are ordinary signal reports from
+        // `on_container_init_stop_signal`, not policy decisions. Deliberately out.
+        assert_eq!(count("assert_eq!(run.status.code(), Some(143));"), 0);
+    }
 
     #[test]
     fn catches_a_site_whose_context_says_status_without_calling_code() {
