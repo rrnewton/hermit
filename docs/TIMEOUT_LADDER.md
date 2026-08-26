@@ -5,6 +5,15 @@ Several independent mechanisms can stop a Hermit run. They are nested, they do
 each one bounds, how to tell which one fired, and what has to stay true between
 them.
 
+**If a run was killed rather than failing, this is the page for it.** The same
+number means different things at different rungs, so two rungs carrying "15" are
+not agreeing with each other. Five rungs exit **124**, which is why the exit code
+cannot say which one fired and the stderr class line is the discriminator
+instead. And a bound at an inner rung that is not strictly smaller than its outer
+rung can never fire: it is dead configuration that reads as protection, and it
+presents as an intermittently killed test rather than as the configuration error
+it is.
+
 `ci/validate-timeout-layers-test.sh` already calls the nested wall-time limits a
 **ladder** and fails closed on a wrong one; this is the same idea widened to
 every rung, including the ones that script does not cover.
@@ -103,12 +112,28 @@ absence is what distinguishes them from a genuinely slow guest.
 | `sabre` | 40s | none | **did not bound the run at all** |
 | `dbt` | 20s | none | **did not bound the run at all** |
 
-The 40s and 20s are the *harness's* own deadline, not hermit's, and the missing
-marker is exactly the "exit 124 with no marker" reading above. All five backends
-run correctly **without** the flag, so this is the bound failing rather than the
-backend. `sabre` additionally panicked in reverie's blocking RPC transport after
-69 seconds, which is the likely mechanism: a blocking call on the single
-`current_thread` runtime the timer needs.
+⚠️ **READ THAT TABLE AS A DEFECT REPORT, NOT A SUPPORT MATRIX.** `sabre` and
+`dbt` are not backends that merely lack testing — **they structurally cannot
+honour the flag today.** The 40s and 20s are the *harness's* own deadline, not
+hermit's, and the missing marker is exactly the "exit 124 with no marker"
+reading above: the bound was accepted and then had no effect whatsoever. All
+five backends run correctly **without** the flag, so it is the bound that fails,
+not the backend.
+
+The mechanism is visible on `sabre`, which additionally panicked in reverie's
+blocking RPC transport after **69 seconds** — `reverie-rpc-transport`'s
+`blocking_client`, reporting a broken pipe once the container went away. A
+*blocking* call cannot yield to the single `current_thread` tokio runtime that
+`tokio::time::timeout` needs in order to fire, so the primary path is never
+reached. `dbt` shows the same absence of any bound and is a launch adapter
+around DynamoRIO, so it is very likely the same class of problem; that has not
+been traced and should not be asserted.
+
+⚠️ **THE DISTINCTION MATTERS FOR WHOEVER FIXES IT.** "Unverified" invites
+someone to run the flag once, see it accepted, and mark the backend supported.
+What is actually required is finding out why the runtime never reaches the timer
+and fixing that — and until it is fixed, the refusal below is the honest
+behaviour rather than a placeholder.
 
 So `--timeout` **refuses** (exit 122, `HERMIT_POLICY_REFUSAL`) on any backend
 other than `ptrace` and `liteinst`, rather than accepting a bound it cannot

@@ -4099,12 +4099,23 @@ impl RunOpts {
     /// | `sabre`    | 40s     | none -- killed by the harness |
     /// | `dbt`      | 20s     | none -- killed by the harness |
     ///
-    /// `sabre` and `dbt` DID NOT BOUND THE RUN AT ALL: the elapsed times are the
-    /// outer harness's own deadline, and the absence of a marker is precisely
-    /// the "exit 124 with no marker means no inner bound fired" reading in
-    /// docs/TIMEOUT_LADDER.md. Both run fine WITHOUT the flag, so this is the
-    /// bound failing, not the backend. `sabre` additionally panicked in
-    /// reverie's blocking RPC transport after 69 seconds.
+    /// ⚠️ `sabre` AND `dbt` ARE NOT MERELY UNTESTED -- THEY STRUCTURALLY CANNOT
+    /// HONOUR THE FLAG TODAY, and the difference decides what fixing them means.
+    /// Neither BOUNDED THE RUN AT ALL: the elapsed times are the outer harness's
+    /// own deadline, and the absence of a marker is precisely the "exit 124 with
+    /// no marker means no inner bound fired" reading in docs/TIMEOUT_LADDER.md.
+    /// Both run fine WITHOUT the flag, so it is the bound that fails.
+    ///
+    /// The mechanism is visible on `sabre`, which panicked in
+    /// `reverie-rpc-transport`'s blocking client after 69 seconds with a broken
+    /// pipe: a BLOCKING call cannot yield to the single `current_thread` tokio
+    /// runtime that `tokio::time::timeout` needs in order to fire, so the primary
+    /// path is never reached. `dbt` shows the same total absence of a bound and
+    /// is a launch adapter around DynamoRIO, so it is plausibly the same class --
+    /// but that has NOT been traced and must not be asserted.
+    ///
+    /// So do not "qualify" one of these by running the flag once and seeing it
+    /// accepted; acceptance is exactly what already happens and it does nothing.
     ///
     /// `kvm` is excluded for a different and softer reason: it does bound the
     /// run, but ONLY through the hard `_exit` fallback, ten seconds late and
