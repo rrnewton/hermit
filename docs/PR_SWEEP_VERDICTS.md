@@ -2158,6 +2158,8 @@ un-reviewed.
 **FIXED, and the fix validated the reasoning.** `8d03485c` strips block-level prefixes
 before matching. Re-measured against main afterwards, driving `lane_shas` directly:
 
+*(measured at dev-hermit `8d03485c`; re-confirmed at main `8b4b6e137b87`)*
+
 | line form | before | after `8d03485c` |
 |---|---|---|
 | `## APPROVED-AT: claude <sha>` | did not bind, not flagged | **binds** |
@@ -2173,19 +2175,34 @@ match afterwards — it can only promote a line that was *already* a well-formed
 modulo decoration. A relaxation that widens what is **read** while leaving what is
 **accepted** unchanged has no false-positive surface, so it needs no corpus re-audit.
 
-⚠️ **AND THE CLASS IS NOT CLOSED — a leading WORD still defeats both regexes.**
-`## CODEX-LANE CHANGES-REQUESTED-AT: codex <sha>` is not block-level markdown, so
-normalisation does not reach it. Measured on main after the fix:
+⚠️ **THE LEADING-WORD CLASS WAS OPEN AND IS NOW CLOSED, AND THE FACT THAT THIS
+PARAGRAPH HAD TO BE REWRITTEN IS THE SECTION'S OWN POINT.** When first written, a
+leading WORD defeated both regexes: `## CODEX-LANE CHANGES-REQUESTED-AT: codex <sha>`
+is not block-level markdown, so normalisation did not reach it, and the refusal path
+FAILED OPEN. That is no longer true.
 
-```
-Posting APPROVED-AT: claude <head>              binds nothing        flagged
-Registering CHANGES-REQUESTED-AT: claude <head> FAILS OPEN           flagged
-CHANGES-REQUESTED: claude <head>   (no "-AT")   FAILS OPEN           flagged
-```
+**Re-measured 2026-08-25 at dev-hermit main `8b4b6e137b87`**, driving `lane_shas`
+directly for the positive and `changes-requested-gate --from-json` for the negative:
 
-Flagged is not honoured: the malformed report is loud and the lane still admits. So the
-remedy for a decoration you can enumerate is normalisation, and the remedy for one you
-cannot is to key the gate on the marker's **presence** rather than on its parse.
+| line form | approval binds | refusal blocks |
+|---|---|---|
+| `APPROVED-AT: claude <sha>` | yes | yes |
+| `## …` heading, `**…**` bold, `- …` list, `> …` quote | yes | yes |
+| `Posting APPROVED-AT: claude <sha>` — leading word | **no, and FLAGGED malformed** | **yes, blocks** |
+| `CODEX-LANE CHANGES-REQUESTED-AT: claude <sha>` | **no, and FLAGGED malformed** | **yes, blocks** |
+| `CHANGES-REQUESTED: claude <sha>` — no `-AT` | – | **yes, blocks** |
+
+⚠️ **The two directions closed asymmetrically, and the asymmetry is correct.** A
+leading word makes an *approval* fail to bind AND be reported malformed — it cannot
+silently grant. The same word no longer hides a *refusal* at all: every shape above
+blocks. Each direction fails toward refusing, which is the only safe polarity for a
+gate whose two errors are not symmetric.
+
+⚠️ **DO NOT COPY THE PRESCRIPTION THIS PARAGRAPH USED TO CARRY.** It said the remedy
+for a decoration you cannot enumerate is to key the gate on the marker's **presence**
+rather than its parse. That was wrong for the positive direction and is now
+unnecessary for the negative one — the unanchored matcher closed the class without
+giving up the sha test. See the next subsection for what presence-keying costs.
 
 ⚠️ **BUT PRESENCE-KEYING IS RIGHT FOR THE NEGATIVE AND WRONG FOR THE POSITIVE, AND THE
 NEGATIVE STILL HAS TO BIND THE CURRENT HEAD.** Unqualified, that sentence is dangerous
