@@ -829,8 +829,8 @@ struct ResultRow {
     backend: Option<String>,
     classification: String,
     outcome: String,
-    #[serde(default)]
-    duration_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u128>,
     #[serde(default)]
     runtime: Option<JsonValue>,
     argv: Vec<String>,
@@ -6698,7 +6698,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         backend: Some(sample_a.backend.clone()),
         classification: "required".into(),
         outcome: "FAIL".into(),
-        duration_ms: 1,
+        duration_ms: Some(1),
         runtime: None,
         argv: vec!["hermit".into(), "run".into()],
         guest_argv: vec!["fixture".into()],
@@ -6785,7 +6785,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         backend: Some(green_id.backend.clone()),
         classification: "required".into(),
         outcome: "PASS".into(),
-        duration_ms: 1,
+        duration_ms: Some(1),
         runtime: None,
         argv: vec!["hermit".into(), "run".into()],
         guest_argv: vec!["fixture".into()],
