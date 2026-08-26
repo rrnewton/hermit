@@ -876,7 +876,10 @@ pub struct CellResult {
     pub error_kind: Option<String>,
     /// The cell wall-clock bound used for this observation.
     pub timeout_seconds: u64,
-    pub duration_ms: u128,
+    /// Measured wall time for a cell that reached execution. Absent when the
+    /// cell never ran; a measured zero remains a valid sub-millisecond result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u128>,
     /// Runtime totals from the first attempt that produced them.
     pub runtime: Option<VerificationRuntime>,
     pub log_level: Option<String>,
@@ -2189,7 +2192,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         outcome,
         error_kind,
         timeout_seconds: cell.timeout_seconds,
-        duration_ms: started.elapsed().as_millis(),
+        duration_ms: Some(started.elapsed().as_millis()),
         runtime: attempts.iter().find_map(|attempt| attempt.runtime.clone()),
         log_level: (cell.id.mode != "naked").then(|| "info".into()),
         effective_args: literal_argv.iter().skip(1).cloned().collect(),
@@ -2255,7 +2258,7 @@ pub fn infrastructure_error_result(
         outcome: "ERROR".into(),
         error_kind: Some("infrastructure".into()),
         timeout_seconds: cell.timeout_seconds,
-        duration_ms: 0,
+        duration_ms: None,
         runtime: None,
         log_level: (cell.id.mode != "naked").then(|| "info".into()),
         effective_args: Vec::new(),
@@ -2313,7 +2316,7 @@ pub fn host_inapplicable_result(
         outcome: "HOST-INAPPLICABLE".into(),
         error_kind: None,
         timeout_seconds: cell.timeout_seconds,
-        duration_ms: 0,
+        duration_ms: None,
         runtime: None,
         log_level: None,
         effective_args: Vec::new(),
@@ -2552,13 +2555,17 @@ pub fn write_junit(path: &Path, results: &[CellResult]) -> Result<(), String> {
         results.len()
     );
     for result in results {
+        let time = result
+            .duration_ms
+            .map(|duration_ms| format!(" time=\"{:.3}\"", duration_ms as f64 / 1000.0))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "  <testcase classname=\"{}\" name=\"{}/{}/{}\" time=\"{:.3}\">",
+            "  <testcase classname=\"{}\" name=\"{}/{}/{}\"{}>",
             xml(&result.category),
             xml(&result.test),
             xml(&result.mode),
             xml(result.backend.as_deref().unwrap_or("none")),
-            result.duration_ms as f64 / 1000.0
+            time,
         ));
         if result.outcome == "FAIL" {
             out.push_str(&format!(
@@ -3256,6 +3263,19 @@ mod tests {
         assert!(result.attempts.is_empty());
         assert!(result.binary_sha256.is_none());
         assert_eq!(result.error_kind, None);
+        assert_eq!(result.duration_ms, None);
+        let row = serde_json::to_value(&result).unwrap();
+        assert!(
+            row.get("duration_ms").is_none(),
+            "a cell that never executed must not publish a measured zero wall time"
+        );
+        let mut measured_zero = result.clone();
+        measured_zero.duration_ms = Some(0);
+        assert_eq!(
+            serde_json::to_value(measured_zero).unwrap()["duration_ms"],
+            0,
+            "a measured sub-millisecond duration must remain zero"
+        );
 
         let junit = root.join("junit.xml");
         write_junit(&junit, &[result]).unwrap();
@@ -3266,6 +3286,7 @@ mod tests {
                 "<skipped message=\"NOT RUN, NOT a pass, no coverage: planted absence\"/>"
             )
         );
+        assert!(!xml.contains(" time=\"0.000\""));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3311,7 +3332,8 @@ mod tests {
         let mut first = infrastructure_error_result(&context, &cell, "forced failure".into());
         first.outcome = "FAIL".into();
         first.error_kind = None;
-        first.duration_ms = 111;
+        assert_eq!(first.duration_ms, None);
+        first.duration_ms = Some(111);
         append_result(&path, &first).unwrap();
 
         // A validate retry starts a fresh harness process and prepares the same
@@ -3322,7 +3344,7 @@ mod tests {
         let mut second = infrastructure_error_result(&context, &cell, "forced retry".into());
         second.outcome = "FAIL".into();
         second.error_kind = None;
-        second.duration_ms = 222;
+        second.duration_ms = Some(222);
         append_result(&path, &second).unwrap();
 
         let rows = fs::read_to_string(&path).unwrap();
