@@ -7662,6 +7662,64 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
                 .collect::<Vec<_>>()
         ));
     }
+    // ⚠️ THE FLAKY WARNING MUST APPEAR ON A RUN THAT PASSED, and this is the
+    // bracket that holds it there. `retried` above is GREEN — ok=true, no
+    // failures — and it contains a node that failed once and recovered. That is
+    // precisely the run on which a flake warning looks like noise and gets
+    // dropped, and precisely the run where it is the only warning anyone gets
+    // before the test fails for real.
+    //
+    // It also pins the two halves apart: the FLAKY block present, and the
+    // FAILURE banner ABSENT. A summary that printed both would be telling the
+    // reader a green run had failed.
+    {
+        let failed_finally: BTreeSet<String> = retried
+            .outcomes
+            .iter()
+            .filter(|o| outcome_is_failure(o))
+            .map(|o| o.tag.clone())
+            .collect();
+        let flaky = flaky_nodes_from_attempts(&retried.attempts, &failed_finally);
+        let mut green = RunSummary::new(Verdict::Pass, 0, "self-test", Vec::new());
+        green.flaky = flaky.clone();
+        green.wall_s = Some(0.0);
+        let rendered = run_summary_lines(&green, std::time::Instant::now()).join("\n");
+        let names_the_node = rendered.contains("fixture.environmental");
+        let names_the_ground = rendered.contains("bpfjailer-banner");
+        if !retried.ok
+            || flaky.len() != 1
+            || flaky[0].1 != 1
+            || !rendered.contains(SUMMARY_FLAKY_HEADING)
+            || !names_the_node
+            || !names_the_ground
+            || rendered.contains("❌ FAILURE")
+        {
+            return Err(format!(
+                "end-of-run summary: a GREEN run carrying a recovered flake did not warn about \
+                 it, or warned as a failure: lane_ok={} flaky={:?} heading={} node={} \
+                 ground={} failure_banner={}",
+                retried.ok,
+                flaky,
+                rendered.contains(SUMMARY_FLAKY_HEADING),
+                names_the_node,
+                names_the_ground,
+                rendered.contains("❌ FAILURE"),
+            ));
+        }
+        // A node that exhausted its retries and STILL failed is a failure, not a
+        // flake. Feed the same attempts with that node marked failed-finally and
+        // the flake list must empty out, or a red would read as a flaky green.
+        let as_failure: BTreeSet<String> =
+            ["fixture.environmental".to_string()].into_iter().collect();
+        if !flaky_nodes_from_attempts(&retried.attempts, &as_failure).is_empty() {
+            return Err(
+                "end-of-run summary: a node that failed finally was still counted as a flake; \
+                 an unrecovered red must not be reported as a recovered one"
+                    .into(),
+            );
+        }
+    }
+
     // The same node must still report its TERMINAL verdict as PASS. Preserving
     // the first attempt must not turn a recovered node red, or the mechanism
     // would trade one wrong answer for another.
@@ -11061,6 +11119,11 @@ struct RunSummary {
     /// Counted separately from `nodes_executed` and `nodes_skipped` so the
     /// one-line accounting can never read as though everything planned ran.
     nodes_host_inapplicable: usize,
+    /// `(tag, retries, class)` for every node that was RETRIED AND THEN PASSED.
+    /// Rendered even on a green run: see `SUMMARY_FLAKY_HEADING`.
+    flaky: Vec<(String, usize, String)>,
+    /// Tags of nodes that failed FINALLY, after any retries were exhausted.
+    failed_ids: Vec<String>,
     wall_s: Option<f64>,
     jobs: Option<i64>,
     log: Option<PathBuf>,
@@ -11087,6 +11150,8 @@ impl RunSummary {
             nodes_failed: 0,
             nodes_skipped: 0,
             nodes_host_inapplicable: 0,
+            flaky: Vec::new(),
+            failed_ids: Vec::new(),
             wall_s: None,
             jobs: None,
             log: None,
@@ -11105,6 +11170,72 @@ impl RunSummary {
         self.epilogue = epilogue;
         self
     }
+}
+
+/// Cap for every id list in the end-of-run summary, so the block stays roughly
+/// fixed size however wide the failure is.
+const SUMMARY_LIST_CAP: usize = 12;
+
+const SUMMARY_FLAKY_HEADING: &str =
+    "⚠️  FLAKY — these passed only after a retry, and this run is GREEN anyway:";
+
+/// Render one id list, truncated, with the count of what was dropped.
+///
+/// Truncation is stated, never silent: a list that ends in "+N more" is a
+/// different claim from a list that ends.
+fn summary_id_list(ids: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = ids
+        .iter()
+        .take(SUMMARY_LIST_CAP)
+        .map(|id| format!("     - {id}"))
+        .collect();
+    if ids.len() > SUMMARY_LIST_CAP {
+        out.push(format!(
+            "     … and {} more (truncated at {SUMMARY_LIST_CAP})",
+            ids.len() - SUMMARY_LIST_CAP
+        ));
+    }
+    out
+}
+
+/// Nodes that were retried and then PASSED, with how many retries each took.
+///
+/// ⚠️ READ `attempts[].retry_class`, NEVER `retried_nodes`. THIS IS NOT A STYLE
+/// PREFERENCE AND THE WRONG FIELD PRODUCES A PLAUSIBLE NUMBER. `retried_nodes` is
+/// every node with `attempt > 1`, and an environmental retry round RE-RUNS THE
+/// WHOLE LANE -- so it fills with nodes that never failed. Measured on real rows:
+///
+/// ```text
+///     2026-08-25T05:08:07Z   retried_nodes = 37   env_block_retries = 2
+///     2026-08-25T02:27:14Z   retried_nodes = 22   env_block_retries = 1
+/// ```
+///
+/// At most a handful of those 37 failed; the rest were re-run because something
+/// else did. A retry count built from that field is roughly 5x too high, and it
+/// looks entirely reasonable, which is why nothing would catch it. `retry_class`
+/// is set only on an attempt for which a retry was actually GRANTED, per node,
+/// and carries the reason in the words the retry line printed.
+fn flaky_nodes_from_attempts(
+    attempts: &[NodeAttempt],
+    failed_finally: &BTreeSet<String>,
+) -> Vec<(String, usize, String)> {
+    let mut granted: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    for attempt in attempts {
+        if let Some(class) = attempt.retry_class.as_deref() {
+            let entry = granted
+                .entry(attempt.tag.clone())
+                .or_insert((0, class.to_string()));
+            entry.0 += 1;
+        }
+    }
+    granted
+        .into_iter()
+        // A node that exhausted its retries and still failed is a FAILURE, not a
+        // flake. It belongs in the failure list, and counting it here would let a
+        // red read as a flaky green.
+        .filter(|(tag, _)| !failed_finally.contains(tag))
+        .map(|(tag, (n, class))| (tag, n, class))
+        .collect()
 }
 
 /// The ONE summary renderer. Called from exactly one place.
@@ -11128,6 +11259,38 @@ fn run_summary_lines(s: &RunSummary, started: std::time::Instant) -> Vec<String>
     ];
     for line in &s.detail {
         lines.push(format!("   {line}"));
+    }
+    // ---- the four-part end-of-run summary (owner directive 2026-08-26) ----
+    //
+    // ⚠️ THE FLAKY BLOCK IS RENDERED ON A PASSING RUN. That is the whole point and
+    // it is the part that gets dropped, because on a green run there is nothing
+    // demanding attention and the block looks like noise. A test that failed and
+    // then passed is the only warning anyone gets before it fails for real.
+    if !s.flaky.is_empty() {
+        lines.push(String::new());
+        lines.push(format!("   {SUMMARY_FLAKY_HEADING}"));
+        let ids: Vec<String> = s
+            .flaky
+            .iter()
+            .map(|(tag, n, class)| {
+                format!("{tag}  ({n} retr{}, {class})", if *n == 1 { "y" } else { "ies" })
+            })
+            .collect();
+        lines.extend(summary_id_list(&ids));
+        let total: usize = s.flaky.iter().map(|(_, n, _)| n).sum();
+        lines.push(format!(
+            "     {} test(s) retried, {total} retr{} spent in total",
+            s.flaky.len(),
+            if total == 1 { "y" } else { "ies" }
+        ));
+    }
+    if !s.failed_ids.is_empty() {
+        lines.push(String::new());
+        lines.push(format!(
+            "   ❌ FAILURE — {} test(s) failed and did NOT recover on retry:",
+            s.failed_ids.len()
+        ));
+        lines.extend(summary_id_list(&s.failed_ids));
     }
     // Node accounting is printed whenever a DAG ran, and deliberately printed as
     // an explicit zero when one did not, so "no nodes ran" is a stated fact
@@ -12669,6 +12832,13 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     );
     s.nodes_executed = outcomes.len();
     s.nodes_failed = failures;
+    let failed_finally: BTreeSet<String> = outcomes
+        .iter()
+        .filter(|o| outcome_is_failure(o))
+        .map(|o| o.tag.clone())
+        .collect();
+    s.failed_ids = failed_finally.iter().cloned().collect();
+    s.flaky = flaky_nodes_from_attempts(&attempts, &failed_finally);
     s.nodes_skipped = skipped.len();
     s.nodes_host_inapplicable = plan.host_inapplicable.len();
     s.wall_s = Some(wall);
