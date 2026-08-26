@@ -12275,9 +12275,12 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         }
     };
 
-    let already_inside_pinned_root =
-        std::env::var_os("HERMIT_E2E_EMPTY_WORKDIR").as_deref() == Some(OsStr::new("/test"));
-    if let Err(error) = apply_pinned_root(&mut plan, &root, already_inside_pinned_root) {
+    // The public environment variable is the per-cell gate, not proof that the
+    // validate driver itself is already inside the pinned root. Only the exact
+    // internal strict-compat payload established above may suppress another
+    // wrapper; otherwise an operator-supplied variable could bypass the base
+    // image for an entire top-level validation.
+    if let Err(error) = apply_pinned_root(&mut plan, &root, internal_pinned_payload) {
         return RunSummary::refused(
             3,
             &plan.profile,
