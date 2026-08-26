@@ -3106,7 +3106,18 @@ fn durable_log_path(root: &Path, profile: &str, sha: &str) -> PathBuf {
             std::process::id()
         )
     });
+    durable_log_path_for_run(&dir, profile, &sha12, &run)
+}
+
+fn durable_log_path_for_run(dir: &Path, profile: &str, sha12: &str, run: &str) -> PathBuf {
     dir.join(format!("validate-{profile}-{sha12}-{run}.log"))
+}
+
+fn fallback_e2e_result_root(log_path: &Path, run: &std::ffi::OsStr) -> Result<PathBuf, String> {
+    let log_dir = log_path
+        .parent()
+        .ok_or_else(|| format!("durable log has no parent: {}", log_path.display()))?;
+    Ok(log_dir.join("e2e").join(run))
 }
 
 /// Give every real validate invocation its own durable E2E result directory.
@@ -3137,12 +3148,7 @@ fn configure_e2e_result_root(
                 root.join(supplied)
             }
         }
-        _ => {
-            let log_dir = log_path
-                .parent()
-                .ok_or_else(|| format!("durable log has no parent: {}", log_path.display()))?;
-            log_dir.join("e2e").join(&run)
-        }
+        _ => fallback_e2e_result_root(log_path, &run)?,
     };
     std::fs::create_dir_all(&path)
         .map_err(|e| format!("cannot create E2E result directory {}: {e}", path.display()))?;
@@ -3167,6 +3173,133 @@ fn configure_e2e_result_root(
         std::env::set_var("E2E_BUILD_ROOT", temporary_build_root);
     }
     Ok(path)
+}
+
+#[cfg(test)]
+mod concurrent_validate_path_tests {
+    use std::io::Write;
+    use std::sync::mpsc;
+
+    use super::*;
+
+    #[test]
+    fn durable_outputs_reproduce_the_old_second_collision_and_separate_runs_now() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "hermit-validate-output-collision-{}-{nanos}",
+            std::process::id()
+        ));
+        let logs = root.join("ignored/validate");
+        std::fs::create_dir_all(&logs).unwrap();
+        let sha12 = "0123456789ab";
+
+        // Removed behavior: second-resolution identity made both runs append to
+        // one log and write one retained E2E tree.
+        let old = logs.join(format!("validate-full-{sha12}-20260826T120000Z.log"));
+        std::fs::write(&old, b"run-a\n").unwrap();
+        let mut old_second = std::fs::OpenOptions::new().append(true).open(&old).unwrap();
+        old_second.write_all(b"run-b\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "run-a\nrun-b\n");
+        let old_e2e = logs.join("e2e/validate-full-0123456789ab-20260826T120000Z");
+        std::fs::create_dir_all(&old_e2e).unwrap();
+        std::fs::write(old_e2e.join("cell-results.jsonl"), b"run-a").unwrap();
+        std::fs::write(old_e2e.join("cell-results.jsonl"), b"run-b").unwrap();
+        assert_eq!(
+            std::fs::read(old_e2e.join("cell-results.jsonl")).unwrap(),
+            b"run-b"
+        );
+
+        let log_a = durable_log_path_for_run(&logs, "full", sha12, "validate-a");
+        let log_b = durable_log_path_for_run(&logs, "full", sha12, "validate-b");
+        assert_ne!(log_a, log_b);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&log_a)
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&log_b)
+            .unwrap();
+        assert!(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&log_a)
+                .is_err(),
+            "reusing one run identity must refuse rather than append"
+        );
+        let e2e_a = fallback_e2e_result_root(&log_a, std::ffi::OsStr::new("validate-a")).unwrap();
+        let e2e_b = fallback_e2e_result_root(&log_b, std::ffi::OsStr::new("validate-b")).unwrap();
+        assert_ne!(e2e_a, e2e_b);
+        std::fs::create_dir_all(&e2e_a).unwrap();
+        std::fs::create_dir_all(&e2e_b).unwrap();
+        std::fs::write(e2e_a.join("cell-results.jsonl"), b"run-a").unwrap();
+        std::fs::write(e2e_b.join("cell-results.jsonl"), b"run-b").unwrap();
+        assert_eq!(
+            std::fs::read(e2e_a.join("cell-results.jsonl")).unwrap(),
+            b"run-a"
+        );
+        assert_eq!(
+            std::fs::read(e2e_b.join("cell-results.jsonl")).unwrap(),
+            b"run-b"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unavailable_checkout_lock_refuses_before_shared_target_output_is_written() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "hermit-validate-unavailable-lock-{}-{nanos}",
+            std::process::id()
+        ));
+        let shared = root.join("old-target/shared-output");
+        std::fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        let (first_written_tx, first_written_rx) = mpsc::sync_channel(0);
+        let (second_written_tx, second_written_rx) = mpsc::sync_channel(0);
+        let first_path = shared.clone();
+        let first = std::thread::spawn(move || {
+            std::fs::write(first_path, b"run-a").unwrap();
+            first_written_tx.send(()).unwrap();
+            second_written_rx.recv().unwrap();
+        });
+        let second_path = shared.clone();
+        let second = std::thread::spawn(move || {
+            first_written_rx.recv().unwrap();
+            std::fs::write(second_path, b"run-b").unwrap();
+            second_written_tx.send(()).unwrap();
+        });
+        first.join().unwrap();
+        second.join().unwrap();
+        assert_eq!(
+            std::fs::read(&shared).unwrap(),
+            b"run-b",
+            "the removed fail-open path allowed the second run to replace the first run's target output"
+        );
+
+        let checkout = root.join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::write(checkout.join("target"), b"not a directory").unwrap();
+        let error = match validate_runtime::acquire_invocation_lock(&checkout, "full", "abc") {
+            validate_runtime::LockOutcome::Unavailable(error) => error,
+            _ => panic!("an unusable target path must make the checkout lock unavailable"),
+        };
+        let summary = unavailable_invocation_lock_summary("full", error);
+        assert_eq!(summary.verdict, Verdict::Refused);
+        assert!(summary
+            .detail
+            .iter()
+            .any(|line| line.contains("refusing rather than running two validates")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 /// Establish the self-tee. FAIL-CLOSED: any failure exits loudly rather than
@@ -11357,6 +11490,17 @@ impl RunSummary {
     }
 }
 
+fn unavailable_invocation_lock_summary(profile: &str, error: String) -> RunSummary {
+    RunSummary::refused(
+        3,
+        profile,
+        "the per-checkout invocation lock",
+        vec![format!(
+            "cannot establish per-checkout exclusion: {error}; refusing rather than running two validates against shared target output"
+        )],
+    )
+}
+
 /// How many attempts this cell has had so far, by highest recorded ordinal.
 ///
 /// Counting rows would undercount a cell whose attempt was never reported; the
@@ -11889,14 +12033,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                 );
             }
             validate_runtime::LockOutcome::Unavailable(e) => {
-                return RunSummary::refused(
-                    3,
-                    &profile_name,
-                    "the per-checkout invocation lock",
-                    vec![format!(
-                        "cannot establish per-checkout exclusion: {e}; refusing rather than running two validates against shared target output"
-                    )],
-                );
+                return unavailable_invocation_lock_summary(&profile_name, e);
             }
         }
     } else {
