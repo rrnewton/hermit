@@ -31,6 +31,15 @@
                "hard_mem_max_bytes": 536870912, "classification": "light"}
     },
     {
+      "group": "check", "job": "exit_status_class",
+      "desc": "Refuse a bare exit-status integer in a test, for the four values that changed meaning",
+      "description": "hermit#2558 gave hermit its own failure exit code 125, so tests asserting 1 for a failure hermit CHOSE are now wrong -- and which ones cannot be found by running the suite, because 85 of 133 hermit-cli test targets are run by no node. This node is STATIC for exactly that reason: it reads source, so it sees the unrun targets that no execution ever will. It does not judge correctness, which is undecidable here -- stress_suite.rs:342 and flock_exclusion.rs:245 are the same expression and mean opposite things. It refuses a BARE integer, i.e. a site that never says which channel produced the number, for the four contested values 1/125/126/127. Ratchet at 17; it may only go down.",
+      "cmd": "./scripts/check-exit-status-class.rs --gate",
+      "timeout": 60,
+      "hint": {"est_duration_s": 3, "rss_baseline_bytes": 67108864,
+               "hard_mem_max_bytes": 536870912, "classification": "light"}
+    },
+    {
       "group": "check", "job": "dbt_runtime_abi",
       "desc": "Hermit supplies every reverie_dbt_runtime_* callback the DBT client declares",
       "description": "The DBT client declares and calls every reverie_dbt_runtime_* callback unconditionally, but their upstream definitions sit behind reverie-dbt's prototype-runtime feature, which detcore-dbt disables by design so Hermit can supply Detcore's runtime instead. The two lists are joined by hand and nothing compared them: cargo cannot, because the client is C and the link happens when DynamoRIO loads it. MEASURED 2026-08-20: test.dbt_parity had been red nine days on one missing symbol, and advancing the Reverie pin took the gap from one to five while every build stayed green. This node compares the two dynamic symbol tables and names the missing callbacks, which DynamoRIO's own '<ERROR: using undefined symbol!>' never does.",
