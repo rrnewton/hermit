@@ -7299,17 +7299,18 @@ mod nextest_timeout_tests {
     /// The per-test cap stays at 15s, and every exemption from it is named,
     /// measured, and justified IN PLACE.
     ///
-    /// ⚠️ WIDENED FROM ONE OVERRIDE TO TWO, DELIBERATELY AND WITHOUT WEAKENING.
+    /// ⚠️ WIDENED FROM ONE OVERRIDE TO THREE, DELIBERATELY AND WITHOUT WEAKENING.
     /// This gate is a ratchet against exemptions accumulating quietly, so adding
     /// one had to be a visible edit here rather than a silently passing config
-    /// change -- which is exactly what it did: the second override failed this
-    /// test first. It is now STRICTER than before, not looser: it pins both
+    /// change -- which is exactly what it did: each added override failed this
+    /// test first. It is now STRICTER than before, not looser: it pins all three
     /// filters and requires each override's justification text to be present, so
     /// a third exemption still cannot appear without an author changing this
     /// list and supplying a reason. The count alone was the weaker check.
     #[test]
-    fn nextest_uses_the_measured_default_and_only_named_justified_overrides() {
+    fn nextest_uses_the_manifest_default_and_named_overrides() {
         let config = include_str!("../.config/nextest.toml");
+        let manifest = include_str!("../tests/e2e/manifests/defaults.yaml");
         let timeouts: Vec<&str> = config
             .lines()
             .map(str::trim)
@@ -7321,27 +7322,32 @@ mod nextest_timeout_tests {
                 "slow-timeout = { period = \"15s\", terminate-after = 1, grace-period = \"2s\" }",
                 "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
                 "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
+                "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
             ],
-            "the per-test timeout must stay at 15s, with exactly the two measured \
-             30s overrides below and no others"
+            "the per-test timeout must stay at 15s with exactly three justified 30s overrides"
         );
-
-        // Override 1: the source-audit test that launches 12 Hermit processes.
-        assert!(config.contains(
-            "filter = \"test(/(^|::)every_record_container_site_classifies_a_child_fault_by_name$/)\""
-        ));
-        assert!(config.contains("12 separate Hermit processes"));
-        assert!(config.contains("25.98-26.30s while passing"));
-
-        // Override 2: the cell that forces hermit's own `--timeout` SIGALRM
-        // fallback, whose runtime is the smallest expressible bound plus
-        // RUN_TIMEOUT_UNWIND_GRACE and therefore cannot be reduced without
-        // ceasing to exercise the shipped constant.
-        assert!(config.contains(
-            "filter = \"test(/(^|::)run_timeout_fallback_fires_when_the_unwind_does_not_finish$/)\""
-        ));
+        for required in [
+            "test(/(^|::)every_record_container_site_classifies_a_child_fault_by_name$/)",
+            "test(/(^|::)run_timeout_fallback_fires_when_the_unwind_does_not_finish$/)",
+            "binary(=container_init_deadline) & test(/(^|::)bare_timeout_kills_a_hung_hermit_run$/)",
+        ] {
+            assert!(config.contains(required), "nextest config lost {required}");
+            assert!(manifest.contains(required), "manifest lost {required}");
+        }
+        for required in [
+            "12 separate Hermit processes",
+            "25.98-26.30s while passing",
+        ] {
+            assert!(config.contains(required), "nextest config lost {required}");
+            assert!(manifest.contains(required), "manifest lost {required}");
+        }
+        assert!(config.contains("waits for timeout(1)'s 15s deadline"));
+        assert!(config.contains("16.2s while passing"));
         assert!(config.contains("RUN_TIMEOUT_UNWIND_GRACE"));
         assert!(config.contains("11.2s"));
+        assert!(manifest.contains("15-second external deadline"));
+        assert!(manifest.contains("named teardown check"));
+        assert!(manifest.contains("timeout_seconds: 15"));
     }
 }
 

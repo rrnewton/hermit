@@ -1115,7 +1115,7 @@ fn audit_compile(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode 
     let context = RunContext::from_env(root.to_path_buf(), false).unwrap_or_else(|e| fail(e));
     let mut checked = 0;
     let mut failed = false;
-    for (category, test) in manifests.all_tests() {
+    for (category, inherited_timeout_seconds, test) in manifests.all_tests() {
         if args
             .selection
             .lane
@@ -1147,6 +1147,11 @@ fn audit_compile(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode 
             .first()
             .cloned()
             .unwrap_or_else(|| "ptrace".into());
+        let timeout_seconds = verify
+            .timeout_seconds
+            .get(&backend)
+            .copied()
+            .unwrap_or(inherited_timeout_seconds);
         let cell = hermit_manifest_plan::runner::SelectedCell {
             category: category.into(),
             test: test.clone(),
@@ -1156,6 +1161,7 @@ fn audit_compile(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode 
                 backend: Some(backend),
             },
             enabled: false,
+            timeout_seconds,
         };
         checked += 1;
         let dir = context

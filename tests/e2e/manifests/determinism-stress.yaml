@@ -1,4 +1,4 @@
-schema: 2
+schema: 3
 bucket: determinism-stress
 test:
   - id: determinism-stress/thread-output
@@ -9,7 +9,6 @@ test:
       - x86_64
       - userns
       - ptrace
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/determinism-stress/thread-output.sh
     observation:
@@ -68,7 +67,6 @@ test:
       - userns
       - ptrace
       - bash
-    timeout_seconds: 90
     occasional: false
     direct: ./examples/race.sh
     observation:
@@ -128,7 +126,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 120
     occasional: false
     program: tests/e2e/determinism-stress/thread-contention.sh
     observation:
@@ -191,7 +188,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 120
     occasional: false
     program: tests/e2e/determinism-stress/process-chains.sh
     observation:
@@ -250,7 +246,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/chaos/order_violation.c
     observation:
@@ -352,7 +347,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/chaos/thread_interleaving.c
     observation:

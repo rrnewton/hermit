@@ -5,7 +5,7 @@
 //! This source code is licensed under the BSD-style license found in the
 //! LICENSE file in the root directory of this source tree.
 //!
-//! Expand the schema-v2 e2e manifests into runnable command files.
+//! Expand the schema-v3 e2e manifests into runnable command files.
 //!
 //! Run from anywhere inside the checkout:
 //!
@@ -14,10 +14,9 @@
 //! ```
 //!
 //! Each `ignored/e2e-commands/<bucket>.txt` file contains one self-contained
-//! shell command per enabled `(test, mode, backend)` cell. Chaos seeds expand
-//! to separate lines. Commands compile implicit C/Rust guests and prepare shell
-//! wrappers before invoking Hermit, so any individual line can be rerun from
-//! the repository root.
+//! shell command per enabled `(test, mode, backend)` cell. Commands compile
+//! implicit C/Rust guests and prepare shell wrappers before invoking Hermit, so
+//! any individual line can be rerun from the repository root.
 //!
 //! ```cargo
 //! [dependencies]
@@ -32,14 +31,21 @@ mod rust_script_prelude;
 #[path = "../ci/manifest-plan/src/manifest_value.rs"]
 mod manifest_value;
 
+#[path = "../ci/manifest-plan/src/timeouts.rs"]
+mod timeouts;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use manifest_value::Value;
+use timeouts::DEFAULTS_FILE;
+use timeouts::MANIFEST_SCHEMA;
+use timeouts::MAX_TIMEOUT_SECONDS;
+use timeouts::MIN_TIMEOUT_SECONDS;
+use timeouts::resolve_timeout_seconds;
 
-const MANIFEST_SCHEMA: i64 = 2;
 const RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=\"$cell/tmp\" E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 const HERMIT_RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=/tmp/hermit-e2e E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 const HERMIT_GUEST_ENV_ARGS: &str = "--env LC_ALL=C --env TZ=UTC --env HOME=\"$cell/home\" --env XDG_CONFIG_HOME=\"$cell/xdg-config\" --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=\"$cell/fixtures\"";
@@ -91,6 +97,36 @@ fn string_array(value: Option<&Value>, context: &str) -> Vec<String> {
                 .to_owned()
         })
         .collect()
+}
+
+fn timeout_seconds(value: Option<&Value>, context: &str) -> i64 {
+    match value.and_then(Value::as_integer) {
+        Some(timeout)
+            if (MIN_TIMEOUT_SECONDS as i64..=MAX_TIMEOUT_SECONDS as i64).contains(&timeout) =>
+        {
+            timeout
+        }
+        other => fail(format!(
+            "{context} must be {MIN_TIMEOUT_SECONDS}..={MAX_TIMEOUT_SECONDS}, got {other:?}"
+        )),
+    }
+}
+
+fn cell_timeout_seconds(spec: &Value, backend: &str, inherited: i64, id: &str, mode: &str) -> i64 {
+    let Some(value) = spec.get("timeout_seconds") else {
+        return inherited;
+    };
+    let table = value.as_table().unwrap_or_else(|| {
+        fail(format!(
+            "{id}.modes.{mode}.timeout_seconds must be a backend table"
+        ))
+    });
+    table.get(backend).map_or(inherited, |value| {
+        timeout_seconds(
+            Some(value),
+            &format!("{id}.modes.{mode}.timeout_seconds.{backend}"),
+        )
+    })
 }
 
 fn integer_array(value: Option<&Value>, context: &str) -> Vec<i64> {
@@ -250,7 +286,6 @@ fn hermit_command(
     mode: &str,
     backend: &str,
     lane: &str,
-    timeout: i64,
     seed: Option<i64>,
     extra: &[String],
     verify_bitwise_parity: bool,
@@ -267,7 +302,7 @@ fn hermit_command(
             )
         }
         "replay" => format!(
-            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log info --backend {} record start --strict $record_verify_strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout {timeout} {HERMIT_GUEST_ENV_ARGS} -- {guest}",
+            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log info --backend {} record start --strict $record_verify_strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout \"$remaining\" {HERMIT_GUEST_ENV_ARGS} -- {guest}",
             shell_quote(backend)
         ),
         "chaos" => format!(
@@ -290,30 +325,44 @@ fn hermit_command(
         }
         other => fail(format!("unsupported mode `{other}`")),
     };
-    format!("timeout --kill-after=10s {timeout}s {command}")
+    command
 }
 
-fn repeat(command: &str, count: i64) -> String {
+fn bounded_invocation(command: &str, id: &str, attempt: &str) -> String {
+    format!(
+        "remaining=$((cell_deadline - SECONDS)); if [ \"$remaining\" -le 0 ]; then printf '%s\\n' {}; exit 124; fi; {command}",
+        shell_quote(&format!(
+            "{id} exceeded its per-cell timeout before {attempt}"
+        ))
+    )
+}
+
+fn repeat(command: &str, count: i64, id: &str) -> String {
     if count <= 1 {
-        return command.to_owned();
+        return bounded_invocation(command, id, "attempt 1");
     }
     let iterations = (1..=count)
         .map(|n| n.to_string())
         .collect::<Vec<_>>()
         .join(" ");
+    let command = bounded_invocation(command, id, "a repeated attempt");
     format!("for _run in {iterations}; do {command} || exit; done")
 }
 
-fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
+fn outer_cell_command(setup: &str, run: &str, timeout: i64) -> String {
+    let body = format!("cell_deadline=$((SECONDS + {timeout})); {setup} && {run}");
+    format!(
+        "timeout --kill-after=10s {timeout}s bash -c {}",
+        shell_quote(&body)
+    )
+}
+
+fn commands_for_test(test: &Value, bucket: &str, inherited_timeout_seconds: i64) -> Vec<String> {
     let id = test_id(test, bucket);
     let lane = test
         .get("lane")
         .and_then(Value::as_str)
         .unwrap_or("portable");
-    let timeout = test
-        .get("timeout_seconds")
-        .and_then(Value::as_integer)
-        .unwrap_or(60);
     let modes = test
         .get("modes")
         .and_then(Value::as_table)
@@ -334,10 +383,12 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
                 continue;
             }
             let runs = spec.get("runs").and_then(Value::as_integer).unwrap_or(3);
-            let run = format!("timeout --kill-after=10s {timeout}s {RUN_ENV} {guest}");
+            let timeout =
+                cell_timeout_seconds(spec, "native", inherited_timeout_seconds, &id, mode);
+            let run = format!("{RUN_ENV} {guest}");
             lines.push(format!(
-                "{setup} && {} # {id} mode=naked backend=native",
-                repeat(&run, runs)
+                "{} # {id} mode=naked backend=native",
+                outer_cell_command(&setup, &repeat(&run, runs, &id), timeout)
             ));
             continue;
         }
@@ -370,31 +421,37 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
         };
 
         for backend in backends {
+            let timeout =
+                cell_timeout_seconds(spec, &backend, inherited_timeout_seconds, &id, mode);
             let guest_args = mode_guest_args(spec, mode, &backend, &id);
             let guest = guest_with_args(&guest, &guest_args);
+            let mut invocations = Vec::new();
             for seed in &seeds {
                 let seed = (mode == "chaos").then_some(*seed);
                 let command = hermit_command(
                     mode,
                     &backend,
                     lane,
-                    timeout,
                     seed,
                     &extra,
                     verify_bitwise_parity,
                     &guest,
                 );
-                // A chaos command already asks Hermit to execute the same seed
-                // twice via --verify. Repeating the whole command here would
-                // turn one declared seed into four guest executions and make
-                // this front door disagree with the harness.
                 let runs = if mode == "custom" { custom_runs } else { 1 };
-                let seed_note = seed.map(|s| format!(" seed={s}")).unwrap_or_default();
-                lines.push(format!(
-                    "{setup} && {} # {id} mode={mode} backend={backend}{seed_note}",
-                    repeat(&command, runs)
-                ));
+                let attempt = seed
+                    .map(|value| format!("seed {value}"))
+                    .unwrap_or_else(|| "attempt 1".into());
+                let invocation = if runs > 1 {
+                    repeat(&command, runs, &id)
+                } else {
+                    bounded_invocation(&command, &id, &attempt)
+                };
+                invocations.push(invocation);
             }
+            lines.push(format!(
+                "{} # {id} mode={mode} backend={backend}",
+                outer_cell_command(&setup, &invocations.join(" && "), timeout)
+            ));
         }
     }
     lines
@@ -409,9 +466,9 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
 /// the argument list, which would drift. Cells with no declared arguments are
 /// omitted rather than emitted empty, so a consumer can distinguish "declared
 /// nothing" from "not in the manifests" only by the test id's absence.
-fn guest_args_tsv(tests: &[(String, Value)]) -> Vec<String> {
+fn guest_args_tsv(tests: &[(String, i64, Value)]) -> Vec<String> {
     let mut lines = Vec::new();
-    for (bucket, test) in tests {
+    for (bucket, _, test) in tests {
         let id = test_id(test, bucket);
         let Some(modes) = test.get("modes").and_then(Value::as_table) else {
             continue;
@@ -450,14 +507,34 @@ rewrites the generated *.txt files in place.
   --guest-args  Write nothing; print the declared per-backend guest arguments as
                 TSV (`<test-id> <mode> <backend> <arg>...`) on stdout instead.";
 
-/// Parse every manifest under `manifests`, validating schema and bucket naming,
-/// and return `(bucket, test)` pairs in file order.
-fn load_manifest_tests(manifests: &Path) -> Vec<(String, Value)> {
+/// Parse every manifest under `manifests`, resolving the inherited timeout and
+/// returning `(bucket, timeout_seconds, test)` tuples in file order.
+fn load_manifest_tests(manifests: &Path) -> Vec<(String, i64, Value)> {
+    let defaults_path = manifests.join(DEFAULTS_FILE);
+    let defaults_source = fs::read_to_string(&defaults_path)
+        .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", defaults_path.display())));
+    let defaults: Value = defaults_source
+        .parse()
+        .unwrap_or_else(|e| fail(format!("{}: invalid YAML: {e}", defaults_path.display())));
+    let schema = defaults.get("schema").and_then(Value::as_integer);
+    if schema != Some(MANIFEST_SCHEMA as i64) {
+        fail(format!(
+            "{}: expected schema {MANIFEST_SCHEMA}, got {schema:?}",
+            defaults_path.display()
+        ));
+    }
+    let global_timeout_seconds = timeout_seconds(
+        defaults.get("timeout_seconds"),
+        "global default.timeout_seconds",
+    );
     let mut paths = fs::read_dir(manifests)
         .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", manifests.display())))
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "yaml"))
+        .filter(|path| {
+            path.extension().is_some_and(|ext| ext == "yaml")
+                && path.file_name().is_some_and(|name| name != DEFAULTS_FILE)
+        })
         .collect::<Vec<_>>();
     paths.sort();
 
@@ -478,7 +555,7 @@ fn load_manifest_tests(manifests: &Path) -> Vec<(String, Value)> {
             .parse()
             .unwrap_or_else(|e| fail(format!("{}: invalid YAML: {e}", path.display())));
         let schema = manifest.get("schema").and_then(Value::as_integer);
-        if schema != Some(MANIFEST_SCHEMA) {
+        if schema != Some(MANIFEST_SCHEMA as i64) {
             fail(format!(
                 "{}: expected schema {MANIFEST_SCHEMA}, got {schema:?}",
                 path.display()
@@ -494,12 +571,20 @@ fn load_manifest_tests(manifests: &Path) -> Vec<(String, Value)> {
                 path.display()
             ));
         }
+        let bucket_timeout_seconds = manifest
+            .get("timeout_seconds")
+            .map(|value| timeout_seconds(Some(value), &format!("{bucket}.timeout_seconds")));
+        let inherited_timeout_seconds = resolve_timeout_seconds(
+            global_timeout_seconds as u64,
+            bucket_timeout_seconds.map(|value| value as u64),
+            None,
+        ) as i64;
         let tests = manifest
             .get("test")
             .and_then(Value::as_array)
             .unwrap_or_else(|| fail(format!("{}: missing [[test]] entries", path.display())));
         for test in tests {
-            collected.push((bucket.to_owned(), test.clone()));
+            collected.push((bucket.to_owned(), inherited_timeout_seconds, test.clone()));
         }
     }
     collected
@@ -534,8 +619,8 @@ fn main() -> ExitCode {
     }
 
     let mut by_bucket: Vec<(String, Vec<String>)> = Vec::new();
-    for (bucket, test) in load_manifest_tests(&manifests) {
-        let lines = commands_for_test(&test, &bucket);
+    for (bucket, timeout_seconds, test) in load_manifest_tests(&manifests) {
+        let lines = commands_for_test(&test, &bucket, timeout_seconds);
         match by_bucket.iter_mut().find(|(name, _)| name == &bucket) {
             Some((_, existing)) => existing.extend(lines),
             None => by_bucket.push((bucket, lines)),
@@ -573,14 +658,14 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
-    fn manifest(body: &str) -> Vec<(String, Value)> {
+    fn manifest(body: &str) -> Vec<(String, i64, Value)> {
         let value: Value = body.parse().expect("test manifest must parse");
         value
             .get("test")
             .and_then(Value::as_array)
             .expect("test manifest needs [[test]]")
             .iter()
-            .map(|test| ("c-programs".to_owned(), test.clone()))
+            .map(|test| ("c-programs".to_owned(), 15, test.clone()))
             .collect()
     }
 
@@ -601,7 +686,7 @@ test:
     #[test]
     fn declared_guest_args_are_appended_and_quoted() {
         let tests = manifest(DECLARED);
-        let spec = &tests[0].1["modes"]["verify"];
+        let spec = &tests[0].2["modes"]["verify"];
         let args = mode_guest_args(spec, "verify", "ptrace", "c-programs/example");
         assert_eq!(args, vec!["multi", "value with spaces"]);
         assert_eq!(
@@ -616,7 +701,7 @@ test:
     #[test]
     fn guest_args_are_resolved_per_backend() {
         let tests = manifest(DECLARED);
-        let spec = &tests[0].1["modes"]["verify"];
+        let spec = &tests[0].2["modes"]["verify"];
         assert_eq!(
             mode_guest_args(spec, "verify", "liteinst", "c-programs/example"),
             vec!["edge"]
@@ -641,7 +726,7 @@ test:
         backends_enabled: [ptrace]
 "#,
         );
-        let spec = &tests[0].1["modes"]["verify"];
+        let spec = &tests[0].2["modes"]["verify"];
         let args = mode_guest_args(spec, "verify", "ptrace", "c-programs/bare");
         assert!(args.is_empty());
         assert_eq!(guest_with_args("\"$cell/guest\"", &args), "\"$cell/guest\"");
@@ -663,7 +748,7 @@ test:
           ptrace: [multi]
 "#,
         );
-        let spec = &tests[0].1["modes"]["verify"];
+        let spec = &tests[0].2["modes"]["verify"];
         assert!(mode_guest_args(spec, "verify", "kvm", "c-programs/partial").is_empty());
     }
 
@@ -700,32 +785,14 @@ test:
 
     #[test]
     fn generated_mode_commands_match_the_harness_contract() {
-        let replay = hermit_command(
-            "replay",
-            "ptrace",
-            "portable",
-            60,
-            None,
-            &[],
-            false,
-            "guest",
-        );
-        assert!(replay.contains("--data-dir \"$cell/recording\" --record-timeout 60"));
+        let replay = hermit_command("replay", "ptrace", "portable", None, &[], false, "guest");
+        assert!(replay.contains("--data-dir \"$cell/recording\" --record-timeout \"$remaining\""));
         assert!(replay.contains("--strict $record_verify_strict --verify"));
         assert!(replay.contains("--verify-json \"$cell/captures/verify.json\""));
         assert!(replay.contains(HERMIT_GUEST_ENV_ARGS));
         assert!(!replay.contains("--no-virtualize-cpuid"));
 
-        let chaos = hermit_command(
-            "chaos",
-            "ptrace",
-            "portable",
-            60,
-            Some(7),
-            &[],
-            false,
-            "guest",
-        );
+        let chaos = hermit_command("chaos", "ptrace", "portable", Some(7), &[], false, "guest");
         assert!(chaos.contains("run --base-env=minimal"));
         assert!(chaos.contains("--verify --verify-allow=both"));
         assert!(chaos.contains("--strict $run_verify_strict --verify"));
@@ -738,7 +805,6 @@ test:
             "custom",
             "ptrace",
             "portable",
-            60,
             None,
             &["--base-env=minimal".to_owned()],
             false,
@@ -748,7 +814,7 @@ test:
         assert!(!custom.contains("--strict"));
         assert!(!custom.contains("--no-virtualize-cpuid"));
 
-        let verify = hermit_command("verify", "ptrace", "portable", 60, None, &[], true, "guest");
+        let verify = hermit_command("verify", "ptrace", "portable", None, &[], true, "guest");
         assert!(verify.contains("run --base-env=minimal"));
         assert!(verify.contains(
             "--strict $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\""
@@ -768,7 +834,7 @@ test:
         seeds: [7]
 "#,
         );
-        let commands = commands_for_test(&tests[0].1, &tests[0].0);
+        let commands = commands_for_test(&tests[0].2, &tests[0].0, tests[0].1);
 
         assert_eq!(commands.len(), 1, "one seed must emit one outer command");
         assert!(commands[0].contains("--seed=7"));
@@ -777,5 +843,59 @@ test:
             !commands[0].contains("for _run"),
             "Hermit's internal --verify repeat must not be wrapped in another repeat"
         );
+    }
+
+    #[test]
+    fn chaos_seeds_share_one_outer_cell_timeout() {
+        let tests = manifest(
+            r#"
+test:
+  - id: c-programs/two-chaos-seeds
+    program: tests/c/two-chaos-seeds.c
+    modes:
+      chaos:
+        backends_enabled: [ptrace]
+        seeds: [7, 9]
+"#,
+        );
+        let commands = commands_for_test(&tests[0].2, &tests[0].0, tests[0].1);
+
+        assert_eq!(commands.len(), 1, "one manifest cell must emit one command");
+        assert_eq!(
+            commands[0].matches("timeout --kill-after=10s 15s").count(),
+            1
+        );
+        assert_eq!(
+            commands[0]
+                .matches("remaining=$((cell_deadline - SECONDS))")
+                .count(),
+            2
+        );
+        assert!(commands[0].contains("--seed=7"));
+        assert!(commands[0].contains("--seed=9"));
+    }
+
+    #[test]
+    fn generated_commands_use_the_inherited_and_exact_cell_timeouts() {
+        let tests = manifest(
+            r#"
+test:
+  - id: c-programs/timeout-policy
+    program: tests/c/timeout-policy.c
+    modes:
+      verify:
+        backends_enabled: [ptrace, liteinst]
+        timeout_seconds:
+          ptrace: 30
+"#,
+        );
+        let commands = commands_for_test(&tests[0].2, &tests[0].0, tests[0].1);
+        assert_eq!(commands.len(), 2);
+        assert!(commands.iter().any(|line| {
+            line.contains("backend liteinst") && line.contains("timeout --kill-after=10s 15s")
+        }));
+        assert!(commands.iter().any(|line| {
+            line.contains("backend ptrace") && line.contains("timeout --kill-after=10s 30s")
+        }));
     }
 }

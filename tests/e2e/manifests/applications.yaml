@@ -1,4 +1,4 @@
-schema: 2
+schema: 3
 bucket: applications
 test:
   - id: applications/timed-progress-bar
@@ -10,7 +10,6 @@ test:
       - userns
       - ptrace
       - python3
-    timeout_seconds: 120
     occasional: false
     direct:
       - ./examples/timed-progress-bar.py
@@ -27,6 +26,10 @@ test:
           native: Elapsed time drives progress but final output is intentionally stable
       verify:
         ci: true
+        timeout_seconds:
+          ptrace: 30
+        slow_reason:
+          ptrace: Three complete validation runs measured this cell at 17.52-18.85 seconds while passing.
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -70,7 +73,6 @@ test:
       - userns
       - ptrace
       - python3
-    timeout_seconds: 120
     occasional: false
     direct:
       - ./examples/timed-progress-bar.py
@@ -130,7 +132,6 @@ test:
       - x86_64
       - kvm
       - python3
-    timeout_seconds: 120
     occasional: false
     program: tests/e2e/applications/kvm-python-examples.sh
     observation:
@@ -187,7 +188,6 @@ test:
       - linux
       - x86_64
       - kvm
-    timeout_seconds: 60
     occasional: true
     program: tests/e2e/applications/kvm-shell-environment.sh
     observation:
@@ -247,7 +247,6 @@ test:
       - ptrace
       - cc
       - ar
-    timeout_seconds: 120
     occasional: false
     program: tests/e2e/applications/c-toolchain-workflow.sh
     observation:
@@ -306,7 +305,6 @@ test:
       - userns
       - ptrace
       - git
-    timeout_seconds: 120
     occasional: false
     program: tests/e2e/applications/git-repository-workflow.sh
     observation:

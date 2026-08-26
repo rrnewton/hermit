@@ -1,4 +1,4 @@
-schema: 2
+schema: 3
 bucket: language-runtimes
 test:
   - id: language-runtimes/bash-loop-pipe-time
@@ -10,7 +10,6 @@ test:
       - userns
       - ptrace
       - bash
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/language-runtimes/bash-loop-pipe-time.sh
     observation:
@@ -69,7 +68,6 @@ test:
       - userns
       - ptrace
       - bash
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/language-runtimes/bash-random.sh
     observation:
@@ -132,7 +130,6 @@ test:
       - userns
       - ptrace
       - cxx
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/language-runtimes/cpp-stl-determinism.sh
     observation:
@@ -195,7 +192,6 @@ test:
       - userns
       - ptrace
       - python3
-    timeout_seconds: 90
     occasional: false
     direct:
       - ./examples/rand.py
@@ -256,7 +252,6 @@ test:
       - userns
       - ptrace
       - gawk
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/language-runtimes/gawk-random.sh
     observation:
@@ -319,7 +314,6 @@ test:
       - userns
       - ptrace
       - m4
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/language-runtimes/m4-macro-mkstemp.sh
     observation:
@@ -382,7 +376,6 @@ test:
       - userns
       - ptrace
       - perl
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/language-runtimes/perl-io-subprocess-time.sh
     observation:
@@ -441,7 +434,6 @@ test:
       - userns
       - ptrace
       - perl
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/language-runtimes/perl-random.sh
     observation:
@@ -504,7 +496,6 @@ test:
       - userns
       - ptrace
       - python3
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/language-runtimes/python-hash-determinism.sh
     observation:
@@ -567,7 +558,6 @@ test:
       - userns
       - ptrace
       - python3
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/language-runtimes/python-io-subprocess-time.sh
     observation:
@@ -626,7 +616,6 @@ test:
       - userns
       - ptrace
       - python3
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/language-runtimes/python-random.sh
     observation:
@@ -691,7 +680,6 @@ test:
       - userns
       - ptrace
       - rustc
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/language-runtimes/rust-hashmap-iteration.rs
     observation:
@@ -754,7 +742,6 @@ test:
       - userns
       - ptrace
       - ruby
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/language-runtimes/ruby-random.sh
     observation:
@@ -817,7 +804,6 @@ test:
       - userns
       - ptrace
       - perl
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/language-runtimes/perl-hash-order.sh
     observation:
@@ -880,7 +866,6 @@ test:
       - userns
       - ptrace
       - lua5.4
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/language-runtimes/lua-random.sh
     observation:
@@ -943,7 +928,6 @@ test:
       - userns
       - ptrace
       - python3
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/language-runtimes/python-hashseed.sh
     observation:
@@ -1012,7 +996,6 @@ test:
       - userns
       - ptrace
       - python3
-    timeout_seconds: 120
     occasional: false
     program: tests/e2e/language-runtimes/python-dict-hash-iteration.sh
     observation:
@@ -1071,7 +1054,6 @@ test:
       - userns
       - ptrace
       - tclsh
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/language-runtimes/tcl-rand-clock.sh
     observation:
@@ -1134,7 +1116,6 @@ test:
       - userns
       - ptrace
       - node
-    timeout_seconds: 120
     occasional: false
     program: tests/e2e/language-runtimes/node-v8-jit.sh
     observation:

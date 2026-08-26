@@ -1,4 +1,4 @@
-schema: 2
+schema: 3
 bucket: bin-c
 test:
   - id: bin-c/posix-timer-test
@@ -10,7 +10,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/bin/posix_timer_test.c
     observation:
@@ -70,7 +69,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/bin/robust_futex_test.c
     observation:

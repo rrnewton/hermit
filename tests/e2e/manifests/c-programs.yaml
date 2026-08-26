@@ -1,4 +1,4 @@
-schema: 2
+schema: 3
 bucket: c-programs
 test:
   - id: c-programs/procfs-identity-agreement
@@ -10,7 +10,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/procfs_identity_agreement.c
     observation:
@@ -74,7 +73,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/acct_refusal_probe.c
     observation:
@@ -134,7 +132,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/add_key_enosys.c
     observation:
@@ -201,7 +198,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/adjtimex_deterministic.c
     observation:
@@ -261,7 +257,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/arch_prctl_determinism.c
     observation:
@@ -320,7 +315,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/bpf_enosys.c
     observation:
@@ -380,7 +374,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/cachestat_enosys.c
     observation:
@@ -447,7 +440,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/clock_adjtime_deterministic.c
     observation:
@@ -507,7 +499,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/clone.c
     observation:
@@ -576,7 +567,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/copy_file_range_refusal_probe.c
     observation:
@@ -636,7 +626,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/dbt_copied_tiocgpgrp.c
     observation:
@@ -696,7 +685,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/dbt_exec_failure.c
     observation:
@@ -765,7 +753,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/dbt_execveat_unsupported.c
     observation:
@@ -825,7 +812,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/dbt_mmap_exec.c
     observation:
@@ -884,7 +870,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/dbt_pid_virtualization.c
     observation:
@@ -944,7 +929,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/dbt_prlimit_self.c
     observation:
@@ -1014,7 +998,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/dbt_self_sigqueue.c
     observation:
@@ -1074,7 +1057,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/dbt_unsupported_syscall.c
     observation:
@@ -1139,7 +1121,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/dbt_wait_lifecycle.c
     observation:
@@ -1209,7 +1190,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/epoll_determinism.c
     observation:
@@ -1288,7 +1268,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/fp_reduction_nondeterminism.c
     observation:
@@ -1333,6 +1312,10 @@ test:
           liteinst: Record/replay is unsupported by LiteInst
       chaos:
         ci: true
+        timeout_seconds:
+          ptrace: 30
+        slow_reason:
+          ptrace: Three complete validation runs measured this schedule search at 27.01-29.78 seconds while passing.
         # The chaos argument preserves the default full floating-point result
         # used by strict verification, but prints only its low three bits here.
         # That gives an exact eight-class ceiling: the output can express at
@@ -1411,7 +1394,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/futex_requeue_enosys.c
     observation:
@@ -1471,7 +1453,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/futex_waitv_enosys.c
     observation:
@@ -1538,7 +1519,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/futex_wake_enosys.c
     observation:
@@ -1598,7 +1578,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/get_robust_list_child.c
     observation:
@@ -1658,7 +1637,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/get_robust_list_self.c
     observation:
@@ -1725,7 +1703,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/get_robust_list_thread.c
     observation:
@@ -1785,7 +1762,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/getCpu.c
     observation:
@@ -1854,7 +1830,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/getitimer_determinism_probe.c
     observation:
@@ -1913,7 +1888,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/getsockopt_null.c
     observation:
@@ -1972,7 +1946,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/hello_alarm.c
     observation:
@@ -2041,7 +2014,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/simple/hello_nostdlib.c
     observation:
@@ -2116,7 +2088,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/hello_signals.c
     observation:
@@ -2185,7 +2156,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/io_uring_fallback.c
     observation:
@@ -2254,7 +2224,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/io_uring_ring_determinism.c
     observation:
@@ -2323,7 +2292,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/ioctl_fioclex.c
     observation:
@@ -2395,7 +2363,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/ioctl_siocethtool.c
     observation:
@@ -2464,7 +2431,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/ipc_determinism.c
     observation:
@@ -2584,7 +2550,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/just_spin.c
     observation:
@@ -2654,7 +2619,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/kcmp_eperm.c
     observation:
@@ -2721,7 +2685,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/keyctl_enosys.c
     observation:
@@ -2788,7 +2751,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/keyctl_passthrough.c
     observation:
@@ -2847,7 +2809,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/listmount_enosys.c
     observation:
@@ -2914,7 +2875,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/liteinst_advanced.c
     observation:
@@ -2976,7 +2936,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/lsm_get_self_attr_enosys.c
     observation:
@@ -3036,7 +2995,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/lsm_list_modules_enosys.c
     observation:
@@ -3096,7 +3054,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/lsm_set_self_attr_enosys.c
     observation:
@@ -3156,7 +3113,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/madvise_determinism.c
     observation:
@@ -3219,7 +3175,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/map_shadow_stack_enosys.c
     observation:
@@ -3279,7 +3234,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/memfd_secret_enosys.c
     observation:
@@ -3339,7 +3293,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/meminfo_available_deterministic.c
     observation:
@@ -3398,7 +3351,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/meminfo_cached_deterministic.c
     observation:
@@ -3457,7 +3409,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/meminfo_free_deterministic.c
     observation:
@@ -3516,7 +3467,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/memoryPress.c
     observation:
@@ -3575,7 +3525,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/mmap_determinism.c
     observation:
@@ -3644,7 +3593,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/mmap_stress_determinism.c
     observation:
@@ -3713,7 +3661,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/name_to_handle_at_eopnotsupp.c
     observation:
@@ -3773,7 +3720,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/name_to_handle_directory_eopnotsupp.c
     observation:
@@ -3833,7 +3779,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/name_to_handle_empty_path_eopnotsupp.c
     observation:
@@ -3893,7 +3838,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/name_to_handle_regular_eopnotsupp.c
     observation:
@@ -3952,7 +3896,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/nanosleep-par.c
     observation:
@@ -4021,7 +3964,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/simple/nanosleep-threads-nocrash.c
     observation:
@@ -4091,7 +4033,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/simple/nanosleep-threads-simple.c
     observation:
@@ -4161,7 +4102,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/netlink_autobind_generic.c
     observation:
@@ -4221,7 +4161,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/netlink_autobind_route.c
     observation:
@@ -4281,7 +4220,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/netlink_autobind_usersock.c
     observation:
@@ -4341,7 +4279,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/netns_cookie_tcp4.c
     observation:
@@ -4400,7 +4337,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/netns_cookie_tcp6.c
     observation:
@@ -4459,7 +4395,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/netns_cookie_udp4.c
     observation:
@@ -4518,7 +4453,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/pause_alarm_interrupt.c
     observation:
@@ -4586,7 +4520,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/perf_event_hardware_enosys.c
     observation:
@@ -4646,7 +4579,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/perf_event_open_enosys.c
     observation:
@@ -4706,7 +4638,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/perf_event_software_enosys.c
     observation:
@@ -4766,7 +4697,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/perf_event_watchpoint_enosys.c
     observation:
@@ -4826,7 +4756,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/periodic_setitimer_delivery.c
     observation:
@@ -4885,7 +4814,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/pidfd_open_self.c
     observation:
@@ -4944,7 +4872,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/pidfd_poll_self.c
     observation:
@@ -5003,7 +4930,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/pidfd_waitid_child.c
     observation:
@@ -5063,7 +4989,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/pipe2_errno_precedence.c
     observation:
@@ -5143,7 +5068,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/ppoll_readv.c
     observation:
@@ -5202,7 +5126,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/ppoll_simulation.c
     observation:
@@ -5262,7 +5185,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/prctl_dumpable.c
     observation:
@@ -5321,7 +5243,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/prctl_option_policy.c
     observation:
@@ -5384,7 +5305,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/simple/pread64_nostdlib.c
     observation:
@@ -5459,7 +5379,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/print_memaddrs.c
     observation:
@@ -5528,7 +5447,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/printf_with_threads.c
     observation:
@@ -5598,7 +5516,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/proc_fd_link_aliases.c
     observation:
@@ -5658,7 +5575,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/proc_fdinfo.c
     observation:
@@ -5727,7 +5643,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/proc_locks.c
     observation:
@@ -5796,7 +5711,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/process_mrelease_enosys.c
     observation:
@@ -5856,7 +5770,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/process_vm_readv_refusal_probe.c
     observation:
@@ -5916,7 +5829,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/process_vm_writev_refusal_probe.c
     observation:
@@ -5976,7 +5888,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/procfs_positioned_probe.c
     observation:
@@ -6035,7 +5946,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/prodcons_determinism.c
     observation:
@@ -6095,7 +6005,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/pselect6_simulation.c
     observation:
@@ -6154,7 +6063,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/ptrace_attach_eperm.c
     observation:
@@ -6214,7 +6122,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/ptrace_eperm.c
     observation:
@@ -6274,7 +6181,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/ptrace_seize_eperm.c
     observation:
@@ -6334,7 +6240,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/ptrace_traceme_eperm.c
     observation:
@@ -6394,7 +6299,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/pty_nr_count.c
     observation:
@@ -6453,7 +6357,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/simple/racewrite_nostdlib.c
     observation:
@@ -6528,7 +6431,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/random_sources.c
     observation:
@@ -6597,7 +6499,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/rcx_canonicalization.c
     observation:
@@ -6656,7 +6557,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/record_replay_fd_close.c
     observation:
@@ -6716,7 +6616,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/record_replay_file_state.c
     observation:
@@ -6776,7 +6675,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/record_replay_lseek_seek_cur.c
     observation:
@@ -6840,7 +6738,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/record_replay_setsockopt.c
     observation:
@@ -6899,7 +6796,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/recvmsg_scm_rights_mmap.c
     observation:
@@ -6958,7 +6854,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/remap_file_pages_anonymous_enosys.c
     observation:
@@ -7018,7 +6913,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/remap_file_pages_memfd_enosys.c
     observation:
@@ -7078,7 +6972,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/remap_file_pages_tmpfile_enosys.c
     observation:
@@ -7138,7 +7031,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/request_key_enosys.c
     observation:
@@ -7198,7 +7090,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/resource_determinism.c
     observation:
@@ -7268,7 +7159,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/sched_setattr_batch.c
     observation:
@@ -7327,7 +7217,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/sched_setattr_idle.c
     observation:
@@ -7386,7 +7275,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/sched_setattr_other.c
     observation:
@@ -7445,7 +7333,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/sched_yield_progress.c
     observation:
@@ -7515,7 +7402,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/scheduler_policy_queries.c
     observation:
@@ -7574,7 +7460,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/setitimer_determinism.c
     observation:
@@ -7643,7 +7528,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/session_identity.c
     observation:
@@ -7720,7 +7604,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/sigmask_preemption.c
     observation:
@@ -7780,7 +7663,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/signal_determinism.c
     observation:
@@ -7852,7 +7734,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/sigpipe_siginfo.c
     observation:
@@ -7920,7 +7801,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/sigtimedwait-no-timeout.c
     observation:
@@ -7989,7 +7869,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/sigtimedwait-timeout-0s.c
     observation:
@@ -8059,7 +7938,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/sigtimedwait-timeout-1s.c
     observation:
@@ -8128,7 +8006,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/so_incoming_cpu_tcp4.c
     observation:
@@ -8188,7 +8065,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/so_incoming_cpu_tcp6.c
     observation:
@@ -8248,7 +8124,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/so_incoming_cpu_udp4.c
     observation:
@@ -8308,7 +8183,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/socket_cookie_tcp.c
     observation:
@@ -8368,7 +8242,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/socket_cookie_udp.c
     observation:
@@ -8428,7 +8301,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/socket_cookie_unix.c
     observation:
@@ -8488,7 +8360,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/socket_ioctl_timestamp.c
     observation:
@@ -8553,7 +8424,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/socket_timestamp_edge_cases.c
     observation:
@@ -8613,7 +8483,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/socket_timestamp_timespec.c
     observation:
@@ -8673,7 +8542,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/socket_timestamp_timeval.c
     observation:
@@ -8733,7 +8601,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/splice_enosys.c
     observation:
@@ -8793,7 +8660,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/statmount_enosys.c
     observation:
@@ -8853,7 +8719,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/syscall_file_io.c
     observation:
@@ -8912,7 +8777,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/syscall_file_metadata.c
     observation:
@@ -8971,7 +8835,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/syscall_quick_wins.c
     observation:
@@ -9030,7 +8893,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/sysfs_enosys.c
     observation:
@@ -9090,7 +8952,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/sysinfo.c
     observation:
@@ -9149,7 +9010,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/sysinfo_uptime.c
     observation:
@@ -9218,7 +9078,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/syslog_deterministic.c
     observation:
@@ -9278,7 +9137,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/sysv_sem_enosys.c
     observation:
@@ -9338,7 +9196,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/sysv_shm_enosys.c
     observation:
@@ -9398,7 +9255,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/tcp_info_accept4.c
     observation:
@@ -9457,7 +9313,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/tcp_info_accept6.c
     observation:
@@ -9516,7 +9371,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/tcp_info_client4.c
     observation:
@@ -9575,7 +9429,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/tee_enosys.c
     observation:
@@ -9635,7 +9488,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/thread_self_procfs_handoff.c
     observation:
@@ -9695,7 +9547,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/thread_sync_determinism.c
     observation:
@@ -9818,7 +9669,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/threadExhaustion.c
     observation:
@@ -9888,7 +9738,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/timer_create_determinism.c
     observation:
@@ -9957,7 +9806,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/uname.c
     observation:
@@ -10016,7 +9864,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/unix_autobind_dgram.c
     observation:
@@ -10076,7 +9923,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/unix_autobind_seqpacket.c
     observation:
@@ -10136,7 +9982,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/unix_autobind_stream.c
     observation:
@@ -10195,7 +10040,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/ustat_enosys.c
     observation:
@@ -10255,7 +10099,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/vforkExec.c
     observation:
@@ -10324,7 +10167,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/vmsplice_enosys.c
     observation:
@@ -10384,7 +10226,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/wait_on_child.c
     observation:
@@ -10443,7 +10284,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/writev_determinism.c
     observation:

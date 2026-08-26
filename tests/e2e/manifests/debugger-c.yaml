@@ -1,4 +1,4 @@
-schema: 2
+schema: 3
 bucket: debugger-c
 test:
   - id: debugger-c/debuggee
@@ -10,7 +10,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/debugger/guests/debuggee.c
     observation:

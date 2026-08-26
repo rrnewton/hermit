@@ -57,6 +57,14 @@ slow-timeout = { period = "30s", terminate-after = 1, grace-period = "2s" }
 filter = "test(/(^|::)run_timeout_fallback_fires_when_the_unwind_does_not_finish$/)"
 slow-timeout = { period = "30s", terminate-after = 1, grace-period = "2s" }
 
+# This test deliberately waits for timeout(1)'s 15s deadline before checking
+# that the container init disappears. The complete three-test binary measured
+# 16.2s while passing; 30s leaves room for its named teardown check without
+# widening the two sibling tests.
+[[profile.default.overrides]]
+filter = "binary(=container_init_deadline) & test(/(^|::)bare_timeout_kills_a_hung_hermit_run$/)"
+slow-timeout = { period = "30s", terminate-after = 1, grace-period = "2s" }
+
 [[profile.default.overrides]]
 filter = "package(=hermit) & kind(=test)"
 test-group = "hermit-serialized"

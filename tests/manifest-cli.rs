@@ -5,7 +5,7 @@
 //! This source code is licensed under the BSD-style license found in the
 //! LICENSE file in the root directory of this source tree.
 //!
-//! Ergonomic front-door to the schema-v2 e2e manifest corpus.
+//! Ergonomic front-door to the schema-v3 e2e manifest corpus.
 //!
 //! Where `manifest-to-commands.rs` expands *every* enabled cell into bucket
 //! command files, this CLI answers the three questions an operator actually
@@ -43,6 +43,9 @@ mod rust_script_prelude;
 #[path = "../ci/manifest-plan/src/manifest_value.rs"]
 mod manifest_value;
 
+#[path = "../ci/manifest-plan/src/timeouts.rs"]
+mod timeouts;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -51,8 +54,12 @@ use std::process::Command;
 use std::process::ExitCode;
 
 use manifest_value::Value;
+use timeouts::DEFAULTS_FILE;
+use timeouts::MANIFEST_SCHEMA;
+use timeouts::MAX_TIMEOUT_SECONDS;
+use timeouts::MIN_TIMEOUT_SECONDS;
+use timeouts::resolve_timeout_seconds;
 
-const MANIFEST_SCHEMA: i64 = 2;
 const RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=\"$cell/tmp\" E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 const HERMIT_RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=/tmp/hermit-e2e E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 const HERMIT_GUEST_ENV_ARGS: &str = "--env LC_ALL=C --env TZ=UTC --env HOME=\"$cell/home\" --env XDG_CONFIG_HOME=\"$cell/xdg-config\" --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=\"$cell/fixtures\"";
@@ -120,6 +127,19 @@ fn integer_array(value: Option<&Value>, context: &str) -> Vec<i64> {
                 .unwrap_or_else(|| fail(format!("{context} entries must be integers")))
         })
         .collect()
+}
+
+fn required_timeout_seconds(value: Option<&Value>, context: &str) -> i64 {
+    match value.and_then(Value::as_integer) {
+        Some(timeout)
+            if (MIN_TIMEOUT_SECONDS as i64..=MAX_TIMEOUT_SECONDS as i64).contains(&timeout) =>
+        {
+            timeout
+        }
+        other => fail(format!(
+            "{context} must be {MIN_TIMEOUT_SECONDS}..={MAX_TIMEOUT_SECONDS}, got {other:?}"
+        )),
+    }
 }
 
 fn first_chaos_seed(spec: &Value, id: &str) -> Result<i64, String> {
@@ -247,7 +267,6 @@ fn hermit_command(
     mode: &str,
     backend: &str,
     lane: &str,
-    timeout: i64,
     seed: Option<i64>,
     mode_args: &[String],
     verify_bitwise_parity: bool,
@@ -288,7 +307,7 @@ fn hermit_command(
             )
         }
         "replay" => format!(
-            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log {log} --backend {be} record start --strict $record_verify_strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout {timeout} {HERMIT_GUEST_ENV_ARGS}{extra_joined} -- {guest}"
+            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log {log} --backend {be} record start --strict $record_verify_strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout \"$remaining\" {HERMIT_GUEST_ENV_ARGS}{extra_joined} -- {guest}"
         ),
         "chaos" => {
             let seed = seed.unwrap_or_else(|| {
@@ -313,7 +332,24 @@ fn hermit_command(
         }
         other => fail(format!("unsupported mode `{other}`")),
     };
-    format!("timeout --kill-after=10s {timeout}s {command}")
+    command
+}
+
+fn bounded_invocation(command: &str, id: &str) -> String {
+    format!(
+        "remaining=$((cell_deadline - SECONDS)); if [ \"$remaining\" -le 0 ]; then printf '%s\\n' {}; exit 124; fi; {command}",
+        shell_quote(&format!(
+            "{id} exceeded its per-cell timeout before attempt 1"
+        ))
+    )
+}
+
+fn outer_cell_command(setup: &str, run: &str, timeout: i64) -> String {
+    let body = format!("cell_deadline=$((SECONDS + {timeout})); {setup} && {run}");
+    format!(
+        "timeout --kill-after=10s {timeout}s bash -c {}",
+        shell_quote(&body)
+    )
 }
 
 /// Default `--log` level per mode, matching the CI expansion.
@@ -322,17 +358,37 @@ fn default_log(_mode: &str) -> &'static str {
 }
 
 struct Manifests {
-    /// (bucket, test-value) for every [[test]] across all manifests, sorted.
-    tests: Vec<(String, Value)>,
+    /// (bucket, inherited timeout, test-value) for every test, sorted.
+    tests: Vec<(String, i64, Value)>,
 }
 
 fn load_manifests(root: &Path) -> Manifests {
     let dir = root.join("tests/e2e/manifests");
+    let defaults_path = dir.join(DEFAULTS_FILE);
+    let defaults_source = fs::read_to_string(&defaults_path)
+        .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", defaults_path.display())));
+    let defaults: Value = defaults_source
+        .parse()
+        .unwrap_or_else(|e| fail(format!("{}: invalid YAML: {e}", defaults_path.display())));
+    let schema = defaults.get("schema").and_then(Value::as_integer);
+    if schema != Some(MANIFEST_SCHEMA as i64) {
+        fail(format!(
+            "{}: expected schema {MANIFEST_SCHEMA}, got {schema:?}",
+            defaults_path.display()
+        ));
+    }
+    let global_timeout_seconds = required_timeout_seconds(
+        defaults.get("timeout_seconds"),
+        "global default.timeout_seconds",
+    );
     let mut paths = fs::read_dir(&dir)
         .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", dir.display())))
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "yaml"))
+        .filter(|path| {
+            path.extension().is_some_and(|ext| ext == "yaml")
+                && path.file_name().is_some_and(|name| name != DEFAULTS_FILE)
+        })
         .collect::<Vec<_>>();
     paths.sort();
 
@@ -348,7 +404,7 @@ fn load_manifests(root: &Path) -> Manifests {
             .parse()
             .unwrap_or_else(|e| fail(format!("{}: invalid YAML: {e}", path.display())));
         let schema = manifest.get("schema").and_then(Value::as_integer);
-        if schema != Some(MANIFEST_SCHEMA) {
+        if schema != Some(MANIFEST_SCHEMA as i64) {
             fail(format!(
                 "{}: expected schema {MANIFEST_SCHEMA}, got {schema:?}",
                 path.display()
@@ -365,21 +421,26 @@ fn load_manifests(root: &Path) -> Manifests {
                 path.display()
             ));
         }
+        let bucket_timeout_seconds = manifest.get("timeout_seconds").map(|value| {
+            required_timeout_seconds(Some(value), &format!("{bucket}.timeout_seconds"))
+        });
+        let inherited_timeout_seconds = resolve_timeout_seconds(
+            global_timeout_seconds as u64,
+            bucket_timeout_seconds.map(|value| value as u64),
+            None,
+        ) as i64;
         let entries = manifest
             .get("test")
             .and_then(Value::as_array)
             .unwrap_or_else(|| fail(format!("{}: missing [[test]] entries", path.display())));
         for test in entries {
-            tests.push((bucket.clone(), test.clone()));
+            tests.push((bucket.clone(), inherited_timeout_seconds, test.clone()));
         }
     }
     Manifests { tests }
 }
 
-fn modes_table<'a>(
-    test: &'a Value,
-    id: &str,
-) -> &'a std::collections::BTreeMap<String, Value> {
+fn modes_table<'a>(test: &'a Value, id: &str) -> &'a std::collections::BTreeMap<String, Value> {
     test.get("modes")
         .and_then(Value::as_table)
         .unwrap_or_else(|| fail(format!("{id}: missing `modes`")))
@@ -417,10 +478,21 @@ fn test_lane(test: &Value) -> &str {
         .unwrap_or("portable")
 }
 
-fn test_timeout(test: &Value) -> i64 {
-    test.get("timeout_seconds")
-        .and_then(Value::as_integer)
-        .unwrap_or(60)
+fn cell_timeout_seconds(test: &Value, id: &str, mode: &str, backend: &str, inherited: i64) -> i64 {
+    let Some(value) = modes_table(test, id)[mode].get("timeout_seconds") else {
+        return inherited;
+    };
+    let table = value.as_table().unwrap_or_else(|| {
+        fail(format!(
+            "{id}.modes.{mode}.timeout_seconds must be a backend table"
+        ))
+    });
+    table.get(backend).map_or(inherited, |value| {
+        required_timeout_seconds(
+            Some(value),
+            &format!("{id}.modes.{mode}.timeout_seconds.{backend}"),
+        )
+    })
 }
 
 /// Pick a default mode: prefer `verify` if it has enabled backends, else the
@@ -448,12 +520,12 @@ fn default_mode(test: &Value, id: &str) -> String {
     fail(format!("{id}: no mode has an enabled backend"))
 }
 
-fn find_test<'a>(manifests: &'a Manifests, id: &str) -> &'a Value {
+fn find_test<'a>(manifests: &'a Manifests, id: &str) -> (&'a Value, i64) {
     manifests
         .tests
         .iter()
-        .find(|(bucket, test)| test_id(test, bucket) == id)
-        .map(|(_, test)| test)
+        .find(|(bucket, _, test)| test_id(test, bucket) == id)
+        .map(|(_, timeout_seconds, test)| (test, *timeout_seconds))
         .unwrap_or_else(|| {
             fail(format!(
                 "no test with id `{id}` (try `manifest-cli list` to see ids)"
@@ -536,7 +608,7 @@ fn cmd_list(manifests: &Manifests, args: &Args) -> ExitCode {
     let verbose = args.has("verbose");
 
     let mut shown = 0usize;
-    for (bucket, test) in &manifests.tests {
+    for (bucket, _, test) in &manifests.tests {
         let id = test_id(test, bucket);
         if let Some(b) = bucket_f {
             if bucket != b {
@@ -604,7 +676,12 @@ fn cmd_list(manifests: &Manifests, args: &Args) -> ExitCode {
 }
 
 /// Resolve mode + backend + lane for a get/run, applying overrides.
-fn resolve_cell(test: &Value, id: &str, args: &Args) -> (String, String, String, i64) {
+fn resolve_cell(
+    test: &Value,
+    id: &str,
+    inherited_timeout_seconds: i64,
+    args: &Args,
+) -> (String, String, String, i64) {
     let mode = args
         .flag("mode")
         .map(str::to_owned)
@@ -632,12 +709,17 @@ fn resolve_cell(test: &Value, id: &str, args: &Args) -> (String, String, String,
         .flag("lane")
         .map(str::to_owned)
         .unwrap_or_else(|| test_lane(test).to_owned());
-    let timeout = test_timeout(test);
+    let timeout = cell_timeout_seconds(test, id, &mode, &backend, inherited_timeout_seconds);
     (mode, backend, lane, timeout)
 }
 
-fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, String) {
-    let (mode, backend, lane, timeout) = resolve_cell(test, id, args);
+fn build_full_command(
+    test: &Value,
+    id: &str,
+    inherited_timeout_seconds: i64,
+    args: &Args,
+) -> (String, String, String) {
+    let (mode, backend, lane, timeout) = resolve_cell(test, id, inherited_timeout_seconds, args);
     let (setup, guest) = setup_prefix(test, id);
     let log = args
         .flag("log")
@@ -666,13 +748,12 @@ fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, S
         None
     };
     let run = if mode == "naked" {
-        format!("timeout --kill-after=10s {timeout}s {RUN_ENV} {guest}")
+        format!("{RUN_ENV} {guest}")
     } else {
         hermit_command(
             &mode,
             &backend,
             &lane,
-            timeout,
             seed,
             &mode_args,
             verify_bitwise_parity,
@@ -681,16 +762,32 @@ fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, S
             &guest,
         )
     };
-    let full = format!("{setup} && {run}");
+    let full = outer_cell_command(&setup, &bounded_invocation(&run, id), timeout);
     (full, mode, backend)
 }
 
 fn self_test() -> ExitCode {
+    let timeout_fixture: Value = r#"
+modes:
+  verify:
+    timeout_seconds:
+      ptrace: 30
+"#
+    .parse()
+    .unwrap();
+    assert_eq!(
+        cell_timeout_seconds(&timeout_fixture, "fixture", "verify", "ptrace", 15),
+        30
+    );
+    assert_eq!(
+        cell_timeout_seconds(&timeout_fixture, "fixture", "verify", "liteinst", 15),
+        15
+    );
+
     let replay = hermit_command(
         "replay",
         "ptrace",
         "portable",
-        60,
         None,
         &[],
         false,
@@ -698,7 +795,7 @@ fn self_test() -> ExitCode {
         &[],
         "guest",
     );
-    assert!(replay.contains("--data-dir \"$cell/recording\" --record-timeout 60"));
+    assert!(replay.contains("--data-dir \"$cell/recording\" --record-timeout \"$remaining\""));
     assert!(replay.contains("--strict $record_verify_strict --verify"));
     assert!(replay.contains("--verify-json \"$cell/captures/verify.json\""));
     assert!(replay.contains(HERMIT_GUEST_ENV_ARGS));
@@ -708,7 +805,6 @@ fn self_test() -> ExitCode {
         "chaos",
         "ptrace",
         "portable",
-        60,
         Some(7),
         &[],
         false,
@@ -736,7 +832,6 @@ fn self_test() -> ExitCode {
         "custom",
         "ptrace",
         "portable",
-        60,
         None,
         &["--base-env=minimal".to_owned()],
         false,
@@ -752,7 +847,6 @@ fn self_test() -> ExitCode {
         "verify",
         "ptrace",
         "portable",
-        60,
         None,
         &[],
         true,
@@ -770,7 +864,6 @@ fn self_test() -> ExitCode {
         "verify",
         "ptrace",
         "portable",
-        60,
         None,
         &[],
         false,
@@ -789,7 +882,7 @@ fn cmd_get(manifests: &Manifests, args: &Args) -> ExitCode {
         .positional
         .first()
         .unwrap_or_else(|| fail("get: missing <test-id>"));
-    let test = find_test(manifests, id);
+    let (test, timeout_seconds) = find_test(manifests, id);
     if args.has("all-modes") {
         let modes = modes_table(test, id);
         let mut names = modes.keys().cloned().collect::<Vec<_>>();
@@ -806,14 +899,14 @@ fn cmd_get(manifests: &Manifests, args: &Args) -> ExitCode {
                     sub.flags.push(("lane".to_owned(), Some(l.to_owned())));
                 }
                 sub.positional.push(id.clone());
-                let (full, mode, backend) = build_full_command(test, id, &sub);
+                let (full, mode, backend) = build_full_command(test, id, timeout_seconds, &sub);
                 println!("# {id} mode={mode} backend={backend}");
                 println!("{full}\n");
             }
         }
         return ExitCode::SUCCESS;
     }
-    let (full, mode, backend) = build_full_command(test, id, args);
+    let (full, mode, backend) = build_full_command(test, id, timeout_seconds, args);
     println!("# {id} mode={mode} backend={backend}");
     println!("{full}");
     ExitCode::SUCCESS
@@ -824,8 +917,8 @@ fn cmd_run(manifests: &Manifests, args: &Args, root: &Path) -> ExitCode {
         .positional
         .first()
         .unwrap_or_else(|| fail("run: missing <test-id>"));
-    let test = find_test(manifests, id);
-    let (full, mode, backend) = build_full_command(test, id, args);
+    let (test, timeout_seconds) = find_test(manifests, id);
+    let (full, mode, backend) = build_full_command(test, id, timeout_seconds, args);
     eprintln!("manifest-cli: running {id} mode={mode} backend={backend}");
     eprintln!("manifest-cli: $ {full}");
     let status = Command::new("sh")
