@@ -94,6 +94,21 @@ pub const RECORD_REPLAY_VIRTUALIZES_TIME: bool = false;
 /// exit code rather than about the behaviour it exists to check. Same shape as
 /// [`RECORD_REPLAY_HASHES_IO_BUFFERS`] above — a decision carried in two places
 /// that had to agree and had no way to. Exported here, the tests move with it.
+///
+/// ⚠️ DO NOT FLIP EVERY `Some(1)` YOU FIND. `tests/stress_suite.rs`
+/// asserts `Some(1)` as THE GUEST'S OWN SIGNAL, not as a stale copy of this
+/// constant: there `Some(1) => GuestOutcome::Exposed`, and
+/// `status.code() == Some(1)` IS the `exposes_bug` predicate. It is
+/// pattern-identical to the tests that DID go stale, and it is the OPPOSITE
+/// case -- the assertion is CORRECT and must not move with this constant.
+///
+/// ⚠️ ITS FAILURE MODE IS SILENT SUCCESS. Changing it to 125 would not
+/// turn the stress suite red; it would make `exposes_bug` NEVER FIRE, so the
+/// suite would report no bug exposed forever and pass while blind. A red is
+/// recoverable; a green that cannot fail is not.
+///
+/// REVIEWER RULE: a change to `tests/stress_suite.rs` inside an exit-code head
+/// SHOULD BE REFUSED ON SIGHT AND QUESTIONED.
 pub const HERMIT_INTERNAL_FAILURE_EXIT: i32 = 125;
 
 /// The guest program could not be found at all: **127**.
