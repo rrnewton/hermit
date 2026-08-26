@@ -337,6 +337,30 @@ fn main() {
 /// further.
 fn runner_flag_path(text: &str, path: &str) -> bool {
     const RUNNERS: [&str; 5] = ["python3", "python", "bash", "sh", "rustc"];
+    /// Flags whose VALUE is the next token, so that token is never the script.
+    ///
+    /// ⚠️ THE ORIGINAL NOTE HERE HAD THE RISK BACKWARDS, and that is why this list
+    /// exists rather than being avoided. It said naming these "is a guess -- and a
+    /// wrong guess here fails in the silent direction". Both ways of being wrong
+    /// were checked, and neither does:
+    ///
+    ///   * OVER-marking (listing a flag that takes no value): the scan skips one
+    ///     token too many, lands past the script, and reports a FALSE ORPHAN --
+    ///     loud, and one line to fix.
+    ///   * UNDER-marking (the state before this list): the scan stops ON the
+    ///     value, so `rustc -o <checker> in.rs` reads an OUTPUT as an invocation
+    ///     and reports a FALSE "SCHEDULED" -- silent, and it defeats the guard.
+    ///
+    /// So omitting the list is the silent failure and having it is the loud one.
+    /// Both directions are pinned in `self_test`.
+    const VALUE_FLAGS: [&str; 18] = [
+        // rustc
+        "-o", "--out-dir", "--emit", "--extern", "--target", "--edition",
+        "--crate-name", "--crate-type", "--cfg", "--check-cfg", "-L", "-l", "-C",
+        "-Z", "-W", "-A", "-D",
+        // python / shell: the token after these is code or a module name
+        "-m",
+    ];
     let dotted = format!("./{path}");
     for line in text.lines() {
         let tokens: Vec<&str> = line.split_whitespace().collect();
@@ -346,6 +370,12 @@ fn runner_flag_path(text: &str, path: &str) -> bool {
             }
             let mut next = index + 1;
             while next < tokens.len() && tokens[next].starts_with('-') {
+                // A flag that takes a separate value consumes the token after it,
+                // so skip both. An attached form (`--edition=2021`, `-Dwarnings`)
+                // is a single token and is handled by the plain skip.
+                if VALUE_FLAGS.contains(&tokens[next]) {
+                    next += 1;
+                }
                 next += 1;
             }
             if next < tokens.len() && (tokens[next] == path || tokens[next] == dotted) {
@@ -564,6 +594,26 @@ target/ci/check-exit-status-class --gate";
     assert!(
         !is_invoked("python3 -X faulthandler scripts/check-y.py", "scripts/check-y.py"),
         "the separate-value flag gap closed -- update this pin and re-check the -o control"
+    );
+    // ⚠️ THE ORDERING THE ORIGINAL CONTROL MISSED, AND IT WAS A LIVE FALSE
+    // "SCHEDULED". `-o` directly after the runner was skipped as an ordinary flag,
+    // so the scan landed on its VALUE and read an OUTPUT as an invocation. The
+    // control below uses the input-first ordering, where the scan stops at
+    // `other.rs` and never reaches `-o`, so it passed while this did not.
+    assert!(
+        !is_invoked("rustc -o scripts/check-z.rs other.rs", "scripts/check-z.rs"),
+        "an output path directly after -o read as an invocation -- a false SCHEDULED, \
+         which is the silent direction this guard must never fail in"
+    );
+    // A value-taking flag must not hide the script that follows its value. Without
+    // the table this stops on `2021` and reports a false ORPHAN.
+    assert!(
+        is_invoked("rustc --edition 2021 scripts/check-x.rs", "scripts/check-x.rs"),
+        "a separate-value flag hid the script after it"
+    );
+    assert!(
+        is_invoked("rustc -C opt-level=3 scripts/check-x.rs", "scripts/check-x.rs"),
+        "a -C value hid the script after it"
     );
     // ⚠️ THE CONTROL FOR THE SILENT DIRECTION. An OUTPUT path must not read as an
     // invocation: matching it would report an unscheduled checker as scheduled, which is
