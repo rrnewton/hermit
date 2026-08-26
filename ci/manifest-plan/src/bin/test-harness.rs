@@ -1299,6 +1299,17 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 ));
                 failed = true;
             } else {
+                let series_results = context.result_root.join("series-results.jsonl");
+                if let Err(error) = append_result(&series_results, &result) {
+                    eprintln!(
+                        "ERROR {} ({}/{}): completed cell result could not be added to {}: {error}",
+                        result.test,
+                        result.mode,
+                        result.backend.as_deref().unwrap_or("native"),
+                        series_results.display()
+                    );
+                    failed = true;
+                }
                 if result.outcome == "ERROR" {
                     eprintln!(
                         "ERROR {} ({}/{}): {}",
