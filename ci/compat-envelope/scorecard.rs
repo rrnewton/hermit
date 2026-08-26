@@ -3686,6 +3686,9 @@ fn self_test() -> Result<(), String> {
                             canonical_verdict::RecordEnvelopeReport::AllRecordsV1,
                     }),
                     compared_log_messages: Some(canonical_verdict::ComparedLogMessages { left: 1, right: 1 }),
+                    // This fixture predates runtime totals. Keep "not recorded"
+                    // distinct from a measured zero.
+                    runtime: None,
                     // A matched verdict located no divergence, so both
                     // positions are absent -- the same value a pre-field
                     // report carries.
