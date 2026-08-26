@@ -5451,6 +5451,81 @@ test:
           kvm: No custom edge-case arguments have been calibrated for this C guest
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
+  - id: backend-parity-c/environment-and-workdir
+    description: The scheduled guest sees exactly the minimal environment and starts in a fresh tmpfs at /test
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    timeout_seconds: 90
+    occasional: false
+    program: tests/backend-parity/fixtures/environment_and_workdir.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        guest_args:
+          ptrace:
+            - workdir
+        assert:
+          bitwise_parity: true
+        backends_disabled:
+          dbt: DBT does not preserve the requested guest working directory
+          kvm: KVM verification does not yet compare canonical non-vacuous INFO evidence
+          sabre: Canonical SaBRe verification has not been qualified for this environment-control fixture
+          liteinst: LiteInst canonical verification remains blocked by guest-visible startup mapping identity
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: native execution cannot apply Hermit environment or mount controls.'
+        backends_enabled: []
+        backends_disabled:
+          native: Native execution cannot apply Hermit environment or mount controls
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is separate from these scheduled run controls.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from these scheduled run controls
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: fixed environment and workdir values have no schedule-diversity contract.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Fixed environment and workdir values have no schedule-diversity contract
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: true
+        args:
+          - --strict
+        guest_args:
+          ptrace:
+            - environment
+        assert:
+          runs: 3
+          repeat_identical: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: DBT does not preserve the requested guest working directory
+          kvm: KVM custom execution is not qualified by the canonical comparison policy
+          sabre: SaBRe custom execution is not qualified for this environment-control fixture
+          liteinst: LiteInst custom execution remains blocked by guest-visible startup mapping identity
   - id: backend-parity-c/o-tmpfile-anon
     description: Strict verification for tests/backend-parity/fixtures/o_tmpfile_anon.c
     lane: portable
