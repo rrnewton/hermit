@@ -1049,6 +1049,32 @@ fn workflow_step_timeout_sum(workflow: &YamlValue, job: &str) -> Result<u64, Str
 fn print_plan(manifests: &ManifestSet, args: &Args, population: Population) -> ExitCode {
     let mut selection = args.selection.clone();
     selection.population = Some(population);
+
+    // ⚠️ AN UNKNOWN TEST ID IS A REFUSAL HERE, AND THIS IS THE ONLY SUBCOMMAND THAT
+    // NEEDED IT. `run` and `build` already fail closed on an empty selection
+    // (`filters selected no cells`), but `plan` printed an empty list and exited 0 --
+    // measured 2026-08-26: `plan --lane portable --test no-such-test-xyz` is rc=0, and
+    // so is the same command with a REAL id, so its exit code carried no information in
+    // either direction. Anything driving a bisection off `plan` therefore reads a typo
+    // as "nothing failed here" and converges, confidently, on the wrong commit.
+    //
+    // ⚠️ AND THE CHECK IS "UNKNOWN ID", NOT "EMPTY RESULT", WHICH IS NOT THE SAME FIX.
+    // `print_plan` also serves `audit-gaps` (Population::Disabled), where an empty
+    // answer legitimately means NO GAPS. Mirroring run's `cells.is_empty()` guard here
+    // would turn that good answer into a failure. Asking whether the named id exists at
+    // all separates the two: a real id with no cells in this population still prints
+    // nothing and exits 0.
+    if let Some(id) = selection.test.as_deref() {
+        if !manifests.knows_test(id) {
+            fail(format!(
+                "unknown test id {id:?}: it is not in any manifest. An empty plan for a \
+                 real id means that population has no cells; an empty plan for an id \
+                 that does not exist means the filter is wrong, and refusing is what \
+                 stops a bisection reading a typo as a pass."
+            ));
+        }
+    }
+
     let cells = manifests.select(&selection).unwrap_or_else(|e| fail(e));
     if args.format == "json" {
         println!("{}", serde_json::to_string(&cells.iter().map(|c| {
