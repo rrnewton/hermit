@@ -30,6 +30,10 @@ use std::process::Command;
 /// A real test id that exists in the portable manifests but has no cells in the
 /// privileged lane, so a lane-mismatched query for it is legitimately empty.
 const REAL_ID: &str = "applications/c-toolchain-workflow";
+/// A second real portable id, so `--test` can be repeated with two values that are
+/// each independently valid. Without a second VALID id the repeat case cannot be
+/// distinguished from a lookup failure.
+const SECOND_REAL_ID: &str = "applications/git-repository-workflow";
 const UNKNOWN_ID: &str = "no-such-test-xyz";
 
 fn repo_root() -> PathBuf {
@@ -163,17 +167,76 @@ fn a_repeated_test_flag_is_refused_in_either_order() {
     );
 }
 
+/// Each single-valued selector with TWO INDEPENDENTLY VALID values for it.
+///
+/// ⚠️ THE VALUES ARE THE WHOLE POINT, AND THE FIRST VERSION OF THIS TEST GOT THEM
+/// WRONG. It passed the placeholders `a` and `b`, which `--lane`, `--test`, `--mode`
+/// and `--backend` each reject on their own. Those four assertions therefore could
+/// not tell "refused because repeated" from "refused because the value is nonsense",
+/// and they stayed green while the flag happily accepted repeats. Measured
+/// 2026-08-26 by deleting `set_once` from all five arms of `parse()` and running the
+/// binary directly: `--lane` 2, `--category` 0, `--test` 2, `--mode` 2,
+/// `--backend` 2 — only `--category` moved, because `a` happens to be a legal
+/// (merely empty) category. One of five bound, under a name claiming all five.
+///
+/// A test that cannot fail for four of the five reasons in its own name is worse
+/// than no test: a reader grepping for coverage finds the name and stops looking.
+const REPEATABLE_SELECTORS: [(&str, &str, &str); 5] = [
+    ("--lane", "portable", "privileged"),
+    ("--category", "applications", "c-programs"),
+    ("--test", REAL_ID, SECOND_REAL_ID),
+    ("--mode", "verify", "chaos"),
+    ("--backend", "ptrace", "sabre"),
+];
+
+/// `plan` argv naming `flag` once per entry in `values`.
+///
+/// `--lane portable` is the ordinary base for these queries, but it must NOT be the
+/// base for `--lane` itself: that would make the "repeat" case a triple and the
+/// single-occurrence control a repeat, quietly inverting both.
+fn plan_args<'a>(flag: &'a str, values: &[&'a str]) -> Vec<&'a str> {
+    let mut argv = vec!["plan"];
+    if flag != "--lane" {
+        argv.extend(["--lane", "portable"]);
+    }
+    for value in values {
+        argv.extend([flag, value]);
+    }
+    argv
+}
+
 /// Every single-valued selector, not just the one the defect was found through.
 /// `--jobs` already refused a repeat; these did not, and there is no reason for the
 /// rule to differ per flag.
 #[test]
 fn every_single_valued_selector_refuses_a_repeat() {
-    for flag in ["--lane", "--category", "--test", "--mode", "--backend"] {
+    for (flag, first, second) in REPEATABLE_SELECTORS {
         assert_eq!(
-            harness(&["plan", "--lane", "portable", flag, "a", flag, "b"]),
+            harness(&plan_args(flag, &[first, second])),
             2,
-            "{flag} must be refused when repeated"
+            "{flag} must be refused when repeated ({first} then {second}); both \
+             values are accepted singly, so only the repeat can explain a refusal"
         );
+    }
+}
+
+/// ⚠️ THE ATTRIBUTION CONTROL for the test above, and that test proves nothing
+/// without it. Every value used there must be accepted ON ITS OWN, so that the only
+/// thing a repeat adds is the repetition. This is exactly the check whose absence
+/// let four of the five assertions above pass vacuously; if someone later swaps in a
+/// value that is independently invalid, this fails and names the flag and the value
+/// rather than silently hollowing out the test next to it.
+#[test]
+fn each_repeat_value_is_independently_accepted_alone() {
+    for (flag, first, second) in REPEATABLE_SELECTORS {
+        for value in [first, second] {
+            assert_eq!(
+                harness(&plan_args(flag, &[value])),
+                0,
+                "{flag} {value} must be accepted on its own, or a repeat's rc=2 \
+                 cannot be attributed to the repeat"
+            );
+        }
     }
 }
 
