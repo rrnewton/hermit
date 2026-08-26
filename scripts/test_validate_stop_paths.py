@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import subprocess
@@ -256,78 +257,50 @@ def warm_validate_binary() -> None:
     )
 
 
-# The shapes `scripts/validate.rs` uses to decline before it starts work. Both are
-# rendered by RunSummary::refused, which prefixes "refused by: <what>". Matching
-# the rendered prefix rather than a specific reason keeps this from needing an
-# update every time a new refusal reason is added.
-_REFUSAL_SHAPES = (
-    "refused by:",
-    "validate: REFUSED",
-    "another validate is already running",
+# The complete final status line emitted by `run_summary_lines()` for a refusal.
+# Reason text is not enough: the captured output also contains text written by
+# wrappers and child programs.
+_REFUSAL_SUMMARY = re.compile(
+    r"🚫 validate REFUSED \(exit [1-9][0-9]*\) — profile .+ @ [0-9a-f]{40}"
 )
 
 
 def _looks_refused(output: str) -> bool:
     """Did the child DECLINE, as opposed to failing at something?
 
-    ⚠️ ANCHORED TO THE START OF A LINE, AND THE UNANCHORED FORM WAS A LIVE DEFECT.
-    `shape in output` searched the child's ENTIRE captured log, which carries far
-    more than validate's own decline messages -- panic text, guest stdout, file
-    paths. Found by `agent(hermit-dbg)` on hermit#2637, whose table gives three
-    realistic failures that classified as could-not-evaluate:
-
-        thread 'main' panicked ... connection refused by: peer
-        server said 'refused by: firewall' + error: compilation failed
-        error[E0433]: /home/x/validate: REFUSED_cases/t.rs not found
-
-    Each is a RED reported as "nothing was observed" -- the silent direction this
-    function's own contract says it exists to prevent.
-
-    ⚠️ THE MISTAKE THAT PRODUCED IT IS WORTH NAMING, because it is general: the
-    vocabulary was checked against the PRODUCER (does validate.rs print these only
-    when declining? yes, verifiably) when the predicate reads the CHANNEL. A
-    channel carries more than its producer writes.
-
-    ⚠️ AND THIS CODEBASE ALREADY LEARNED IT ONE HOP DOWN THE SAME CHAIN.
-    `ci/lint-checks-node.sh:80` consumes this file's own NO_RESULT marker with
-    `grep -q "^${NO_RESULT_MARKER}"`, and its self-test at :121 records that the
-    unanchored form "is what this replaced". The consumer anchored; the producer
-    side had not.
-
-    ⚠️ STRIP BEFORE ANCHORING -- a bare `startswith` BREAKS TWO OF THE THREE SHAPES.
-    `RunSummary::refused` puts its reasons in `detail`, and the renderer emits every
-    detail line with a three-space indent (`validate.rs:11068`,
-    `lines.push(format!("   {line}"))`). So "refused by:" and "another validate is
-    already running" arrive INDENTED and only "validate: REFUSED" is column zero.
-    Anchoring without stripping would have turned a false-positive defect into a
-    false-negative one, which is the worse direction.
+    Match the complete status line, not refusal-shaped prose anywhere else on the
+    captured channel. Anything else stays an AssertionError because reporting a
+    crash as could-not-evaluate would hide the failure.
     """
-    return any(
-        line.strip().startswith(shape)
-        for line in output.splitlines()
-        for shape in _REFUSAL_SHAPES
-    )
+    return any(_REFUSAL_SUMMARY.fullmatch(line) for line in output.splitlines())
 
 
-# ⚠️ FOREIGN LINES ON THE CHANNEL, WHICH IS THE TEST THE ORIGINAL LACKED. The
-# predicate above classifies ANOTHER PROGRAM'S OUTPUT, so the cases that matter are
-# not validate's own messages -- they are the things that share the channel with
-# them. The first three are `agent(hermit-dbg)`'s, verbatim.
+_SAMPLE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
 _REFUSAL_SELF_CHECK: tuple[tuple[str, bool], ...] = (
-    # Foreign lines carrying a shape somewhere other than the start: NOT refusals.
+    # Text from another writer must not decide the result, including at line start.
     ("thread 'main' panicked at src/x.rs:9: connection refused by: peer", False),
     ("guest: server said 'refused by: firewall'\nerror: compilation failed", False),
     ("error[E0433]: file /home/x/validate: REFUSED_cases/t.rs not found", False),
-    ("Connection refused (os error 111)", False),
-    ("error: could not compile `detcore` due to 2 previous errors", False),
-    # ⚠️ THE HALF A NAIVE ANCHOR BREAKS. These are how validate ACTUALLY renders a
-    # decline: the two detail-borne shapes carry the renderer's three-space indent.
-    ("   refused by: the re-entrancy guard", True),
-    ("   another validate is already running", True),
-    ("validate: REFUSED - product validation must enter through ci-hub", True),
-    # A decline buried in a longer log still counts; it is the LINE that anchors,
-    # not the log.
-    ("some earlier chatter\n   refused by: admission\nmore chatter", True),
+    ("refused by: guest firewall policy", False),
+    ("   refused by: guest firewall policy", False),
+    ("validate: REFUSED_cases is a guest label", False),
+    ("another validate is already running in this documentation", False),
+    (
+        f"wrapper: 🚫 validate REFUSED (exit 3) — profile full @ {_SAMPLE_COMMIT}",
+        False,
+    ),
+    # A real final status line still counts when other writers used the channel.
+    (
+        "refused by: guest firewall policy\n"
+        f"🚫 validate REFUSED (exit 3) — profile full @ {_SAMPLE_COMMIT}\n"
+        "   refused by: the per-checkout invocation lock\n"
+        "   another validate is already running",
+        True,
+    ),
+    (
+        f"🚫 validate REFUSED (exit 2) — profile strict @ {_SAMPLE_COMMIT}",
+        True,
+    ),
 )
 
 
