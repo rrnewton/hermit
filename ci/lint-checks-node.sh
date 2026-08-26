@@ -146,7 +146,7 @@ lint-checks: OK"
     # never fire. This is the exact shape the producer emits: column 0, on its own
     # line, with make's recipe echo above it.
     check_run 'genuine emission at column 0 is a no_result' 'no_result' 0 \
-        "python3 scripts/test_validate_stop_paths.py
+        "python3 scripts/example-producer-not-a-real-checker.py
 NO-RESULT-CASE: canonical adapter contract, accept arm: no parent adapter
 PARTIAL: every evaluable assertion passed"
     check_run 'clean run is a pass' 'pass' 0 "lint-checks: everything passed"
