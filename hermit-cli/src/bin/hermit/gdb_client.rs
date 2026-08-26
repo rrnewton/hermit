@@ -87,20 +87,27 @@ const CLIENT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// we are looking for, so retrying is the right response to it.
 const RELEASE_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// How long to wait, after a successful release connect, for the container to
-/// finish before concluding we reached the wrong listener.
+/// How long to pause after a successful release connect before trying again.
 ///
-/// ⚠️ THIS IS THE DIFFERENCE BETWEEN "WE CONNECTED" AND "WE RELEASED OURS", and
-/// nothing else in this file can tell them apart. The port is guessable, so a
-/// successful connect can mean a stranger accepted. The container finishing is
-/// the only effect that distinguishes the two, and it needs a window to happen
-/// in.
+/// ⚠️ THIS IS A RATE LIMIT AND NOTHING ELSE. IT DISCRIMINATES NOTHING. An earlier
+/// revision of this comment claimed it was "the difference between WE CONNECTED
+/// and WE RELEASED OURS", on the strength of a `done` check inside the grace
+/// loop. That check is gone — see the loop body for why `done` is CORRELATION,
+/// NOT AUTHENTICATION — but the claim outlived the mechanism and sat here
+/// describing code that no longer existed. A doc comment asserting a property
+/// the code dropped is worse than no comment: it is the first thing a reader
+/// trusts.
+///
+/// What it actually buys: one connect per grace period to a peer that may not be
+/// ours, instead of one every [`RELEASE_RETRY_INTERVAL`]. Without it the loop
+/// spins as fast as `connect` returns — measured 16714 attempts in a window that
+/// admits ~2 with the pause.
 ///
 /// 25 × 20ms is a FLOOR of 500ms, not a bound: `thread::sleep` may overshoot, so
-/// this paces the retries and guarantees no upper limit on the pause. Long enough
-/// that a stranger is contacted rarely, short enough that it is re-probed rather
-/// than abandoned. It does not extend the saturated-listener bound, because that
-/// path never gets a successful connect to start a window from.
+/// there is no upper limit on the pause. Long enough that a stranger is
+/// contacted rarely, short enough that it is re-probed rather than abandoned. It
+/// does not extend the saturated-listener bound, because that path never gets a
+/// successful connect to start a window from.
 const RELEASE_GRACE_TICKS: u32 = 25;
 
 /// Watches the gdb client hermit spawned, and releases the gdbserver's accept if
@@ -282,7 +289,24 @@ impl GdbClientWatch {
                     // so no arrangement of a `done` check distinguishes a release
                     // from a collision. Waiting for it only made the false report
                     // look earned.
+                    // ⚠️ CHECK `done` BETWEEN TICKS, OR `finish()` JOINS UP TO A
+                    // FULL GRACE PERIOD LATE. `finish()` sets `done` and then
+                    // joins this thread, so a flat 25-tick sleep put up to ~499ms
+                    // of dead wait on hermit's own return path for a container
+                    // that finished 1ms after a probe. The outer `while !done`
+                    // already exits on the same fact; this only stops the sleep
+                    // from outliving it, bounding the overshoot to one
+                    // RELEASE_RETRY_INTERVAL.
+                    //
+                    // ⚠️ THIS IS NOT THE `done` CHECK THAT WAS REMOVED. That one
+                    // read `done` to decide whether the report was EARNED, which
+                    // it cannot do. This one only decides when to stop sleeping;
+                    // the flag above is already set either way, so no report
+                    // depends on it.
                     for _ in 0..RELEASE_GRACE_TICKS {
+                        if done.load(Ordering::SeqCst) {
+                            break;
+                        }
                         thread::sleep(RELEASE_RETRY_INTERVAL);
                     }
                     continue;
@@ -395,6 +419,60 @@ mod tests {
 
     use super::*;
 
+    /// `finish()` must not sit out a grace period it no longer needs.
+    ///
+    /// ⚠️ THE GRACE SLEEP IS ON HERMIT'S OWN RETURN PATH, because `finish()` sets
+    /// `container_done` and then JOINS this thread. A flat `for _ in
+    /// 0..RELEASE_GRACE_TICKS { sleep }` cannot notice the container finishing, so
+    /// hermit waited out the remainder of a pause whose only purpose is to slow
+    /// down contacting a stranger. MEASURED on this test, entering the sleep and
+    /// then calling `finish()`:
+    ///
+    ///     without the `done` check .... 381.7ms
+    ///     with it ..................... 0.52ms
+    ///
+    /// The bound is one `RELEASE_RETRY_INTERVAL` (20ms) plus scheduling, so 100ms
+    /// is generous while still an order of magnitude below the regression.
+    ///
+    /// ⚠️ THIS IS NOT THE `done` CHECK THAT WAS REMOVED FROM THIS LOOP. That one
+    /// read `done` to decide whether the early-exit report was EARNED, which it
+    /// cannot do -- `done` is correlation, not authentication. This one decides
+    /// only when to stop sleeping, and no report depends on it.
+    #[test]
+    fn finish_does_not_wait_out_a_grace_period_after_the_container_is_done() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind");
+        let port = listener.local_addr().expect("no local addr").port();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => drop(stream),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let client = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("failed to spawn the stand-in client");
+        // Let the client exit, so the watcher reaches the release loop.
+        thread::sleep(Duration::from_millis(200));
+        let mut watch = GdbClientWatch::spawn(client, port);
+        // Long enough for one successful connect to land the watcher INSIDE the
+        // grace sleep, short enough that the sleep is still running.
+        thread::sleep(Duration::from_millis(120));
+
+        let started = std::time::Instant::now();
+        let _ = watch.finish();
+        let lag = started.elapsed();
+
+        assert!(
+            lag < Duration::from_millis(100),
+            "finish() took {lag:?} to join after setting container_done; the grace \
+             sleep is ignoring `done` and is charging hermit's return path for a \
+             pause that only exists to rate-limit contacting a stranger"
+        );
+    }
+
     /// Connecting to a listener that is not ours must not end the watch.
     ///
     /// ⚠️ THIS IS THE HANG, RESTORED BY A SUCCESSFUL CONNECT, and it is live on
@@ -412,10 +490,18 @@ mod tests {
     /// already-served cases BOTH read as not-accepted. Asserting a retry count
     /// asks only what this loop actually controls.
     ///
+    /// ⚠️ AND THE NAME NOW SAYS "STILL LATCHES THE REPORT", BECAUSE IT DOES. This
+    /// was called `a_connect_to_a_stranger_is_not_treated_as_a_release` while
+    /// discarding `watch.finish()` and never reading the flag — so the test named
+    /// for the defect did not assert it, and `assert!(!watch.finish())` fails
+    /// here. A stranger IS still treated as a release for reporting purposes.
+    /// Naming the test for the property it has, and asserting the gap it does
+    /// not close, is the difference between coverage and the appearance of it.
+    ///
     /// Bounded, and asserts a count rather than blocking, so a regression is a
     /// named red and not a wedged runner.
     #[test]
-    fn a_connect_to_a_stranger_is_not_treated_as_a_release() {
+    fn a_stranger_does_not_end_the_release_attempts_but_still_latches_the_report() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind");
         let port = listener.local_addr().expect("no local addr").port();
 
@@ -442,16 +528,29 @@ mod tests {
         let mut watch = GdbClientWatch::spawn(client, port);
         // The container is DELIBERATELY never marked done: the stranger did not
         // release our accept, because it never had it.
-        thread::sleep(RELEASE_RETRY_INTERVAL * (RELEASE_GRACE_TICKS + 10));
+        //
+        // ⚠️ A FIXED WALL-CLOCK WINDOW, NOT ONE DERIVED FROM THE CONSTANT UNDER
+        // TEST. This slept `RELEASE_RETRY_INTERVAL * (RELEASE_GRACE_TICKS + 10)`,
+        // so the observation window SCALED WITH THE PACE IT WAS MEASURING and the
+        // attempt count stayed ~2 for every setting. Measured: RELEASE_GRACE_TICKS
+        // of 2, 5, 25, 50 and 100 ALL PASSED — a 40ms grace hammers a stranger
+        // 12.5x harder than a 500ms one and the test could not see it. A test
+        // whose window moves with its subject pins nothing.
+        //
+        // 1600ms admits 1 + floor(1600/500) = 4 attempts at the current pace. The
+        // bounds below are set to catch a 2x move in either direction while
+        // leaving room for `thread::sleep` overshoot.
+        const OBSERVATION_WINDOW: Duration = Duration::from_millis(1600);
+        thread::sleep(OBSERVATION_WINDOW);
         let attempts = accepted.load(Ordering::SeqCst);
 
         // Let the watcher finish before asserting, so a failure reports a count
         // rather than leaving a thread running under the harness.
         watch.container_done.store(true, Ordering::SeqCst);
-        let _ = watch.finish();
+        let reported_early = watch.finish();
 
         assert!(
-            attempts >= 2,
+            attempts >= 3,
             "the watcher made {attempts} connection(s) to a peer that never released \
              anything; a successful connect must be an ATTEMPT, not a conclusion, or a \
              stranger on a guessable port silently restores the hang"
@@ -461,15 +560,39 @@ mod tests {
         // `agent(hermit-001)` measured that the grace loop's body could be gutted
         // with all seven cells still green: the floor pins "it retried" and says
         // nothing about the rate, which is the only property the pause actually
-        // has. Over this window a 500ms floor admits ~2 attempts; without the
-        // pause the loop spins as fast as connect returns: MEASURED 16714 in this
-        // same window with the pause deleted. 6 is clear of scheduling jitter and
-        // three orders of magnitude below that.
+        // has. Without the pause the loop spins as fast as connect returns:
+        // MEASURED 16714 attempts in a comparable window.
         assert!(
             attempts <= 6,
-            "the watcher made {attempts} connections in one grace window; the pause \
-             is a RATE LIMIT on contacting a peer that may not be ours, and an \
+            "the watcher made {attempts} connections in {OBSERVATION_WINDOW:?}; the \
+             pause is a RATE LIMIT on contacting a peer that may not be ours, and an \
              unpaced retry loop hammers a stranger every RELEASE_RETRY_INTERVAL"
+        );
+
+        // ⚠️ THE OPEN DEFECT, PINNED RATHER THAN LEFT UNSTATED. This test is named
+        // for a release and until now discarded `finish()` entirely, so it never
+        // touched the report at all: `assert!(!reported_early)` FAILS here, and
+        // the test named for the defect did not assert it.
+        //
+        // A stranger's accept still latches `client_exited_early` at the connect
+        // site, and nothing lowers it — `store(false)` appears nowhere in this
+        // file. So hermit tells the operator "the client exited before
+        // connecting" on a port collision. THIS HEAD DOES NOT FIX THAT; it fixes
+        // the hang, and this assertion states the remaining gap in executable
+        // form so it cannot change unnoticed in either direction.
+        //
+        // Closing it needs the listener IDENTIFIED rather than the port guessed —
+        // `done` is correlation not authentication, `peer_addr` cannot separate
+        // two loopback listeners, and an EOF probe was measured non-
+        // discriminating. Tracked as `gdb_watcher_release_probe`.
+        //
+        // ⚠️ WHOEVER FIXES IT: this assertion is expected to fail, and the fix is
+        // to INVERT it, not to delete it.
+        assert!(
+            reported_early,
+            "a stranger no longer latches the false early-exit report -- if that is \
+             deliberate, invert this assertion and retire `gdb_watcher_release_probe`; \
+             if it is accidental, the report has become silent instead of correct"
         );
     }
 
