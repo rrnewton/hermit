@@ -21,6 +21,7 @@ mod backends;
 mod bisect;
 mod clean;
 mod container;
+mod gdb_client;
 mod global_opts;
 mod image;
 mod instruction_map;

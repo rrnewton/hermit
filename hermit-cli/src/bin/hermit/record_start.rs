@@ -42,6 +42,8 @@ use super::container::Classified;
 use super::container::IdentityGuard;
 use super::container::RunGuarded;
 use super::container::deterministic_container;
+use super::gdb_client::CLIENT_EXITED_BEFORE_CONNECTING;
+use super::gdb_client::GdbClientWatch;
 use super::global_opts::GlobalOpts;
 use super::record_envelope::RecordEnvelope;
 use super::run::BaseEnv;
@@ -639,7 +641,7 @@ impl StartOpts {
         // Make sure gdb always exit.
         gdb_command.arg("-batch");
         gdb_command.arg("--return-child-result");
-        let mut gdb_client = gdb_command
+        let gdb_client = gdb_command
             .spawn()
             .context("Failed to run gdb command. Please make sure it is in your $PATH.")?;
 
@@ -648,18 +650,31 @@ impl StartOpts {
         // to initialize logging inside the container because it may spawn a
         // thread. If we can guarantee that tracing won't spawn a thread, then
         // that restriction be lifted.
+        // ⚠️ HAND THE CLIENT OVER BEFORE THE CONTAINER STARTS. The gdbserver
+        // inside the container waits for this process with an UNBOUNDED accept,
+        // so if it has already died the container blocks forever -- and the
+        // `gdb_client.wait()` that would have noticed used to sit BELOW the `?`
+        // on that container result, unreachable in exactly the case that needed
+        // it. The watch owns the reap and releases the accept.
+        let mut gdb_watch = GdbClientWatch::spawn(gdb_client, gdbserver_port);
         let (mut container, _identity_guard) = self.configured_container()?;
-        let result = container
-            .run_guarded_at("record_verify_debug.replay", || {
-                // Namespace init: arm the stop guards before anything else.
-                crate::container::arm_container_init_guards()?;
-                let _guard = global.init_tracing();
-                hermit::replay_with_gdbserver_and_mounts(data_dir, gdbserver_port, &self.mount)
-                    .map_err(SerializableError::from)
-            })
-            .classified()?;
-        let _ = gdb_client.wait();
-        Ok(result)
+        let ran = container.run_guarded_at("record_verify_debug.replay", || {
+            // Namespace init: arm the stop guards before anything else.
+            crate::container::arm_container_init_guards()?;
+            let _guard = global.init_tracing();
+            hermit::replay_with_gdbserver_and_mounts(data_dir, gdbserver_port, &self.mount)
+                .map_err(SerializableError::from)
+        });
+        let client_exited_early = gdb_watch.finish();
+        match ran.classified() {
+            Ok(result) => Ok(result),
+            // Name the cause rather than the symptom: without this the failure
+            // reads as an opaque protocol error from a session that never began.
+            Err(error) if client_exited_early => {
+                Err(error.context(CLIENT_EXITED_BEFORE_CONNECTING))
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
