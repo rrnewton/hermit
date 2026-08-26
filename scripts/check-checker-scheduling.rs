@@ -328,6 +328,45 @@ fn main() {
     }
     std::process::exit(1);
 }
+/// Does `flag` consume the token after it, for this `runner`?
+///
+/// ⚠️ THIS IS PER-RUNNER BECAUSE ONE FLAG IS NOT ONE FLAG. `-O` is a boolean under
+/// python (optimise) and under rustc (opt-level=2), and under bash it takes a SHELL
+/// OPTION NAME (`bash -O extglob script.sh`). A single flat list of no-value flags was
+/// runner-blind, and `agent(hermit-007)` found the consequence, measured by
+/// `agent(hermit-005)` at 4e9ea946eda2:
+///
+///     bash -O scripts/check-x.sh          -> true   FALSE SCHEDULED, the silent one
+///     bash -O extglob scripts/check-x.sh  -> false  false ORPHAN
+///
+/// Both directions wrong for one flag. Inverting the DEFAULT (see below) moved the
+/// unknown case to the loud side, but a WRONG ENTRY inside the table still fails
+/// silently, so the table itself has to stop being a guess about which runner is
+/// speaking.
+///
+/// THE DEFAULT REMAINS THE LOUD ONE: a flag not listed here is assumed to consume the
+/// next token, so a missing entry steps past the script and reports a false ORPHAN,
+/// which is one line to fix. What changed is that a flag can no longer be right for
+/// one runner and silently wrong for another.
+fn flag_takes_value(runner: &str, flag: &str) -> bool {
+    // An attached value is a single token: `--edition=2021`, `-Dwarnings`.
+    if flag.contains('=') || (!flag.starts_with("--") && flag.len() > 2) {
+        return false;
+    }
+    let booleans: &[&str] = match runner {
+        "python" | "python3" => {
+            &["-B", "-E", "-I", "-O", "-OO", "-s", "-S", "-u", "-v", "-b", "-d", "-q", "-x"]
+        }
+        // ⚠️ `-O`, `-o` and `-c` are DELIBERATELY ABSENT for the shells: each takes a
+        // separate value there, and listing any of them is the silent direction.
+        "bash" | "sh" => &["-e", "-x", "-u", "-v", "-n", "-f", "-C", "-a", "-h", "-i", "-l",
+                           "-m", "-p", "-r", "-s", "-t"],
+        "rustc" => &["-O", "-g", "-V", "-h", "-v"],
+        _ => &[],
+    };
+    !booleans.contains(&flag)
+}
+
 
 /// A runner, then any number of FLAGS, then the path: `rustc --edition=2021 <path>`.
 ///
@@ -337,44 +376,9 @@ fn main() {
 /// further.
 fn runner_flag_path(text: &str, path: &str) -> bool {
     const RUNNERS: [&str; 5] = ["python3", "python", "bash", "sh", "rustc"];
-    /// Flags whose VALUE is the next token, so that token is never the script.
-    ///
-    /// ⚠️ THE ORIGINAL NOTE HERE HAD THE RISK BACKWARDS, and that is why this list
-    /// exists rather than being avoided. It said naming these "is a guess -- and a
-    /// wrong guess here fails in the silent direction". Both ways of being wrong
-    /// were checked, and neither does:
-    ///
-    ///   * OVER-marking (listing a flag that takes no value): the scan skips one
-    ///     token too many, lands past the script, and reports a FALSE ORPHAN --
-    ///     loud, and one line to fix.
-    ///   * UNDER-marking (the state before this list): the scan stops ON the
-    ///     value, so `rustc -o <checker> in.rs` reads an OUTPUT as an invocation
-    ///     and reports a FALSE "SCHEDULED" -- silent, and it defeats the guard.
-    ///
-    /// So omitting the list is the silent failure and having it is the loud one.
-    /// Both directions are pinned in `self_test`.
-    /// Flags known NOT to take a separate value.
-    ///
-    /// WARNING -- THE DEFAULT IS INVERTED FROM WHAT IT WAS, AND THE INVERSION IS THE
-    /// FIX. This was a `VALUE_FLAGS` table listing flags that DO consume the next
-    /// token, everything unlisted assumed not to. That puts the burden on the table
-    /// being complete, and an incomplete table fails SILENTLY: the scan stops on a
-    /// flag's value and reads it as the script, reporting a false SCHEDULED. Three
-    /// heads paid for that in one night -- `-o` (hermit#2667), `-c` (hermit#2674),
-    /// and `-X`, still live after both landed.
-    ///
-    /// Now an unrecognised flag is ASSUMED to consume the token after it. Getting
-    /// that wrong steps past the script and reports a false ORPHAN -- loud, one line
-    /// to fix. A missing entry here can no longer hide a checker, which is the
-    /// property the old table could not have at any length.
-    ///
-    /// Attached values need no entry: `--edition=2021`, `-Dwarnings`.
-    const NO_VALUE_FLAGS: [&str; 12] = [
-        // python
-        "-B", "-E", "-I", "-O", "-OO", "-s", "-S", "-u", "-v", "-b",
-        // shells
-        "-e", "-x",
-    ];
+    // NO_VALUE_FLAGS moved out of this function and BECAME PER-RUNNER; see
+    // `flag_takes_value`. A single flat list was runner-blind, which is the defect
+    // `agent(hermit-007)` found and `agent(hermit-005)` measured.
     let dotted = format!("./{path}");
     for line in text.lines() {
         let tokens: Vec<&str> = line.split_whitespace().collect();
@@ -384,13 +388,7 @@ fn runner_flag_path(text: &str, path: &str) -> bool {
             }
             let mut next = index + 1;
             while next < tokens.len() && tokens[next].starts_with('-') {
-                let flag = tokens[next];
-                // Attached value: one token. Known boolean: consumes nothing.
-                // EVERYTHING ELSE IS ASSUMED to consume the token after it --
-                // see NO_VALUE_FLAGS for why that default and not the other.
-                let attached =
-                    flag.contains('=') || (!flag.starts_with("--") && flag.len() > 2);
-                if !attached && !NO_VALUE_FLAGS.contains(&flag) {
+                if flag_takes_value(token, tokens[next]) {
                     next += 1;
                 }
                 next += 1;
@@ -800,6 +798,13 @@ target/ci/check-exit-status-class --gate";
             "an assignment VALUE read as an invocation",
         ),
         (
+            "bash -O scripts/check-x.sh",
+            "scripts/check-x.sh",
+            "bash -O takes a SHELL OPTION NAME, so the script is not the next token -- \
+             a single runner-blind flag list read this as an invocation, the silent \
+             direction, found by agent(hermit-007) and measured by agent(hermit-005)",
+        ),
+        (
             "        \"python3 scripts/test_validate_stop_paths.py",
             "scripts/test_validate_stop_paths.py",
             "a runner prefix carried as FIXTURE DATA read as an invocation -- this is \
@@ -859,6 +864,22 @@ target/ci/check-exit-status-class --gate";
             "rustc --edition 2021 scripts/check-x.rs",
             "scripts/check-x.rs",
             "a separate-value flag between the runner and the script",
+        ),
+        (
+            "bash -O extglob scripts/check-x.sh",
+            "scripts/check-x.sh",
+            "the OTHER direction of the same flag: with its value present the script \
+             IS the next token, and a flat list reported a false ORPHAN here",
+        ),
+        (
+            "python3 -O scripts/check-y.py",
+            "scripts/check-y.py",
+            "python -O is a BOOLEAN, so the same flag must behave differently per runner",
+        ),
+        (
+            "rustc -O scripts/check-x.rs",
+            "scripts/check-x.rs",
+            "rustc -O is also a boolean (opt-level=2)",
         ),
         (
             "cargo build && scripts/check-y.sh --gate",
