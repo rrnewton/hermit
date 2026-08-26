@@ -37,16 +37,31 @@
 //!   before   Some(125) flagged;  Some(122) and Some(130) invisible   18 sites
 //!   after    all three flagged                                       20 sites
 //!
+//! 129 and 143 were invisible on the same measurement and are now in as well.
+//!
 //! Adding them cost NOTHING on the current tree -- still 17 undeclared, baseline 17 --
 //! because every existing 122 and 130 site already spells the constant. That is the
 //! cheap moment to close a blind spot: before anything drifts into it.
 //!
-//! ⚠️ THE BAND IS NOT ADDED WHOLESALE, and that is a judgement worth stating. 130 is
-//! the only signal-band value hermit emits from a policy decision; 129 and 143 come
-//! from `on_container_init_stop_signal` and are ordinary signal reports. Adding
-//! 129..=192 would demand a declaration at sites carrying no ambiguity, and a noisy
-//! gate is exempted into uselessness -- the same reasoning that keeps the 44 below
-//! out. If hermit starts choosing another band value, it belongs here then.
+//! ⚠️ THE THREE THE HANDLER EMITS, AND AN EARLIER VERSION OF THIS PARAGRAPH HAD THE
+//! REASON EXACTLY BACKWARDS. It said 130 was "the only signal-band value hermit emits
+//! from a policy decision" while 129 and 143 were "ordinary signal reports". They are
+//! the same event. `CONTAINER_INIT_STOP_SIGNALS` is `[SIGTERM, SIGINT, SIGHUP]`, one
+//! loop installs one handler for all three, and one line -- `_exit(128 + signal)` at
+//! `container.rs:354` -- is the sole producer of 143, 130 AND 129.
+//!
+//! ⚠️ AND THE CLAIM WAS IMPORTED FROM AN UNLANDED BRANCH, which is the part worth
+//! recording. On a tree where `sigint_instakill` chooses `HERMIT_SIGINT_DEATH_EXIT`,
+//! 130 really would be policy-chosen -- but that is hermit#2672 and it has not landed.
+//! Here `sigint_instakill` calls `unrecoverable_shutdown(guest)` and exits 122, so on
+//! THIS tree no policy decision produces 130 at all. I reviewed my own change against
+//! knowledge the repository does not yet have. agent(hermit-triage) caught it.
+//!
+//! So all three are in, on the only rule that survives contact: hermit's own reporting
+//! emits them, and each is equally a legal guest status. The rest of the band --
+//! 128, and 131..=192 -- stays out because nothing in hermit emits it, which is the
+//! same reasoning that keeps `Some(124)` and `Some(2)` out. If hermit starts emitting
+//! another band value, it belongs here then and for a reason that can be checked.
 //!
 //! ⚠️ WHY NOT MORE THAN SIX. Counted before the key was chosen: 62 exit-status
 //! integer literals live in these tests, and 44 of them cannot be confused with a
@@ -72,7 +87,7 @@ use std::process::Command;
 
 /// Exit-status values whose meaning is contested. See the module docs for why the
 /// other 44 literals are deliberately out of scope.
-const COLLIDING: [(u32, &str); 6] = [
+const COLLIDING: [(u32, &str); 8] = [
     (
         1,
         "pre-#2558 hermit failure code: guest exit OR stale hermit code",
@@ -85,8 +100,16 @@ const COLLIDING: [(u32, &str); 6] = [
         "HERMIT_POLICY_REFUSAL_EXIT: hermit refused, or the guest chose 122",
     ),
     (
+        129,
+        "128 + SIGHUP from on_container_init_stop_signal, or the guest chose 129",
+    ),
+    (
         130,
-        "128 + SIGINT: hermit's signal-death report, or the guest chose 130",
+        "128 + SIGINT from on_container_init_stop_signal, or the guest chose 130",
+    ),
+    (
+        143,
+        "128 + SIGTERM from on_container_init_stop_signal, or the guest chose 143",
     ),
 ];
 
@@ -383,9 +406,16 @@ mod tests {
         // convention, 2 is clap usage, and hermit never chooses either.
         assert_eq!(count("assert_eq!(run.status.code(), Some(124));"), 0);
         assert_eq!(count("assert_eq!(run.status.code(), Some(2));"), 0);
-        // 129 and 143 are in the signal band but are ordinary signal reports from
-        // `on_container_init_stop_signal`, not policy decisions. Deliberately out.
-        assert_eq!(count("assert_eq!(run.status.code(), Some(143));"), 0);
+        // ⚠️ 129 AND 143 ARE IN, AND THIS ROW PINNED THE OPPOSITE. It asserted 143
+        // must stay unflagged, on a rationale that had the producer backwards: the
+        // same handler line emits 143, 130 and 129, so excluding two of the three
+        // was arbitrary. The test enforced the error, which is what a test does
+        // when the reasoning behind it is wrong rather than the code.
+        assert_eq!(count("assert_eq!(run.status.code(), Some(129));"), 1);
+        assert_eq!(count("assert_eq!(run.status.code(), Some(143));"), 1);
+        // The band value hermit does NOT emit stays out, so this is still a set and
+        // not the whole range.
+        assert_eq!(count("assert_eq!(run.status.code(), Some(131));"), 0);
     }
 
     #[test]
