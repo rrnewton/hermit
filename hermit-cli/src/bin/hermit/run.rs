@@ -2256,39 +2256,86 @@ fn validate_e9patch_mount_target(path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-/// The status flags on hermit's own stderr, or `None` if they cannot be read.
+/// The descriptors a verification snapshots and restores between its two runs.
 ///
-/// Read once before the first verification run so the second can be handed the
-/// same starting state. `None` is not an error: an unreadable descriptor simply
-/// means there is nothing to restore, and a verification must not fail over
-/// housekeeping.
-fn stderr_status_flags() -> Option<libc::c_int> {
-    // SAFETY: `F_GETFL` reads flags from an existing descriptor and writes no
-    // memory. Fd 2 is valid for the life of the process.
-    let flags = unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_GETFL) };
+/// ⚠️ ALL THREE, AND THE FIRST VERSION OF THIS FIX RESTORED ONLY STDERR.
+/// The leak is a property of an INHERITED OPEN FILE DESCRIPTION, not of stderr:
+/// a guest that sets a status flag on any descriptor hermit passed it leaves
+/// that flag set on the description itself, which run 2 then inherits already
+/// mutated. Nothing about fd 2 is special, and scoping the fix to the descriptor
+/// the reproducing guest happened to touch was the limit of that guest, not the
+/// limit of the defect.
+///
+/// Measured at `aeda16ff7de3`, the head that restored fd 2 alone, with a stock
+/// `/usr/bin/perl` guest that conditionally sets `O_APPEND`:
+///
+/// ```text
+/// mutating STDOUT, --backend kvm --strict --verify   rc=125  nondeterministic
+/// mutating STDOUT, ptrace (control)                  rc=0    deterministic
+/// mutating STDERR, kvm  (the shipped fix works)      rc=0    deterministic
+/// mutating STDIN,  kvm                               rc=0    deterministic
+/// touching no flags, kvm (negative control)          rc=0    deterministic
+/// run 1: fcntl(1, F_GETFL) = Ok(32769)   run 2: fcntl(1, F_GETFL) = Ok(33793)
+/// ```
+///
+/// ⚠️ STDIN IS INCLUDED THOUGH IT DID NOT REPRODUCE, DELIBERATELY. Its probe
+/// is green because KVM reserves its own stdin path, which is a property of
+/// today's backend rather than of the descriptor. Snapshotting it costs one
+/// `F_GETFL` and one comparison per verification, and leaving it out would
+/// rebuild the exact gap this change exists to close -- a descriptor omitted
+/// because no test currently reaches it.
+const VERIFY_RESTORED_FDS: [libc::c_int; 3] =
+    [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO];
+
+/// The status flags on one descriptor, or `None` if they cannot be read.
+///
+/// `None` is not an error: an unreadable descriptor simply means there is
+/// nothing to restore, and a verification must not fail over housekeeping.
+fn fd_status_flags(fd: libc::c_int) -> Option<libc::c_int> {
+    // SAFETY: `F_GETFL` reads flags from a descriptor number and writes no
+    // memory. Validity is NOT a precondition here: a closed or never-opened
+    // descriptor returns -1 with `EBADF`, which this reads as `None`. Saying
+    // "fd 2 is valid for the life of the process" would have been an unfounded
+    // guarantee -- stderr can be closed -- so the safety argument rests on the
+    // call being memory-safe for any integer, which it is.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 { None } else { Some(flags) }
 }
 
-/// Put stderr's status flags back to what the first run was handed.
+/// The status flags of every descriptor a verification restores, in
+/// `VERIFY_RESTORED_FDS` order.
+///
+/// Read once before the first verification run so the second can be handed the
+/// same starting state.
+fn standard_fd_status_flags() -> [Option<libc::c_int>; VERIFY_RESTORED_FDS.len()] {
+    VERIFY_RESTORED_FDS.map(fd_status_flags)
+}
+
+/// Put each descriptor's status flags back to what the first run was handed.
 ///
 /// ⚠️ ONLY WHEN THEY ACTUALLY CHANGED. An unconditional `F_SETFL` would be a
 /// write on a descriptor hermit does not own whenever nothing moved, and the
 /// common case is that nothing moved. Comparing first keeps this inert on every
-/// run except the one it exists for.
-fn restore_stderr_status_flags(before: Option<libc::c_int>) {
-    let Some(before) = before else {
-        return;
-    };
-    let Some(now) = stderr_status_flags() else {
-        return;
-    };
-    if now == before {
-        return;
-    }
-    // SAFETY: `F_SETFL` sets flags on an existing descriptor and writes no
-    // memory. The value is one this same descriptor reported earlier.
-    unsafe {
-        libc::fcntl(libc::STDERR_FILENO, libc::F_SETFL, before);
+/// run except the one it exists for -- and it is compared PER DESCRIPTOR, so a
+/// guest that moves one flag does not cause writes on the other two.
+fn restore_standard_fd_status_flags(before: [Option<libc::c_int>; VERIFY_RESTORED_FDS.len()]) {
+    for (fd, before) in VERIFY_RESTORED_FDS.iter().copied().zip(before) {
+        let Some(before) = before else {
+            continue;
+        };
+        let Some(now) = fd_status_flags(fd) else {
+            continue;
+        };
+        if now == before {
+            continue;
+        }
+        // SAFETY: `F_SETFL` sets flags on a descriptor number and writes no
+        // memory. The value is one this same descriptor reported earlier, and a
+        // descriptor that has become invalid meanwhile fails with `EBADF`
+        // rather than doing anything.
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFL, before);
+        }
     }
 }
 
@@ -3464,9 +3511,9 @@ impl RunOpts {
         let (log1_file, log1_path) = log1.into_parts();
         let (log2_file, log2_path) = log2.into_parts();
 
-        // Captured BEFORE run 1 so the same value can be put back before run 2.
+        // Captured BEFORE run 1 so the same values can be put back before run 2.
         // See the restore call below for the measurement this exists for.
-        let stderr_flags_before_run1 = stderr_status_flags();
+        let fd_flags_before_run1 = standard_fd_status_flags();
 
         eprintln!(":: {}", "Run1...".yellow().bold());
 
@@ -3582,7 +3629,7 @@ impl RunOpts {
         // Best-effort by construction: if the flags cannot be read or restored
         // we leave the descriptor alone rather than fail a verification over
         // housekeeping, and the comparison reports the divergence as before.
-        restore_stderr_status_flags(stderr_flags_before_run1);
+        restore_standard_fd_status_flags(fd_flags_before_run1);
 
         eprintln!(":: {}", "Run2...".yellow().bold());
         let mut out2 = match self.run_verify(log2_file, global) {

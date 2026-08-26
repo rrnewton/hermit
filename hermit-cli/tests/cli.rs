@@ -1889,9 +1889,13 @@ fn run_kvm_executes_dynamic_guest() {
 ///     run 1  fcntl(2, F_GETFL) = 32769  -> fcntl(2, F_SETFL, 33793)
 ///     run 2  fcntl(2, F_GETFL) = 33793  -> no SETFL at all
 /// One extra syscall in run 1 shifted every later record by one and reported
-/// TWENTY mismatches for ONE divergence. `2>>file` instead of `2>file` -- the
-/// same run with the bit already set -- was deterministic, which is the whole
-/// demonstration.
+/// TWENTY mismatches for TWO real divergences -- the extra `F_SETFL` record AND
+/// the differing `F_GETFL` RESULT (`Ok(32769)` against `Ok(33793)`). ⚠️ THIS
+/// SAID "ONE" UNTIL `agent(codex-rev-2668)` AND `agent(hermit-dbg)` CAUGHT IT,
+/// and `run.rs` already said two: a reader who checked only the inbound records
+/// would have found them clean and concluded the harness was blameless.
+/// `2>>file` instead of `2>file` -- the same run with the bit already set --
+/// was deterministic, which is the whole demonstration.
 ///
 /// ⚠️ THE `run_kvm_` PREFIX IS LOAD-BEARING, NOT DECORATION. `ci/dag/privileged.json`
 /// selects this suite with `-E 'test(/^run_kvm_/)'`, and that is the only lane with
@@ -1960,6 +1964,94 @@ fn run_kvm_verify_is_deterministic_when_the_guest_mutates_hermit_stderr_flags() 
         stderr(&output).contains(":: Success: deterministic. Determinism verified."),
         "a guest that mutated hermit's stderr flags was reported as nondeterministic; \
          the two verification runs did not start from identical fd state\nstderr:\n{}",
+        stderr(&output),
+    );
+}
+
+/// ⚠️ THE SAME LEAK ON **STDOUT**, AND IT IS HERE BECAUSE THE FIRST VERSION OF
+/// THIS PULL REQUEST RESTORED fd 2 ALONE AND I CALLED THAT "SCOPE".
+///
+/// It was not scope, it was the limit of the guest I tested with. `awk` mutates
+/// stderr, so stderr is what I fixed. `agent(codex-rev-2668)` reproduced the
+/// identical mechanism on fd 1 at the head I had asked to land, and
+/// `agent(hermit-dbg)` -- who had written the fd 0/fd 1 gap down in his own
+/// review as "fine as scope" -- reproduced it, withdrew his approval and
+/// stripped the label. Both were right. Measured by me at that head, on the
+/// binary as it then stood:
+///
+/// ```text
+/// mutating STDOUT, kvm --strict --verify   rc=125  Failure: nondeterministic
+/// mutating STDOUT, ptrace (control)        rc=0    Success: deterministic
+/// mutating STDERR, kvm (fd 2 fix works)    rc=0    Success: deterministic
+/// mutating STDIN,  kvm                     rc=0    Success: deterministic
+/// touching no flags, kvm (neg. control)    rc=0    Success: deterministic
+/// run 1: fcntl(1, F_GETFL) = Ok(32769)     run 2: fcntl(1, F_GETFL) = Ok(33793)
+/// ```
+///
+/// The last three rows are what make it a finding rather than a coincidence: the
+/// shipped fd 2 fix genuinely works, stdin does not reproduce, and a guest that
+/// touches no flags at all is green. It is the flag mutation on the inherited
+/// description that decides the verdict, and the descriptor number is incidental.
+///
+/// ⚠️ THIS CELL DRIVES THE BIT DIRECTLY AND OWES NOTHING TO awk -- which is what
+/// the stderr cell above cannot say, and `agent(codex-rev-2668)` was right that
+/// the stderr cell is a NAMED cell rather than an independent trigger. This guest
+/// is four lines of `perl -e` that call `fcntl(F_SETFL)` on fd 1 unconditionally
+/// of any tool's internals, so if `awk` ever stops setting the flag both awk
+/// cells go quiet together and THIS one still fails. That is the independence
+/// the other cell explicitly disclaims.
+///
+/// ⚠️ `run_kvm_` PREFIX IS LOAD-BEARING. `ci/dag/privileged.json` selects this
+/// suite with `-E 'test(/^run_kvm_/)'` and that is the only lane with /dev/kvm.
+/// Without the prefix this is selected on PORTABLE, its guard returns early, and
+/// it reports a silent pass -- the exact hazard that node's description warns of.
+#[test]
+fn run_kvm_verify_is_deterministic_when_the_guest_mutates_hermit_stdout_flags() {
+    if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/perl").exists() {
+        return;
+    }
+
+    // Conditional on purpose: setting the flag only when it is not already set
+    // is what makes run 1 and run 2 issue DIFFERENT syscall sequences. An
+    // unconditional `F_SETFL` fires in both runs and the sequences match, so it
+    // would not reproduce -- the same trap the stderr cell records for
+    // `sh -c 'exec 2>>...'`, which reopens the descriptor instead of mutating
+    // the inherited description.
+    let program = concat!(
+        "use Fcntl; ",
+        "my $f = fcntl(STDOUT, F_GETFL, 0); ",
+        "fcntl(STDOUT, F_SETFL, $f | O_APPEND) unless $f & O_APPEND; ",
+        "print \"42\\n\";",
+    );
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--verify",
+        "--",
+        "/usr/bin/perl",
+        "-e",
+        program,
+    ];
+    let output = Command::new("timeout")
+        .args(["--kill-after", "2s", "60s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(args)
+        .output()
+        .expect("failed to run the stdout-flag determinism regression");
+
+    assert_ne!(
+        output.status.code(),
+        Some(124),
+        "the stdout-flag determinism probe hung"
+    );
+    assert_success(&output, &args);
+    assert!(
+        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
+        "a guest that mutated hermit's STDOUT flags was reported as nondeterministic; \
+         the two verification runs did not start from identical fd state, so the \
+         restore does not cover every inherited descriptor\nstderr:\n{}",
         stderr(&output),
     );
 }
