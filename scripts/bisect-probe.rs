@@ -181,7 +181,7 @@ fn probe_rc(verdicts: &[Verdict]) -> i32 {
     if verdicts.iter().any(|v| !v.measured()) {
         return RC_NOT_MEASURED;
     }
-    if verdicts.iter().any(|v| *v == Verdict::Fail) {
+    if verdicts.contains(&Verdict::Fail) {
         return RC_FAIL;
     }
     RC_OK
@@ -327,7 +327,9 @@ fn main() {
             .stderr(std::process::Stdio::null())
             .status();
         if status.is_err() {
-            outcomes.get_mut(id).map(|v| v.push("ERROR".to_string()));
+            if let Some(v) = outcomes.get_mut(id) {
+                v.push("ERROR".to_string());
+            }
             continue;
         }
         // ⚠️ READ THE ROWS, NOT THE EXIT CODE. `run` exits non-zero for a failed cell
@@ -338,7 +340,9 @@ fn main() {
             for line in text.lines().filter(|l| !l.trim().is_empty()) {
                 if let Ok(row) = serde_json::from_str::<serde_json::Value>(line) {
                     if let Some(o) = row.get("outcome").and_then(|o| o.as_str()) {
-                        outcomes.get_mut(id).map(|v| v.push(o.to_string()));
+                        if let Some(v) = outcomes.get_mut(id) {
+                            v.push(o.to_string());
+                        }
                     }
                 }
             }
