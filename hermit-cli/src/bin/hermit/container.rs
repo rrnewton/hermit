@@ -682,6 +682,21 @@ impl std::error::Error for PolicyRefusal {}
 
 /// The container child was terminated by a signal, reported as `128 + signo`.
 ///
+/// Reattaches "a `--timeout` deadline fired" on the PARENT side of the
+/// container boundary, where `hermit::GuestTimedOut` no longer exists as a type.
+///
+/// Carries no number, unlike [`SignalDeath`]: the seconds are already in the
+/// child's message and re-parsing them out of English is exactly what
+/// `FailureKind` exists to avoid.
+#[derive(Debug)]
+pub struct RunTimeoutMarker;
+
+impl std::fmt::Display for RunTimeoutMarker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the --timeout bound fired; see the reason above")
+    }
+}
+
 /// Carries the signal, unlike [`PolicyRefusal`], because there is more than one
 /// and the number is the whole content of the report.
 #[derive(Debug)]
@@ -778,6 +793,14 @@ pub fn classify_container_result<T>(
                 // the operator needs while claiming it was printed. Attaching it
                 // as context keeps the downcast working and the chain intact.
                 FailureKind::PolicyRefusal => error.context(PolicyRefusal),
+                // ⚠️ THE LIMIT IS RE-DERIVED, NOT RE-PARSED. `kind` says a
+                // deadline fired; the seconds live only in the message the
+                // child wrote, and `RunTimeoutMarker` deliberately carries no
+                // number rather than scraping one back out of English. The
+                // message itself is still printed as the error chain, so the
+                // operator sees the bound; only the machine-readable class is
+                // reconstructed here.
+                FailureKind::RunTimeout => error.context(RunTimeoutMarker),
                 FailureKind::Error => error,
             })
         }

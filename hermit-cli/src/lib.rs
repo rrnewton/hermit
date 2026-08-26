@@ -285,11 +285,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicPtr;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::anyhow;
 use clap::ValueEnum;
+use nix::sys::signal::SaFlags;
+use nix::sys::signal::SigAction;
+use nix::sys::signal::SigHandler;
+use nix::sys::signal::SigSet;
+use nix::sys::signal::Signal;
+use nix::sys::signal::sigaction;
 use consts::METADATA_NAME;
 pub use detcore::Config as DetConfig;
 pub use detcore::Detcore;
@@ -2000,6 +2009,35 @@ pub fn run_with_backend(
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
 ) -> Result<ExitStatus, Error> {
+    run_with_backend_timeout(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        None,
+    )
+}
+
+/// [`run_with_backend`] with a hermit-enforced wall-clock bound on the guest.
+///
+/// `timeout: None` is byte-for-byte the old behaviour: no alarm is armed and no
+/// timer is created, so an unbounded run is not paying for a feature it did not
+/// ask for. See [`with_run_deadline`] for what firing actually does.
+///
+/// ⚠️ NOT PART OF `DetConfig`, DELIBERATELY. A wall-clock bound is host state,
+/// and `DetConfig` is the determinism configuration that is serialized to disk
+/// and reasoned about as guest-visible. Threading a real-time deadline through
+/// it would put a nondeterministic quantity inside the structure whose entire
+/// job is to exclude them.
+pub fn run_with_backend_timeout(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    timeout: Option<Duration>,
+) -> Result<ExitStatus, Error> {
     if backend == Backend::Kvm {
         ensure_kvm_stdin_reserved()?;
     }
@@ -2010,6 +2048,7 @@ pub fn run_with_backend(
         print_summary,
         print_summary_to_json_file,
         backend,
+        timeout,
     )
 }
 
@@ -2082,8 +2121,203 @@ fn liteinst_requires_forced_shutdown(status: ExitStatus) -> bool {
     }
 }
 
+/// The guest outlived the wall-clock bound the caller asked hermit to enforce.
+///
+/// A DISTINCT TYPE, NOT A STRING, because `failure_exit_code` and
+/// `classify_failure` both have to recognise it and a prose match would break
+/// silently the first time the wording changed.
+#[derive(Debug)]
+pub struct GuestTimedOut {
+    /// The bound that was exceeded, as the caller spelled it.
+    pub limit: Duration,
+}
+
+impl std::fmt::Display for GuestTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Guest exceeded the --timeout bound of {} seconds; hermit tore the container down",
+            self.limit.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for GuestTimedOut {}
+
+/// How long the unwind gets before the hard fallback fires.
+///
+/// The fallback exists because the gentle path can itself wedge: if the guest
+/// is stopped in a way that keeps a tracer task from completing, dropping the
+/// future never returns and the deadline would be as inert as the mechanisms
+/// this replaces. Ten seconds is the same grace the per-cell
+/// `timeout --kill-after=10s` already uses, so the two tiers agree rather than
+/// racing on different numbers.
+const RUN_TIMEOUT_UNWIND_GRACE: Duration = Duration::from_secs(10);
+
+/// Bound `guest` by `timeout`, preferring an unwind over a kill.
+///
+/// ⚠️ THE UNWIND IS THE POINT. `tokio::time::timeout` DROPS the guest future on
+/// expiry, and dropping it is what runs every `Drop` in the async stack:
+/// reverie detaches and reaps its tracees, detcore's global state is dropped,
+/// and the error then propagates out through `with_container`, so the container
+/// init returns NORMALLY instead of `_exit`ing. The mounts and the guest go away
+/// because the namespace is torn down in order, not because the kernel demolished
+/// it under us.
+///
+/// Contrast `record_start.rs`'s `recording_timeout_handler`, which this follows
+/// in SHAPE but deliberately not in ACTION: it `_exit(124)`s from a signal
+/// handler, skipping every destructor, because a signal handler may only call
+/// async-signal-safe functions and cannot unwind. That remains the right answer
+/// for the FALLBACK tier below and the wrong one for the primary path.
+///
+/// ⚠️ WHY A FALLBACK IS STILL REQUIRED. The primary path depends on the runtime
+/// reaching the timer, and on the dropped future actually completing its own
+/// teardown. Neither is guaranteed for an arbitrary wedged guest. A bound that
+/// works only when the run was healthy enough not to need it is the inert
+/// mechanism this exists to remove, so the alarm below is armed FIRST and is
+/// disarmed by RAII only once the unwind has finished.
+async fn with_run_deadline<F>(timeout: Option<Duration>, guest: F) -> Result<ExitStatus, Error>
+where
+    F: std::future::Future<Output = Result<ExitStatus, Error>>,
+{
+    let Some(limit) = timeout else {
+        return guest.await;
+    };
+
+    // Armed before the guest starts and dropped after it finishes, so the
+    // window it covers is exactly the window the bound applies to.
+    let _fallback = RunTimeoutFallback::arm(limit + RUN_TIMEOUT_UNWIND_GRACE)?;
+
+    match tokio::time::timeout(limit, guest).await {
+        Ok(result) => result,
+        // The future has already been dropped by `timeout` at this point; every
+        // destructor in the guest stack has run before we get here.
+        Err(_elapsed) => Err(Error::new(GuestTimedOut { limit })),
+    }
+}
+
+static RUN_TIMEOUT_MESSAGE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+static RUN_TIMEOUT_MESSAGE_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// The hard fallback: fires only if the unwind above did not finish in time.
+///
+/// Identical in construction to `record_start.rs`'s `recording_timeout_handler`
+/// -- non-blocking stderr so a full pipe cannot wedge the handler, then
+/// `_exit` -- and identical in exit code, because "a deadline fired" is one
+/// meaning and 124 already carries it for GNU `timeout`, for `safehermit`'s wall
+/// bound, and for `hermit record`'s own deadline. Reusing it here adds no new
+/// collision; inventing a fourth number for the same event would.
+extern "C" fn run_timeout_fallback_handler(_signal: libc::c_int) {
+    let len = RUN_TIMEOUT_MESSAGE_LEN.load(Ordering::Acquire);
+    let message = RUN_TIMEOUT_MESSAGE.load(Ordering::Acquire);
+    if !message.is_null() && len != 0 {
+        // SAFETY: the message is leaked before the timer is armed, and
+        // fcntl(2), write(2) and _exit(2) are async-signal-safe.
+        unsafe {
+            let flags = libc::fcntl(libc::STDERR_FILENO, libc::F_GETFL);
+            if flags != -1 {
+                libc::fcntl(libc::STDERR_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+            libc::write(libc::STDERR_FILENO, message.cast(), len);
+        }
+    }
+    // Exiting the namespace init tears down the container and its tracees.
+    // SAFETY: _exit(2) is async-signal-safe and runs no Rust destructors --
+    // which is precisely why this is the fallback and not the primary path.
+    unsafe { libc::_exit(124) }
+}
+
+struct RunTimeoutFallback {
+    previous_handler: SigAction,
+    reblock_sigalrm: bool,
+}
+
+impl RunTimeoutFallback {
+    fn arm(after: Duration) -> Result<Self, Error> {
+        let seconds: libc::c_uint = after
+            .as_secs()
+            .try_into()
+            .map_err(|_| Error::msg("--timeout exceeds the platform alarm limit"))?;
+        let message = Box::leak(
+            format!(
+                "HERMIT_RUN_TIMEOUT_FALLBACK: the --timeout unwind did not complete within {} seconds; \
+                 the container was terminated without a clean teardown\n",
+                RUN_TIMEOUT_UNWIND_GRACE.as_secs()
+            )
+            .into_boxed_str(),
+        );
+        RUN_TIMEOUT_MESSAGE.store(message.as_mut_ptr(), Ordering::Release);
+        RUN_TIMEOUT_MESSAGE_LEN.store(message.len(), Ordering::Release);
+
+        let action = SigAction::new(
+            SigHandler::Handler(run_timeout_fallback_handler),
+            SaFlags::SA_RESETHAND,
+            SigSet::empty(),
+        );
+        // SAFETY: the handler uses only async-signal-safe operations and stays
+        // installed until this guard disarms it.
+        let previous_handler = unsafe { sigaction(Signal::SIGALRM, &action) }?;
+
+        // A blocked SIGALRM stays pending forever and the handler never runs,
+        // silently disabling the fallback. `record_start.rs` learned this too.
+        let mut alarm = SigSet::empty();
+        alarm.add(Signal::SIGALRM);
+        let reblock_sigalrm = SigSet::thread_get_mask()
+            .map(|mask| mask.contains(Signal::SIGALRM))
+            .unwrap_or(false);
+        if reblock_sigalrm {
+            let _ = alarm.thread_unblock();
+        }
+
+        // SAFETY: `seconds` fits c_uint.
+        unsafe { libc::alarm(seconds) };
+        Ok(Self {
+            previous_handler,
+            reblock_sigalrm,
+        })
+    }
+}
+
+impl Drop for RunTimeoutFallback {
+    fn drop(&mut self) {
+        // SAFETY: disarm the alarm before restoring the inherited handler.
+        unsafe {
+            libc::alarm(0);
+            let _ = sigaction(Signal::SIGALRM, &self.previous_handler);
+        }
+        if self.reblock_sigalrm {
+            let mut alarm = SigSet::empty();
+            alarm.add(Signal::SIGALRM);
+            let _ = alarm.thread_block();
+        }
+        RUN_TIMEOUT_MESSAGE_LEN.store(0, Ordering::Release);
+        RUN_TIMEOUT_MESSAGE.store(std::ptr::null_mut(), Ordering::Release);
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn run_with_backend_inner(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    timeout: Option<Duration>,
+) -> Result<ExitStatus, Error> {
+    with_run_deadline(timeout, async {
+        dispatch_backend(
+            command,
+            config,
+            print_summary,
+            print_summary_to_json_file,
+            backend,
+        )
+        .await
+    })
+    .await
+}
+
+async fn dispatch_backend(
     command: Command,
     config: DetConfig,
     print_summary: bool,
@@ -2191,6 +2425,30 @@ pub fn run_with_output_backend(
     if backend == Backend::Kvm {
         ensure_kvm_stdin_reserved()?;
     }
+    run_with_output_backend_timeout(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        None,
+    )
+}
+
+/// [`run_with_output_backend`] with a hermit-enforced wall-clock bound.
+///
+/// See [`run_with_backend_timeout`]; the teardown semantics are identical.
+pub fn run_with_output_backend_timeout(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    timeout: Option<Duration>,
+) -> Result<Output, Error> {
+    if backend == Backend::Kvm {
+        ensure_kvm_stdin_reserved()?;
+    }
     let config = prepare_backend_config(config, backend);
     run_with_output_backend_inner(
         command,
@@ -2198,11 +2456,48 @@ pub fn run_with_output_backend(
         print_summary,
         print_summary_to_json_file,
         backend,
+        timeout,
     )
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn run_with_output_backend_inner(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    timeout: Option<Duration>,
+) -> Result<Output, Error> {
+    let Some(limit) = timeout else {
+        return dispatch_output_backend(
+            command,
+            config,
+            print_summary,
+            print_summary_to_json_file,
+            backend,
+        )
+        .await;
+    };
+    let _fallback = RunTimeoutFallback::arm(limit + RUN_TIMEOUT_UNWIND_GRACE)?;
+    match tokio::time::timeout(
+        limit,
+        dispatch_output_backend(
+            command,
+            config,
+            print_summary,
+            print_summary_to_json_file,
+            backend,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => Err(Error::new(GuestTimedOut { limit })),
+    }
+}
+
+async fn dispatch_output_backend(
     mut command: Command,
     config: DetConfig,
     print_summary: bool,

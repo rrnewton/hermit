@@ -43,6 +43,18 @@ pub enum FailureKind {
     /// `class=container-child-exit`. Two configurations of one policy reported
     /// opposite things about the same decision.
     PolicyRefusal,
+    /// The child stopped because HERMIT'S OWN `--timeout` BOUND was reached.
+    ///
+    /// ⚠️ THE SAME ARGUMENT A THIRD TIME, and it is not hypothetical: measured
+    /// on 2026-08-26, `hermit run --timeout 3 -- ./spin` fired at exactly 3s
+    /// with no residue and still reported `exit 125` /
+    /// `class=cli-error` -- "hermit broke" -- because `GuestTimedOut` is
+    /// produced INSIDE the container child and every type is a string by the
+    /// time the parent sees it. Unlike the refusal path there is no status
+    /// channel to fall back on either: the timeout unwinds and RETURNS rather
+    /// than calling `unrecoverable_shutdown`, precisely because the unwind is
+    /// the point.
+    RunTimeout,
 }
 
 /// ⚠️ THE `kind` FIELD IS THE THIRD AND LAST OF ONE CHAIN OF FLATTENINGS.
@@ -148,6 +160,8 @@ impl From<Error> for SerializableError {
         // avoid.
         let kind = if is_policy_refusal(&err) {
             FailureKind::PolicyRefusal
+        } else if err.downcast_ref::<crate::GuestTimedOut>().is_some() {
+            FailureKind::RunTimeout
         } else {
             FailureKind::Error
         };
