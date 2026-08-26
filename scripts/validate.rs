@@ -8417,25 +8417,90 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     // WHAT IS STILL ASSERTED, and is the part worth keeping: the lane is STILL NOT
     // ok. Retrying a genuine red three times must return the same red, never a
     // pass. The cost changed by directive; the verdict must not.
-    // ⚠️ THIS NOW PINS THE STRUCTURAL SUPPRESSION, and the numbers are the point.
-    // The fixture fails the same way every time. Always-eligible retry alone would
-    // spend the whole budget on it -- 2 retries, 3 attempts at the max=2 passed
-    // above -- and stamp a retry_class on each, so a flakiness timeline would read
-    // a permanently broken test as flaky every run. `already_failed_identically`
-    // stops after the failure reproduces its own reason once: ONE retry, TWO
-    // attempts. The saving is real and so is the record: one occurrence, not three.
+    // ⚠️ PER-CELL BUDGET (owner ruling 2026-08-26): this fixture fails every time,
+    // so it uses its whole allowance and stays red. The lane round backstop passed
+    // above is 2, so it reaches 3 attempts here -- the cell cap and the backstop
+    // agree at this size, and the bracket below is the one that separates them.
     //
-    // The verdict is unchanged and that is the other half: retrying a genuine red,
-    // whether once or three times, must return the same red.
-    if ordinary_only.ok || ordinary_only.env_retries != 1 || ordinary_only.attempts.len() != 2 {
+    // The verdict is the invariant: retrying a genuine red, once or three times,
+    // must return the same red. The cost is policy; the verdict is not.
+    if ordinary_only.ok || ordinary_only.env_retries != 2 || ordinary_only.attempts.len() != 3 {
         return Err(format!(
-            "scheduler accounting: a structurally-repeating failure must be retried ONCE, then \
-             suppressed, and STILL be red: ok={} retries={} attempts={}",
+            "scheduler accounting: an always-eligible failure must spend its per-cell \
+             allowance and STILL be red: ok={} retries={} attempts={}",
             ordinary_only.ok,
             ordinary_only.env_retries,
             ordinary_only.attempts.len()
         ));
     }
+
+    // ⚠️ THE POINT OF THE RULING: A SECOND CELL GETS ITS OWN THREE, WHATEVER THE
+    // FIRST SPENT. Two cells in ONE lane, both failing every time. Under the lane
+    // round budget that shipped first, the two shared a pool: whichever failed
+    // first consumed the rounds and the other's chance of recovering depended on
+    // its neighbour. That is the incoherence the ruling removes, so it is pinned
+    // here rather than described.
+    //
+    // Both must reach exactly MAX_ATTEMPTS_PER_CELL, and the cap must be what
+    // stops them: removing the per-cell gate lets the lane backstop run them to 33
+    // attempts each and this bracket fails.
+    //
+    // ⚠️ WHAT THIS BRACKET DOES NOT PROVE, MEASURED RATHER THAN ASSUMED. It does
+    // not discriminate a per-cell cap from a lane-round budget on its own. These
+    // two cells fail in the SAME round, so they share every round efficiently and
+    // a lane budget of 2 rounds also yields 3 attempts each -- checked by setting
+    // the backstop to 2, and the bracket still passed. The starvation case the
+    // ruling names -- one cell exhausting the pool BEFORE another has failed --
+    // cannot be built in this harness, because a node that has passed is never
+    // added to a retry set and so can never fail late. The per-cell property is
+    // carried by the gate's position in the code, ahead of every ground and keyed
+    // on the cell's own tag; this bracket pins that the gate binds and binds at
+    // three.
+    let twin_log = tmp.join("twin.log");
+    let twin_cfg = DagConfig {
+        steps: vec![
+            step("twin_a", "exit 1"),
+            step("twin_b", "exit 1"),
+        ],
+        ..Default::default()
+    };
+    let twins = run_lane_with_env_retries(
+        &twin_cfg,
+        2,
+        true,
+        0,
+        None,
+        &twin_log,
+        None,
+        validate_runtime::LANE_ROUND_BACKSTOP,
+        &BTreeMap::new(),
+        false,
+    );
+    let attempts_for = |tag: &str| -> usize {
+        twins
+            .attempts
+            .iter()
+            .filter(|a| a.tag == tag)
+            .map(|a| a.attempt)
+            .max()
+            .unwrap_or(0)
+    };
+    let (a, b) = (attempts_for("fixture.twin_a"), attempts_for("fixture.twin_b"));
+    if twins.ok
+        || a != validate_runtime::MAX_ATTEMPTS_PER_CELL
+        || b != validate_runtime::MAX_ATTEMPTS_PER_CELL
+    {
+        return Err(format!(
+            "retry budget: a second failing cell in the same lane did not get its own \
+             {} attempts independently of the first -- this is the lane-budget \
+             incoherence the per-cell ruling removes: twin_a={a} twin_b={b} ok={}",
+            validate_runtime::MAX_ATTEMPTS_PER_CELL,
+            twins.ok
+        ));
+    }
+    // And the cap is a CAP: neither may exceed it, or "three attempts" means
+    // nothing. The equality above already pins this; stated so a later edit that
+    // relaxes it to `>=` has to argue with a comment.
 
     // REFUSAL 2: a registry entry with a ONE-SIDED sample grants no retry. This
     // is the structural-`no_result` shape the flakiness investigation measured
@@ -8782,6 +8847,18 @@ fn run_lane_with_env_retries(
         let blocked: Vec<(String, String)> = failed
             .iter()
             .filter_map(|o| {
+                // ⚠️ THE BUDGET IS PER CELL. Owner ruling 2026-08-26. This cell has
+                // had `attempts_so_far` attempts; it gets MAX_ATTEMPTS_PER_CELL and
+                // no more, and what any OTHER cell spent does not touch it.
+                //
+                // The gate is here, ahead of every ground, so it binds uniformly:
+                // an environmental block cannot buy a fourth attempt any more than
+                // the blanket arm can.
+                if attempts_so_far(&attempts, &o.tag)
+                    >= validate_runtime::MAX_ATTEMPTS_PER_CELL
+                {
+                    return None;
+                }
                 environmental
                     .get(&o.tag)
                     .cloned()
@@ -8811,15 +8888,7 @@ fn run_lane_with_env_retries(
                     // a failure whose prerequisite did not complete is dropped by
                     // `retry_steps_with_satisfied_prerequisites` below, and the whole
                     // loop is bounded by `max` rounds.
-                    // STRUCTURAL SUPPRESSION on the blanket arm only. The three
-                    // grounds above are unaffected: an environmental block that
-                    // repeats may still clear, so it keeps its retry. A failure
-                    // that reproduces its own reason exactly has told us what a
-                    // third attempt will say.
-                    .or_else(|| {
-                        (!already_failed_identically(&attempts, &o.tag, &o.reason))
-                            .then(|| format!("always-eligible: {}", o.reason.trim()))
-                    })
+                    .or_else(|| Some(format!("always-eligible: {}", o.reason.trim())))
                     .map(|class| (o.tag.clone(), class))
             })
             .collect();
@@ -11190,32 +11259,18 @@ impl RunSummary {
     }
 }
 
-/// Has this node ALREADY failed with this exact reason earlier in this run?
+/// How many attempts this cell has had so far, by highest recorded ordinal.
 ///
-/// ⚠️ A 0-PASS IDENTITY IS STRUCTURAL, NOT FLAKY, AND RETRYING IT RETURNS THE SAME
-/// ANSWER. The registry reader has always known this -- `measured_unstable_nodes`
-/// rejects a one-sided sample with "0 pass / 5 fail ... rather than measured
-/// instability" -- but it DISCARDS those entries, so the retry loop never learns
-/// which identities they are. Making every cell always eligible therefore handed
-/// the full budget to exactly the cells the registry had already judged
-/// unretryable.
-///
-/// TWO COSTS, AND THE SECOND IS THE WORSE ONE. It burns the budget on a node that
-/// cannot recover; and it stamps a `retry_class` on every one of those attempts,
-/// so a multi-week flakiness timeline reads a permanently broken test as flaky
-/// every single run. That corrupts the record the retry work exists to produce.
-///
-/// The in-run test is used rather than the registry because the registry holds
-/// ONE cell, measured 2026-08-04, and cannot speak for the rest of the manifest.
-/// An identical reason on a second attempt is direct evidence from this run that
-/// a third attempt returns the same answer.
-fn already_failed_identically(attempts: &[NodeAttempt], tag: &str, reason: &str) -> bool {
-    let reason = reason.trim();
+/// Counting rows would undercount a cell whose attempt was never reported; the
+/// ordinal is assigned when the attempt is made, so it is the honest measure of
+/// "how many chances has this cell already had".
+fn attempts_so_far(attempts: &[NodeAttempt], tag: &str) -> usize {
     attempts
         .iter()
-        .filter(|a| a.tag == tag && a.ok == Some(false) && a.reason.trim() == reason)
-        .count()
-        >= 2
+        .filter(|a| a.tag == tag)
+        .map(|a| a.attempt)
+        .max()
+        .unwrap_or(0)
 }
 
 /// Cap for every id list in the end-of-run summary, so the block stays roughly

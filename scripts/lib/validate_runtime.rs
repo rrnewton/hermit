@@ -73,6 +73,26 @@ use std::time::Duration;
 /// retry by having already been retried.
 pub const ENV_BLOCK_RETRIES_DEFAULT: usize = 3;
 
+/// ⚠️ THE BUDGET IS PER CELL, NOT PER LANE. Owner ruling 2026-08-26: a cell gets
+/// THREE ATTEMPTS -- the first plus two retries -- and what any other cell spent
+/// is irrelevant to it.
+///
+/// A lane-wide round budget, which is what shipped first, is incoherent: one
+/// permanently broken cell consumes the rounds that other cells needed, so a
+/// cell's chance of recovering depends on which OTHER cells happened to fail in
+/// the same run. Per-cell attempts make that impossible by construction.
+///
+/// `ENV_BLOCK_RETRIES_DEFAULT` above is now only a RUNAWAY BACKSTOP on the number
+/// of lane rounds, not the policy. It has to exceed the per-cell cap because
+/// different cells fail in different rounds: cell A can exhaust its three while
+/// cell B has not yet failed once, and B must still get its own three.
+pub const MAX_ATTEMPTS_PER_CELL: usize = 3;
+
+/// Lane-round backstop. Per-cell caps are what actually bound the work; this only
+/// stops a pathological loop. It must be large enough never to bind before the
+/// per-cell caps do, or the lane budget returns through the back door.
+pub const LANE_ROUND_BACKSTOP: usize = 32;
+
 /// Resolve the environmental-block retry budget from the environment.
 pub fn env_block_max_retries() -> usize {
     match std::env::var("VALIDATE_ENV_BLOCK_RETRIES") {
