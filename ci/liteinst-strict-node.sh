@@ -129,7 +129,7 @@ self_test() {
     # answer "no_result" unconditionally and every case above would still pass.
     mkdir -p "$scratch/good"
     : >"$scratch/good/libreverie_liteinst.so"
-    printf 'a16e3c466a15c3746a5ef23a76d1f74e11aba935\n' >"$scratch/good/libreverie_liteinst.so.revision"
+    printf 'ad598995c8018bf17414a92119acfac6c9fd58ee\n' >"$scratch/good/libreverie_liteinst.so.revision"
     check 'a staged runtime that records a revision is NOT a no_result' \
         "staged $scratch/good/libreverie_liteinst.so" \
         "$(HERMIT_LITEINST_STAGE_DIR=$scratch/good classify)"
@@ -157,7 +157,7 @@ self_test() {
     # The deps/ fallback the product searches second.
     mkdir -p "$scratch/deps-only/deps"
     : >"$scratch/deps-only/deps/libreverie_liteinst.so"
-    printf 'a16e3c466a15c3746a5ef23a76d1f74e11aba935\n' \
+    printf 'ad598995c8018bf17414a92119acfac6c9fd58ee\n' \
         >"$scratch/deps-only/deps/libreverie_liteinst.so.revision"
     check 'the deps/ fallback is searched, as the product searches it' \
         "staged $scratch/deps-only/deps/libreverie_liteinst.so" \
