@@ -353,13 +353,22 @@ fn runner_flag_path(text: &str, path: &str) -> bool {
     ///
     /// So omitting the list is the silent failure and having it is the loud one.
     /// Both directions are pinned in `self_test`.
-    const VALUE_FLAGS: [&str; 18] = [
+    ///
+    /// ⚠️ `-C` AND `-c` ARE DIFFERENT FLAGS AND THE LIST HELD ONLY THE FIRST.
+    /// `-C` is rustc codegen; `-c` is CODE, and FOUR of the five `RUNNERS` take
+    /// it that way -- `sh -c`, `bash -c`, `python -c`, `python3 -c`. Because the
+    /// two differ only in case, the list looked complete. It was not, and the
+    /// omission failed in the SILENT direction the note above names: the scan
+    /// stopped on the code string, read it as an invocation, and reported a
+    /// false SCHEDULED, which is precisely how a checker that nothing runs is
+    /// recorded as running.
+    const VALUE_FLAGS: [&str; 19] = [
         // rustc
         "-o", "--out-dir", "--emit", "--extern", "--target", "--edition",
         "--crate-name", "--crate-type", "--cfg", "--check-cfg", "-L", "-l", "-C",
         "-Z", "-W", "-A", "-D",
         // python / shell: the token after these is code or a module name
-        "-m",
+        "-m", "-c",
     ];
     let dotted = format!("./{path}");
     for line in text.lines() {
@@ -604,6 +613,20 @@ target/ci/check-exit-status-class --gate";
         !is_invoked("rustc -o scripts/check-z.rs other.rs", "scripts/check-z.rs"),
         "an output path directly after -o read as an invocation -- a false SCHEDULED, \
          which is the silent direction this guard must never fail in"
+    );
+    // ⚠️ THE SAME ORDERING, ON `-c`, WHICH THE `-o` FIX DID NOT COVER. `-C` was
+    // listed and `-c` was not; they differ only in case, so the table read as
+    // complete. Four of the five runners take `-c` as CODE, so the scan stopped
+    // on the code string and read it as an invocation -- a false SCHEDULED, the
+    // silent direction, and the exact shape the `-o` control was added for.
+    assert!(
+        !is_invoked("sh -c scripts/check-z.rs other.rs", "scripts/check-z.rs"),
+        "a code string directly after -c read as an invocation -- a false \
+         SCHEDULED, which records a checker that nothing runs as running"
+    );
+    assert!(
+        !is_invoked("python3 -c scripts/check-z.py other.py", "scripts/check-z.py"),
+        "-c is code for python too, not only for the shells"
     );
     // A value-taking flag must not hide the script that follows its value. Without
     // the table this stops on `2021` and reports a false ORPHAN.
