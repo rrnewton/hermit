@@ -180,6 +180,7 @@ use self::bisect::BisectOpts;
 use self::container::ContainerChildExit;
 use self::container::ContainerChildPanic;
 use self::container::PolicyRefusal;
+use self::container::RunTimeoutMarker;
 use self::container::SignalDeath;
 use self::global_opts::GlobalOpts;
 use self::instruction_map::InstructionMapOpts;
@@ -461,6 +462,16 @@ fn failure_exit_code(error: &Error) -> i32 {
     if let Some(SignalDeath(signal)) = error.downcast_ref::<SignalDeath>() {
         return detcore_model::signal_exit_status(*signal);
     }
+    // ⚠️ A DEADLINE IS NOT A HERMIT FAILURE EITHER. The bound the caller asked
+    // for was reached and hermit tore the container down on purpose, so
+    // reporting HERMIT_INTERNAL_FAILURE_EXIT would send the operator to file a
+    // bug against a mechanism that did its job. 124 is the established code for
+    // "a deadline fired" -- GNU `timeout`, `safehermit`'s wall bound, and
+    // `hermit record --record-timeout` all already use it, so this adds no new
+    // meaning to the number.
+    if error.downcast_ref::<RunTimeoutMarker>().is_some() {
+        return 124;
+    }
     match error.downcast_ref::<GuestProgramFault>() {
         Some(fault) => fault.exit_code(),
         None => HERMIT_INTERNAL_FAILURE_EXIT,
@@ -484,6 +495,12 @@ fn classify_failure(error: &Error) -> String {
     // the band has several members and the number is the report.
     if let Some(SignalDeath(signal)) = error.downcast_ref::<SignalDeath>() {
         return format!("HERMIT_SIGNAL_DEATH class=signal-death signal={}", signal);
+    }
+    // NOT HERMIT_INTERNAL_FAILURE: the bound fired and hermit unwound the
+    // container deliberately. The seconds are in the line because "it timed
+    // out" without the bound it exceeded is the anonymous kill this replaces.
+    if error.downcast_ref::<RunTimeoutMarker>().is_some() {
+        return "HERMIT_RUN_TIMEOUT class=run-timeout".to_string();
     }
     // ONE discriminant, read once, covering all three flattenings.
     if let Some(ContainerChildExit(status)) = error.downcast_ref::<ContainerChildExit>() {

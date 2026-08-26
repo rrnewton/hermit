@@ -16,12 +16,14 @@ use std::hash::Hash;
 use std::hash::Hasher;
 use std::io::Read;
 use std::io::Write;
+use std::num::NonZeroU64;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use clap::Parser;
 use colored::Colorize;
@@ -188,6 +190,16 @@ pub struct RunOpts {
         conflicts_with_all = ["strict", "panic_on_unsupported_syscalls"]
     )]
     allow_unsupported_syscalls: bool,
+
+    /// Kill the run if the guest does not finish within this many seconds.
+    ///
+    /// Hermit created the container, so hermit unwinds it: on expiry the guest
+    /// future is dropped, reverie reaps its tracees, detcore's state is torn
+    /// down, and the container init returns normally. Exits 124, the same code
+    /// GNU `timeout` and `hermit record --record-timeout` already use for a
+    /// deadline. Wall-clock, so it never affects guest-visible determinism.
+    #[clap(long, value_name = "SECONDS")]
+    timeout: Option<NonZeroU64>,
 
     /// Disable deterministic sequential thread execution.
     #[clap(long)]
@@ -4055,6 +4067,15 @@ impl RunOpts {
         config
     }
 
+    /// The `--timeout` bound, if the caller asked for one.
+    ///
+    /// Mirrors `StartOpts::record_timeout` so the two spellings of a hermit
+    /// deadline are read the same way.
+    fn run_timeout(&self) -> Option<Duration> {
+        self.timeout
+            .map(|seconds| Duration::from_secs(seconds.get()))
+    }
+
     fn run_in_container(
         &self,
         global: &GlobalOpts,
@@ -4067,22 +4088,25 @@ impl RunOpts {
         let config = self.effective_det_config();
         self.save_config_to_disk()?;
 
+        let timeout = self.run_timeout();
         if capture_output {
-            let out = hermit::run_with_output_backend(
+            let out = hermit::run_with_output_backend_timeout(
                 command,
                 config,
                 self.summary,
                 &self.summary_json,
                 self.runtime_backend(),
+                timeout,
             )?;
             Ok((out.status, Some(out)))
         } else {
-            let status = hermit::run_with_backend(
+            let status = hermit::run_with_backend_timeout(
                 command,
                 config,
                 self.summary,
                 &self.summary_json,
                 self.runtime_backend(),
+                timeout,
             )?;
             Ok((status, None))
         }
