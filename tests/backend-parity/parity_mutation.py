@@ -400,14 +400,27 @@ def observe_native(binary: Path, mutate: str | None) -> Observation | None:
     return _run([str(binary)], env, NATIVE_TIMEOUT_S)
 
 
-def _hermit_command(hermit: Path, backend: str, binary: Path, mutate: str | None) -> list[str]:
+def _hermit_command(
+    hermit: Path,
+    backend: str,
+    binary: Path,
+    mutate: str | None,
+    host_tmp: Path,
+) -> list[str]:
     # --log=info is what makes TIER-3 possible at all: without it hermit emits
     # no INFO log, so "compare the unstripped INFO log" would be comparing two
     # empty strings — a vacuous pass wearing the name of the strictest tier.
     command = [str(hermit), "--log=info", "run"]
     if backend != GOLDEN_BACKEND:
         command.extend(["--backend", backend])
-    command.extend(["--strict", "--base-env=minimal", "--max-timeslice=disabled", "--tmp=/tmp"])
+    command.extend(
+        [
+            "--strict",
+            "--base-env=minimal",
+            "--max-timeslice=disabled",
+            f"--tmp={host_tmp}",
+        ]
+    )
     if mutate is not None:
         # --base-env=minimal strips the ambient env, so the mutation must be
         # passed through explicitly for the guest to observe it.
@@ -422,8 +435,13 @@ def observe_hermit(
     """Run the fixture under a hermit backend, optionally planting a mutation."""
     env = dict(os.environ)
     env.pop("HERMIT_PARITY_MUTATE", None)  # only the guest, via --env, should see it
+    host_tmp = Path(
+        tempfile.mkdtemp(
+            prefix=f"hermit-tmp-{backend}-", dir=binary.parent
+        )
+    )
     return _run(
-        _hermit_command(hermit, backend, binary, mutate),
+        _hermit_command(hermit, backend, binary, mutate, host_tmp),
         env,
         HERMIT_TIMEOUT_S,
         capture_log=True,

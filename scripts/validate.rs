@@ -3087,8 +3087,26 @@ fn durable_log_path(root: &Path, profile: &str, sha: &str) -> PathBuf {
         _ => root.join("ignored").join("validate"),
     };
     let sha12: String = sha.chars().take(12).collect();
-    let ts = utc_now().replace([':', '-'], "");
-    dir.join(format!("validate-{profile}-{sha12}-{ts}.log"))
+    let supplied = std::env::var("E2E_RUN_ID")
+        .ok()
+        .filter(|value| {
+            !value.is_empty()
+                && value
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._@:-".contains(c))
+        });
+    let run = supplied.unwrap_or_else(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        format!(
+            "{}-{}-{nanos}",
+            utc_now().replace([':', '-'], ""),
+            std::process::id()
+        )
+    });
+    dir.join(format!("validate-{profile}-{sha12}-{run}.log"))
 }
 
 /// Give every real validate invocation its own durable E2E result directory.
@@ -3103,9 +3121,13 @@ fn configure_e2e_result_root(
     log_path: &Path,
     temporary_build_root: &Path,
 ) -> Result<PathBuf, String> {
-    let run = log_path
+    let fallback_run = log_path
         .file_stem()
-        .ok_or_else(|| format!("durable log has no file name: {}", log_path.display()))?;
+        .ok_or_else(|| format!("durable log has no file name: {}", log_path.display()))?
+        .to_os_string();
+    let run = std::env::var_os("E2E_RUN_ID")
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback_run);
     let path = match std::env::var_os("E2E_RESULT_ROOT") {
         Some(value) if !value.is_empty() => {
             let supplied = PathBuf::from(value);
@@ -3119,7 +3141,7 @@ fn configure_e2e_result_root(
             let log_dir = log_path
                 .parent()
                 .ok_or_else(|| format!("durable log has no parent: {}", log_path.display()))?;
-            log_dir.join("e2e").join(run)
+            log_dir.join("e2e").join(&run)
         }
     };
     std::fs::create_dir_all(&path)
@@ -3129,7 +3151,7 @@ fn configure_e2e_result_root(
     // bucket rows to the durable validate identity instead of letting each
     // harness process mint a local timestamp. Schema-6 evidence is one complete
     // selected population, not a pool of unrelated bucket attempts.
-    std::env::set_var("E2E_RUN_ID", run);
+    std::env::set_var("E2E_RUN_ID", &run);
 
     // The harness derives its prebuilt-fixture directory from RESULT_ROOT too,
     // but build products are not evidence and must not accumulate beside every
@@ -3162,6 +3184,13 @@ fn setup_durable_log(root: &Path, profile: &str, sha: &str) -> Result<DurableLog
             );
             return Err(4);
         }
+    }
+    if let Err(e) = std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        eprintln!(
+            "validate: ERROR: cannot reserve durable log {}: {e}. Refusing to append two runs to one path.",
+            path.display()
+        );
+        return Err(4);
     }
     let mut tee = match Command::new("tee")
         .arg("-a")
@@ -9551,7 +9580,7 @@ fn canonical_validate_lock_status_admits(
     commit: &str,
     host: &str,
     boot_id: Option<&str>,
-    identity_in_ancestry: impl FnOnce(i32, u64) -> bool,
+    identity_in_ancestry: impl FnMut(i32, u64) -> bool,
 ) -> bool {
     canonical_validate_lock_status_reason(status, commit, host, boot_id, identity_in_ancestry)
         .is_ok()
@@ -9579,7 +9608,7 @@ fn canonical_validate_lock_status_reason(
     commit: &str,
     host: &str,
     boot_id: Option<&str>,
-    identity_in_ancestry: impl FnOnce(i32, u64) -> bool,
+    mut identity_in_ancestry: impl FnMut(i32, u64) -> bool,
 ) -> Result<(), String> {
     fn object_string<'a>(
         object: &'a serde_json::Map<String, serde_json::Value>,
@@ -9593,6 +9622,33 @@ fn canonical_validate_lock_status_reason(
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(status) else {
         return Err("the authority response is not valid JSON".into());
     };
+    if let Some(authorities) = value
+        .get("authorities")
+        .and_then(serde_json::Value::as_array)
+    {
+        if authorities.is_empty() {
+            return Err("the authority response contains no validation slots".into());
+        }
+        let mut reasons = Vec::new();
+        for authority in authorities {
+            let encoded = serde_json::to_vec(authority)
+                .map_err(|error| format!("cannot encode validation slot: {error}"))?;
+            match canonical_validate_lock_status_reason(
+                &encoded,
+                commit,
+                host,
+                boot_id,
+                &mut identity_in_ancestry,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(reason) => reasons.push(reason),
+            }
+        }
+        return Err(format!(
+            "none of the canonical validation slots belongs to this run: {}",
+            reasons.join("; ")
+        ));
+    }
     let Some(holder) = value.get("holder").and_then(serde_json::Value::as_object) else {
         return Err(format!(
             "no lock is held: the authority reports state {} (reason {}), so there \
@@ -11833,12 +11889,14 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                 );
             }
             validate_runtime::LockOutcome::Unavailable(e) => {
-                // Fail OPEN here, deliberately: refusing every run because a lock
-                // file could not be created would be a larger outage than the
-                // concurrency it guards, and the condition is stated rather than
-                // swallowed.
-                eprintln!("validate: WARNING: per-checkout invocation lock unavailable ({e}); proceeding UNGUARDED.");
-                invocation_lock = None;
+                return RunSummary::refused(
+                    3,
+                    &profile_name,
+                    "the per-checkout invocation lock",
+                    vec![format!(
+                        "cannot establish per-checkout exclusion: {e}; refusing rather than running two validates against shared target output"
+                    )],
+                );
             }
         }
     } else {
@@ -11898,6 +11956,28 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             "run-state setup",
             vec![format!("cannot create {}: {e}", tmp.display())],
         );
+    }
+    if !nesting.nested {
+        for (variable, name) in [
+            ("TMPDIR", "tmp"),
+            ("XDG_CACHE_HOME", "cache"),
+            ("PYTHONPYCACHEPREFIX", "python-cache"),
+            ("HERMIT_DATA_DIR", "hermit-data"),
+        ] {
+            if std::env::var_os(variable).is_some_and(|value| !value.is_empty()) {
+                continue;
+            }
+            let path = tmp.join(name);
+            if let Err(error) = std::fs::create_dir_all(&path) {
+                return RunSummary::refused(
+                    2,
+                    &profile_name,
+                    "run-owned temporary path setup",
+                    vec![format!("cannot create {} for {variable}: {error}", path.display())],
+                );
+            }
+            std::env::set_var(variable, path);
+        }
     }
 
     let mut plan = match build_plan(&root, &args, &tmp) {
@@ -12535,9 +12615,13 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         reverie_base_sha: receipt.reverie_base_sha,
         reverie_base_tree: receipt.reverie_base_tree,
         reverie_pin_current: pin_gate_passed,
-        concurrent_validates: if lock_admitted { Some(0) } else { peak_active },
+        concurrent_validates: peak_active,
         concurrency_proof: if lock_admitted {
-            Some("validate_lock_owner_ancestry")
+            Some(if peak_active.unwrap_or(0) == 0 {
+                "validate_lock_owner_ancestry"
+            } else {
+                "validate_lock_owner_ancestry+live_flock_registry_cpu_delta"
+            })
         } else {
             peak_active.map(|_| "live_flock_registry_cpu_delta")
         },
