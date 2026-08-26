@@ -146,13 +146,8 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
-        ci_disabled_reason:
-          dbt:
-            result: unavailable
-            evidence: hermit-cli/src/bin/hermit/run.rs:2163
-            reason: DBT completes both guest executions, but its dedicated path returns without a terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without counting it green.
         backends_enabled:
           - ptrace
           - dbt
@@ -392,13 +387,8 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
-        ci_disabled_reason:
-          dbt:
-            result: unavailable
-            evidence: hermit-cli/src/bin/hermit/run.rs:2163
-            reason: DBT completes both guest executions, but its dedicated path returns without a terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without counting it green.
         backends_enabled:
           - ptrace
           - dbt
@@ -1483,13 +1473,8 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
-        ci_disabled_reason:
-          dbt:
-            result: unavailable
-            evidence: hermit-cli/src/bin/hermit/run.rs:2163
-            reason: DBT completes both guest executions, but its dedicated path returns without a terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without counting it green.
         backends_enabled:
           - ptrace
           - dbt
@@ -1670,13 +1655,8 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
-        ci_disabled_reason:
-          dbt:
-            result: unavailable
-            evidence: hermit-cli/src/bin/hermit/run.rs:2163
-            reason: DBT completes both guest executions, but its dedicated path returns without a terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without counting it green.
         backends_enabled:
           - ptrace
           - dbt
@@ -2335,14 +2315,10 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           liteinst: false
         ci_disabled_reason:
-          dbt:
-            result: unavailable
-            evidence: hermit-cli/src/bin/hermit/run.rs:2163
-            reason: DBT completes both guest executions, but its dedicated path returns without a terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without counting it green.
           liteinst:
             result: determinism-failure
             evidence: "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout"
@@ -2666,13 +2642,8 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
-        ci_disabled_reason:
-          dbt:
-            result: unavailable
-            evidence: hermit-cli/src/bin/hermit/run.rs:2163
-            reason: DBT completes both guest executions, but its dedicated path returns without a terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without counting it green.
         backends_enabled:
           - ptrace
           - dbt
@@ -2733,13 +2704,8 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
-        ci_disabled_reason:
-          dbt:
-            result: unavailable
-            evidence: hermit-cli/src/bin/hermit/run.rs:2163
-            reason: DBT completes both guest executions, but its dedicated path returns without a terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without counting it green.
         backends_enabled:
           - ptrace
           - dbt
@@ -2859,13 +2825,8 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
-        ci_disabled_reason:
-          dbt:
-            result: unavailable
-            evidence: hermit-cli/src/bin/hermit/run.rs:2163
-            reason: DBT completes both guest executions, but its dedicated path returns without a terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without counting it green.
         backends_enabled:
           - ptrace
           - dbt

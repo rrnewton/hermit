@@ -7041,12 +7041,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "hermit-cli/src/bin/hermit/run.rs:2163",
-        "reason": "DBT exits successfully after both guest executions, but its dedicated path emits no terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without reporting it green."
-      },
+      "status": "green",
       "observations": [],
       "measurement": "never-measured"
     },
@@ -21303,12 +21298,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "hermit-cli/src/bin/hermit/run.rs:2163",
-        "reason": "DBT completes both guest executions, but its dedicated path returns without a terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without counting it green."
-      },
+      "status": "green",
       "observations": [],
       "measurement": "never-measured"
     },
@@ -22084,12 +22074,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "hermit-cli/src/bin/hermit/run.rs:2163",
-        "reason": "DBT completes both guest executions, but its dedicated path returns without a terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without counting it green."
-      },
+      "status": "green",
       "observations": [],
       "measurement": "never-measured"
     },
@@ -25207,12 +25192,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "hermit-cli/src/bin/hermit/run.rs:2163",
-        "reason": "DBT completes both guest executions, but its dedicated path returns without a terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without counting it green."
-      },
+      "status": "green",
       "observations": [],
       "measurement": "never-measured"
     },
@@ -25795,12 +25775,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "hermit-cli/src/bin/hermit/run.rs:2163",
-        "reason": "DBT completes both guest executions, but its dedicated path returns without a terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without counting it green."
-      },
+      "status": "green",
       "observations": [],
       "measurement": "never-measured"
     },
@@ -27706,12 +27681,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "hermit-cli/src/bin/hermit/run.rs:2163",
-        "reason": "DBT completes both guest executions, but its dedicated path returns without a terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without counting it green."
-      },
+      "status": "green",
       "observations": [],
       "measurement": "never-measured"
     },
@@ -28483,12 +28453,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "hermit-cli/src/bin/hermit/run.rs:2163",
-        "reason": "DBT completes both guest executions, but its dedicated path returns without a terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without counting it green."
-      },
+      "status": "green",
       "observations": [],
       "measurement": "never-measured"
     },
@@ -28677,12 +28642,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "hermit-cli/src/bin/hermit/run.rs:2163",
-        "reason": "DBT completes both guest executions, but its dedicated path returns without a terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without counting it green."
-      },
+      "status": "green",
       "observations": [],
       "measurement": "never-measured"
     },
@@ -29061,12 +29021,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "hermit-cli/src/bin/hermit/run.rs:2163",
-        "reason": "DBT completes both guest executions, but its dedicated path returns without a terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without counting it green."
-      },
+      "status": "green",
       "observations": [],
       "measurement": "never-measured"
     },

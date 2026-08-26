@@ -204,6 +204,13 @@
       "test": "backend-parity-c/host-identity"
     },
     {
+      "backend": "dbt",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/host-identity"
+    },
+    {
       "backend": "ptrace",
       "category": "backend-parity-c",
       "lane": "portable",
@@ -645,6 +652,13 @@
       "test": "c-programs/add-key-enosys"
     },
     {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/add-key-enosys"
+    },
+    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -660,6 +674,13 @@
     },
     {
       "backend": "sabre",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/cachestat-enosys"
+    },
+    {
+      "backend": "dbt",
       "category": "c-programs",
       "lane": "portable",
       "mode": "verify",
@@ -729,6 +750,13 @@
       "test": "c-programs/futex-waitv-enosys"
     },
     {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/futex-waitv-enosys"
+    },
+    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -737,6 +765,13 @@
     },
     {
       "backend": "sabre",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/get-robust-list-self"
+    },
+    {
+      "backend": "dbt",
       "category": "c-programs",
       "lane": "portable",
       "mode": "verify",
@@ -862,6 +897,13 @@
       "test": "c-programs/ioctl-fioclex"
     },
     {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/ioctl-fioclex"
+    },
+    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -897,6 +939,13 @@
       "test": "c-programs/kcmp-eperm"
     },
     {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/kcmp-eperm"
+    },
+    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -905,6 +954,13 @@
     },
     {
       "backend": "sabre",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/keyctl-enosys"
+    },
+    {
+      "backend": "dbt",
       "category": "c-programs",
       "lane": "portable",
       "mode": "verify",
@@ -933,6 +989,13 @@
     },
     {
       "backend": "sabre",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/listmount-enosys"
+    },
+    {
+      "backend": "dbt",
       "category": "c-programs",
       "lane": "portable",
       "mode": "verify",
