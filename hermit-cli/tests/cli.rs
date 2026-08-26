@@ -13,6 +13,8 @@ use std::fs;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -50,6 +52,9 @@ static LITEINST_INERT_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
 static EXEC_CLOCK_CONTINUITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FORK_CHILD_GETRANDOM_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static STDIO_STATUS_FLAG_CONTAINMENT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static NONBLOCKING_STDIN_RECV_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static STDIO_NONBLOCK_THEN_APPEND_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 const DBT_IO_BUFFER_MUTATOR_SOURCE: &str = r#"
@@ -444,6 +449,371 @@ fn kvm_exact_child_waits_guest() -> &'static Path {
         );
         guest
     })
+}
+
+fn stdio_status_flag_containment_guest() -> &'static Path {
+    STDIO_STATUS_FLAG_CONTAINMENT_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root =
+            Path::new(env!("CARGO_TARGET_TMPDIR")).join("stdio-status-flag-containment");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create stdio status-flag containment guest directory");
+        let guest = build_root.join("stdio_status_flag_containment");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/stdio_status_flag_containment.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the stdio status-flag containment guest");
+        assert!(
+            output.status.success(),
+            "stdio status-flag containment guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// A guest must be able to change what IT sees about its own stderr without
+/// changing what the supervising hermit process -- and therefore hermit's own
+/// caller -- sees.
+///
+/// `fcntl(F_SETFL)` mutates the open file DESCRIPTION, not the descriptor. When
+/// hermit passes its own stdio through to the guest, that description is the
+/// one hermit inherited from the process that invoked it, so a forwarded
+/// request escapes the container: it outlives the guest, outlives hermit, and
+/// is visible to the caller afterwards.
+///
+/// Measured on hermit d7413071581f before the fix, on BOTH backends:
+/// `hermit run -- /usr/bin/awk 'BEGIN { print 42 }'` left the caller's stderr
+/// at 0x8401 where it had been 0x8001. Under `hermit run --strict --verify`
+/// that also made the KVM backend report itself nondeterministic, because both
+/// runs share one hermit process and the first run's mutation was still there
+/// when the second started (0 of 20 verified before; 20 of 20 after).
+///
+/// BOTH halves are asserted on purpose. Dropping the guest's request entirely
+/// would satisfy the containment half while silently breaking the guest, so the
+/// guest's own before/after reading is checked first.
+fn assert_guest_cannot_mutate_hermits_stderr_flags(backend: &str) {
+    let _guard = hermit_run_guard();
+    let guest = stdio_status_flag_containment_guest();
+
+    let directory = tempfile::tempdir().expect("failed to create a temporary directory");
+    let hermit_stderr_path = directory.path().join("hermit.err");
+    // Opened WITHOUT O_APPEND, so "the bit turned on" is unambiguous.
+    let hermit_stderr = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&hermit_stderr_path)
+        .expect("failed to open the file standing in for hermit's stderr");
+
+    // SAFETY: the descriptor is live and F_GETFL takes no third argument.
+    let before = unsafe { libc::fcntl(hermit_stderr.as_raw_fd(), libc::F_GETFL) };
+    assert!(before >= 0, "F_GETFL on the supervisor's descriptor failed");
+    assert_eq!(
+        before & libc::O_APPEND,
+        0,
+        "the supervisor's descriptor must start without O_APPEND for this test \
+         to mean anything",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["run", "--backend", backend, "--"])
+        .arg(guest)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        // `Stdio::from` dups this onto the child's fd 2, so hermit's stderr and
+        // `hermit_stderr` are the SAME open file description -- exactly the
+        // sharing a caller's shell redirect creates.
+        .stderr(Stdio::from(
+            hermit_stderr
+                .try_clone()
+                .expect("failed to duplicate the stderr stand-in"),
+        ))
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run the {backend} containment guest: {error}"));
+
+    let diagnostics = fs::read_to_string(&hermit_stderr_path).unwrap_or_default();
+    assert!(
+        output.status.success(),
+        "{backend} containment guest failed: {:?}\nhermit stderr:\n{diagnostics}",
+        output.status,
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "append_before=0 append_after=1\n",
+        "the guest must observe the status flag it set on its own stderr \
+         ({backend} backend)\nhermit stderr:\n{diagnostics}",
+    );
+
+    // SAFETY: the descriptor is still live and F_GETFL takes no third argument.
+    let after = unsafe { libc::fcntl(hermit_stderr.as_raw_fd(), libc::F_GETFL) };
+    assert!(after >= 0, "F_GETFL on the supervisor's descriptor failed");
+    assert_eq!(
+        after, before,
+        "a guest fcntl(F_SETFL) on stderr escaped the container and changed the \
+         SUPERVISOR's file description ({backend} backend): 0x{before:x} -> \
+         0x{after:x}\nhermit stderr:\n{diagnostics}",
+    );
+}
+
+fn nonblocking_stdin_recv_guest() -> &'static Path {
+    NONBLOCKING_STDIN_RECV_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("nonblocking-stdin-recv");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create nonblocking stdin guest directory");
+        let guest = build_root.join("nonblocking_stdin_recv");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/nonblocking_stdin_recv.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the nonblocking stdin guest");
+        assert!(
+            output.status.success(),
+            "nonblocking stdin guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// Setting `O_NONBLOCK` on the container's stdin and then reading from it must
+/// not abort the container.
+///
+/// Detcore keeps two views of `O_NONBLOCK` — the guest-visible one and its own
+/// `physically_nonblocking` — and `ioaction_based_on_fd_status` panics when they
+/// disagree in the direction `virt && !phys`. Any change that answers the
+/// guest's `F_SETFL` from a model WITHOUT asking the kernel creates exactly that
+/// disagreement on the standard streams. Measured before the exclusion that
+/// prevents it, with a socketpair as stdin and a byte already readable:
+/// `rc=125, "Invariant violation, fd 0" (helpers.rs:582)`, on ptrace and KVM
+/// alike, where the parent commit returned `rc=0, recv=1`.
+///
+/// The guest deliberately uses `recv` rather than `read`; see the fixture's own
+/// comment for why `read` cannot reach the invariant and would make this test
+/// pass over a live defect.
+fn assert_nonblocking_stdin_does_not_abort_the_container(backend: &str) {
+    let _guard = hermit_run_guard();
+    let guest = nonblocking_stdin_recv_guest();
+
+    let mut sockets = [-1_i32; 2];
+    // SAFETY: sockets is a writable pair of ints, which is what socketpair fills.
+    let paired = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM,
+            0,
+            sockets.as_mut_ptr().cast(),
+        )
+    };
+    assert_eq!(paired, 0, "socketpair failed");
+    // SAFETY: both descriptors are live and owned by this test from here on.
+    let (guest_end, peer) = unsafe {
+        (
+            std::os::fd::OwnedFd::from_raw_fd(sockets[0]),
+            std::os::fd::OwnedFd::from_raw_fd(sockets[1]),
+        )
+    };
+    // One byte is already readable, so the recv can be satisfied immediately and
+    // this test asks about classification, not about blocking.
+    // SAFETY: peer is live and the buffer is one byte of this stack frame.
+    let sent = unsafe { libc::send(peer.as_raw_fd(), b"A".as_ptr().cast(), 1, 0) };
+    assert_eq!(sent, 1, "failed to prime the guest's stdin socket");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["run", "--backend", backend, "--"])
+        .arg(guest)
+        .stdin(Stdio::from(guest_end))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run the {backend} nonblocking guest: {error}"));
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("Invariant violation"),
+        "modeling O_NONBLOCK on container stdin without the kernel reached the \
+         nonblocking/blocking invariant and aborted the container ({backend} \
+         backend):\n{stderr}",
+    );
+    assert!(
+        output.status.success(),
+        "{backend} nonblocking stdin guest failed: {:?}\nstderr:\n{stderr}",
+        output.status,
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "recv=1 byte=65\n",
+        "the guest's nonblocking recv on container stdin must still deliver its \
+         byte ({backend} backend)\nstderr:\n{stderr}",
+    );
+}
+
+fn stdio_nonblock_then_append_guest() -> &'static Path {
+    STDIO_NONBLOCK_THEN_APPEND_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("stdio-nonblock-then-append");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create nonblock-then-append guest directory");
+        let guest = build_root.join("stdio_nonblock_then_append");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/stdio_nonblock_then_append.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the nonblock-then-append guest");
+        assert!(
+            output.status.success(),
+            "nonblock-then-append guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// Going nonblocking must not turn containment off for everything else.
+///
+/// `O_NONBLOCK` is forwarded to the supervisor's descriptor because Detcore
+/// cannot model it (see the F_SETFL arm). An earlier revision implemented that
+/// by reverting the WHOLE call whenever the flag was involved, which LATCHED:
+/// once the model carried `O_NONBLOCK`, every later `F_SETFL` and `F_GETFL` on
+/// that description reverted too and the `O_APPEND` escape came back. Measured
+/// at 9c75b9db57: supervisor `0x8001 -> 0x8c01`, both backends.
+///
+/// This asserts the exception is exactly one bit wide. `O_NONBLOCK` on the
+/// supervisor is asserted PRESENT, not merely tolerated, so the one flag this
+/// change knowingly lets through is written down as a contract rather than
+/// left as an unexamined gap.
+fn assert_nonblocking_does_not_unlatch_containment(backend: &str) {
+    let _guard = hermit_run_guard();
+    let guest = stdio_nonblock_then_append_guest();
+
+    let directory = tempfile::tempdir().expect("failed to create a temporary directory");
+    let hermit_stderr_path = directory.path().join("hermit.err");
+    let hermit_stderr = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&hermit_stderr_path)
+        .expect("failed to open the file standing in for hermit's stderr");
+
+    // SAFETY: the descriptor is live and F_GETFL takes no third argument.
+    let before = unsafe { libc::fcntl(hermit_stderr.as_raw_fd(), libc::F_GETFL) };
+    assert!(before >= 0, "F_GETFL on the supervisor's descriptor failed");
+    assert_eq!(
+        before & (libc::O_APPEND | libc::O_NONBLOCK),
+        0,
+        "the supervisor's descriptor must start with neither flag for this test \
+         to mean anything",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["run", "--backend", backend, "--"])
+        .arg(guest)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(
+            hermit_stderr
+                .try_clone()
+                .expect("failed to duplicate the stderr stand-in"),
+        ))
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run the {backend} latch guest: {error}"));
+
+    let diagnostics = fs::read_to_string(&hermit_stderr_path).unwrap_or_default();
+    assert!(
+        output.status.success(),
+        "{backend} latch guest failed: {:?}\nhermit stderr:\n{diagnostics}",
+        output.status,
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "guest_append=1 guest_nonblock=1\n",
+        "the guest must still observe both flags it set ({backend} backend)\n\
+         hermit stderr:\n{diagnostics}",
+    );
+
+    // SAFETY: the descriptor is still live and F_GETFL takes no third argument.
+    let after = unsafe { libc::fcntl(hermit_stderr.as_raw_fd(), libc::F_GETFL) };
+    assert!(after >= 0, "F_GETFL on the supervisor's descriptor failed");
+    // Every settable flag EXCEPT O_NONBLOCK must be exactly what the caller had.
+    //
+    // ⚠️ MASKED, NOT ASSERTED PRESENT. An earlier revision paired the O_APPEND
+    // check with `assert_ne!(after & O_NONBLOCK, 0)` — "the exemption is exactly
+    // one bit wide" — and two review lanes and the author all read that as the
+    // right way to record a known hole. It is not. `assert_ne!` on the
+    // SUPERVISOR's flag asserts that a mutation ESCAPED, so it passes precisely
+    // when containment fails for that bit, and it would FAIL the day someone
+    // contains O_NONBLOCK properly. A test that breaks when a defect is fixed
+    // has stopped defending the property and started pinning the defect.
+    //
+    // Masking the bit tolerates the residual without requiring it: this fails if
+    // any contained flag escapes, and keeps passing if the residual is later
+    // closed. The invariant that actually depends on O_NONBLOCK reaching the
+    // kernel is `virt && !phys`, and it is defended where it belongs, by
+    // `run_*_nonblocking_stdin_does_not_abort_the_container`, which asserts the
+    // guest does not abort rather than asserting the flag escaped.
+    assert_eq!(
+        after & !libc::O_NONBLOCK,
+        before & !libc::O_NONBLOCK,
+        "a contained status flag escaped to the SUPERVISOR after the guest went \
+         nonblocking ({backend} backend): containment latched off. \
+         0x{before:x} -> 0x{after:x}\nhermit stderr:\n{diagnostics}",
+    );
+}
+
+#[test]
+fn run_ptrace_nonblocking_does_not_unlatch_containment() {
+    assert_nonblocking_does_not_unlatch_containment("ptrace");
+}
+
+#[test]
+fn run_kvm_nonblocking_does_not_unlatch_containment() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+    assert_nonblocking_does_not_unlatch_containment("kvm");
+}
+
+#[test]
+fn run_ptrace_nonblocking_stdin_does_not_abort_the_container() {
+    assert_nonblocking_stdin_does_not_abort_the_container("ptrace");
+}
+
+#[test]
+fn run_kvm_nonblocking_stdin_does_not_abort_the_container() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+    assert_nonblocking_stdin_does_not_abort_the_container("kvm");
+}
+
+#[test]
+fn run_ptrace_guest_cannot_mutate_hermits_stderr_flags() {
+    assert_guest_cannot_mutate_hermits_stderr_flags("ptrace");
+}
+
+#[test]
+fn run_kvm_guest_cannot_mutate_hermits_stderr_flags() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+    assert_guest_cannot_mutate_hermits_stderr_flags("kvm");
 }
 
 // TODO-HUMAN-REVIEW(PR-723): Review the DBT PID fixture build.
@@ -2174,6 +2544,27 @@ fn run_kvm_verify_is_deterministic_when_the_guest_mutates_hermit_stdout_flags() 
     );
 }
 
+/// ⚠️ THIS TEST NO LONGER COVERS THE CONTAINMENT DEFECT IT ORIGINALLY SURFACED,
+/// and it must not be credited with doing so.
+///
+/// It was the single red in the 22-cell `run_kvm_` set on 2026-08-26, and the
+/// divergence it reported — run 1 issuing `fcntl(2, F_SETFL, 1025)` where run 2
+/// issued `getrandom` — is what led to both hermit#2668 and the fd-flag
+/// containment in Detcore. Since #2668 restores the standard fd status flags
+/// BETWEEN the two verify runs, run 2 now starts from run 1's starting state
+/// whether or not the guest can still mutate the supervisor's descriptor.
+///
+/// Measured: with Detcore's containment predicate forced false — i.e. the defect
+/// fully restored — this test still passes on KVM, reporting
+/// `:: Success: deterministic`, while the guest's `O_APPEND` is left on the
+/// supervisor's stderr afterwards (`0x8001 -> 0x8401`).
+///
+/// So what it covers now is the VERDICT: that two runs of awk under KVM compare
+/// equal. That is a real property and worth keeping. It is not containment, and
+/// the containment property is defended separately by
+/// `run_*_guest_cannot_mutate_hermits_stderr_flags` and
+/// `run_*_nonblocking_does_not_unlatch_containment`, which read the supervisor's
+/// descriptor directly instead of inferring from a verdict.
 #[test]
 fn run_kvm_awk_mincore_probe_terminates() {
     if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/awk").exists() {
