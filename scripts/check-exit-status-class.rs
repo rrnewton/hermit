@@ -251,6 +251,21 @@ fn main() {
 /// here, so NARROWING THE MATCHER FAILS A NAMED TEST rather than reading as work
 /// done.
 ///
+/// ⚠️ THAT SENTENCE WAS NOT TRUE WHEN IT WAS WRITTEN, AND THE GAP WAS EXACTLY THE
+/// KIND IT WARNS ABOUT. Three narrowings passed all seventeen original cases:
+/// dropping the `.code()` half of `is_exit_status_context`, collapsing the
+/// FORWARD context window, and widening the declaration window DOWNWARD. Each
+/// makes the matcher see less, so the count falls and reads as progress. They
+/// survived for one reason worth remembering: every fixture written for `.code()`
+/// spelled it `output.status.code()`, which also contains `status`, and every
+/// fixture put the status mention ABOVE the value. A suite inherits the blind
+/// spots of whoever wrote its fixtures, so the question to ask of this module is
+/// never "do the tests pass" but "which shapes are still unpinned".
+///
+/// The three are pinned below. If you add a recognised shape, add its case here
+/// and verify by MUTATION that removing the shape fails your new case -- a test
+/// that passes both ways pins nothing.
+///
 /// If you are here because a test failed after you edited the matcher: that is
 /// the test working. Decide whether the shape should still be caught, and if it
 /// should not, delete the case DELIBERATELY and say why in the commit.
@@ -416,5 +431,53 @@ mod tests {
     fn two_sites_on_one_line_are_both_counted() {
         let body = "assert!(status.code() == Some(1) || status.code() == Some(125));";
         assert_eq!(count(body), 2);
+    }
+
+    // ---- the three narrowings the original seventeen did not catch -----------
+    //
+    // Each was found by applying the narrowing to the matcher and observing that
+    // every existing case still passed. Each case below fails under exactly the
+    // narrowing it names, and under no other.
+
+    /// ⚠️ PINS THE `.code()` CLAUSE INDEPENDENTLY, and it is the mirror of the
+    /// blind spot that `catches_a_site_whose_context_says_status_without_calling_code`
+    /// closed. Every other fixture spells the call `output.status.code()`, which
+    /// also contains `status` -- so that clause was never the reason a fixture
+    /// matched, and the `.code()` half could be deleted with all cases green.
+    /// Closing one half of an `||` is what leaves the other half untested.
+    #[test]
+    fn catches_code_without_the_word_status_anywhere() {
+        let body = "assert_eq!(child.wait().unwrap().code(), Some(1));";
+        assert!(
+            !body.contains("status"),
+            "the fixture must not contain 'status', or it pins nothing new"
+        );
+        assert_eq!(count(body), 1, "a `.code()` context with no 'status' counts");
+    }
+
+    /// The FORWARD half of the context window. Every other fixture puts the
+    /// status mention ABOVE the value, so `hi` could collapse from `i + 7` to
+    /// `i + 1` untouched. This is expected-first ordering, which is ordinary Rust.
+    #[test]
+    fn catches_the_status_mention_below_the_value() {
+        let body = r#"assert_eq!(
+    Some(1),
+    output.status.code(),
+);"#;
+        assert_eq!(count(body), 1, "the forward window must stay >= 6 lines");
+    }
+
+    /// The declaration window in the OTHER direction.
+    /// `a_declaration_far_above_the_site_does_not_satisfy_it` pins only the
+    /// upward side, so widening `chi` downward let a distant declaration satisfy
+    /// a site it does not describe.
+    #[test]
+    fn a_declaration_far_below_the_site_does_not_satisfy_it() {
+        let mut body = String::from("assert_eq!(output.status.code(), Some(1));");
+        for _ in 0..7 {
+            body.push('\n');
+        }
+        body.push_str("// EXIT-CLASS: guest");
+        assert_eq!(count(&body), 1, "a distant declaration must not carry");
     }
 }
