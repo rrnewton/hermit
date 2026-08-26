@@ -233,7 +233,7 @@ impl GdbClientWatch {
                         // which must NOT be reported as an early exit -- or the
                         // port belongs to an unrelated service. Neither is a
                         // release, so keep waiting for the container.
-                        thread::sleep(POLL_INTERVAL);
+                        thread::sleep(RELEASE_RETRY_INTERVAL);
                         continue;
                     }
                     // ⚠️ A SUCCESSFUL CONNECT IS NOT PROOF WE RELEASED *OUR*
