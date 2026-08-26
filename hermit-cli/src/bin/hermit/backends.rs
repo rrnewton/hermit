@@ -1447,6 +1447,7 @@ mod tests {
             ),
             compared_log_messages: Some(ComparedLogCounts { left: 4, right: 4 }),
             dbt_counted_branches: None,
+            runtime: None,
             compared_labels: detcore::logdiff::ComparisonSideLabels::default(),
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
