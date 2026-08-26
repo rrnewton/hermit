@@ -4904,3 +4904,68 @@ fn drain_bounded(pipe: Option<std::process::ChildStderr>) -> String {
             String::from("<stderr drain timed out: a descendant still holds the write end>")
         })
 }
+
+/// `hermit record` reports a fail-closed refusal as a REFUSAL, not as "hermit broke".
+///
+/// ⚠️ THE CELL agent(hermit-001)'s CODEX LANE ASKED FOR, AND IT DID NOT EXIST BECAUSE
+/// THE FIX DID NOT WORK. Their finding was that nothing pinned the positive
+/// direction. Writing this cell is what exposed why: at that head `hermit record`
+/// still reported exit 125 `class=cli-error` against this exact guest. The
+/// in-process unit test passed throughout, because it builds the error directly and
+/// never crosses the boundary that broke it.
+///
+/// ⚠️ THE BOUNDARY IS `reverie::Error::Tool`, DECLARED `#[error(transparent)]`. That
+/// forwards `source()` past the inner `anyhow::Error`'s own value, and
+/// `UnsupportedSyscallError` IS that value, so a chain walk cannot see it. Detection
+/// now reaches through the wrapper; see `is_policy_refusal`.
+///
+/// Run mode already worked and is covered by
+/// `run_ptrace_fails_closed_by_default_on_unsupported_syscall`: it sets
+/// `shutdown_on_unsupported_syscall`, so the STATUS carries the meaning. Record mode
+/// sets `exit_on_unsupported_syscall` instead and returns a typed error, producing no
+/// status of its own — which is why the two spellings of one policy disagreed.
+#[test]
+fn record_reports_an_unsupported_syscall_as_a_refusal_not_an_internal_failure() {
+    let program = dbt_unsupported_syscall_guest()
+        .to_str()
+        .expect("unsupported-syscall guest path should be UTF-8");
+
+    let args = ["record", "start", "--", program];
+    let recorded = hermit(&args);
+    let err = stderr(&recorded);
+
+    assert_eq!(
+        recorded.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "record mode must report a fail-closed refusal as a REFUSAL; run mode already \
+         does, and the two spellings of one policy must not disagree\nstderr:\n{err}"
+    );
+    assert!(
+        err.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "the class marker is the only exclusive channel -- every value in 0..=255 is a \
+         legal guest status\nstderr:\n{err}"
+    );
+    // ⚠️ THE DIAGNOSTIC MUST SURVIVE. `PolicyRefusal`'s prose says the reason is
+    // above; on this path the reason exists only in the error chain, so a fix that
+    // classified correctly while dropping the cause would satisfy the two assertions
+    // above and still leave the operator without the syscall's name.
+    // ⚠️ MATCHED ON THE CHAIN LINE, NOT ON THE TEXT ANYWHERE. detcore ALSO logs
+    // "unsupported syscall: restart_syscall() = ?" independently, so a plain
+    // `contains` is satisfied by the log and says nothing about the error chain.
+    // Measured: with the cause dropped, that assertion still passed. The chain
+    // rendering has no parens and ends the line; detcore's log has "() = ?".
+    let chain_line = err.lines().any(|l| {
+        l.trim_end()
+            .ends_with("unsupported syscall: restart_syscall")
+    });
+    assert!(
+        chain_line,
+        "the refused syscall must survive into the error CHAIN, not merely appear in \
+         detcore's own log line\nstderr:\n{err}"
+    );
+    // CONTROL: it must NOT read as hermit breaking, which is what it did before.
+    assert!(
+        !err.contains("HERMIT_INTERNAL_FAILURE"),
+        "a deliberate refusal must not be reported as an internal failure\nstderr:\n{err}"
+    );
+}
