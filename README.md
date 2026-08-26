@@ -465,3 +465,4 @@ and licensing guidelines.
 - [Examples](examples/README.md): small programs demonstrating controlled
   nondeterminism.
 - [License](LICENSE): BSD 3-Clause.
+H106_SLOT_WORK
