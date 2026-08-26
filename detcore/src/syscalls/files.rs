@@ -297,6 +297,42 @@ fn is_inherited_container_output(resource: Option<ResourceID>) -> bool {
     )
 }
 
+/// Exactly the bits `fcntl(F_SETFL)` can change; access mode and creation
+/// flags are silently ignored by the kernel.
+const SETTABLE_STATUS_FLAGS: i32 =
+    libc::O_APPEND | libc::O_ASYNC | libc::O_DIRECT | libc::O_NOATIME | libc::O_NONBLOCK;
+
+/// The container's own stdin/stdout/stderr, i.e. the three descriptions the
+/// guest did NOT create.
+///
+/// ⚠️ THESE ARE THE SUPERVISOR'S DESCRIPTIONS. When Hermit passes its own
+/// stdio through to the guest rather than capturing it, the guest's fd 0/1/2
+/// name the very open file descriptions the hermit process holds -- inherited
+/// in turn from whoever invoked hermit. `fcntl(F_SETFL)` mutates the
+/// DESCRIPTION, not the descriptor, so forwarding a guest's request there
+/// changes state that outlives the guest, outlives hermit, and is visible to
+/// hermit's caller. Measured on hermit d7413071581f, both backends:
+/// `hermit run -- /usr/bin/awk 'BEGIN { print 42 }'` turned `O_APPEND` on in
+/// the caller's stderr (0x8001 -> 0x8401) and left it on.
+///
+/// Two runs of one guest must also start from the same descriptor state, so
+/// this is a determinism defect as well as a containment one: under
+/// `hermit run --strict --verify` the two runs share one hermit process, and
+/// the first run's mutation is still there when the second starts.
+///
+/// This is deliberately a SEPARATE predicate from
+/// [`is_inherited_container_output`], which excludes stdin because it exists to
+/// answer an `lseek` question about a redirect file that also carries Hermit's
+/// own diagnostics. Containment applies to all three.
+fn is_inherited_container_stdio(resource: Option<ResourceID>) -> bool {
+    matches!(
+        resource,
+        Some(ResourceID::Device(
+            Device::ContainerStdin | Device::ContainerStdout | Device::ContainerStderr
+        ))
+    )
+}
+
 fn unix_autobind_addrlen() -> i32 {
     (std::mem::offset_of!(libc::sockaddr_un, sun_path) + UNIX_AUTOBIND_NAME_LEN) as i32
 }
@@ -2694,18 +2730,145 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         match call.cmd() {
             F_GETFL => {
+                let (contained, observed) = guest.thread_state().with_detfd(fd, |detfd| {
+                    (
+                        // No O_NONBLOCK condition here, deliberately. An earlier revision
+                        // reverted this arm to the kernel whenever the model carried
+                        // O_NONBLOCK, to avoid reading a model that the forwarded F_SETFL
+                        // path had overwritten. That was a LATCH: one nonblocking guest
+                        // turned containment off for the rest of the description's life, on
+                        // this arm and on F_SETFL, and the O_APPEND escape this change exists
+                        // to close came straight back. MEASURED at 9c75b9db57, guest sets
+                        // O_NONBLOCK then O_APPEND on stderr: supervisor 0x8001 -> 0x8c01 on
+                        // both backends. The fix is below in F_SETFL -- only the O_NONBLOCK
+                        // BIT is ever forwarded, so the model is never overwritten and this
+                        // arm can always trust it.
+                        is_inherited_container_stdio(detfd.resource()),
+                        detfd.status_flags_observed(),
+                    )
+                })?;
+                if contained && observed {
+                    // Answer from the model. Asking the kernel would report
+                    // whatever a PREVIOUS guest left behind on the supervisor's
+                    // description -- which is exactly the leak being closed.
+                    return Ok(i64::from(
+                        guest
+                            .thread_state()
+                            .with_detfd(fd, |detfd| detfd.status_flags())?,
+                    ));
+                }
                 let physical_flags = self.record_or_replay(guest, call).await?;
                 let logical_nonblocking = guest
                     .thread_state()
                     .with_detfd(fd, |detfd| detfd.is_nonblocking())?;
                 let nonblocking = i64::from(OFlag::O_NONBLOCK.bits());
-                if logical_nonblocking {
-                    Ok(physical_flags | nonblocking)
+                let flags = if logical_nonblocking {
+                    physical_flags | nonblocking
                 } else {
-                    Ok(physical_flags & !nonblocking)
+                    physical_flags & !nonblocking
+                };
+                if contained {
+                    // First look at an inherited stream: adopt the kernel's
+                    // answer as the model's starting point, so the guest still
+                    // sees the truth about its stdio (access mode, O_LARGEFILE,
+                    // an append-mode redirect the CALLER chose) and nothing
+                    // later has to ask the kernel again.
+                    guest
+                        .thread_state()
+                        .with_detfd(fd, |detfd| detfd.observe_status_flags(flags as i32))?;
                 }
+                Ok(flags)
             }
             F_SETFL(flags) => {
+                let (contained, observed) = guest.thread_state().with_detfd(fd, |detfd| {
+                    (
+                        is_inherited_container_stdio(detfd.resource()),
+                        detfd.status_flags_observed(),
+                    )
+                })?;
+                if contained {
+                    // ⚠️ EXACTLY ONE BIT IS ALLOWED THROUGH TO THE SUPERVISOR, AND IT IS
+                    // O_NONBLOCK. Everything else is modeled and never reaches the kernel.
+                    //
+                    // O_NONBLOCK cannot be modeled here. Detcore keeps a SECOND, physical
+                    // view of it (`physically_nonblocking`) because it manipulates the real
+                    // descriptor itself for nonblockize-and-retry, and
+                    // `ioaction_based_on_fd_status` PANICS on the pairing `virt && !phys`:
+                    // "we cannot simulate nonblocking behavior when set to blocking mode in
+                    // the kernel." Modeling the flag creates precisely that pairing.
+                    // MEASURED at 7fc9417bdf47, stdin a socketpair with a byte readable:
+                    //
+                    //     fcntl(0, F_SETFL, O_NONBLOCK); recv(0, &b, 1, 0);
+                    //       ptrace rc=125, kvm rc=125, "Invariant violation, fd 0"
+                    //       (helpers.rs:582); the parent commit returns rc=0, recv=1.
+                    //
+                    // `read(2)` does NOT reach it: `setup_stdio` types stdio
+                    // `FdType::Regular` and `handle_read` routes only Socket/Pipe/
+                    // notification descriptors through the nonblockable path, while the
+                    // socket handlers in `syscalls/io.rs` call it unconditionally by syscall
+                    // kind. A regression test written on `read` passes over a live defect.
+                    //
+                    // ⚠️ AND FORWARDING THE GUEST'S WHOLE WORD IS NOT AN OPTION EITHER. The
+                    // revision that did -- reverting the entire call whenever O_NONBLOCK was
+                    // involved -- LATCHED: once the model carried the flag, every later
+                    // F_SETFL and F_GETFL on that description reverted too, and the O_APPEND
+                    // escape came straight back. MEASURED at 9c75b9db57, guest sets
+                    // O_NONBLOCK then O_APPEND on stderr: supervisor 0x8001 -> 0x8c01, both
+                    // backends. So the forward is scoped to the single bit: the physical
+                    // word is re-read and only its O_NONBLOCK is replaced, leaving whatever
+                    // append-mode or other settable state the CALLER chose untouched.
+                    if !observed {
+                        // A guest that sets flags without reading them first still needs a
+                        // starting point. glibc reads before it writes, so this is rare.
+                        let physical_flags = self
+                            .record_or_replay(
+                                guest,
+                                syscalls::Fcntl::new().with_fd(fd).with_cmd(F_GETFL),
+                            )
+                            .await?;
+                        guest.thread_state().with_detfd(fd, |detfd| {
+                            detfd.observe_status_flags(physical_flags as i32)
+                        })?;
+                    }
+                    let requested_nonblocking = flags & libc::O_NONBLOCK;
+                    let model_nonblocking = guest
+                        .thread_state()
+                        .with_detfd(fd, |detfd| detfd.status_flags() & libc::O_NONBLOCK)?;
+                    if requested_nonblocking != model_nonblocking {
+                        // Re-read rather than reuse the model: the model's other settable
+                        // bits are the GUEST's, and pushing those to the kernel is the
+                        // escape. Only the supervisor's own physical word may be echoed back.
+                        let physical_now = self
+                            .record_or_replay(
+                                guest,
+                                syscalls::Fcntl::new().with_fd(fd).with_cmd(F_GETFL),
+                            )
+                            .await? as i32;
+                        let physical_next =
+                            (physical_now & !libc::O_NONBLOCK) | requested_nonblocking;
+                        self.record_or_replay(
+                            guest,
+                            syscalls::Fcntl::new()
+                                .with_fd(fd)
+                                .with_cmd(F_SETFL(physical_next)),
+                        )
+                        .await?;
+                        // The kernel really was told, so the physical view is honest and the
+                        // `virt && !phys` pairing cannot arise.
+                        guest.thread_state().with_detfd(fd, |detfd| {
+                            detfd.set_nonblocking(requested_nonblocking != 0)
+                        })?;
+                    }
+                    guest.thread_state().with_detfd(fd, |detfd| {
+                        let current = detfd.status_flags();
+                        // fcntl(2): F_SETFL changes only the settable bits and ignores access
+                        // mode and creation flags.
+                        detfd.set_logical_status_flags(
+                            (current & !SETTABLE_STATUS_FLAGS) | (flags & SETTABLE_STATUS_FLAGS),
+                        );
+                    })?;
+                    return Ok(0);
+                }
                 let fd_type = guest.thread_state().with_detfd(fd, |detfd| detfd.ty())?;
                 let force_nonblocking = self.cfg.use_nonblocking_sockets()
                     && !self.cfg.recordreplay_modes
