@@ -827,6 +827,23 @@ mod tests {
             "    RUSTUP_TOOLCHAIN=stable rustc --edition=2021 \\\n        scripts/check-reverie-pin.rs -o \"$checker\"",
             "scripts/check-reverie-pin.rs"
         ));
+        // ⚠️ THE PER-RUNNER SPLIT ITSELF, PINNED HERE RATHER THAN ONLY IN
+        // `self_test`. Re-merging the tables leaves `self_test` red but left THIS
+        // suite green, so the change had no pin in the harness most people run.
+        // Found by agent(hermit-004), who mutated `-l` back into
+        // SHELL_VALUE_FLAGS and got "12 passed; 0 failed".
+        //
+        // A shell flag that takes NO value: the path after it IS the script.
+        // Measured by execution -- `bash -l ./x.sh` and `sh -l ./x.sh` print RAN.
+        assert!(is_invoked("\tbash -l scripts/check-x.sh", "scripts/check-x.sh"));
+        assert!(is_invoked("\tsh -l scripts/check-x.sh", "scripts/check-x.sh"));
+        // ...and the value-taking side, so the shell table cannot simply be
+        // EMPTIED to satisfy the two above -- that would trade the loud failure
+        // (false orphan) for the silent one (false scheduled).
+        // Measured: `bash -o ./x.sh` answers "invalid option name", the path was
+        // eaten as the value; `python3 -c ./x.sh` is a SyntaxError, never run.
+        assert!(!is_invoked("\tbash -o scripts/check-x.sh", "scripts/check-x.sh"));
+        assert!(!is_invoked("\tpython3 -c scripts/check-x.py", "scripts/check-x.py"));
     }
 
     // A DAG `description` is prose and routinely names checkers it does not run.
