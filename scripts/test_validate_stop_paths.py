@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import subprocess
@@ -256,25 +257,75 @@ def warm_validate_binary() -> None:
     )
 
 
-# The shapes `scripts/validate.rs` uses to decline before it starts work. Both are
-# rendered by RunSummary::refused, which prefixes "refused by: <what>". Matching
-# the rendered prefix rather than a specific reason keeps this from needing an
-# update every time a new refusal reason is added.
-_REFUSAL_SHAPES = (
-    "refused by:",
-    "validate: REFUSED",
-    "another validate is already running",
+# The complete final status line emitted by `run_summary_lines()` for a refusal.
+# Reason text is not enough: the captured output also contains text written by
+# wrappers and child programs.
+_REFUSAL_SUMMARY = re.compile(
+    r"🚫 validate REFUSED \(exit [1-9][0-9]*\) — profile .+ @ [0-9a-f]{40}"
 )
 
 
 def _looks_refused(output: str) -> bool:
     """Did the child DECLINE, as opposed to failing at something?
 
-    Deliberately narrow. Anything not recognised stays an AssertionError, because
-    a crash misreported as a could-not-evaluate is silent, and silence in that
-    direction is what this whole change is against.
+    Match the complete status line, not refusal-shaped prose anywhere else on the
+    captured channel. Anything else stays an AssertionError because reporting a
+    crash as could-not-evaluate would hide the failure.
     """
-    return any(shape in output for shape in _REFUSAL_SHAPES)
+    return any(_REFUSAL_SUMMARY.fullmatch(line) for line in output.splitlines())
+
+
+_SAMPLE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
+_REFUSAL_SELF_CHECK: tuple[tuple[str, bool], ...] = (
+    # Text from another writer must not decide the result, including at line start.
+    ("thread 'main' panicked at src/x.rs:9: connection refused by: peer", False),
+    ("guest: server said 'refused by: firewall'\nerror: compilation failed", False),
+    ("error[E0433]: file /home/x/validate: REFUSED_cases/t.rs not found", False),
+    ("refused by: guest firewall policy", False),
+    ("   refused by: guest firewall policy", False),
+    ("validate: REFUSED_cases is a guest label", False),
+    ("another validate is already running in this documentation", False),
+    (
+        f"wrapper: 🚫 validate REFUSED (exit 3) — profile full @ {_SAMPLE_COMMIT}",
+        False,
+    ),
+    # A real final status line still counts when other writers used the channel.
+    (
+        "refused by: guest firewall policy\n"
+        f"🚫 validate REFUSED (exit 3) — profile full @ {_SAMPLE_COMMIT}\n"
+        "   refused by: the per-checkout invocation lock\n"
+        "   another validate is already running",
+        True,
+    ),
+    (
+        f"🚫 validate REFUSED (exit 2) — profile strict @ {_SAMPLE_COMMIT}",
+        True,
+    ),
+)
+
+
+def check_refusal_predicate() -> None:
+    """Assert the predicate before anything spawns, and refuse to run if it is wrong.
+
+    Cheap enough to run unconditionally: pure string work, no process, no I/O. It
+    sits at the top of `main()` so a regression here cannot hide behind a run whose
+    children all happened to start.
+    """
+    expected_results = {want for _, want in _REFUSAL_SELF_CHECK}
+    if expected_results != {False, True}:
+        raise AssertionError(
+            "the refusal predicate self-check must contain refusing and "
+            "non-refusing cases"
+        )
+    wrong = [
+        f"{'must' if want else 'must NOT'} classify as refused: {sample!r}"
+        for sample, want in _REFUSAL_SELF_CHECK
+        if _looks_refused(sample) is not want
+    ]
+    if wrong:
+        raise AssertionError(
+            "the refusal predicate misclassifies the channel:\n  " + "\n  ".join(wrong)
+        )
 
 
 def wait_for_text(log: Path, text: str, process: subprocess.Popen[bytes]) -> None:
@@ -601,6 +652,10 @@ def main() -> None:
     # Clearing it here, rather than moving the guard in validate.rs, keeps that
     # guard intact for REAL nested runs — which is exactly what it is for.
     os.environ.pop("HERMIT_VALIDATE_ACTIVE", None)
+
+    # Before anything spawns: a misclassifying predicate turns this run's reds into
+    # no-results, so it is checked first rather than trusted.
+    check_refusal_predicate()
 
     unevaluated: list[str] = []
     # ⚠️ A REFUSED CHILD MAKES EVERY SIGNAL CASE UNEVALUABLE, NOT FAILED, so the
