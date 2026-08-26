@@ -109,6 +109,18 @@ mkdir -p "$ROOT_DIR/target"
 self_test
 if ! check_repository; then
     echo "portability check failed: replace literal homes/hosts with HOME, repo-relative paths, PATH lookup, or an explicit environment override" >&2
+    # WARNING -- THE FIFTH REMEDY, AND IT EXISTS BECAUSE FOUR AGENTS GUESSED A
+    # SIXTH. On 2026-08-25 five heads cleared this gate by removing a host
+    # identity from a provenance record; four destroyed the information (#2646,
+    # #2647, #2648, #2652) and one moved it correctly (#2526). Every remedy on
+    # the line above substitutes something a PROGRAM resolves -- none fits a
+    # hostname in a COMMENT recording where a measurement was taken, where the
+    # literal is a fact rather than a path. Faced with four inapplicable options
+    # and a red gate, the cheapest remaining action is deletion, and a
+    # measurement whose host is unrecorded cannot be re-run, compared or
+    # challenged. Naming the fifth option is what stops that.
+    echo "  ...or, when the literal is a MEASUREMENT PROVENANCE rather than a path: record the host in docs/TESTING_ENVIRONMENTS.md (this checker does not scan docs/) and reference it from here." >&2
+    echo "  DO NOT DELETE IT. A measurement with no host cannot be re-run, compared or challenged; that is what four fixes on 2026-08-25 cost." >&2
     exit 1
 fi
 

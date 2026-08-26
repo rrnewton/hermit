@@ -3976,9 +3976,17 @@ mod tests {
     /// shelling out to git saw it in 83 of 600 invocations.
     ///
     /// ⚠️ WHAT THAT PARTIAL STATE DOES **NOT** DO, RE-MEASURED 2026-08-25 ON
-    /// on the measurement host: it does not make git fail. Neither git there
-    /// rejects a
-    /// count with no key -- both exit 0 and ignore the surplus. An earlier
+    /// the host recorded for this file in `docs/TESTING_ENVIRONMENTS.md` under
+    /// "Named measurement hosts": it does not make git fail. Neither git there
+    /// rejects a count with no key -- both exit 0 and ignore the surplus.
+    ///
+    /// ⚠️ THE HOST IS NAMED IN THE DOCS RATHER THAN HERE, AND THAT IS THE POINT.
+    /// An earlier revision spelled the hostname out here, which correctly
+    /// reddened `check-portable-paths.sh`; the fix for that red then DELETED it
+    /// outright and left "on the measurement host", which identifies nothing and
+    /// makes this measurement impossible to re-run or challenge. The docs table
+    /// is where the checker permits an identity, so the reference goes there and
+    /// the fact survives. An earlier
     /// revision of this comment said such a child "dies with `error: missing
     /// config key GIT_CONFIG_KEY_0`, exit 128", and that is not reproducible
     /// here; the only conditions that do exit 128 are an EMPTY key and a
