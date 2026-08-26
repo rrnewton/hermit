@@ -1386,14 +1386,35 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
 /// WAS ABSENT. The `GIT_CONFIG_*` family is inherited from the AGENT HARNESS
 /// PROCESS -- `GIT_CONFIG_COUNT=3` with `KEY_0..KEY_2` all set to
 /// `url.https://github.com/.insteadOf`, the proxy's GitHub URL rewrites, present
-/// in the process environment before any shell starts. NOT exported by a git
-/// wrapper and NOT by shell initialisation: `/usr/local/bin/git` is an ELF binary
-/// and can export nothing, and `/etc/profile`, `/etc/profile.d`, `~/.bashrc`,
+/// in the process environment before any shell starts. NOT set by shell
+/// initialisation: `/etc/profile`, `/etc/profile.d`, `~/.bashrc`,
 /// `~/.bash_profile` and `~/.profile` mention none of them -- grepped, zero hits.
 /// A login shell therefore proves nothing either way, because `bash -l` inherits
-/// from whatever launched it. Running `env GIT_CONFIG_COUNT=1 git ...` overrides
-/// only the COUNT; `KEY_0` is still there, so git found a key and exited 0. Measured both ways in the same shell, 20 runs each: with `KEY_0`
-/// inherited, 0/20 non-zero; with it unset, 20/20 non-zero.
+/// from whatever launched it.
+///
+/// AND NO EXECUTED PROGRAM COULD HAVE SET THEM, WHATEVER THE `git` ON PATH IS.
+/// A child -- ELF binary, shell script, anything -- gets a COPY of the
+/// environment and cannot write back to its parent. Stated as a measurement
+/// because an earlier revision of this paragraph offered "it is an ELF binary"
+/// as the reason, and that is not the reason:
+///
+/// ```text
+/// wrapper.sh:   #!/bin/sh
+///               export ZZPROBE=1
+///               exec /bin/true
+///
+/// unset ZZPROBE; ./wrapper.sh; echo "${ZZPROBE-<unset>}"   ->  <unset>
+/// ```
+///
+/// A shell-script wrapper cannot do it either, so ELF-ness distinguishes
+/// nothing and is not evidence about a wrapper -- which matters here, because
+/// the paragraph above calls this same binary a wrapper. Being a CHILD is the
+/// reason; being compiled is not.
+///
+/// Running `env GIT_CONFIG_COUNT=1 git ...` overrides only the COUNT; `KEY_0` is
+/// still there, so git found a key and exited 0. Measured both ways in the same
+/// shell, 20 runs each: with `KEY_0` inherited, 0/20 non-zero; with it unset,
+/// 20/20 non-zero.
 ///
 /// ⚠️ AND THE POSITIVE CONTROL PASSED, BOTH THEN AND NOW. `zzz.probe=HIT`
 /// appearing in `config --list` proved the overrides were HONOURED. It never
@@ -4053,8 +4074,10 @@ mod tests {
     /// through the proxy is the one that inverts this measurement.
     ///
     /// An earlier revision of this comment blamed "this host's git wrapper ...
-    /// into every login shell". Both halves were false: `/usr/local/bin/git` is an
-    /// ELF binary and can export nothing, and no shell file sets these. Diagnosed by
+    /// into every login shell". Both halves were false: no shell file sets these,
+    /// and no executed program could have -- a child gets a COPY of the environment
+    /// and cannot write back, so what the `git` on PATH is does not enter into it.
+    /// Diagnosed by
     /// `agent(hermit-015)` and `agent(hermit-001)` on review, from
     /// `/proc/<parent>/environ`. Kept visible because this sentence is now on its
     /// fifth revision and a silent correction is what produced the previous four.
