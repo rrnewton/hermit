@@ -3975,18 +3975,51 @@ mod tests {
     /// writer doing exactly what `with_config_override` does and four threads
     /// shelling out to git saw it in 83 of 600 invocations.
     ///
-    /// ⚠️ WHAT THAT PARTIAL STATE DOES **NOT** DO, RE-MEASURED 2026-08-25 ON
-    /// on the measurement host: it does not make git fail. Neither git there
-    /// rejects a
-    /// count with no key -- both exit 0 and ignore the surplus. An earlier
-    /// revision of this comment said such a child "dies with `error: missing
-    /// config key GIT_CONFIG_KEY_0`, exit 128", and that is not reproducible
-    /// here; the only conditions that do exit 128 are an EMPTY key and a
-    /// non-numeric count, neither of which `with_config_override` can produce
-    /// (it restores with `remove_var`). An earlier revision also reported "8
-    /// failing tests across 8 runs" without the guard; re-measured, the suite
-    /// ran 30 times with no guard at all and failed 0 times. See
+    /// ⚠️ WHAT THAT PARTIAL STATE DOES: IT MAKES git FAIL, AND THIS COMMENT SAID
+    /// THE OPPOSITE FOR THREE REVISIONS. Re-measured 2026-08-26 on the host
+    /// recorded for this file in `docs/TESTING_ENVIRONMENTS.md` under "Named
+    /// measurement hosts", both gits present there, inside a real repository,
+    /// twenty runs each and no pipe between the command and `$?`:
+    ///
+    /// ```text
+    /// GIT_CONFIG_COUNT=1 git rev-parse --show-toplevel     (no GIT_CONFIG_KEY_0)
+    ///   git 2.52.0        exit 128 in 20/20
+    ///   git 2.53.0-Meta   exit 128 in 20/20
+    ///   error: missing config key GIT_CONFIG_KEY_0
+    ///   fatal: unable to parse command-line config
+    /// CONTROL, same command with no GIT_CONFIG_COUNT: non-zero in 0/20
+    /// ```
+    ///
+    /// ⚠️ SO THE REVISION THIS COMMENT "CORRECTED" WAS RIGHT. It said such a
+    /// child "dies with `error: missing config key GIT_CONFIG_KEY_0`, exit 128".
+    /// That is the exact string, verbatim, and it reproduces on both gits. The
+    /// correction claimed it was "not reproducible here" and that "the only
+    /// conditions that do exit 128 are an EMPTY key and a non-numeric count" --
+    /// both of those DO exit 128, but they are not the only ones, and the
+    /// sentence turned a true report into a false denial. A correction is not
+    /// self-verifying merely because it is a correction.
+    ///
+    /// ⚠️ AND THIS STRENGTHENS THE LOCK RATHER THAN WEAKENING IT, WHICH IS WHY
+    /// IT MATTERS. The read lock was defended by a comment saying the race it
+    /// prevents is harmless. It is not: a child forked in the window between
+    /// setting `GIT_CONFIG_COUNT` and setting `GIT_CONFIG_KEY_0` dies at 128
+    /// rather than ignoring the surplus. Anyone who read this comment while
+    /// deciding whether the lock earns its cost was reading an argument against
+    /// it, assembled from a measurement nobody re-ran.
+    ///
+    /// The 0-of-30 figure is separate and stands: an earlier revision reported
+    /// "8 failing tests across 8 runs" without the guard, and re-measured, the
+    /// suite ran 30 times with no guard at all and failed 0 times. See
     /// [`under_git_env`] for the full table and the positive control.
+    ///
+    /// ⚠️ "Neither git there ... both" HAD NO ANTECEDENT AND NEVER DID. A review
+    /// lane read the missing subject as provenance destroyed by an edit, which
+    /// was a reasonable inference on this file and is wrong: `git log -S` shows
+    /// the phrase entering as "Neither git on this host" and no revision ever
+    /// naming the two. The versions are stated above now, so the sentence says
+    /// what it always meant to. Recorded because "the identity was deleted" and
+    /// "the identity was never written down" look identical afterwards, and only
+    /// one of them is tonight's story.
     ///
     /// ⚠️ AND THE CONCLUSION THAT ONCE FOLLOWED THAT 0-OF-30 IS FALSIFIED.
     /// Mutating `under_git_env` to a no-op FAILED 9 OF 10 RUNS at load average
