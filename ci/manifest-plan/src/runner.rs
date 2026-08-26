@@ -355,6 +355,17 @@ impl ManifestSet {
         Ok(Self { documents, tests })
     }
 
+    /// Is `id` a test this manifest set has ever heard of?
+    ///
+    /// ⚠️ THIS EXISTS TO SEPARATE "NO CELLS" FROM "NO SUCH TEST". `select` returns an
+    /// empty vector for both, and they mean opposite things: an unfiltered population
+    /// that is legitimately empty ("no gaps") versus a filter naming something that
+    /// does not exist (a typo). A caller that cannot tell them apart must either
+    /// refuse a good answer or accept a meaningless one.
+    pub fn knows_test(&self, id: &str) -> bool {
+        self.tests.contains_key(id)
+    }
+
     pub fn select(&self, selection: &Selection) -> Result<Vec<SelectedCell>, String> {
         let population = selection.population.unwrap_or(Population::Enabled);
         let mut cells = Vec::new();
@@ -2964,6 +2975,46 @@ mod tests {
             modes: BTreeMap::from([("verify".into(), mode)]),
             preprocessors: Vec::new(),
         }
+    }
+
+    /// ⚠️ "NO CELLS" AND "NO SUCH TEST" ARE DIFFERENT ANSWERS, AND `select` GIVES
+    /// THE SAME EMPTY VECTOR FOR BOTH. Measured 2026-08-26 before this existed:
+    /// `test-harness plan --lane portable --test no-such-test-xyz` printed nothing and
+    /// exited 0 -- and so did the same command with a REAL id, so the exit code
+    /// carried no information either way and anything bisecting off `plan` read a typo
+    /// as "nothing failed here".
+    ///
+    /// The fix could NOT be `cells.is_empty()`, which is why this predicate exists:
+    /// `print_plan` also serves `audit-gaps`, where empty legitimately means NO GAPS.
+    /// Measured on the same head, a real id filtered to a lane it has no cells in
+    /// (`--lane privileged --test applications/c-toolchain-workflow`) prints `[]` and
+    /// exits 0 -- a correct, well-formed query that an emptiness guard would refuse.
+    #[test]
+    fn knows_test_separates_an_absent_id_from_an_empty_population() {
+        let test = recipe(false);
+        let id = test.id.clone();
+        let set = ManifestSet {
+            documents: Vec::new(),
+            tests: BTreeMap::from([(id.clone(), ("fixture".into(), test))]),
+        };
+        assert!(set.knows_test(&id), "a declared test must be known");
+        assert!(
+            !set.knows_test("no-such-test-xyz"),
+            "an id in no manifest must NOT be known -- this is the typo a bisect would \
+             otherwise read as a pass"
+        );
+        // The control that makes the pair meaningful: the KNOWN id still selects zero
+        // cells in the Required population, so emptiness and unknown-ness genuinely
+        // come apart here rather than only in principle.
+        assert!(
+            set.select(&Selection {
+                population: Some(Population::Required),
+                ..Selection::default()
+            })
+            .unwrap()
+            .is_empty(),
+            "fixture must be empty in Required, or this test proves nothing"
+        );
     }
 
     #[test]
