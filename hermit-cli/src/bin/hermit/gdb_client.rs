@@ -44,6 +44,7 @@
 //! The distinction is not which call site it is, but whether there is a client
 //! whose liveness we own — which a timeout cannot tell apart and a [`Child`] can.
 
+use std::io::Read;
 use std::net::TcpStream;
 use std::process::Child;
 use std::sync::Arc;
@@ -78,6 +79,35 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// next attempt. 25 ticks is half a second, which is far longer than a released
 /// `accept()` needs to unwind and short enough to retry promptly.
 const RELEASE_GRACE_TICKS: u32 = 25;
+
+/// How long to wait for the peer to close after we connect, before concluding it
+/// never accepted us.
+const ACCEPT_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Did the peer ACCEPT this connection, rather than leave it queued?
+///
+/// ⚠️ `connect()` SUCCEEDING PROVES NOTHING, WHICH IS THE WHOLE PROBLEM. The kernel
+/// completes the handshake into the listen backlog whether or not the application
+/// ever calls `accept()`. So a gdbserver that ALREADY HAS its peer -- the healthy
+/// case, where gdb connected, worked and quit -- answers a probe exactly like one
+/// still blocked in `accept()`.
+///
+/// The two are distinguishable by what happens next. A gdbstub that accepts this
+/// connection sees a peer that immediately disconnects and closes it, so the read
+/// returns EOF promptly. A listener that is not accepting leaves us queued: no
+/// data, no EOF, just the timeout. Erring toward NOT ACCEPTED is the safe
+/// direction -- it withholds a report rather than inventing one.
+fn peer_accepted_and_closed(stream: &TcpStream) -> bool {
+    if stream.set_read_timeout(Some(ACCEPT_PROBE_TIMEOUT)).is_err() {
+        return false;
+    }
+    let mut byte = [0u8; 1];
+    match (&mut { stream }).read(&mut byte) {
+        Ok(0) => true,   // clean EOF: it accepted us, then closed
+        Ok(_) => false,  // it sent data, so it is not our silent gdbstub
+        Err(_) => false, // timed out queued in the backlog, or reset
+    }
+}
 
 /// Watches the gdb client hermit spawned, and releases the gdbserver's accept if
 /// that client dies while the container is still waiting for it.
@@ -136,14 +166,26 @@ impl GdbClientWatch {
             if done.load(Ordering::SeqCst) {
                 return;
             }
-            exited_early.store(true, Ordering::SeqCst);
 
             while !done.load(Ordering::SeqCst) {
                 // Refused simply means the container has not bound the port yet
                 // -- expected, since the client is spawned before the container
                 // exists.
                 if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)) {
+                    // Was this connection ACCEPTED, or merely queued? Only an
+                    // accepted-then-closed connection shows a gdbserver that was
+                    // still waiting for a peer.
+                    let accepted = peer_accepted_and_closed(&stream);
                     drop(stream);
+                    if !accepted {
+                        // Someone is listening but not accepting: either the
+                        // gdbserver already has its peer -- the healthy case,
+                        // which must NOT be reported as an early exit -- or the
+                        // port belongs to an unrelated service. Neither is a
+                        // release, so keep waiting for the container.
+                        thread::sleep(POLL_INTERVAL);
+                        continue;
+                    }
                     // ⚠️ A SUCCESSFUL CONNECT IS NOT PROOF WE RELEASED *OUR*
                     // GDBSERVER, AND RETURNING HERE ASSUMED IT WAS. The port is
                     // guessable and shared: `replay` defaults to 1234, and
@@ -164,6 +206,24 @@ impl GdbClientWatch {
                     // grace period instead of one every POLL_INTERVAL.
                     for _ in 0..RELEASE_GRACE_TICKS {
                         if done.load(Ordering::SeqCst) {
+                            // ⚠️ AND THIS IS THE ONLY PLACE THE EARLY-EXIT REPORT
+                            // IS EARNED. The container was blocked, OUR connect
+                            // was what let it go, and it finished immediately
+                            // after -- which is evidence the gdbserver was still
+                            // waiting for a peer, i.e. the client really did exit
+                            // before connecting.
+                            //
+                            // The flag used to be set before this loop, on
+                            // nothing more than "the client exited and the
+                            // container had not returned yet". That is TRUE OF
+                            // EVERY HEALTHY SESSION whose gdb quits first: a
+                            // `gdb -batch ... quit` exits as soon as its work is
+                            // done, and the container is still shutting down. The
+                            // report was then welded onto whatever the container
+                            // failed with later, naming a cause that did not
+                            // occur -- worse than naming none, because it sends
+                            // the reader somewhere useless.
+                            exited_early.store(true, Ordering::SeqCst);
                             return;
                         }
                         thread::sleep(POLL_INTERVAL);
@@ -279,6 +339,48 @@ mod tests {
         assert!(
             !early || watch.container_done.load(Ordering::SeqCst),
             "a completed session must not be reported as having exited before connecting"
+        );
+    }
+
+    /// ⚠️ THE FALSE EARLY-EXIT REPORT. A gdb that connected, did its work and quit
+    /// leaves the gdbserver ALREADY SERVED: its `accept()` has returned, but the
+    /// listening socket is still open, so a probe `connect()` succeeds exactly as
+    /// it would against one still waiting. The old code reported "exited before it
+    /// finished connecting" on nothing more than the client exiting first -- true
+    /// of every healthy `gdb -batch ... quit` -- and that cause was then welded
+    /// onto whatever the container failed with later.
+    ///
+    /// Here the listener has taken its one peer and stopped accepting, so the
+    /// watcher's probe lands in the backlog and is never accepted. That must NOT
+    /// be read as a release, and no early-exit report may be produced.
+    #[test]
+    fn an_already_served_gdbserver_is_not_reported_as_an_early_exit() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind");
+        let port = listener.local_addr().expect("no local addr").port();
+
+        // Stand in for gdb having connected and been served. Both ends stay alive
+        // and the listener never accepts again.
+        let served = TcpStream::connect(("127.0.0.1", port)).expect("failed to connect");
+        let (accepted, _) = listener.accept().expect("failed to accept");
+
+        let client = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("failed to spawn the stand-in client");
+        thread::sleep(Duration::from_millis(200));
+
+        let mut watch = GdbClientWatch::spawn(client, port);
+        // Long enough for at least one probe to connect and time out unaccepted.
+        thread::sleep(ACCEPT_PROBE_TIMEOUT + Duration::from_millis(300));
+        let early = watch.finish();
+
+        drop(accepted);
+        drop(served);
+
+        assert!(
+            !early,
+            "a gdbserver that already had its peer was reported as though the client \
+             exited before connecting; that names a cause which did not occur and welds \
+             it onto any later container failure"
         );
     }
 
