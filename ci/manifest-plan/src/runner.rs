@@ -7,6 +7,7 @@ use std::fs::{self};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
+use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -190,8 +191,8 @@ const SCHEDULED_JOBS_ENV: &str = "HERMIT_E2E_SCHEDULED_JOBS";
 const ISOLATED_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
 const HERMETIC_TEST_WORKDIR: &str = "/test";
 
-/// The working directory every Hermit-run cell gets, and the name of the empty
-/// per-cell directory bound to it.
+/// The working directory every Hermit-run cell gets, and the parent of the empty
+/// per-attempt directories bound to it.
 ///
 /// ⚠️ THIS IS THE FIXED HALF OF THE HERMETIC WORKDIR CONTROL, NOT THE WHOLE OF IT
 /// AS THE BRIEF SPELLS IT. The brief asks for a fixed `/test`. This delivers a
@@ -211,11 +212,25 @@ const HERMETIC_TEST_WORKDIR: &str = "/test";
 ///     control exists to remove.
 ///
 /// So: a reader must NOT conclude from this constant that the hermetic workdir
-/// work is finished. What is done is "every cell runs in the same empty directory
-/// whatever the host cwd is". What is not done is that directory being `/test`,
-/// and that waits on the reverie mount panic.
+/// work is finished. What is done is "every attempt runs in an empty directory
+/// at the same guest path whatever the host cwd is". What is not done is that
+/// directory being `/test`, and that waits on the reverie mount panic.
 const FIXED_GUEST_WORKDIR: &str = "/tmp/test";
 const FIXED_WORKDIR_SOURCE_DIR: &str = "workdir";
+
+fn fixed_workdir_source_for_attempt(cell_dir: &Path, attempt: &str) -> Result<PathBuf, String> {
+    let mut components = Path::new(attempt).components();
+    let is_one_normal_component = matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(component)), None) if component == OsStr::new(attempt)
+    );
+    if !is_one_normal_component {
+        return Err(format!(
+            "invalid attempt label {attempt:?}: expected exactly one normal path component"
+        ));
+    }
+    Ok(cell_dir.join(FIXED_WORKDIR_SOURCE_DIR).join(attempt))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Population {
@@ -634,6 +649,10 @@ pub struct CellRunSpec {
     pub verification_log_dir: Option<PathBuf>,
     pub sabre_path_evidence: Option<PathBuf>,
     pub cell_dir: PathBuf,
+    #[serde(skip)]
+    attempt: String,
+    #[serde(skip)]
+    fixed_workdir_source: PathBuf,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1096,6 +1115,11 @@ pub fn build_spec(
     attempt: &str,
     seed: Option<i64>,
 ) -> Result<CellRunSpec, String> {
+    // Validate before using the label in the workdir, verdict, log, or evidence
+    // paths. `execute_spec` may remove the workdir, so accepting `..`, an
+    // absolute path, or more than one component would turn a label into a
+    // filesystem target outside this attempt's directory.
+    let fixed_workdir_source = fixed_workdir_source_for_attempt(&dir, attempt)?;
     let backend = cell.id.backend.as_deref().unwrap_or("native");
     let mode_recipe = &cell.test.modes[&cell.id.mode];
     let mut env = execution_cell_env(context, &dir, cell.id.mode != "naked");
@@ -1112,9 +1136,10 @@ pub fn build_spec(
             path.to_string_lossy().into_owned(),
         );
     }
-    // The per-cell empty directory bound to FIXED_GUEST_WORKDIR. `None` disables
-    // the default, and there are exactly two reasons to disable it, both of which
-    // `validate_mode_workdir` already refuses a manifest-declared workdir for:
+    // The per-attempt empty directory bound to FIXED_GUEST_WORKDIR. `None`
+    // disables the default, and there are exactly two reasons to disable it,
+    // both of which `validate_mode_workdir` already refuses a manifest-declared
+    // workdir for:
     //   * a non-Hermit run mode has no `--workdir` to give;
     //   * DBT rebuilds the guest launch from program/args/env only and does NOT
     //     preserve `Command::current_dir`, so binding a workdir it will not honour
@@ -1122,9 +1147,9 @@ pub fn build_spec(
     // Keeping the two in step matters: `append_execution_root_args` applies
     // `isolated_workdir` ahead of everything and bypasses both refusals, which is
     // a pre-existing gap this default must not widen.
-    let fixed_workdir_source = (matches!(cell.id.mode.as_str(), "verify" | "chaos" | "custom")
+    let bound_workdir_source = (matches!(cell.id.mode.as_str(), "verify" | "chaos" | "custom")
         && backend != "dbt")
-        .then(|| dir.join(FIXED_WORKDIR_SOURCE_DIR));
+        .then_some(fixed_workdir_source.as_path());
     let verdict = dir.join(format!("verify-{attempt}.json"));
     let mut verification_log_dir = None;
     let (argv, verdict_path) = match cell.id.mode.as_str() {
@@ -1171,7 +1196,7 @@ pub fn build_spec(
                 &mut argv,
                 context.isolated_workdir.as_deref(),
                 mode_recipe.workdir.as_deref(),
-                fixed_workdir_source.as_deref(),
+                bound_workdir_source,
             );
             append_guest_env_args(&mut argv, &env, context.isolated_workdir.is_some());
             argv.push("--".into());
@@ -1208,7 +1233,7 @@ pub fn build_spec(
                 &mut argv,
                 context.isolated_workdir.as_deref(),
                 mode_recipe.workdir.as_deref(),
-                fixed_workdir_source.as_deref(),
+                bound_workdir_source,
             );
             append_guest_env_args(&mut argv, &env, context.isolated_workdir.is_some());
             argv.push("--".into());
@@ -1243,7 +1268,7 @@ pub fn build_spec(
                 &mut argv,
                 context.isolated_workdir.as_deref(),
                 mode_recipe.workdir.as_deref(),
-                fixed_workdir_source.as_deref(),
+                bound_workdir_source,
             );
             append_guest_env_args(&mut argv, &env, context.isolated_workdir.is_some());
             argv.push("--".into());
@@ -1270,7 +1295,7 @@ pub fn build_spec(
                 &mut argv,
                 context.isolated_workdir.as_deref(),
                 mode_recipe.workdir.as_deref(),
-                fixed_workdir_source.as_deref(),
+                bound_workdir_source,
             );
             argv.push("--".into());
             argv.extend(guest_argv.clone());
@@ -1291,10 +1316,13 @@ pub fn build_spec(
         verification_log_dir,
         sabre_path_evidence,
         cell_dir: dir,
+        attempt: attempt.into(),
+        fixed_workdir_source,
     })
 }
 
-pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, String> {
+pub fn execute_spec(spec: &CellRunSpec) -> Result<AttemptResult, String> {
+    let index = &spec.attempt;
     if spec.argv.is_empty() {
         return Err("empty cell argv".into());
     }
@@ -1307,17 +1335,17 @@ pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, St
     }
     fs::create_dir_all(&tmp).map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
     // Reset the bound working directory the same way and for the same reason as
-    // `tmp`: a cell must not see what the previous attempt left behind. This runs
-    // unconditionally — the directory is cheap, and creating it when the cell did
-    // not ask for a bind is harmless, whereas failing to reset it when the cell DID
-    // would leak state between attempts of a stress repetition.
-    let workdir = spec.cell_dir.join(FIXED_WORKDIR_SOURCE_DIR);
+    // `tmp`: each sequential attempt must start empty, including when rerunning
+    // the cell reuses an attempt label. The attempt component is also required
+    // because concurrent attempts of one cell must not remove or write into each
+    // other's working directories. This runs unconditionally — the directory is
+    // cheap, and creating it when the cell did not ask for a bind is harmless.
+    let workdir = &spec.fixed_workdir_source;
     if workdir.exists() {
-        fs::remove_dir_all(&workdir)
+        fs::remove_dir_all(workdir)
             .map_err(|e| format!("cannot reset {}: {e}", workdir.display()))?;
     }
-    fs::create_dir_all(&workdir)
-        .map_err(|e| format!("cannot create {}: {e}", workdir.display()))?;
+    fs::create_dir_all(workdir).map_err(|e| format!("cannot create {}: {e}", workdir.display()))?;
     let captures = spec.cell_dir.join("captures");
     fs::create_dir_all(&captures).map_err(|e| e.to_string())?;
     let stdout_path = captures.join(format!("{}-{index}.stdout", spec.id.mode));
@@ -1679,12 +1707,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
                     &index.to_string(),
                     None,
                 )?;
-                attempts.push(execute_observed(
-                    &spec,
-                    &index.to_string(),
-                    &cell.test.observation,
-                    &dir,
-                )?);
+                attempts.push(execute_observed(&spec, &cell.test.observation, &dir)?);
             }
         }
         "chaos" => {
@@ -1705,12 +1728,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
                     &index,
                     Some(*seed),
                 )?;
-                attempts.push(execute_observed(
-                    &spec,
-                    &index,
-                    &cell.test.observation,
-                    &dir,
-                )?);
+                attempts.push(execute_observed(&spec, &cell.test.observation, &dir)?);
             }
         }
         "custom" => {
@@ -1723,17 +1741,12 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
                     &index.to_string(),
                     None,
                 )?;
-                attempts.push(execute_observed(
-                    &spec,
-                    &index.to_string(),
-                    &cell.test.observation,
-                    &dir,
-                )?);
+                attempts.push(execute_observed(&spec, &cell.test.observation, &dir)?);
             }
         }
         _ => {
             let spec = build_spec(context, cell, dir.clone(), guest.clone(), "1", None)?;
-            attempts.push(execute_observed(&spec, "1", &cell.test.observation, &dir)?);
+            attempts.push(execute_observed(&spec, &cell.test.observation, &dir)?);
         }
     }
     let hashes = attempts
@@ -2427,8 +2440,8 @@ fn require_minimal_base_env(argv: &mut Vec<String>) -> Result<(), String> {
 ///   1. `isolated_workdir` — the hermetic lane's fresh tmpfs at `/test`, enabled by
 ///      `HERMIT_E2E_EMPTY_WORKDIR` from `ci/hermetic/run-split-validate.sh`.
 ///   2. `requested_workdir` — a workdir the manifest names for itself.
-///   3. `fixed_workdir_source` — the default: bind a fresh per-cell directory at
-///      `FIXED_GUEST_WORKDIR` and chdir into it.
+///   3. `fixed_workdir_source` — the default: bind a fresh per-attempt directory
+///      at `FIXED_GUEST_WORKDIR` and chdir into it.
 ///
 /// ⚠️ (3) IS A STAND-IN FOR (1), NOT THE INTENDED END STATE. Do not read the
 /// default as the design. The design is the hermetic lane's `/test`; the default
@@ -2582,11 +2595,10 @@ fn command_help_contains(program: &Path, args: &[&str], needle: &str) -> bool {
 
 fn execute_observed(
     spec: &CellRunSpec,
-    index: &str,
     observation: &Observation,
     dir: &Path,
 ) -> Result<AttemptResult, String> {
-    let mut attempt = execute_spec(spec, index)?;
+    let mut attempt = execute_spec(spec)?;
     attempt.observation_sha256 = Some(observation_hash(observation, &attempt, dir));
     Ok(attempt)
 }
@@ -2639,6 +2651,55 @@ mod tests {
             slow_reason: None,
             preprocessors: Vec::new(),
         }
+    }
+
+    fn ptrace_cell(mode: &str) -> SelectedCell {
+        let mut test = recipe(true);
+        if mode != "verify" {
+            let mode_recipe = test.modes.remove("verify").unwrap();
+            test.modes.insert(mode.into(), mode_recipe);
+        }
+        SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: test.id.clone(),
+                mode: mode.into(),
+                backend: Some("ptrace".into()),
+            },
+            test,
+            enabled: true,
+        }
+    }
+
+    fn run_context(root: &Path) -> RunContext {
+        RunContext {
+            root: root.into(),
+            hermit_bin: root.join("hermit"),
+            result_root: root.join("results"),
+            build_root: root.join("build"),
+            run_id: "fixture".into(),
+            source_sha: "0".repeat(40),
+            binary_build_sha: None,
+            source_dirty: false,
+            prebuilt: false,
+            keep_logs: false,
+            run_verify_strict: false,
+            record_verify_strict: false,
+            scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
+            isolated_workdir: None,
+        }
+    }
+
+    fn bound_workdir_source(spec: &CellRunSpec) -> PathBuf {
+        let bind = spec
+            .argv
+            .iter()
+            .find_map(|arg| {
+                arg.strip_prefix("--bind=")
+                    .and_then(|arg| arg.strip_suffix(":/tmp/test"))
+            })
+            .expect("default workdir bind is present");
+        PathBuf::from(bind)
     }
 
     #[test]
@@ -3667,8 +3728,10 @@ backends_disabled:
             verification_log_dir: None,
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
+            attempt: "1".into(),
+            fixed_workdir_source: dir.join("workdir/1"),
         };
-        let result = execute_spec(&spec, "1").unwrap();
+        let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
         result
     }
@@ -3709,8 +3772,10 @@ backends_disabled:
             verification_log_dir: None,
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
+            attempt: "1".into(),
+            fixed_workdir_source: dir.join("workdir/1"),
         };
-        let result = execute_spec(&spec, "1").unwrap();
+        let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
         result
     }
@@ -3883,8 +3948,10 @@ backends_disabled:
             verification_log_dir: None,
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
+            attempt: "1".into(),
+            fixed_workdir_source: dir.join("workdir/1"),
         };
-        let result = execute_spec(&spec, "1").unwrap();
+        let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
         result
     }
@@ -4108,18 +4175,18 @@ backends_disabled:
     /// actually regresses — that the three cases which must NOT get it still do not.
     #[test]
     fn fixed_workdir_is_bound_by_default_and_withheld_where_it_would_lie() {
-        let source = Path::new("/cells/x/workdir");
+        let source = Path::new("/cells/x/workdir/attempt-7");
 
         let mut argv: Vec<String> = Vec::new();
         append_execution_root_args(&mut argv, None, None, Some(source));
         assert_eq!(
             argv,
             vec![
-                "--bind=/cells/x/workdir:/tmp/test".to_string(),
+                "--bind=/cells/x/workdir/attempt-7:/tmp/test".to_string(),
                 "--workdir".to_string(),
                 "/tmp/test".to_string(),
             ],
-            "the default must bind a fresh per-cell directory AND chdir into it; \
+            "the default must bind a fresh per-attempt directory AND chdir into it; \
              binding without --workdir leaves the guest in the host's cwd"
         );
 
@@ -4139,6 +4206,138 @@ backends_disabled:
             argv.is_empty(),
             "a cell that cannot honour a workdir must be given none, got {argv:?}"
         );
+    }
+
+    #[test]
+    fn fixed_workdir_bind_is_distinct_for_concurrent_attempts() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-concurrent-workdir-bracket-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let cell_dir = root.join("cell");
+        fs::create_dir_all(&cell_dir).unwrap();
+        let cell = ptrace_cell("verify");
+        let context = run_context(&root);
+        let source_for = |attempt: &str| {
+            let spec = build_spec(
+                &context,
+                &cell,
+                cell_dir.clone(),
+                vec!["/bin/true".into()],
+                attempt,
+                None,
+            )
+            .unwrap();
+            bound_workdir_source(&spec)
+        };
+        let sources = [source_for("1"), source_for("2")];
+        assert_eq!(sources[0], cell_dir.join("workdir/1"));
+        assert_eq!(sources[1], cell_dir.join("workdir/2"));
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(sources.len()));
+        let results = sources.map(|source| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                fs::create_dir_all(&source).unwrap();
+                barrier.wait();
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(source.join("myfile.txt"))
+            })
+        });
+        for result in results {
+            assert!(
+                result.join().unwrap().is_ok(),
+                "concurrent attempts of one cell must not write into the same host directory"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn attempt_labels_must_be_one_normal_path_component() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-attempt-label-bracket-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let cell = ptrace_cell("verify");
+        let context = run_context(&root);
+        let cell_dir = root.join("cell");
+
+        for attempt in [
+            "",
+            ".",
+            "..",
+            "/absolute",
+            "../parent",
+            "parent/child",
+            "normal/",
+        ] {
+            let error = build_spec(
+                &context,
+                &cell,
+                cell_dir.clone(),
+                vec!["/bin/true".into()],
+                attempt,
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error,
+                format!(
+                    "invalid attempt label {attempt:?}: expected exactly one normal path component"
+                )
+            );
+            assert!(
+                !cell_dir.exists(),
+                "an invalid attempt label must be rejected before filesystem operations"
+            );
+        }
+    }
+
+    #[test]
+    fn execute_spec_resets_the_exact_bound_workdir() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-workdir-reset-bracket-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let cell_dir = root.join("cell");
+        let cell = ptrace_cell("custom");
+        let context = run_context(&root);
+        let mut spec = build_spec(
+            &context,
+            &cell,
+            cell_dir.clone(),
+            vec!["/bin/true".into()],
+            "attempt-7",
+            None,
+        )
+        .unwrap();
+        let bound = bound_workdir_source(&spec);
+        assert_eq!(bound, cell_dir.join("workdir/attempt-7"));
+        assert_eq!(bound, spec.fixed_workdir_source);
+
+        fs::create_dir_all(&bound).unwrap();
+        fs::write(bound.join("stale"), b"left by an earlier run").unwrap();
+        spec.argv = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            r#"test -d "$1" && test ! -e "$1/stale" && : > "$1/myfile.txt""#.into(),
+            "sh".into(),
+            bound.to_string_lossy().into_owned(),
+        ];
+
+        let result = execute_spec(&spec).unwrap();
+        assert_eq!(result.index, "attempt-7");
+        assert_eq!(result.outcome, "PASS", "{}", result.stderr);
+        assert!(bound.join("myfile.txt").is_file());
+        assert!(!bound.join("stale").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// THE PRECEDENCE, ASSERTED — a comment can be reordered without anyone noticing.
