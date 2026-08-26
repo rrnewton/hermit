@@ -106,8 +106,8 @@
       "requires_host_capability": "kvm",
       "cmd": "set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the 22 run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); status=0; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)' >\"$log\" 2>&1 || status=$?; cat \"$log\"; ran=$(sed -n 's/^running \\([0-9]\\{1,\\}\\) tests\\{0,1\\}$/\\1/p' \"$log\" | tail -1); if [ \"${ran:-0}\" -ne 22 ]; then printf 'test.cli_kvm: expected 22 run_kvm_ tests to be SELECTED, saw %s. A rename or filter change has shrunk the set; fix the filter or update the expected count deliberately.\\n' \"${ran:-0}\" >&2; rm -f \"$log\"; exit 1; fi; rm -f \"$log\"; exit \"$status\"",
       "deps": ["build.privileged_tests"],
-      "timeout": 900,
-      "hint": {"resources": {"kvm": 1}, "est_duration_s": 330,
+      "timeout": 180,
+      "hint": {"resources": {"kvm": 1}, "est_duration_s": 60,
                "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "cpu-bound"}
     }
