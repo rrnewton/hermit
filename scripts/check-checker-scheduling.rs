@@ -521,6 +521,24 @@ fn in_command_position(before: &str) -> bool {
     // judge what precedes IT; the word test below then rejects the cases where the
     // quote was not opening anything, so no separate rule is needed for that.
     if let Some(rest) = before.strip_suffix('"').or_else(|| before.strip_suffix('\'')) {
+        // ⚠️ ONLY WHEN THE QUOTE OPENS AN EMBEDDED COMMAND, AND THE NARROWNESS IS THE
+        // WHOLE POINT. `agent(hermit-005)` refused an earlier revision of this head for
+        // stripping ANY trailing quote, which readmitted the exact shape hermit#2656
+        // excluded: a runner prefix carried as FIXTURE DATA,
+        //
+        //     "        \"python3 scripts/test_validate_stop_paths.py"
+        //
+        // read as an invocation again, and that fixture is what turned this checker RED
+        // on main at 00:11Z. There the quote is preceded by nothing but indentation. In
+        // a genuine embedded command it is preceded by the operator or bracket that
+        // introduces the literal -- `node.cmd = "./ci/verify-x.sh"` in validate.rs --
+        // so THAT is what is required here, rather than merely "a quote was present".
+        let opener = rest.trim_end();
+        let opens = !opener.is_empty()
+            && opener.ends_with(|c: char| matches!(c, '=' | '(' | ','));
+        if !opens {
+            return false;
+        }
         before = rest;
     }
     // The match must START A WORD. `OUT=./scripts/check-x.sh` is an assignment's
@@ -780,6 +798,13 @@ target/ci/check-exit-status-class --gate";
             "OUT=./scripts/check-z.rs",
             "scripts/check-z.rs",
             "an assignment VALUE read as an invocation",
+        ),
+        (
+            "        \"python3 scripts/test_validate_stop_paths.py",
+            "scripts/test_validate_stop_paths.py",
+            "a runner prefix carried as FIXTURE DATA read as an invocation -- this is \
+             hermit#2656, the P0 that turned this checker red on main, and an earlier \
+             revision of this head reverted it by stripping any trailing quote",
         ),
         (
             "see ./scripts/check-z.rs for details",
