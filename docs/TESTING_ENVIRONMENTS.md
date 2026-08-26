@@ -180,10 +180,18 @@ portable or scheduled validation.
 
 ## Named measurement hosts
 
-`scripts/check-portable-paths.sh` scans `ci/dag/*.json` and refuses a literal
-hostname there. It does **not** scan this file, which is why `devbig030` appears
-unflagged under "KVM memory-hash repeatability" below. So the identity of a
-measurement host belongs here, and the DAG points at it instead of deleting it.
+`scripts/check-portable-paths.sh` refuses a literal hostname in a file that
+**builds or runs** — its scope predicate is `is_build_or_run_file`, and its own
+self-test pins that arbitrary text evidence is deliberately outside it. The harm it
+exists to prevent is a build or a run breaking on another machine; prose cannot do
+that. So this file is out of scope BY DESIGN, and that is what makes it the right
+home for a host identity.
+
+⚠️ **"The scanner does not look here" would NOT be a good enough reason.** Unscanned
+is not the same as permitted, and treating it as such is how a rule gets evaded by
+relocation. The claim above is the stronger one — the scope is deliberate, named and
+tested — and `scripts/check-portable-paths.sh` names this section as the designated
+destination, with a self-test, so the permission is declared rather than inferred.
 
 A measurement whose host is unrecorded cannot be re-run, compared, or challenged.
 Four fixes on 2026-08-25 (#2646, #2647, #2648, #2652) each satisfied the checker by

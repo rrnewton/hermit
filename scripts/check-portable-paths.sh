@@ -102,6 +102,27 @@ self_test() {
         rm -f "$fixture"
         return 1
     fi
+
+    # ⚠️ WHERE A HOST IDENTITY IS SUPPOSED TO GO, DECLARED RATHER THAN INFERRED.
+    # Removing a hostname from a build/run file destroys the provenance of whatever
+    # was measured on it, and a measurement whose host is unrecorded cannot be re-run
+    # or challenged. The designated destination is the "Named measurement hosts"
+    # section of docs/TESTING_ENVIRONMENTS.md. That file is out of scope because it
+    # neither builds nor runs -- NOT because the scanner happens to miss it. The two
+    # assertions below pin that distinction: the destination must stay out of scope,
+    # and the predicate must still say yes to something, so a uniformly-false
+    # predicate cannot pass this test.
+    if is_build_or_run_file docs/TESTING_ENVIRONMENTS.md; then
+        echo "portability self-test: the designated host-provenance file is in scope; \
+move the identities or update the designation" >&2
+        rm -f "$fixture"
+        return 1
+    fi
+    is_build_or_run_file ci/dag/privileged.json || {
+        echo "portability self-test: scope predicate said no to a file it must scan" >&2
+        rm -f "$fixture"
+        return 1
+    }
     rm -f "$fixture"
 }
 
