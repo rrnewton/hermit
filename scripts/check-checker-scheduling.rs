@@ -656,6 +656,32 @@ target/ci/check-exit-status-class --gate";
         "python -c takes SOURCE TEXT; a bare path there executes nothing, so \
          reading it as an invocation is a false SCHEDULED -- the silent direction"
     );
+    // ⚠️ THE MAIN-SIDE BUG THE SPLIT ACTUALLY FIXES, AND IT PREDATES `-c`.
+    // The flat list applied rustc's flags to every runner, and FOUR OF THEM ARE
+    // VALUELESS OPTIONS IN BASH -- verified by running them: `bash -m`, `bash -l`,
+    // `bash -C`, `bash -D` are all accepted with no argument. Treating them as
+    // value-taking makes the scan skip the SCRIPT as though it were the flag's
+    // value, so a checker genuinely scheduled as `bash -m scripts/check-x.sh`
+    // reads as an ORPHAN. Note `-m` is correctly value-taking for PYTHON
+    // (`python -m module`), which is precisely why one list could not serve both.
+    assert!(
+        is_invoked("bash -m scripts/check-x.sh", "scripts/check-x.sh"),
+        "-m is monitor mode in bash and takes no value; skipping the token after \
+         it hides the script and reports a false ORPHAN"
+    );
+    assert!(
+        is_invoked("bash -l scripts/check-x.sh", "scripts/check-x.sh"),
+        "-l is login shell in bash and takes no value"
+    );
+    assert!(
+        is_invoked("sh -C scripts/check-x.sh", "scripts/check-x.sh"),
+        "-C is noclobber in sh and takes no value; -C is rustc codegen, which is \
+         the collision that made a single table unserviceable"
+    );
+    assert!(
+        is_invoked("python3 -m scripts.check_x scripts/check-x.py", "scripts/check-x.py"),
+        "-m IS value-taking for python, so the module name must not hide the path"
+    );
     // A shell option name is a value and must still be skipped.
     assert!(
         is_invoked("bash -o pipefail scripts/check-x.sh", "scripts/check-x.sh"),
