@@ -531,6 +531,39 @@ fn repro_check(
     worst
 }
 
+/// Is `root` the PRIMARY checkout of its repository, rather than a linked worktree?
+///
+/// ⚠️ THIS ASKS GIT INSTEAD OF COMPARING A PATH, AND THE PATH VERSION WAS A DEFECT.
+/// An earlier revision compared `root` against a hardcoded absolute path under one
+/// developer's home directory. That is wrong twice over: it fires on ONE machine
+/// for ONE user, so everywhere
+/// else the guard silently does not exist while the operator believes it does —
+/// worse than no guard — and a literal home directory fails
+/// `scripts/check-portable-paths.sh`, which is how it was caught (rc=0 on main,
+/// rc=1 with that line). Found by the claude lane on hermit#2696.
+///
+/// The primary/worktree split is a git fact, not a location. A linked worktree's
+/// `--git-dir` points inside the primary's `.git/worktrees/<name>` while its
+/// `--git-common-dir` points at the primary's `.git`; in the primary the two are
+/// the same directory. Measured on both:
+///
+/// ```text
+/// primary          --git-dir .../hermit/.git                    == --git-common-dir
+/// linked worktree  --git-dir .../hermit/.git/worktrees/hermit10 != --git-common-dir
+/// ```
+///
+/// ⚠️ FAIL SAFE, NOT OPEN. If git cannot answer, this returns `true` — treat the
+/// checkout as the primary and refuse. The alternative would let a broken git turn
+/// the guard off silently, which is the failure this whole function exists to stop.
+fn is_primary_checkout(root: &Path) -> bool {
+    let dir = git(root, &["rev-parse", "--absolute-git-dir"]);
+    let common = git(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    match (dir, common) {
+        (Ok(dir), Ok(common)) => dir == common,
+        _ => true,
+    }
+}
+
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     let out = Command::new("git")
         .current_dir(root)
@@ -909,7 +942,7 @@ fn main() {
             Err(e) => fail(&format!("cannot read git status: {e}")),
             _ => {}
         }
-        if root == Path::new("/home/newton/work/dev-hermit/hermit") {
+        if is_primary_checkout(&root) {
             fail(
                 "REFUSED: this is the shared primary hermit checkout. Bisecting here would \
                  move it under every other agent. Allocate a worktree slot and run there.",
@@ -1049,6 +1082,56 @@ fn self_test() -> i32 {
     // is safer but equally useless.
     if fold(1, &pass()) == Verdict::Unselected {
         bad.push("control: a real passing cell must NOT read as UNSELECTED".into());
+    }
+
+    // ── The two refusals that guard `bisect`, which CHECKS OUT COMMITS ──────────
+    // ⚠️ A REFUSAL BRACKET MUST ASSERT THE MESSAGE, and neither of these had one.
+    // Both guards shipped unbracketed in the first revision of this change, and the
+    // consequence was immediate: the shared-primary guard was written as a literal
+    // home directory, so it fired on one machine and silently did not exist
+    // anywhere else. A bracket that ran the predicate would have caught that before
+    // `check-portable-paths.sh` did. Found by the claude lane on hermit#2696.
+    //
+    // These exercise the PREDICATE, not `fail()`, because `fail` exits the process
+    // and a self-test cannot survive it. The predicate is the part that can be
+    // wrong; the message beside it is asserted so a reword cannot silently retarget
+    // the guard.
+    {
+        // The primary of this repository, whatever machine this is running on.
+        let here = repo_root();
+        let common = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&here)
+            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim().to_string()));
+        if let Some(common) = common {
+            // `<primary>/.git` -> `<primary>`.
+            if let Some(primary) = common.parent() {
+                if !is_primary_checkout(primary) {
+                    bad.push(
+                        "the shared-primary guard must RECOGNISE the primary checkout".into(),
+                    );
+                }
+                // ⚠️ THE CONTROL, and it is the half the literal path failed. This
+                // file is being tested FROM a linked worktree in CI as often as not,
+                // so a guard that only ever answers "yes" would satisfy the case
+                // above and still be useless.
+                if here != primary && is_primary_checkout(&here) {
+                    bad.push(
+                        "control: the shared-primary guard must NOT fire in a linked worktree"
+                            .into(),
+                    );
+                }
+            }
+        }
+        // ⚠️ AND FAIL SAFE: an unreadable repository must READ AS the primary, so a
+        // broken git refuses rather than silently disarming the guard.
+        if !is_primary_checkout(Path::new("/nonexistent-checkout-for-bisect-probe-self-test")) {
+            bad.push("a checkout git cannot read must be treated as the primary".into());
+        }
     }
     if probe_rc(&[Verdict::Pass, Verdict::Pass]) != RC_OK {
         bad.push("control: an all-pass probe must exit 0".into());
