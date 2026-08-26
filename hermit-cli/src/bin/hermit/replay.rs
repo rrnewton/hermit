@@ -18,6 +18,8 @@ use reverie::process::ExitStatus;
 
 use super::container::deterministic_container;
 use super::container::with_container;
+use super::gdb_client::CLIENT_EXITED_BEFORE_CONNECTING;
+use super::gdb_client::GdbClientWatch;
 use super::global_opts::GlobalOpts;
 
 /// Command-line options for the "replay" subcommand.
@@ -88,7 +90,7 @@ impl ReplayOpts {
             for ex in &self.gdbex {
                 gdb_command.arg("-ex").arg(ex);
             }
-            let mut gdb_client = gdb_command
+            let gdb_client = gdb_command
                 .spawn()
                 .context("Failed to run gdb command. Please make sure it is in your $PATH.")?;
 
@@ -97,12 +99,25 @@ impl ReplayOpts {
             // to initialize logging inside the container because it may spawn a
             // thread. If we can guarantee that tracing won't spawn a thread, then
             // that restriction be lifted.
+            // Same unbounded accept as the record path: the client is spawned
+            // before the container that binds the port, so a client that dies
+            // early leaves the gdbserver waiting for a peer that cannot arrive.
+            // This file's `wait()` WAS reached on every path -- the result is
+            // bound rather than `?`-propagated -- so it never leaked a zombie;
+            // the hang is upstream of that wait and affects it just the same.
+            let mut gdb_watch = GdbClientWatch::spawn(gdb_client, self.gdbserver_port);
             let (mut container, _identity_guard) = deterministic_container()?;
             let result = with_container(&mut container, || {
                 self.container_main(global, self.autopilot, &hermit, id)
             });
-            let _ = gdb_client.wait();
-            result
+            let client_exited_early = gdb_watch.finish();
+            match result {
+                Ok(status) => Ok(status),
+                Err(error) if client_exited_early => {
+                    Err(error.context(CLIENT_EXITED_BEFORE_CONNECTING))
+                }
+                Err(error) => Err(error),
+            }
         }
     }
 
