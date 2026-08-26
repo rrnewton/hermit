@@ -122,7 +122,9 @@ def compile_guest(name: str, out_dir: Path) -> Path:
     return output
 
 
-def hermit_command(hermit: Path, e9: bool, verify: bool, guest: Path) -> list[str]:
+def hermit_command(
+    hermit: Path, e9: bool, verify: bool, guest: Path, host_tmp: Path
+) -> list[str]:
     command = [str(hermit)]
     if e9:
         command.extend(["--backend", "e9patch"])
@@ -130,10 +132,7 @@ def hermit_command(hermit: Path, e9: bool, verify: bool, guest: Path) -> list[st
     command.append("--strict")
     if verify:
         command.append("--verify")
-    # Guests are compiled into a temp dir under host /tmp; --tmp=/tmp keeps
-    # Hermit from replacing the guest's /tmp so the binary path resolves
-    # (mirrors run_matrix.py).
-    command.append("--tmp=/tmp")
+    command.append(f"--tmp={host_tmp}")
     command.extend(["--", str(guest)])
     return command
 
@@ -148,7 +147,9 @@ def run(command: list[str], timeout: int) -> tuple[int, bytes, bytes]:
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def detlog_syscalls(hermit: Path, e9: bool, guest: Path) -> list[str]:
+def detlog_syscalls(
+    hermit: Path, e9: bool, guest: Path, host_tmp: Path
+) -> list[str]:
     """Canonical guest-syscall sequence from a --log=info plain --strict run.
 
     Uses the "inbound syscall:" lines (they include exit_group, which has no
@@ -159,7 +160,7 @@ def detlog_syscalls(hermit: Path, e9: bool, guest: Path) -> list[str]:
     if e9:
         command.extend(["--backend", "e9patch"])
     command.extend(
-        ["--log=info", "run", "--strict", "--tmp=/tmp", "--", str(guest)]
+        ["--log=info", "run", "--strict", f"--tmp={host_tmp}", "--", str(guest)]
     )
     _, _, stderr = run(command, timeout=60)
     lines: list[str] = []
@@ -203,10 +204,29 @@ def run_guest(hermit: Path, name: str, out_dir: Path) -> tuple[str, str]:
     expected_exit, expected_stdout = CORPUS[name]
     guest = compile_guest(name, out_dir)
 
-    gx, gout, _ = run(hermit_command(hermit, False, False, guest), timeout=40)
-    _, _, gv = run(hermit_command(hermit, False, True, guest), timeout=60)
-    ex, eout, eerr = run(hermit_command(hermit, True, False, guest), timeout=60)
-    _, _, ev = run(hermit_command(hermit, True, True, guest), timeout=90)
+    sequence = 0
+
+    def host_tmp(label: str) -> Path:
+        nonlocal sequence
+        sequence += 1
+        path = out_dir / "host-tmp" / f"{name}-{label}-{sequence}"
+        path.mkdir(parents=True)
+        return path
+
+    gx, gout, _ = run(
+        hermit_command(hermit, False, False, guest, host_tmp("golden")), timeout=40
+    )
+    _, _, gv = run(
+        hermit_command(hermit, False, True, guest, host_tmp("golden-verify")),
+        timeout=60,
+    )
+    ex, eout, eerr = run(
+        hermit_command(hermit, True, False, guest, host_tmp("e9patch")), timeout=60
+    )
+    _, _, ev = run(
+        hermit_command(hermit, True, True, guest, host_tmp("e9patch-verify")),
+        timeout=90,
+    )
 
     if gx == 124 or ex == 124:
         return "FAIL", f"timeout (golden={gx}, e9patch={ex})"
@@ -237,8 +257,8 @@ def run_guest(hermit: Path, name: str, out_dir: Path) -> tuple[str, str]:
     if b0 != 0:
         return "FAIL", f"b0_sites={b0} (SIGILL signal fallback rejected)"
 
-    golden_seq = detlog_syscalls(hermit, False, guest)
-    e9_seq = detlog_syscalls(hermit, True, guest)
+    golden_seq = detlog_syscalls(hermit, False, guest, host_tmp("golden-detlog"))
+    e9_seq = detlog_syscalls(hermit, True, guest, host_tmp("e9patch-detlog"))
     prologue = len(e9_seq) - len(golden_seq)
     if prologue < 0 or e9_seq[prologue:] != golden_seq:
         return "FAIL", (

@@ -883,9 +883,9 @@ pub enum LockOutcome {
     /// The metadata guard itself could not be established. Proceeding would
     /// disable the primary exclusion guarantee, so the caller must fail closed.
     SafetyRefusal(String),
-    /// The lock could not be created at all (unwritable `target/`); the caller
-    /// proceeds, because refusing every run over a lock-file hiccup would be a
-    /// worse outage than the concurrency it guards.
+    /// The lock could not be created at all (for example, unwritable `target/`).
+    /// The caller must refuse; proceeding would run against shared output with
+    /// no exclusion.
     Unavailable(String),
 }
 

@@ -281,6 +281,17 @@ class Fixtures:
     def __init__(self, root: Path) -> None:
         self.root = root
         self._binaries: dict[str, Path] = {}
+        self._host_tmp_sequence = 0
+
+    def host_tmp(self, backend: str, name: str) -> Path:
+        self._host_tmp_sequence += 1
+        path = (
+            self.root
+            / "host-tmp"
+            / f"{backend}-{name}-{self._host_tmp_sequence}"
+        )
+        path.mkdir(parents=True)
+        return path
 
     def binary(self, name: str) -> Path:
         if name in self._binaries:
@@ -618,6 +629,7 @@ def hermit_command(
     guest: list[str],
     name: str,
     strict: bool,
+    host_tmp: Path,
     verify: bool = False,
     verify_json: Path | None = None,
 ) -> list[str]:
@@ -648,7 +660,7 @@ def hermit_command(
         [
             "--base-env=minimal",
             "--max-timeslice=disabled",
-            "--tmp=/tmp",
+            f"--tmp={host_tmp}",
         ]
     )
     if backend == "ptrace" and name != "cpuid_policy":
@@ -806,10 +818,11 @@ def capture_ptrace_reference(
     strict: bool,
     expected_status: int,
     expected_stdout: bytes | None,
+    host_tmp: Path,
 ) -> tuple[bytes | None, str, bool]:
     """Capture the plain-run ptrace stdout used as the cross-backend reference."""
     reference = run_with_timeout(
-        hermit_command(hermit, "ptrace", guest, name, strict)
+        hermit_command(hermit, "ptrace", guest, name, strict, host_tmp)
     )
     if reference is None:
         return None, "ptrace reference timed out", False
@@ -987,6 +1000,7 @@ def run_case_verify(
     guest: list[str],
     expected_status: int,
     expected_l2: str,
+    host_tmp: Path,
     evidence: dict[str, str] | None = None,
 ) -> tuple[str, str, float]:
     """Verification probe: one `hermit run --strict --verify` invocation.
@@ -1008,6 +1022,7 @@ def run_case_verify(
             guest,
             name,
             strict=True,
+            host_tmp=host_tmp,
             verify=True,
             verify_json=verdict_path,
         )
@@ -1138,7 +1153,14 @@ def run_case(
         guest = [*guest, "--kvm"]
     if verify:
         return run_case_verify(
-            hermit, backend, name, guest, expected_status, expected_l2, evidence
+            hermit,
+            backend,
+            name,
+            guest,
+            expected_status,
+            expected_l2,
+            fixtures.host_tmp(backend, f"{name}-verify"),
+            evidence,
         )
     baseline: bytes | None = None
     started = time.monotonic()
@@ -1155,7 +1177,13 @@ def run_case(
             reference_problem,
             reference_blocked,
         ) = capture_ptrace_reference(
-            hermit, reference_guest, name, strict, expected_status, expected_stdout
+            hermit,
+            reference_guest,
+            name,
+            strict,
+            expected_status,
+            expected_stdout,
+            fixtures.host_tmp("ptrace", f"{name}-reference"),
         )
         if evidence is not None:
             evidence.update(stdout_parity_evidence(None, reference_stdout))
@@ -1178,7 +1206,14 @@ def run_case(
         else None
     )
     for iteration in range(RUNS):
-        command = hermit_command(hermit, backend, guest, name, strict)
+        command = hermit_command(
+            hermit,
+            backend,
+            guest,
+            name,
+            strict,
+            fixtures.host_tmp(backend, f"{name}-run-{iteration + 1}"),
+        )
         result = run_with_timeout(command)
         if result is None:
             return "FAIL", f"run {iteration + 1} timed out", time.monotonic() - started
