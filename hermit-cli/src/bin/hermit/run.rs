@@ -2258,6 +2258,42 @@ fn validate_e9patch_mount_target(path: &Path) -> Result<(), Error> {
 
 /// Create two logging destinations and two global configs. Returns non-zero exit
 /// status if there was a difference in any component of the output.
+/// The status flags on hermit's own stderr, or `None` if they cannot be read.
+///
+/// Read once before the first verification run so the second can be handed the
+/// same starting state. `None` is not an error: an unreadable descriptor simply
+/// means there is nothing to restore, and a verification must not fail over
+/// housekeeping.
+fn stderr_status_flags() -> Option<libc::c_int> {
+    // SAFETY: `F_GETFL` reads flags from an existing descriptor and writes no
+    // memory. Fd 2 is valid for the life of the process.
+    let flags = unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_GETFL) };
+    if flags < 0 { None } else { Some(flags) }
+}
+
+/// Put stderr's status flags back to what the first run was handed.
+///
+/// ⚠️ ONLY WHEN THEY ACTUALLY CHANGED. An unconditional `F_SETFL` would be a
+/// write on a descriptor hermit does not own whenever nothing moved, and the
+/// common case is that nothing moved. Comparing first keeps this inert on every
+/// run except the one it exists for.
+fn restore_stderr_status_flags(before: Option<libc::c_int>) {
+    let Some(before) = before else {
+        return;
+    };
+    let Some(now) = stderr_status_flags() else {
+        return;
+    };
+    if now == before {
+        return;
+    }
+    // SAFETY: `F_SETFL` sets flags on an existing descriptor and writes no
+    // memory. The value is one this same descriptor reported earlier.
+    unsafe {
+        libc::fcntl(libc::STDERR_FILENO, libc::F_SETFL, before);
+    }
+}
+
 impl RunOpts {
     /// Point this run at an OCI image rootfs, as `--image` does.
     ///
@@ -3428,6 +3464,10 @@ impl RunOpts {
         let (log1_file, log1_path) = log1.into_parts();
         let (log2_file, log2_path) = log2.into_parts();
 
+        // Captured BEFORE run 1 so the same value can be put back before run 2.
+        // See the restore call below for the measurement this exists for.
+        let stderr_flags_before_run1 = stderr_status_flags();
+
         eprintln!(":: {}", "Run1...".yellow().bold());
 
         let mut out1: Output = match self.run_verify(log1_file, global) {
@@ -3507,6 +3547,34 @@ impl RunOpts {
             }
             return Err(Error::msg(format!("First run during --verify {status}")));
         }
+
+        // ⚠️ THE TWO RUNS MUST START FROM IDENTICAL fd STATE, AND WITHOUT THIS
+        // THEY DO NOT. Both runs inherit hermit's OWN stderr, so a guest that
+        // mutates its status flags leaves run 2 starting from state run 1
+        // created -- and the comparison then reports the guest as
+        // nondeterministic when the guest was identical both times.
+        //
+        // MEASURED 2026-08-26 on `run --backend kvm --strict --verify --
+        // /usr/bin/awk 'BEGIN { print 42 }'`: awk sets O_APPEND on fd 2 only
+        // when it is not already set, so
+        //     run 1  fcntl(2, F_GETFL) = 32769  -> fcntl(2, F_SETFL, 33793)
+        //     run 2  fcntl(2, F_GETFL) = 33793  -> no SETFL at all
+        // One extra syscall in run 1 (161 vs 160), which shifts every later
+        // record by one and reported TWENTY mismatches for ONE divergence.
+        // Drop that single record and the two sequences are byte-identical.
+        //
+        // The one-line demonstration, before this fix: `2>file` gave rc=125
+        // and 20 mismatches; `2>>file` -- the same run with O_APPEND already
+        // set, so awk skips the SETFL in BOTH runs -- gave rc=0 and 0
+        // mismatches. One bit on one descriptor decided the verdict.
+        //
+        // ⚠️ RESTORE, DO NOT SANITISE. Clearing the flags outright would change
+        // what the guest observes; this puts back exactly what run 1 was
+        // handed, so run 2 sees the same starting state and nothing else moves.
+        // Best-effort by construction: if the flags cannot be read or restored
+        // we leave the descriptor alone rather than fail a verification over
+        // housekeeping, and the comparison reports the divergence as before.
+        restore_stderr_status_flags(stderr_flags_before_run1);
 
         eprintln!(":: {}", "Run2...".yellow().bold());
         let mut out2 = match self.run_verify(log2_file, global) {
