@@ -3210,31 +3210,13 @@ impl RunOpts {
             return validate_executable(requested, requested, None);
         }
 
-        // ⚠️ SAME FAULT AS THE ABSOLUTE-PATH BRANCH ABOVE, SO THE SAME CODE.
-        // The guest program is not there. Whether the caller spelled it as an
-        // absolute path or as a bare name is a property of the COMMAND LINE, not
-        // of the failure, and it was deciding the exit code: `/nope/x` gave 127
-        // with class=guest-program-not-found while `nope-x` gave 125 with
-        // class=cli-error. A caller scripting on the code got either for the same
-        // mistake with no way to predict which.
-        //
-        // ⚠️ AND 125 IS NOT FREE. `bin/safehermit` sets rc=125 when a run is
-        // cgroup-killed at the log byte cap -- "A distinct code, because 255 tells
-        // a caller nothing about WHY". Under that wrapper a mistyped program name
-        // was indistinguishable from a run killed for producing too much output.
-        // 127 is the GNU convention for command-not-found and is what the
-        // absolute branch already returns, so this joins it rather than minting a
-        // third code.
-        let resolved = command
-            .find_program()
-            .with_context(|| {
-                format!(
-                    "Could not resolve program {:?} in the guest PATH. Check PATH or use an absolute \
-                     executable path.",
-                    requested
-                )
-            })
-            .map_err(|error| error.context(GuestProgramFault::NotFound))?;
+        let resolved = command.find_program().with_context(|| {
+            format!(
+                "Could not resolve program {:?} in the guest PATH. Check PATH or use an absolute \
+                 executable path.",
+                requested
+            )
+        })?;
         validate_executable(&resolved, requested, None)
     }
 
