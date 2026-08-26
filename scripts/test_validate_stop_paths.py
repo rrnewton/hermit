@@ -440,7 +440,10 @@ def run_signal(
             VALIDATE_STOP_TEST_PRIOR_FAILURE="1" if prior_failure else "0",
         )
         with log.open("wb") as output:
-            assert env.get("HERMIT_VALIDATE_STOP_TEST_MODE") == "1"
+            if env.get("HERMIT_VALIDATE_STOP_TEST_MODE") != "1":
+                raise AssertionError(
+                    "HERMIT_VALIDATE_STOP_TEST_MODE must be 1 before launching validate"
+                )
             process = subprocess.Popen(
                 [str(VALIDATE), "full"],
                 cwd=ROOT,
@@ -615,7 +618,10 @@ def run_cleanup_signal_race() -> None:
             VALIDATE_STOP_TEST_CLEANUP_DELAY_SECONDS="1",
         )
         with log.open("wb") as output:
-            assert env.get("HERMIT_VALIDATE_STOP_TEST_MODE") == "1"
+            if env.get("HERMIT_VALIDATE_STOP_TEST_MODE") != "1":
+                raise AssertionError(
+                    "HERMIT_VALIDATE_STOP_TEST_MODE must be 1 before launching validate"
+                )
             process = subprocess.Popen(
                 [str(VALIDATE), "full"],
                 cwd=ROOT,
