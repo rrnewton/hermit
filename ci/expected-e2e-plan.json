@@ -81,6 +81,20 @@
       "backend": "ptrace",
       "category": "backend-parity-c",
       "lane": "portable",
+      "mode": "custom",
+      "test": "backend-parity-c/environment-and-workdir"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/environment-and-workdir"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
       "mode": "verify",
       "test": "backend-parity-c/epoll-pwait2"
     },
