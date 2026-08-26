@@ -176,6 +176,22 @@ struct OpenFileDescription {
     /// wrong. Only the second is a reason to refuse `vfork`.
     #[serde(default)]
     flock_mode_ever_known: bool,
+    /// Whether `status_flags` describes the kernel state.
+    ///
+    /// A description Detcore created through an intercepted syscall knows its
+    /// own flags. The container's stdin/stdout/stderr existed before Detcore
+    /// began observing the guest, so `setup_stdio` has to register them with a
+    /// placeholder; this bit says so, and the first `F_GETFL` adopts the
+    /// kernel's answer as the model's starting point. Same distinction, and the
+    /// same reason, as `flock_mode_known` directly above.
+    #[serde(default = "default_true")]
+    status_flags_observed: bool,
+}
+
+/// Serde default for fields whose absence means "yes" (an older record was
+/// written before the field existed, by a path that did know the value).
+fn default_true() -> bool {
+    true
 }
 
 impl PartialEq for DetFd {
@@ -225,6 +241,7 @@ impl DetFd {
                 flock_mode: None,
                 flock_mode_known: true,
                 flock_mode_ever_known: true,
+                status_flags_observed: true,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
             })),
@@ -633,6 +650,38 @@ impl DetFd {
     pub(crate) fn flock_mode_may_be_stale(&self) -> bool {
         let description = self.description();
         description.flock_mode_ever_known && !description.flock_mode_known
+    }
+
+    /// Record that Detcore never observed this description's status flags, so
+    /// the registered value is a placeholder rather than the kernel's.
+    pub(crate) fn mark_status_flags_unobserved(&self) {
+        self.description().status_flags_observed = false;
+    }
+
+    /// Whether [`Self::status_flags`] reflects a value Detcore actually saw.
+    pub(crate) fn status_flags_observed(&self) -> bool {
+        self.description().status_flags_observed
+    }
+
+    /// Adopt the kernel's answer as the model's starting point for a
+    /// description whose flags Detcore had not yet observed.
+    pub(crate) fn observe_status_flags(&self, flags: i32) {
+        let mut description = self.description();
+        description.status_flags = flags & !OFlag::O_CLOEXEC.bits();
+        description.status_flags_observed = true;
+    }
+
+    /// Update the GUEST-VISIBLE status flags for every alias of this open file
+    /// description without touching Detcore's physical nonblocking state.
+    ///
+    /// This is the counterpart of [`Self::set_status_flags`] for a request that
+    /// deliberately never reached the kernel. `set_status_flags` also rewrites
+    /// `physically_nonblocking`, which is only correct when the physical
+    /// descriptor really was changed; claiming it here would tell the scheduler
+    /// an fd is nonblocking when the kernel still says otherwise, and a read
+    /// that should have been nonblockized would block instead.
+    pub(crate) fn set_logical_status_flags(&self, flags: i32) {
+        self.description().status_flags = flags & !OFlag::O_CLOEXEC.bits();
     }
 }
 
