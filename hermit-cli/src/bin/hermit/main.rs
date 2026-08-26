@@ -179,6 +179,7 @@ use self::analyze::AnalyzeOpts;
 use self::bisect::BisectOpts;
 use self::container::ContainerChildExit;
 use self::container::ContainerChildPanic;
+use self::container::PolicyRefusal;
 use self::global_opts::GlobalOpts;
 use self::instruction_map::InstructionMapOpts;
 use self::logdiff::LogDiffCLIOpts;
@@ -447,6 +448,13 @@ fn main() {
 /// positions are consistent: the code channel exists to tell hermit's failures
 /// apart from the guest's, not to subdivide hermit's own.
 fn failure_exit_code(error: &Error) -> i32 {
+    // ⚠️ A REFUSAL IS NOT A FAILURE, AND IT IS CHECKED FIRST FOR THAT REASON.
+    // A fail-closed policy stopping the run is hermit working; reporting it as
+    // HERMIT_INTERNAL_FAILURE_EXIT tells the operator to file a bug against a
+    // shutdown path that behaved exactly as designed.
+    if error.downcast_ref::<PolicyRefusal>().is_some() {
+        return detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
+    }
     match error.downcast_ref::<GuestProgramFault>() {
         Some(fault) => fault.exit_code(),
         None => HERMIT_INTERNAL_FAILURE_EXIT,
@@ -454,6 +462,16 @@ fn failure_exit_code(error: &Error) -> i32 {
 }
 
 fn classify_failure(error: &Error) -> String {
+    // ⚠️ REFUSAL BEFORE FAILURE. This arm and the ContainerChildExit arm below
+    // describe the SAME observation -- a container child that exited -- and
+    // only the status separates them. Ordering matters: a refusal that fell
+    // through to the arm below would be reported as an accident, which is the
+    // defect this exists to remove.
+    if error.downcast_ref::<PolicyRefusal>().is_some() {
+        // NOT HERMIT_INTERNAL_FAILURE: hermit did not fail. It refused, on
+        // purpose, and printed why immediately above this line.
+        return "HERMIT_POLICY_REFUSAL class=policy-refusal".to_string();
+    }
     // ONE discriminant, read once, covering all three flattenings.
     if let Some(ContainerChildExit(status)) = error.downcast_ref::<ContainerChildExit>() {
         // The child died with a status IT DID NOT CHOOSE: a kill, a fault, a

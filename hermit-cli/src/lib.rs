@@ -158,10 +158,18 @@ pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
 // must not invent its own reading of it.
 //
 //   0          success.
-//   1 ..= 122  THE GUEST'S OWN STATUS, passed through untouched. `1` is the
+//   1 ..= 121  THE GUEST'S OWN STATUS, passed through untouched. `1` is the
 //              commonest of these, which is why hermit must never use it.
-//              (The range stops at 122 because 123 is reserved below; a guest
+//              (The range stops at 121 because 122 is reserved below; a guest
 //              may still CHOOSE any value, see the caveat at the end.)
+//   122        HERMIT_POLICY_REFUSAL_EXIT -- hermit REFUSED the run under a
+//              fail-closed policy. Hermit WORKED; the run was stopped on
+//              purpose and the reason was printed. Distinct from 125 because
+//              "hermit refused" and "hermit broke" demand opposite responses:
+//              read the refusal and change your program or flags, versus file a
+//              bug. Defined in `detcore-model` because `detcore` emits it and
+//              this crate recognises it, and that is the only crate both
+//              depend on.
 //   123        DO NOT USE. dev-hermit's `bin/safehermit` LOG BYTE CAP kill.
 //              It moved here FROM 125 so it would stop colliding with the line
 //              below; taking 123 back would undo that.
