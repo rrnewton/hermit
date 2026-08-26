@@ -102,9 +102,12 @@ impl ReplayOpts {
             // Same unbounded accept as the record path: the client is spawned
             // before the container that binds the port, so a client that dies
             // early leaves the gdbserver waiting for a peer that cannot arrive.
-            // This file's `wait()` WAS reached on every path -- the result is
-            // bound rather than `?`-propagated -- so it never leaked a zombie;
-            // the hang is upstream of that wait and affects it just the same.
+            // ⚠️ AN EARLIER COMMENT HERE CLAIMED THIS FILE "never leaked a
+            // zombie" because its `wait()` was reached on every path. THAT WAS
+            // FALSE: `deterministic_container()?` sits between the spawn and
+            // that wait, so an error there skipped it exactly as
+            // `record_start.rs` did. Both files leaked; measured by
+            // `agent(codex-rev-2654)`. The watch's `Drop` covers both.
             let mut gdb_watch = GdbClientWatch::spawn(gdb_client, self.gdbserver_port);
             let (mut container, _identity_guard) = deterministic_container()?;
             let result = with_container(&mut container, || {
