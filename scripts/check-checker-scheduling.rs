@@ -339,28 +339,52 @@ fn runner_flag_path(text: &str, path: &str) -> bool {
     const RUNNERS: [&str; 5] = ["python3", "python", "bash", "sh", "rustc"];
     /// Flags whose VALUE is the next token, so that token is never the script.
     ///
-    /// ⚠️ THE ORIGINAL NOTE HERE HAD THE RISK BACKWARDS, and that is why this list
-    /// exists rather than being avoided. It said naming these "is a guess -- and a
-    /// wrong guess here fails in the silent direction". Both ways of being wrong
-    /// were checked, and neither does:
+    /// ⚠️ ONE TABLE CANNOT SERVE FIVE RUNNERS, AND SHARING IT WAS WRONG IN BOTH
+    /// DIRECTIONS AT ONCE. Every entry in the old shared list was chosen for
+    /// rustc and then applied to `bash`, `sh`, `python` and `python3` too.
+    /// Measured 2026-08-26 by running each runner against a real script:
     ///
-    ///   * OVER-marking (listing a flag that takes no value): the scan skips one
-    ///     token too many, lands past the script, and reports a FALSE ORPHAN --
-    ///     loud, and one line to fix.
-    ///   * UNDER-marking (the state before this list): the scan stops ON the
-    ///     value, so `rustc -o <checker> in.rs` reads an OUTPUT as an invocation
-    ///     and reports a FALSE "SCHEDULED" -- silent, and it defeats the guard.
+    ///   bash -l x.sh      RAN          `-l` is a login shell and takes NO value,
+    ///   sh   -l x.sh      RAN          but rustc's `-l` links a library and DOES.
+    ///                                  Sharing it skipped the script: false ORPHAN.
+    ///   bash -c x.sh      RAN          the shells EXECUTE the token after `-c`...
+    ///   sh   -c x.sh      RAN
+    ///   python3 -c x.sh   SyntaxError  ...while python treats it as code and never
+    ///                                  runs it. ONE FLAG, OPPOSITE CORRECTNESS.
     ///
-    /// So omitting the list is the silent failure and having it is the loud one.
-    /// Both directions are pinned in `self_test`.
-    const VALUE_FLAGS: [&str; 18] = [
-        // rustc
+    /// So the tables are per runner, and every entry below was measured rather
+    /// than read off a manual page.
+    ///
+    /// THE DIRECTION STILL MATTERS, which is why the shell table is not empty.
+    /// Over-marking skips one token too many and reports a FALSE ORPHAN -- loud,
+    /// one line to fix. Under-marking stops ON the value and reports a false
+    /// SCHEDULED -- silent, and it defeats the guard. Both are pinned in
+    /// `self_test`.
+    const RUSTC_VALUE_FLAGS: [&str; 17] = [
         "-o", "--out-dir", "--emit", "--extern", "--target", "--edition",
         "--crate-name", "--crate-type", "--cfg", "--check-cfg", "-L", "-l", "-C",
         "-Z", "-W", "-A", "-D",
-        // python / shell: the token after these is code or a module name
-        "-m",
     ];
+    /// `-c` is CODE and `-m` is a module name; neither is ever a script path.
+    /// Measured: `python3 -c x.sh` is a SyntaxError, so the token after `-c` is
+    /// not an invocation for python even though it is one for the shells.
+    const PYTHON_VALUE_FLAGS: [&str; 2] = ["-c", "-m"];
+    /// Measured for bash and sh against a real script:
+    ///   `-o`, `-O`, `--rcfile` consume the next token -- `bash -o x.sh` answers
+    ///   "invalid option name", so the path was eaten as the value and never ran.
+    ///   `-D` exits after dumping translatable strings without running it.
+    /// Deliberately ABSENT: `-l -e -u -x -p -c`, every one of which RAN the
+    /// script, so the token after them can be a genuine invocation.
+    const SHELL_VALUE_FLAGS: [&str; 4] = ["-o", "-O", "--rcfile", "-D"];
+
+    fn value_flags_for(runner: &str) -> &'static [&'static str] {
+        match runner {
+            "rustc" => &RUSTC_VALUE_FLAGS,
+            "python" | "python3" => &PYTHON_VALUE_FLAGS,
+            _ => &SHELL_VALUE_FLAGS,
+        }
+    }
+
     let dotted = format!("./{path}");
     for line in text.lines() {
         let tokens: Vec<&str> = line.split_whitespace().collect();
@@ -368,12 +392,13 @@ fn runner_flag_path(text: &str, path: &str) -> bool {
             if !RUNNERS.contains(token) {
                 continue;
             }
+            let value_flags = value_flags_for(token);
             let mut next = index + 1;
             while next < tokens.len() && tokens[next].starts_with('-') {
                 // A flag that takes a separate value consumes the token after it,
                 // so skip both. An attached form (`--edition=2021`, `-Dwarnings`)
                 // is a single token and is handled by the plain skip.
-                if VALUE_FLAGS.contains(&tokens[next]) {
+                if value_flags.contains(&tokens[next]) {
                     next += 1;
                 }
                 next += 1;
@@ -605,6 +630,56 @@ target/ci/check-exit-status-class --gate";
         "an output path directly after -o read as an invocation -- a false SCHEDULED, \
          which is the silent direction this guard must never fail in"
     );
+    // ⚠️ THE RUNNERS GENUINELY DISAGREE, WHICH IS WHY THE TABLES ARE SPLIT. Each
+    // pair below was measured by running the runner against a real script, not
+    // inferred: the shells EXECUTE the token after `-c`, python treats it as code
+    // and never runs it. One flag, opposite correctness, so one table cannot hold
+    // both.
+    assert!(
+        is_invoked("bash -c scripts/check-z.sh", "scripts/check-z.sh"),
+        "bash -c RUNS the token after it (measured: prints RAN), so it is an \
+         invocation -- marking -c value-taking for the shells is a false ORPHAN"
+    );
+    assert!(
+        is_invoked("sh -c scripts/check-z.sh", "scripts/check-z.sh"),
+        "sh -c RUNS the token after it, exactly as bash does"
+    );
+    assert!(
+        !is_invoked("python3 -c scripts/check-z.py", "scripts/check-z.py"),
+        "python3 -c is CODE (measured: SyntaxError, never runs the file), so the \
+         token after it is not an invocation -- the opposite of the shells"
+    );
+    // ⚠️ AND THE REGRESSION THIS SPLIT FIXES, live on main until now: `-l` is a
+    // login shell for bash and sh and takes NO value, while rustc's `-l` links a
+    // library and DOES. The shared table skipped the script and reported a false
+    // ORPHAN.
+    assert!(
+        is_invoked("bash -l scripts/check-z.sh", "scripts/check-z.sh"),
+        "bash -l takes no value (measured: prints RAN), so the script after it \
+         must still be seen"
+    );
+    assert!(
+        is_invoked("sh -l scripts/check-z.sh", "scripts/check-z.sh"),
+        "sh -l takes no value either"
+    );
+    assert!(
+        is_invoked("rustc -l foo scripts/check-z.rs", "scripts/check-z.rs"),
+        "rustc -l DOES take a value, so `foo` must be skipped and the script AFTER \
+         it still seen -- that is what the table is for, and the split must not \
+         lose it"
+    );
+    // The shell entries that ARE value-taking, each measured: the path is eaten as
+    // the value and never runs, so reporting it scheduled would be a false
+    // SCHEDULED -- the silent direction.
+    assert!(
+        !is_invoked("bash -o scripts/check-z.sh", "scripts/check-z.sh"),
+        "bash -o consumes the next token (measured: 'invalid option name')"
+    );
+    assert!(
+        !is_invoked("bash -D scripts/check-z.sh", "scripts/check-z.sh"),
+        "bash -D exits after dumping strings without running the script"
+    );
+
     // A value-taking flag must not hide the script that follows its value. Without
     // the table this stops on `2021` and reports a false ORPHAN.
     assert!(
