@@ -440,16 +440,49 @@ fn runner_flag_path(text: &str, path: &str) -> bool {
     // Flags whose VALUE is the program, so a path AFTER that value is an argument.
     const PROGRAM_IS_THE_VALUE: [&str; 2] = ["-c", "-m"];
 
-    fn takes_value(runner: &str, flag: &str) -> bool {
+    // ⚠️ A THIRD ANSWER: UNKNOWN. The previous revision had two -- takes a value, or does
+    // not -- with UNKNOWN folded into "takes a value" and called the loud direction. It is
+    // not always loud, and `agent(hermit-020)` relaying codex showed why:
+    //
+    //     python3 --nonsense ignored scripts/check-z.sh   ->  SCHEDULED
+    //
+    // Skipping a presumed value moves the cursor PAST one token, and the token it lands on
+    // may be an argument rather than the program. Skipping too far yields a false ORPHAN
+    // only when the landing token is not the checker; when it happens to BE the checker,
+    // the same over-skip yields a false SCHEDULED, which is silent. My claim that the
+    // inverted default made omissions loud was therefore true only for the cases I tested.
+    //
+    // So an unrecognised flag now yields NO INVOCATION for that occurrence. Uncertainty
+    // resolves to orphan -- loud -- instead of to a guess in either direction.
+    const RUSTC_VALUE: [&str; 17] = [
+        "-o", "--out-dir", "--emit", "--extern", "--target", "--edition", "--crate-name",
+        "--crate-type", "--cfg", "--check-cfg", "-L", "-l", "-C", "-Z", "-W", "-A", "-D",
+    ];
+    const PYTHON_VALUE: [&str; 5] = ["-c", "-m", "-X", "-W", "-Q"];
+    const SHELL_VALUE: [&str; 4] = ["-o", "-O", "--rcfile", "-D"];
+
+    enum Arity {
+        None,
+        Value,
+        Unknown,
+    }
+
+    fn arity(runner: &str, flag: &str) -> Arity {
         if flag.contains('=') || (!flag.starts_with("--") && flag.len() > 2) {
-            return false;
+            return Arity::None;
         }
-        let booleans: &[&str] = match runner {
-            "rustc" => &RUSTC_NO_VALUE,
-            "python" | "python3" => &PYTHON_NO_VALUE,
-            _ => &SHELL_NO_VALUE,
+        let (booleans, valued): (&[&str], &[&str]) = match runner {
+            "rustc" => (&RUSTC_NO_VALUE, &RUSTC_VALUE),
+            "python" | "python3" => (&PYTHON_NO_VALUE, &PYTHON_VALUE),
+            _ => (&SHELL_NO_VALUE, &SHELL_VALUE),
         };
-        !booleans.contains(&flag)
+        if booleans.contains(&flag) {
+            Arity::None
+        } else if valued.contains(&flag) {
+            Arity::Value
+        } else {
+            Arity::Unknown
+        }
     }
 
     fn no_exec(runner: &str, flag: &str) -> bool {
@@ -508,8 +541,14 @@ fn runner_flag_path(text: &str, path: &str) -> bool {
                 if flag == "-o" && next + 1 < tokens.len() && tokens[next + 1] == "noexec" {
                     executes = false;
                 }
-                if takes_value(token, flag) {
-                    next += 1;
+                match arity(token, flag) {
+                    Arity::Value => next += 1,
+                    Arity::Unknown => {
+                        // Cannot tell where the program is. Refuse the occurrence.
+                        executes = false;
+                        break;
+                    }
+                    Arity::None => {}
                 }
                 next += 1;
             }
@@ -611,7 +650,17 @@ fn invokes_on_line(line: &str, needle: &str) -> bool {
     let mut from = 0;
     while let Some(hit) = line[from..].find(needle) {
         let at = from + hit;
-        if in_command_position(&line[..at]) {
+        // ⚠️ THE MATCH MUST END AT A WORD BOUNDARY TOO. Without this,
+        // `./scripts/check-z.sh.disabled` schedules `scripts/check-z.sh`: a longer
+        // path CONTAINING the checker as a prefix satisfies the guard. Renaming a
+        // checker to `.disabled` is a normal way to retire one, so this fires by
+        // ACCIDENT rather than by contrivance -- reported by agent(hermit-020)
+        // relaying codex, and reproduced here.
+        let after = line[at + needle.len()..].chars().next();
+        let ends_cleanly = after
+            .map(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')' | '"' | '\'' | ','))
+            .unwrap_or(true);
+        if ends_cleanly && in_command_position(&line[..at]) {
             return true;
         }
         from = at + 1;
@@ -854,6 +903,20 @@ fn self_test() {
             "scripts/check-z.rs",
             "rustc -V prints a version and compiles nothing, yet -V is a NO-VALUE flag \
              -- which is why a two-state table classified it SCHEDULED",
+        ),
+        (
+            "./scripts/check-z.rs.disabled",
+            "scripts/check-z.rs",
+            "a LONGER path containing the checker as a prefix scheduled it -- renaming \
+             a checker to .disabled is a normal way to retire one, so this fires by \
+             ACCIDENT rather than by contrivance (agent(hermit-020) relaying codex)",
+        ),
+        (
+            "python3 --nonsense ignored scripts/check-z.py",
+            "scripts/check-z.py",
+            "an UNRECOGNISED flag: skipping its presumed value can land the cursor on \
+             the checker itself, so the inverted default was loud only for the cases \
+             I happened to test -- uncertainty now resolves to orphan",
         ),
         (
             "see ./scripts/check-z.rs for details",
