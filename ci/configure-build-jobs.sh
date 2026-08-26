@@ -92,6 +92,24 @@ fi
 # itself is unchanged; see the carry chain below. The portable wrapper obtains
 # the repository's recorded pin through the canonical checker and carries it
 # here; a pin bump cannot silently retain the old clamp or threshold.
+# CARRY TO ad598995 (2026-08-26): 200439dc..ad598995 is exactly
+# rrnewton/reverie#496 and changes only reverie-process/src/container.rs.
+# Both repository inputs to source_recipe_key are byte-identical by git object
+# id: reverie-dbt/build.rs remains 0ff8ae24b974 and
+# reverie-dbt/vendor/dynamorio remains de352475846e. The selected CMAKE and
+# CMAKE_GENERATOR are unchanged, so the measured 1050 effective-job-second
+# budget and MAX_PARALLEL_JOBS=16 carry unchanged. Fresh validation remains
+# required because the runtime behavior changed.
+#
+# CARRY TO 200439dc (2026-08-26): a16e3c46..200439dc changes only
+# reverie-ptrace/src/gdbstub/server.rs. reverie-dbt/build.rs remains blob
+# 0ff8ae24b974 and reverie-dbt/vendor/dynamorio remains de352475846e. The pin
+# does not alter the selected CMAKE or CMAKE_GENERATOR, so the complete recipe
+# remains install key 132d77130980c546c8867fc196d97e664bc4816b1dfa9ea9c18de4a94d109c4d.
+# The 1050 effective-job-second budget and MAX_PARALLEL_JOBS=16 carry unchanged.
+# Fresh validation is still required, and an earlier pin's receipt is not valid
+# for this pin.
+#
 # CARRY TO f4152f8f (2026-08-25), on the same recipe-identity evidence as the
 # carries above, and stronger than any of them: `git diff 13cf8bcb f4152f8f --
 # reverie-dbt` is EMPTY. Both repository inputs to source_recipe_key are
@@ -122,8 +140,8 @@ fi
 # while this layer declines with 2 reports the SAME condition as two different
 # things depending on which guard fired first. Both are "could not determine",
 # which is what EX_TEMPFAIL means to scripts/validate.rs.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a16e3c466a15c3746a5ef23a76d1f74e11aba935 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to calibrated Reverie a16e3c466a15c3746a5ef23a76d1f74e11aba935 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != ad598995c8018bf17414a92119acfac6c9fd58ee ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to calibrated Reverie ad598995c8018bf17414a92119acfac6c9fd58ee (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
