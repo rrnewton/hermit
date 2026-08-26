@@ -676,6 +676,13 @@ impl FileMetadata {
         stdout.mark_flock_mode_unobserved();
         stderr.mark_flock_mode_unobserved();
 
+        // Their status flags were never observed either: the `OFlag::empty()`
+        // above is a placeholder, not a reading. The first guest `F_GETFL`
+        // adopts the kernel's answer (see `handle_fcntl`).
+        stdin.mark_status_flags_unobserved();
+        stdout.mark_status_flags_unobserved();
+        stderr.mark_status_flags_unobserved();
+
         self.add_detfd(stdin);
         self.add_detfd(stdout);
         self.add_detfd(stderr);
