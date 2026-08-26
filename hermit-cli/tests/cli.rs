@@ -4549,3 +4549,65 @@ fn no_container_site_is_unreachable_by_the_fault_injector() {
          at nothing: {stale:?}"
     );
 }
+
+/// A guest that exits with one of hermit's own reserved statuses must still be
+/// reported as the guest, not as hermit.
+///
+/// ⚠️ THIS IS THE ASSERTION hermit#2659 SHIPPED WITHOUT. That PR introduced
+/// `HERMIT_POLICY_REFUSAL_EXIT` (122) and its doc claimed, correctly, that an
+/// ordinary guest exit does not reach the new match arm -- but it added zero test
+/// functions, so the claim was carried by prose. A reviewer executed it by hand
+/// once at one head; nothing re-executes it. If the refusal arm ever moved above
+/// the `Ok(Ok(..))` path, a guest legitimately exiting 122 would be reported as a
+/// policy refusal -- the exact inverse of the defect 122 was introduced to fix,
+/// and silent, because the number the operator sees would be unchanged.
+///
+/// ⚠️ AND 130 IS NOW THE SAME SHAPE. `sigint_instakill` reports `128 + SIGINT`, so
+/// 130 acquired a hermit meaning too and needs the identical guarantee.
+///
+/// The discriminator is the MARKER, never the code: every value in `0..=255` is a
+/// legal guest status, so a bare code cannot separate these and a test asserting
+/// only the code would pass while the defect was live.
+#[test]
+fn a_guest_exiting_a_reserved_status_is_not_reported_as_hermit() {
+    // 122 and 130 are the reserved values under test; 0/1/7 are controls that
+    // must behave identically, so a failure says "the reserved ones are special"
+    // rather than "exit codes are broken generally".
+    for code in [
+        0,
+        1,
+        7,
+        detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+        125,
+        detcore_model::HERMIT_SIGINT_DEATH_EXIT,
+    ] {
+        let run = Command::new(env!("CARGO_BIN_EXE_hermit"))
+            .args(["run", "--", "/bin/sh", "-c", &format!("exit {code}")])
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run the guest exiting {code}: {e}"));
+        let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+
+        assert_eq!(
+            run.status.code(),
+            Some(code),
+            "a guest exiting {code} must report {code}\nstderr:\n{stderr}"
+        );
+        // The marker is the exclusive channel. Its ABSENCE is what says the status
+        // came from the guest.
+        assert!(
+            !stderr.contains("HERMIT_POLICY_REFUSAL"),
+            "a guest exiting {code} must not be reported as a hermit policy \
+             refusal\nstderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("HERMIT_SIGNAL_DEATH"),
+            "a guest exiting {code} must not be reported as a signal death\n\
+             stderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("HERMIT_INTERNAL_FAILURE"),
+            "a guest exiting {code} must not be reported as a hermit internal \
+             failure\nstderr:\n{stderr}"
+        );
+    }
+}

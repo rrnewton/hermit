@@ -680,6 +680,26 @@ impl std::fmt::Display for PolicyRefusal {
 
 impl std::error::Error for PolicyRefusal {}
 
+/// The container child was terminated by a signal, reported as `128 + signo`.
+///
+/// Carries the signal, unlike [`PolicyRefusal`], because there is more than one
+/// and the number is the whole content of the report.
+#[derive(Debug)]
+pub struct SignalDeath(pub i32);
+
+impl std::fmt::Display for SignalDeath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Hermit's container was terminated by signal {}. This is not a hermit \
+             failure and not a refusal: the run was stopped from outside.",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for SignalDeath {}
+
 /// The container child PANICKED, and the panic was caught and reported.
 ///
 /// Distinct from [`ContainerChildExit`], which is the child dying of something
@@ -744,6 +764,22 @@ pub fn classify_container_result<T>(
             if status.code() == Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT) =>
         {
             Err(Error::new(PolicyRefusal))
+        }
+        // A signal death, before the catch-all for the same reason the refusal arm
+        // is: falling through would report a run stopped from outside as an
+        // internal failure. `sigint_instakill` and `on_container_init_stop_signal`
+        // both land here.
+        Err(RunError::ExitStatus(status))
+            if status
+                .code()
+                .and_then(detcore_model::signal_from_exit_status)
+                .is_some() =>
+        {
+            let signal = status
+                .code()
+                .and_then(detcore_model::signal_from_exit_status)
+                .expect("guard just matched");
+            Err(Error::new(SignalDeath(signal)))
         }
         Err(RunError::ExitStatus(status)) => Err(Error::new(ContainerChildExit(status))),
         // A spawn failure is a genuine CLI-side failure and keeps its prose.

@@ -2997,7 +2997,20 @@ where
 
 /// Signal an unrecoverable error that exits the entire container.
 /// Such exits are not determinizable (see "quasi-determinism").
-pub async fn unrecoverable_shutdown<G, T>(guest: &G) -> !
+///
+/// ⚠️ `status` IS NOT A DEFAULTABLE PARAMETER, AND THAT IS THE POINT. This
+/// function has four callers and they do not all mean the same thing: three are
+/// fail-closed policy refusals (`HERMIT_POLICY_REFUSAL_EXIT`) and one is an
+/// operator interrupt (`HERMIT_SIGINT_DEATH_EXIT`). While the status was baked in
+/// here, every caller inherited whatever the last edit chose, so the SIGINT path
+/// reported "hermit refused this run" for a run hermit did not refuse. Making it
+/// an argument turns the meaning into a visible claim at each call site, which is
+/// the same rule `scripts/check-exit-status-class.rs` enforces on the test side:
+/// a status you can read is worth less than a status that says which channel
+/// produced it.
+///
+/// Adding a caller means choosing; there is deliberately no default to fall into.
+pub async fn unrecoverable_shutdown<G, T>(guest: &G, status: i32) -> !
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -3023,9 +3036,13 @@ where
     // that worked exactly as designed. `HERMIT_POLICY_REFUSAL_EXIT` is the
     // agreed value for "hermit refused"; see its doc for why it is not 1.
     //
+    // ⚠️ AND WHICH VALUE IS THE CALLER'S TO SAY, NOT THIS FUNCTION'S. Baking one
+    // in here is what made an operator's Ctrl-C report as a policy refusal: the
+    // condition differs per caller and only the caller knows it.
+    //
     // The RPC above is `cfg!(debug_assertions)`-only, so it cannot be the
     // signal — in a release build the parent would learn nothing.
-    std::process::exit(detcore_model::HERMIT_POLICY_REFUSAL_EXIT);
+    std::process::exit(status);
 }
 
 #[cfg(test)]
