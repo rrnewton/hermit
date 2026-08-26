@@ -3130,6 +3130,19 @@ fn configure_e2e_result_root(
     // harness process mint a local timestamp. Schema-6 evidence is one complete
     // selected population, not a pool of unrelated bucket attempts.
     std::env::set_var("E2E_RUN_ID", run);
+    if std::env::var_os(PARENT_ENV).is_some() {
+        let series_results = path.join("series-results.jsonl");
+        match std::fs::remove_file(&series_results) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot clear prior series input {}: {error}",
+                    series_results.display()
+                ));
+            }
+        }
+    }
 
     // The harness derives its prebuilt-fixture directory from RESULT_ROOT too,
     // but build products are not evidence and must not accumulate beside every
@@ -3145,6 +3158,62 @@ fn configure_e2e_result_root(
         std::env::set_var("E2E_BUILD_ROOT", temporary_build_root);
     }
     Ok(path)
+}
+
+/// Send all completed cells from one validate invocation to the parent series
+/// writer as one batch. Bucket processes append rows as each cell completes, so
+/// this includes earlier failed attempts even when a later retry passes.
+fn append_validate_series(
+    parent: Option<&Path>,
+    result_root: &Path,
+    tree: &str,
+) -> Result<bool, String> {
+    let Some(parent) = parent else {
+        return Ok(false);
+    };
+    let rows = result_root.join("series-results.jsonl");
+    if !rows.is_file() {
+        return Ok(false);
+    }
+    let run_id = std::env::var_os("E2E_RUN_ID")
+        .filter(|value| !value.is_empty())
+        .ok_or("E2E_RUN_ID is missing after completed cell rows were recorded")?;
+    let script = parent.join("ci-hub/series/series.py");
+    if !script.is_file() {
+        return Err(format!(
+            "{} does not exist; DEV_HERMIT_PARENT does not contain the series writer",
+            script.display()
+        ));
+    }
+    let input = std::fs::File::open(&rows)
+        .map_err(|error| format!("cannot read {}: {error}", rows.display()))?;
+    let output = Command::new("python3")
+        .arg(&script)
+        .arg("append-cells")
+        .arg("--parent")
+        .arg(parent)
+        .arg("--producer")
+        .arg("validate")
+        .arg("--run-id")
+        .arg(&run_id)
+        .arg("--tree")
+        .arg(tree)
+        .stdin(input)
+        .output()
+        .map_err(|error| format!("cannot run {}: {error}", script.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "series writer refused {}: {}",
+            rows.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    eprintln!(
+        "validate: per-cell series updated from {}: {}",
+        rows.display(),
+        String::from_utf8_lossy(&output.stdout).trim()
+    );
+    Ok(true)
 }
 
 /// Establish the self-tee. FAIL-CLOSED: any failure exits loudly rather than
@@ -7562,12 +7631,15 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     // prerequisite and fails unless the retry preserves their edge.
     let environmental_log = tmp.join("environmental.log");
     let first_attempt = tmp.join("environmental-first-attempt");
+    let run_indices = tmp.join("environmental-run-indices");
     let edge_ready = tmp.join("edge-ready");
     let environmental_cmd = format!(
-        "if test ! -e {first}; then : > {first}; printf '%s\\n' \
+        "printf '%s\\n' \"$E2E_RUN_INDEX\" >> {indices}; \
+         if test ! -e {first}; then : > {first}; printf '%s\\n' \
          '[fixture.environmental] ----- detail -----' \
          '[fixture.environmental] An action was blocked on this server based on a security policy!' \
          '[fixture.environmental] ----- end detail -----' > {log}; exit 1; fi",
+        indices = validate_plan::shell_quote(&run_indices.to_string_lossy()),
         first = validate_plan::shell_quote(&first_attempt.to_string_lossy()),
         log = validate_plan::shell_quote(&environmental_log.to_string_lossy()),
     );
@@ -7652,10 +7724,20 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     let names_its_ground = environmental_attempts
         .iter()
         .any(|a| a.attempt == 1 && a.retry_class.as_deref() == Some("bpfjailer-banner"));
-    if environmental_attempts.len() != 2 || !first_failed || !second_passed || !names_its_ground {
+    let observed_run_indices = std::fs::read_to_string(&run_indices)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if environmental_attempts.len() != 2
+        || !first_failed
+        || !second_passed
+        || !names_its_ground
+        || observed_run_indices != ["0", "1"]
+    {
         return Err(format!(
             "scheduler accounting: a node that FAILED then PASSED was recorded as if it had \
-             passed first time — the retry erased the flake. attempts={:?}",
+             passed first time — the retry erased the flake. attempts={:?} run_indices={observed_run_indices:?}",
             environmental_attempts
                 .iter()
                 .map(|a| (a.attempt, a.ok, a.reported, a.retry_class.clone()))
@@ -8726,8 +8808,12 @@ fn run_lane_with_env_retries(
         };
     }
     let mut round_log_start = settled_log_len(log_path);
+    let mut first_cfg = cfg.clone();
+    for step in &mut first_cfg.steps {
+        step.env.insert("E2E_RUN_INDEX".into(), "0".into());
+    }
     let first = run_dag_boxed_deadline(
-        cfg,
+        &first_cfg,
         jobs,
         keep_going,
         verbosity,
@@ -8945,6 +9031,10 @@ fn run_lane_with_env_retries(
         let mut retry_cfg = cfg.clone();
         retry_cfg.description = format!("{} — retry {env_retries}/{max}", cfg.description);
         retry_cfg.steps = steps;
+        for step in &mut retry_cfg.steps {
+            step.env
+                .insert("E2E_RUN_INDEX".into(), env_retries.to_string());
+        }
         // Everything before this byte belongs to an earlier scheduler
         // invocation. The retry may emit no detail at all; that must stay
         // unknown rather than inheriting a stale banner through whole-log rfind.
@@ -11597,6 +11687,14 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         );
     }
     let parent = find_parent(&root);
+    if std::env::var_os(PARENT_ENV).is_none() {
+        if let Some(parent) = &parent {
+            // Child test-harness processes use the same parent checkout for the
+            // per-cell series writer. The validate driver already discovered
+            // this path for its ledger, so do not make every child rediscover it.
+            std::env::set_var(PARENT_ENV, parent);
+        }
+    }
     // The profile name is needed by the admission gates below, which run BEFORE
     // the plan exists. It is derived exactly as `build_plan` derives it, so the
     // lock record and the ledger row can never disagree about what was running.
@@ -12424,6 +12522,17 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // INT TERM HUP` bought the bash.
     validate_runtime::enter_cleanup_critical_section();
     let interruption = interrupted_by().map(|s| s.to_string());
+    let series_error = if nesting.nested {
+        None
+    } else {
+        match append_validate_series(parent.as_deref(), &e2e_result_root, &commit) {
+            Ok(_) => None,
+            Err(error) => {
+                eprintln!("validate: ERROR: completed cell results were not added to the series: {error}");
+                Some(error)
+            }
+        }
+    };
     // Stop the monitor and take the peak ONCE, here, so the ledger and the
     // summary cannot disagree about how crowded the box was.
     let (peak_active, peak_live) = match &monitor {
@@ -12537,16 +12646,22 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         }
         drop(run_record);
         let _ = std::fs::remove_dir_all(&tmp);
+        let mut detail = vec![
+            format!("stopped by SIG{sig}; recorded as a NO-RESULT, not a failure"),
+            "an interrupt learned nothing about the tree, so it does not establish a product \
+             verdict — a TIMEOUT, by contrast, does"
+                .into(),
+        ];
+        if let Some(error) = &series_error {
+            detail.push(format!(
+                "completed cell results could not be added to the series: {error}"
+            ));
+        }
         let mut s = RunSummary::new(
             Verdict::Interrupted,
             130,
             &plan.profile,
-            vec![
-                format!("stopped by SIG{sig}; recorded as a NO-RESULT, not a failure"),
-                "an interrupt learned nothing about the tree, so it does not establish a product \
-                 verdict — a TIMEOUT, by contrast, does"
-                    .into(),
-            ],
+            detail,
         );
         s.nodes_executed = outcomes.len();
         s.nodes_failed = outcomes.iter().filter(|o| outcome_is_failure(o)).count();
@@ -12680,6 +12795,9 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     }
     if let Some((code, _)) = &envelope_error {
         exit_code = *code;
+    }
+    if series_error.is_some() {
+        exit_code = 1;
     }
     if !execution_complete {
         eprintln!(

@@ -5,6 +5,7 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::fs::{self};
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -25,6 +26,7 @@ use sha2::Digest;
 use sha2::Sha256;
 
 pub use crate::canonical_verdict::VerificationReport;
+pub use crate::canonical_verdict::VerificationRuntime;
 use crate::ci_selection::CiDisabledReasonSpec;
 use crate::ci_selection::CiSelection;
 use crate::ci_selection::CiSelectionSpec;
@@ -655,6 +657,8 @@ pub struct AttemptResult {
     pub stderr: String,
     pub verification_report: Option<String>,
     pub verification_report_sha256: Option<String>,
+    /// Runtime totals for the two executions compared by this attempt.
+    pub runtime: Option<VerificationRuntime>,
     /// The divergence position, LIFTED OUT of `verification_report` so it is a
     /// field rather than a substring.
     ///
@@ -690,6 +694,8 @@ struct SabrePathRecord {
 pub struct CellResult {
     pub schema: u64,
     pub run_id: String,
+    /// Ordered pressure repetition or validate retry within `run_id`.
+    pub run_index: u64,
     /// HEAD of the CHECKOUT the harness ran in. NOT the provenance of the
     /// binary that produced this measurement, despite the name.
     ///
@@ -724,6 +730,8 @@ pub struct CellResult {
     pub outcome: String,
     pub error_kind: Option<String>,
     pub duration_ms: u128,
+    /// Runtime totals from the first attempt that produced them.
+    pub runtime: Option<VerificationRuntime>,
     pub log_level: Option<String>,
     pub effective_args: Vec<String>,
     pub argv: Vec<String>,
@@ -789,6 +797,7 @@ pub struct RunContext {
     pub result_root: PathBuf,
     pub build_root: PathBuf,
     pub run_id: String,
+    pub run_index: u64,
     pub source_sha: String,
     pub source_dirty: bool,
     /// Provenance the hermit binary reports about itself, probed once per run.
@@ -820,6 +829,15 @@ impl RunContext {
                 std::process::id()
             )
         });
+        let run_index = std::env::var("E2E_RUN_INDEX")
+            .ok()
+            .map(|value| {
+                value.parse::<u64>().map_err(|_| {
+                    format!("E2E_RUN_INDEX must be a non-negative integer, got {value:?}")
+                })
+            })
+            .transpose()?
+            .unwrap_or(0);
         let build_root = std::env::var_os("E2E_BUILD_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| result_root.join("build").join(&source_sha));
@@ -860,6 +878,7 @@ impl RunContext {
             result_root,
             build_root,
             run_id,
+            run_index,
             source_sha,
             source_dirty,
             binary_build_sha,
@@ -1406,6 +1425,7 @@ pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, St
     }
     let mut report_json = None;
     let mut report_sha = None;
+    let mut runtime = None;
     let mut first_divergent_scheduler_turn = None;
     let mut first_divergent_virtual_nanoseconds = None;
     let mut first_divergent_record = None;
@@ -1428,6 +1448,7 @@ pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, St
                 report_json = Some(String::from_utf8_lossy(&bytes).into_owned());
                 match VerificationReport::from_json_slice(&bytes) {
                     Ok(report) => {
+                        runtime = report.runtime.clone();
                         // Recorded BEFORE the classification chain below,
                         // because where the divergence began is a fact about
                         // the report rather than a consequence of how the
@@ -1523,6 +1544,7 @@ pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, St
         stderr,
         verification_report: report_json,
         verification_report_sha256: report_sha,
+        runtime,
         first_divergent_scheduler_turn,
         first_divergent_virtual_nanoseconds,
         first_divergent_record,
@@ -1854,6 +1876,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         artifact_dir: dir.display().to_string(),
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
+        run_index: context.run_index,
         hermit_sha: context.source_sha.clone(),
         binary_build_sha: context.binary_build_sha.clone(),
         source_tree_dirty: context.source_dirty,
@@ -1872,6 +1895,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         outcome,
         error_kind,
         duration_ms: started.elapsed().as_millis(),
+        runtime: attempts.iter().find_map(|attempt| attempt.runtime.clone()),
         log_level: (cell.id.mode != "naked").then(|| "info".into()),
         effective_args: literal_argv.iter().skip(1).cloned().collect(),
         argv: literal_argv,
@@ -1919,6 +1943,7 @@ pub fn infrastructure_error_result(
         artifact_dir: dir.display().to_string(),
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
+        run_index: context.run_index,
         hermit_sha: context.source_sha.clone(),
         binary_build_sha: context.binary_build_sha.clone(),
         source_tree_dirty: context.source_dirty,
@@ -1935,6 +1960,7 @@ pub fn infrastructure_error_result(
         outcome: "ERROR".into(),
         error_kind: Some("infrastructure".into()),
         duration_ms: 0,
+        runtime: None,
         log_level: (cell.id.mode != "naked").then(|| "info".into()),
         effective_args: Vec::new(),
         argv: Vec::new(),
@@ -1976,6 +2002,7 @@ pub fn host_inapplicable_result(
         artifact_dir: dir.display().to_string(),
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
+        run_index: context.run_index,
         hermit_sha: context.source_sha.clone(),
         binary_build_sha: context.binary_build_sha.clone(),
         source_tree_dirty: context.source_dirty,
@@ -1990,6 +2017,7 @@ pub fn host_inapplicable_result(
         outcome: "HOST-INAPPLICABLE".into(),
         error_kind: None,
         duration_ms: 0,
+        runtime: None,
         log_level: None,
         effective_args: Vec::new(),
         argv: Vec::new(),
@@ -2169,12 +2197,29 @@ pub fn append_result(path: &Path, result: &CellResult) -> Result<(), String> {
         .append(true)
         .open(path)
         .map_err(|e| e.to_string())?;
-    serde_json::to_writer(&mut file, result).map_err(|e| e.to_string())?;
-    file.write_all(b"\n").map_err(|e| e.to_string())?;
+    let mut line = serde_json::to_vec(result).map_err(|e| e.to_string())?;
+    line.push(b'\n');
+    // Validate runs manifest buckets in separate processes. Their ordinary
+    // result files do not overlap, but every completed cell is also appended to
+    // one run-wide input for the series writer. Hold an advisory lock across the
+    // complete JSON line so two buckets cannot interleave their writes.
+    let fd = file.as_raw_fd();
+    if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let write_result = file
+        .write_all(&line)
+        .and_then(|()| file.flush())
+        .map_err(|e| e.to_string());
+    let unlock_result = if unsafe { libc::flock(fd, libc::LOCK_UN) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().to_string())
+    };
     // The bucket runner publishes each completed cell before printing its
     // PASS/FAIL/ERROR line. Flush the row now rather than waiting for the
     // bucket's JUnit/summary epilogue, which an outer node timeout may kill.
-    file.flush().map_err(|e| e.to_string())
+    write_result.and(unlock_result)
 }
 
 pub fn write_junit(path: &Path, results: &[CellResult]) -> Result<(), String> {
@@ -2684,6 +2729,7 @@ mod tests {
             result_root: root.join("results"),
             build_root: root.join("build"),
             run_id: "fixture".into(),
+            run_index: 0,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -2726,6 +2772,7 @@ mod tests {
             result_root: root.join("results"),
             build_root: root.join("build"),
             run_id: "fixture".into(),
+            run_index: 0,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -2783,6 +2830,7 @@ mod tests {
             result_root: root.join("results"),
             build_root: root.join("build"),
             run_id: "fixture".into(),
+            run_index: 0,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -2804,6 +2852,31 @@ mod tests {
                     .all(|line| serde_json::from_str::<JsonValue>(line).is_ok())
             );
         }
+
+        let concurrent_path = root.join("series-results.jsonl");
+        let base = infrastructure_error_result(&context, &cell, "fixture".into());
+        let writers = (0..32)
+            .map(|run_index| {
+                let path = concurrent_path.clone();
+                let mut result = base.clone();
+                result.run_index = run_index;
+                std::thread::spawn(move || append_result(&path, &result).unwrap())
+            })
+            .collect::<Vec<_>>();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let rows = fs::read_to_string(&concurrent_path).unwrap();
+        let mut run_indices = rows
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<JsonValue>(line).unwrap()["run_index"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        run_indices.sort_unstable();
+        assert_eq!(run_indices, (0..32).collect::<Vec<_>>());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2943,6 +3016,7 @@ backends_disabled:
             result_root: PathBuf::from("/repo/results"),
             build_root: PathBuf::from("/repo/build"),
             run_id: "fixture".into(),
+            run_index: 0,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -2990,6 +3064,7 @@ backends_disabled:
             result_root: PathBuf::from("/repo/results"),
             build_root: PathBuf::from("/repo/build"),
             run_id: "fixture".into(),
+            run_index: 0,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -3202,6 +3277,7 @@ backends_disabled:
             result_root: PathBuf::from("/repo/results"),
             build_root: PathBuf::from("/repo/build"),
             run_id: "fixture".into(),
+            run_index: 0,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -3282,6 +3358,7 @@ backends_disabled:
             result_root: PathBuf::from("/repo/results"),
             build_root: PathBuf::from("/repo/build"),
             run_id: "fixture".into(),
+            run_index: 0,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -3570,6 +3647,7 @@ backends_disabled:
             stderr: String::new(),
             verification_report: None,
             verification_report_sha256: None,
+            runtime: None,
             sabre_path_evidence: Some(evidence.into()),
             sabre_path_evidence_sha256: Some("b".into()),
             reason: None,
@@ -3637,6 +3715,7 @@ backends_disabled:
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            runtime: None,
             compared_log_messages: Some(crate::canonical_verdict::ComparedLogMessages {
                 left: 1,
                 right: 1,
@@ -3856,6 +3935,7 @@ backends_disabled:
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            runtime: None,
         })
         .unwrap();
         let spec = CellRunSpec {
@@ -3927,6 +4007,7 @@ backends_disabled:
             result_root: root.join("results"),
             build_root: root.join("build"),
             run_id: "fixture".into(),
+            run_index: 0,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -3992,6 +4073,7 @@ backends_disabled:
             result_root: root.join("results"),
             build_root,
             run_id: "fixture".into(),
+            run_index: 0,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
