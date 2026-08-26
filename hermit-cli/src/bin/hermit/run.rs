@@ -2256,6 +2256,89 @@ fn validate_e9patch_mount_target(path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+/// The descriptors a verification snapshots and restores between its two runs.
+///
+/// ⚠️ ALL THREE, AND THE FIRST VERSION OF THIS FIX RESTORED ONLY STDERR.
+/// The leak is a property of an INHERITED OPEN FILE DESCRIPTION, not of stderr:
+/// a guest that sets a status flag on any descriptor hermit passed it leaves
+/// that flag set on the description itself, which run 2 then inherits already
+/// mutated. Nothing about fd 2 is special, and scoping the fix to the descriptor
+/// the reproducing guest happened to touch was the limit of that guest, not the
+/// limit of the defect.
+///
+/// Measured at `aeda16ff7de3`, the head that restored fd 2 alone, with a stock
+/// `/usr/bin/perl` guest that conditionally sets `O_APPEND`:
+///
+/// ```text
+/// mutating STDOUT, --backend kvm --strict --verify   rc=125  nondeterministic
+/// mutating STDOUT, ptrace (control)                  rc=0    deterministic
+/// mutating STDERR, kvm  (the shipped fix works)      rc=0    deterministic
+/// mutating STDIN,  kvm                               rc=0    deterministic
+/// touching no flags, kvm (negative control)          rc=0    deterministic
+/// run 1: fcntl(1, F_GETFL) = Ok(32769)   run 2: fcntl(1, F_GETFL) = Ok(33793)
+/// ```
+///
+/// ⚠️ STDIN IS INCLUDED THOUGH IT DID NOT REPRODUCE, DELIBERATELY. Its probe
+/// is green because KVM reserves its own stdin path, which is a property of
+/// today's backend rather than of the descriptor. Snapshotting it costs one
+/// `F_GETFL` and one comparison per verification, and leaving it out would
+/// rebuild the exact gap this change exists to close -- a descriptor omitted
+/// because no test currently reaches it.
+const VERIFY_RESTORED_FDS: [libc::c_int; 3] =
+    [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO];
+
+/// The status flags on one descriptor, or `None` if they cannot be read.
+///
+/// `None` is not an error: an unreadable descriptor simply means there is
+/// nothing to restore, and a verification must not fail over housekeeping.
+fn fd_status_flags(fd: libc::c_int) -> Option<libc::c_int> {
+    // SAFETY: `F_GETFL` reads flags from a descriptor number and writes no
+    // memory. Validity is NOT a precondition here: a closed or never-opened
+    // descriptor returns -1 with `EBADF`, which this reads as `None`. Saying
+    // "fd 2 is valid for the life of the process" would have been an unfounded
+    // guarantee -- stderr can be closed -- so the safety argument rests on the
+    // call being memory-safe for any integer, which it is.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 { None } else { Some(flags) }
+}
+
+/// The status flags of every descriptor a verification restores, in
+/// `VERIFY_RESTORED_FDS` order.
+///
+/// Read once before the first verification run so the second can be handed the
+/// same starting state.
+fn standard_fd_status_flags() -> [Option<libc::c_int>; VERIFY_RESTORED_FDS.len()] {
+    VERIFY_RESTORED_FDS.map(fd_status_flags)
+}
+
+/// Put each descriptor's status flags back to what the first run was handed.
+///
+/// ⚠️ ONLY WHEN THEY ACTUALLY CHANGED. An unconditional `F_SETFL` would be a
+/// write on a descriptor hermit does not own whenever nothing moved, and the
+/// common case is that nothing moved. Comparing first keeps this inert on every
+/// run except the one it exists for -- and it is compared PER DESCRIPTOR, so a
+/// guest that moves one flag does not cause writes on the other two.
+fn restore_standard_fd_status_flags(before: [Option<libc::c_int>; VERIFY_RESTORED_FDS.len()]) {
+    for (fd, before) in VERIFY_RESTORED_FDS.iter().copied().zip(before) {
+        let Some(before) = before else {
+            continue;
+        };
+        let Some(now) = fd_status_flags(fd) else {
+            continue;
+        };
+        if now == before {
+            continue;
+        }
+        // SAFETY: `F_SETFL` sets flags on a descriptor number and writes no
+        // memory. The value is one this same descriptor reported earlier, and a
+        // descriptor that has become invalid meanwhile fails with `EBADF`
+        // rather than doing anything.
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFL, before);
+        }
+    }
+}
+
 /// Create two logging destinations and two global configs. Returns non-zero exit
 /// status if there was a difference in any component of the output.
 impl RunOpts {
@@ -3428,6 +3511,10 @@ impl RunOpts {
         let (log1_file, log1_path) = log1.into_parts();
         let (log2_file, log2_path) = log2.into_parts();
 
+        // Captured BEFORE run 1 so the same values can be put back before run 2.
+        // See the restore call below for the measurement this exists for.
+        let fd_flags_before_run1 = standard_fd_status_flags();
+
         eprintln!(":: {}", "Run1...".yellow().bold());
 
         let mut out1: Output = match self.run_verify(log1_file, global) {
@@ -3507,6 +3594,42 @@ impl RunOpts {
             }
             return Err(Error::msg(format!("First run during --verify {status}")));
         }
+
+        // ⚠️ THE TWO RUNS MUST START FROM IDENTICAL fd STATE, AND WITHOUT THIS
+        // THEY DO NOT. Both runs inherit hermit's OWN stderr, so a guest that
+        // mutates its status flags leaves run 2 starting from state run 1
+        // created -- and the comparison then reports the guest as
+        // nondeterministic when the guest was identical both times.
+        //
+        // MEASURED 2026-08-26 on `run --backend kvm --strict --verify --
+        // /usr/bin/awk 'BEGIN { print 42 }'`: awk sets O_APPEND on fd 2 only
+        // when it is not already set, so
+        //     run 1  fcntl(2, F_GETFL) = 32769  -> fcntl(2, F_SETFL, 33793)
+        //     run 2  fcntl(2, F_GETFL) = 33793  -> no SETFL at all
+        // One extra syscall in run 1 (161 vs 160), which shifts every later
+        // record by one and reported TWENTY mismatches for TWO real differences.
+        //
+        // ⚠️ TWO, NOT ONE. An earlier version of this comment said "drop that
+        // single record and the sequences are byte-identical". The INBOUND
+        // records are -- measured, 0 of 160 differ once run 1's `F_SETFL` is
+        // removed -- but the `F_GETFL` RESULT differs as well, `Ok(32769)`
+        // against `Ok(33793)`, because that is the flag word this defect is
+        // about. Caught by `agent(hermit-dbg)`. The distinction matters: the
+        // claim as written invited a reader to check inbound records only, find
+        // them clean, and conclude the harness was blameless.
+        //
+        // The one-line demonstration, before this fix: `2>file` gave rc=125
+        // and 20 mismatches; `2>>file` -- the same run with O_APPEND already
+        // set, so awk skips the SETFL in BOTH runs -- gave rc=0 and 0
+        // mismatches. One bit on one descriptor decided the verdict.
+        //
+        // ⚠️ RESTORE, DO NOT SANITISE. Clearing the flags outright would change
+        // what the guest observes; this puts back exactly what run 1 was
+        // handed, so run 2 sees the same starting state and nothing else moves.
+        // Best-effort by construction: if the flags cannot be read or restored
+        // we leave the descriptor alone rather than fail a verification over
+        // housekeeping, and the comparison reports the divergence as before.
+        restore_standard_fd_status_flags(fd_flags_before_run1);
 
         eprintln!(":: {}", "Run2...".yellow().bold());
         let mut out2 = match self.run_verify(log2_file, global) {
