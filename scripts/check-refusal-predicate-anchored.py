@@ -30,12 +30,25 @@ it; this refuses.
 WHAT IS REQUIRED INSTEAD. Match the marker ANCHORED to the start of a line:
 
     return any(
-        line.startswith(shape) for line in output.splitlines() for shape in SHAPES
+        line.strip().startswith(shape)
+        for line in output.splitlines()
+        for shape in SHAPES
     )
 
-or a regex with `^` under `re.MULTILINE`. Anchoring is what distinguishes the
-producing program's own first-column output from a quotation of it inside
+or a regex with `^\s*` under `re.MULTILINE`. Anchoring is what distinguishes the
+producing program's own line-initial output from a quotation of it inside
 somebody else's line.
+
+⚠️ STRIP BEFORE ANCHORING. This file previously recommended a bare
+`line.startswith(shape)` and that advice was WRONG. Measured by
+`agent(hermit-101)` on hermit#2699: `RunSummary::refused` puts its reasons in
+`detail` and the renderer indents every detail line by three spaces
+(`scripts/validate.rs:11068`), so of the three real shapes only
+"validate: REFUSED" is at column zero. A bare `startswith` would have stopped
+recognising TWO OF THREE genuine declines -- converting a false positive into a
+false negative, which is the worse direction. The checker cannot tell the two
+forms apart (both are anchored), so the only defence is that this text names the
+right one.
 
 ⚠️ THIS IS PYTHON, NOT rust-script, AND THAT IS DELIBERATE. `AGENTS.md` prefers
 rust-script for new scripts. rust-script compiles, and this was written under an
@@ -233,6 +246,20 @@ ANCHORED = '''
 _REFUSAL_SHAPES = ("refused by:", "validate: REFUSED")
 def looks_refused(output):
     return any(
+        line.strip().startswith(shape)
+        for line in output.splitlines()
+        for shape in _REFUSAL_SHAPES
+    )
+'''
+
+# ⚠️ ACCEPTED, AND THE CHECKER CANNOT TELL IT FROM THE FORM ABOVE. Both are
+# anchored, so both pass. This one is nonetheless WRONG in practice -- it misses
+# the indented detail shapes. Pinned as a KNOWN LIMIT so nobody reads a green
+# checker as proof the predicate is correct.
+ANCHORED_BUT_UNSTRIPPED = '''
+_REFUSAL_SHAPES = ("refused by:", "validate: REFUSED")
+def looks_refused(output):
+    return any(
         line.startswith(shape)
         for line in output.splitlines()
         for shape in _REFUSAL_SHAPES
@@ -278,6 +305,8 @@ def self_test() -> int:
     check("unrelated GREETINGS collection", UNRELATED, 0)
     print("CONTROL -- a NAME test is not a channel classification (this checker's own shape):")
     check("`hint in upper` name comparison", NAME_TEST, 0)
+    print("KNOWN LIMIT -- anchored-but-unstripped also passes; only the text above warns:")
+    check("bare startswith, misses indented shapes", ANCHORED_BUT_UNSTRIPPED, 0)
     if failures:
         print(f"check-refusal-predicate-anchored --self-test: {failures} case(s) FAILED", file=sys.stderr)
         return 1
