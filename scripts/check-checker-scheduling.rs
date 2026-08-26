@@ -35,6 +35,7 @@
 mod rust_script_prelude;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 
@@ -45,6 +46,162 @@ use std::process::Command;
 /// list should shrink. It exists so this checker starts green on a tree that
 /// already has four orphans rather than landing as an immediate red.
 const ALLOWLIST: &[(&str, &str)] = &[
+    (
+        "ci/configure-build-jobs.sh",
+        "NOT A CHECKER: shared inner-build width for every DAG launch path; a \
+         configuration helper other scripts source, with no assertion of its \
+         own.",
+    ),
+    (
+        "ci/hermetic/assert-no-network.sh",
+        "A REAL CHECKER, UNSCHEDULED. It asserts the calling environment has no \
+         network. Reached only from other hermetic scripts, none of which a \
+         lane runs. This is a DEBT, not a classification: schedule it or delete \
+         it.",
+    ),
+    (
+        "ci/hermetic/build-image.sh",
+        "NOT A CHECKER: builds the pinned validate root from flake.lock; a \
+         build step, not an assertion.",
+    ),
+    (
+        "ci/hermetic/fedora-runner-probe.sh",
+        "NOT A CHECKER: its own header calls it a READ-ONLY probe for the \
+         self-hosted runner box; it answers questions rather than gating.",
+    ),
+    (
+        "ci/hermetic/run-in-pinned-root.sh",
+        "NOT A CHECKER: its own header says OPT-IN, nothing calls this; a \
+         launcher for running a command inside the pinned root.",
+    ),
+    (
+        "ci/hermetic/run-split-validate.sh",
+        "NOT A CHECKER: a launcher that runs validate as two phases across a \
+         network boundary; it schedules work, it does not assert.",
+    ),
+    (
+        "ci/merge-test-inventory.py",
+        "NOT A CHECKER: merges inventory files; a data transform with no pass \
+         or fail verdict.",
+    ),
+    (
+        "ci/power-to-weight.rs",
+        "NOT A CHECKER: produces a cost report; it reports a number and gates \
+         nothing.",
+    ),
+    (
+        "ci/probe-runner-boxing.sh",
+        "NOT A CHECKER: its own header says DIAGNOSTIC ONLY, never fails its \
+         caller, never changes a default, never gates a lane.",
+    ),
+    (
+        "ci/run-dag.sh",
+        "NOT A CHECKER: the DAG launcher itself; scheduling other things is its \
+         job.",
+    ),
+    (
+        "ci/run-node.sh",
+        "NOT A CHECKER: runs one DAG node; the thing checkers are scheduled BY, \
+         not a checker.",
+    ),
+    (
+        "ci/select-tests.rs",
+        "NOT A CHECKER: selects a test set; a selector, not an assertion.",
+    ),
+    (
+        "ci/validate-timeout-layers-test.sh",
+        "NOT A CHECKER: a self-test of the validate timeout layering. It runs \
+         when its subject does; scheduling it separately would double the cost \
+         and gate nothing new.",
+    ),
+    (
+        "scripts/check_outcome_adapter.py",
+        "NOT A CHECKER: loads the content-pinned check-outcome authority for \
+         other callers; an adapter, named check_ only by that convention.",
+    ),
+    (
+        "scripts/classify-required-check.sh",
+        "NOT A CHECKER: classifies a check result for callers; a helper with no \
+         verdict of its own.",
+    ),
+    (
+        "scripts/compat-map.sh",
+        "NOT A CHECKER: generates the compatibility map; a data producer.",
+    ),
+    (
+        "scripts/configure-merge-gate-ruleset.sh",
+        "NOT A CHECKER: MUTATES GitHub rulesets to match owner policy; an \
+         administrative action, and one that must never run unattended from a \
+         lane.",
+    ),
+    (
+        "scripts/core-review-protocol-lint.sh",
+        "A REAL CHECKER, UNSCHEDULED, AND IT IS THE post-facto-human-review \
+         MERGE GATE. Nothing runs it by EITHER path: merge-gate.yml has been \
+         workflow_dispatch-only since 0ff814f038, and no Makefile recipe \
+         invokes it. This entry RECORDS the debt, it does not excuse it.",
+    ),
+    (
+        "scripts/hermit-code-coverage.rs",
+        "NOT A CHECKER: produces a coverage report; it reports numbers and \
+         gates nothing.",
+    ),
+    (
+        "scripts/label-strip-evidence.sh",
+        "NOT A CHECKER: records what a pull request previously carried so \
+         evidence is not lost; an evidence recorder.",
+    ),
+    (
+        "scripts/log_timeslice.rs",
+        "NOT A CHECKER: reads a DETLOG stream and reports timeslice statistics. \
+         It produces numbers for a human to read and asserts nothing, so there \
+         is no verdict for a lane to gate on.",
+    ),
+    (
+        "scripts/manifest-to-commands.rs",
+        "NOT A CHECKER: converts a manifest into commands; a transform.",
+    ),
+    (
+        "scripts/pr-dag-health.sh",
+        "NOT A CHECKER: reports DAG health for a pull request; a report.",
+    ),
+    (
+        "scripts/progress-report.sh",
+        "NOT A CHECKER: summarises repository progress for a human reader. It \
+         asserts nothing and cannot fail, so scheduling it would add cost \
+         without adding a gate.",
+    ),
+    (
+        "scripts/pr_status.py",
+        "NOT A CHECKER: its own header says it reports operational health for \
+         open pull requests; a report.",
+    ),
+    (
+        "scripts/runner_health.rs",
+        "NOT A CHECKER: reports runner health; a report.",
+    ),
+    (
+        "scripts/setup-hooks.sh",
+        "NOT A CHECKER: installs the tracked pre-commit and pre-push hooks; an \
+         installer.",
+    ),
+    (
+        "scripts/stress-test.sh",
+        "NOT A CHECKER: a stress-exercise tool; it produces load, not a \
+         verdict.",
+    ),
+    (
+        "scripts/update_spreadsheet.rs",
+        "NOT A CHECKER: updates an external spreadsheet; an administrative \
+         action.",
+    ),
+    (
+        "scripts/validate-env-block-test.sh",
+        "NOT A CHECKER: a self-test of the environmental classifier bracket \
+         inside validate.rs --self-test, which the Makefile does schedule. It \
+         runs when its subject does; scheduling it separately would double the \
+         cost and gate nothing new.",
+    ),
     (
         "scripts/check-default-build-warnings.sh",
         "Builds the workspace; its findings were never counted, so wiring it \
@@ -114,31 +271,78 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ),
 ];
 
-/// Is this tracked path a checker entrypoint by convention?
-fn is_checker_path(path: &str) -> bool {
-    CHECKER_PREFIXES.iter().any(|pre| path.starts_with(pre))
-        || CHECKER_SUFFIXES.iter().any(|suf| path.ends_with(suf))
+/// Is this tracked path in the discovered population?
+///
+/// ⚠️ THIS REPLACED A PREFIX/SUFFIX PREDICATE AND KEEPS ITS GUARANTEE. hermit#2684
+/// widened the naming convention from `check-`/`test_` prefixes to include the
+/// `-test.sh` suffix, and pinned three files as required members. The convention is
+/// gone -- a shebang is a property of the file rather than a habit of its author --
+/// but the REQUIREMENT is not: those files must still be in the population, and the
+/// assertions that pinned them are rewritten against this predicate rather than
+/// deleted. A mechanism change is not a licence to retire the guarantee it carried.
+fn in_population(path: &str) -> bool {
+    (path.starts_with("scripts/") || path.starts_with("ci/"))
+        && (path.ends_with(".sh") || path.ends_with(".rs") || path.ends_with(".py"))
+        && has_shebang(path)
 }
 
 /// Directory/prefix pairs that identify a checker entrypoint by convention.
-const CHECKER_PREFIXES: &[&str] = &[
-    "scripts/check-",
-    "scripts/test-",
-    "scripts/test_",
-    "ci/check-",
-    "ci/verify-",
-    "ci/test-",
-    "ci/test_",
-];
-
-/// Suffixes that identify a checker entrypoint by convention.
+/// The smallest population this guard will accept before refusing to answer.
 ///
-/// WARNING -- A CONVENTION EXPRESSED ONLY AS A PREFIX CANNOT SEE ITS OWN FAMILY.
-/// `foo-test.sh` is a checker by every standard this file uses -- it asserts and
-/// exits nonzero -- and five of them were outside the population entirely, so
-/// nothing verified that anything runs them. Two turned out to be scheduled by
-/// NOTHING, which is the condition this checker exists to report and could not.
-const CHECKER_SUFFIXES: &[&str] = &["-test.sh"];
+/// ⚠️ A FLOOR, NOT A TARGET. It replaces an `is_empty()` assertion that could not
+/// catch the failure that matters: discovery going to ZERO was already caught,
+/// but discovery COLLAPSING -- a predicate change leaving five files instead of
+/// seventy -- was not, and would report "OK, 5 scheduled" in exactly the
+/// confident tone this guard exists to avoid. Measured 2026-08-26: 70
+/// entrypoints. 50 leaves room for real deletion without admitting a collapse.
+const POPULATION_FLOOR: usize = 50;
+
+/// Is this tracked file an ENTRYPOINT -- something meant to be run directly?
+///
+/// ⚠️ THIS REPLACED A FILENAME-CONVENTION POPULATION, AND THE CONVENTION WAS THE
+/// DEFECT. The guard asked "is it named `check-`/`test-`/`verify-`, or does it end
+/// `-test.sh`?" as a proxy for "is it a checker?". A naming convention is a habit,
+/// not a definition.
+///
+/// The standing case is `ci/audit-test-binary-registration.py`. RE-MEASURED
+/// 2026-08-26 on `origin/main` `d710acd970`, because the original justification here
+/// has expired and leaving it would be a false claim in a file about false claims:
+///
+///   * it IS scheduled -- `Makefile:155`, `python3 ./ci/audit-test-binary-registration.py`
+///   * it DOES pass -- rc=0, "inventory is complete"
+///
+/// An earlier revision of this comment said it "was scheduled by nothing, and was
+/// itself reporting a FAIL". Both halves were true when written and neither is now.
+///
+/// ⚠️ THE GAP IS NARROWER THAN THAT, AND STILL REAL: the file is mode `100644`, has
+/// no `check-`/`test-`/`verify-` prefix and no `-test.sh` suffix, so it is NOT in the
+/// convention population even after hermit#2684 widened it. It is a scheduled checker
+/// this guard cannot see -- delete `Makefile:155` and nothing reports it. Being
+/// unverifiable is the defect, not being unscheduled.
+///
+/// A shebang is a PROPERTY of the file rather than a habit of its author: the
+/// file declaring how it is to be executed. Measured on main against the
+/// alternatives, both of which were tried and rejected:
+///
+///   filename prefix   24 files -- misses the auditor that motivated this
+///   executable bit    65 files -- ALSO misses it. That file is mode 100644, so
+///                                 a discovery keyed on the exec bit would have
+///                                 missed the very file that exposed the defect.
+///   shebang           70 files -- a strict superset of executable, and it
+///                                 catches the auditor.
+///
+/// It over-matches in one direction only: a shebanged script that is not a
+/// checker must be allowlisted with a reason. That cost is visible and
+/// arguable. The prefix's error was invisible, which is worse.
+fn has_shebang(path: &str) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        // Unreadable is not "not an entrypoint". Fail toward INCLUSION so a
+        // permissions or checkout problem cannot silently shrink the population.
+        return true;
+    };
+    bytes.starts_with(b"#!")
+}
+
 
 /// This checker's own tracked path.
 const SELF_PATH: &str = "scripts/check-checker-scheduling.rs";
@@ -203,12 +407,6 @@ fn strip_comments(text: &str, path: &str) -> String {
         .join("\n")
 }
 
-fn is_executable(path: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
 
 fn main() {
     rust_script_prelude::init();
@@ -232,14 +430,14 @@ fn main() {
     // Every checker entrypoint we expect to be scheduled.
     let checkers: BTreeSet<String> = tracked
         .iter()
-        .filter(|p| is_checker_path(p))
-        .filter(|p| p.ends_with(".sh") || p.ends_with(".rs") || p.ends_with(".py"))
-        .filter(|p| is_executable(p) || p.ends_with(".py"))
+        .filter(|p| in_population(p))
         .cloned()
         .collect();
     assert!(
-        !checkers.is_empty(),
-        "discovered no checker entrypoints; the naming convention or this filter moved"
+        checkers.len() >= POPULATION_FLOOR,
+        "discovered {} entrypoints, fewer than the {POPULATION_FLOOR} floor; the \
+         discovery predicate moved and this guard is now reading the wrong set",
+        checkers.len()
     );
     // A rename must not silently re-enable the self-reference described on
     // `expands_frontier`. If SELF_PATH stops naming a tracked file the exclusion
@@ -599,29 +797,50 @@ fn lint_checks_recipe(makefile: &str) -> String {
 }
 
 fn self_test() {
-    // ⚠️ PINS THE POPULATION RULE, AND THE ASYMMETRY THAT MOTIVATED IT. A convention
-    // expressed only as a PREFIX cannot see its own family: `foo-test.sh` asserts and
-    // exits nonzero by every standard this file uses, and five were outside the
-    // population entirely, so nothing verified that anything ran them -- three were
-    // scheduled by NOTHING and are wired into `lint-checks` by this change. The prefix
-    // list was also asymmetric: it carried `scripts/test_` but not `ci/test_`, so a
-    // Python checker under ci/ was invisible for no reason anyone chose.
+    // ⚠️ SEMANTIC REGRESSION TEST: THE FILES, NOT THE MECHANISM. `agent(codex-rev-2665)`
+    // found that restoring the old prefix predicate tripped the population floor but
+    // left every unit test passing, and that excluding all five named files passed too
+    // -- so nothing pinned the OUTCOME this change exists for. These do.
+    //
+    // The first two are hermit#2684's assertions, rewritten rather than deleted: that
+    // head pinned them against a prefix/suffix convention this one removes, and the
+    // convention going away does not retire the requirement it carried.
+    for required in [
+        "scripts/core-review-protocol-lint-test.sh",
+        "ci/test_audit_test_binary_registration.py",
+        // ⚠️ THE FILE THIS WHOLE CHANGE EXISTS FOR, and the one a narrowing would drop
+        // first: mode 100644, no `check-`/`test-`/`verify-` prefix, no `-test.sh`
+        // suffix. Measured 2026-08-26 on `origin/main` d710acd970 -- it IS scheduled
+        // (`Makefile:155`) and it DOES pass, so the gap is not an unscheduled checker;
+        // it is a scheduled one this guard cannot see. Delete that Makefile line and
+        // nothing would notice. A prefix population misses it, and so does one keyed
+        // on the executable bit.
+        "ci/audit-test-binary-registration.py",
+    ] {
+        assert!(
+            in_population(required),
+            "{required} must be in the discovered population; a predicate that drops it \
+             reintroduces the gap this guard exists to close, and the floor will not \
+             catch it because the count stays high"
+        );
+    }
+
+    // ⚠️ AND THE LIMIT, MEASURED RATHER THAN ASSUMED. Widening to every tracked file
+    // under scripts/ and ci/ regardless of shebang was measured at runners, libraries
+    // and fixtures entering the population -- a standing red, which is how a gate gets
+    // switched off. The control matters: without it a predicate returning `true` for
+    // everything would satisfy every assertion above.
+    // ⚠️ THE PATH MUST EXIST, AND THAT IS NOT PEDANTRY. `has_shebang` fails toward
+    // INCLUSION so a permissions or checkout problem cannot silently shrink the
+    // population -- which means a NONEXISTENT path is "in the population" and a
+    // control written against an invented filename passes for the wrong reason, or
+    // in this case fails for one. hermit#2684's control used `scripts/lib/helper.sh`,
+    // which does not exist; caught by running it.
     assert!(
-        is_checker_path("scripts/core-review-protocol-lint-test.sh"),
-        "a -test.sh checker must be in the population"
-    );
-    assert!(
-        is_checker_path("ci/test_audit_test_binary_registration.py"),
-        "ci/test_ must be recognised, as scripts/test_ already was"
-    );
-    // ⚠️ AND THE LIMIT, MEASURED RATHER THAN ASSUMED. Widening the population to every
-    // tracked executable under scripts/ and ci/ was measured 2026-08-26 at 32 checkers
-    // scheduled by NOTHING -- runners, libraries and probes, not checkers. That is a
-    // standing red, which is how a gate gets switched off. The convention stays a
-    // convention; what changed is that it no longer misses its own families.
-    assert!(
-        !is_checker_path("scripts/lib/helper.sh"),
-        "the population must not swallow libraries"
+        !in_population("ci/manifest-plan/src/lib.rs"),
+        "a real library module with no shebang must NOT be in the population -- \
+         without this a predicate returning true for everything satisfies every \
+         requirement above"
     );
 
     // Comment stripping is what separates a real invocation from a mention.
