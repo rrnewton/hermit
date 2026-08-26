@@ -872,7 +872,10 @@ pub struct CellResult {
     pub classification: String,
     pub outcome: String,
     pub error_kind: Option<String>,
-    pub duration_ms: u128,
+    /// Measured wall time for a cell that reached execution. Absent when the
+    /// cell never ran; a measured zero remains a valid sub-millisecond result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u128>,
     /// Runtime totals from the first attempt that produced them.
     pub runtime: Option<VerificationRuntime>,
     pub log_level: Option<String>,
@@ -2176,7 +2179,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         classification: if cell.enabled { "required" } else { "disabled" }.into(),
         outcome,
         error_kind,
-        duration_ms: started.elapsed().as_millis(),
+        duration_ms: Some(started.elapsed().as_millis()),
         runtime: attempts.iter().find_map(|attempt| attempt.runtime.clone()),
         log_level: (cell.id.mode != "naked").then(|| "info".into()),
         effective_args: literal_argv.iter().skip(1).cloned().collect(),
@@ -2241,7 +2244,7 @@ pub fn infrastructure_error_result(
         classification: if cell.enabled { "required" } else { "disabled" }.into(),
         outcome: "ERROR".into(),
         error_kind: Some("infrastructure".into()),
-        duration_ms: 0,
+        duration_ms: None,
         runtime: None,
         log_level: (cell.id.mode != "naked").then(|| "info".into()),
         effective_args: Vec::new(),
@@ -2298,7 +2301,7 @@ pub fn host_inapplicable_result(
         classification: if cell.enabled { "required" } else { "disabled" }.into(),
         outcome: "HOST-INAPPLICABLE".into(),
         error_kind: None,
-        duration_ms: 0,
+        duration_ms: None,
         runtime: None,
         log_level: None,
         effective_args: Vec::new(),
@@ -2525,13 +2528,17 @@ pub fn write_junit(path: &Path, results: &[CellResult]) -> Result<(), String> {
         results.len()
     );
     for result in results {
+        let time = result
+            .duration_ms
+            .map(|duration_ms| format!(" time=\"{:.3}\"", duration_ms as f64 / 1000.0))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "  <testcase classname=\"{}\" name=\"{}/{}/{}\" time=\"{:.3}\">",
+            "  <testcase classname=\"{}\" name=\"{}/{}/{}\"{}>",
             xml(&result.category),
             xml(&result.test),
             xml(&result.mode),
             xml(result.backend.as_deref().unwrap_or("none")),
-            result.duration_ms as f64 / 1000.0
+            time,
         ));
         if result.outcome == "FAIL" {
             out.push_str(&format!(
@@ -3228,6 +3235,19 @@ mod tests {
         assert!(result.attempts.is_empty());
         assert!(result.binary_sha256.is_none());
         assert_eq!(result.error_kind, None);
+        assert_eq!(result.duration_ms, None);
+        let row = serde_json::to_value(&result).unwrap();
+        assert!(
+            row.get("duration_ms").is_none(),
+            "a cell that never executed must not publish a measured zero wall time"
+        );
+        let mut measured_zero = result.clone();
+        measured_zero.duration_ms = Some(0);
+        assert_eq!(
+            serde_json::to_value(measured_zero).unwrap()["duration_ms"],
+            0,
+            "a measured sub-millisecond duration must remain zero"
+        );
 
         let junit = root.join("junit.xml");
         write_junit(&junit, &[result]).unwrap();
@@ -3238,6 +3258,7 @@ mod tests {
                 "<skipped message=\"NOT RUN, NOT a pass, no coverage: planted absence\"/>"
             )
         );
+        assert!(!xml.contains(" time=\"0.000\""));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3284,10 +3305,13 @@ mod tests {
             append_result(&path, &result).unwrap();
             let rows = fs::read_to_string(&path).unwrap();
             assert_eq!(rows.lines().count(), expected);
-            assert!(
-                rows.lines()
-                    .all(|line| serde_json::from_str::<JsonValue>(line).is_ok())
-            );
+            for line in rows.lines() {
+                let row = serde_json::from_str::<JsonValue>(line).unwrap();
+                assert!(
+                    row.get("duration_ms").is_none(),
+                    "an infrastructure error that never executed must omit wall time"
+                );
+            }
         }
 
         let concurrent_path = root.join("series-results.jsonl");
