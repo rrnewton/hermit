@@ -355,7 +355,21 @@ fn is_invoked(text: &str, path: &str) -> bool {
     // scripts/check-reverie-pin.rs and runs the resulting binary, so the checker is
     // genuinely scheduled without ever being executed as a script.
     for runner in ["python3 ", "python ", "bash ", "sh ", "rustc "] {
-        if text.contains(&format!("{runner}{path}")) {
+        let needle = format!("{runner}{path}");
+        // ⚠️ AND THE RUNNER PREFIX MUST NOT BE INSIDE A STRING LITERAL. Requiring
+        // `python3 ` in front of the path was still not enough: `ci/lint-checks-node.sh`
+        // carries `"python3 scripts/test_validate_stop_paths.py` as FIXTURE DATA -- a
+        // quoted multi-line string handed to `check_run` to simulate make's output --
+        // and that read as an invocation. Measured 2026-08-26: it turned
+        // check-checker-scheduling RED on main immediately after #2622 merged, because
+        // the entry #2622 correctly allowlisted was then reported STALE ("now
+        // scheduled") on the strength of a test fixture.
+        //
+        // A real invocation begins a command: the runner is at the start of a line, or
+        // follows a shell operator. It is never preceded by a quote. This is the THIRD
+        // narrowing of this predicate, and each one has been the same lesson -- a
+        // filename in live code is not evidence that the code runs it.
+        if text.lines().any(|line| invokes_on_line(line, &needle)) {
             return true;
         }
     }
@@ -363,6 +377,33 @@ fn is_invoked(text: &str, path: &str) -> bool {
     // the form run-reverie-pin-check.sh uses for both pin checkers. Anchoring to the
     // line start is what keeps this from matching a filename quoted mid-sentence.
     text.lines().any(|l| l.trim_start().starts_with(path))
+}
+
+/// Is `needle` used as a COMMAND on this line, rather than quoted inside a string?
+///
+/// The discriminator is the character immediately before the match: a command starts
+/// a line or follows a shell operator (`;`, `&`, `|`, `(`, backtick) or `$(`. A quote
+/// before it means the text is data -- an echoed diagnostic, or a fixture standing in
+/// for output. Erring toward FALSE ORPHAN stays the safe direction.
+fn invokes_on_line(line: &str, needle: &str) -> bool {
+    let mut from = 0;
+    while let Some(hit) = line[from..].find(needle) {
+        let at = from + hit;
+        let before = line[..at].trim_end();
+        let quoted = before.ends_with('"') || before.ends_with('\'');
+        if !quoted
+            && (before.is_empty()
+                || before.ends_with(';')
+                || before.ends_with('&')
+                || before.ends_with('|')
+                || before.ends_with('(')
+                || before.ends_with('`'))
+        {
+            return true;
+        }
+        from = at + 1;
+    }
+    false
 }
 
 /// Pull the value of every `"cmd":` field out of a DAG file.
@@ -470,6 +511,42 @@ mod tests {
         let s = strip_comments("// scripts/check-c.rs\nrun(\"check-d.rs\");\n", "x.rs");
         assert!(!s.contains("check-c.rs"));
         assert!(s.contains("check-d.rs"));
+    }
+
+    /// ⚠️ THE FIXTURE CASE, WHICH IS THE ONE THAT REDDENED MAIN. `ci/lint-checks-node.sh`
+    /// hands `check_run` a quoted multi-line string standing in for make's output, and
+    /// its first line is `"python3 scripts/test_validate_stop_paths.py`. Requiring the
+    /// `python3 ` prefix was not enough -- the fixture has it. Measured 2026-08-26:
+    /// this exact line made a correctly-allowlisted checker report STALE on main.
+    #[test]
+    fn a_runner_prefix_inside_a_string_literal_is_not_an_invocation() {
+        let fixture = "        \"python3 scripts/test_validate_stop_paths.py";
+        assert!(
+            !is_invoked(fixture, "scripts/test_validate_stop_paths.py"),
+            "a runner prefix quoted as fixture data must not read as an invocation"
+        );
+    }
+
+    /// ...and the real shapes must still fire, so the guard cannot be over-tightened
+    /// into a permanent pass. Each of these is a form this repository actually uses.
+    #[test]
+    fn genuine_invocations_still_fire_after_the_quote_guard() {
+        for real in [
+            "\tpython3 scripts/test_validate_stop_paths.py",
+            "python3 scripts/test_validate_stop_paths.py",
+            "\t./scripts/check-x.sh",
+            "\tcd foo && python3 scripts/test_validate_stop_paths.py",
+            "\t$(SUBMODULE_PROXY) ./ci/verify-submodules.sh",
+        ] {
+            let path = if real.contains("check-x") {
+                "scripts/check-x.sh"
+            } else if real.contains("verify-submodules") {
+                "ci/verify-submodules.sh"
+            } else {
+                "scripts/test_validate_stop_paths.py"
+            };
+            assert!(is_invoked(real, path), "must still fire: {real}");
+        }
     }
 
     #[test]
