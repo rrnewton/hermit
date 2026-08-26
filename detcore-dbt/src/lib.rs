@@ -1685,6 +1685,34 @@ pub unsafe extern "C" fn reverie_dbt_runtime_copied_syscall(sysnum: i64, args: *
     {
         return 1;
     }
+    // setpgid FAILS CLOSED IN STRICT MODE BECAUSE THE COPIED CHILD CAN PERFORM
+    // IT BUT CANNOT RECORD IT.
+    //
+    // `handle_setpgid` in the instrumented root does two things: it injects the
+    // call, so the KERNEL really moves the process group, and then it mirrors
+    // that move into Detcore's model with `set_process_group`, "so
+    // group-selecting waits do not consult host /proc state". A copied child has
+    // no Detcore Tool, so it performs the first half and silently skips the
+    // second: the kernel's process groups and Detcore's model diverge, and the
+    // next `wait` with a negative pgid selects against a model that is now
+    // wrong. That is the machinery hermit#bc9d178 reclassified setpgid to
+    // determinize in the first place.
+    //
+    // ⚠️ AND A FIXED ERRNO IS THE WRONG SHAPE HERE, WHICH IS WHY THIS IS NOT
+    // `-EPERM`. The ioctl arm above emulates ENOTTY because the instrumented
+    // root observes ENOTTY too -- that is faithful. The root observes setpgid
+    // SUCCEEDING, so no errno we return is faithful, and the choice is between
+    // two divergences. EPERM is the quiet one: setpgid's return is widely
+    // ignored, so a child would carry on believing it leads a process group it
+    // does not lead. Failing closed is the loud one, and a wrong answer about
+    // process-group identity is worse than no answer.
+    //
+    // Strict-only, matching the receive/readlink arms directly above: non-strict
+    // copied children keep native behaviour, and only strict execution -- which
+    // is where determinism is actually claimed -- refuses.
+    if sysno == Sysno::setpgid && strict {
+        return 1;
+    }
     if detcore::is_deterministically_refused_syscall(sysno)
         && (strict || !detcore::is_strict_only_deterministic_refusal_syscall(sysno))
     {
