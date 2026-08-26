@@ -240,10 +240,29 @@ fn contended_blocking_upgrade_is_refused_without_losing_the_shared_lock() {
 #[test]
 fn contended_blocking_upgrade_is_fail_closed_under_strict() {
     let run = hermit_run("error", &["--strict"], "upgrade");
+    // ⚠️ 122 IS "HERMIT REFUSED", NOT "HERMIT BROKE", AND NOT THE GUEST'S 1.
+    // This assertion read `Some(1)` because `unrecoverable_shutdown` used to
+    // `exit(1)`. That made the parent's classifier -- whose arm is documented
+    // "the child died with a status it did not pick" -- report
+    // `class=container-child-exit` and 125 for a shutdown that worked exactly as
+    // designed, sending a reader to hunt a defect in the refusal path. `1` was
+    // no better as a target: it is the commonest guest exit status, so it cannot
+    // distinguish "hermit refused" from "your program returned 1".
+    //
+    // Imported rather than written out: a copied exit code is what left eight
+    // cli tests asserting a stale value for a day after the product moved.
     assert_eq!(
         run.status.code(),
-        Some(1),
-        "a contended blocking flock upgrade must fail closed with exit 1, not time out or die for an unrelated reason\n{}",
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "a contended blocking flock upgrade must fail closed as a POLICY REFUSAL, not time out or die for an unrelated reason\n{}",
+        run.combined()
+    );
+    // The class is asserted too, because the code alone cannot carry it: every
+    // value in 0..=255 is a legal guest status, so only the marker is exclusive.
+    assert!(
+        run.combined()
+            .contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "the refusal must be machine-readable as a refusal, not as a failure\n{}",
         run.combined()
     );
     assert!(

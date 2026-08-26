@@ -643,6 +643,43 @@ impl std::fmt::Display for ContainerChildExit {
 
 impl std::error::Error for ContainerChildExit {}
 
+/// Hermit DELIBERATELY refused the run; the child exited a status hermit CHOSE.
+///
+/// ⚠️ THIS IS THE INVERSE OF [`ContainerChildExit`], AND SEPARATING THEM IS THE
+/// WHOLE POINT. That type means "the child died of something no handler caught".
+/// This one means "a fail-closed policy stopped the run on purpose". They are
+/// the same observation at this boundary — a container child that exited — and
+/// they demand opposite responses: file a bug against hermit, versus read the
+/// refusal hermit just printed and change the program or the flags.
+///
+/// Before this, a policy refusal arrived as `ContainerChildExit(Exited(1))` and
+/// surfaced as `HERMIT_INTERNAL_FAILURE class=container-child-exit`, exit 125 —
+/// a correct refusal reported as an accident, sending the reader to look for a
+/// defect in a shutdown path that behaved as designed.
+///
+/// The status is the only channel across the fork boundary, so
+/// `HERMIT_POLICY_REFUSAL_EXIT` is what carries the distinction. It is safe to
+/// key on: an ordinary guest exit does NOT arrive here — it is returned as a
+/// value through the `Ok(Ok(..))` arm, which is why `hermit run -- sh -c 'exit
+/// 122'` still reports 122 with no failure marker.
+#[derive(Debug)]
+// A unit struct on purpose: the status is `HERMIT_POLICY_REFUSAL_EXIT` by
+// construction -- it is what the match arm keys on -- so carrying a copy would
+// be a second place for it to be wrong.
+pub struct PolicyRefusal;
+
+impl std::fmt::Display for PolicyRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Hermit refused the run: a fail-closed policy stopped it before completion. \
+             This is not a hermit failure; the refusal reason is above."
+        )
+    }
+}
+
+impl std::error::Error for PolicyRefusal {}
+
 /// The container child PANICKED, and the panic was caught and reported.
 ///
 /// Distinct from [`ContainerChildExit`], which is the child dying of something
@@ -698,6 +735,16 @@ pub fn classify_container_result<T>(
             })
         }
         // PRESERVED, not flattened: the child died with a status it did not pick.
+        // A DELIBERATE refusal is separated from an unchosen death BEFORE the
+        // catch-all below, because at this boundary they look identical: both
+        // are a container child that exited. Only the status distinguishes
+        // them, and only because `unrecoverable_shutdown` chose one that says
+        // so.
+        Err(RunError::ExitStatus(status))
+            if status.code() == Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT) =>
+        {
+            Err(Error::new(PolicyRefusal))
+        }
         Err(RunError::ExitStatus(status)) => Err(Error::new(ContainerChildExit(status))),
         // A spawn failure is a genuine CLI-side failure and keeps its prose.
         Err(error @ RunError::Spawn(_)) => {

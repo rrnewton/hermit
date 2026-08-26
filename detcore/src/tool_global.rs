@@ -3012,7 +3012,20 @@ where
     }
 
     // In this scenario a backtrace doesn't really help us.
-    std::process::exit(1);
+    //
+    // ⚠️ THE STATUS IS THE ONLY THING THAT CROSSES THIS BOUNDARY, SO IT HAS TO
+    // CARRY THE MEANING. This is a DELIBERATE, policy-driven shutdown: the run
+    // hit an operation it cannot service under a fail-closed configuration and
+    // hermit chose to stop. The parent sees only a container child that exited,
+    // and its classifier treats an exit it cannot account for as unchosen — so
+    // exiting 1 here made `classify_container_result` report
+    // `class=container-child-exit` and 125, i.e. "hermit broke", for a shutdown
+    // that worked exactly as designed. `HERMIT_POLICY_REFUSAL_EXIT` is the
+    // agreed value for "hermit refused"; see its doc for why it is not 1.
+    //
+    // The RPC above is `cfg!(debug_assertions)`-only, so it cannot be the
+    // signal — in a release build the parent would learn nothing.
+    std::process::exit(detcore_model::HERMIT_POLICY_REFUSAL_EXIT);
 }
 
 #[cfg(test)]
