@@ -2042,8 +2042,10 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
 
 // TODO-HUMAN-REVIEW(PR-736): Review reserved LiteInst runtime failure statuses.
 //
-// ⚠️ THIS PREDICATE AND THE CLASSIFIER MUST COVER THE SAME STATUSES, AND A
-// HARD-CODED RANGE CANNOT. When the reserved set grew to include the signal
+// ⚠️ THIS PREDICATE AND THE CLASSIFIER MUST AGREE ABOUT THE SIGNAL BAND, AND A
+// HARD-CODED RANGE CANNOT. They do NOT cover the same statuses and are not meant
+// to -- see the table below for what each covers. It is the SIGNAL half that has
+// to move together, because both readers derive it from the same fact. When the reserved set grew to include the signal
 // band, `Exited(130)` fell outside `122..=127` and is NOT `Signaled(_, _)` --
 // it is a status hermit CHOSE, not an actual signal death -- so LiteInst
 // skipped the forced shutdown and `clean_up` could wait forever on
@@ -2582,8 +2584,12 @@ pub async fn replay_with_output_and_mounts(dir: &Path, mounts: &[Mount]) -> Resu
 
 #[cfg(test)]
 mod tests {
-    /// ⚠️ THE REGRESSION agent(hermit-007)'s CODEX LANE CAUGHT, PINNED SO IT
-    /// CANNOT RETURN. `liteinst_requires_forced_shutdown` hard-coded
+    /// ⚠️ THE REGRESSION agent(hermit-007)'s CODEX LANE CAUGHT, PINNED FOR THE
+    /// SIGNAL BAND. This test fails if the signal half stops being covered; it
+    /// does NOT prove the predicate can never drift again, because the
+    /// `122..=127` half is still a hard-coded literal that a future reserved
+    /// value would fall outside exactly as 130 did.
+    /// `liteinst_requires_forced_shutdown` hard-coded
     /// `Exited(122..=127)`. When the reserved set grew to include the signal
     /// band, `Exited(130)` fell outside it and is not `Signaled(_, _)` -- it is a
     /// status hermit CHOSE -- so LiteInst skipped the forced shutdown and

@@ -4681,7 +4681,10 @@ fn a_signal_killed_container_reports_a_signal_death_not_a_refusal() {
         "failed to deliver SIGINT to the container child"
     );
 
-    let status = child.wait().expect("failed to wait for the signalled run");
+    // ⚠️ STDIN IS DROPPED FIRST so the guest can retire if the signal was missed,
+    // and the wait is bounded so it cannot wedge if it still does not.
+    drop(_stdin);
+    let status = wait_bounded(&mut child, "a_signal_killed_container");
     let mut stderr = String::new();
     if let Some(mut pipe) = child.stderr.take() {
         let _ = pipe.read_to_string(&mut stderr);
@@ -4789,9 +4792,7 @@ fn sigint_instakill_reports_a_signal_death_not_a_policy_refusal() {
     // eliminations blaming the cargo harness for it. The guest is blocked in a
     // read on this pipe; the signal alone does not retire the run.
     drop(stdin);
-    let status = child
-        .wait()
-        .expect("failed to wait for the interrupted run");
+    let status = wait_bounded(&mut child, "sigint_instakill_reports_a_signal_death");
     let mut stderr = String::new();
     if let Some(mut pipe) = child.stderr.take() {
         let _ = pipe.read_to_string(&mut stderr);
@@ -4806,4 +4807,36 @@ fn sigint_instakill_reports_a_signal_death_not_a_policy_refusal() {
         !stderr.contains("HERMIT_POLICY_REFUSAL"),
         "an operator interrupt is not a policy refusal -- hermit refused nothing\n{stderr}"
     );
+}
+
+/// Wait for a child, but never forever.
+///
+/// ⚠️ AN UNBOUNDED `wait()` IN A SIGNAL TEST WEDGES THE RUNNER INSTEAD OF FAILING,
+/// and this repository has already paid for that shape: hermit#2654's cell hung
+/// the run to an external rc=124 with no test named and no failing status of its
+/// own. Both callers below hold the guest open on a pipe read, so if the signal
+/// is missed -- handler not yet installed, or the pid raced -- nothing ends the
+/// run. A wedge costs the whole run's budget and reports nothing; a red names
+/// itself in one line. Raised by agent(hermit-006) and agent(hermit-007).
+///
+/// The child is killed on expiry so the failure is a named red and leaves nothing
+/// running.
+fn wait_bounded(child: &mut std::process::Child, what: &str) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        match child.try_wait().expect("failed to poll the child") {
+            Some(status) => return status,
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "{what}: the run did not finish within 60s of the signal; killed it \
+                         so this is a named failure rather than a wedged runner"
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
 }
