@@ -130,15 +130,31 @@ fn declared(context: &str) -> bool {
 }
 
 fn scan(files: &[String]) -> Vec<Site> {
-    let colliding: BTreeMap<u32, &str> = COLLIDING.iter().copied().collect();
     let mut found = Vec::new();
     for file in files {
-        if EXEMPT_FILES.iter().any(|(f, _)| f == file) {
-            continue;
-        }
         let Ok(body) = fs::read_to_string(Path::new(file)) else {
             continue;
         };
+        found.extend(scan_text(file, &body));
+    }
+    found
+}
+
+/// The matcher itself, over (path, contents), so it can be exercised on fixtures.
+///
+/// ⚠️ THE SEAM EXISTS SO THE TESTS CAN SEE NARROWING. This ratchet reports a
+/// COUNT, and a count going down is ambiguous: sites were declared, or the
+/// matcher stopped seeing them. Those are opposite facts and the number cannot
+/// tell them apart. The tests below pin each recognised shape by name, so
+/// narrowing the matcher fails a NAMED test instead of quietly reading as
+/// progress. Do not inline this back into `scan`.
+fn scan_text(file: &str, body: &str) -> Vec<Site> {
+    let colliding: BTreeMap<u32, &str> = COLLIDING.iter().copied().collect();
+    let mut found = Vec::new();
+    {
+        if EXEMPT_FILES.iter().any(|(f, _)| *f == file) {
+            return found;
+        }
         let lines: Vec<&str> = body.lines().collect();
         for (i, line) in lines.iter().enumerate() {
             let mut rest = *line;
@@ -166,7 +182,7 @@ fn scan(files: &[String]) -> Vec<Site> {
                     continue;
                 }
                 found.push(Site {
-                    file: file.clone(),
+                    file: file.to_owned(),
                     line: i + 1,
                     value,
                     text: line.split_whitespace().collect::<Vec<_>>().join(" "),
@@ -224,5 +240,181 @@ fn main() {
             BASELINE,
             sites.len()
         );
+    }
+}
+
+/// ⚠️ THESE TESTS EXIST BECAUSE THE RATCHET REPORTS A COUNT, AND A FALLING COUNT
+/// IS AMBIGUOUS. 17 becoming 12 means either five sites were declared, or the
+/// matcher stopped recognising five shapes. Those are opposite facts -- one is
+/// progress, the other is the gate quietly measuring less -- and the number alone
+/// cannot distinguish them. Every recognised shape is therefore pinned by name
+/// here, so NARROWING THE MATCHER FAILS A NAMED TEST rather than reading as work
+/// done.
+///
+/// If you are here because a test failed after you edited the matcher: that is
+/// the test working. Decide whether the shape should still be caught, and if it
+/// should not, delete the case DELIBERATELY and say why in the commit.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const F: &str = "hermit-cli/tests/example.rs";
+
+    fn count(body: &str) -> usize {
+        scan_text(F, body).len()
+    }
+
+    // ---- each contested value is caught -------------------------------------
+
+    #[test]
+    fn catches_bare_one_the_pre_2558_hermit_code() {
+        assert_eq!(count("assert_eq!(output.status.code(), Some(1));"), 1);
+    }
+
+    #[test]
+    fn catches_bare_125_which_should_be_the_constant() {
+        assert_eq!(count("assert_eq!(output.status.code(), Some(125));"), 1);
+    }
+
+    #[test]
+    fn catches_bare_126_and_127_the_guest_fault_codes() {
+        assert_eq!(count("assert_eq!(output.status.code(), Some(126));"), 1);
+        assert_eq!(count("assert_eq!(output.status.code(), Some(127));"), 1);
+    }
+
+    #[test]
+    fn ignores_values_that_cannot_be_confused_with_a_hermit_code() {
+        // 0 success, 2 clap, 101 Rust panic, 124 timeout(1), 20 fixture.
+        for v in [0, 2, 20, 101, 124] {
+            let body = format!("assert_eq!(output.status.code(), Some({v}));");
+            assert_eq!(count(&body), 0, "Some({v}) must stay out of scope");
+        }
+    }
+
+    // ---- the SHAPES the matcher must keep recognising ------------------------
+
+    #[test]
+    fn catches_a_multi_line_assert_where_the_value_is_on_its_own_line() {
+        let body = "assert_eq!(\n    output.status.code(),\n    Some(1),\n    \"msg\"\n);";
+        assert_eq!(count(body), 1);
+    }
+
+    #[test]
+    fn catches_a_predicate_closure_form() {
+        let body = "let exposes = |o: &Output| o.status.code() == Some(1);";
+        assert_eq!(count(body), 1);
+    }
+
+    #[test]
+    fn catches_a_match_arm_form() {
+        let body = "match output.status.code() {\n    Some(1) => Outcome::Exposed,\n    _ => Outcome::Other,\n}";
+        assert_eq!(count(body), 1);
+    }
+
+    #[test]
+    fn catches_the_value_up_to_six_lines_below_the_status_mention() {
+        let mut body = String::from("let c = output.status.code();\n");
+        for _ in 0..5 {
+            body.push_str("// filler\n");
+        }
+        body.push_str("assert_eq!(c, Some(1));");
+        assert_eq!(count(&body), 1, "the context window must stay >= 6 lines");
+    }
+
+    // ---- the guards that keep it from over-reading ---------------------------
+
+    #[test]
+    fn catches_a_site_whose_context_says_status_without_calling_code() {
+        // ⚠️ PINS THE SECOND HALF OF `is_exit_status_context`. Every other fixture
+        // here happens to contain `.code()`, so without this case the `status`
+        // clause is untested and could be deleted with all tests still green --
+        // measured, that mutation passed 16/16 before this test existed.
+        let body = "let status = child.wait().unwrap();\nassert_eq!(status.into_raw(), Some(1));";
+        assert_eq!(
+            count(body),
+            1,
+            "a `status` context with no .code() must count"
+        );
+    }
+
+    #[test]
+    fn ignores_some_one_with_no_exit_status_context() {
+        assert_eq!(count("let x: Option<u32> = Some(1);"), 0);
+    }
+
+    #[test]
+    fn ignores_a_non_numeric_or_unclosed_some() {
+        assert_eq!(count("let s = Some(name); // status"), 0);
+        assert_eq!(count("let s = Some(1u32); // status"), 0);
+    }
+
+    // ---- declarations satisfy the gate ---------------------------------------
+
+    #[test]
+    fn every_declaration_form_satisfies_the_site() {
+        for decl in [
+            "// EXIT-CLASS: guest",
+            "// EXIT-CLASS: hermit",
+            "let e = ExpectedExit::Guest(1);",
+            "let e = GuestExit(1);",
+            "let e = HermitInternal;",
+        ] {
+            let body = format!("{decl}\nassert_eq!(output.status.code(), Some(1));");
+            assert_eq!(count(&body), 0, "{decl:?} must satisfy the site");
+        }
+    }
+
+    #[test]
+    fn a_declaration_far_above_the_site_does_not_satisfy_it() {
+        let mut body = String::from("// EXIT-CLASS: guest\n");
+        for _ in 0..6 {
+            body.push_str("// filler\n");
+        }
+        body.push_str("assert_eq!(output.status.code(), Some(1));");
+        assert_eq!(count(&body), 1, "a distant declaration must not carry");
+    }
+
+    // ---- the exemption is exactly one file, and it is load-bearing -----------
+
+    #[test]
+    fn stress_suite_is_exempt_and_nothing_else_is() {
+        let body = "let exposes = |o: &Output| o.status.code() == Some(1);";
+        assert_eq!(
+            scan_text("hermit-cli/tests/stress_suite.rs", body).len(),
+            0,
+            "stress_suite.rs is exempt: Some(1) there is the GUEST's signal"
+        );
+        assert_eq!(
+            scan_text("hermit-cli/tests/stress_suite_helpers.rs", body).len(),
+            1,
+            "the exemption must be the exact path, not a prefix"
+        );
+    }
+
+    #[test]
+    fn the_exemption_records_a_reason() {
+        for (file, reason) in EXEMPT_FILES {
+            assert!(
+                reason.len() > 40,
+                "{file} is exempt without a substantive reason"
+            );
+        }
+    }
+
+    // ---- reporting -----------------------------------------------------------
+
+    #[test]
+    fn a_site_reports_its_file_line_and_value() {
+        let sites = scan_text(F, "// pad\nassert_eq!(output.status.code(), Some(127));");
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].file, F);
+        assert_eq!(sites[0].line, 2);
+        assert_eq!(sites[0].value, 127);
+    }
+
+    #[test]
+    fn two_sites_on_one_line_are_both_counted() {
+        let body = "assert!(status.code() == Some(1) || status.code() == Some(125));";
+        assert_eq!(count(body), 2);
     }
 }
