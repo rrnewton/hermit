@@ -5,6 +5,7 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::fs::{self};
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -25,6 +26,7 @@ use sha2::Digest;
 use sha2::Sha256;
 
 pub use crate::canonical_verdict::VerificationReport;
+pub use crate::canonical_verdict::VerificationRuntime;
 use crate::ci_selection::CiDisabledReasonSpec;
 use crate::ci_selection::CiSelection;
 use crate::ci_selection::CiSelectionSpec;
@@ -809,6 +811,8 @@ pub struct AttemptResult {
     pub stderr: String,
     pub verification_report: Option<String>,
     pub verification_report_sha256: Option<String>,
+    /// Runtime totals for the two executions compared by this attempt.
+    pub runtime: Option<VerificationRuntime>,
     /// The divergence position, LIFTED OUT of `verification_report` so it is a
     /// field rather than a substring.
     ///
@@ -884,6 +888,8 @@ pub struct CellResult {
     /// The cell wall-clock bound used for this observation.
     pub timeout_seconds: u64,
     pub duration_ms: u128,
+    /// Runtime totals from the first attempt that produced them.
+    pub runtime: Option<VerificationRuntime>,
     pub log_level: Option<String>,
     pub effective_args: Vec<String>,
     pub argv: Vec<String>,
@@ -1650,6 +1656,7 @@ fn execute_spec_until(
     }
     let mut report_json = None;
     let mut report_sha = None;
+    let mut runtime = None;
     let mut first_divergent_scheduler_turn = None;
     let mut first_divergent_virtual_nanoseconds = None;
     let mut first_divergent_record = None;
@@ -1672,6 +1679,7 @@ fn execute_spec_until(
                 report_json = Some(String::from_utf8_lossy(&bytes).into_owned());
                 match VerificationReport::from_json_slice(&bytes) {
                     Ok(report) => {
+                        runtime = report.runtime.clone();
                         // Recorded BEFORE the classification chain below,
                         // because where the divergence began is a fact about
                         // the report rather than a consequence of how the
@@ -1767,6 +1775,7 @@ fn execute_spec_until(
         stderr,
         verification_report: report_json,
         verification_report_sha256: report_sha,
+        runtime,
         first_divergent_scheduler_turn,
         first_divergent_virtual_nanoseconds,
         first_divergent_record,
@@ -2192,6 +2201,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         error_kind,
         timeout_seconds: cell.timeout_seconds,
         duration_ms: started.elapsed().as_millis(),
+        runtime: attempts.iter().find_map(|attempt| attempt.runtime.clone()),
         log_level: (cell.id.mode != "naked").then(|| "info".into()),
         effective_args: literal_argv.iter().skip(1).cloned().collect(),
         argv: literal_argv,
@@ -2257,6 +2267,7 @@ pub fn infrastructure_error_result(
         error_kind: Some("infrastructure".into()),
         timeout_seconds: cell.timeout_seconds,
         duration_ms: 0,
+        runtime: None,
         log_level: (cell.id.mode != "naked").then(|| "info".into()),
         effective_args: Vec::new(),
         argv: Vec::new(),
@@ -2314,6 +2325,7 @@ pub fn host_inapplicable_result(
         error_kind: None,
         timeout_seconds: cell.timeout_seconds,
         duration_ms: 0,
+        runtime: None,
         log_level: None,
         effective_args: Vec::new(),
         argv: Vec::new(),
@@ -2505,12 +2517,29 @@ pub fn append_result(path: &Path, result: &CellResult) -> Result<(), String> {
         .append(true)
         .open(path)
         .map_err(|e| e.to_string())?;
-    serde_json::to_writer(&mut file, result).map_err(|e| e.to_string())?;
-    file.write_all(b"\n").map_err(|e| e.to_string())?;
+    let mut line = serde_json::to_vec(result).map_err(|e| e.to_string())?;
+    line.push(b'\n');
+    // Validate runs manifest buckets in separate processes. Their ordinary
+    // result files do not overlap, but every completed cell is also appended to
+    // one run-wide input for the series writer. Hold an advisory lock across the
+    // complete JSON line so two buckets cannot interleave their writes.
+    let fd = file.as_raw_fd();
+    if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let write_result = file
+        .write_all(&line)
+        .and_then(|()| file.flush())
+        .map_err(|e| e.to_string());
+    let unlock_result = if unsafe { libc::flock(fd, libc::LOCK_UN) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().to_string())
+    };
     // The bucket runner publishes each completed cell before printing its
     // PASS/FAIL/ERROR line. Flush the row now rather than waiting for the
     // bucket's JUnit/summary epilogue, which an outer node timeout may kill.
-    file.flush().map_err(|e| e.to_string())
+    write_result.and(unlock_result)
 }
 
 pub fn write_junit(path: &Path, results: &[CellResult]) -> Result<(), String> {
@@ -4290,6 +4319,7 @@ backends_disabled:
             stderr: String::new(),
             verification_report: None,
             verification_report_sha256: None,
+            runtime: None,
             sabre_path_evidence: Some(evidence.into()),
             sabre_path_evidence_sha256: Some("b".into()),
             reason: None,
@@ -4357,6 +4387,7 @@ backends_disabled:
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            runtime: None,
             compared_log_messages: Some(crate::canonical_verdict::ComparedLogMessages {
                 left: 1,
                 right: 1,
@@ -4576,6 +4607,7 @@ backends_disabled:
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            runtime: None,
         })
         .unwrap();
         let spec = CellRunSpec {
