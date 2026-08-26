@@ -51,6 +51,39 @@ struct Args {
     jobs: Option<usize>,
 }
 
+/// Take a single-valued selection flag, refusing a second occurrence.
+///
+/// ⚠️ LAST-VALUE-WINS SILENTLY UNDID THIS FILE'S OWN GUARD, WHICH IS WHY THIS EXISTS.
+/// `plan` refuses a `--test` naming no known id. With plain assignment a SECOND
+/// `--test` overwrote the first, so the unknown one was never looked up at all:
+///
+/// ```text
+/// plan --lane portable --test no-such-test-xyz                             rc=2
+/// plan --lane portable --test no-such-test-xyz --test applications/...     rc=0   []
+/// plan --lane portable --test applications/... --test no-such-test-xyz     rc=2
+/// ```
+///
+/// Measured 2026-08-26 at `979a50b17a75` by `agent(codex-rev-2686)` and confirmed
+/// independently by `agent(hermit-012)` and by me. The asymmetry is the tell: the
+/// same two ids in the other order refuse, because only the LAST occurrence is ever
+/// examined. A bisection driver reading rc=0 there sees "nothing failed" for a list
+/// containing an id that does not exist -- the exact silent green this guard was
+/// added to remove, reappearing one layer up in the argument parser.
+///
+/// `--jobs` already refused a repeat; the selection flags did not. Refusing is right
+/// rather than taking the first or the last, because a repeated selector has no
+/// defensible meaning: the caller asked for two different things and we cannot serve
+/// both from one field.
+fn set_once(slot: &mut Option<String>, values: &mut impl Iterator<Item = String>, flag: &str) {
+    let value = required_value(values, flag);
+    if slot.replace(value).is_some() {
+        fail(format!(
+            "{flag} may be specified only once; a repeat silently overwrote the first \
+             value, so an earlier id was never validated"
+        ));
+    }
+}
+
 fn parse(mut values: impl Iterator<Item = String>) -> Args {
     let mut args = Args {
         format: "text".into(),
@@ -58,13 +91,11 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
     };
     while let Some(value) = values.next() {
         match value.as_str() {
-            "--lane" => args.selection.lane = Some(required_value(&mut values, "--lane")),
-            "--category" => {
-                args.selection.category = Some(required_value(&mut values, "--category"))
-            }
-            "--test" => args.selection.test = Some(required_value(&mut values, "--test")),
-            "--mode" => args.selection.mode = Some(required_value(&mut values, "--mode")),
-            "--backend" => args.selection.backend = Some(required_value(&mut values, "--backend")),
+            "--lane" => set_once(&mut args.selection.lane, &mut values, "--lane"),
+            "--category" => set_once(&mut args.selection.category, &mut values, "--category"),
+            "--test" => set_once(&mut args.selection.test, &mut values, "--test"),
+            "--mode" => set_once(&mut args.selection.mode, &mut values, "--mode"),
+            "--backend" => set_once(&mut args.selection.backend, &mut values, "--backend"),
             "--ci-only" => {
                 args.ci_only = true;
                 args.selection.population = Some(Population::Required);
@@ -1049,6 +1080,32 @@ fn workflow_step_timeout_sum(workflow: &YamlValue, job: &str) -> Result<u64, Str
 fn print_plan(manifests: &ManifestSet, args: &Args, population: Population) -> ExitCode {
     let mut selection = args.selection.clone();
     selection.population = Some(population);
+
+    // ⚠️ AN UNKNOWN TEST ID IS A REFUSAL HERE, AND THIS IS THE ONLY SUBCOMMAND THAT
+    // NEEDED IT. `run` and `build` already fail closed on an empty selection
+    // (`filters selected no cells`), but `plan` printed an empty list and exited 0 --
+    // measured 2026-08-26: `plan --lane portable --test no-such-test-xyz` is rc=0, and
+    // so is the same command with a REAL id, so its exit code carried no information in
+    // either direction. Anything driving a bisection off `plan` therefore reads a typo
+    // as "nothing failed here" and converges, confidently, on the wrong commit.
+    //
+    // ⚠️ AND THE CHECK IS "UNKNOWN ID", NOT "EMPTY RESULT", WHICH IS NOT THE SAME FIX.
+    // `print_plan` also serves `audit-gaps` (Population::Disabled), where an empty
+    // answer legitimately means NO GAPS. Mirroring run's `cells.is_empty()` guard here
+    // would turn that good answer into a failure. Asking whether the named id exists at
+    // all separates the two: a real id with no cells in this population still prints
+    // nothing and exits 0.
+    if let Some(id) = selection.test.as_deref() {
+        if !manifests.knows_test(id) {
+            fail(format!(
+                "unknown test id {id:?}: it is not in any manifest. An empty plan for a \
+                 real id means that population has no cells; an empty plan for an id \
+                 that does not exist means the filter is wrong, and refusing is what \
+                 stops a bisection reading a typo as a pass."
+            ));
+        }
+    }
+
     let cells = manifests.select(&selection).unwrap_or_else(|e| fail(e));
     if args.format == "json" {
         println!("{}", serde_json::to_string(&cells.iter().map(|c| {
