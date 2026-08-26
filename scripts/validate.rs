@@ -7270,15 +7270,26 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         &BTreeMap::new(),
         false,
     );
+    // ⚠️ THIS BRACKET WAS RE-POINTED, NOT WEAKENED (owner directive 2026-08-26).
+    // It used to require `env_retries == 0` -- an unclassified failure got no
+    // retry, because retry was opt-in. Every cell is now ALWAYS eligible, so this
+    // failure is retried exactly once here, bounded by the `max` of 1 passed
+    // above. The retry count assertion therefore flipped from 0 to 1.
+    //
+    // WHAT DID NOT CHANGE, AND IS THE POINT OF THE BRACKET: a retried failure must
+    // still be a RED and still be INCOMPLETE. Retry must never launder a failure
+    // into a pass or into a complete run. Those three clauses -- `complete`, `ok`,
+    // and the nonzero exit code -- are untouched and are what would catch a retry
+    // policy that swallowed a real failure.
     if failed.complete
         || failed.ok
-        || failed.env_retries != 0
+        || failed.env_retries != 1
         || failed.outcomes.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>()
             != vec!["fixture.fail"]
         || exit_code_with_execution_completeness(0, failed.complete) == 0
     {
         return Err(format!(
-            "scheduler accounting: unclassified failure did not remain an incomplete red without retry: complete={} ok={} retries={} outcomes={:?}",
+            "scheduler accounting: an always-eligible unclassified failure must be retried once at max=1 and REMAIN an incomplete red: complete={} ok={} retries={} outcomes={:?}",
             failed.complete,
             failed.ok,
             failed.env_retries,
@@ -7303,9 +7314,13 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     );
     let mut kept_tags: Vec<&str> = kept.outcomes.iter().map(|o| o.tag.as_str()).collect();
     kept_tags.sort_unstable();
+    // Re-pointed with its twin above: always-eligible retry means this failure is
+    // retried once at max=1, so the count moved 0 -> 1. The teeth are unchanged --
+    // the lane must stay COMPLETE, stay NOT ok, and still measure every peer. A
+    // retry that softened the verdict or lost a peer still fails here.
     if !kept.complete
         || kept.ok
-        || kept.env_retries != 0
+        || kept.env_retries != 1
         || kept_tags != vec!["fixture.fail", "fixture.pending_a", "fixture.pending_b"]
     {
         return Err(format!(
@@ -7526,9 +7541,14 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         &BTreeMap::new(),
         false,
     );
+    // Re-pointed with its two twins: always-eligible retry makes this failure
+    // retry once at max=1, so the count moved 0 -> 1. The teeth are unchanged --
+    // a COMPLETE allowed failure must stay complete, stay not-ok, and still exit
+    // 0 on the completeness axis, which is the distinction this bracket exists
+    // to hold and which retry must not blur.
     if !allowed.complete
         || allowed.ok
-        || allowed.env_retries != 0
+        || allowed.env_retries != 1
         || exit_code_with_execution_completeness(0, allowed.complete) != 0
     {
         return Err(format!(
@@ -7754,9 +7774,13 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         .iter()
         .find(|attempt| attempt.tag == "fixture.partial_detail")
         .ok_or("scheduler accounting: partial-detail attempt was not recorded")?;
+    // Re-pointed: always-eligible retry gives this failure one retry at max=1.
+    // The teeth are the DETAIL clauses, not the count -- an unterminated detail
+    // must still not be accepted as evidence, so `detail_observed` false and
+    // `environmental_class` none are unchanged.
     if partial.ok
         || !partial.complete
-        || partial.env_retries != 0
+        || partial.env_retries != 1
         || partial_attempt.detail_observed
         || partial_attempt.environmental_class.is_some()
     {
@@ -8326,10 +8350,19 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         &BTreeMap::new(),
         false,
     );
-    if ordinary_only.ok || ordinary_only.env_retries != 0 || ordinary_only.attempts.len() != 1 {
+    // ⚠️ THIS BRACKET ASSERTED THE OPT-IN POLICY ITSELF AND THE OWNER SUPERSEDED IT
+    // (2026-08-26). It required an unclassified product failure to cost ONE attempt
+    // -- that was the whole point of opt-in retry. Every cell is now always
+    // eligible, so this failure costs up to `max` retries; at the max=2 passed
+    // above that is 2 retries and 3 attempts.
+    //
+    // WHAT IS STILL ASSERTED, and is the part worth keeping: the lane is STILL NOT
+    // ok. Retrying a genuine red three times must return the same red, never a
+    // pass. The cost changed by directive; the verdict must not.
+    if ordinary_only.ok || ordinary_only.env_retries != 2 || ordinary_only.attempts.len() != 3 {
         return Err(format!(
-            "scheduler accounting: an unclassified product failure was retried; a genuine red \
-             must cost one attempt, not three: ok={} retries={} attempts={}",
+            "scheduler accounting: an always-eligible unclassified failure must exhaust its \
+             retries and STILL be red: ok={} retries={} attempts={}",
             ordinary_only.ok,
             ordinary_only.env_retries,
             ordinary_only.attempts.len()
@@ -8444,9 +8477,16 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         .unwrap_or_default()
         .lines()
         .count();
+    // Re-pointed for always-eligible retry: the ordinary failure is now retried
+    // too, so its attempt count moved 1 -> 2. MEASURED that this is the ONLY
+    // clause that moved -- dependent_ran=false, transitive_dependent_ran=false,
+    // environmental_passed=true and both outcomes were unchanged. The safety
+    // property this bracket exists for, that a retry must NOT cross an
+    // unsatisfied ordinary dependency into its dependents, still holds and its
+    // clauses below are untouched.
     if mixed.complete
         || mixed.env_retries != 1
-        || ordinary_attempt_count != 1
+        || ordinary_attempt_count != 2
         || mixed_by_tag
             .get("fixture.ordinary_failure")
             .is_none_or(|outcome| outcome.ok || outcome.aborted)
@@ -8682,6 +8722,28 @@ fn run_lane_with_env_retries(
                             .then(|| format!("bound-kill under contention: {}", o.reason.trim()))
                     })
                     .or_else(|| validate_runtime::measured_unstable_class(unstable, &o.tag))
+                    // ALWAYS-ELIGIBLE FALLBACK (owner directive 2026-08-26): every
+                    // cell is eligible for retry, not just one that earned it.
+                    //
+                    // ⚠️ THE OPT-IN GROUND HAD NEVER FIRED. Measured across all 106
+                    // recorded runs carrying `retried_nodes`: 12 had a retry and all
+                    // 12 were granted environmentally. `measured_unstable_class` --
+                    // the registry ground directly above -- has granted zero, and its
+                    // registry holds one cell measured 22 days ago. A cell earned a
+                    // retry by having already been retried.
+                    //
+                    // The three grounds above are KEPT AND TRIED FIRST, deliberately:
+                    // each names a specific cause, and that name is what reaches the
+                    // ledger as `retry_class`. Falling straight to the blanket class
+                    // would erase the distinction between "BPF-jailed", "bound-kill
+                    // under contention" and "no idea", which is the signal a
+                    // multi-week flakiness timeline is built from.
+                    //
+                    // The two SAFETY refusals still bound this and are not bypassed:
+                    // a failure whose prerequisite did not complete is dropped by
+                    // `retry_steps_with_satisfied_prerequisites` below, and the whole
+                    // loop is bounded by `max` rounds.
+                    .or_else(|| Some(format!("always-eligible: {}", o.reason.trim())))
                     .map(|class| (o.tag.clone(), class))
             })
             .collect();

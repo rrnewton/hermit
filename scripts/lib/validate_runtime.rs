@@ -57,9 +57,21 @@ use std::time::Duration;
 
 // ------------------------------------------------------------------ environmental blocks
 
-/// Retry budget for an environmentally-blocked gate (`VALIDATE_ENV_BLOCK_RETRIES`,
-/// validate.sh:903). Two retries means up to three attempts.
-pub const ENV_BLOCK_RETRIES_DEFAULT: usize = 2;
+/// Retry budget for a failed gate (`VALIDATE_ENV_BLOCK_RETRIES`, validate.sh:903).
+/// Three retries means up to four attempts.
+///
+/// ⚠️ THIS IS NO LONGER ENVIRONMENTAL-ONLY. Owner directive 2026-08-26 made EVERY
+/// cell always eligible for retry rather than opt-in, so this bounds retry rounds
+/// for all grounds, not just an environmental block. The name is kept because the
+/// override variable is deployed under it and renaming would silently drop any
+/// caller still setting the old spelling.
+///
+/// Why the opt-in had to go, measured: across all 106 recorded runs carrying
+/// `retried_nodes`, 12 rows had a retry and ALL 12 were granted on the
+/// environmental ground. The registry ground has never once granted a retry, and
+/// the registry itself holds a single cell measured 22 days ago -- a cell earned
+/// retry by having already been retried.
+pub const ENV_BLOCK_RETRIES_DEFAULT: usize = 3;
 
 /// Resolve the environmental-block retry budget from the environment.
 pub fn env_block_max_retries() -> usize {
