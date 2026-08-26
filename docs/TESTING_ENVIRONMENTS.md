@@ -178,6 +178,22 @@ sub-five-minute sentinel: one CPUID test, one direct PMU overflow/skid probe,
 and one KVM multi-mode E2E cell. Broad product and stress coverage remains in
 portable or scheduled validation.
 
+## Named measurement hosts
+
+`scripts/check-portable-paths.sh` scans `ci/dag/*.json` and refuses a literal
+hostname there. It does **not** scan this file, which is why `devbig030` appears
+unflagged under "KVM memory-hash repeatability" below. So the identity of a
+measurement host belongs here, and the DAG points at it instead of deleting it.
+
+A measurement whose host is unrecorded cannot be re-run, compared, or challenged.
+Four fixes on 2026-08-25 (#2646, #2647, #2648, #2652) each satisfied the checker by
+erasing the host; this table is where the erased identities go back.
+
+| lane / node | measured on | what was measured |
+| --- | --- | --- |
+| `privileged` lane, node `test.cli_kvm` | `devbig014` | `/dev/kvm` mode 666; `open(O_RDWR)` succeeds; `KVM_GET_API_VERSION` = 12; `hermit run --backend kvm` exits 0 |
+| `scripts/check-reverie-pin.rs` git-env lock | `devbig014` | 30x no-guard run failed 0 times; mutation of `under_git_env` failed 9 of 10 at load average ~39 |
+
 ## Hardware-sensitive Cargo tests
 
 Named tests and the capabilities they require. Paths are relative to the repo
