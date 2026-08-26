@@ -2256,8 +2256,6 @@ fn validate_e9patch_mount_target(path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-/// Create two logging destinations and two global configs. Returns non-zero exit
-/// status if there was a difference in any component of the output.
 /// The status flags on hermit's own stderr, or `None` if they cannot be read.
 ///
 /// Read once before the first verification run so the second can be handed the
@@ -2294,6 +2292,8 @@ fn restore_stderr_status_flags(before: Option<libc::c_int>) {
     }
 }
 
+/// Create two logging destinations and two global configs. Returns non-zero exit
+/// status if there was a difference in any component of the output.
 impl RunOpts {
     /// Point this run at an OCI image rootfs, as `--image` does.
     ///
@@ -3560,8 +3560,16 @@ impl RunOpts {
         //     run 1  fcntl(2, F_GETFL) = 32769  -> fcntl(2, F_SETFL, 33793)
         //     run 2  fcntl(2, F_GETFL) = 33793  -> no SETFL at all
         // One extra syscall in run 1 (161 vs 160), which shifts every later
-        // record by one and reported TWENTY mismatches for ONE divergence.
-        // Drop that single record and the two sequences are byte-identical.
+        // record by one and reported TWENTY mismatches for TWO real differences.
+        //
+        // ⚠️ TWO, NOT ONE. An earlier version of this comment said "drop that
+        // single record and the sequences are byte-identical". The INBOUND
+        // records are -- measured, 0 of 160 differ once run 1's `F_SETFL` is
+        // removed -- but the `F_GETFL` RESULT differs as well, `Ok(32769)`
+        // against `Ok(33793)`, because that is the flag word this defect is
+        // about. Caught by `agent(hermit-dbg)`. The distinction matters: the
+        // claim as written invited a reader to check inbound records only, find
+        // them clean, and conclude the harness was blameless.
         //
         // The one-line demonstration, before this fix: `2>file` gave rc=125
         // and 20 mismatches; `2>>file` -- the same run with O_APPEND already
