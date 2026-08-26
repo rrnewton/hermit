@@ -692,8 +692,15 @@ impl std::error::Error for PolicyRefusal {}
 pub struct RunTimeoutMarker;
 
 impl std::fmt::Display for RunTimeoutMarker {
+    /// ⚠️ IT DOES NOT SAY "SEE THE REASON ABOVE", AND AN EARLIER VERSION DID.
+    /// [`PolicyRefusal`] can say that truthfully because detcore logs the
+    /// refusal before exiting, so the reason really is earlier on stderr. Here
+    /// the child's message arrives as a CAUSE, which `display_error` prints
+    /// BELOW this line -- measured: the chain reads "Error: ... above" followed
+    /// by "> Guest exceeded the --timeout bound of 3 seconds". Pointing the
+    /// reader the wrong way is worse than not pointing at all.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the --timeout bound fired; see the reason above")
+        write!(f, "the --timeout bound fired")
     }
 }
 

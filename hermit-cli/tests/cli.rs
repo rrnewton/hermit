@@ -5380,3 +5380,190 @@ fn diagnostics_survive_a_nonblocking_stderr_under_back_pressure() {
          not the same as delivering the message"
     );
 }
+
+/// A guest that never finishes and that IGNORES `SIGTERM`.
+///
+/// ⚠️ IGNORING `SIGTERM` IS LOAD-BEARING, NOT DECORATION, and the reasoning is
+/// `container_init_deadline.rs`'s, measured there: an ordinary spinning guest is
+/// an ordinary host process, so anything that signals the process group kills it
+/// and `hermit` then exits because its guest finished -- which makes the test
+/// pass whether or not the bound did anything. With `trap '' TERM` the guest
+/// survives a group signal, so the run can only end if hermit's own `--timeout`
+/// actually tears the container down.
+const RUN_TIMEOUT_SPINNER: &[&str] = &["/bin/sh", "-c", "trap '' TERM; while : ; do : ; done"];
+
+/// The bound under test. Deliberately small: `.config/nextest.toml` caps every
+/// test process at 15 seconds, so a regression cell for a timeout has to fire,
+/// tear down and be checked well inside that. Two seconds plus startup and the
+/// drain check measured about 4s total.
+const RUN_TIMEOUT_SECS: u64 = 2;
+
+/// Session id of `pid`, or `None` if it is gone.
+///
+/// The comm field is parenthesised and may itself contain spaces and
+/// parentheses, so it is skipped from the LAST `)`. `session` is the sixth
+/// field overall, i.e. index 3 after `state`.
+fn run_timeout_session_of(pid: i32) -> Option<i32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = &stat[stat.rfind(')')? + 1..];
+    after_comm.split_whitespace().nth(3)?.parse().ok()
+}
+
+/// Every live pid in `session`: the outer `hermit`, the container init, and the
+/// guest. Scanning the SESSION rather than a pid is what lets the test see a
+/// process that was reparented away from us.
+fn run_timeout_pids_in_session(session: i32) -> Vec<i32> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_string_lossy().parse::<i32>().ok())
+        .filter(|pid| run_timeout_session_of(*pid) == Some(session))
+        .collect()
+}
+
+/// Run `hermit run --timeout <secs> -- <argv>` as its own session leader.
+///
+/// Its own session so the test can account for every process the run creates,
+/// including one that outlives its parent and is reparented to host PID 1 --
+/// which is precisely the residue this bound exists to prevent and which a
+/// parent-child check cannot see.
+fn spawn_timed_run(secs: u64, argv: &[&str]) -> std::process::Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .arg("run")
+        .arg("--timeout")
+        .arg(secs.to_string())
+        .arg("--")
+        .args(argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: `setsid` is async-signal-safe, allocates nothing, and runs in the
+    // forked child before exec where this process is not yet a session leader.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command
+        .spawn()
+        .expect("failed to spawn hermit run --timeout")
+}
+
+/// PAST the bound: the run is ended, named, and genuinely unwound.
+///
+/// ⚠️ THE THIRD ASSERTION IS THE ONE THAT MATTERS AND IT IS THE ONE A NAIVE
+/// TEST OMITS. `container_init_deadline.rs` records the reason: exit 124, empty
+/// output and a supervisor that returns promptly all look IDENTICAL whether or
+/// not the run was actually torn down. A cell that checked only the code and
+/// the class string would pass over a hermit that printed the right words and
+/// left the guest spinning -- the out-of-disk incident's exact shape. So this
+/// asserts on process liveness directly.
+#[test]
+fn run_timeout_fires_by_name_and_unwinds_the_container() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let child = spawn_timed_run(RUN_TIMEOUT_SECS, RUN_TIMEOUT_SPINNER);
+    let session = child.id() as i32;
+    let started = Instant::now();
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for hermit run --timeout");
+    let elapsed = started.elapsed();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    assert_eq!(
+        output.status.code(),
+        Some(124),
+        "a --timeout expiry must report 124, the established code for a deadline. \
+         Got {:?}. stderr:\n{stderr}",
+        output.status
+    );
+
+    assert!(
+        stderr.contains("class=run-timeout"),
+        "the bound must fail BY NAME -- an anonymous kill is most of why a timed-out \
+         cell teaches nothing. Expected `class=run-timeout` in stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("bound of {RUN_TIMEOUT_SECS} seconds")),
+        "the report must state the bound that was exceeded, not merely that one was. \
+         stderr:\n{stderr}"
+    );
+
+    // The unwind. Nothing above this line can distinguish a torn-down container
+    // from an orphaned one.
+    let drained = {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if run_timeout_pids_in_session(session).is_empty() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let survivors: Vec<String> = run_timeout_pids_in_session(session)
+        .into_iter()
+        .map(|pid| {
+            let comm = fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+            format!("{pid} ({})", comm.trim())
+        })
+        .collect();
+    for pid in run_timeout_pids_in_session(session) {
+        // SAFETY: `kill` takes a pid and a signal and touches no caller memory;
+        // a stale pid can only fail with ESRCH. A failing test must not leak the
+        // very processes it is about.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    assert!(
+        drained,
+        "hermit reported the timeout but left the run alive: {survivors:?}. \
+         The bound is supposed to UNWIND the container hermit built, not just \
+         report that it expired."
+    );
+
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "the bound fired but took {elapsed:?}; a --timeout that overruns the \
+         15s nextest per-test cap would be killed by that cap instead, and this \
+         cell would stop testing hermit's own teardown"
+    );
+}
+
+/// INSIDE the bound: a guest that finishes in time is untouched.
+///
+/// Without this direction the cell above is satisfied by a `--timeout` that
+/// simply kills every run, which would be a strictly worse product than having
+/// no flag at all.
+#[test]
+fn run_timeout_leaves_a_guest_that_finishes_in_time_alone() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let output = spawn_timed_run(30, &["/bin/echo", "finished-well-inside"])
+        .wait_with_output()
+        .expect("failed to wait for hermit run --timeout");
+
+    assert!(
+        output.status.success(),
+        "a guest that finishes inside its bound must exit 0; got {:?}. stderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "finished-well-inside",
+        "the guest's own output must be unaffected by an unexpired bound"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("class=run-timeout"),
+        "an unexpired bound must say nothing at all"
+    );
+}
