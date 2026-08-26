@@ -623,4 +623,83 @@ mod tests {
             "the flag was set after the fact for a container that was never blocked"
         );
     }
+    /// A client that CONNECTED, completed its session and exited must not be
+    /// reported as having exited before connecting.
+    ///
+    /// ⚠️ THIS IS THE FLAG'S OWN DOCUMENTED MEANING, AND IT WAS THE ONE CASE NO
+    /// TEST COVERED. [`CLIENT_EXITED_BEFORE_CONNECTING`] says the client "exited
+    /// before it finished connecting", so the negation -- connected, served,
+    /// quit -- is precisely what must never be flagged. The three tests above
+    /// pin clients that never connect at all; a healthy finished session is a
+    /// different path through the same code and it is the one a real
+    /// `gdb -batch ... quit` takes on every successful run.
+    ///
+    /// ⚠️ AND IT PASSES ONLY BECAUSE OF A CONTRACT IN ANOTHER REPOSITORY.
+    /// `reverie-ptrace`'s `wait_for_tcp_connection` drops its listener the moment
+    /// it accepts, so once the session is under way nothing is listening and the
+    /// watcher's release connect is refused -- which is what keeps the flag
+    /// false. This test reproduces that drop deliberately. If reverie ever keeps
+    /// the listener bound, every healthy session starts being reported as a
+    /// failed connect, and THIS is the test that would go red; the reverie side
+    /// is pinned by `the_listener_is_closed_once_the_client_is_accepted`.
+    #[test]
+    fn a_client_that_connected_and_finished_its_session_is_not_reported_as_early() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind a test listener");
+        let port = listener.local_addr().expect("no local addr").port();
+
+        // A stand-in for `gdb -batch ... quit`: connect, hold the session open
+        // briefly, then exit. The hold is what makes the ordering deterministic
+        // -- it lets the accept and the listener drop happen while the client is
+        // still alive, so the watcher cannot race in before the session exists.
+        let client = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "exec 3<>/dev/tcp/127.0.0.1/{port} || exit 1; sleep 1; exec 3>&-"
+            ))
+            .spawn()
+            .expect("failed to spawn the stand-in client");
+
+        let mut watch = GdbClientWatch::spawn(client, port);
+
+        // The gdbserver accepts. Bounded, because a hanging test is worse than a
+        // red one: it names itself in a line, a wedged one eats the whole run.
+        listener
+            .set_nonblocking(true)
+            .expect("failed to set the test listener non-blocking");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let accepted = loop {
+            match listener.accept() {
+                Ok(pair) => break Some(pair),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        break None;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("accept failed: {e}"),
+            }
+        };
+        let accepted = accepted.expect("the stand-in client never connected within 30s");
+
+        // ⚠️ THE REVERIE CONTRACT, REPRODUCED. `wait_for_tcp_connection` returns
+        // the stream and drops the listener; from here on the port answers
+        // nothing, while the session itself stays open.
+        drop(listener);
+
+        // Let the client finish its session and exit, and give the watcher time
+        // to observe that and attempt its release connect.
+        thread::sleep(Duration::from_millis(2000));
+
+        assert!(
+            !watch.finish(),
+            "a client that connected, finished its session and exited was reported as having \
+             exited before connecting -- the flag's own documented meaning, inverted"
+        );
+        assert!(
+            !watch.client_exited_early.load(Ordering::SeqCst),
+            "the flag was set for a session that completed normally"
+        );
+
+        drop(accepted);
+    }
 }
