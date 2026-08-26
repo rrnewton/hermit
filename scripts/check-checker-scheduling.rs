@@ -423,29 +423,50 @@ fn runner_flag_path(text: &str, path: &str) -> bool {
     /// one line to fix. Under-marking stops ON the value and reports a false
     /// SCHEDULED -- silent, and it defeats the guard. Both are pinned in
     /// `self_test`.
-    const RUSTC_VALUE_FLAGS: [&str; 17] = [
-        "-o", "--out-dir", "--emit", "--extern", "--target", "--edition",
-        "--crate-name", "--crate-type", "--cfg", "--check-cfg", "-L", "-l", "-C",
-        "-Z", "-W", "-A", "-D",
+    // ⚠️ THE LISTS BELOW ARE BOOLEANS, NOT VALUE-TAKERS, AND THE INVERSION IS THE
+    // POINT. hermit#2681 made this table per-runner, which was the right half of the
+    // fix: `-O` is a boolean under python and rustc and takes a shell option name under
+    // bash, so one flat list was right for one runner and silently wrong for another.
+    //
+    // The other half is the DEFAULT. A list of flags that DO take values puts the burden
+    // on the list being complete, and an incomplete list fails SILENTLY: the scan stops
+    // on a flag's value and reads it as the script, reporting a false SCHEDULED -- a
+    // checker nothing runs, recorded as running. Three heads paid for that in one night
+    // (`-o` #2667, `-c` #2674, `-X`), and per-runner splitting does not change it: a
+    // value-taking flag missing from a runner's list still fails the silent way.
+    //
+    // So the lists name the flags that take NOTHING, and everything unlisted is ASSUMED
+    // to consume the token after it. A missing entry now steps PAST the script and
+    // reports a false ORPHAN -- loud, and one line to fix. hermit#2681's knowledge is
+    // preserved: every flag it listed as value-taking is absent from these.
+    const PYTHON_NO_VALUE: [&str; 13] = [
+        "-B", "-E", "-I", "-O", "-OO", "-s", "-S", "-u", "-v", "-b", "-d", "-q", "-x",
     ];
-    /// `-c` is CODE and `-m` is a module name; neither is ever a script path.
-    /// Measured: `python3 -c x.sh` is a SyntaxError, so the token after `-c` is
-    /// not an invocation for python even though it is one for the shells.
-    const PYTHON_VALUE_FLAGS: [&str; 2] = ["-c", "-m"];
-    /// Measured for bash and sh against a real script:
-    ///   `-o`, `-O`, `--rcfile` consume the next token -- `bash -o x.sh` answers
-    ///   "invalid option name", so the path was eaten as the value and never ran.
-    ///   `-D` exits after dumping translatable strings without running it.
-    /// Deliberately ABSENT: `-l -e -u -x -p -c`, every one of which RAN the
-    /// script, so the token after them can be a genuine invocation.
-    const SHELL_VALUE_FLAGS: [&str; 4] = ["-o", "-O", "--rcfile", "-D"];
+    // `-o`, `-O` and `--rcfile` are DELIBERATELY ABSENT: each takes a value here.
+    //
+    // ⚠️ `-c` IS PRESENT, AND IT IS NOT AN OVERSIGHT. The shells EXECUTE the token after
+    // `-c` -- measured, `sh -c ./check-z.sh` prints the script's output -- so that token
+    // IS an invocation and must be seen as one. Python's `-c` is the opposite: the token
+    // is code that is never run as a path, so it stays out of PYTHON_NO_VALUE. One flag,
+    // opposite correctness per runner, which is the case that makes this table per-runner
+    // rather than merely long.
+    const SHELL_NO_VALUE: [&str; 17] = [
+        "-e", "-x", "-u", "-v", "-n", "-f", "-C", "-a", "-h", "-i", "-l", "-m", "-p",
+        "-r", "-s", "-t", "-c",
+    ];
+    const RUSTC_NO_VALUE: [&str; 5] = ["-O", "-g", "-V", "-h", "-v"];
 
-    fn value_flags_for(runner: &str) -> &'static [&'static str] {
-        match runner {
-            "rustc" => &RUSTC_VALUE_FLAGS,
-            "python" | "python3" => &PYTHON_VALUE_FLAGS,
-            _ => &SHELL_VALUE_FLAGS,
+    fn takes_value(runner: &str, flag: &str) -> bool {
+        // An attached value is one token: `--edition=2021`, `-Dwarnings`.
+        if flag.contains('=') || (!flag.starts_with("--") && flag.len() > 2) {
+            return false;
         }
+        let booleans: &[&str] = match runner {
+            "rustc" => &RUSTC_NO_VALUE,
+            "python" | "python3" => &PYTHON_NO_VALUE,
+            _ => &SHELL_NO_VALUE,
+        };
+        !booleans.contains(&flag)
     }
 
     let dotted = format!("./{path}");
@@ -455,13 +476,9 @@ fn runner_flag_path(text: &str, path: &str) -> bool {
             if !RUNNERS.contains(token) {
                 continue;
             }
-            let value_flags = value_flags_for(token);
             let mut next = index + 1;
             while next < tokens.len() && tokens[next].starts_with('-') {
-                // A flag that takes a separate value consumes the token after it,
-                // so skip both. An attached form (`--edition=2021`, `-Dwarnings`)
-                // is a single token and is handled by the plain skip.
-                if value_flags.contains(&tokens[next]) {
+                if takes_value(token, tokens[next]) {
                     next += 1;
                 }
                 next += 1;
@@ -493,7 +510,15 @@ fn runner_flag_path(text: &str, path: &str) -> bool {
 /// Erring toward a FALSE ORPHAN is the safe direction: it is loud and a human fixes
 /// it in one line, whereas a false "scheduled" is silent and defeats the guard.
 fn is_invoked(text: &str, path: &str) -> bool {
-    if text.contains(&format!("./{path}")) {
+    // WARNING -- EVERY CLAUSE HERE GOES THROUGH `invokes_on_line`, AND THAT IS THE SHAPE
+    // THAT MATTERS. This was a disjunction in which only the runner clause consulted a
+    // guard and this one was a bare `text.contains`. Because the clauses are OR-ed the
+    // WEAKEST decided the answer, so every hardening added to the flag scan --
+    // hermit#2661, #2667, #2674, #2681 -- was reachable only when this clause had already
+    // declined. Two characters defeated them all: `rustc -o ./scripts/x.rs` read as an
+    // invocation. A guard one arm of an OR can bypass is not a guard.
+    let dotted = format!("./{path}");
+    if text.lines().any(|line| invokes_on_line(line, &dotted)) {
         return true;
     }
     // `rustc` is a runner here too: ci/run-reverie-pin-check.sh COMPILES
@@ -540,7 +565,7 @@ fn is_invoked(text: &str, path: &str) -> bool {
     // A path alone at the start of a line is a shell line-continuation argument --
     // the form run-reverie-pin-check.sh uses for both pin checkers. Anchoring to the
     // line start is what keeps this from matching a filename quoted mid-sentence.
-    text.lines().any(|l| l.trim_start().starts_with(path))
+    text.lines().any(|line| invokes_on_line(line, path))
 }
 
 /// Is `needle` used as a COMMAND on this line, rather than quoted inside a string?
@@ -553,22 +578,124 @@ fn invokes_on_line(line: &str, needle: &str) -> bool {
     let mut from = 0;
     while let Some(hit) = line[from..].find(needle) {
         let at = from + hit;
-        let before = line[..at].trim_end();
-        let quoted = before.ends_with('"') || before.ends_with('\'');
-        if !quoted
-            && (before.is_empty()
-                || before.ends_with(';')
-                || before.ends_with('&')
-                || before.ends_with('|')
-                || before.ends_with('(')
-                || before.ends_with('`'))
-        {
+        if in_command_position(&line[..at]) {
             return true;
         }
         from = at + 1;
     }
     false
 }
+
+/// Is a match starting right after `before` THE FIRST WORD OF A COMMAND?
+///
+/// WARNING -- THIS USED TO ASK WHICH CHARACTER PRECEDED THE MATCH, which is the same
+/// mistake as every other defect in this file: a semantic question answered by
+/// enumerating syntax. The old rule accepted nothing, `;`, `&`, `|`, `(` or a backtick.
+/// Two real invocations here are preceded by neither -- `$(SUBMODULE_PROXY) ./scripts/x.rs`
+/// in the Makefile and `VAR=value ./ci/node.sh` in a DAG command -- so funnelling the
+/// other clauses through the old guard reported 2 checkers as scheduled by NOTHING.
+/// Adding `)` and `=` to the list would have fixed those two and left the third shape.
+fn in_command_position(before: &str) -> bool {
+    let mut before = before;
+    // A quote directly before the match may be a string DELIMITER. Commands reach this
+    // file as shell text, as JSON (decoded upstream) and as RUST literals in
+    // scripts/validate.rs (`node.cmd = "./ci/verify-x.sh ..."`).
+    //
+    // ⚠️ ONLY WHEN IT OPENS ONE. agent(hermit-005) refused an earlier revision for
+    // stripping ANY trailing quote, which readmitted the shape hermit#2656 excluded: a
+    // runner prefix carried as FIXTURE DATA, where the quote is preceded by nothing but
+    // indentation. In a genuine embedded command it is preceded by the operator that
+    // introduces the literal, so that is what is required.
+    if let Some(rest) = before.strip_suffix('"').or_else(|| before.strip_suffix('\'')) {
+        let opener = rest.trim_end();
+        if opener.is_empty() || !opener.ends_with(['=', '(', ',']) {
+            return false;
+        }
+        before = rest;
+    }
+    // The match must START A WORD. `OUT=./scripts/check-x.sh` is an assignment's VALUE.
+    if let Some(last) = before.chars().last() {
+        if !last.is_whitespace() && !matches!(last, ';' | '&' | '|' | '(' | '`') {
+            return false;
+        }
+    }
+    let trimmed = before.trim_end();
+    if trimmed.is_empty() {
+        return true;
+    }
+    for token in trimmed.split_whitespace().rev() {
+        if is_command_boundary(token) {
+            return true;
+        }
+        if is_assignment(token) || is_expansion(token) {
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+/// `NAME=value` -- an environment prefix, which precedes a command.
+fn is_assignment(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `$(VAR)`, `${VAR}` or `$VAR` -- may expand to a command prefix.
+fn is_expansion(token: &str) -> bool {
+    token.starts_with('$')
+}
+
+/// A token that ENDS the previous command, so what follows begins a new one.
+fn is_command_boundary(token: &str) -> bool {
+    // A BARE `=` is an assignment operator with spaces around it, which shell
+    // assignments never have. It occurs only in source that BUILDS a command string.
+    matches!(token, ";" | "&&" | "||" | "|" | "&" | "(" | "`" | "=")
+        || token.ends_with(';')
+        || token.ends_with("&&")
+        || token.ends_with("||")
+        || token.ends_with('|')
+        || token.ends_with('`')
+}
+/// Decode a JSON string literal into the text a shell would see.
+///
+/// WARNING -- WITHOUT THIS THE QUOTE GUARD IS MEANINGLESS ON DAG COMMANDS, and that was
+/// a live defect. `extract_cmds` returned everything after `"cmd":` verbatim, so the JSON
+/// delimiter stayed on the front. The guard rejects a match preceded by a quote -- meaning
+/// SHELL quoting -- and cannot tell the two apart, so
+///
+///     "cmd": "python3 scripts/check-x.py --gate"
+///
+/// was rejected as quoted and read as an ORPHAN. Measured before this change: that shape
+/// returned false while the `./` shape returned true, and it returned true only because
+/// the `./` clause consulted no guard at all. The unguarded clause was LOAD-BEARING --
+/// guarding it without decoding first turns every DAG-scheduled checker into a false
+/// orphan at once, which is exactly what happened when I tried.
+fn decode_json_string(raw: &str) -> String {
+    let Some(rest) = raw.strip_prefix('"') else {
+        return raw.to_string();
+    };
+    let mut out = String::with_capacity(rest.len());
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => break,
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some(other) => out.push(other),
+                None => break,
+            },
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 
 /// Pull the value of every `"cmd":` field out of a DAG file.
 ///
@@ -585,7 +712,7 @@ fn extract_cmds(raw: &str) -> Vec<String> {
         let Some(after_colon) = rest.1.split_once(':') else {
             continue;
         };
-        out.push(after_colon.1.trim().to_string());
+        out.push(decode_json_string(after_colon.1.trim()));
     }
     out
 }
@@ -624,6 +751,91 @@ fn lint_checks_recipe(makefile: &str) -> String {
 }
 
 fn self_test() {
+    // ⚠️ THE SHARED CONTROL. Several matcher defects in one night shared a SIGNATURE and
+    // not a cause: each inferred a semantic fact from an unverified syntactic position,
+    // and each failed DOWNWARD, where a smaller count reads as fewer problems. A shared
+    // signature buys no shared patch -- the fixes are independent -- but it buys this: a
+    // block of cases that must be FALSE, so a narrowing cannot pass as green. Add to it
+    // whenever a clause is hardened; that is what the earlier fixes did not do, which is
+    // why each was defeated by the next input shape.
+    for (text, path, why) in [
+        (
+            "rustc -o ./scripts/check-z.rs in.rs",
+            "scripts/check-z.rs",
+            "a dotted -o OUTPUT read as an invocation -- this bypassed the flag scan",
+        ),
+        (
+            "python3 -c ./scripts/check-z.py x.py",
+            "scripts/check-z.py",
+            "a dotted -c VALUE read as an invocation",
+        ),
+        (
+            "sh -c \"echo ./scripts/check-z.rs\"",
+            "scripts/check-z.rs",
+            "a path inside a shell-quoted string read as an invocation",
+        ),
+        (
+            "OUT=./scripts/check-z.rs",
+            "scripts/check-z.rs",
+            "an assignment VALUE read as an invocation",
+        ),
+        (
+            "see ./scripts/check-z.rs for details",
+            "scripts/check-z.rs",
+            "a mid-sentence mention read as an invocation",
+        ),
+        (
+            "        \"python3 scripts/test_validate_stop_paths.py",
+            "scripts/test_validate_stop_paths.py",
+            "a runner prefix carried as FIXTURE DATA -- hermit#2656, the P0 that turned \
+             this checker red on main, reverted once by stripping any trailing quote",
+        ),
+    ] {
+        assert!(!is_invoked(text, path), "false SCHEDULED (silent direction): {why}");
+    }
+
+    // ...and the other half. Every one is a REAL invocation in this repository; if the
+    // guard above is tightened until one fails, scheduled checkers become orphans.
+    for (text, path, why) in [
+        (
+            "\t$(SUBMODULE_PROXY) ./scripts/check-n.rs",
+            "scripts/check-n.rs",
+            "a make variable expansion before the command",
+        ),
+        (
+            "FOO=bar ./ci/node.sh",
+            "ci/node.sh",
+            "an environment assignment before the command",
+        ),
+        (
+            "python3 scripts/check-x.py --gate",
+            "scripts/check-x.py",
+            "a DAG command in runner form, after JSON decoding",
+        ),
+        (
+            "n.cmd = \"./ci/verify-x.sh p\".to_string();",
+            "ci/verify-x.sh",
+            "a command built as a Rust string literal in scripts/validate.rs",
+        ),
+        (
+            "cargo build && scripts/check-y.sh --gate",
+            "scripts/check-y.sh",
+            "a checker CHAINED after another command -- the bare-path clause used to \
+             require the START OF A LINE",
+        ),
+    ] {
+        assert!(is_invoked(text, path), "false ORPHAN (loud direction): {why}");
+    }
+
+    // Pins JSON DECODING, which nothing else reaches: every other case calls is_invoked
+    // on text that is already decoded, so dropping the decoder leaves them all green
+    // while every DAG command silently changes shape.
+    assert_eq!(
+        extract_cmds("      \"cmd\": \"python3 scripts/check-x.py --gate\","),
+        vec!["python3 scripts/check-x.py --gate".to_string()],
+        "a DAG command must reach the matcher as shell text, not as a JSON literal"
+    );
+
     // ⚠️ PINS THE POPULATION RULE, AND THE ASYMMETRY THAT MOTIVATED IT. A convention
     // expressed only as a PREFIX cannot see its own family: `foo-test.sh` asserts and
     // exits nonzero by every standard this file uses, and five were outside the
@@ -704,9 +916,41 @@ target/ci/check-exit-status-class --gate";
     // next token; a wrong entry there fails SILENTLY, by reading an output as an input.
     // The false orphan is loud and costs one line to fix, so it is the side to be on.
     // If you widen this, keep the `-o` control below passing.
+    // ⚠️ THIS PIN IS INVERTED, AS ITS OWN MESSAGE ASKED. It asserted that
+    // `-X faulthandler <path>` reads as an ORPHAN and said to update it if the gap ever
+    // closed. It has: the scan no longer needs to know that `-X` takes a value, because
+    // an unrecognised flag is now ASSUMED to take one.
     assert!(
-        !is_invoked("python3 -X faulthandler scripts/check-y.py", "scripts/check-y.py"),
-        "the separate-value flag gap closed -- update this pin and re-check the -o control"
+        is_invoked("python3 -X faulthandler scripts/check-y.py", "scripts/check-y.py"),
+        "an unrecognised separate-value flag must no longer hide the script after it"
+    );
+    // The COST of the loud default, pinned so it is a choice and not a surprise: a
+    // boolean missing from a runner's list is assumed to take a value, so the scan steps
+    // past the script and reports a FALSE ORPHAN. The remedy is to add the flag, not to
+    // widen the default back.
+    assert!(
+        !is_invoked("python3 --nonsense-bool scripts/check-y.py", "scripts/check-y.py"),
+        "an unknown boolean is assumed to take a value; add it to the runner's list"
+    );
+    // ⚠️ BOTH DIRECTIONS OF ONE FLAG, WHICH IS WHY THE TABLE IS PER-RUNNER (hermit#2681)
+    // AND WHY THE DEFAULT IS LOUD. `-O` is a boolean under python and rustc and takes a
+    // shell option name under bash. Found by agent(hermit-007), measured by
+    // agent(hermit-005).
+    assert!(
+        !is_invoked("bash -O scripts/check-x.sh", "scripts/check-x.sh"),
+        "bash -O takes a shell option name, so the script is not the next token"
+    );
+    assert!(
+        is_invoked("bash -O extglob scripts/check-x.sh", "scripts/check-x.sh"),
+        "with its value present the script IS the next token"
+    );
+    assert!(
+        is_invoked("python3 -O scripts/check-y.py", "scripts/check-y.py"),
+        "python -O is a boolean, so the same flag differs per runner"
+    );
+    assert!(
+        is_invoked("rustc -O scripts/check-x.rs", "scripts/check-x.rs"),
+        "rustc -O is also a boolean (opt-level=2)"
     );
     // ⚠️ THE ORDERING THE ORIGINAL CONTROL MISSED, AND IT WAS A LIVE FALSE
     // "SCHEDULED". `-o` directly after the runner was skipped as an ordinary flag,
