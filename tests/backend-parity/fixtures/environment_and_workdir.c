@@ -27,6 +27,19 @@ static const char *environment_value(const char *name) {
     return NULL;
 }
 
+static int has_prefix_and_suffix(const char *value, const char *prefix,
+                                 const char *suffix) {
+    if (value == NULL) {
+        return 0;
+    }
+    size_t value_length = strlen(value);
+    size_t prefix_length = strlen(prefix);
+    size_t suffix_length = strlen(suffix);
+    return value_length >= prefix_length + suffix_length &&
+           strncmp(value, prefix, prefix_length) == 0 &&
+           strcmp(value + value_length - suffix_length, suffix) == 0;
+}
+
 static int check_environment(void) {
     static const char *const expected[] = {
         "ASAN_OPTIONS",
@@ -87,12 +100,20 @@ static int check_environment(void) {
         return fail("environment contains an unexpected fixed value");
     }
 
-    static const char *const path_names[] = {"HOME", "XDG_CONFIG_HOME", "E2E_FIXTURE_DIR"};
-    for (size_t index = 0; index < sizeof(path_names) / sizeof(path_names[0]); ++index) {
-        const char *value = environment_value(path_names[index]);
-        if (value == NULL || value[0] != '/') {
-            return fail("environment path is missing or not absolute");
-        }
+    const char *home = environment_value("HOME");
+    const char *xdg = environment_value("XDG_CONFIG_HOME");
+    const char *fixtures = environment_value("E2E_FIXTURE_DIR");
+    if (!has_prefix_and_suffix(home, "/results/", "/home") ||
+        !has_prefix_and_suffix(xdg, "/results/", "/xdg-config") ||
+        !has_prefix_and_suffix(fixtures, "/results/", "/fixtures")) {
+        return fail("environment path is not rooted in the pinned result mount");
+    }
+    size_t base_length = strlen(home) - strlen("/home");
+    if (strlen(xdg) != base_length + strlen("/xdg-config") ||
+        strlen(fixtures) != base_length + strlen("/fixtures") ||
+        strncmp(home, xdg, base_length) != 0 ||
+        strncmp(home, fixtures, base_length) != 0) {
+        return fail("environment paths do not name one result cell");
     }
 
     const char *jobs = environment_value("HERMIT_E2E_SCHEDULED_JOBS");

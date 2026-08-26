@@ -5479,7 +5479,7 @@ test:
         assert:
           bitwise_parity: true
         backends_disabled:
-          dbt: DBT does not preserve the requested guest working directory
+          dbt: DBT does not enter the per-cell /test mount namespace
           kvm: KVM verification does not yet compare canonical non-vacuous INFO evidence
           sabre: Canonical SaBRe verification has not been qualified for this environment-control fixture
           liteinst: LiteInst canonical verification remains blocked by guest-visible startup mapping identity
@@ -5522,7 +5522,7 @@ test:
         backends_enabled:
           - ptrace
         backends_disabled:
-          dbt: DBT does not preserve the requested guest working directory
+          dbt: DBT does not enter the per-cell /test mount namespace
           kvm: KVM custom execution is not qualified by the canonical comparison policy
           sabre: SaBRe custom execution is not qualified for this environment-control fixture
           liteinst: LiteInst custom execution remains blocked by guest-visible startup mapping identity

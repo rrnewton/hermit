@@ -91,6 +91,7 @@ mod validate_super; // Normalizes and audits extracted Cargo tests/synthetic arg
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -127,6 +128,23 @@ const LEDGER_PRODUCER: &str = "hermit-validate-rs";
 /// and the fail-closed assertion that requires it cannot drift apart.
 const PIN_GATE_TAG: &str = "pre.reverie_pin";
 const MANIFEST_AUDIT_COMMAND: &str = "target/debug/test-harness validate";
+const PINNED_ROOT_FETCH_TAG: &str = "setup.pinned_root_fetch";
+const PINNED_ROOT_FETCH_COMMAND: &str = "seed=(); if [ -n \"${CARGO_HOME:-}\" ]; then seed=(--seed-cargo \"$CARGO_HOME\"); fi; ./ci/hermetic/run-split-validate.sh --fetch-only \"${seed[@]}\"";
+
+const PINNED_ROOT_FORWARDED_ENV: &[&str] = &[
+    "CARGO_BUILD_JOBS",
+    STEP_STARTED_MONOTONIC_NS_ENV,
+    "E2E_BUILD_ROOT",
+    "E2E_RESULT_ROOT",
+    "E2E_RUN_ID",
+    "HERMIT_E2E_EMPTY_WORKDIR",
+    "HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT",
+    "L4_REPS",
+    "PR_NUMBER",
+    "SUPER_REPETITIONS",
+    "THIRD_PARTY_BUILD_JOBS",
+    "VALIDATE_VERBOSITY",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ValidationStepIdentity {
@@ -294,6 +312,7 @@ struct Args {
     run_on_dirty_tree: bool,
     ignore_cache: bool,
     label_pr: bool,
+    no_label_pr_explicit: bool,
     verbosity: i64,
     jobs: Option<i64>,
     keep_going: bool,
@@ -441,6 +460,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         run_on_dirty_tree: env_flag("VALIDATE_RUN_ON_DIRTY_TREE", "1"),
         ignore_cache: env_flag("VALIDATE_IGNORE_CACHE", "1"),
         label_pr: !env_flag("VALIDATE_LABEL_PR", "0"),
+        no_label_pr_explicit: false,
         verbosity,
         jobs: None,
         keep_going: false,
@@ -521,8 +541,14 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
             "--all" | "--full-run" => args.force_full = true,
             "--run-on-dirty-tree" => args.run_on_dirty_tree = true,
             "--ignore-cache" => args.ignore_cache = true,
-            "--label-pr" => args.label_pr = true,
-            "--no-label-pr" => args.label_pr = false,
+            "--label-pr" => {
+                args.label_pr = true;
+                args.no_label_pr_explicit = false;
+            }
+            "--no-label-pr" => {
+                args.label_pr = false;
+                args.no_label_pr_explicit = true;
+            }
             "--verbose" => args.verbosity = 2,
             "--verbosity" => {
                 i += 1;
@@ -613,7 +639,8 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
     args.show_plan = show_plan;
     args.focused = focused.pop();
     if args.reuse_parent_manifest_gate
-        && (!matches!(args.focused, Some(Focused::PortableStrictCompat)) || args.label_pr)
+        && (!matches!(args.focused, Some(Focused::PortableStrictCompat))
+            || !args.no_label_pr_explicit)
     {
         eprintln!(
             "validate: --reuse-parent-manifest-gate is internal to the no-label \
@@ -645,6 +672,14 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
 /// suite, so it accepts only the unfocused `full` level.
 fn force_full_policy_allows(force_full: bool, level: Level, focused: Option<&str>) -> bool {
     !force_full || (level == Level::Full && focused.is_none())
+}
+
+fn pinned_root_nested_payload(args: &Args, workdir: Option<&OsStr>) -> bool {
+    args.reuse_parent_manifest_gate
+        && matches!(args.focused, Some(Focused::PortableStrictCompat))
+        && !args.label_pr
+        && args.no_label_pr_explicit
+        && workdir == Some(OsStr::new("/test"))
 }
 
 /// The environment marker only routes an invocation that already parsed the
@@ -1519,6 +1554,58 @@ fn self_test() -> Result<(), String> {
             return Err(format!("force-full: focused mode {m} must be refused"));
         }
     }
+    let exact_payload = vec![
+        "--portable-strict-compat-only".to_string(),
+        "--reuse-parent-manifest-gate".to_string(),
+        "--no-label-pr".to_string(),
+    ];
+    let mut payload = parse_argv(&exact_payload).map_err(|code| {
+        format!("pinned-root nested payload: exact internal argv was refused with exit {code}")
+    })?;
+    if !pinned_root_nested_payload(&payload, Some(OsStr::new("/test"))) {
+        return Err("pinned-root nested payload: the exact internal form was not recognized".into());
+    }
+    for missing in ["workdir", "reuse", "focused", "no-label"] {
+        let saved_reuse = payload.reuse_parent_manifest_gate;
+        let saved_focused = payload.focused.clone();
+        let saved_label = payload.label_pr;
+        let saved_explicit = payload.no_label_pr_explicit;
+        let workdir = match missing {
+            "workdir" => None,
+            "reuse" => {
+                payload.reuse_parent_manifest_gate = false;
+                Some(OsStr::new("/test"))
+            }
+            "focused" => {
+                payload.focused = Some(Focused::StrictCompat);
+                Some(OsStr::new("/test"))
+            }
+            "no-label" => {
+                payload.no_label_pr_explicit = false;
+                Some(OsStr::new("/test"))
+            }
+            _ => unreachable!(),
+        };
+        if pinned_root_nested_payload(&payload, workdir) {
+            return Err(format!(
+                "pinned-root nested payload: dropping required condition {missing} still selected the nested path"
+            ));
+        }
+        payload.reuse_parent_manifest_gate = saved_reuse;
+        payload.focused = saved_focused;
+        payload.label_pr = saved_label;
+        payload.no_label_pr_explicit = saved_explicit;
+    }
+    if parse_argv(&[
+        "--portable-strict-compat-only".into(),
+        "--reuse-parent-manifest-gate".into(),
+    ])
+    .is_ok()
+    {
+        return Err(
+            "pinned-root nested payload: the parser accepted reuse without --no-label-pr".into(),
+        );
+    }
     // Shell quoting: a corpus argv element must survive round-tripping through
     // `bash -c` byte-for-byte. A silent mangling here would change what the guest
     // runs while every count still looked right.
@@ -1624,6 +1711,7 @@ fn self_test() -> Result<(), String> {
         validate_history::self_test()?,
         validate_receipt::self_test()?,
         validate_runtime::self_test()?,
+        pinned_root_plan_bracket()?,
     ] {
         println!("  {line}");
     }
@@ -6496,6 +6584,256 @@ fn propagate_verbosity(plan: &mut Plan, verbosity: i64) {
             step.env.insert("VALIDATE_VERBOSITY".into(), value.clone());
         }
     }
+}
+
+fn pinned_root_host_step(step: &Step) -> bool {
+    step.tag() == "pre.submodules"
+        || step.tag() == PINNED_ROOT_FETCH_TAG
+        || step.tag() == PIN_GATE_TAG
+}
+
+fn pinned_root_command(root: &Path, out: &Path, step: &Step) -> String {
+    let mut env_names: BTreeSet<&str> = PINNED_ROOT_FORWARDED_ENV.iter().copied().collect();
+    env_names.extend(step.env.keys().map(String::as_str));
+    let mut argv = vec![
+        root.join("ci/hermetic/run-in-pinned-root.sh")
+            .to_string_lossy()
+            .into_owned(),
+        "--src".into(),
+        root.to_string_lossy().into_owned(),
+        "--out".into(),
+        out.to_string_lossy().into_owned(),
+        "--src-rw".into(),
+        "--cargo-home".into(),
+        out.join("cargo").to_string_lossy().into_owned(),
+    ];
+    for name in env_names {
+        argv.extend(["--env".into(), name.into()]);
+    }
+    argv.extend([
+        "--".into(),
+        "bash".into(),
+        "-c".into(),
+        "/src/ci/hermetic/assert-no-network.sh && exec bash -c \"$1\"".into(),
+        "bash".into(),
+        step.cmd.clone(),
+    ]);
+    validate_plan::shell_join(argv)
+}
+
+/// Keep the canonical driver, DAG identities, resource caps, and receipt on the
+/// host while executing every build/test command in the pinned root. The only
+/// host-side DAG work is repository inspection plus the networked locked fetch;
+/// neither is a test. The fetched Cargo input and target directory are shared by
+/// all pinned-root commands, so the existing fused portable+privileged plan is
+/// preserved rather than replaced with a second runner or a different node set.
+fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Result<(), String> {
+    if already_inside {
+        return Ok(());
+    }
+    let out = root.join("ignored/hermetic/split");
+    for (index, cfg) in std::iter::once(&mut plan.cfg)
+        .chain(plan.second.iter_mut())
+        .enumerate()
+    {
+        if cfg.steps.iter().any(|step| step.tag() == PINNED_ROOT_FETCH_TAG) {
+            return Err(format!("plan already contains reserved node {PINNED_ROOT_FETCH_TAG}"));
+        }
+        if index == 0 {
+            let fetch_deps = cfg
+                .steps
+                .iter()
+                .any(|step| step.tag() == PIN_GATE_TAG)
+                .then(|| vec![PIN_GATE_TAG.to_string()])
+                .unwrap_or_default();
+            cfg.steps.push(step_with_caps(
+                "setup",
+                "pinned_root_fetch",
+                "Fetch locked Cargo inputs before the network-disabled pinned-root commands",
+                PINNED_ROOT_FETCH_COMMAND.into(),
+                fetch_deps,
+                600,
+                600,
+                1024 * 1024 * 1024,
+            ));
+        }
+
+        for step in &mut cfg.steps {
+            if pinned_root_host_step(step) {
+                continue;
+            }
+            // The selected E2E population has no naked or DBT cells. Every
+            // scheduled Hermit attempt therefore accepts this exact tmpfs gate;
+            // the harness refuses an unsupported mode/backend instead of
+            // silently running it outside /test.
+            step.env
+                .insert("HERMIT_E2E_EMPTY_WORKDIR".into(), "/test".into());
+            // The only nested validate command is already written to opt out of
+            // a second cgroup layer in CI. The outer DAG step remains boxed and
+            // owns the resource limits around this container.
+            if step.tag() == "test.strict_compat" {
+                step.env.insert("CI".into(), "1".into());
+            }
+            step.cmd = pinned_root_command(root, &out, step);
+            if index == 0 && !step.deps.iter().any(|dep| dep == PINNED_ROOT_FETCH_TAG) {
+                step.deps.push(PINNED_ROOT_FETCH_TAG.into());
+                step.deps.sort();
+            }
+        }
+    }
+    Ok(())
+}
+
+fn pinned_root_plan_bracket() -> Result<String, String> {
+    let step = |group: &str, job: &str, cmd: &str, deps: Vec<String>| {
+        step_with_caps(group, job, "fixture", cmd.into(), deps, 30, 30, 1024 * 1024)
+    };
+    let mut ordinary = step("test", "ordinary", "echo pinned", vec![]);
+    ordinary.env.insert("FIXTURE_VALUE".into(), "literal".into());
+    let strict = step("test", "strict_compat", "./scripts/validate.rs --portable-strict-compat-only", vec![]);
+    let mut plan = Plan {
+        cfg: validate_plan::config_from(
+            vec![
+                step("pre", "submodules", "host-submodules", vec![]),
+                step("pre", "reverie_pin", "./ci/run-reverie-pin-check.sh", vec!["pre.submodules".into()]),
+                ordinary,
+                strict,
+                step(
+                    "test",
+                    "mentions_pin_script",
+                    "echo ./ci/run-reverie-pin-check.sh",
+                    vec![],
+                ),
+            ],
+            "pinned-root bracket",
+        ),
+        ..Default::default()
+    };
+    apply_pinned_root(&mut plan, Path::new("/repo"), false)?;
+    let by_tag: BTreeMap<String, &Step> =
+        plan.cfg.steps.iter().map(|step| (step.tag(), step)).collect();
+    let fetch = by_tag
+        .get(PINNED_ROOT_FETCH_TAG)
+        .ok_or("pinned-root bracket: locked fetch node was not added")?;
+    if fetch.cmd != PINNED_ROOT_FETCH_COMMAND
+        || fetch.deps != [PIN_GATE_TAG.to_string()]
+    {
+        return Err(format!(
+            "pinned-root bracket: fetch command/dependency drifted: cmd={:?} deps={:?}",
+            fetch.cmd, fetch.deps
+        ));
+    }
+    for tag in ["pre.submodules", PIN_GATE_TAG] {
+        let host = by_tag
+            .get(tag)
+            .ok_or_else(|| format!("pinned-root bracket: host preflight {tag} disappeared"))?;
+        if host.cmd.contains("run-in-pinned-root.sh") {
+            return Err(format!(
+                "pinned-root bracket: network/repository preflight {tag} was moved into the network-disabled image"
+            ));
+        }
+    }
+    for tag in [
+        "test.ordinary",
+        "test.strict_compat",
+        "test.mentions_pin_script",
+    ] {
+        let wrapped = by_tag
+            .get(tag)
+            .ok_or_else(|| format!("pinned-root bracket: wrapped node {tag} disappeared"))?;
+        if !wrapped.cmd.starts_with("/repo/ci/hermetic/run-in-pinned-root.sh ")
+            || !wrapped.cmd.contains("--src /repo")
+            || !wrapped.cmd.contains("--out /repo/ignored/hermetic/split")
+            || !wrapped
+                .cmd
+                .contains(&format!("--env {STEP_STARTED_MONOTONIC_NS_ENV}"))
+            || !wrapped.cmd.contains("--env HERMIT_E2E_EMPTY_WORKDIR")
+            || !wrapped
+                .cmd
+                .contains("/src/ci/hermetic/assert-no-network.sh")
+            || wrapped.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
+            || !wrapped.deps.iter().any(|dep| dep == PINNED_ROOT_FETCH_TAG)
+        {
+            return Err(format!(
+                "pinned-root bracket: {tag} lost its image wrapper, /test gate, or fetch edge: cmd={:?} env={:?} deps={:?}",
+                wrapped.cmd, wrapped.env, wrapped.deps
+            ));
+        }
+    }
+    let ordinary = by_tag["test.ordinary"];
+    if !ordinary.cmd.contains("--env FIXTURE_VALUE")
+        || !ordinary.cmd.ends_with(" bash 'echo pinned'")
+    {
+        return Err(format!(
+            "pinned-root bracket: per-step environment or literal command changed: {:?}",
+            ordinary.cmd
+        ));
+    }
+    let strict = by_tag["test.strict_compat"];
+    if strict.env.get("CI").map(String::as_str) != Some("1")
+        || !strict.cmd.contains("--env CI")
+    {
+        return Err(
+            "pinned-root bracket: nested strict compatibility did not select its existing explicit inner-cgroup opt-out"
+                .into(),
+        );
+    }
+    let mut nested = Plan {
+        cfg: validate_plan::config_from(
+            vec![step("test", "nested", "echo already-inside", vec![])],
+            "already inside pinned root",
+        ),
+        ..Default::default()
+    };
+    apply_pinned_root(&mut nested, Path::new("/repo"), true)?;
+    if nested.cfg.steps.len() != 1
+        || nested.cfg.steps[0].cmd != "echo already-inside"
+        || nested.cfg.steps[0].env.contains_key("HERMIT_E2E_EMPTY_WORKDIR")
+    {
+        return Err(format!(
+            "pinned-root bracket: a nested payload was wrapped a second time: {:?}",
+            nested.cfg.steps
+        ));
+    }
+    let mut sequential = Plan {
+        cfg: validate_plan::config_from(
+            vec![step("test", "first", "true", vec![])],
+            "first lane",
+        ),
+        second: Some(validate_plan::config_from(
+            vec![step("test", "second", "true", vec![])],
+            "second lane",
+        )),
+        ..Default::default()
+    };
+    apply_pinned_root(&mut sequential, Path::new("/repo"), false)?;
+    let first_fetches = sequential
+        .cfg
+        .steps
+        .iter()
+        .filter(|step| step.tag() == PINNED_ROOT_FETCH_TAG)
+        .count();
+    let second = sequential.second.as_ref().expect("second lane remains present");
+    let second_fetches = second
+        .steps
+        .iter()
+        .filter(|step| step.tag() == PINNED_ROOT_FETCH_TAG)
+        .count();
+    let second_step = second
+        .steps
+        .iter()
+        .find(|step| step.tag() == "test.second")
+        .expect("second-lane step remains present");
+    if first_fetches != 1
+        || second_fetches != 0
+        || second_step.deps.iter().any(|dep| dep == PINNED_ROOT_FETCH_TAG)
+        || !second_step.cmd.contains("run-in-pinned-root.sh")
+    {
+        return Err(format!(
+            "pinned-root bracket: sequential lanes must fetch once then reuse the cache: first_fetches={first_fetches} second_fetches={second_fetches} second={second_step:?}"
+        ));
+    }
+    Ok("pinned root: 2 host preflights retained, 1 locked fetch added, 3 test commands wrapped with the /test gate".into())
 }
 
 // --------------------------------------------------------------------------- interruption
@@ -11658,13 +11996,32 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // SECOND receipt for one logical run. A nested FOCUSED invocation is a
     // PAYLOAD — the outer run owns the ledger, receipt, cache, lock and
     // concurrency accounting; a nested non-focused level is refused outright.
-    let nesting = validate_runtime::detect_nesting();
+    let observed_nesting = validate_runtime::detect_nesting();
+    let internal_pinned_payload = pinned_root_nested_payload(
+        &args,
+        std::env::var_os("HERMIT_E2E_EMPTY_WORKDIR").as_deref(),
+    );
+    let nesting = if !observed_nesting.nested && internal_pinned_payload {
+        validate_runtime::Nesting {
+            nested: true,
+            outer_pid: None,
+            stale_marker: observed_nesting.stale_marker,
+        }
+    } else {
+        observed_nesting
+    };
     if let Some(stale) = nesting.stale_marker {
         eprintln!(
             "validate: ignoring a STALE {} marker naming pid {stale}: that pid is not an ancestor \
              of this process, so this is a TOP-LEVEL run. (Treating the bare env var as proof of \
              nesting would refuse every legitimate full run in a shell that once exported it.)",
             validate_runtime::ACTIVE_ENV
+        );
+    }
+    if internal_pinned_payload && nesting.outer_pid.is_none() {
+        eprintln!(
+            "validate: exact no-label portable-strict payload is already inside the pinned root; \
+             the outer validation owns its lock, cache, ledger, receipt, and accounting."
         );
     }
     // The marker is claimed LATER, after the cgroup re-exec -- see the call site
@@ -11917,6 +12274,17 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             );
         }
     };
+
+    let already_inside_pinned_root =
+        std::env::var_os("HERMIT_E2E_EMPTY_WORKDIR").as_deref() == Some(OsStr::new("/test"));
+    if let Err(error) = apply_pinned_root(&mut plan, &root, already_inside_pinned_root) {
+        return RunSummary::refused(
+            3,
+            &plan.profile,
+            "pinned-root plan construction",
+            vec![error],
+        );
+    }
 
     assign_fail_fast_families(&mut plan);
 
@@ -12317,12 +12685,18 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         ))
     };
     if nesting.nested {
-        println!(
-            "Nested validate (payload of outer pid {}): focused mode {} only; the outer run owns \
-             the ledger, receipt, cache, invocation lock and concurrency accounting.",
-            nesting.outer_pid.unwrap_or(-1),
-            plan.profile
-        );
+        match nesting.outer_pid {
+            Some(outer) => println!(
+                "Nested validate (payload of outer pid {outer}): focused mode {} only; the outer run owns \
+                 the ledger, receipt, cache, invocation lock and concurrency accounting.",
+                plan.profile
+            ),
+            None => println!(
+                "Nested validate (exact pinned-root payload): focused mode {} only; the outer run owns \
+                 the ledger, receipt, cache, invocation lock and concurrency accounting.",
+                plan.profile
+            ),
+        }
     }
 
     let jobs = args.jobs.unwrap_or_else(default_jobs);
