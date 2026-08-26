@@ -3241,20 +3241,13 @@ fn run_rejects_invalid_programs_with_actionable_errors() {
     let output = hermit(&["run", "--", "definitely-missing-hermit-program"]);
     assert_hermit_refusal_contains(
         &output,
-        // ⚠️ GuestNotFound, THE SAME AS THE ABSOLUTE-PATH ARM ABOVE, AND THAT IS
-        // THE POINT OF THIS ASSERTION. An earlier version of this comment
-        // recorded the opposite as a filed inconsistency: a bare name that would
-        // not resolve on the guest PATH exited 125 with `class=cli-error` while
-        // `/nope/x` exited 127. Same condition, and the only difference was how
-        // the caller SPELLED it -- a property of the command line, not of the
-        // failure.
-        //
-        // ⚠️ AND THE SPLIT WAS BACKWARDS WITH RESPECT TO ITS OWN CONVENTION. The
-        // scheme is borrowed from GNU `env`/`chroot`/`timeout`, where 127 is
-        // PRIMARILY the PATH-lookup failure -- "command not found" is the shell
-        // failing to resolve a bare name. The branch getting the non-PATH code
-        // was the one the code was written for.
-        Refusal::GuestNotFound,
+        // ⚠️ NOT GuestNotFound, deliberately. An absolute path that does not
+        // exist is a GuestProgramFault (127), but failing to resolve a bare name
+        // on the guest PATH is reported as `class=cli-error` and exits 125. Both
+        // are "the program is not there", and they answer a caller differently
+        // for no reason a caller can see. Asserting what the product DOES, with
+        // the inconsistency filed rather than smoothed over here.
+        Refusal::Hermit,
         &["Could not resolve program", "guest PATH"],
     );
 
