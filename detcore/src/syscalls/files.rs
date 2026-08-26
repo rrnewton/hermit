@@ -297,6 +297,42 @@ fn is_inherited_container_output(resource: Option<ResourceID>) -> bool {
     )
 }
 
+/// Exactly the bits `fcntl(F_SETFL)` can change; access mode and creation
+/// flags are silently ignored by the kernel.
+const SETTABLE_STATUS_FLAGS: i32 =
+    libc::O_APPEND | libc::O_ASYNC | libc::O_DIRECT | libc::O_NOATIME | libc::O_NONBLOCK;
+
+/// The container's own stdin/stdout/stderr, i.e. the three descriptions the
+/// guest did NOT create.
+///
+/// ⚠️ THESE ARE THE SUPERVISOR'S DESCRIPTIONS. When Hermit passes its own
+/// stdio through to the guest rather than capturing it, the guest's fd 0/1/2
+/// name the very open file descriptions the hermit process holds -- inherited
+/// in turn from whoever invoked hermit. `fcntl(F_SETFL)` mutates the
+/// DESCRIPTION, not the descriptor, so forwarding a guest's request there
+/// changes state that outlives the guest, outlives hermit, and is visible to
+/// hermit's caller. Measured on hermit d7413071581f, both backends:
+/// `hermit run -- /usr/bin/awk 'BEGIN { print 42 }'` turned `O_APPEND` on in
+/// the caller's stderr (0x8001 -> 0x8401) and left it on.
+///
+/// Two runs of one guest must also start from the same descriptor state, so
+/// this is a determinism defect as well as a containment one: under
+/// `hermit run --strict --verify` the two runs share one hermit process, and
+/// the first run's mutation is still there when the second starts.
+///
+/// This is deliberately a SEPARATE predicate from
+/// [`is_inherited_container_output`], which excludes stdin because it exists to
+/// answer an `lseek` question about a redirect file that also carries Hermit's
+/// own diagnostics. Containment applies to all three.
+fn is_inherited_container_stdio(resource: Option<ResourceID>) -> bool {
+    matches!(
+        resource,
+        Some(ResourceID::Device(
+            Device::ContainerStdin | Device::ContainerStdout | Device::ContainerStderr
+        ))
+    )
+}
+
 fn unix_autobind_addrlen() -> i32 {
     (std::mem::offset_of!(libc::sockaddr_un, sun_path) + UNIX_AUTOBIND_NAME_LEN) as i32
 }
@@ -2549,18 +2585,82 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         match call.cmd() {
             F_GETFL => {
+                let (contained, observed) = guest.thread_state().with_detfd(fd, |detfd| {
+                    (
+                        is_inherited_container_stdio(detfd.resource()),
+                        detfd.status_flags_observed(),
+                    )
+                })?;
+                if contained && observed {
+                    // Answer from the model. Asking the kernel would report
+                    // whatever a PREVIOUS guest left behind on the supervisor's
+                    // description -- which is exactly the leak being closed.
+                    return Ok(i64::from(
+                        guest
+                            .thread_state()
+                            .with_detfd(fd, |detfd| detfd.status_flags())?,
+                    ));
+                }
                 let physical_flags = self.record_or_replay(guest, call).await?;
                 let logical_nonblocking = guest
                     .thread_state()
                     .with_detfd(fd, |detfd| detfd.is_nonblocking())?;
                 let nonblocking = i64::from(OFlag::O_NONBLOCK.bits());
-                if logical_nonblocking {
-                    Ok(physical_flags | nonblocking)
+                let flags = if logical_nonblocking {
+                    physical_flags | nonblocking
                 } else {
-                    Ok(physical_flags & !nonblocking)
+                    physical_flags & !nonblocking
+                };
+                if contained {
+                    // First look at an inherited stream: adopt the kernel's
+                    // answer as the model's starting point, so the guest still
+                    // sees the truth about its stdio (access mode, O_LARGEFILE,
+                    // an append-mode redirect the CALLER chose) and nothing
+                    // later has to ask the kernel again.
+                    guest
+                        .thread_state()
+                        .with_detfd(fd, |detfd| detfd.observe_status_flags(flags as i32))?;
                 }
+                Ok(flags)
             }
             F_SETFL(flags) => {
+                let (contained, observed) = guest.thread_state().with_detfd(fd, |detfd| {
+                    (
+                        is_inherited_container_stdio(detfd.resource()),
+                        detfd.status_flags_observed(),
+                    )
+                })?;
+                if contained {
+                    // ⚠️ NOT FORWARDED, DELIBERATELY. See
+                    // `is_inherited_container_stdio`: the kernel object here
+                    // belongs to the supervising hermit process, so the guest's
+                    // request is applied to the model and to nothing else. The
+                    // guest still reads back what it asked for; hermit's caller
+                    // reads back what it had.
+                    if !observed {
+                        // A guest that sets flags without reading them first
+                        // still needs a starting point. glibc normally issues
+                        // F_GETFL first, so this injection is rare.
+                        let physical_flags = self
+                            .record_or_replay(
+                                guest,
+                                syscalls::Fcntl::new().with_fd(fd).with_cmd(F_GETFL),
+                            )
+                            .await?;
+                        guest.thread_state().with_detfd(fd, |detfd| {
+                            detfd.observe_status_flags(physical_flags as i32)
+                        })?;
+                    }
+                    guest.thread_state().with_detfd(fd, |detfd| {
+                        let current = detfd.status_flags();
+                        // fcntl(2): F_SETFL changes only the settable bits and
+                        // ignores access mode and creation flags.
+                        detfd.set_logical_status_flags(
+                            (current & !SETTABLE_STATUS_FLAGS) | (flags & SETTABLE_STATUS_FLAGS),
+                        );
+                    })?;
+                    return Ok(0);
+                }
                 let fd_type = guest.thread_state().with_detfd(fd, |detfd| detfd.ty())?;
                 let force_nonblocking = self.cfg.use_nonblocking_sockets()
                     && !self.cfg.recordreplay_modes

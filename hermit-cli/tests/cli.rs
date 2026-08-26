@@ -13,6 +13,7 @@ use std::fs;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -50,6 +51,7 @@ static LITEINST_INERT_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
 static EXEC_CLOCK_CONTINUITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FORK_CHILD_GETRANDOM_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static STDIO_STATUS_FLAG_CONTAINMENT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 // This lock only serializes independent child processes; a failed assertion carries no
@@ -423,6 +425,130 @@ fn kvm_exact_child_waits_guest() -> &'static Path {
         );
         guest
     })
+}
+
+fn stdio_status_flag_containment_guest() -> &'static Path {
+    STDIO_STATUS_FLAG_CONTAINMENT_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root =
+            Path::new(env!("CARGO_TARGET_TMPDIR")).join("stdio-status-flag-containment");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create stdio status-flag containment guest directory");
+        let guest = build_root.join("stdio_status_flag_containment");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/stdio_status_flag_containment.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the stdio status-flag containment guest");
+        assert!(
+            output.status.success(),
+            "stdio status-flag containment guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// A guest must be able to change what IT sees about its own stderr without
+/// changing what the supervising hermit process -- and therefore hermit's own
+/// caller -- sees.
+///
+/// `fcntl(F_SETFL)` mutates the open file DESCRIPTION, not the descriptor. When
+/// hermit passes its own stdio through to the guest, that description is the
+/// one hermit inherited from the process that invoked it, so a forwarded
+/// request escapes the container: it outlives the guest, outlives hermit, and
+/// is visible to the caller afterwards.
+///
+/// Measured on hermit d7413071581f before the fix, on BOTH backends:
+/// `hermit run -- /usr/bin/awk 'BEGIN { print 42 }'` left the caller's stderr
+/// at 0x8401 where it had been 0x8001. Under `hermit run --strict --verify`
+/// that also made the KVM backend report itself nondeterministic, because both
+/// runs share one hermit process and the first run's mutation was still there
+/// when the second started (0 of 20 verified before; 20 of 20 after).
+///
+/// BOTH halves are asserted on purpose. Dropping the guest's request entirely
+/// would satisfy the containment half while silently breaking the guest, so the
+/// guest's own before/after reading is checked first.
+fn assert_guest_cannot_mutate_hermits_stderr_flags(backend: &str) {
+    let _guard = hermit_run_guard();
+    let guest = stdio_status_flag_containment_guest();
+
+    let directory = tempfile::tempdir().expect("failed to create a temporary directory");
+    let hermit_stderr_path = directory.path().join("hermit.err");
+    // Opened WITHOUT O_APPEND, so "the bit turned on" is unambiguous.
+    let hermit_stderr = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&hermit_stderr_path)
+        .expect("failed to open the file standing in for hermit's stderr");
+
+    // SAFETY: the descriptor is live and F_GETFL takes no third argument.
+    let before = unsafe { libc::fcntl(hermit_stderr.as_raw_fd(), libc::F_GETFL) };
+    assert!(before >= 0, "F_GETFL on the supervisor's descriptor failed");
+    assert_eq!(
+        before & libc::O_APPEND,
+        0,
+        "the supervisor's descriptor must start without O_APPEND for this test \
+         to mean anything",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["run", "--backend", backend, "--"])
+        .arg(guest)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        // `Stdio::from` dups this onto the child's fd 2, so hermit's stderr and
+        // `hermit_stderr` are the SAME open file description -- exactly the
+        // sharing a caller's shell redirect creates.
+        .stderr(Stdio::from(
+            hermit_stderr
+                .try_clone()
+                .expect("failed to duplicate the stderr stand-in"),
+        ))
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run the {backend} containment guest: {error}"));
+
+    let diagnostics = fs::read_to_string(&hermit_stderr_path).unwrap_or_default();
+    assert!(
+        output.status.success(),
+        "{backend} containment guest failed: {:?}\nhermit stderr:\n{diagnostics}",
+        output.status,
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "append_before=0 append_after=1\n",
+        "the guest must observe the status flag it set on its own stderr \
+         ({backend} backend)\nhermit stderr:\n{diagnostics}",
+    );
+
+    // SAFETY: the descriptor is still live and F_GETFL takes no third argument.
+    let after = unsafe { libc::fcntl(hermit_stderr.as_raw_fd(), libc::F_GETFL) };
+    assert!(after >= 0, "F_GETFL on the supervisor's descriptor failed");
+    assert_eq!(
+        after, before,
+        "a guest fcntl(F_SETFL) on stderr escaped the container and changed the \
+         SUPERVISOR's file description ({backend} backend): 0x{before:x} -> \
+         0x{after:x}\nhermit stderr:\n{diagnostics}",
+    );
+}
+
+#[test]
+fn run_ptrace_guest_cannot_mutate_hermits_stderr_flags() {
+    assert_guest_cannot_mutate_hermits_stderr_flags("ptrace");
+}
+
+#[test]
+fn run_kvm_guest_cannot_mutate_hermits_stderr_flags() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+    assert_guest_cannot_mutate_hermits_stderr_flags("kvm");
 }
 
 // TODO-HUMAN-REVIEW(PR-723): Review the DBT PID fixture build.
