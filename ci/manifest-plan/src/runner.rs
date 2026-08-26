@@ -2421,6 +2421,30 @@ fn require_minimal_base_env(argv: &mut Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+/// Choose the guest's working directory. Three sources, in this order, and the
+/// ORDER IS THE POINT.
+///
+///   1. `isolated_workdir` — the hermetic lane's fresh tmpfs at `/test`, enabled by
+///      `HERMIT_E2E_EMPTY_WORKDIR` from `ci/hermetic/run-split-validate.sh`.
+///   2. `requested_workdir` — a workdir the manifest names for itself.
+///   3. `fixed_workdir_source` — the default: bind a fresh per-cell directory at
+///      `FIXED_GUEST_WORKDIR` and chdir into it.
+///
+/// ⚠️ (3) IS A STAND-IN FOR (1), NOT THE INTENDED END STATE. Do not read the
+/// default as the design. The design is the hermetic lane's `/test`; the default
+/// exists because that lane is not invoked today — nothing in the tree calls
+/// `run-split-validate.sh` — and because the tmpfs route it uses panics on this
+/// host anyway (`reverie-process/src/container.rs:909` unwraps
+/// `Err(ENOENT, context: Mount)` for ANY target). Rather than leave every cell
+/// inheriting the HOST's cwd while that is sorted out, (3) gives them a fixed,
+/// empty, host-independent directory now.
+///
+/// ⚠️ AND THE TWO DO NOT FIGHT WHEN THE HERMETIC LANE IS ENABLED. (1) is tried
+/// FIRST, so the moment `HERMIT_E2E_EMPTY_WORKDIR` is set the tmpfs form wins and
+/// the default stands down on its own. Enabling the hermetic lane therefore needs
+/// no change here, and removing (3) later is a deletion rather than an
+/// untangling. That precedence is deliberate; if you reorder these arms you will
+/// silently downgrade the hermetic lane to the stand-in.
 fn append_execution_root_args(
     argv: &mut Vec<String>,
     isolated_workdir: Option<&Path>,
@@ -4114,6 +4138,38 @@ backends_disabled:
         assert!(
             argv.is_empty(),
             "a cell that cannot honour a workdir must be given none, got {argv:?}"
+        );
+    }
+
+    /// THE PRECEDENCE, ASSERTED — a comment can be reordered without anyone noticing.
+    ///
+    /// When the hermetic lane is enabled BOTH sources are present at once, and the
+    /// tmpfs form must win. If this ever fails, the stand-in default has silently
+    /// downgraded the hermetic lane it exists to stand in for, and the symptom
+    /// would be a cell quietly running in a bound /tmp directory while its receipt
+    /// claims the hermetic /test.
+    #[test]
+    fn the_hermetic_lane_outranks_the_stand_in_default() {
+        let mut argv: Vec<String> = Vec::new();
+        append_execution_root_args(
+            &mut argv,
+            Some(Path::new(HERMETIC_TEST_WORKDIR)),
+            None,
+            Some(Path::new("/cells/x/workdir")),
+        );
+        assert_eq!(
+            argv,
+            vec![
+                format!("--mount=type=tmpfs,target={HERMETIC_TEST_WORKDIR}"),
+                "--workdir".to_string(),
+                HERMETIC_TEST_WORKDIR.to_string(),
+            ],
+            "the hermetic tmpfs must win when both are available, and the default \
+             must contribute nothing at all — not even a stray --bind"
+        );
+        assert!(
+            !argv.iter().any(|arg| arg.starts_with("--bind")),
+            "the stand-in leaked a bind into the hermetic lane: {argv:?}"
         );
     }
 
