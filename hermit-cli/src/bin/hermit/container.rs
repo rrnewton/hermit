@@ -746,12 +746,27 @@ pub fn classify_container_result<T>(
         // used to arrive as indistinguishable prose.
         Ok(Ok(value)) => Ok(value),
         Ok(Err(reported)) => {
-            let panicked = reported.kind() == FailureKind::Panic;
+            let kind = reported.kind();
             let error = Error::from(reported);
-            Err(if panicked {
-                Error::new(ContainerChildPanic(error))
-            } else {
-                error
+            Err(match kind {
+                FailureKind::Panic => Error::new(ContainerChildPanic(error)),
+                // ⚠️ A REFUSAL REPORTED THROUGH THE ERROR CHANNEL IS STILL A
+                // REFUSAL. `hermit record` reaches the same fail-closed policy
+                // as `hermit run` but is configured to return a typed error
+                // instead of shutting the container down, so it never produces
+                // the exit status the run path keys on. Without this arm the two
+                // spellings of one policy reported 122 and 125 respectively --
+                // "hermit refused" and "hermit broke" -- for the same decision.
+                //
+                // ⚠️ THE CAUSE IS KEPT AS CONTEXT, NOT REPLACED. `PolicyRefusal`
+                // says "the refusal reason is above", which is true on the run
+                // path because detcore logs it before exiting. Here the reason
+                // -- WHICH syscall -- exists only inside this error, so
+                // `Error::new(PolicyRefusal)` would discard the one diagnostic
+                // the operator needs while claiming it was printed. Attaching it
+                // as context keeps the downcast working and the chain intact.
+                FailureKind::PolicyRefusal => error.context(PolicyRefusal),
+                FailureKind::Error => error,
             })
         }
         // PRESERVED, not flattened: the child died with a status it did not pick.
@@ -804,6 +819,59 @@ impl<T> Classified<T> for Result<Result<T, SerializableError>, RunError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⚠️ RECORD MODE REACHES THE SAME POLICY BY A DIFFERENT CHANNEL, and for
+    /// one release the two channels disagreed about what happened.
+    ///
+    /// `hermit run` sets `shutdown_on_unsupported_syscall`, so a refusal calls
+    /// `unrecoverable_shutdown` and the STATUS carries the meaning (122).
+    /// `hermit record` sets `exit_on_unsupported_syscall` with
+    /// `shutdown_on_unsupported_syscall: false` (metadata.rs), so it returns a
+    /// typed `UnsupportedSyscallError` through Reverie and produces no status of
+    /// its own -- arriving as an ordinary reported error, i.e. 125 and
+    /// `class=container-child-exit`, "hermit broke", for a decision hermit made
+    /// on purpose.
+    ///
+    /// Set the kind back to `FailureKind::Error` and this fails.
+    #[test]
+    fn a_refusal_reported_through_the_error_channel_is_still_a_refusal() {
+        let refusal = SerializableError::from(anyhow::Error::new(
+            detcore::UnsupportedSyscallError(reverie::syscalls::Sysno::kexec_load),
+        ));
+        assert_eq!(
+            refusal.kind(),
+            FailureKind::PolicyRefusal,
+            "an UnsupportedSyscallError must be classified at the boundary, which is the \
+             last place its TYPE still exists -- past it everything is strings"
+        );
+
+        let classified = classify_container_result::<()>(Ok(Err(refusal)))
+            .expect_err("a refusal is not a success");
+        assert!(
+            classified.downcast_ref::<PolicyRefusal>().is_some(),
+            "record mode must report the same class as run mode for the same policy"
+        );
+        assert!(
+            classified.downcast_ref::<ContainerChildPanic>().is_none(),
+            "a refusal is not a panic"
+        );
+        // ⚠️ THE CAUSE MUST SURVIVE. `PolicyRefusal` says the reason is above; on
+        // this path the reason exists ONLY in this chain, so replacing the error
+        // rather than contextualising it would delete the only diagnostic naming
+        // WHICH syscall while still claiming it was printed.
+        assert!(
+            format!("{classified:#}").contains("kexec_load"),
+            "the refused syscall must survive into the reported chain: {classified:#}"
+        );
+
+        // ⚠️ CONTROL: an ordinary reported error must NOT become a refusal, or
+        // this arm would relabel every child-reported failure as deliberate.
+        let ordinary = SerializableError::from(anyhow::anyhow!("something broke"));
+        assert_eq!(ordinary.kind(), FailureKind::Error);
+        let classified = classify_container_result::<()>(Ok(Err(ordinary)))
+            .expect_err("an error is not a success");
+        assert!(classified.downcast_ref::<PolicyRefusal>().is_none());
+    }
 
     /// ⚠️ THE RECOGNITION HALF, WHICH THE END-TO-END TEST DOES NOT WITNESS.
     /// `a_guest_exiting_a_reserved_status_is_not_reported_as_hermit` in

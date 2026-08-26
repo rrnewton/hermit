@@ -2050,9 +2050,24 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
 // `handle.await` (detcore/src/tool_global.rs). The reserved set had grown past
 // the range this hard-coded, and nothing connected the two.
 //
-// Keying the signal half on `signal_from_exit_status` -- the same predicate
-// `classify_container_result` uses to recognise these statuses -- is what stops
-// them drifting again: a future band change moves both or neither.
+// Keying the SIGNAL HALF on `signal_from_exit_status` -- the same predicate
+// `classify_container_result` uses -- is what stops that half drifting again: a
+// change to the band moves both readers or neither.
+//
+// ⚠️ THE TWO PREDICATES ARE NOT THE SAME SET, AND AN EARLIER VERSION OF THIS
+// COMMENT SAID THEY WERE. agent(hermit-007)'s codex lane caught the overclaim.
+// They deliberately differ:
+//
+//   this predicate            122..=127  +  signal band  +  real Signaled
+//   classify_container_result 122        +  signal band
+//
+// 123..=127 force a LiteInst shutdown and are classified as NEITHER a refusal
+// nor a signal death -- 123 is safehermit's log cap, 124 a deadline, 125 hermit
+// itself, 126/127 exec-level, and each has a different producer. Only the signal
+// half is shared, and only the signal half is protected from drift. Do not
+// "simplify" this by assuming the two agree; the `122..=127` bound here is still
+// hard-coded and still needs a human to widen it if the reserved set grows
+// again.
 fn liteinst_requires_forced_shutdown(status: ExitStatus) -> bool {
     match status {
         // A real signal death: the process never chose a status at all.

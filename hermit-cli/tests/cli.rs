@@ -4611,3 +4611,97 @@ fn a_guest_exiting_a_reserved_status_is_not_reported_as_hermit() {
         );
     }
 }
+
+/// A container child killed by a signal reports `128 + signo` with the
+/// signal-death marker, NOT a policy refusal and NOT an internal failure.
+///
+/// ⚠️ THIS IS THE END-TO-END HALF THAT TWO EARLIER ATTEMPTS FAILED TO MEASURE,
+/// and both failures are recorded here so a third attempt does not repeat them.
+/// `/bin/sleep 30` proves nothing: hermit VIRTUALIZES time, so the sleep retires
+/// in ~40ms of wall clock (measured: 40ms under hermit vs 4004ms bare) and the
+/// run completes before any signal arrives -- it reads `Some(0)` and looks like a
+/// product defect reporting an interrupt as success. Signalling the hermit CLI
+/// itself is also the wrong path: the outer process has default SIGINT
+/// disposition, dies of it, and `status.code()` is `None` because the death is
+/// `WIFSIGNALED` -- a real report, but not the one the container's own status
+/// channel produces.
+///
+/// Signalling the CONTAINER CHILD is what exercises the status channel: the child
+/// chooses `128 + signo` (it cannot produce a genuine signalled status, being a
+/// namespace init) and the parent must recognise that as a signal death rather
+/// than an unaccounted exit.
+///
+/// ⚠️ SCOPE, STATED SO THE COVERAGE IS NOT OVERCLAIMED. This exercises
+/// `on_container_init_stop_signal` and the parent's `SignalDeath` arm. It does
+/// NOT exercise `--sigint-instakill`, which governs a SIGINT delivered to the
+/// GUEST inside the namespace; that remains uncovered.
+#[test]
+fn a_signal_killed_container_reports_a_signal_death_not_a_refusal() {
+    use std::io::Read;
+
+    // ⚠️ THE GUEST MUST BLOCK ON REAL I/O, NOT ON A CLOCK -- see above. A read on
+    // a pipe nobody writes to is not determinized, so it holds the run open in
+    // wall-clock time.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["run", "--", "/bin/cat"])
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn the container under test");
+    let _stdin = child.stdin.take().expect("piped stdin");
+
+    // Find the container child, polling rather than sleeping a fixed time: the
+    // fork has to have happened before there is anything to signal.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let container = loop {
+        let out = Command::new("pgrep")
+            .args(["-P", &child.id().to_string()])
+            .output()
+            .expect("pgrep failed");
+        let first = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .and_then(|l| l.trim().parse::<i32>().ok());
+        if let Some(pid) = first {
+            break Some(pid);
+        }
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let container = container.expect("the container child never appeared within 30s");
+
+    // Give it a moment to install its stop-signal handler before signalling.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    // SAFETY: `kill` on a pid in this process's own tree.
+    assert_eq!(
+        unsafe { libc::kill(container, libc::SIGINT) },
+        0,
+        "failed to deliver SIGINT to the container child"
+    );
+
+    let status = child.wait().expect("failed to wait for the signalled run");
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+
+    assert_eq!(
+        status.code(),
+        Some(detcore_model::HERMIT_SIGINT_DEATH_EXIT),
+        "a signal-killed container must report 128 + SIGINT\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("HERMIT_SIGNAL_DEATH class=signal-death signal=2"),
+        "it must be classified as a signal death\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("HERMIT_POLICY_REFUSAL"),
+        "a signal death is not a policy refusal -- hermit refused nothing\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("HERMIT_INTERNAL_FAILURE"),
+        "a signal death is not a hermit failure\nstderr:\n{stderr}"
+    );
+}

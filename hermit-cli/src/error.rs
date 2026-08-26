@@ -30,6 +30,19 @@ pub enum FailureKind {
     /// match on English or call them the same thing. It called them the same
     /// thing, which is why a tracer panic and a bad flag were indistinguishable.
     Panic,
+    /// The child stopped because a FAIL-CLOSED POLICY refused the run.
+    ///
+    /// ⚠️ A REFUSAL AND A REPORTED ERROR ARE THE SAME SHAPE HERE TOO, which is
+    /// the identical argument that justified `Panic`. Record mode sets
+    /// `exit_on_unsupported_syscall` and `shutdown_on_unsupported_syscall:
+    /// false`, so it returns a typed `UnsupportedSyscallError` through Reverie
+    /// instead of calling `unrecoverable_shutdown`. That path never produces an
+    /// exit status of its own, so the status channel -- which is what carries
+    /// `HERMIT_POLICY_REFUSAL_EXIT` on the run path -- has nothing to say, and
+    /// the refusal arrived indistinguishable from "hermit broke": exit 125,
+    /// `class=container-child-exit`. Two configurations of one policy reported
+    /// opposite things about the same decision.
+    PolicyRefusal,
 }
 
 /// ⚠️ THE `kind` FIELD IS THE THIRD AND LAST OF ONE CHAIN OF FLATTENINGS.
@@ -86,10 +99,24 @@ impl From<Error> for SerializableError {
     fn from(err: Error) -> Self {
         let error = err.to_string();
         let context = err.chain().skip(1).map(ToString::to_string).collect();
+        // ⚠️ CLASSIFIED HERE BECAUSE THIS IS THE LAST PLACE THE TYPE EXISTS.
+        // Everything below this line is strings: `From<SerializableError> for
+        // Error` rebuilds the chain with `Error::msg`, so a downcast on the far
+        // side can only ever fail. Detecting the refusal after the boundary
+        // would mean matching on English, which is the thing `kind` exists to
+        // avoid.
+        let kind = if err
+            .chain()
+            .any(|cause| cause.is::<detcore::UnsupportedSyscallError>())
+        {
+            FailureKind::PolicyRefusal
+        } else {
+            FailureKind::Error
+        };
         Self {
             error,
             context,
-            kind: FailureKind::Error,
+            kind,
         }
     }
 }
