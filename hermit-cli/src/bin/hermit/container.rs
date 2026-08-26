@@ -19,6 +19,7 @@ use anyhow::anyhow;
 use hermit::Context;
 use hermit::Error;
 use hermit::FailureKind;
+use hermit::HERMIT_DEADLINE_EXIT;
 use hermit::SerializableError;
 use nix::sched::CpuSet;
 use nix::sched::sched_getaffinity;
@@ -704,6 +705,8 @@ impl std::fmt::Display for RunTimeoutMarker {
     }
 }
 
+impl std::error::Error for RunTimeoutMarker {}
+
 /// Carries the signal, unlike [`PolicyRefusal`], because there is more than one
 /// and the number is the whole content of the report.
 #[derive(Debug)]
@@ -821,6 +824,16 @@ pub fn classify_container_result<T>(
             if status.code() == Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT) =>
         {
             Err(Error::new(PolicyRefusal))
+        }
+        // A DEADLINE HERMIT ITSELF ENFORCED, and it needs its own arm for exactly
+        // the reason the refusal above does: the init chose this status on
+        // purpose, and without an arm it falls through to `ContainerChildExit`
+        // and is reported as "the child died with a status it did not pick" --
+        // exit 125, `class=container-child-exit`, i.e. "hermit broke" for a
+        // bound working as designed. Measured before this arm existed: the
+        // `run --timeout` fallback exited the init 124 and the run reported 125.
+        Err(RunError::ExitStatus(status)) if status.code() == Some(HERMIT_DEADLINE_EXIT) => {
+            Err(Error::new(RunTimeoutMarker))
         }
         // A signal death, before the catch-all for the same reason the refusal arm
         // is: falling through would report a signal-terminated run as an

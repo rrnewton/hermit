@@ -5567,3 +5567,102 @@ fn run_timeout_leaves_a_guest_that_finishes_in_time_alone() {
         "an unexpired bound must say nothing at all"
     );
 }
+
+/// The SIGALRM fallback fires, is named, and reports the deadline code.
+///
+/// ⚠️ THIS CELL EXISTS BECAUSE THE FALLBACK COULD NOT BE MADE TO FIRE ANY OTHER
+/// WAY, AND SHIPPING IT UNEXERCISED WAS REFUSED. Five guest shapes were tried
+/// against the primary path on 2026-08-26 -- a userspace spinner, a blocking
+/// read on a pipe with no writer, a guest that `SIGSTOP`s itself, an
+/// eight-thread guest ignoring `SIGTERM`, and a multi-process guest ignoring
+/// `SIGTERM` -- and every one unwound cleanly at exactly the bound. So the
+/// condition is injected instead, through the shipped binary rather than a
+/// `cfg(test)` build.
+///
+/// ⚠️ WHAT IT PROVES, AND WHAT IT DOES NOT. It proves the alarm arms with the
+/// inherited mask handled, the handler runs, the marker reaches stderr, the
+/// container is torn down, and the status survives the container boundary as
+/// 124. It does NOT prove that any particular teardown hang is survivable: the
+/// injected delay sits after the drop, not inside a wedged destructor, because
+/// no wedging destructor is known. Do not read a pass here as coverage of one.
+///
+/// Forcing it also FOUND A DEFECT that review had not: the init exited 124,
+/// `classify_container_result` had no arm for that status, and the run reported
+/// exit 125 `class=container-child-exit` -- "hermit broke" -- for a bound doing
+/// its job. That is why `HERMIT_DEADLINE_EXIT` and its arm exist.
+#[test]
+fn run_timeout_fallback_fires_when_the_unwind_does_not_finish() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .env("HERMIT_INTERNAL_RUN_TIMEOUT_STALL_UNWIND", "1")
+        .arg("run")
+        .arg("--timeout")
+        .arg("1")
+        .arg("--")
+        .args(RUN_TIMEOUT_SPINNER)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: `setsid` is async-signal-safe, allocates nothing, and runs in the
+    // forked child before exec where this process is not yet a session leader.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command
+        .spawn()
+        .expect("failed to spawn hermit run --timeout");
+    let session = child.id() as i32;
+    let output = child.wait_with_output().expect("failed to wait for hermit");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    assert!(
+        stderr.contains("HERMIT_RUN_TIMEOUT_FALLBACK"),
+        "the fallback must announce itself -- an unnamed hard kill here is \
+         indistinguishable from the outer rungs. stderr:\n{stderr}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(124),
+        "the fallback must report the deadline code across the container \
+         boundary. Exit 125 here is the regression this cell was written for: \
+         the init exits 124 and `classify_container_result` loses it, turning a \
+         working bound into `class=container-child-exit`. Got {:?}. stderr:\n{stderr}",
+        output.status
+    );
+    assert!(
+        !stderr.contains("class=container-child-exit"),
+        "a hermit-chosen deadline status must not be reported as an unchosen \
+         child death. stderr:\n{stderr}"
+    );
+
+    let drained = {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if run_timeout_pids_in_session(session).is_empty() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    for pid in run_timeout_pids_in_session(session) {
+        // SAFETY: `kill` takes a pid and a signal and touches no caller memory;
+        // a stale pid can only fail with ESRCH.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    assert!(
+        drained,
+        "the fallback `_exit`s the namespace init, and the kernel must then reap \
+         every remaining member. Survivors mean the hard fallback leaks what the \
+         gentle path does not."
+    );
+}
