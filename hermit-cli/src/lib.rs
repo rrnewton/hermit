@@ -200,6 +200,23 @@ pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
 // stderr, present exactly when hermit itself failed. Any consumer deciding on
 // `$?` alone is guessing, and should say so.
 //
+// ⚠️ THE SAME ARGUMENT APPLIES TO 124, AND MORE SHARPLY, BECAUSE FIVE
+// MECHANISMS PRODUCE IT. `hermit run --timeout`, its unwind fallback, `hermit
+// record --record-timeout`, the `timeout(1)` wrapped around a manifest cell, and
+// `safehermit`'s wall deadline all exit 124, and GNU `timeout` uses it for the
+// same event. They demand different responses -- a slow guest, a wedged
+// teardown inside hermit, a cell bound set too low, a run that escaped every
+// inner bound -- so `$?` cannot route the reader to any of them.
+//
+// The discriminator is again the marker on stderr, and it is a CONTRACT rather
+// than a diagnostic nicety: `class=run-timeout` for hermit's own bound (which
+// also states the bound in seconds), `HERMIT_RUN_TIMEOUT_FALLBACK` for the
+// unwind failing to complete, `safehermit: bound.wall=` for the cgroup reap.
+// EXIT 124 WITH NO MARKER AT ALL MEANS NO INNER BOUND FIRED -- something outside
+// hermit killed the run -- which is a configuration error and not a slow guest.
+// The full picture, including which rung bounds which quantity and the
+// strict-inequality invariant between them, is docs/TIMEOUT_LADDER.md.
+//
 // ⚠️ DO NOT CLAMP INTO THIS RANGE. `scripts/hermit-code-coverage.rs` used
 // `clamp(1, 125)` and so rewrote 127 and 126 into 125 -- turning "your program is
 // missing" into "hermit broke" and pointing the reader at the wrong project.
