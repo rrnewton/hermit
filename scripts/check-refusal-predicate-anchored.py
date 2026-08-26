@@ -78,10 +78,32 @@ CHANNEL_NAME_HINTS = (
 CHANNEL_PRESERVING = ("lower", "upper", "casefold", "strip", "lstrip", "rstrip", "decode")
 # A regex search over a whole channel is the same defect wearing a different call.
 REGEX_SEARCHES = ("search", "match", "fullmatch", "findall", "finditer")
+SUBSTRING_SEARCHES = ("find", "rfind", "index", "rindex", "count")
+ANCHORED_METHODS = ("startswith", "endswith")
+
+
+def _is_regex_call(func: ast.AST) -> bool:
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr in REGEX_SEARCHES
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "re"
+    )
+
+
+# ⚠️ A COLLECTION OF NAME FRAGMENTS IS NOT A COLLECTION OF CHANNEL MARKERS.
+# Excluding these BY THE COLLECTION'S OWN NAME is what lets the haystack filter go
+# away entirely. The haystack filter was the weakening: it keyed the guard on a
+# ten-word naming convention nothing enforces, so renaming `output` to `buf`
+# switched the gate off -- claude-lane finding, reproduced.
+NOT_A_MARKER_HINT = ("NAME", "HINT", "IDENT", "KEYWORD")
 
 
 def _is_marker_name(name: str) -> bool:
-    return any(h in name.upper() for h in MARKER_NAME_HINTS)
+    upper = name.upper()
+    if any(x in upper for x in NOT_A_MARKER_HINT):
+        return False
+    return any(h in upper for h in MARKER_NAME_HINTS)
 
 
 def _marker_collections(tree: ast.Module) -> set[str]:
@@ -176,6 +198,15 @@ class _Scan(ast.NodeVisitor):
             return False
         if isinstance(node, ast.Subscript):
             return self._marker_derived(node.value)
+        if isinstance(node, ast.Call):
+            # `re.escape(shape)` is still the marker -- claude-lane rewrite 1.
+            return any(self._marker_derived(a) for a in node.args)
+        if isinstance(node, ast.JoinedStr):
+            return any(
+                self._marker_derived(v.value)
+                for v in node.values
+                if isinstance(v, ast.FormattedValue)
+            )
         return False
 
     def _push(self, gens) -> int:
@@ -214,10 +245,13 @@ class _Scan(ast.NodeVisitor):
             # ⚠️ DIRECTION MATTERS -- codex finding 3. `output in _REFUSAL_SHAPES`
             # is an EXACT-VALUE membership and is safe; only marker-as-needle
             # against channel-as-haystack is the defect.
+            # ⚠️ NO LONGER REQUIRES THE HAYSTACK TO BE NAMED LIKE A CHANNEL.
+            # `any(s in buf for s in REFUSAL_SHAPES)` -- a pure rename -- used to
+            # pass. Direction still matters (codex finding 3): the safe
+            # `output in _REFUSAL_SHAPES` has a marker-derived HAYSTACK.
             if (
                 self._marker_derived(needle)
                 and not self._marker_derived(haystack)
-                and _is_channel(haystack)
                 and not self._line_bound(haystack)
             ):
                 self.hits.append((node.lineno, ast.unparse(node)))
@@ -225,6 +259,29 @@ class _Scan(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         f = node.func
+        # `output.find(shape) >= 0` -- same test, different method. claude rewrite 2.
+        if (
+            isinstance(f, ast.Attribute)
+            and f.attr in SUBSTRING_SEARCHES
+            and len(node.args) >= 1
+            and self._marker_derived(node.args[0])
+            and not self._line_bound(f.value)
+            and not self._marker_derived(f.value)
+        ):
+            self.hits.append((node.lineno, ast.unparse(node)))
+        # `_contains(output, shape)` -- one level of indirection. claude rewrite 4.
+        # Requires BOTH a marker-derived argument AND a separate non-marker,
+        # non-line-bound argument, so single-argument uses such as `print(shape)`
+        # or `shapes.append(shape)` are not flagged.
+        elif not (isinstance(f, ast.Attribute) and f.attr in ANCHORED_METHODS):
+            marker_args = [a for a in node.args if self._marker_derived(a)]
+            other_args = [
+                a
+                for a in node.args
+                if not self._marker_derived(a) and not self._line_bound(a)
+            ]
+            if marker_args and other_args and not _is_regex_call(f):
+                self.hits.append((node.lineno, ast.unparse(node)))
         if (
             isinstance(f, ast.Attribute)
             and f.attr in REGEX_SEARCHES
@@ -292,6 +349,23 @@ def main(argv: list[str]) -> int:
         print(f"check-refusal-predicate-anchored: no such path: {root}", file=sys.stderr)
         return 2
     targets = sorted(root.rglob("*.py")) if root.is_dir() else [root]
+    # ⚠️ FAIL CLOSED ON AN EMPTY CORPUS. This previously printed
+    # "OK -- no unanchored refusal predicate" and returned 0 when it had scanned
+    # NOTHING. A rename, a move, or a typo in the Makefile line would have
+    # silently disabled the gate while it reported success -- a check that passes
+    # because it has nothing to check, which is the defect class this whole file
+    # exists to remove, reproduced inside the guard built to prevent it.
+    # `a-corpus-test-must-fail-closed-on-empty` is the standing rule here.
+    if not targets:
+        print(
+            f"check-refusal-predicate-anchored: REFUSED -- scanned ZERO files under "
+            f"{root}.\n"
+            "  An empty corpus is not a pass. Either the path is wrong (a rename, a\n"
+            "  move, or a typo in the invoking recipe) or the tree really has no\n"
+            "  Python, and neither is evidence that no unanchored predicate exists.",
+            file=sys.stderr,
+        )
+        return 1
     bad = 0
     for path in targets:
         if "/.git/" in str(path):
@@ -403,6 +477,42 @@ def is_marker_name(name):
 '''
 
 
+F_REGEX_ESCAPE = '''
+import re
+_REFUSAL_SHAPES = ("refused by:",)
+def looks_refused(output):
+    return any(re.search(re.escape(s), output) for s in _REFUSAL_SHAPES)
+'''
+
+F_FIND = '''
+_REFUSAL_SHAPES = ("refused by:",)
+def looks_refused(output):
+    return any(output.find(s) >= 0 for s in _REFUSAL_SHAPES)
+'''
+
+F_RENAMED_HAYSTACK = '''
+_REFUSAL_SHAPES = ("refused by:",)
+def looks_refused(buf):
+    return any(s in buf for s in _REFUSAL_SHAPES)
+'''
+
+F_INDIRECTION = '''
+_REFUSAL_SHAPES = ("refused by:",)
+def _contains(hay, needle):
+    return needle in hay
+def looks_refused(output):
+    return any(_contains(output, s) for s in _REFUSAL_SHAPES)
+'''
+
+F_BENIGN_CALL = '''
+_REFUSAL_SHAPES = ("refused by:",)
+def report():
+    for shape in _REFUSAL_SHAPES:
+        print(shape)
+        collected.append(shape)
+'''
+
+
 def self_test() -> int:
     import subprocess
     import tempfile
@@ -438,11 +548,17 @@ def self_test() -> int:
     check("codex-2 statement `for` loop, not a comprehension", F_FOR_LOOP, True)
     check("codex-2 `shape in output.lower()`", F_LOWER, True)
     check("codex-2 unanchored `re.search(shape, output)`", F_REGEX, True)
+    print("REFUSES the four one-line rewrites the claude lane demonstrated evading it:")
+    check("claude-1 `re.search(re.escape(s), output)`", F_REGEX_ESCAPE, True)
+    check("claude-2 `output.find(s) >= 0`", F_FIND, True)
+    check("claude-3 haystack merely RENAMED to `buf`", F_RENAMED_HAYSTACK, True)
+    check("claude-4 indirection via `_contains(output, s)`", F_INDIRECTION, True)
     print("PASSES what is safe -- without these the gate could refuse everything:")
     check("anchored strip().startswith", F_ANCHORED, False)
     check("codex-3 `output in _REFUSAL_SHAPES` exact membership", F_EXACT_MEMBERSHIP, False)
     check("unrelated marker collection", F_UNRELATED, False)
     check("name test, this checker's own shape", F_NAME_TEST, False)
+    check("benign single-arg uses of a marker are NOT flagged", F_BENIGN_CALL, False)
     print("KNOWN LIMIT -- anchored-but-unstripped passes; only the remedy text warns:")
     check("bare startswith, misses indented shapes", F_UNSTRIPPED, False)
     print("codex-4 EXIT-STATUS CONTRACT:")
@@ -455,6 +571,10 @@ def self_test() -> int:
         clean.write_text("x = 1\n", encoding="utf-8")
         check_rc("clean file is 0", 0, str(clean))
         check_rc("extra positional is 2, not silently 0", 2, str(clean), str(clean))
+        # ⚠️ THE SERIOUS ONE. A check that passes with nothing to check.
+        empty = Path(d) / "empty_corpus"
+        empty.mkdir()
+        check_rc("EMPTY CORPUS FAILS CLOSED, not 0", 1, str(empty))
 
     if failures:
         print(f"check-refusal-predicate-anchored --self-test: {failures} case(s) FAILED", file=sys.stderr)
