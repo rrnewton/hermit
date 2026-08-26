@@ -4733,3 +4733,423 @@ fn no_container_site_is_unreachable_by_the_fault_injector() {
          at nothing: {stale:?}"
     );
 }
+
+/// A guest that exits with one of hermit's own reserved statuses must still be
+/// reported as the guest, not as hermit.
+///
+/// ⚠️ THIS IS THE ASSERTION hermit#2659 SHIPPED WITHOUT. That PR introduced
+/// `HERMIT_POLICY_REFUSAL_EXIT` (122) and its doc claimed, correctly, that an
+/// ordinary guest exit does not reach the new match arm -- but it added zero test
+/// functions, so the claim was carried by prose. A reviewer executed it by hand
+/// once at one head; nothing re-executes it. If the refusal arm ever moved above
+/// the `Ok(Ok(..))` path, a guest legitimately exiting 122 would be reported as a
+/// policy refusal -- the exact inverse of the defect 122 was introduced to fix,
+/// and silent, because the number the operator sees would be unchanged.
+///
+/// ⚠️ AND 130 IS NOW THE SAME SHAPE. `sigint_instakill` reports `128 + SIGINT`, so
+/// 130 acquired a hermit meaning too and needs the identical guarantee.
+///
+/// The discriminator is the MARKER, never the code: every value in `0..=255` is a
+/// legal guest status, so a bare code cannot separate these and a test asserting
+/// only the code would pass while the defect was live.
+#[test]
+fn a_guest_exiting_a_reserved_status_is_not_reported_as_hermit() {
+    // 122 and 130 are the reserved values under test; 0/1/7 are controls that
+    // must behave identically, so a failure says "the reserved ones are special"
+    // rather than "exit codes are broken generally".
+    for code in [
+        0,
+        1,
+        7,
+        detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+        125,
+        detcore_model::HERMIT_SIGINT_DEATH_EXIT,
+    ] {
+        let run = Command::new(env!("CARGO_BIN_EXE_hermit"))
+            .args(["run", "--", "/bin/sh", "-c", &format!("exit {code}")])
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run the guest exiting {code}: {e}"));
+        let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+
+        assert_eq!(
+            run.status.code(),
+            Some(code),
+            "a guest exiting {code} must report {code}\nstderr:\n{stderr}"
+        );
+        // The marker is the exclusive channel. Its ABSENCE is what says the status
+        // came from the guest.
+        assert!(
+            !stderr.contains("HERMIT_POLICY_REFUSAL"),
+            "a guest exiting {code} must not be reported as a hermit policy \
+             refusal\nstderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("HERMIT_SIGNAL_DEATH"),
+            "a guest exiting {code} must not be reported as a signal death\n\
+             stderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("HERMIT_INTERNAL_FAILURE"),
+            "a guest exiting {code} must not be reported as a hermit internal \
+             failure\nstderr:\n{stderr}"
+        );
+    }
+}
+
+/// A container child killed by a signal reports `128 + signo` with the
+/// signal-death marker, NOT a policy refusal and NOT an internal failure.
+///
+/// ⚠️ THIS IS THE END-TO-END HALF THAT TWO EARLIER ATTEMPTS FAILED TO MEASURE,
+/// and both failures are recorded here so a third attempt does not repeat them.
+/// `/bin/sleep 30` proves nothing: hermit VIRTUALIZES time, so the sleep retires
+/// in ~40ms of wall clock (measured: 40ms under hermit vs 4004ms bare) and the
+/// run completes before any signal arrives -- it reads `Some(0)` and looks like a
+/// product defect reporting an interrupt as success. Signalling the hermit CLI
+/// itself is also the wrong path: the outer process has default SIGINT
+/// disposition, dies of it, and `status.code()` is `None` because the death is
+/// `WIFSIGNALED` -- a real report, but not the one the container's own status
+/// channel produces.
+///
+/// Signalling the CONTAINER CHILD is what exercises the status channel: the child
+/// chooses `128 + signo` (it cannot produce a genuine signalled status, being a
+/// namespace init) and the parent must recognise that as a signal death rather
+/// than an unaccounted exit.
+///
+/// ⚠️ SCOPE, STATED SO THE COVERAGE IS NOT OVERCLAIMED. This exercises
+/// `on_container_init_stop_signal` and the parent's `SignalDeath` arm. It does
+/// NOT exercise `--sigint-instakill`, which governs a SIGINT delivered to the
+/// GUEST inside the namespace. ⚠️ THAT IS NOW COVERED, by
+/// `sigint_instakill_reports_a_signal_death_not_a_policy_refusal` below; this
+/// sentence said otherwise for three heads after the cell existed, which
+/// agent(hermit-005)'s codex lane caught. The two cells exercise DIFFERENT
+/// producers and both are needed -- that is why this one is still here.
+#[test]
+fn a_signal_killed_container_reports_a_signal_death_not_a_refusal() {
+    // ⚠️ THE GUEST MUST BLOCK ON REAL I/O, NOT ON A CLOCK -- see above. A read on
+    // a pipe nobody writes to is not determinized, so it holds the run open in
+    // wall-clock time.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["run", "--", "/bin/cat"])
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // Own process group, so `wait_bounded` can reach namespace descendants
+        // with a negative pid rather than only the direct child.
+        .process_group(0)
+        .spawn()
+        .expect("failed to spawn the container under test");
+    let _stdin = child.stdin.take().expect("piped stdin");
+
+    // Find the container child, polling rather than sleeping a fixed time: the
+    // fork has to have happened before there is anything to signal.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let container = loop {
+        let out = Command::new("pgrep")
+            .args(["-P", &child.id().to_string()])
+            .output()
+            .expect("pgrep failed");
+        let first = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .and_then(|l| l.trim().parse::<i32>().ok());
+        if let Some(pid) = first {
+            break Some(pid);
+        }
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let container = container.expect("the container child never appeared within 30s");
+
+    // Give it a moment to install its stop-signal handler before signalling.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    // SAFETY: `kill` on a pid in this process's own tree.
+    assert_eq!(
+        unsafe { libc::kill(container, libc::SIGINT) },
+        0,
+        "failed to deliver SIGINT to the container child"
+    );
+
+    // ⚠️ STDIN IS DROPPED FIRST so the guest can retire if the signal was missed,
+    // and the wait is bounded so it cannot wedge if it still does not.
+    drop(_stdin);
+    let status = wait_bounded(&mut child, "a_signal_killed_container");
+    let stderr = drain_bounded(child.stderr.take());
+
+    assert_eq!(
+        status.code(),
+        Some(detcore_model::HERMIT_SIGINT_DEATH_EXIT),
+        "a signal-killed container must report 128 + SIGINT\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("HERMIT_SIGNAL_DEATH class=signal-death signal=2"),
+        "it must be classified as a signal death\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("HERMIT_POLICY_REFUSAL"),
+        "a signal death is not a policy refusal -- hermit refused nothing\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("HERMIT_INTERNAL_FAILURE"),
+        "a signal death is not a hermit failure\nstderr:\n{stderr}"
+    );
+}
+
+/// `--sigint-instakill` reports a SIGNAL DEATH, not a policy refusal.
+///
+/// ⚠️ THIS IS THE PRODUCER, AND IT IS A DIFFERENT CLAIM FROM THE CLASSIFIER.
+/// `a_signal_killed_container_reports_a_signal_death_not_a_refusal` signals the
+/// CONTAINER, which runs `on_container_init_stop_signal` and never touches
+/// `unrecoverable_shutdown`. agent(hermit-007)'s codex lane proved that by
+/// mutation: reverting the producer at `detcore/src/lib.rs` from
+/// `HERMIT_SIGINT_DEATH_EXIT` to `HERMIT_POLICY_REFUSAL_EXIT` left the whole
+/// suite green. This test is what closes that: the signal goes to the GUEST, so
+/// detcore's `handle_signal_event` runs and `sigint_instakill` chooses the code.
+///
+/// ⚠️ THE GUEST IS FOUND BY WALKING `/proc`, NOT BY `pgrep -f`. A pattern search
+/// matches the searching process's own command line -- three probes for this test
+/// signalled themselves before this was written, one of them exiting 130 from its
+/// own SIGINT and looking briefly like a product result.
+#[test]
+fn sigint_instakill_reports_a_signal_death_not_a_policy_refusal() {
+    fn parent_of(pid: i32) -> Option<i32> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat.rsplit_once(')')?
+            .1
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
+    }
+    fn children_of(pid: i32) -> Vec<i32> {
+        std::fs::read_dir("/proc")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+            .filter(|c| parent_of(*c) == Some(pid))
+            .collect()
+    }
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["run", "--sigint-instakill", "--", "/bin/cat"])
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // Own process group, so `wait_bounded` can reach namespace descendants
+        // with a negative pid rather than only the direct child.
+        .process_group(0)
+        .spawn()
+        .expect("failed to spawn the sigint-instakill run");
+    let stdin = child.stdin.take().expect("piped stdin");
+
+    // hermit -> container init -> guest. Poll: the two forks must both have
+    // happened before there is a guest to signal.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let guest = loop {
+        let found = children_of(child.id() as i32)
+            .into_iter()
+            .flat_map(children_of)
+            .next();
+        if let Some(pid) = found {
+            break Some(pid);
+        }
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let guest = guest.expect("the guest never appeared under the container within 30s");
+
+    // Verify WHICH process is being signalled rather than trusting the walk.
+    let comm = std::fs::read_to_string(format!("/proc/{guest}/comm")).unwrap_or_default();
+    assert_eq!(comm.trim(), "cat", "walked to the wrong process: {comm:?}");
+
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    // SAFETY: `kill` on a pid in this process's own tree, verified above.
+    assert_eq!(
+        unsafe { libc::kill(guest, libc::SIGINT) },
+        0,
+        "SIGINT to guest failed"
+    );
+
+    // ⚠️ CLOSE STDIN AFTER SIGNALLING, BEFORE WAITING. This one line is the
+    // difference between measuring the fix and measuring nothing. With it held
+    // open through the wait, this reported `code=None signal=Some(2)` -- the
+    // CONTROL outcome, as though the flag were absent -- and I spent six
+    // eliminations blaming the cargo harness for it. The guest is blocked in a
+    // read on this pipe; the signal alone does not retire the run.
+    drop(stdin);
+    let status = wait_bounded(&mut child, "sigint_instakill_reports_a_signal_death");
+    let stderr = drain_bounded(child.stderr.take());
+
+    assert_eq!(
+        status.code(),
+        Some(detcore_model::HERMIT_SIGINT_DEATH_EXIT),
+        "sigint_instakill must report 128 + SIGINT, not a policy refusal\nstderr:\n{stderr}"
+    );
+    // ⚠️ THE MARKER, NOT ONLY THE CODE, AND THE PAIR IS THE POINT. Asserting
+    // exit 130 alone leaves the marker free to disappear: every value in
+    // `0..=255` is a legal guest status, which is exactly why this change
+    // introduced a marker at all. agent(hermit-007)'s codex lane proved the gap
+    // by mutation -- the producer mutation failed this test, but a MARKER-only
+    // mutation left it green, so the machine-readable half was unpinned. That is
+    // the same shape as the defect this PR exists to fix: an outcome
+    // distinguishable only by a channel nobody checks.
+    assert!(
+        stderr.contains("HERMIT_SIGNAL_DEATH"),
+        "a signal death must be machine-readable as one, not only exit 130\nstderr:\n{stderr}"
+    );
+    // ⚠️ AND THE OPERATOR-FACING HALF, WHICH IS A SEPARATE CHANNEL FROM THE MARKER.
+    // agent(hermit-dbg) withdrew an approval over this and proved it with a
+    // DIFFERENT mutation than the marker one: gutting `SignalDeath`'s `Display` to
+    // `write!(f, "")` leaves the marker intact, so a test checking only
+    // `HERMIT_SIGNAL_DEATH` stays green while the sentence the operator actually
+    // reads disappears. Two halves, two mutations, two assertions -- the machine
+    // channel and the human channel fail independently.
+    assert!(
+        stderr.contains("not a hermit failure and not a refusal"),
+        "the operator must be told this was not a hermit failure; the marker alone is \
+         machine-readable but says nothing to a person\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("HERMIT_POLICY_REFUSAL"),
+        "an operator interrupt is not a policy refusal -- hermit refused nothing\n{stderr}"
+    );
+}
+
+/// Wait for a child, but never forever.
+///
+/// ⚠️ AN UNBOUNDED `wait()` IN A SIGNAL TEST WEDGES THE RUNNER INSTEAD OF FAILING,
+/// and this repository has already paid for that shape: hermit#2654's cell hung
+/// the run to an external rc=124 with no test named and no failing status of its
+/// own. Both callers below hold the guest open on a pipe read, so if the signal
+/// is missed -- handler not yet installed, or the pid raced -- nothing ends the
+/// run. A wedge costs the whole run's budget and reports nothing; a red names
+/// itself in one line. Raised by agent(hermit-006) and agent(hermit-007).
+///
+/// The child is killed on expiry so the failure is a named red and leaves nothing
+/// running.
+fn wait_bounded(child: &mut std::process::Child, what: &str) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        match child.try_wait().expect("failed to poll the child") {
+            Some(status) => return status,
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    // ⚠️ THE GROUP, NOT THE CHILD. `child.kill()` reaps only the
+                    // direct CLI process; a namespace descendant that outlived it
+                    // keeps running AND keeps the inherited stderr write end open,
+                    // so the drain below would then block forever on a pipe that
+                    // never reaches EOF. agent(hermit-005)'s codex lane found this
+                    // and named the reachable window: the few milliseconds before
+                    // `PR_SET_PDEATHSIG` is armed (container.rs:299-310). Both
+                    // callers spawn with `process_group(0)`, so the child leads its
+                    // own group and a negative pid reaches every descendant.
+                    // SAFETY: signalling a process group this test created.
+                    unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "{what}: the run did not finish within 60s of the signal; killed it \
+                         so this is a named failure rather than a wedged runner"
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+/// Read a child's stderr without the possibility of blocking forever.
+///
+/// ⚠️ `read_to_string` RETURNS ON EOF, NOT ON THE CHILD EXITING, and those are
+/// different events. EOF needs every holder of the write end to close it, so one
+/// surviving namespace descendant with inherited stderr blocks the read
+/// indefinitely — after the child has been waited for and after the test believes
+/// it is finished. Bounding the WAIT and leaving the DRAIN unbounded moves the
+/// hang one line down rather than removing it. Found by agent(hermit-005)'s codex
+/// lane.
+fn drain_bounded(pipe: Option<std::process::ChildStderr>) -> String {
+    let Some(mut pipe) = pipe else {
+        return String::new();
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = String::new();
+        let _ = pipe.read_to_string(&mut buf);
+        let _ = tx.send(buf);
+    });
+    // The reader thread is detached on timeout: it is blocked on a pipe nobody
+    // will close, and leaving it parked costs one thread for the rest of the
+    // process rather than wedging the run.
+    rx.recv_timeout(std::time::Duration::from_secs(20))
+        .unwrap_or_else(|_| {
+            String::from("<stderr drain timed out: a descendant still holds the write end>")
+        })
+}
+
+/// `hermit record` reports a fail-closed refusal as a REFUSAL, not as "hermit broke".
+///
+/// ⚠️ THE CELL agent(hermit-001)'s CODEX LANE ASKED FOR, AND IT DID NOT EXIST BECAUSE
+/// THE FIX DID NOT WORK. Their finding was that nothing pinned the positive
+/// direction. Writing this cell is what exposed why: at that head `hermit record`
+/// still reported exit 125 `class=cli-error` against this exact guest. The
+/// in-process unit test passed throughout, because it builds the error directly and
+/// never crosses the boundary that broke it.
+///
+/// ⚠️ THE BOUNDARY IS `reverie::Error::Tool`, DECLARED `#[error(transparent)]`. That
+/// forwards `source()` past the inner `anyhow::Error`'s own value, and
+/// `UnsupportedSyscallError` IS that value, so a chain walk cannot see it. Detection
+/// now reaches through the wrapper; see `is_policy_refusal`.
+///
+/// Run mode already worked and is covered by
+/// `run_ptrace_fails_closed_by_default_on_unsupported_syscall`: it sets
+/// `shutdown_on_unsupported_syscall`, so the STATUS carries the meaning. Record mode
+/// sets `exit_on_unsupported_syscall` instead and returns a typed error, producing no
+/// status of its own — which is why the two spellings of one policy disagreed.
+#[test]
+fn record_reports_an_unsupported_syscall_as_a_refusal_not_an_internal_failure() {
+    let program = dbt_unsupported_syscall_guest()
+        .to_str()
+        .expect("unsupported-syscall guest path should be UTF-8");
+
+    let args = ["record", "start", "--", program];
+    let recorded = hermit(&args);
+    let err = stderr(&recorded);
+
+    assert_eq!(
+        recorded.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "record mode must report a fail-closed refusal as a REFUSAL; run mode already \
+         does, and the two spellings of one policy must not disagree\nstderr:\n{err}"
+    );
+    assert!(
+        err.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "the class marker is the only exclusive channel -- every value in 0..=255 is a \
+         legal guest status\nstderr:\n{err}"
+    );
+    // ⚠️ THE DIAGNOSTIC MUST SURVIVE. `PolicyRefusal`'s prose says the reason is
+    // above; on this path the reason exists only in the error chain, so a fix that
+    // classified correctly while dropping the cause would satisfy the two assertions
+    // above and still leave the operator without the syscall's name.
+    // ⚠️ MATCHED ON THE CHAIN LINE, NOT ON THE TEXT ANYWHERE. detcore ALSO logs
+    // "unsupported syscall: restart_syscall() = ?" independently, so a plain
+    // `contains` is satisfied by the log and says nothing about the error chain.
+    // Measured: with the cause dropped, that assertion still passed. The chain
+    // rendering has no parens and ends the line; detcore's log has "() = ?".
+    let chain_line = err.lines().any(|l| {
+        l.trim_end()
+            .ends_with("unsupported syscall: restart_syscall")
+    });
+    assert!(
+        chain_line,
+        "the refused syscall must survive into the error CHAIN, not merely appear in \
+         detcore's own log line\nstderr:\n{err}"
+    );
+    // CONTROL: it must NOT read as hermit breaking, which is what it did before.
+    assert!(
+        !err.contains("HERMIT_INTERNAL_FAILURE"),
+        "a deliberate refusal must not be reported as an internal failure\nstderr:\n{err}"
+    );
+}

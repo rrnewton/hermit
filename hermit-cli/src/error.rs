@@ -30,6 +30,19 @@ pub enum FailureKind {
     /// match on English or call them the same thing. It called them the same
     /// thing, which is why a tracer panic and a bad flag were indistinguishable.
     Panic,
+    /// The child stopped because a FAIL-CLOSED POLICY refused the run.
+    ///
+    /// ⚠️ A REFUSAL AND A REPORTED ERROR ARE THE SAME SHAPE HERE TOO, which is
+    /// the identical argument that justified `Panic`. Record mode sets
+    /// `exit_on_unsupported_syscall` and `shutdown_on_unsupported_syscall:
+    /// false`, so it returns a typed `UnsupportedSyscallError` through Reverie
+    /// instead of calling `unrecoverable_shutdown`. That path never produces an
+    /// exit status of its own, so the status channel -- which is what carries
+    /// `HERMIT_POLICY_REFUSAL_EXIT` on the run path -- has nothing to say, and
+    /// the refusal arrived indistinguishable from "hermit broke": exit 125,
+    /// `class=container-child-exit`. Two configurations of one policy reported
+    /// opposite things about the same decision.
+    PolicyRefusal,
 }
 
 /// ⚠️ THE `kind` FIELD IS THE THIRD AND LAST OF ONE CHAIN OF FLATTENINGS.
@@ -82,14 +95,66 @@ impl SerializableError {
     }
 }
 
+/// Is this error a fail-closed POLICY REFUSAL rather than something that broke?
+///
+/// ⚠️ THE CHAIN WALK ALONE DOES NOT FIND IT, AND I SHIPPED A FIX THAT ONLY DID THAT.
+/// `reverie::Error::Tool` is declared `#[error(transparent)]`, which forwards
+/// `source()` to the inner `anyhow::Error`'s source -- PAST that error's own value.
+/// `UnsupportedSyscallError` IS that value, so it never appears in
+/// `err.chain()` and `.is::<_>()` is false at every link. Reproduced in isolation:
+/// a one-entry chain whose Display is right and whose `is::<T>()` is false.
+///
+/// The consequence was that record mode still reported exit 125
+/// `class=cli-error` -- measured against `tests/c/dbt_unsupported_syscall.c`, the
+/// path this whole change exists to fix, unchanged. The in-process test passed
+/// because it constructs the error directly and never crosses the wrapper.
+/// agent(hermit-001)'s codex lane asked for the end-to-end cell that would have
+/// caught it; the cell was absent because the fix did not work.
+///
+/// ⚠️ IT IS STILL A TYPE TEST, NOT A STRING MATCH. Matching the Display text would
+/// be the thing `kind` exists to avoid, and it would break the moment the message
+/// is reworded. This reaches through the one wrapper that hides the type.
+fn is_policy_refusal(err: &Error) -> bool {
+    if err
+        .chain()
+        .any(|cause| cause.is::<detcore::UnsupportedSyscallError>())
+    {
+        return true;
+    }
+    // The wrapper case: reverie hands the tool's error back inside `Tool`, whose
+    // transparent forwarding hides the value from the chain above.
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<reverie::Error>()
+            .and_then(|reverie_error| match reverie_error {
+                reverie::Error::Tool(inner) => {
+                    inner.downcast_ref::<detcore::UnsupportedSyscallError>()
+                }
+                _ => None,
+            })
+            .is_some()
+    })
+}
+
 impl From<Error> for SerializableError {
     fn from(err: Error) -> Self {
         let error = err.to_string();
         let context = err.chain().skip(1).map(ToString::to_string).collect();
+        // ⚠️ CLASSIFIED HERE BECAUSE THIS IS THE LAST PLACE THE TYPE EXISTS.
+        // Everything below this line is strings: `From<SerializableError> for
+        // Error` rebuilds the chain with `Error::msg`, so a downcast on the far
+        // side can only ever fail. Detecting the refusal after the boundary
+        // would mean matching on English, which is the thing `kind` exists to
+        // avoid.
+        let kind = if is_policy_refusal(&err) {
+            FailureKind::PolicyRefusal
+        } else {
+            FailureKind::Error
+        };
         Self {
             error,
             context,
-            kind: FailureKind::Error,
+            kind,
         }
     }
 }

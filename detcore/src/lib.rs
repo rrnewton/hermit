@@ -356,7 +356,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.display(&guest.memory()),
             );
             if guest.config().shutdown_on_unsupported_syscall {
-                unrecoverable_shutdown(guest).await;
+                // A fail-closed policy decision: the run named a syscall hermit
+                // cannot service and `shutdown_on_unsupported_syscall` says stop.
+                unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT).await;
             }
             if guest.config().exit_on_unsupported_syscall {
                 return Err(Error::Tool(anyhow::Error::new(UnsupportedSyscallError(
@@ -1351,7 +1353,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     ) -> Result<Option<Signal>, Errno> {
         if signal == Signal::SIGINT && self.cfg.sigint_instakill {
             warn!("Fatal: Exiting hermit container immediately upon SIGINT");
-            unrecoverable_shutdown(guest).await
+            // ⚠️ NOT A REFUSAL. The operator interrupted the run; hermit examined
+            // nothing and decided nothing. Reporting `128 + SIGINT` is what every
+            // other tool reports for this, and it keeps 122 meaning one thing.
+            unrecoverable_shutdown(guest, detcore_model::HERMIT_SIGINT_DEATH_EXIT).await
         } else {
             self.pre_handler_hook(guest, false).await;
 

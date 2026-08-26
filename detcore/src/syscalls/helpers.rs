@@ -74,7 +74,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(fallback.into());
         }
         if guest.config().shutdown_on_unsupported_syscall {
-            crate::tool_global::unrecoverable_shutdown(guest).await;
+            // Fail-closed policy: the operation is unserviceable and the config
+            // forbids passing it through.
+            crate::tool_global::unrecoverable_shutdown(
+                guest,
+                detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+            )
+            .await;
         }
         if guest.config().exit_on_unsupported_syscall {
             return Err(Error::Tool(anyhow::Error::new(

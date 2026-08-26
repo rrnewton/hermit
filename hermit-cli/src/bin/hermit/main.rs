@@ -180,6 +180,7 @@ use self::bisect::BisectOpts;
 use self::container::ContainerChildExit;
 use self::container::ContainerChildPanic;
 use self::container::PolicyRefusal;
+use self::container::SignalDeath;
 use self::global_opts::GlobalOpts;
 use self::instruction_map::InstructionMapOpts;
 use self::logdiff::LogDiffCLIOpts;
@@ -455,6 +456,11 @@ fn failure_exit_code(error: &Error) -> i32 {
     if error.downcast_ref::<PolicyRefusal>().is_some() {
         return detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
     }
+    // A signal death reports 128 + signo, the status the shell would have shown
+    // had the container been an ordinary process. Also not a failure.
+    if let Some(SignalDeath(signal)) = error.downcast_ref::<SignalDeath>() {
+        return detcore_model::signal_exit_status(*signal);
+    }
     match error.downcast_ref::<GuestProgramFault>() {
         Some(fault) => fault.exit_code(),
         None => HERMIT_INTERNAL_FAILURE_EXIT,
@@ -471,6 +477,13 @@ fn classify_failure(error: &Error) -> String {
         // NOT HERMIT_INTERNAL_FAILURE: hermit did not fail. It refused, on
         // purpose, and printed why immediately above this line.
         return "HERMIT_POLICY_REFUSAL class=policy-refusal".to_string();
+    }
+    // ⚠️ THE MARKER IS WHAT MAKES 130 UNAMBIGUOUS, exactly as it is for 122. A
+    // guest may exit 130 of its own accord and hermit cannot stop it; the status
+    // alone therefore cannot say who produced it. `signal=` is included because
+    // the band has several members and the number is the report.
+    if let Some(SignalDeath(signal)) = error.downcast_ref::<SignalDeath>() {
+        return format!("HERMIT_SIGNAL_DEATH class=signal-death signal={}", signal);
     }
     // ONE discriminant, read once, covering all three flattenings.
     if let Some(ContainerChildExit(status)) = error.downcast_ref::<ContainerChildExit>() {

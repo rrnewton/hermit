@@ -3094,7 +3094,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                          Determinism is unavailable for this run.",
                         DETERMINISTIC_PIPE_CAPACITY_BYTES, failure.created_fds, failure.error,
                     );
-                    unrecoverable_shutdown(guest).await;
+                    // Fail-closed policy: determinism is unavailable for this run.
+                    unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT).await;
                 }
             }
             self.add_fd(guest, fds[0], call.flags(), FdType::Pipe)

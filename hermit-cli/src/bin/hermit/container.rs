@@ -680,6 +680,38 @@ impl std::fmt::Display for PolicyRefusal {
 
 impl std::error::Error for PolicyRefusal {}
 
+/// The container child was terminated by a signal, reported as `128 + signo`.
+///
+/// Carries the signal, unlike [`PolicyRefusal`], because there is more than one
+/// and the number is the whole content of the report.
+#[derive(Debug)]
+pub struct SignalDeath(pub i32);
+
+impl std::fmt::Display for SignalDeath {
+    /// ⚠️ IT DOES NOT SAY WHERE THE SIGNAL CAME FROM, AND AN EARLIER VERSION DID.
+    /// It read "the run was stopped from outside", which hermit cannot know:
+    /// `handle_signal_event` carries no origin, so a guest that signals ITSELF
+    /// produces the identical report. Measured --
+    /// `hermit run --sigint-instakill -- /bin/sh -c 'kill -INT $$'` exits 130 and
+    /// printed that the run was stopped externally, when nothing external
+    /// happened. agent(hermit-005)'s codex lane found it.
+    ///
+    /// That is the same defect this whole change exists to remove: a report
+    /// asserting something the system has no channel to observe. What hermit
+    /// DOES know is that the container died of a signal rather than of a hermit
+    /// decision, and that is now all it claims.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Hermit's container was terminated by signal {}. This is not a hermit \
+             failure and not a refusal: hermit did not choose to stop this run.",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for SignalDeath {}
+
 /// The container child PANICKED, and the panic was caught and reported.
 ///
 /// Distinct from [`ContainerChildExit`], which is the child dying of something
@@ -726,12 +758,27 @@ pub fn classify_container_result<T>(
         // used to arrive as indistinguishable prose.
         Ok(Ok(value)) => Ok(value),
         Ok(Err(reported)) => {
-            let panicked = reported.kind() == FailureKind::Panic;
+            let kind = reported.kind();
             let error = Error::from(reported);
-            Err(if panicked {
-                Error::new(ContainerChildPanic(error))
-            } else {
-                error
+            Err(match kind {
+                FailureKind::Panic => Error::new(ContainerChildPanic(error)),
+                // ⚠️ A REFUSAL REPORTED THROUGH THE ERROR CHANNEL IS STILL A
+                // REFUSAL. `hermit record` reaches the same fail-closed policy
+                // as `hermit run` but is configured to return a typed error
+                // instead of shutting the container down, so it never produces
+                // the exit status the run path keys on. Without this arm the two
+                // spellings of one policy reported 122 and 125 respectively --
+                // "hermit refused" and "hermit broke" -- for the same decision.
+                //
+                // ⚠️ THE CAUSE IS KEPT AS CONTEXT, NOT REPLACED. `PolicyRefusal`
+                // says "the refusal reason is above", which is true on the run
+                // path because detcore logs it before exiting. Here the reason
+                // -- WHICH syscall -- exists only inside this error, so
+                // `Error::new(PolicyRefusal)` would discard the one diagnostic
+                // the operator needs while claiming it was printed. Attaching it
+                // as context keeps the downcast working and the chain intact.
+                FailureKind::PolicyRefusal => error.context(PolicyRefusal),
+                FailureKind::Error => error,
             })
         }
         // PRESERVED, not flattened: the child died with a status it did not pick.
@@ -744,6 +791,22 @@ pub fn classify_container_result<T>(
             if status.code() == Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT) =>
         {
             Err(Error::new(PolicyRefusal))
+        }
+        // A signal death, before the catch-all for the same reason the refusal arm
+        // is: falling through would report a signal-terminated run as an
+        // internal failure. `sigint_instakill` and `on_container_init_stop_signal`
+        // both land here.
+        Err(RunError::ExitStatus(status))
+            if status
+                .code()
+                .and_then(detcore_model::signal_from_exit_status)
+                .is_some() =>
+        {
+            let signal = status
+                .code()
+                .and_then(detcore_model::signal_from_exit_status)
+                .expect("guard just matched");
+            Err(Error::new(SignalDeath(signal)))
         }
         Err(RunError::ExitStatus(status)) => Err(Error::new(ContainerChildExit(status))),
         // A spawn failure is a genuine CLI-side failure and keeps its prose.
@@ -768,6 +831,115 @@ impl<T> Classified<T> for Result<Result<T, SerializableError>, RunError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⚠️ RECORD MODE REACHES THE SAME POLICY BY A DIFFERENT CHANNEL, and for
+    /// one release the two channels disagreed about what happened.
+    ///
+    /// `hermit run` sets `shutdown_on_unsupported_syscall`, so a refusal calls
+    /// `unrecoverable_shutdown` and the STATUS carries the meaning (122).
+    /// `hermit record` sets `exit_on_unsupported_syscall` with
+    /// `shutdown_on_unsupported_syscall: false` (metadata.rs), so it returns a
+    /// typed `UnsupportedSyscallError` through Reverie and produces no status of
+    /// its own -- arriving as an ordinary reported error, i.e. 125 and
+    /// `class=container-child-exit`, "hermit broke", for a decision hermit made
+    /// on purpose.
+    ///
+    /// Set the kind back to `FailureKind::Error` and this fails.
+    #[test]
+    fn a_refusal_reported_through_the_error_channel_is_still_a_refusal() {
+        let refusal = SerializableError::from(anyhow::Error::new(
+            detcore::UnsupportedSyscallError(reverie::syscalls::Sysno::kexec_load),
+        ));
+        assert_eq!(
+            refusal.kind(),
+            FailureKind::PolicyRefusal,
+            "an UnsupportedSyscallError must be classified at the boundary, which is the \
+             last place its TYPE still exists -- past it everything is strings"
+        );
+
+        let classified = classify_container_result::<()>(Ok(Err(refusal)))
+            .expect_err("a refusal is not a success");
+        assert!(
+            classified.downcast_ref::<PolicyRefusal>().is_some(),
+            "record mode must report the same class as run mode for the same policy"
+        );
+        assert!(
+            classified.downcast_ref::<ContainerChildPanic>().is_none(),
+            "a refusal is not a panic"
+        );
+        // ⚠️ THE CAUSE MUST SURVIVE. `PolicyRefusal` says the reason is above; on
+        // this path the reason exists ONLY in this chain, so replacing the error
+        // rather than contextualising it would delete the only diagnostic naming
+        // WHICH syscall while still claiming it was printed.
+        assert!(
+            format!("{classified:#}").contains("kexec_load"),
+            "the refused syscall must survive into the reported chain: {classified:#}"
+        );
+
+        // ⚠️ CONTROL: an ordinary reported error must NOT become a refusal, or
+        // this arm would relabel every child-reported failure as deliberate.
+        let ordinary = SerializableError::from(anyhow::anyhow!("something broke"));
+        assert_eq!(ordinary.kind(), FailureKind::Error);
+        let classified = classify_container_result::<()>(Ok(Err(ordinary)))
+            .expect_err("an error is not a success");
+        assert!(classified.downcast_ref::<PolicyRefusal>().is_none());
+    }
+
+    /// ⚠️ THE RECOGNITION HALF, WHICH THE END-TO-END TEST DOES NOT WITNESS.
+    /// `a_guest_exiting_a_reserved_status_is_not_reported_as_hermit` in
+    /// `tests/cli.rs` runs real guests, so every status it sees arrives through
+    /// the `Ok(Ok(..))` arm and it never reaches the classifier at all --
+    /// agent(hermit-007)'s codex lane proved that by mutation: it still passed
+    /// with the signal classifier deleted outright. That test establishes a
+    /// guest's own 122/130 is still reported as the guest, which is real and is
+    /// the gap hermit#2659 left, but it cannot witness this.
+    ///
+    /// Feeding the classifier a synthesized `Exited(130)` directly is what
+    /// witnesses it, and needs no signal delivery -- which matters because the
+    /// end-to-end SIGINT path may not be observable from outside at all: the
+    /// outer process can die of the same signal before the child's status is
+    /// ever classified.
+    ///
+    /// Delete the signal arm in `classify_container_result` and this fails.
+    #[test]
+    fn a_container_child_exiting_in_the_signal_band_is_not_an_internal_failure() {
+        use reverie::process::ExitStatus;
+
+        let signal_death = classify_container_result::<()>(Err(RunError::ExitStatus(
+            ExitStatus::Exited(detcore_model::HERMIT_SIGINT_DEATH_EXIT),
+        )))
+        .expect_err("a signal death is not a success");
+        assert!(
+            signal_death.downcast_ref::<SignalDeath>().is_some(),
+            "Exited(130) must classify as a signal death, not as an unchosen child \
+             exit -- LiteInst and the exit-code path both key on this distinction"
+        );
+        assert!(
+            signal_death.downcast_ref::<ContainerChildExit>().is_none(),
+            "a signal death must not also read as an unaccounted container exit"
+        );
+
+        // The refusal arm must still win for 122: the two arms are adjacent and
+        // ordering decides meaning.
+        let refusal = classify_container_result::<()>(Err(RunError::ExitStatus(
+            ExitStatus::Exited(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        )))
+        .expect_err("a refusal is not a success");
+        assert!(refusal.downcast_ref::<PolicyRefusal>().is_some());
+        assert!(
+            refusal.downcast_ref::<SignalDeath>().is_none(),
+            "122 must not parse as a signal death; the const-assert pins them disjoint"
+        );
+
+        // ⚠️ CONTROL: a status in neither reserved set must STILL be an unchosen
+        // child exit. Without this, a classifier that returned SignalDeath for
+        // everything would pass the rows above.
+        let unchosen =
+            classify_container_result::<()>(Err(RunError::ExitStatus(ExitStatus::Exited(7))))
+                .expect_err("an unaccounted exit is not a success");
+        assert!(unchosen.downcast_ref::<ContainerChildExit>().is_some());
+        assert!(unchosen.downcast_ref::<SignalDeath>().is_none());
+    }
 
     #[test]
     fn child_panic_becomes_an_error_naming_message_and_location() {
