@@ -3982,13 +3982,50 @@ mod tests {
     /// twenty runs each and no pipe between the command and `$?`:
     ///
     /// ```text
-    /// GIT_CONFIG_COUNT=1 git rev-parse --show-toplevel     (no GIT_CONFIG_KEY_0)
+    /// env -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 \
+    ///     GIT_CONFIG_COUNT=1 git rev-parse --show-toplevel
     ///   git 2.52.0        exit 128 in 20/20
     ///   git 2.53.0-Meta   exit 128 in 20/20
     ///   error: missing config key GIT_CONFIG_KEY_0
     ///   fatal: unable to parse command-line config
-    /// CONTROL, same command with no GIT_CONFIG_COUNT: non-zero in 0/20
+    /// POSITIVE CONTROL: GIT_CONFIG_COUNT=notanumber -> exit 128,
+    ///   "error: bogus count in GIT_CONFIG_COUNT". It proves git PARSES the
+    ///   variable, so the mechanism under test is live -- which is what saved a
+    ///   review lane from filing a refutation of a correct result after measuring
+    ///   0/20. It does NOT discriminate the environment: measured 2026-08-26 it
+    ///   gives 128 with the variables present and 128 with them absent, exactly
+    ///   like the control it replaced. NOTHING here needs to discriminate, because
+    ///   with the `env -u` the recipe gives 20/20 either way; an earlier revision
+    ///   of this line claimed otherwise and `agent(hermit-001)` and
+    ///   `agent(hermit-015)` were right to refuse it.
     /// ```
+    ///
+    /// ⚠️ THE `env -u` IS LOAD-BEARING, NOT TIDINESS, AND OMITTING IT INVERTS THE
+    /// RESULT -- FOR SOME READERS AND NOT OTHERS, WHICH IS THE WHOLE DIFFICULTY.
+    /// Measured 2026-08-26 on the host named in `docs/TESTING_ENVIRONMENTS.md`:
+    /// with `GIT_CONFIG_KEY_0` present the bare recipe gives 0 of 20, the exact
+    /// opposite of the table above; with the `GIT_CONFIG*` family unset, 20 of 20.
+    ///
+    /// The variables are inherited from the AGENT HARNESS PROCESS, not from a git
+    /// wrapper and not from shell initialisation. Agents launched with the proxy's
+    /// GitHub URL-rewrite config carry `GIT_CONFIG_COUNT` plus `GIT_CONFIG_KEY_0..2`
+    /// (`url.https://github.com/.insteadOf`) in their process environment before any
+    /// shell starts, so `COUNT=1` finds an inherited `KEY_0` and git succeeds.
+    ///
+    /// ⚠️ SO A LOGIN SHELL PROVES NOTHING EITHER WAY, and that is why three
+    /// reviewers disagreed while all measuring correctly. `bash -l` inherits from
+    /// whatever launched it: from an affected agent it reports the variables, from
+    /// an unaffected one it reports none, and NOTHING in `/etc/profile`,
+    /// `/etc/profile.d`, `~/.bashrc`, `~/.bash_profile` or `~/.profile` mentions
+    /// them -- grepped, zero hits. The same mechanism that lets git reach github.com
+    /// through the proxy is the one that inverts this measurement.
+    ///
+    /// An earlier revision of this comment blamed "this host's git wrapper ...
+    /// into every login shell". Both halves were false: `/usr/local/bin/git` is an
+    /// ELF binary and can export nothing, and no shell file sets these. Diagnosed by
+    /// `agent(hermit-015)` and `agent(hermit-001)` on review, from
+    /// `/proc/<parent>/environ`. Kept visible because this sentence is now on its
+    /// fifth revision and a silent correction is what produced the previous four.
     ///
     /// ⚠️ SO THE REVISION THIS COMMENT "CORRECTED" WAS RIGHT. It said such a
     /// child "dies with `error: missing config key GIT_CONFIG_KEY_0`, exit 128".
