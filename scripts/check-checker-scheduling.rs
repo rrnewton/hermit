@@ -73,6 +73,17 @@ const ALLOWLIST: &[(&str, &str)] = &[
          checker, not to this list.",
     ),
     (
+        "scripts/test_validate_stop_paths.py",
+        "CANNOT be scheduled: it SPAWNS A VALIDATE. Its run_signal does \
+         Popen([scripts/validate.rs, 'full']), so as a DAG node it runs a validate from \
+         inside a validate; the child is refused and exits 2 before emitting \
+         VALIDATE_STOP_TEST_READY. Measured on main at 7406b4dd2efc, deterministically, \
+         after the other ten checkers passed. It passes STANDALONE, which is why wiring \
+         it looked safe -- a checker that spawns the harness it runs under is not merely \
+         unscheduled, it is unschedulable in this shape. Run it by hand, or give it a \
+         mode that does not launch a real validate.",
+    ),
+    (
         "ci/check-shard-coverage.sh",
         "Unscheduled, and a WORKING guard: it caught a real error in the change \
          that added check.lint_checks (a node assigned to no shard). Its only \
@@ -202,11 +213,32 @@ fn main() {
     );
 
     // Seed the reachable set from the two things that actually schedule work.
+    //
+    // ⚠️ ONLY THE `cmd` FIELDS, never the whole JSON. A DAG node's `description` is
+    // prose and routinely NAMES checkers it does not run -- check.lint_checks's own
+    // description lists six of them. Seeding from the raw file therefore counted a
+    // checker mentioned in prose as scheduled, which is the false negative this guard
+    // exists to prevent: it would report an orphan as covered because someone wrote
+    // about it. Caught 2026-08-25 when a freshly ALLOWLISTED entry was reported STALE
+    // ("now scheduled") purely because a node description mentioned it.
+    //
+    // Same defect class as counting a marker's TEXT instead of the binding: the
+    // instrument must read the field that CAUSES execution, not the field that
+    // discusses it.
     let mut seed = String::new();
     for dag in ["ci/dag/portable.json", "ci/dag/privileged.json"] {
         if Path::new(dag).exists() {
-            seed.push_str(&std::fs::read_to_string(dag).unwrap());
-            seed.push('\n');
+            let raw = std::fs::read_to_string(dag).unwrap();
+            let cmds = extract_cmds(&raw);
+            assert!(
+                !cmds.is_empty(),
+                "{dag} yielded no `cmd` fields; the schema moved and this guard would \
+                 otherwise report every checker as an orphan"
+            );
+            for c in cmds {
+                seed.push_str(&c);
+                seed.push('\n');
+            }
         }
     }
     seed.push_str(&lint_checks_recipe(
@@ -237,8 +269,7 @@ fn main() {
             if reached.contains(s) {
                 continue;
             }
-            let base = s.rsplit('/').next().unwrap();
-            if text.contains(base) {
+            if is_invoked(&text, s) {
                 reached.insert(s.clone());
                 if expands_frontier(s) {
                     if let Ok(body) = std::fs::read_to_string(s) {
@@ -296,6 +327,62 @@ fn main() {
         eprintln!("check-checker-scheduling: STALE ALLOWLIST entry {p} -- now scheduled or absent; remove it.");
     }
     std::process::exit(1);
+}
+
+/// Does `text` INVOKE `path`, as opposed to merely naming it?
+///
+/// ⚠️ A bare substring match on the basename is not good enough, and this is the
+/// second time that exact shortcut produced a wrong answer here. A filename appears
+/// in plenty of live, non-comment text that does not run it -- most sharply, an
+/// `echo` inside ci/lint-checks-node.sh names test_validate_stop_paths.py in a
+/// diagnostic message, which read as an invocation and silently marked an
+/// unschedulable checker as scheduled.
+///
+/// So require one of the shapes this repository actually uses to RUN a script:
+///
+///     ./scripts/foo.sh            $(SUBMODULE_PROXY) ./ci/foo.sh
+///     python3 ./scripts/foo.py    python3 scripts/foo.py
+///     bash scripts/foo.sh         sh scripts/foo.sh
+///
+/// The bare-path forms are deliberately restricted to an explicit interpreter prefix.
+/// Erring toward a FALSE ORPHAN is the safe direction: it is loud and a human fixes
+/// it in one line, whereas a false "scheduled" is silent and defeats the guard.
+fn is_invoked(text: &str, path: &str) -> bool {
+    if text.contains(&format!("./{path}")) {
+        return true;
+    }
+    // `rustc` is a runner here too: ci/run-reverie-pin-check.sh COMPILES
+    // scripts/check-reverie-pin.rs and runs the resulting binary, so the checker is
+    // genuinely scheduled without ever being executed as a script.
+    for runner in ["python3 ", "python ", "bash ", "sh ", "rustc "] {
+        if text.contains(&format!("{runner}{path}")) {
+            return true;
+        }
+    }
+    // A path alone at the start of a line is a shell line-continuation argument --
+    // the form run-reverie-pin-check.sh uses for both pin checkers. Anchoring to the
+    // line start is what keeps this from matching a filename quoted mid-sentence.
+    text.lines().any(|l| l.trim_start().starts_with(path))
+}
+
+/// Pull the value of every `"cmd":` field out of a DAG file.
+///
+/// Deliberately textual rather than a JSON parse: these scripts take no third-party
+/// dependencies, and the field is emitted one-per-line by the generator. It fails
+/// closed at the call site if the result is empty, so a schema move is loud rather
+/// than silently reporting every checker as an orphan.
+fn extract_cmds(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let Some(rest) = line.split_once("\"cmd\"") else {
+            continue;
+        };
+        let Some(after_colon) = rest.1.split_once(':') else {
+            continue;
+        };
+        out.push(after_colon.1.trim().to_string());
+    }
+    out
 }
 
 /// Extract just the `lint-checks` recipe. Using the whole Makefile would count a
@@ -425,5 +512,48 @@ mod tests {
                 "allowlist entry {path} needs a real reason, not a placeholder"
             );
         }
+    }
+
+    // The regression that motivated is_invoked: a filename quoted inside a live
+    // (non-comment) diagnostic message is NOT an invocation. ci/lint-checks-node.sh
+    // echoes exactly this shape, and a substring match read it as scheduling.
+    #[test]
+    fn a_name_quoted_mid_sentence_is_not_an_invocation() {
+        let echoed = "        echo '  contract in scripts/test_validate_stop_paths.py exercises the REAL parent' >&2";
+        assert!(!is_invoked(echoed, "scripts/test_validate_stop_paths.py"));
+    }
+
+    #[test]
+    fn the_shapes_that_do_run_a_script_all_count() {
+        assert!(is_invoked("\t./scripts/check-x.sh", "scripts/check-x.sh"));
+        assert!(is_invoked(
+            "\tpython3 scripts/test_x.py",
+            "scripts/test_x.py"
+        ));
+        assert!(is_invoked(
+            "\t$(SUBMODULE_PROXY) ./ci/run-x.sh",
+            "ci/run-x.sh"
+        ));
+        // Compiled rather than interpreted, and split across a continuation line --
+        // how run-reverie-pin-check.sh reaches both pin checkers.
+        assert!(is_invoked(
+            "    RUSTUP_TOOLCHAIN=stable rustc --edition=2021 \\\n        scripts/check-reverie-pin.rs -o \"$checker\"",
+            "scripts/check-reverie-pin.rs"
+        ));
+    }
+
+    // A DAG `description` is prose and routinely names checkers it does not run.
+    #[test]
+    fn only_cmd_fields_seed_scheduling_not_descriptions() {
+        let dag = r#"{"steps":[
+          {"job":"a","description":"this node supersedes scripts/check-ghost.sh entirely",
+           "cmd": "./scripts/check-real.sh"}]}"#;
+        let cmds = extract_cmds(dag);
+        assert_eq!(cmds.len(), 1, "one cmd expected, got {cmds:?}");
+        assert!(cmds[0].contains("check-real.sh"));
+        assert!(
+            !cmds[0].contains("check-ghost.sh"),
+            "a checker named only in prose must not read as scheduled"
+        );
     }
 }

@@ -129,6 +129,17 @@ check-skill-discovery: ## Verify Claude and stock Codex discover the same produc
 # checkers in this target had no such node (measured 2026-08-25 at a5fef7ff7623).
 lint: lint-checks lint-cargo ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, Reverie pin policy, nested lockfiles, record-version floor)
 
+# ⚠️ scripts/test_validate_stop_paths.py is deliberately NOT in this recipe and must
+# not be added back. It SPAWNS A VALIDATE -- `Popen([scripts/validate.rs, "full"])` in
+# its run_signal -- so as a DAG node it runs a validate from inside a validate. The
+# child is refused and exits 2 before emitting VALIDATE_STOP_TEST_READY, which is what
+# turned check.lint_checks red on main at 7406b4dd2efc: `AssertionError: validate
+# exited before ready: rc=2`, deterministic, after the other checkers had passed.
+# It passes STANDALONE, which is exactly why wiring it looked safe. Its absence is kept
+# honest by the ALLOWLIST entry in scripts/check-checker-scheduling.rs.
+#
+# ⚠️ Comments INSIDE the recipe below must be TAB-indented. A comment at column 0 ends
+# the recipe, silently dropping every line after it.
 lint-checks: ## The lint checkers CI schedules as one node (everything in `lint` except the two cargo passes)
 	./scripts/check-skill-discovery.rs
 	./scripts/test-required-check-outcomes.sh
@@ -151,7 +162,6 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 	@git diff --check
 	./ci/verify-submodules.sh --self-test
 	./ci/verify-submodules.sh
-	python3 scripts/test_validate_stop_paths.py
 	$(SUBMODULE_PROXY) ./ci/run-reverie-pin-check.sh
 	$(SUBMODULE_PROXY) ./scripts/check-nested-lockfiles.rs
 	./scripts/check-record-version-floor.rs
