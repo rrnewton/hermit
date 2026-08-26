@@ -2218,3 +2218,78 @@ regressed main, yet still held two standalone C guests absent from main.
 The queue is **unlanded work, not duplicates**, and the shortage is **rebases,
 not candidates**. Plan sweeps on that basis: budget for rebasing, extracting
 residuals and naming successors, not for closing.
+
+## Four fields on a pull request whose plain reading is wrong
+
+⚠️ **The GitHub pull-request API has at least four fields a reviewer naturally
+reads as an answer, and each of them answers a different question than the one
+being asked.** They are collected here because they were found one at a time,
+scattered across four sections and five pull requests in a single evening, and a
+reviewer who learns them one at a time learns each one by being burned by it.
+
+| field | reads as | actually means |
+| --- | --- | --- |
+| `mergeable` | can this land | *computed at some past moment*, `UNKNOWN` until asked, and never recomputed once the pull request closes |
+| `merged` / the merged flag | my commit is on `main` | **a** merge happened on this pull request; says nothing about which commits were in it |
+| `merge_commit_sha` | it merged, here is the commit | **populated on pull requests that were never merged** |
+| `head.sha` | the head I am reviewing | the head has not *moved*; says nothing about whether it is still *open* |
+
+The first two have their own sections above --
+[`mergeable` is THREE-VALUED](#mergeable-is-three-valued-and-the-third-value-is-not-an-answer)
+and the merged-flag section. The last two are recorded here.
+
+### `merge_commit_sha` is populated on a pull request that never merged
+
+Measured 2026-08-25 on hermit#2604, closed as obsolete rather than merged:
+
+```console
+state             closed
+merged            False
+merged_at         None
+merged_by         None
+merge_commit_sha  aa565ed86abf922b396749ee334c2f546738dd4e   <-- populated
+```
+
+And the content is verifiably absent from `main`: grepping `origin/main` for a
+distinctive string from the change returns **0**.
+
+So a populated `merge_commit_sha` is not evidence of a merge, and a sha that
+looks like a landing is not a landing. GitHub computes a *candidate* merge commit
+to answer the mergeability question, and the field keeps that value whatever
+happens to the pull request afterwards. **Check `merged`, and then check `main`.**
+
+### `head.sha` agreeing does not mean the head is still open
+
+The standing rule for supplying a review lane is to resolve the head from the
+branch ref **and** the API and require the two to agree, because a head that
+moves under a reviewer invalidates the binding. That rule is correct and it is
+not sufficient: **a sha stays valid on a closed pull request**, so agreement
+proves the head has not *moved* and says nothing about whether it is still
+*alive*.
+
+Measured 2026-08-25, and the author of this section is the one who got it wrong:
+
+```
+18:48:58Z  author posts "Closing: obsolete"
+18:48:59Z  pull request CLOSED, merged=false
+18:50:13Z  reviewer posts APPROVED-AT + passed-review-codex   <-- 74s too late
+```
+
+The reviewer re-read the head immediately before posting, exactly as the protocol
+requires. The API returned `state: closed` **in the same response the sha was
+read from**. The sha was checked; the state was not.
+
+**The rule is therefore: re-read the head AND the state.** One extra field, in a
+request already being made. An approving lane on a closed pull request is not
+harmless -- it is an approval a scanner will count, on a head nobody can land,
+and it has to be retracted by hand with a `CHANGES-REQUESTED-AT` at the same sha.
+
+### The shape they share
+
+Each of these fields reports something true. `mergeable` really was `UNKNOWN`
+when asked; the merge really did happen; the candidate merge commit really was
+computed; the head really has not moved. **The defect is never that the field
+lies -- it is that the question a reviewer is asking is one step further on than
+the question the field answers.** So the check is the same in all four cases:
+name the question you actually need answered, and confirm the field answers
+*that* one, rather than one adjacent to it.
