@@ -717,7 +717,7 @@ mod tests {
     fn dbt_verdict_names_a_canonical_record_envelope() {
         let source = include_str!("backends.rs");
         let start = source
-            .find("let outcome = compare_two_runs(")
+            .find("= compare_two_runs(")
             .expect("DBT arm must compare two runs");
         let options = source[start..]
             .find("ComparisonOptions {")

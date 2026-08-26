@@ -52,6 +52,27 @@ static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FORK_CHILD_GETRANDOM_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
+const DBT_IO_BUFFER_MUTATOR_SOURCE: &str = r#"
+#define _XOPEN_SOURCE 700
+#include <fcntl.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+  static const char replacement[16] = {
+      66, 66, 66, 66, 66, 66, 66, 66,
+      66, 66, 66, 66, 66, 66, 66, 66,
+  };
+  char observed[16];
+  if (argc != 2) return 64;
+  int fd = open(argv[1], O_RDWR | O_CLOEXEC);
+  if (fd < 0) return 65;
+  if (pread(fd, observed, sizeof(observed), 0) != (ssize_t)sizeof(observed)) return 66;
+  if (pwrite(fd, replacement, sizeof(replacement), 0) != (ssize_t)sizeof(replacement)) return 67;
+  if (fsync(fd) != 0 || close(fd) != 0) return 68;
+  return 0;
+}
+"#;
+
 // This lock only serializes independent child processes; a failed assertion carries no
 // protected state invariant and must not poison unrelated tests.
 fn hermit_run_guard() -> MutexGuard<'static, ()> {
@@ -572,6 +593,22 @@ fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).expect("hermit stderr should be UTF-8")
 }
 
+fn strip_ansi_sgr(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut remaining = input;
+    while let Some(start) = remaining.find("\x1b[") {
+        output.push_str(&remaining[..start]);
+        let escape = &remaining[start + 2..];
+        let Some(end) = escape.find('m') else {
+            output.push_str(&remaining[start..]);
+            return output;
+        };
+        remaining = &escape[end + 1..];
+    }
+    output.push_str(remaining);
+    output
+}
+
 /// WHICH failure a call site means to assert. Named at the call site, so the
 /// assertion states an intention instead of inheriting one.
 ///
@@ -876,6 +913,87 @@ fn run_dbt_verifies_simple_env_shebang() {
         "DBT determinism confirmation missing:\n{}",
         stderr(&output),
     );
+}
+
+#[test]
+fn dbt_verify_without_json_rejects_io_buffer_content_divergence() {
+    if dbt_unavailable("dbt_verify_without_json_rejects_io_buffer_content_divergence") {
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let build_root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create DBT io-buffer test directory");
+    let source = build_root.path().join("io_buffer_mutator.c");
+    let guest = build_root.path().join("io_buffer_mutator");
+    fs::write(&source, DBT_IO_BUFFER_MUTATOR_SOURCE)
+        .expect("failed to write DBT io-buffer mutator source");
+    let compile = Command::new("cc")
+        .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile DBT io-buffer mutator");
+    assert!(
+        compile.status.success(),
+        "failed to compile DBT io-buffer mutator:\n{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let state = Path::new("/tmp").join(format!(
+        "hermit-dbt-iobuf-verification-{}",
+        std::process::id()
+    ));
+    fs::write(&state, b"AAAAAAAAAAAAAAAA").expect("failed to seed DBT io-buffer state");
+    let log_dir = build_root.path().join("verify-logs");
+    fs::create_dir(&log_dir).expect("failed to create DBT verification log directory");
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log",
+            "info",
+            "run",
+            "--backend",
+            "dbt",
+            "--strict",
+            "--verify",
+            "--keep-logs",
+            "--verify-log-dir",
+        ])
+        .arg(&log_dir)
+        .arg("--")
+        .arg(&guest)
+        .arg(&state)
+        .output()
+        .expect("failed to run DBT io-buffer verification");
+    let _ = fs::remove_file(&state);
+    let stderr = strip_ansi_sgr(&stderr(&output));
+
+    assert!(
+        !output.status.success(),
+        "DBT verification without --verify-json accepted an A-to-B syscall output-buffer \
+         mutation:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Success: deterministic. Determinism verified."),
+        "DBT announced deterministic success after an output-buffer divergence:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Failure: nondeterministic."),
+        "DBT rejected the mutation for a reason other than the two-run comparison:\n{stderr}"
+    );
+    for marker in [
+        "[iobuf]",
+        "pread64",
+        "= Ok(16)",
+        "991204fba2b6216d476282d375ab88d20e6108d109aecded97ef424ddd114706",
+        "900dfeb7f1b5e344209e2abce56c333dafe606fb3bf59f68ab2b0e2ef8a0662b",
+    ] {
+        assert!(
+            stderr.contains(marker),
+            "DBT's no-JSON verification failure did not name {marker:?}; it must fail on the \
+             syscall output-buffer evidence itself:\n{stderr}"
+        );
+    }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED

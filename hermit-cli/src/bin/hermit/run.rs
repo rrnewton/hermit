@@ -1083,6 +1083,65 @@ fn verification_always_compares_retained_logs() {
 }
 
 #[test]
+fn every_backend_keeps_io_buffer_checking_on_by_default() {
+    for backend in ["ptrace", "dbt", "liteinst", "sabre", "kvm", "e9patch"] {
+        let run = RunOpts::parse_from([
+            "fakehermit",
+            "--backend",
+            backend,
+            "--verify",
+            "--verify-strict",
+            "fakeprog",
+        ]);
+        let prepared =
+            hermit::prepare_backend_config(run.effective_det_config(), run.runtime_backend());
+        assert!(
+            prepared.detlog_io_buffers,
+            "{backend} disabled syscall output-buffer checking while the ordinary strict-verify \
+             request left it enabled"
+        );
+        if run.selected_backend() != Backend::Dbt {
+            // DBT has its own production comparator in `backends.rs`; the
+            // no-JSON content-mutation integration test exercises that path.
+            assert_eq!(
+                run.verification_comparison_options().compare_io_buffers,
+                prepared.detlog_io_buffers,
+                "{backend} reported an io-buffer comparison state different from the \
+                 configuration that backend actually receives"
+            );
+        }
+
+        let opted_out = RunOpts::parse_from([
+            "fakehermit",
+            "--backend",
+            backend,
+            "--verify",
+            "--verify-strict",
+            "--no-detlog-io-buffers",
+            "fakeprog",
+        ]);
+        let prepared_opt_out = hermit::prepare_backend_config(
+            opted_out.effective_det_config(),
+            opted_out.runtime_backend(),
+        );
+        assert!(
+            !prepared_opt_out.detlog_io_buffers,
+            "{backend} ignored the explicit --no-detlog-io-buffers relaxation"
+        );
+        if opted_out.selected_backend() != Backend::Dbt {
+            assert_eq!(
+                opted_out
+                    .verification_comparison_options()
+                    .compare_io_buffers,
+                prepared_opt_out.detlog_io_buffers,
+                "{backend} reported an io-buffer comparison state different from its explicit \
+                 opt-out"
+            );
+        }
+    }
+}
+
+#[test]
 fn e9patch_preserves_executable_identity_and_uses_ptrace_runtime() {
     let mut ro = RunOpts::parse_from(["fakehermit", "--backend", "e9patch", "/bin/echo", "hello"]);
     ro.e9patch_overlay = Some(E9patchOverlay {
@@ -2397,6 +2456,13 @@ impl RunOpts {
     }
 
     fn verification_comparison_options(&self) -> ComparisonOptions {
+        // Use the configuration the selected runtime backend actually receives.
+        // `run_with_output_backend` applies this same normalization before
+        // constructing Detcore. Reading the pre-normalization CLI value here
+        // would let a backend disable an observation while the verdict still
+        // reported that it participated.
+        let config =
+            hermit::prepare_backend_config(self.effective_det_config(), self.runtime_backend());
         ComparisonOptions {
             verbose: self.verify_verbose,
             strictness: self.verification_strictness(),
@@ -2406,7 +2472,7 @@ impl RunOpts {
             // bracket above.
             compare_logs: true,
             diagnostic_full_trace: self.verify_verbose,
-            compare_io_buffers: self.det_opts.det_config.detlog_io_buffers,
+            compare_io_buffers: config.detlog_io_buffers,
             keep_logs: self.keep_logs,
             record_envelope: RecordEnvelope::all_records_v1(),
             // Read from the LIVE config, not a constant: `--no-virtualize-time`
@@ -2414,7 +2480,7 @@ impl RunOpts {
             // `true` would publish a time policy the run did not use. The
             // record/replay path is a fixed decision instead and names it once, as
             // `RECORD_REPLAY_VIRTUALIZES_TIME`.
-            virtualize_time: self.det_opts.det_config.virtualize_time,
+            virtualize_time: config.virtualize_time,
         }
     }
 
@@ -3676,7 +3742,8 @@ impl RunOpts {
         // verified" on a run that the same command with hashing enabled
         // reports as diverged. Claiming
         // determinism there was the defect, so the sentence now names its limit.
-        let success_message = if !self.det_opts.det_config.detlog_io_buffers {
+        let comparison_options = self.verification_comparison_options();
+        let success_message = if !comparison_options.compare_io_buffers {
             // The "Determinism verified" marker is RETAINED verbatim and the
             // qualification appended after it. That is not politeness: ~110
             // files in this repository assert on that exact substring -- Rust
@@ -3709,7 +3776,7 @@ impl RunOpts {
                 log: log2_path,
                 label: "run 2",
             },
-            self.verification_comparison_options(),
+            comparison_options,
         )?;
 
         // Emit the machine-readable verdict (if requested) before collapsing the
