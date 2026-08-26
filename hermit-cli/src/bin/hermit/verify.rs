@@ -15,6 +15,7 @@ use colored::Colorize;
 use detcore::logdiff;
 use detcore::logdiff::ComparisonSideLabels;
 use detcore::logdiff::LogComparisonMode;
+use detcore_model::summary::RunSummary;
 use hermit::Context;
 use hermit::Error;
 use pretty_assertions::Comparison;
@@ -504,6 +505,42 @@ pub struct DbtCountedBranchComparison {
     pub right: u64,
 }
 
+/// Totals from one completed Hermit execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RunRuntime {
+    pub scheduler_turns: u64,
+    pub virtual_nanoseconds: u64,
+    pub syscalls: u64,
+}
+
+impl From<&RunSummary> for RunRuntime {
+    fn from(summary: &RunSummary) -> Self {
+        Self {
+            scheduler_turns: summary.sched_turns,
+            virtual_nanoseconds: summary.virttime_elapsed,
+            syscalls: summary.syscalls,
+        }
+    }
+}
+
+/// Runtime totals for the two executions compared by verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct VerificationRuntime {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run1: Option<RunRuntime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run2: Option<RunRuntime>,
+}
+
+impl VerificationRuntime {
+    pub fn from_summaries(run1: Option<&RunSummary>, run2: Option<&RunSummary>) -> Option<Self> {
+        (run1.is_some() || run2.is_some()).then(|| Self {
+            run1: run1.map(RunRuntime::from),
+            run2: run2.map(RunRuntime::from),
+        })
+    }
+}
+
 impl DbtCountedBranchComparison {
     /// Whether both completed runs reported the same counted-branch clock.
     pub fn matched(self) -> bool {
@@ -530,6 +567,8 @@ pub struct VerificationOutcome {
     /// runs and produced readable statistics. `None` for non-DBT runs and when
     /// verification did not reach a verdict.
     pub dbt_counted_branches: Option<DbtCountedBranchComparison>,
+    /// Runtime totals for the two compared executions when their summaries were readable.
+    pub runtime: Option<VerificationRuntime>,
     /// Reader-facing names of the two compared sides, retained so terminal
     /// diagnostics do not assume that every comparison was two fresh runs.
     pub compared_labels: ComparisonSideLabels,
@@ -640,6 +679,9 @@ pub struct VerificationReport {
     /// divergence that can exist even when the canonical log comparison matched.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dbt_counted_branches: Option<DbtCountedBranchComparison>,
+    /// Runtime totals for run 1 and run 2 when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<VerificationRuntime>,
     /// The guest's exit code, if it exited normally.
     pub guest_exit_code: Option<i32>,
     /// The guest's terminating signal number, if it was killed by a signal.
@@ -709,6 +751,7 @@ impl VerificationReport {
             comparison: None,
             compared_log_messages: None,
             dbt_counted_branches: None,
+            runtime: None,
             guest_exit_code: None,
             guest_signal: None,
             first_divergent_scheduler_turn: None,
@@ -750,6 +793,7 @@ impl From<&VerificationOutcome> for VerificationReport {
             } else {
                 outcome.dbt_counted_branches
             },
+            runtime: outcome.runtime,
             guest_exit_code: outcome.guest_status.code(),
             guest_signal: outcome.guest_status.signal(),
             first_divergent_scheduler_turn: outcome.first_divergent_scheduler_turn,
@@ -1161,6 +1205,7 @@ fn compare_two_runs_with_unsupported_scan(
             comparison: spec,
             compared_log_messages,
             dbt_counted_branches: None,
+            runtime: None,
             compared_labels: compared_labels.clone(),
             first_divergent_scheduler_turn,
             first_divergent_virtual_nanoseconds,
@@ -1174,6 +1219,7 @@ fn compare_two_runs_with_unsupported_scan(
             comparison: spec,
             compared_log_messages,
             dbt_counted_branches: None,
+            runtime: None,
             compared_labels: compared_labels.clone(),
             first_divergent_scheduler_turn,
             first_divergent_virtual_nanoseconds,
@@ -2698,6 +2744,7 @@ mod tests {
             comparison: full,
             compared_log_messages: Some(ComparedLogCounts { left: 9, right: 9 }),
             dbt_counted_branches: None,
+            runtime: None,
             compared_labels: ComparisonSideLabels::default(),
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
@@ -2705,6 +2752,33 @@ mod tests {
             first_divergent_syscall: None,
         };
         assert!(!VerificationReport::from(&diverged).bitwise_parity);
+    }
+
+    #[test]
+    fn report_carries_both_run_runtime_totals_without_changing_the_verdict() {
+        let first = RunSummary {
+            sched_turns: 12,
+            virttime_elapsed: 34,
+            syscalls: 5,
+            ..Default::default()
+        };
+        let second = RunSummary {
+            sched_turns: 13,
+            virttime_elapsed: 35,
+            syscalls: 6,
+            ..Default::default()
+        };
+        let runtime = VerificationRuntime::from_summaries(Some(&first), Some(&second))
+            .expect("two summaries produce runtime totals");
+        assert_eq!(runtime.run1.unwrap().scheduler_turns, 12);
+        assert_eq!(runtime.run2.unwrap().syscalls, 6);
+
+        let mut report = VerificationReport::no_result();
+        report.runtime = Some(runtime);
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["verdict"], "no_result");
+        assert_eq!(json["runtime"]["run1"]["virtual_nanoseconds"], 34);
+        assert_eq!(json["runtime"]["run2"]["syscalls"], 6);
     }
 
     #[test]
