@@ -405,9 +405,55 @@ Semantics** (how the change preserves faithful Linux behavior), and
 PR additionally requires **Human Review Required**, naming the specific
 numbered trigger rather than a vague category such as "backend change". For a
 `post-facto-human-review` PR these sections and the dual-reviewer approval
-labels are enforced by the `core-review-protocol` merge-gate job
-(`scripts/core-review-protocol-lint.sh`), which blocks landing when any are
-missing.
+labels are checked by `scripts/core-review-protocol-lint.sh` — **which you must
+run by hand. Nothing runs it for you, and nothing blocks a landing that skips
+it.**
+
+This document previously said the script was "enforced by the
+`core-review-protocol` merge-gate job, which blocks landing when any are
+missing". That was false in three independent layers, each measured on
+2026-08-26 against `rrnewton/hermit`:
+
+- its only caller is `.github/workflows/merge-gate.yml`, whose `on:` block is
+  `workflow_dispatch:` alone, so it cannot fire on a pull request;
+- `branches/main/protection` returns **404 Branch not protected**;
+- ruleset *"main check gating (admin-bypassable)"* is `enforcement=active` with
+  **`rules: []`** — active and empty, so it requires no check at all.
+
+⚠️ **A FALSE ENFORCEMENT CLAIM IS WORSE THAN A MISSING GATE**, which is why the
+correction is written out rather than quietly swapped. A reader who believes
+landing is gated has no reason to run anything by hand, so the claim removed the
+very behaviour it described. Every agent is told to read this file; almost none
+read the workflow YAML that would have contradicted it.
+
+**The script itself is sound — it is the wiring that is absent.** Measured the
+same day: its self-test passes 24/24, and it returns rc=1 on heads that are
+genuinely short and rc=0 on heads that are not. Run it before you land a labeled
+PR:
+
+```bash
+pr=<N>
+PR_LABELS="$(gh pr view "$pr" -R rrnewton/hermit --json labels \
+              -q '.labels|map(.name)|join("\n")')" \
+PR_BODY="$(gh pr view "$pr" -R rrnewton/hermit --json body -q .body)" \
+  bash scripts/core-review-protocol-lint.sh "$pr"
+```
+
+⚠️ **BOTH variables are required, and the script REFUSES rather than guessing** —
+an unset `PR_LABELS` or `PR_BODY` exits 2 with `This gate cannot decide anything`,
+not 0. That is deliberate: a missing body would otherwise produce five phantom
+"missing section" errors, and a missing label list would silently pass every PR.
+Pass an explicit empty string to mean "genuinely none". Supplying only
+`PR_LABELS` — the obvious half — is itself an exit 2, so read the status rather
+than the absence of complaints.
+
+⚠️ **DO NOT "FIX" THIS BY ARMING THE GATE.** Adding a `pull_request` trigger
+contradicts the standing directive that CI does not run automatically, and a
+trigger without a `required_status_checks` rule — or a rule without a trigger —
+yields either a check that gates nothing or a requirement nothing can satisfy.
+Both layers or neither, and that pairing is an owner decision.
+
+**What actually holds this line today is agents choosing to hold it.**
 
 GitHub Issues are the public issue tracker. In Meta environments, use
 appropriate proxies for accessing the web.
