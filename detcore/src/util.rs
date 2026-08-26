@@ -8,6 +8,8 @@
 
 //! Widely useful small utilities.
 
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::types::NANOS_PER_RCB;
@@ -83,34 +85,79 @@ pub fn truncated(width: usize, mut s: String) -> String {
 /// would busy-spin against a full pipe, so it blocks in `poll(POLLOUT)`.
 pub struct RetryingStderr;
 
-/// Total wall-clock a single diagnostic write may spend waiting for a reader.
+/// Total wall-clock ALL diagnostic writes may spend waiting for a reader, for the
+/// whole life of the process.
 ///
-/// ⚠️ WITHOUT A CEILING THIS LOOP NEVER ENDS, AND IT RUNS WHILE HERMIT IS ALREADY
-/// FAILING. `EAGAIN` -> `poll(POLLOUT, 1s)` -> retry is correct for a reader that
-/// is SLOW and unbounded for a reader that is STOPPED. Measured 2026-08-26 on a
-/// 4096-byte pipe filled to 3900 with `O_NONBLOCK` set, where nothing ever reads:
+/// ⚠️ THE BUDGET IS FOR THE PROCESS, NOT FOR ONE `write` CALL, AND THE DIFFERENCE
+/// IS NOT SMALL. `write_all` calls `write` repeatedly, and a single error report
+/// is several separate `writeln!`s -- `display_error` issues three, and the
+/// tracing writer issues one per log line. A budget scoped to one call is
+/// therefore multiplied by however many writes remain, so "five seconds" would
+/// mean fifteen on the ordinary guest-not-found path and 5s x lines under
+/// `--log info`. That is not the ceiling a reader of the constant thinks it is.
+///
+/// Waiting for a SLOW reader is the feature; waiting for a STOPPED one is a hang
+/// on the path that reports why hermit is stopping. This bounds the second
+/// without capping the first per-call, by charging every wait to one budget.
+const STDERR_WAIT_BUDGET: Duration = Duration::from_secs(5);
+
+/// ⚠️ RESIDUAL, MEASURED AND NOT FIXED HERE: THIS BOUNDS ONE OS PROCESS, AND ONE
+/// HERMIT INVOCATION IS SEVERAL. A `static` lives per process, so each hermit
+/// process that writes diagnostics carries its OWN accumulator and its own full
+/// budget. Counted directly on 2026-08-26 by reading `/proc/*/fd/2` for the pipe
+/// inode while a run was in flight:
 ///
 /// ```text
-///   before RetryingStderr (eprintln!)   EXITED rc=101 immediately
-///   RetryingStderr, no ceiling          STILL RUNNING after 25s, no exit
+///   distinct processes holding that stderr pipe on fd 2: 3
+///     pid 440249  hermit
+///     pid 440255  hermit
+///     pid 440257  true      (the guest; writes no diagnostics)
 /// ```
 ///
-/// The first is wrong loudly; the second does not return at all, on the path that
-/// reports why hermit is stopping. A supervisor that hangs while reporting an
-/// error is harder to diagnose than one that dies reporting it badly.
+/// Two writing hermit processes, so the ceiling an invocation actually observes is
+/// about TWO budgets, not one. Measured end to end at `--log info` against a
+/// stopped reader: 10.66s extra over a 0.02s baseline, against a 5s budget. At
+/// `--log warn` the extra is 0.01s, because too little is written to fill the pipe
+/// at all -- the cost appears only when there is enough output to block.
 ///
-/// Five seconds is far above any real drain and far below "never". On expiry the
-/// write returns `WouldBlock`, `writeln!` gives up, the caller's `let _ =` drops
-/// that line, and hermit exits — which is the pre-existing contract for a
-/// diagnostic that cannot be delivered.
-const STDERR_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+/// So this is a real ceiling and it is NOT the one-budget ceiling the name suggests
+/// on its own. It is stated here rather than left to be discovered because an
+/// unexplained partial bound reads as a complete one. A true per-invocation ceiling
+/// needs a deadline shared across the process tree -- an absolute time computed
+/// once and inherited by children rather than a per-process accumulator -- which is
+/// filed separately and deliberately not attempted here.
+///
+/// ⚠️ ALSO OBSERVED, SAME MEASUREMENT, NOT ADDRESSED: a stopped reader turns an
+/// otherwise successful run's exit status from 0 into 125 at `--log info`. The
+/// diagnostic path failing still moves the exit code, which is the same shape as
+/// the defect this machinery exists to bound.
+/// Wall-clock already spent waiting on stderr across this process, in
+/// milliseconds. Charged against `STDERR_WAIT_BUDGET` by every diagnostic write.
+///
+/// `Relaxed` is sufficient: this is an approximate accumulator whose only reader
+/// is the comparison below, and over-shooting by one poll interval is harmless
+/// where the alternative is not returning at all.
+static STDERR_WAITED_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Reset the accumulated stderr wait. Test-only: brackets that measure the budget
+/// need each case to start from zero, and nothing in a real run wants this.
+#[doc(hidden)]
+pub fn reset_stderr_wait_budget_for_test() {
+    STDERR_WAITED_MS.store(0, Ordering::Relaxed);
+}
+
+/// The budget, exposed so a bracket can pin it BY VALUE rather than restating a
+/// literal that could drift away from the code it claims to describe.
+#[doc(hidden)]
+pub fn stderr_wait_budget() -> Duration {
+    STDERR_WAIT_BUDGET
+}
 
 impl std::io::Write for RetryingStderr {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
-        let started = std::time::Instant::now();
         loop {
             // SAFETY: `write(2)` on fd 2 reads `buf.len()` bytes from `buf`,
             // which is valid for that length, and writes no memory.
@@ -125,9 +172,15 @@ impl std::io::Write for RetryingStderr {
                     // ⚠️ BOUNDED. Waiting for a slow reader is the point; waiting
                     // for a stopped one is a hang on hermit's exit path. Give up
                     // and let the caller drop the line rather than never return.
-                    if started.elapsed() >= STDERR_WRITE_DEADLINE {
+                    // Charged against the PROCESS budget, not this call's own
+                    // elapsed time, so three writeln!s cannot each buy the full
+                    // ceiling. See STDERR_WAIT_BUDGET.
+                    if STDERR_WAITED_MS.load(Ordering::Relaxed)
+                        >= STDERR_WAIT_BUDGET.as_millis() as u64
+                    {
                         return Err(err);
                     }
+                    let waited = std::time::Instant::now();
                     // Block until the reader makes room. A failed or timed-out
                     // poll falls through to another write attempt rather than
                     // dropping the bytes.
@@ -140,6 +193,10 @@ impl std::io::Write for RetryingStderr {
                     unsafe {
                         libc::poll(&mut pfd, 1, 1000);
                     }
+                    STDERR_WAITED_MS.fetch_add(
+                        waited.elapsed().as_millis() as u64,
+                        Ordering::Relaxed,
+                    );
                     continue;
                 }
                 _ => return Err(err),

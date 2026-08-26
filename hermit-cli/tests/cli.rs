@@ -5365,6 +5365,32 @@ fn a_stopped_stderr_reader_does_not_hang_hermit_on_its_way_out() {
         Some(127),
         "giving up on an undeliverable diagnostic must not change the exit status"
     );
+
+    // ⚠️ PIN THE BOUND BY VALUE. Without this the ceiling could be raised to an
+    // hour and every assertion here would still pass: "it exited" is true at any
+    // finite bound. The test would keep reporting success about a guarantee that
+    // had quietly stopped being the one the comment describes.
+    let budget = detcore::util::stderr_wait_budget();
+    assert_eq!(
+        budget,
+        std::time::Duration::from_secs(5),
+        "the stderr wait budget moved; change this assertion deliberately and say why, \
+         or the tests below stop measuring the bound they claim to measure"
+    );
+
+    // It must actually have waited, or the bound above is satisfied by a write
+    // path that never blocked and the case went untested.
+    assert!(
+        elapsed >= budget,
+        "hermit exited in {elapsed:?}, under the {budget:?} budget: the stopped-reader \
+         wait did not happen, so this test did not exercise the ceiling at all"
+    );
+    // ⚠️ THIS TEST DOES NOT DISTINGUISH A PER-PROCESS BUDGET FROM A PER-CALL ONE,
+    // AND SAYING SO IS THE POINT. MEASURED: charging the budget per `write` call
+    // instead of per process leaves this test passing at the same 5.06s. Only ONE
+    // write blocks on this path -- the guest-not-found report is short and the
+    // first failure ends `write_all`, so the later `writeln!`s never reach a full
+    // pipe. The companion test below is the one that separates them.
 }
 
 #[test]
@@ -5806,4 +5832,101 @@ fn run_timeout_refuses_backends_where_it_cannot_bound_the_run() {
              point somewhere. backend={backend} stderr:\n{stderr}"
         );
     }
+}
+
+/// Several diagnostic writes against a stopped reader must share ONE budget.
+///
+/// ⚠️ THIS IS THE TEST THAT SEPARATES A PROCESS BUDGET FROM A PER-CALL ONE, and it
+/// needs `--log info` to do it. The guest-not-found case above blocks exactly once,
+/// so both scopes finish in the same time there and it cannot tell them apart --
+/// measured, by charging per call and watching that test still pass unchanged.
+/// Under `--log info` the tracing writer emits a line at a time, so once a
+/// 4096-byte pipe is full, write after write blocks. Charged per call each one buys
+/// the whole ceiling again; charged once for the process the total stays at one.
+#[test]
+fn many_blocked_diagnostic_writes_share_one_budget() {
+    use std::os::unix::io::FromRawFd;
+    const F_SETPIPE_SZ: i32 = 1031;
+
+    let budget = detcore::util::stderr_wait_budget();
+
+    // BASELINE FIRST, with a reader that drains. Same command, same host, so
+    // hermit's own runtime cancels out of the comparison. Without it the assertion
+    // is really "hermit is fast", which fails on a loaded box for no interesting
+    // reason.
+    let base_started = std::time::Instant::now();
+    let base = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log", "info", "run", "--", "/bin/true"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("baseline run");
+    let baseline = base_started.elapsed();
+    assert!(base.status.success(), "baseline run must succeed");
+
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    unsafe { libc::fcntl(write_fd, F_SETPIPE_SZ, 4096) };
+    let flags = unsafe { libc::fcntl(write_fd, libc::F_GETFL) };
+    unsafe { libc::fcntl(write_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+
+    let started = std::time::Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log", "info", "run", "--", "/bin/true"])
+        .stdout(std::process::Stdio::null())
+        .stderr(unsafe { std::process::Stdio::from_raw_fd(write_fd) })
+        .spawn()
+        .expect("spawn hermit");
+    // Held and never read: that is what keeps the writes returning EAGAIN.
+    let held = unsafe { std::fs::File::from_raw_fd(read_fd) };
+
+    // Bounded wait, so an unbounded loop is a RED and not a wedged runner.
+    let deadline = baseline + budget * 8;
+    let status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => break Some(status),
+            None if started.elapsed() >= deadline => {
+                let _ = child.kill();
+                break None;
+            }
+            None => thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    };
+    let elapsed = started.elapsed();
+    drop(held);
+
+    // ⚠️ THE MEASURE IS THE EXTRA TIME THE STOPPED READER COSTS, not total runtime,
+    // so hermit's own speed cancels out and a loaded box does not fail this.
+    let extra = elapsed.saturating_sub(baseline);
+    assert!(
+        status.is_some(),
+        "hermit had not exited after {elapsed:?} (baseline {baseline:?}) with a \
+         {budget:?} budget and a stopped reader under --log info: the diagnostic \
+         wait is unbounded"
+    );
+    // ⚠️ WHAT THIS PINS IS "BOUNDED", NOT "ONE BUDGET", AND THE DIFFERENCE IS
+    // MEASURED RATHER THAN GUESSED. The accumulator is a `static`, so it bounds one
+    // OS PROCESS -- and an invocation is several. Counting /proc/*/fd/2 for this
+    // pipe during a run found THREE holders: two hermit processes and the guest.
+    // Two of them write diagnostics, so the observed cost is about two budgets:
+    // 10.66s extra over a 0.02s baseline against a 5s budget.
+    //
+    // The multiple is therefore the number of hermit processes that write, and this
+    // test does NOT pin that number -- if a future change adds another writing
+    // process the cost grows and this still passes. It pins that the wait
+    // terminates and stays within a small multiple, which is the guarantee the code
+    // actually delivers. A per-invocation ceiling is filed separately.
+    assert!(
+        extra < budget * 4,
+        "a stopped reader cost {extra:?} on top of the {baseline:?} baseline with a \
+         {budget:?} budget: that is past the small multiple a per-process budget can \
+         explain (two writing hermit processes were measured), so the wait is being \
+         charged per write again or another writer appeared"
+    );
+    assert!(
+        extra >= budget,
+        "the stopped reader cost only {extra:?} with a {budget:?} budget, so nothing \
+         blocked and this test did not exercise the ceiling at all"
+    );
 }
