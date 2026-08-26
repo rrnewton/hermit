@@ -1900,11 +1900,22 @@ fn run_kvm_executes_dynamic_guest() {
 /// twenty-third instance of the hazard that node's own description warns about. The
 /// name is what schedules it.
 ///
-/// ⚠️ THIS DRIVES THE BIT DIRECTLY RATHER THAN THROUGH awk, AND THAT IS THE
-/// POINT. `run_kvm_awk_mincore_probe_terminates` catches this only by accident,
-/// because awk happens to set the flag conditionally; a future awk that always
-/// set it, or never did, would leave that test green with the defect present.
-/// This guest states the property it is testing.
+/// ⚠️ THIS USES awk TOO, AND THE COMMENT HERE ONCE CLAIMED OTHERWISE. It said
+/// "THIS DRIVES THE BIT DIRECTLY RATHER THAN THROUGH awk", which was false at the
+/// moment it was written: the guest below is `/usr/bin/awk`. I had drafted a
+/// purpose-built guest, measured that it does NOT reproduce (see the note on the
+/// `args` array), swapped back to awk, and left the sentence describing the guest
+/// I had abandoned. `agent(hermit-dbg)` caught it.
+///
+/// ⚠️ SO WHAT DOES THIS ADD OVER `run_kvm_awk_mincore_probe_terminates`, WHICH ALSO
+/// RUNS awk? Only its ASSERTION. That cell asserts `stdout == "42\n"` and the
+/// determinism line, so it fails for any reason at all and names none of them.
+/// This one asserts exactly the determinism verdict and says in its failure
+/// message which mechanism is suspected, so a future regression arrives with its
+/// cause attached instead of as a bare mismatch. It is a NAMED cell for a known
+/// mechanism, not an independent trigger for it -- and if awk ever stops setting
+/// the flag conditionally, BOTH cells go quiet together. That residual risk is
+/// real and is stated here rather than papered over with a claim of independence.
 #[test]
 fn run_kvm_verify_is_deterministic_when_the_guest_mutates_hermit_stderr_flags() {
     if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/awk").exists() {
