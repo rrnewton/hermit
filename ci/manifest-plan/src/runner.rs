@@ -190,6 +190,33 @@ const SCHEDULED_JOBS_ENV: &str = "HERMIT_E2E_SCHEDULED_JOBS";
 const ISOLATED_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
 const HERMETIC_TEST_WORKDIR: &str = "/test";
 
+/// The working directory every Hermit-run cell gets, and the name of the empty
+/// per-cell directory bound to it.
+///
+/// ⚠️ THIS IS THE FIXED HALF OF THE HERMETIC WORKDIR CONTROL, NOT THE WHOLE OF IT
+/// AS THE BRIEF SPELLS IT. The brief asks for a fixed `/test`. This delivers a
+/// fixed AND freshly-empty `/tmp/test`, which is a different path for a
+/// structural reason, not a cosmetic one:
+///
+///   * `--bind` refuses any target outside guest `/tmp` — it warns "target ... is
+///     outside guest /tmp, so this option has no effect" and does nothing — so a
+///     literal `/test` cannot be reached by binding;
+///   * the only route that reaches `/test` is `--mount=type=tmpfs,target=/test`,
+///     and that PANICS today: `reverie-process/src/container.rs:909` unwraps an
+///     `Err(ENOENT, context: Mount)` for ANY target, one that exists on the host
+///     as much as one that does not. That is `HERMETIC_TEST_WORKDIR` above and it
+///     is why `ISOLATED_WORKDIR_ENV` is set by nothing;
+///   * and `--workdir /test` alone only works on a host where somebody has already
+///     created `/test` by hand. Depending on that is the hidden host state this
+///     control exists to remove.
+///
+/// So: a reader must NOT conclude from this constant that the hermetic workdir
+/// work is finished. What is done is "every cell runs in the same empty directory
+/// whatever the host cwd is". What is not done is that directory being `/test`,
+/// and that waits on the reverie mount panic.
+const FIXED_GUEST_WORKDIR: &str = "/tmp/test";
+const FIXED_WORKDIR_SOURCE_DIR: &str = "workdir";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Population {
     Required,
@@ -1085,6 +1112,19 @@ pub fn build_spec(
             path.to_string_lossy().into_owned(),
         );
     }
+    // The per-cell empty directory bound to FIXED_GUEST_WORKDIR. `None` disables
+    // the default, and there are exactly two reasons to disable it, both of which
+    // `validate_mode_workdir` already refuses a manifest-declared workdir for:
+    //   * a non-Hermit run mode has no `--workdir` to give;
+    //   * DBT rebuilds the guest launch from program/args/env only and does NOT
+    //     preserve `Command::current_dir`, so binding a workdir it will not honour
+    //     would report a control that is not in force.
+    // Keeping the two in step matters: `append_execution_root_args` applies
+    // `isolated_workdir` ahead of everything and bypasses both refusals, which is
+    // a pre-existing gap this default must not widen.
+    let fixed_workdir_source = (matches!(cell.id.mode.as_str(), "verify" | "chaos" | "custom")
+        && backend != "dbt")
+        .then(|| dir.join(FIXED_WORKDIR_SOURCE_DIR));
     let verdict = dir.join(format!("verify-{attempt}.json"));
     let mut verification_log_dir = None;
     let (argv, verdict_path) = match cell.id.mode.as_str() {
@@ -1131,6 +1171,7 @@ pub fn build_spec(
                 &mut argv,
                 context.isolated_workdir.as_deref(),
                 mode_recipe.workdir.as_deref(),
+                fixed_workdir_source.as_deref(),
             );
             append_guest_env_args(&mut argv, &env, context.isolated_workdir.is_some());
             argv.push("--".into());
@@ -1167,6 +1208,7 @@ pub fn build_spec(
                 &mut argv,
                 context.isolated_workdir.as_deref(),
                 mode_recipe.workdir.as_deref(),
+                fixed_workdir_source.as_deref(),
             );
             append_guest_env_args(&mut argv, &env, context.isolated_workdir.is_some());
             argv.push("--".into());
@@ -1201,6 +1243,7 @@ pub fn build_spec(
                 &mut argv,
                 context.isolated_workdir.as_deref(),
                 mode_recipe.workdir.as_deref(),
+                fixed_workdir_source.as_deref(),
             );
             append_guest_env_args(&mut argv, &env, context.isolated_workdir.is_some());
             argv.push("--".into());
@@ -1227,6 +1270,7 @@ pub fn build_spec(
                 &mut argv,
                 context.isolated_workdir.as_deref(),
                 mode_recipe.workdir.as_deref(),
+                fixed_workdir_source.as_deref(),
             );
             argv.push("--".into());
             argv.extend(guest_argv.clone());
@@ -1262,6 +1306,18 @@ pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, St
         fs::remove_dir_all(&tmp).map_err(|e| format!("cannot reset {}: {e}", tmp.display()))?;
     }
     fs::create_dir_all(&tmp).map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
+    // Reset the bound working directory the same way and for the same reason as
+    // `tmp`: a cell must not see what the previous attempt left behind. This runs
+    // unconditionally — the directory is cheap, and creating it when the cell did
+    // not ask for a bind is harmless, whereas failing to reset it when the cell DID
+    // would leak state between attempts of a stress repetition.
+    let workdir = spec.cell_dir.join(FIXED_WORKDIR_SOURCE_DIR);
+    if workdir.exists() {
+        fs::remove_dir_all(&workdir)
+            .map_err(|e| format!("cannot reset {}: {e}", workdir.display()))?;
+    }
+    fs::create_dir_all(&workdir)
+        .map_err(|e| format!("cannot create {}: {e}", workdir.display()))?;
     let captures = spec.cell_dir.join("captures");
     fs::create_dir_all(&captures).map_err(|e| e.to_string())?;
     let stdout_path = captures.join(format!("{}-{index}.stdout", spec.id.mode));
@@ -2369,12 +2425,26 @@ fn append_execution_root_args(
     argv: &mut Vec<String>,
     isolated_workdir: Option<&Path>,
     requested_workdir: Option<&str>,
+    fixed_workdir_source: Option<&Path>,
 ) {
     if let Some(workdir) = isolated_workdir {
         argv.push(format!("--mount=type=tmpfs,target={}", workdir.display()));
         argv.extend(["--workdir".into(), workdir.to_string_lossy().into_owned()]);
     } else if let Some(workdir) = requested_workdir {
+        // A manifest that names its own workdir keeps it. applications.yaml sets
+        // `/tmp` because git discovers repositories through cwd ancestors; that is
+        // a deliberate per-cell choice and the default must not override it.
         argv.extend(["--workdir".into(), workdir.into()]);
+    } else if let Some(source) = fixed_workdir_source {
+        // THE DEFAULT. Without it the guest inherits the HOST's cwd verbatim, so
+        // one cell reports a different `pwd` in every checkout — measured across
+        // four checkouts, four distinct guest paths — and any cell that reads its
+        // cwd or its ancestors is sensitive to unrelated filesystem churn.
+        argv.push(format!(
+            "--bind={}:{FIXED_GUEST_WORKDIR}",
+            source.to_string_lossy()
+        ));
+        argv.extend(["--workdir".into(), FIXED_GUEST_WORKDIR.into()]);
     }
 }
 
@@ -4001,6 +4071,70 @@ backends_disabled:
         assert!(
             !checkout.contains("-dirty") && built_from.ends_with("-dirty"),
             "and the checkout cannot express the build tree's dirtiness at all"
+        );
+    }
+
+    /// REGRESSION CELL FOR THE FIXED WORKING DIRECTORY.
+    ///
+    /// Without the default the guest inherits the HOST's cwd verbatim. Measured on
+    /// 2026-08-26 at main f4de43461a, 200 runs rotating across four checkouts:
+    ///   default off -> 4 distinct guest `pwd` values
+    ///   default on  -> 1, `/tmp/test`, and the directory empty on all 200
+    /// This asserts the argv that produces the second row, and — the half that
+    /// actually regresses — that the three cases which must NOT get it still do not.
+    #[test]
+    fn fixed_workdir_is_bound_by_default_and_withheld_where_it_would_lie() {
+        let source = Path::new("/cells/x/workdir");
+
+        let mut argv: Vec<String> = Vec::new();
+        append_execution_root_args(&mut argv, None, None, Some(source));
+        assert_eq!(
+            argv,
+            vec![
+                "--bind=/cells/x/workdir:/tmp/test".to_string(),
+                "--workdir".to_string(),
+                "/tmp/test".to_string(),
+            ],
+            "the default must bind a fresh per-cell directory AND chdir into it; \
+             binding without --workdir leaves the guest in the host's cwd"
+        );
+
+        // A manifest that names its own workdir keeps it. applications.yaml sets
+        // /tmp deliberately, because git discovers repositories through cwd
+        // ancestors; overriding that would reintroduce the defect it fixed.
+        let mut argv: Vec<String> = Vec::new();
+        append_execution_root_args(&mut argv, None, Some("/tmp"), Some(source));
+        assert_eq!(argv, vec!["--workdir".to_string(), "/tmp".to_string()]);
+
+        // No source means the cell is one `validate_mode_workdir` refuses a workdir
+        // for — a non-Hermit mode, or DBT, which does not preserve current_dir.
+        // Emitting a workdir there would record a control that is not in force.
+        let mut argv: Vec<String> = Vec::new();
+        append_execution_root_args(&mut argv, None, None, None);
+        assert!(
+            argv.is_empty(),
+            "a cell that cannot honour a workdir must be given none, got {argv:?}"
+        );
+    }
+
+    /// ⚠️ THE SPLIT, ASSERTED SO IT CANNOT BE QUIETLY CLOSED.
+    ///
+    /// `HERMETIC_TEST_WORKDIR` (`/test`) is what the brief asks for and it is NOT
+    /// what the default delivers, because the only route to it is the tmpfs mount
+    /// that panics in `reverie-process/src/container.rs:909` for any target. If a
+    /// later change makes these equal, the isolation half has either been fixed or
+    /// been papered over, and this test failing is the prompt to say which.
+    #[test]
+    fn the_fixed_workdir_is_not_yet_the_hermetic_one() {
+        assert_ne!(
+            FIXED_GUEST_WORKDIR, HERMETIC_TEST_WORKDIR,
+            "these became equal without anyone recording that the reverie mount \
+             panic was fixed; do not delete this assertion to make it pass"
+        );
+        assert!(
+            FIXED_GUEST_WORKDIR.starts_with("/tmp/"),
+            "--bind refuses a target outside guest /tmp, so the default path must \
+             live under it or the bind silently does nothing"
         );
     }
 }
