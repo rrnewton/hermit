@@ -21,7 +21,7 @@ agreeing with each other.
 
 | Rung | Bounds | Value comes from | How it stops the run | Reports |
 | --- | --- | --- | --- | --- |
-| `hermit run --timeout N` | **one hermit invocation** = one guest execution | the caller's argument | hermit drops the guest future and unwinds its own container | exit 124, `HERMIT_RUN_TIMEOUT class=run-timeout` |
+| `hermit run --timeout N` | **one hermit invocation** = one guest execution, **ptrace and liteinst only** | the caller's argument | hermit drops the guest future and unwinds its own container | exit 124, `HERMIT_RUN_TIMEOUT class=run-timeout` |
 | hermit's unwind fallback | the same invocation, `N + 10s` | `RUN_TIMEOUT_UNWIND_GRACE` in `hermit-cli/src/lib.rs` | `_exit(124)` from a `SIGALRM` handler; no destructors | exit 124, `HERMIT_RUN_TIMEOUT_FALLBACK` |
 | `hermit record --record-timeout N` | one recording | the caller's argument | `_exit(124)` from a `SIGALRM` handler | exit 124 |
 | nextest `slow-timeout` | **one cargo test process**, which may invoke hermit zero or many times | `.config/nextest.toml`: 15s default, two named 30s overrides | `SIGTERM` to the test binary, 2s grace, then `SIGKILL` | wrapper exit 100, test named by nextest |
@@ -89,6 +89,37 @@ That last row is the useful one. **A cell that times out with no class line mean
 no inner bound fired**, which is either a missing `--timeout` or an inner bound
 set larger than the outer one. Both are configuration errors, and the marker's
 absence is what distinguishes them from a genuinely slow guest.
+
+## `--timeout` is qualified per backend, and refuses elsewhere
+
+⚠️ **A TIMEOUT FLAG READS AS BACKEND-AGNOSTIC AND THIS ONE IS NOT.** Measured
+2026-08-26 with `--timeout 3` against a guest that never exits, two runs each:
+
+| Backend | Elapsed | Marker | Meaning |
+| --- | --- | --- | --- |
+| `ptrace` | 3s | `class=run-timeout` | bound works, container unwound |
+| `liteinst` | 3s | `class=run-timeout` | bound works, container unwound |
+| `kvm` | 13s | `HERMIT_RUN_TIMEOUT_FALLBACK` | bound holds, but ONLY via the hard fallback |
+| `sabre` | 40s | none | **did not bound the run at all** |
+| `dbt` | 20s | none | **did not bound the run at all** |
+
+The 40s and 20s are the *harness's* own deadline, not hermit's, and the missing
+marker is exactly the "exit 124 with no marker" reading above. All five backends
+run correctly **without** the flag, so this is the bound failing rather than the
+backend. `sabre` additionally panicked in reverie's blocking RPC transport after
+69 seconds, which is the likely mechanism: a blocking call on the single
+`current_thread` runtime the timer needs.
+
+So `--timeout` **refuses** (exit 122, `HERMIT_POLICY_REFUSAL`) on any backend
+other than `ptrace` and `liteinst`, rather than accepting a bound it cannot
+enforce. `kvm` is refused for a softer reason than the other two: it does bound
+the run, but every KVM timeout would take the hard `_exit` path and emit the
+marker that is supposed to mean *the unwind failed*, destroying the signal that
+marker carries. Qualify a backend by finding out why the runtime never reaches
+the timer — not by widening the list.
+
+Fail-closed, so a new backend must be qualified deliberately instead of
+inheriting a guarantee nobody measured for it.
 
 ## The invariant
 

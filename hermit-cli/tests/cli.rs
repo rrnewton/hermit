@@ -5666,3 +5666,62 @@ fn run_timeout_fallback_fires_when_the_unwind_does_not_finish() {
          gentle path does not."
     );
 }
+
+/// `--timeout` refuses a backend where it was measured not to bound the run.
+///
+/// ⚠️ THE BACKENDS ARE NAMED INDIVIDUALLY, NOT LOOPED OVER A LIST, so adding a
+/// backend does not silently inherit a guarantee nobody measured for it.
+///
+/// Measured 2026-08-26 with `--timeout 3` on a guest that never exits, two runs
+/// each: ptrace and liteinst stopped at 3s reporting `class=run-timeout`; kvm
+/// stopped only via the hard fallback at 13s; sabre ran 40s and dbt ran 20s and
+/// neither produced any marker at all -- those elapsed times are the harness's
+/// own deadline, not hermit's. All five run correctly WITHOUT the flag, so it is
+/// the bound that fails, not the backend.
+///
+/// ⚠️ `dbt` IS THE LOAD-BEARING CASE. The `RunOpts::main` DBT arm returns
+/// `run_dbt(..)` and never reaches `RunOpts::run`, so the first version of this
+/// check -- placed in `run()` -- covered every backend EXCEPT the one furthest
+/// from working, and dbt still accepted the flag and ran unbounded. Same shape
+/// as the `--namespace-only` second launch path. Move the check back into
+/// `run()` and this cell fails on dbt while the others still pass.
+#[test]
+fn run_timeout_refuses_backends_where_it_cannot_bound_the_run() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    for backend in ["sabre", "dbt", "kvm"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+            .args([
+                "run",
+                "--backend",
+                backend,
+                "--timeout",
+                "3",
+                "--",
+                "/bin/echo",
+                "unreachable",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run hermit");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+        assert_eq!(
+            output.status.code(),
+            Some(122),
+            "`--timeout` on `{backend}` must REFUSE (122), not accept a bound it \
+             cannot enforce. Got {:?}. stderr:\n{stderr}",
+            output.status
+        );
+        assert!(
+            stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+            "a refusal is hermit working, and must not be reported as a failure. \
+             backend={backend} stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("not qualified"),
+            "the refusal must say the bound is unqualified on this backend, and \
+             point somewhere. backend={backend} stderr:\n{stderr}"
+        );
+    }
+}
