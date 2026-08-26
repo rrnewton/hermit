@@ -4705,3 +4705,105 @@ fn a_signal_killed_container_reports_a_signal_death_not_a_refusal() {
         "a signal death is not a hermit failure\nstderr:\n{stderr}"
     );
 }
+
+/// `--sigint-instakill` reports a SIGNAL DEATH, not a policy refusal.
+///
+/// ⚠️ THIS IS THE PRODUCER, AND IT IS A DIFFERENT CLAIM FROM THE CLASSIFIER.
+/// `a_signal_killed_container_reports_a_signal_death_not_a_refusal` signals the
+/// CONTAINER, which runs `on_container_init_stop_signal` and never touches
+/// `unrecoverable_shutdown`. agent(hermit-007)'s codex lane proved that by
+/// mutation: reverting the producer at `detcore/src/lib.rs` from
+/// `HERMIT_SIGINT_DEATH_EXIT` to `HERMIT_POLICY_REFUSAL_EXIT` left the whole
+/// suite green. This test is what closes that: the signal goes to the GUEST, so
+/// detcore's `handle_signal_event` runs and `sigint_instakill` chooses the code.
+///
+/// ⚠️ THE GUEST IS FOUND BY WALKING `/proc`, NOT BY `pgrep -f`. A pattern search
+/// matches the searching process's own command line -- three probes for this test
+/// signalled themselves before this was written, one of them exiting 130 from its
+/// own SIGINT and looking briefly like a product result.
+#[test]
+fn sigint_instakill_reports_a_signal_death_not_a_policy_refusal() {
+    use std::io::Read;
+
+    fn parent_of(pid: i32) -> Option<i32> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat.rsplit_once(')')?
+            .1
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
+    }
+    fn children_of(pid: i32) -> Vec<i32> {
+        std::fs::read_dir("/proc")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+            .filter(|c| parent_of(*c) == Some(pid))
+            .collect()
+    }
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["run", "--sigint-instakill", "--", "/bin/cat"])
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn the sigint-instakill run");
+    let stdin = child.stdin.take().expect("piped stdin");
+
+    // hermit -> container init -> guest. Poll: the two forks must both have
+    // happened before there is a guest to signal.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let guest = loop {
+        let found = children_of(child.id() as i32)
+            .into_iter()
+            .flat_map(children_of)
+            .next();
+        if let Some(pid) = found {
+            break Some(pid);
+        }
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let guest = guest.expect("the guest never appeared under the container within 30s");
+
+    // Verify WHICH process is being signalled rather than trusting the walk.
+    let comm = std::fs::read_to_string(format!("/proc/{guest}/comm")).unwrap_or_default();
+    assert_eq!(comm.trim(), "cat", "walked to the wrong process: {comm:?}");
+
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    // SAFETY: `kill` on a pid in this process's own tree, verified above.
+    assert_eq!(
+        unsafe { libc::kill(guest, libc::SIGINT) },
+        0,
+        "SIGINT to guest failed"
+    );
+
+    // ⚠️ CLOSE STDIN AFTER SIGNALLING, BEFORE WAITING. This one line is the
+    // difference between measuring the fix and measuring nothing. With it held
+    // open through the wait, this reported `code=None signal=Some(2)` -- the
+    // CONTROL outcome, as though the flag were absent -- and I spent six
+    // eliminations blaming the cargo harness for it. The guest is blocked in a
+    // read on this pipe; the signal alone does not retire the run.
+    drop(stdin);
+    let status = child
+        .wait()
+        .expect("failed to wait for the interrupted run");
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+
+    assert_eq!(
+        status.code(),
+        Some(detcore_model::HERMIT_SIGINT_DEATH_EXIT),
+        "sigint_instakill must report 128 + SIGINT, not a policy refusal\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("HERMIT_POLICY_REFUSAL"),
+        "an operator interrupt is not a policy refusal -- hermit refused nothing\n{stderr}"
+    );
+}
