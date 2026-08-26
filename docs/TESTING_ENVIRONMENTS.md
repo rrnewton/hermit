@@ -178,6 +178,17 @@ sub-five-minute sentinel: one CPUID test, one direct PMU overflow/skid probe,
 and one KVM multi-mode E2E cell. Broad product and stress coverage remains in
 portable or scheduled validation.
 
+## Named measurement hosts
+
+`ci/dag/*.json` is scanned by `scripts/check-portable-paths.sh`, which refuses a
+literal hostname there; this file is not scanned, so the identity of a
+measurement host belongs here and is referenced from the DAG rather than
+deleted. A measurement whose host is unrecorded cannot be re-run or challenged.
+
+| lane / node | measured on | what was measured |
+| --- | --- | --- |
+| `privileged` lane, node `test.cli_kvm` | `devbig014` | `/dev/kvm` mode 666; `open(O_RDWR)` succeeds; `KVM_GET_API_VERSION` = 12; `hermit run --backend kvm` exits 0 |
+
 ## Hardware-sensitive Cargo tests
 
 Named tests and the capabilities they require. Paths are relative to the repo
