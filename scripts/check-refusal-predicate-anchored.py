@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Refuse a refusal-classification predicate that matches a marker unanchored.
+"""Refuse a refusal predicate that does not strip and anchor each line.
 
 ⚠️ THE CHANNEL CARRIES MORE THAN THE PRODUCER WRITES. A predicate that decides
 "did the child DECLINE, or did it FAIL?" by asking whether a marker appears
@@ -39,16 +39,15 @@ or a regex anchored per line under `re.MULTILINE`. Anchoring is what distinguish
 producing program's own line-initial output from a quotation of it inside
 somebody else's line.
 
-⚠️ STRIP BEFORE ANCHORING. This file previously recommended a bare
-`line.startswith(shape)` and that advice was WRONG. Measured by
+⚠️ STRIP BEFORE ANCHORING. A bare `line.startswith(shape)` is not an
+acceptable substitute. Measured by
 `agent(hermit-101)` on hermit#2699: `RunSummary::refused` puts its reasons in
 `detail` and the renderer indents every detail line by three spaces
 (`scripts/validate.rs:11068`), so of the three real shapes only
 "validate: REFUSED" is at column zero. A bare `startswith` would have stopped
 recognising TWO OF THREE genuine declines -- converting a false positive into a
-false negative, which is the worse direction. The checker cannot tell the two
-forms apart (both are anchored), so the only defence is that this text names the
-right one.
+false negative, which is the worse direction. The checker therefore refuses the
+bare form as well as matching against the whole captured log.
 
 ⚠️ THIS IS PYTHON, NOT rust-script, AND THAT IS DELIBERATE. `AGENTS.md` prefers
 rust-script for new scripts. rust-script compiles, and this was written under an
@@ -57,7 +56,7 @@ is a reasonable follow-up and needs no behaviour change; the detection rule is
 twelve lines of AST walk.
 
 EXIT STATUS
-    0  no unanchored refusal predicate found
+    0  no refusal predicate missing the required line handling was found
     1  at least one found -- each named with file, line, and the offending call
     2  usage error / could not parse a file it was asked to check
 """
@@ -196,6 +195,10 @@ class _Scan(ast.NodeVisitor):
             return node.id in self.markers or any(node.id in f for f in self.marks)
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             return False
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+            return any(self._marker_derived(element) for element in node.elts)
+        if isinstance(node, ast.Starred):
+            return self._marker_derived(node.value)
         if isinstance(node, ast.Subscript):
             return self._marker_derived(node.value)
         if isinstance(node, ast.Call):
@@ -207,6 +210,17 @@ class _Scan(ast.NodeVisitor):
                 for v in node.values
                 if isinstance(v, ast.FormattedValue)
             )
+        return False
+
+    def _leading_whitespace_removed(self, node: ast.AST) -> bool:
+        """Whether a line-bound value has had leading whitespace removed."""
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            return False
+        method = node.func.attr
+        if method in ("strip", "lstrip"):
+            return not node.args and not node.keywords and self._line_bound(node.func.value)
+        if method in CHANNEL_PRESERVING:
+            return self._leading_whitespace_removed(node.func.value)
         return False
 
     def _push(self, gens) -> int:
@@ -259,8 +273,28 @@ class _Scan(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         f = node.func
-        # `output.find(shape) >= 0` -- same test, different method. claude rewrite 2.
+        # `line.startswith(shape)` is anchored at column zero, but real refusal
+        # detail lines are indented by the validate renderer. Require the line to
+        # have leading whitespace removed before startswith, or two of the three
+        # genuine decline forms are missed. Also refuse start/end arguments: a
+        # nonzero start means the check is no longer anchored at the beginning.
+        # One starred AST argument can expand to both the marker and that start.
         if (
+            isinstance(f, ast.Attribute)
+            and f.attr == "startswith"
+            and len(node.args) >= 1
+            and self._marker_derived(node.args[0])
+            and self._line_bound(f.value)
+            and (
+                len(node.args) != 1
+                or any(isinstance(arg, ast.Starred) for arg in node.args)
+                or node.keywords
+                or not self._leading_whitespace_removed(f.value)
+            )
+        ):
+            self.hits.append((node.lineno, ast.unparse(node)))
+        # `output.find(shape) >= 0` -- same test, different method. claude rewrite 2.
+        elif (
             isinstance(f, ast.Attribute)
             and f.attr in SUBSTRING_SEARCHES
             and len(node.args) >= 1
@@ -348,7 +382,11 @@ def main(argv: list[str]) -> int:
     if not root.exists():
         print(f"check-refusal-predicate-anchored: no such path: {root}", file=sys.stderr)
         return 2
-    targets = sorted(root.rglob("*.py")) if root.is_dir() else [root]
+    targets = (
+        sorted(path for path in root.rglob("*.py") if ".git" not in path.parts)
+        if root.is_dir()
+        else ([] if ".git" in root.parts else [root])
+    )
     # ⚠️ FAIL CLOSED ON AN EMPTY CORPUS. This previously printed
     # "OK -- no unanchored refusal predicate" and returned 0 when it had scanned
     # NOTHING. A rename, a move, or a typo in the Makefile line would have
@@ -368,8 +406,6 @@ def main(argv: list[str]) -> int:
         return 1
     bad = 0
     for path in targets:
-        if "/.git/" in str(path):
-            continue
         try:
             found = offences(path)
         except Unreadable as error:
@@ -378,18 +414,21 @@ def main(argv: list[str]) -> int:
         for lineno, src in found:
             bad += 1
             print(
-                f"{path}:{lineno}: refusal marker matched UNANCHORED against a whole "
-                f"channel: {src}",
+                f"{path}:{lineno}: refusal marker is not matched with "
+                f"line.strip().startswith(...): {src}",
                 file=sys.stderr,
             )
     if bad:
         print(
-            f"\ncheck-refusal-predicate-anchored: REFUSED -- {bad} unanchored "
-            f"refusal predicate(s).\n" + REMEDY,
+            f"\ncheck-refusal-predicate-anchored: REFUSED -- {bad} refusal "
+            f"predicate(s) do not strip and anchor each line.\n" + REMEDY,
             file=sys.stderr,
         )
         return 1
-    print("check-refusal-predicate-anchored: OK -- no unanchored refusal predicate.")
+    print(
+        "check-refusal-predicate-anchored: OK -- every refusal predicate strips "
+        "and anchors each line."
+    )
     return 0
 
 
@@ -454,6 +493,76 @@ _REFUSAL_SHAPES = ("refused by:",)
 def looks_refused(output):
     return any(
         line.startswith(shape) for line in output.splitlines() for shape in _REFUSAL_SHAPES
+    )
+'''
+
+F_STARTS_AFTER_BEGINNING = '''
+_REFUSAL_SHAPES = ("refused by:",)
+def looks_refused(output):
+    return any(
+        line.strip().startswith(shape, 1)
+        for line in output.splitlines()
+        for shape in _REFUSAL_SHAPES
+    )
+'''
+
+F_TUPLE_UNSTRIPPED = '''
+_REFUSAL_SHAPES = ("refused by:",)
+def looks_refused(output):
+    return any(
+        line.startswith((shape,))
+        for line in output.splitlines()
+        for shape in _REFUSAL_SHAPES
+    )
+'''
+
+F_TUPLE_STARTS_AFTER_BEGINNING = '''
+_REFUSAL_SHAPES = ("refused by:",)
+def looks_refused(output):
+    return any(
+        line.strip().startswith((shape,), 1)
+        for line in output.splitlines()
+        for shape in _REFUSAL_SHAPES
+    )
+'''
+
+F_LIST_DERIVED = '''
+_REFUSAL_SHAPES = ("refused by:",)
+def looks_refused(output):
+    return any(
+        line.startswith(tuple([shape]))
+        for line in output.splitlines()
+        for shape in _REFUSAL_SHAPES
+    )
+'''
+
+F_SET_DERIVED = '''
+_REFUSAL_SHAPES = ("refused by:",)
+def looks_refused(output):
+    return any(
+        line.startswith(tuple({shape}))
+        for line in output.splitlines()
+        for shape in _REFUSAL_SHAPES
+    )
+'''
+
+F_STARRED_DERIVED = '''
+_REFUSAL_SHAPES = ("refused by:",)
+def looks_refused(output):
+    return any(
+        line.startswith((*[shape],))
+        for line in output.splitlines()
+        for shape in _REFUSAL_SHAPES
+    )
+'''
+
+F_STARRED_STARTS_AFTER_BEGINNING = '''
+_REFUSAL_SHAPES = ("refused by:",)
+def looks_refused(output):
+    return any(
+        line.strip().startswith(*(shape, 1))
+        for line in output.splitlines()
+        for shape in _REFUSAL_SHAPES
     )
 '''
 
@@ -559,8 +668,23 @@ def self_test() -> int:
     check("unrelated marker collection", F_UNRELATED, False)
     check("name test, this checker's own shape", F_NAME_TEST, False)
     check("benign single-arg uses of a marker are NOT flagged", F_BENIGN_CALL, False)
-    print("KNOWN LIMIT -- anchored-but-unstripped passes; only the remedy text warns:")
-    check("bare startswith, misses indented shapes", F_UNSTRIPPED, False)
+    print("REFUSES startswith without removing indentation first:")
+    check("bare startswith, misses indented shapes", F_UNSTRIPPED, True)
+    check("startswith begins after the start of the line", F_STARTS_AFTER_BEGINNING, True)
+    check("tuple of markers with bare startswith", F_TUPLE_UNSTRIPPED, True)
+    check(
+        "tuple of markers begins after the start of the line",
+        F_TUPLE_STARTS_AFTER_BEGINNING,
+        True,
+    )
+    check("marker nested in a list", F_LIST_DERIVED, True)
+    check("marker nested in a set", F_SET_DERIVED, True)
+    check("marker nested under a starred element", F_STARRED_DERIVED, True)
+    check(
+        "starred arguments include a start after the beginning",
+        F_STARRED_STARTS_AFTER_BEGINNING,
+        True,
+    )
     print("codex-4 EXIT-STATUS CONTRACT:")
     with tempfile.TemporaryDirectory() as d:
         broken = Path(d) / "broken.py"
@@ -575,6 +699,10 @@ def self_test() -> int:
         empty = Path(d) / "empty_corpus"
         empty.mkdir()
         check_rc("EMPTY CORPUS FAILS CLOSED, not 0", 1, str(empty))
+        git_only = Path(d) / "git_only_corpus"
+        (git_only / ".git").mkdir(parents=True)
+        (git_only / ".git" / "ignored.py").write_text("x = 1\n", encoding="utf-8")
+        check_rc("CORPUS WITH ONLY .git PYTHON FAILS CLOSED, not 0", 1, str(git_only))
 
     if failures:
         print(f"check-refusal-predicate-anchored --self-test: {failures} case(s) FAILED", file=sys.stderr)
