@@ -2635,6 +2635,19 @@ mod tests {
         assert!(!liteinst_requires_forced_shutdown(ExitStatus::Exited(121)));
         assert!(!liteinst_requires_forced_shutdown(ExitStatus::Exited(128)));
         assert!(!liteinst_requires_forced_shutdown(ExitStatus::Exited(200)));
+        // ⚠️ THE BAND EDGES, WHICH THIS TEST STOPPED SHORT OF. It went up to 143
+        // and then jumped to 200, so `MAX_SIGNO` could shrink from 64 to 15 with
+        // every row still green -- proved vacuous by agent(hermit-005)'s codex
+        // lane. 192 is `128 + SIGRTMAX`, the last status in the band; 193 is the
+        // first outside it. Testing a range in the middle pins nothing at either end.
+        assert!(
+            liteinst_requires_forced_shutdown(ExitStatus::Exited(192)),
+            "128 + SIGRTMAX is still a signal death and must force shutdown"
+        );
+        assert!(
+            !liteinst_requires_forced_shutdown(ExitStatus::Exited(193)),
+            "above SIGRTMAX the status is the guest's own and must NOT force shutdown"
+        );
     }
 
     /// ⚠️ The bare `NotFound` here was read as a git-worktree bug and cost real

@@ -122,6 +122,22 @@ pub const fn signal_from_exit_status(status: i32) -> Option<i32> {
 const _: () = assert!(matches!(signal_from_exit_status(130), Some(2)));
 const _: () = assert!(matches!(signal_from_exit_status(143), Some(15)));
 const _: () = assert!(signal_from_exit_status(SIGNAL_EXIT_BASE).is_none());
+// ⚠️ THE UPPER EDGE, WHICH WAS UNPINNED WHILE THIS COMMENT CLAIMED IT WAS NOT.
+// agent(hermit-005)'s codex lane proved it vacuous: `MAX_SIGNO` 64 -> 15 left
+// every test green, so nothing held the top of the band. 192 is `128 + SIGRTMAX`
+// and is the last status that IS a signal; 193 is the first that is not and
+// belongs to the guest. A band needs both edges or it has one.
+const _: () = assert!(
+    matches!(
+        signal_from_exit_status(SIGNAL_EXIT_BASE + MAX_SIGNO),
+        Some(MAX_SIGNO)
+    ),
+    "128 + SIGRTMAX is the last status in the band"
+);
+const _: () = assert!(
+    signal_from_exit_status(SIGNAL_EXIT_BASE + MAX_SIGNO + 1).is_none(),
+    "above SIGRTMAX a status is the guest's own number, not a signal"
+);
 const _: () = assert!(
     signal_from_exit_status(HERMIT_POLICY_REFUSAL_EXIT).is_none(),
     "a policy refusal must not also parse as a signal death"

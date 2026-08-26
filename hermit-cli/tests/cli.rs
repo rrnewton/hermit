@@ -4634,11 +4634,13 @@ fn a_guest_exiting_a_reserved_status_is_not_reported_as_hermit() {
 /// ⚠️ SCOPE, STATED SO THE COVERAGE IS NOT OVERCLAIMED. This exercises
 /// `on_container_init_stop_signal` and the parent's `SignalDeath` arm. It does
 /// NOT exercise `--sigint-instakill`, which governs a SIGINT delivered to the
-/// GUEST inside the namespace; that remains uncovered.
+/// GUEST inside the namespace. ⚠️ THAT IS NOW COVERED, by
+/// `sigint_instakill_reports_a_signal_death_not_a_policy_refusal` below; this
+/// sentence said otherwise for three heads after the cell existed, which
+/// agent(hermit-005)'s codex lane caught. The two cells exercise DIFFERENT
+/// producers and both are needed -- that is why this one is still here.
 #[test]
 fn a_signal_killed_container_reports_a_signal_death_not_a_refusal() {
-    use std::io::Read;
-
     // ⚠️ THE GUEST MUST BLOCK ON REAL I/O, NOT ON A CLOCK -- see above. A read on
     // a pipe nobody writes to is not determinized, so it holds the run open in
     // wall-clock time.
@@ -4646,6 +4648,9 @@ fn a_signal_killed_container_reports_a_signal_death_not_a_refusal() {
         .args(["run", "--", "/bin/cat"])
         .stdin(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        // Own process group, so `wait_bounded` can reach namespace descendants
+        // with a negative pid rather than only the direct child.
+        .process_group(0)
         .spawn()
         .expect("failed to spawn the container under test");
     let _stdin = child.stdin.take().expect("piped stdin");
@@ -4685,10 +4690,7 @@ fn a_signal_killed_container_reports_a_signal_death_not_a_refusal() {
     // and the wait is bounded so it cannot wedge if it still does not.
     drop(_stdin);
     let status = wait_bounded(&mut child, "a_signal_killed_container");
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_string(&mut stderr);
-    }
+    let stderr = drain_bounded(child.stderr.take());
 
     assert_eq!(
         status.code(),
@@ -4726,8 +4728,6 @@ fn a_signal_killed_container_reports_a_signal_death_not_a_refusal() {
 /// own SIGINT and looking briefly like a product result.
 #[test]
 fn sigint_instakill_reports_a_signal_death_not_a_policy_refusal() {
-    use std::io::Read;
-
     fn parent_of(pid: i32) -> Option<i32> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         stat.rsplit_once(')')?
@@ -4751,6 +4751,9 @@ fn sigint_instakill_reports_a_signal_death_not_a_policy_refusal() {
         .args(["run", "--sigint-instakill", "--", "/bin/cat"])
         .stdin(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        // Own process group, so `wait_bounded` can reach namespace descendants
+        // with a negative pid rather than only the direct child.
+        .process_group(0)
         .spawn()
         .expect("failed to spawn the sigint-instakill run");
     let stdin = child.stdin.take().expect("piped stdin");
@@ -4793,10 +4796,7 @@ fn sigint_instakill_reports_a_signal_death_not_a_policy_refusal() {
     // read on this pipe; the signal alone does not retire the run.
     drop(stdin);
     let status = wait_bounded(&mut child, "sigint_instakill_reports_a_signal_death");
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_string(&mut stderr);
-    }
+    let stderr = drain_bounded(child.stderr.take());
 
     assert_eq!(
         status.code(),
@@ -4852,6 +4852,17 @@ fn wait_bounded(child: &mut std::process::Child, what: &str) -> std::process::Ex
             Some(status) => return status,
             None => {
                 if std::time::Instant::now() >= deadline {
+                    // ⚠️ THE GROUP, NOT THE CHILD. `child.kill()` reaps only the
+                    // direct CLI process; a namespace descendant that outlived it
+                    // keeps running AND keeps the inherited stderr write end open,
+                    // so the drain below would then block forever on a pipe that
+                    // never reaches EOF. agent(hermit-005)'s codex lane found this
+                    // and named the reachable window: the few milliseconds before
+                    // `PR_SET_PDEATHSIG` is armed (container.rs:299-310). Both
+                    // callers spawn with `process_group(0)`, so the child leads its
+                    // own group and a negative pid reaches every descendant.
+                    // SAFETY: signalling a process group this test created.
+                    unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
                     let _ = child.kill();
                     let _ = child.wait();
                     panic!(
@@ -4863,4 +4874,33 @@ fn wait_bounded(child: &mut std::process::Child, what: &str) -> std::process::Ex
             }
         }
     }
+}
+
+/// Read a child's stderr without the possibility of blocking forever.
+///
+/// ⚠️ `read_to_string` RETURNS ON EOF, NOT ON THE CHILD EXITING, and those are
+/// different events. EOF needs every holder of the write end to close it, so one
+/// surviving namespace descendant with inherited stderr blocks the read
+/// indefinitely — after the child has been waited for and after the test believes
+/// it is finished. Bounding the WAIT and leaving the DRAIN unbounded moves the
+/// hang one line down rather than removing it. Found by agent(hermit-005)'s codex
+/// lane.
+fn drain_bounded(pipe: Option<std::process::ChildStderr>) -> String {
+    let Some(mut pipe) = pipe else {
+        return String::new();
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = String::new();
+        let _ = pipe.read_to_string(&mut buf);
+        let _ = tx.send(buf);
+    });
+    // The reader thread is detached on timeout: it is blocked on a pipe nobody
+    // will close, and leaving it parked costs one thread for the rest of the
+    // process rather than wedging the run.
+    rx.recv_timeout(std::time::Duration::from_secs(20))
+        .unwrap_or_else(|_| {
+            String::from("<stderr drain timed out: a descendant still holds the write end>")
+        })
 }

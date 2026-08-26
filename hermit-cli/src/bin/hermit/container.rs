@@ -688,11 +688,23 @@ impl std::error::Error for PolicyRefusal {}
 pub struct SignalDeath(pub i32);
 
 impl std::fmt::Display for SignalDeath {
+    /// ⚠️ IT DOES NOT SAY WHERE THE SIGNAL CAME FROM, AND AN EARLIER VERSION DID.
+    /// It read "the run was stopped from outside", which hermit cannot know:
+    /// `handle_signal_event` carries no origin, so a guest that signals ITSELF
+    /// produces the identical report. Measured --
+    /// `hermit run --sigint-instakill -- /bin/sh -c 'kill -INT $$'` exits 130 and
+    /// printed that the run was stopped externally, when nothing external
+    /// happened. agent(hermit-005)'s codex lane found it.
+    ///
+    /// That is the same defect this whole change exists to remove: a report
+    /// asserting something the system has no channel to observe. What hermit
+    /// DOES know is that the container died of a signal rather than of a hermit
+    /// decision, and that is now all it claims.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
             "Hermit's container was terminated by signal {}. This is not a hermit \
-             failure and not a refusal: the run was stopped from outside.",
+             failure and not a refusal: hermit did not choose to stop this run.",
             self.0
         )
     }
@@ -781,7 +793,7 @@ pub fn classify_container_result<T>(
             Err(Error::new(PolicyRefusal))
         }
         // A signal death, before the catch-all for the same reason the refusal arm
-        // is: falling through would report a run stopped from outside as an
+        // is: falling through would report a signal-terminated run as an
         // internal failure. `sigint_instakill` and `on_container_init_stop_signal`
         // both land here.
         Err(RunError::ExitStatus(status))
