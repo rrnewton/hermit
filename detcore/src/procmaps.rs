@@ -56,14 +56,7 @@ pub fn display_as(map: &MemoryMap, pathname: &str) -> String {
 pub fn display_range_as(map: &MemoryMap, start: u64, end: u64, pathname: &str) -> String {
     format!(
         "{:#x}-{:#x} {:?} {:x} {:x}:{:x} {} {}",
-        start,
-        end,
-        map.perms,
-        map.offset,
-        map.dev.0,
-        map.dev.1,
-        map.inode,
-        pathname
+        start, end, map.perms, map.offset, map.dev.0, map.dev.1, map.inode, pathname
     )
 }
 
