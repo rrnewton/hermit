@@ -2765,6 +2765,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 detpid,
                 mm: mm_id,
                 timeslice_stats: thread_state.stats.timeslice_stats,
+                syscall_count: thread_state.stats.syscall_count,
                 chaos_epochs: pending_chaos_epochs,
             },
         )
