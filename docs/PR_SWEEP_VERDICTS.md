@@ -2372,11 +2372,31 @@ printing the reason still was not enough.
 
 ⚠️ **`scripts/core-review-protocol-lint.sh` enforces the `post-facto-human-review`
 protocol and executes in NO job.** Not a workflow, not a Makefile recipe, not a DAG
-node. Measured 2026-08-26: a tree-wide search for `core-review-protocol-lint`
-returns exactly two files — `.github/workflows/merge-gate.yml`, whose `on:` block
-contains only `workflow_dispatch:` and therefore cannot fire on a pull request, and
-the gate's own test. Its only production caller is the one workflow that cannot
-trigger.
+node.
+
+⚠️ **AND A TREE-WIDE GREP WILL TELL YOU OTHERWISE, BECAUSE THE GATE'S TEST *IS*
+SCHEDULED AND ITS NAME CONTAINS THE GATE'S NAME.** Search for the substring
+`core-review-protocol-lint` and you get hits in the `Makefile` and in
+`scripts/check-checker-scheduling.rs`, which reads as "something runs it". Every one
+of those is `core-review-protocol-lint-**test**.sh` — the fixture-driven self-test,
+which `make lint-checks` does run. Separate the two names before drawing a
+conclusion. Measured 2026-08-26 on `origin/main`, references to the **gate itself**:
+
+| file | what it is |
+| --- | --- |
+| `.github/workflows/merge-gate.yml` | the only production caller; `on:` is `workflow_dispatch:` alone, so it cannot fire on a pull request |
+| `AGENTS.md` | documentation |
+
+**The test passing proves the gate's logic is correct on fixtures. It never sees a
+real pull request.** A scheduled test for an unscheduled gate is the most convincing
+possible form of this trap, and it is why the earlier revision of this section
+reported the wrong file count.
+
+`AGENTS.md` is the load-bearing one: since `b999b4cb4c` (07-31) it asserted these
+checks are *"enforced by the `core-review-protocol` merge-gate job, which blocks
+landing when any are missing"*. That false-enforcement claim is a large part of why
+nobody ran the gate. `28210d144d` (#2673) corrected it — cite that as the sibling
+fix rather than re-deriving it.
 
 **It is not dead code. It works, and it would have refused most of a night's core
 changes.** Of 240 pull requests merged from 2026-08-25, twelve carried
@@ -2397,15 +2417,42 @@ invalidated the label". Only two of the nine failed on body sections alone.
 takes about a second and needs no infrastructure:
 
 ```console
-PR_NUMBER=<n> \
-PR_LABELS="$(gh pr view <n> --json labels -q '.labels[].name')" \
-PR_BODY="$(gh pr view <n> --json body -q .body)" \
+PR=<n>
+labels=$(with-proxy gh pr view "$PR" -R rrnewton/hermit --json labels -q '.labels[].name') \
+  || { echo "label fetch FAILED -- this is not a pass" >&2; exit 2; }
+body=$(with-proxy gh pr view "$PR" -R rrnewton/hermit --json body -q .body) \
+  || { echo "body fetch FAILED -- this is not a pass" >&2; exit 2; }
+PR_NUMBER="$PR" PR_LABELS="$labels" PR_BODY="$body" \
   ./scripts/core-review-protocol-lint.sh
 ```
 
 Exit 0 means satisfied *or* the head is not labelled; exit 1 means the protocol is
 violated and landing should be blocked; exit 2 is usage or internal error, which is
 **not** a pass.
+
+⚠️ **CAPTURE THE FETCH AND CHECK IT. DO NOT INLINE IT AS `PR_LABELS="$(gh ...)"`,
+WHICH IS WHAT AN EARLIER REVISION OF THIS SECTION PRINTED.** Two properties combine
+into a silent green. A failing `gh` still assigns — the variable ends up **set and
+empty**, not unset. And the script guards `unset` while treating set-and-empty as the
+affirmative claim *"this pull request genuinely has no labels"*, so it takes the
+not-applicable fast path. Measured on #2216, same script, same head, the only
+variable being whether `gh` egressed:
+
+| `gh` invocation | result on #2216 |
+| --- | --- |
+| plain `gh` — no proxy, the default on this fleet; exits 1, *"network is unreachable"* | **exit 0**, *"the PR has NO labels at all (empty set, supplied); core-review protocol not applicable"* |
+| `with-proxy gh` | **exit 1**, blocking, naming both absent approval labels |
+
+The script's own header names this exact state: *"a hand spot-check that forgot the
+variable took the not-applicable fast path and printed a PASS having checked
+NOTHING."* The inline form reintroduces it at the call site, in the one shape the
+script cannot detect. **That is worse than shipping no recipe at all** — without one
+nobody runs the gate and nobody claims they did, whereas a green line plus this
+section's own instruction to record it converts an absent check into manufactured
+evidence. Any form that makes a failed fetch exit non-zero is fine; `"$(...)"`
+inline is not one of them. The `with-proxy` half matters for the same reason:
+*"network is unreachable"* means the call never left the box, which is an
+environment fault and never a verdict about the pull request.
 
 ⚠️ **THIS HOLDS ONLY WHERE AGENTS HOLD IT, AND YOU SHOULD READ IT THAT WAY.** There
 is no workflow behind it, no required status check behind that, and `main` has no
