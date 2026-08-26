@@ -329,6 +329,33 @@ fn main() {
     std::process::exit(1);
 }
 
+/// A runner, then any number of FLAGS, then the path: `rustc --edition=2021 <path>`.
+///
+/// Tokenised per line rather than matched as a substring, so `--edition=2021` between
+/// the runner and its input does not hide the invocation. Stops at the first token that
+/// is not a flag; see the note at the call site for why it deliberately does not scan
+/// further.
+fn runner_flag_path(text: &str, path: &str) -> bool {
+    const RUNNERS: [&str; 5] = ["python3", "python", "bash", "sh", "rustc"];
+    let dotted = format!("./{path}");
+    for line in text.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        for (index, token) in tokens.iter().enumerate() {
+            if !RUNNERS.contains(token) {
+                continue;
+            }
+            let mut next = index + 1;
+            while next < tokens.len() && tokens[next].starts_with('-') {
+                next += 1;
+            }
+            if next < tokens.len() && (tokens[next] == path || tokens[next] == dotted) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Does `text` INVOKE `path`, as opposed to merely naming it?
 ///
 /// ⚠️ A bare substring match on the basename is not good enough, and this is the
@@ -372,6 +399,25 @@ fn is_invoked(text: &str, path: &str) -> bool {
         if text.lines().any(|line| invokes_on_line(line, &needle)) {
             return true;
         }
+    }
+    // ⚠️ A FLAG MAY SIT BETWEEN THE RUNNER AND THE PATH, and requiring them adjacent
+    // reported a genuinely scheduled checker as an orphan. Found by agent(hermit-004)
+    // wiring check.exit_status_class: `rustc --edition=2021 scripts/check-exit-status-class.rs`
+    // matched nothing -- the cmd has no `./<path>` and no line STARTS with the path,
+    // so every clause missed and the node was called scheduled by NOTHING.
+    //
+    // ⚠️ ONLY LEADING FLAGS ARE SKIPPED, AND THE SCAN STOPS AT THE FIRST NON-FLAG TOKEN.
+    // It does NOT search the whole line for the path, because `rustc a.rs -o <path>`
+    // would then read an OUTPUT as an invocation -- a false "scheduled", which is silent
+    // and defeats the guard. Erring to a FALSE ORPHAN is the direction this file already
+    // chose: loud, and a human fixes it in one line.
+    //
+    // The known cost of stopping at the first non-flag token: `rustc -o out <path>`, where
+    // a flag takes a SEPARATE value, still misses. Skipping that would require knowing
+    // which flags consume the next token, which is a guess -- and a wrong guess here fails
+    // in the silent direction.
+    if runner_flag_path(text, path) {
+        return true;
     }
     // A path alone at the start of a line is a shell line-continuation argument --
     // the form run-reverie-pin-check.sh uses for both pin checkers. Anchoring to the
@@ -490,6 +536,45 @@ fn self_test() {
     assert!(
         ALLOWLIST.iter().all(|(p, _)| *p != SELF_PATH),
         "this checker allowlisting itself would hide the very orphan it reports"
+    );
+
+    // ⚠️ A FLAG BETWEEN THE RUNNER AND THE PATH. The real cmd from check.exit_status_class
+    // (hermit#2655), which this guard called an orphan while it was genuinely scheduled.
+    let flagged = "mkdir -p target/ci && RUSTUP_TOOLCHAIN=stable rustc --edition=2021 \
+scripts/check-exit-status-class.rs -o target/ci/check-exit-status-class && \
+target/ci/check-exit-status-class --gate";
+    assert!(
+        is_invoked(flagged, "scripts/check-exit-status-class.rs"),
+        "a flag between the runner and the path hid a scheduled checker"
+    );
+    assert!(
+        is_invoked("rustc scripts/check-x.rs", "scripts/check-x.rs"),
+        "the adjacent form regressed"
+    );
+    assert!(
+        is_invoked("python3 -B scripts/check-y.py", "scripts/check-y.py"),
+        "a flag before a python path hid a scheduled checker"
+    );
+    // ⚠️ THE KNOWN GAP, PINNED RATHER THAN LEFT TO BE REDISCOVERED. A flag taking a
+    // SEPARATE value (`-X faulthandler`, `-o out`) stops the scan at the value, so this
+    // form still reads as an orphan. Closing it needs a table of which flags consume the
+    // next token; a wrong entry there fails SILENTLY, by reading an output as an input.
+    // The false orphan is loud and costs one line to fix, so it is the side to be on.
+    // If you widen this, keep the `-o` control below passing.
+    assert!(
+        !is_invoked("python3 -X faulthandler scripts/check-y.py", "scripts/check-y.py"),
+        "the separate-value flag gap closed -- update this pin and re-check the -o control"
+    );
+    // ⚠️ THE CONTROL FOR THE SILENT DIRECTION. An OUTPUT path must not read as an
+    // invocation: matching it would report an unscheduled checker as scheduled, which is
+    // the failure this whole guard exists to prevent and is invisible when wrong.
+    assert!(
+        !is_invoked("rustc other.rs -o scripts/check-z.rs", "scripts/check-z.rs"),
+        "an -o output path was read as an invocation"
+    );
+    assert!(
+        !is_invoked("see scripts/check-w.sh for details", "scripts/check-w.sh"),
+        "a mid-sentence mention was read as an invocation"
     );
 
     println!("PASS: check-checker-scheduling strips comments, keeps invocations, scopes the recipe, and does not read its own allowlist as scheduling");
