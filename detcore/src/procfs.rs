@@ -2833,12 +2833,33 @@ pub(crate) fn mapping_header_identity(line: &str) -> Option<(u64, u64)> {
 }
 
 /// Rewrite the device and inode of one mapping header from the caller-supplied
-/// table, preserving every other byte of the line including its column padding.
+/// table, preserving every other byte of the line and the COLUMN its pathname
+/// starts in.
 ///
 /// A raw pair absent from the table is left ALONE rather than guessed at: the
 /// table is built from this same snapshot, so a miss means the pair was not
 /// determinizable (an anonymous mapping), and inventing a value here is the
 /// precise failure this design exists to avoid.
+///
+/// ⚠️ PRESERVE THE COLUMN, NOT THE PADDING BYTES. This used to copy the raw
+/// whitespace run after the inode verbatim, which silently republished the
+/// HOST inode's digit count as line length. The kernel pads the pathname to a
+/// fixed column (`seq_setwidth(m, 25 + sizeof(void *) * 6)`, measured at column
+/// 73 on x86_64), so that run is `73 - len(host_inode_digits)` characters long.
+/// Substituting a short determinized inode into it therefore left a line whose
+/// every VISIBLE field was deterministic and whose LENGTH was not.
+///
+/// Measured 2026-08-26 at hermit `d741307158`: for a LiteInst guest, whose
+/// `/memfd:liteinst2-trampoline` mappings take inodes from a host-global
+/// counter, `cat /proc/self/maps` under `--backend liteinst --strict` produced
+/// TWO distinct outputs in 20 runs (14x one, 6x the other) differing in nothing
+/// but one space on each memfd line -- the runs where the host counter had
+/// crossed a power of ten. With `--detlog-io-buffers` hashing `read()` payloads
+/// that is a hard `--verify` divergence, and `/usr/bin/tail -n 2 <fixture>`
+/// under LiteInst failed 10 of 20 verified runs on it.
+///
+/// Padding to the column the RAW line used keeps this in step with the kernel
+/// rather than hard-coding 73, and that column does not depend on the inode.
 fn rewrite_mapping_header(line: &str, table: &BTreeMap<(u64, u64), (u64, u64)>) -> String {
     let Some(raw) = mapping_header_identity(line) else {
         return line.to_string();
@@ -2878,8 +2899,29 @@ fn rewrite_mapping_header(line: &str, table: &BTreeMap<(u64, u64), (u64, u64)>) 
     let inode_end = remaining
         .find(char::is_whitespace)
         .unwrap_or(remaining.len());
+    let tail = &remaining[inode_end..];
+    let pad_len = tail
+        .find(|c: char| !c.is_whitespace())
+        .unwrap_or(tail.len());
+    // Column the pathname starts in on the raw line. `line.len() - remaining.len()`
+    // is how much of the line has already been consumed by the first four fields.
+    let name_column = (line.len() - remaining.len()) + inode_end + pad_len;
     out.push_str(&det_inode.to_string());
-    out.push_str(&remaining[inode_end..]);
+    let name = &tail[pad_len..];
+    if name.is_empty() {
+        // No pathname, so there is no column to preserve and nothing to pad to.
+        // Trailing whitespace here would be pure host-inode-width leakage.
+        return out;
+    }
+    // A determinized inode can in principle be WIDER than the raw one, which
+    // leaves no room to pad. One space is what the kernel's `seq_pad` emits in
+    // that same situation.
+    if out.len() < name_column {
+        out.extend(std::iter::repeat_n(' ', name_column - out.len()));
+    } else {
+        out.push(' ');
+    }
+    out.push_str(name);
     out
 }
 
@@ -3994,6 +4036,69 @@ mod tests {
         assert!(
             out.ends_with("/lib/libc.so.6\n"),
             "pathname preserved: {out}"
+        );
+    }
+
+    /// ⚠️ THE LINE'S LENGTH IS PART OF ITS CONTENT. The kernel pads the pathname
+    /// to a fixed column, so the whitespace run after the inode is
+    /// `73 - len(host_inode_digits)` characters long. Copying that run verbatim
+    /// while substituting a short determinized inode produced a line whose every
+    /// VISIBLE field was deterministic and whose LENGTH still counted the host's
+    /// digits -- invisible to the eye, and a hard `--verify` divergence once
+    /// `--detlog-io-buffers` began hashing `read()` payloads.
+    ///
+    /// The two inputs below are the SAME mapping observed either side of the
+    /// host inode counter crossing a power of ten. They must determinize to the
+    /// same bytes. Measured before the fix: LiteInst's `/memfd:` trampolines hit
+    /// exactly this, and `cat /proc/self/maps` under `--backend liteinst
+    /// --strict` gave two distinct outputs in 20 runs.
+    #[test]
+    fn maps_padding_does_not_republish_the_host_inode_width() {
+        // Everything up to and including the space before the inode.
+        const HEAD: &str = "70f80000-71000000 r-xs 00000000 00:06 ";
+        const NAME: &str = "/memfd:liteinst2-trampoline (deleted)";
+        // `seq_setwidth(m, 25 + sizeof(void *) * 6)` in the kernel's
+        // `show_map_vma`; measured at 73 on x86_64.
+        const PATHNAME_COLUMN: usize = 73;
+
+        let kernel_line = |inode: u64| {
+            let prefix = format!("{HEAD}{inode}");
+            let pad = PATHNAME_COLUMN - prefix.len();
+            format!("{prefix}{}{NAME}\n", " ".repeat(pad))
+        };
+        let table = |inode: u64| {
+            BTreeMap::from([(
+                (libc::makedev(0x00, 0x06), inode),
+                (libc::makedev(0x00, 0x06), 8u64),
+            )])
+        };
+
+        let four_digit = sanitize_maps(kernel_line(9_999).as_bytes(), &table(9_999));
+        let five_digit = sanitize_maps(kernel_line(10_000).as_bytes(), &table(10_000));
+        assert_eq!(
+            String::from_utf8(four_digit.clone()).unwrap(),
+            String::from_utf8(five_digit).unwrap(),
+            "the host inode's digit count must not survive as line length",
+        );
+
+        // And the surviving line is still a well-formed maps line: same
+        // pathname, at the column the kernel put it in.
+        let out = String::from_utf8(four_digit).unwrap();
+        let body = out.strip_suffix('\n').unwrap();
+        assert_eq!(
+            body.find('/'),
+            Some(PATHNAME_COLUMN),
+            "pathname column preserved: {out:?}",
+        );
+        assert!(body.ends_with(NAME), "pathname preserved: {out:?}");
+        // Read the inode COLUMN rather than substring-searching the line: the
+        // address range `70f80000-71000000` itself contains "10000", so a
+        // `contains` check here passes for the wrong reason on one input and
+        // fails for the wrong reason on the other.
+        assert_eq!(
+            body.split_whitespace().nth(4),
+            Some("8"),
+            "raw inode must not survive in the inode column: {out:?}",
         );
     }
 
