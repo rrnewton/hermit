@@ -389,7 +389,18 @@ fn main() {
     for p in &stale {
         eprintln!("check-checker-scheduling: STALE ALLOWLIST entry {p} -- now scheduled or absent; remove it.");
     }
-    std::process::exit(1);
+    std::process::exit(exit_code_for(unscheduled.len(), stale.len()));
+}
+
+/// The process status for a finished run: 1 when anything is unscheduled or stale.
+///
+/// ⚠️ THIS EXISTS ONLY TO BE TESTABLE, and that is the point. The failure path ended in a
+/// bare `std::process::exit(1)` that no test could reach: `agent(codex-rev-2683)` showed
+/// that replacing it with `return` left `--self-test` and all twelve unit tests GREEN while
+/// an orphan merely printed a warning and the guard exited 0 -- the loudest possible
+/// finding delivered through a silent exit status.
+fn exit_code_for(unscheduled: usize, stale: usize) -> i32 {
+    if unscheduled > 0 || stale > 0 { 1 } else { 0 }
 }
 
 /// A runner, then any number of FLAGS, then the path: `rustc --edition=2021 <path>`.
@@ -400,64 +411,36 @@ fn main() {
 /// further.
 fn runner_flag_path(text: &str, path: &str) -> bool {
     const RUNNERS: [&str; 5] = ["python3", "python", "bash", "sh", "rustc"];
-    /// Flags whose VALUE is the next token, so that token is never the script.
-    ///
-    /// ⚠️ ONE TABLE CANNOT SERVE FIVE RUNNERS, AND SHARING IT WAS WRONG IN BOTH
-    /// DIRECTIONS AT ONCE. Every entry in the old shared list was chosen for
-    /// rustc and then applied to `bash`, `sh`, `python` and `python3` too.
-    /// Measured 2026-08-26 by running each runner against a real script:
-    ///
-    ///   bash -l x.sh      RAN          `-l` is a login shell and takes NO value,
-    ///   sh   -l x.sh      RAN          but rustc's `-l` links a library and DOES.
-    ///                                  Sharing it skipped the script: false ORPHAN.
-    ///   bash -c x.sh      RAN          the shells EXECUTE the token after `-c`...
-    ///   sh   -c x.sh      RAN
-    ///   python3 -c x.sh   SyntaxError  ...while python treats it as code and never
-    ///                                  runs it. ONE FLAG, OPPOSITE CORRECTNESS.
-    ///
-    /// So the tables are per runner, and every entry below was measured rather
-    /// than read off a manual page.
-    ///
-    /// THE DIRECTION STILL MATTERS, which is why the shell table is not empty.
-    /// Over-marking skips one token too many and reports a FALSE ORPHAN -- loud,
-    /// one line to fix. Under-marking stops ON the value and reports a false
-    /// SCHEDULED -- silent, and it defeats the guard. Both are pinned in
-    /// `self_test`.
-    // ⚠️ THE LISTS BELOW ARE BOOLEANS, NOT VALUE-TAKERS, AND THE INVERSION IS THE
-    // POINT. hermit#2681 made this table per-runner, which was the right half of the
-    // fix: `-O` is a boolean under python and rustc and takes a shell option name under
-    // bash, so one flat list was right for one runner and silently wrong for another.
-    //
-    // The other half is the DEFAULT. A list of flags that DO take values puts the burden
-    // on the list being complete, and an incomplete list fails SILENTLY: the scan stops
-    // on a flag's value and reads it as the script, reporting a false SCHEDULED -- a
-    // checker nothing runs, recorded as running. Three heads paid for that in one night
-    // (`-o` #2667, `-c` #2674, `-X`), and per-runner splitting does not change it: a
-    // value-taking flag missing from a runner's list still fails the silent way.
-    //
-    // So the lists name the flags that take NOTHING, and everything unlisted is ASSUMED
-    // to consume the token after it. A missing entry now steps PAST the script and
-    // reports a false ORPHAN -- loud, and one line to fix. hermit#2681's knowledge is
-    // preserved: every flag it listed as value-taking is absent from these.
     const PYTHON_NO_VALUE: [&str; 13] = [
         "-B", "-E", "-I", "-O", "-OO", "-s", "-S", "-u", "-v", "-b", "-d", "-q", "-x",
     ];
-    // `-o`, `-O` and `--rcfile` are DELIBERATELY ABSENT: each takes a value here.
-    //
-    // ⚠️ `-c` IS PRESENT, AND IT IS NOT AN OVERSIGHT. The shells EXECUTE the token after
-    // `-c` -- measured, `sh -c ./check-z.sh` prints the script's output -- so that token
-    // IS an invocation and must be seen as one. Python's `-c` is the opposite: the token
-    // is code that is never run as a path, so it stays out of PYTHON_NO_VALUE. One flag,
-    // opposite correctness per runner, which is the case that makes this table per-runner
-    // rather than merely long.
     const SHELL_NO_VALUE: [&str; 17] = [
         "-e", "-x", "-u", "-v", "-n", "-f", "-C", "-a", "-h", "-i", "-l", "-m", "-p",
         "-r", "-s", "-t", "-c",
     ];
     const RUSTC_NO_VALUE: [&str; 5] = ["-O", "-g", "-V", "-h", "-v"];
 
+    // ⚠️ THE THIRD STATE. A flag is not just "takes a value" or "does not" -- some put the
+    // runner into a mode where the named path IS NEVER EXECUTED, and a two-state table
+    // called every one of them SCHEDULED. Found by `agent(codex-rev-2683)`, who ran each
+    // case and checked for a marker the script writes:
+    //
+    //     bash -n ./check-z.sh      rc 0, marker ABSENT   syntax check only
+    //     bash -o noexec ./x.sh     rc 0, marker ABSENT   noexec via -o's VALUE
+    //     rustc -V ./check-z.rs     rc 0, marker ABSENT   prints a version, compiles nothing
+    //     python3 -c pass ./x.py    rc 0, marker ABSENT   the path is argv, not the program
+    //
+    // A checker that is merely an ARGUMENT to a non-executing runner mode was counted as
+    // coverage -- the silent direction, and exactly what this guard exists to prevent.
+    // Erring loud: any of these before the candidate makes the occurrence an orphan.
+    const PYTHON_NO_EXEC: [&str; 4] = ["-V", "--version", "-h", "--help"];
+    const SHELL_NO_EXEC: [&str; 4] = ["-n", "--help", "--version", "-V"];
+    const RUSTC_NO_EXEC: [&str; 4] = ["-V", "--version", "-h", "--help"];
+
+    // Flags whose VALUE is the program, so a path AFTER that value is an argument.
+    const PROGRAM_IS_THE_VALUE: [&str; 2] = ["-c", "-m"];
+
     fn takes_value(runner: &str, flag: &str) -> bool {
-        // An attached value is one token: `--edition=2021`, `-Dwarnings`.
         if flag.contains('=') || (!flag.starts_with("--") && flag.len() > 2) {
             return false;
         }
@@ -469,19 +452,69 @@ fn runner_flag_path(text: &str, path: &str) -> bool {
         !booleans.contains(&flag)
     }
 
+    fn no_exec(runner: &str, flag: &str) -> bool {
+        let modes: &[&str] = match runner {
+            "rustc" => &RUSTC_NO_EXEC,
+            "python" | "python3" => &PYTHON_NO_EXEC,
+            _ => &SHELL_NO_EXEC,
+        };
+        modes.contains(&flag)
+    }
+
     let dotted = format!("./{path}");
     for line in text.lines() {
         let tokens: Vec<&str> = line.split_whitespace().collect();
+        let mut cursor = 0usize;
         for (index, token) in tokens.iter().enumerate() {
+            if let Some(off) = line[cursor..].find(token) {
+                cursor += off;
+            }
+            let runner_at = cursor;
+            cursor += token.len();
             if !RUNNERS.contains(token) {
                 continue;
             }
+            // ⚠️ THE RUNNER ITSELF MUST BE IN COMMAND POSITION, and this clause did not
+            // check it while this file's own comment claimed every clause did. Measured
+            // by `agent(codex-rev-2683)`: `echo python3 -X faulthandler scripts/check-z.py`
+            // classified SCHEDULED, because the scan found `python3` anywhere on the line.
+            // A guard that three of four clauses consult is one a clause still bypasses.
+            if !in_command_position(&line[..runner_at]) {
+                continue;
+            }
             let mut next = index + 1;
+            let mut executes = true;
             while next < tokens.len() && tokens[next].starts_with('-') {
-                if takes_value(token, tokens[next]) {
+                let flag = tokens[next];
+                if no_exec(token, flag) {
+                    executes = false;
+                }
+                if PROGRAM_IS_THE_VALUE.contains(&flag) {
+                    // The shells RUN the value (`sh -c ./x.sh`); python treats it as code
+                    // or a module. Either way what FOLLOWS the value is an argument, so
+                    // only the value itself can be the invocation.
+                    let value = next + 1;
+                    let shellish = !matches!(*token, "python" | "python3" | "rustc");
+                    if shellish
+                        && value < tokens.len()
+                        && (tokens[value] == path || tokens[value] == dotted)
+                    {
+                        return true;
+                    }
+                    executes = false;
+                    break;
+                }
+                // `-o noexec` turns execution off through the flag's VALUE, not the flag.
+                if flag == "-o" && next + 1 < tokens.len() && tokens[next + 1] == "noexec" {
+                    executes = false;
+                }
+                if takes_value(token, flag) {
                     next += 1;
                 }
                 next += 1;
+            }
+            if !executes {
+                continue;
             }
             if next < tokens.len() && (tokens[next] == path || tokens[next] == dotted) {
                 return true;
@@ -751,6 +784,14 @@ fn lint_checks_recipe(makefile: &str) -> String {
 }
 
 fn self_test() {
+    // ⚠️ PINS THE EXIT STATUS ITSELF. Reported by `agent(codex-rev-2683)`: the failure path
+    // was a bare `exit(1)` no test reached, so swapping it for `return` kept every suite
+    // green while orphans were admitted at rc=0.
+    assert_eq!(exit_code_for(1, 0), 1, "an unscheduled checker must exit nonzero");
+    assert_eq!(exit_code_for(0, 1), 1, "a stale allowlist entry must exit nonzero");
+    assert_eq!(exit_code_for(3, 2), 1, "both together must exit nonzero");
+    assert_eq!(exit_code_for(0, 0), 0, "a clean run must exit zero");
+
     // ⚠️ THE SHARED CONTROL. Several matcher defects in one night shared a SIGNATURE and
     // not a cause: each inferred a semantic fact from an unverified syntactic position,
     // and each failed DOWNWARD, where a smaller count reads as fewer problems. A shared
@@ -778,6 +819,41 @@ fn self_test() {
             "OUT=./scripts/check-z.rs",
             "scripts/check-z.rs",
             "an assignment VALUE read as an invocation",
+        ),
+        (
+            "echo python3 -X faulthandler scripts/check-z.py",
+            "scripts/check-z.py",
+            "a runner named as an ARGUMENT to another command read as an invocation -- \
+             the flag-scan clause skipped command-position validation while this file's \
+             own comment claimed every clause performed it (agent(codex-rev-2683))",
+        ),
+        (
+            "bash -n ./scripts/check-z.sh",
+            "scripts/check-z.sh",
+            "bash -n is a syntax check: rc 0 and the script's marker ABSENT, measured",
+        ),
+        (
+            "bash -o noexec ./scripts/check-z.sh",
+            "scripts/check-z.sh",
+            "noexec arrives through -o's VALUE, not the flag, so the flag table alone \
+             cannot see it",
+        ),
+        (
+            "python3 -c pass ./scripts/check-z.py",
+            "scripts/check-z.py",
+            "python -c makes the VALUE the program; the path after it is argv and is \
+             never run",
+        ),
+        (
+            "python3 -m noopmod ./scripts/check-z.py",
+            "scripts/check-z.py",
+            "same for -m: the module is the program",
+        ),
+        (
+            "rustc -V ./scripts/check-z.rs",
+            "scripts/check-z.rs",
+            "rustc -V prints a version and compiles nothing, yet -V is a NO-VALUE flag \
+             -- which is why a two-state table classified it SCHEDULED",
         ),
         (
             "see ./scripts/check-z.rs for details",
@@ -816,6 +892,12 @@ fn self_test() {
             "n.cmd = \"./ci/verify-x.sh p\".to_string();",
             "ci/verify-x.sh",
             "a command built as a Rust string literal in scripts/validate.rs",
+        ),
+        (
+            "sh -c ./scripts/check-z.sh",
+            "scripts/check-z.sh",
+            "the SHELLS execute the token after -c, so that token IS an invocation -- \
+             the mirror of the python case above, and why the table is per-runner",
         ),
         (
             "cargo build && scripts/check-y.sh --gate",
