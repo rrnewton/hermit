@@ -148,6 +148,7 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 	./scripts/test-configure-merge-gate-ruleset.sh
 	python3 ./scripts/test_pr_status.py
 	./scripts/run-script-tests.sh
+	python3 ./scripts/test_validate_stop_paths.py
 	./ci/lint-checks-node.sh --self-test
 	./ci/liteinst-strict-node.sh --self-test
 	./scripts/check-checker-scheduling.rs --self-test
