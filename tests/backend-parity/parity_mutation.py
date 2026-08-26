@@ -435,17 +435,15 @@ def observe_hermit(
     """Run the fixture under a hermit backend, optionally planting a mutation."""
     env = dict(os.environ)
     env.pop("HERMIT_PARITY_MUTATE", None)  # only the guest, via --env, should see it
-    host_tmp = Path(
-        tempfile.mkdtemp(
-            prefix=f"hermit-tmp-{backend}-", dir=binary.parent
+    with tempfile.TemporaryDirectory(
+        prefix=f"hermit-tmp-{backend}-", dir=binary.parent
+    ) as raw_host_tmp:
+        return _run(
+            _hermit_command(hermit, backend, binary, mutate, Path(raw_host_tmp)),
+            env,
+            HERMIT_TIMEOUT_S,
+            capture_log=True,
         )
-    )
-    return _run(
-        _hermit_command(hermit, backend, binary, mutate, host_tmp),
-        env,
-        HERMIT_TIMEOUT_S,
-        capture_log=True,
-    )
 
 
 def backend_available(hermit: Path, backend: str) -> tuple[bool, str]:
