@@ -551,7 +551,15 @@ impl GlobalState {
         if to_stderr {
             // In this case, print summary irrespective of logging level.
             // TODO: output summary in machine-readable, JSON form.
-            eprint!("{}\n{}", banner, summary);
+            //
+            // NOT `eprint!`: a guest that set O_NONBLOCK on the inherited fd 2
+            // makes `write_all` fail with EAGAIN here, which panics the print
+            // macro and loses both the summary and the panic message. See
+            // `crate::util::RetryingStderr`.
+            {
+                use std::io::Write;
+                let _ = write!(crate::util::RetryingStderr, "{}\n{}", banner, summary);
+            }
         } else {
             // Separate out the nondeterministic bits and print them at debug level:
             let rt = summary.realtime_elapsed.take();

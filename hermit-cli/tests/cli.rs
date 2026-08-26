@@ -5153,3 +5153,112 @@ fn record_reports_an_unsupported_syscall_as_a_refusal_not_an_internal_failure() 
         "a deliberate refusal must not be reported as an internal failure\nstderr:\n{err}"
     );
 }
+
+/// A guest can set `O_NONBLOCK` on the inherited fd 2, and hermit's own
+/// diagnostics must survive it.
+///
+/// ⚠️ THIS CANNOT BE TESTED THROUGH A FILE. On a regular file `O_NONBLOCK` is a
+/// no-op for writes, so a test that redirects stderr to a temp file passes
+/// whether or not the defect is present. The back-pressure has to be real,
+/// which means a pipe with a known amount of free space.
+///
+/// Measured before the fix, at this exact shape: 170 of 2240 bytes arrived, the
+/// process exited 101 (a panic inside `eprintln!`) instead of 127, and the
+/// delivered bytes were NOT a prefix of the true text -- 92 good bytes followed
+/// by the tail of the panic message, which reads as a complete short error
+/// rather than a severed one.
+#[test]
+fn diagnostics_survive_a_nonblocking_stderr_under_back_pressure() {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+
+    // A long, fully deterministic diagnostic whose length the caller controls:
+    // hermit echoes the (absent) program path back in the error chain.
+    let program = format!("/nonexistent-{}", "A".repeat(2000));
+
+    // The truth to compare against, captured with an ordinary pipe.
+    let control = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["run", "--", &program])
+        .output()
+        .expect("control run");
+    let expected = control.stderr;
+    assert_eq!(
+        control.status.code(),
+        Some(127),
+        "control run should report guest-program-not-found"
+    );
+    assert!(
+        expected.len() > 2000,
+        "control diagnostic unexpectedly short ({} bytes); the probe needs a \
+         message larger than the pipe's free space to prove anything",
+        expected.len()
+    );
+
+    // A 4096-byte pipe pre-filled to 3900, so only 196 bytes are free, and the
+    // write end made nonblocking exactly as a guest's fcntl would leave it.
+    let mut fds = [0 as libc::c_int; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    const F_SETPIPE_SZ: libc::c_int = 1031;
+    unsafe { libc::fcntl(write_fd, F_SETPIPE_SZ, 4096) };
+    let filler = vec![b'F'; 3900];
+    let flags = unsafe { libc::fcntl(write_fd, libc::F_GETFL) };
+    unsafe { libc::fcntl(write_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    let mut filled = 0usize;
+    while filled < filler.len() {
+        let n = unsafe {
+            libc::write(
+                write_fd,
+                filler[filled..].as_ptr().cast(),
+                filler.len() - filled,
+            )
+        };
+        if n <= 0 {
+            break;
+        }
+        filled += n as usize;
+    }
+
+    let stderr_for_child = unsafe { std::process::Stdio::from_raw_fd(libc::dup(write_fd)) };
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["run", "--", &program])
+        .stdout(std::process::Stdio::null())
+        .stderr(stderr_for_child)
+        .spawn()
+        .expect("spawn hermit");
+    unsafe { libc::close(write_fd) };
+
+    // Hold the pipe full briefly, then drain. A fix that merely stopped
+    // erroring would still have dropped the bytes during this window.
+    let reader = thread::spawn(move || {
+        thread::sleep(std::time::Duration::from_millis(600));
+        let mut f = unsafe { std::fs::File::from_raw_fd(read_fd) };
+        let mut buf = Vec::new();
+        let _ = f.read_to_end(&mut buf);
+        buf
+    });
+
+    let status = child.wait().expect("hermit exited");
+    let got = reader.join().expect("reader");
+    let diagnostic = &got[filled.min(got.len())..];
+
+    assert_eq!(
+        status.code(),
+        Some(127),
+        "a guest-visible fd flag must not change hermit's exit status \
+         (101 here means eprintln! panicked on EAGAIN)"
+    );
+    assert_eq!(
+        diagnostic.len(),
+        expected.len(),
+        "diagnostic was truncated: {} of {} bytes survived a nonblocking stderr",
+        diagnostic.len(),
+        expected.len()
+    );
+    assert_eq!(
+        diagnostic,
+        expected.as_slice(),
+        "diagnostic differed byte-for-byte from the control; not erroring is \
+         not the same as delivering the message"
+    );
+}

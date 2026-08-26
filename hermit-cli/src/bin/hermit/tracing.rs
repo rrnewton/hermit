@@ -255,7 +255,12 @@ pub fn stderr_subscriber(level: Option<LevelFilter>) -> impl Subscriber {
         .add_directive(level.into());
     tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer(io::stderr)
+        // NOT `io::stderr`: a guest can set O_NONBLOCK on the inherited fd 2,
+        // after which a full pipe makes these writes fail with EAGAIN. The fmt
+        // layer discards the write error, so log lines would vanish with no
+        // marker at all. `RetryingStderr` waits for the reader instead of
+        // dropping, and does not alter the flag the guest set.
+        .with_writer(|| detcore::util::RetryingStderr)
         .with_ansi(stderr().is_terminal())
         .finish()
 }
