@@ -270,11 +270,83 @@ _REFUSAL_SHAPES = (
 def _looks_refused(output: str) -> bool:
     """Did the child DECLINE, as opposed to failing at something?
 
-    Deliberately narrow. Anything not recognised stays an AssertionError, because
-    a crash misreported as a could-not-evaluate is silent, and silence in that
-    direction is what this whole change is against.
+    ⚠️ ANCHORED TO THE START OF A LINE, AND THE UNANCHORED FORM WAS A LIVE DEFECT.
+    `shape in output` searched the child's ENTIRE captured log, which carries far
+    more than validate's own decline messages -- panic text, guest stdout, file
+    paths. Found by `agent(hermit-dbg)` on hermit#2637, whose table gives three
+    realistic failures that classified as could-not-evaluate:
+
+        thread 'main' panicked ... connection refused by: peer
+        server said 'refused by: firewall' + error: compilation failed
+        error[E0433]: /home/x/validate: REFUSED_cases/t.rs not found
+
+    Each is a RED reported as "nothing was observed" -- the silent direction this
+    function's own contract says it exists to prevent.
+
+    ⚠️ THE MISTAKE THAT PRODUCED IT IS WORTH NAMING, because it is general: the
+    vocabulary was checked against the PRODUCER (does validate.rs print these only
+    when declining? yes, verifiably) when the predicate reads the CHANNEL. A
+    channel carries more than its producer writes.
+
+    ⚠️ AND THIS CODEBASE ALREADY LEARNED IT ONE HOP DOWN THE SAME CHAIN.
+    `ci/lint-checks-node.sh:80` consumes this file's own NO_RESULT marker with
+    `grep -q "^${NO_RESULT_MARKER}"`, and its self-test at :121 records that the
+    unanchored form "is what this replaced". The consumer anchored; the producer
+    side had not.
+
+    ⚠️ STRIP BEFORE ANCHORING -- a bare `startswith` BREAKS TWO OF THE THREE SHAPES.
+    `RunSummary::refused` puts its reasons in `detail`, and the renderer emits every
+    detail line with a three-space indent (`validate.rs:11068`,
+    `lines.push(format!("   {line}"))`). So "refused by:" and "another validate is
+    already running" arrive INDENTED and only "validate: REFUSED" is column zero.
+    Anchoring without stripping would have turned a false-positive defect into a
+    false-negative one, which is the worse direction.
     """
-    return any(shape in output for shape in _REFUSAL_SHAPES)
+    return any(
+        line.strip().startswith(shape)
+        for line in output.splitlines()
+        for shape in _REFUSAL_SHAPES
+    )
+
+
+# ⚠️ FOREIGN LINES ON THE CHANNEL, WHICH IS THE TEST THE ORIGINAL LACKED. The
+# predicate above classifies ANOTHER PROGRAM'S OUTPUT, so the cases that matter are
+# not validate's own messages -- they are the things that share the channel with
+# them. The first three are `agent(hermit-dbg)`'s, verbatim.
+_REFUSAL_SELF_CHECK: tuple[tuple[str, bool], ...] = (
+    # Foreign lines carrying a shape somewhere other than the start: NOT refusals.
+    ("thread 'main' panicked at src/x.rs:9: connection refused by: peer", False),
+    ("guest: server said 'refused by: firewall'\nerror: compilation failed", False),
+    ("error[E0433]: file /home/x/validate: REFUSED_cases/t.rs not found", False),
+    ("Connection refused (os error 111)", False),
+    ("error: could not compile `detcore` due to 2 previous errors", False),
+    # ⚠️ THE HALF A NAIVE ANCHOR BREAKS. These are how validate ACTUALLY renders a
+    # decline: the two detail-borne shapes carry the renderer's three-space indent.
+    ("   refused by: the re-entrancy guard", True),
+    ("   another validate is already running", True),
+    ("validate: REFUSED - product validation must enter through ci-hub", True),
+    # A decline buried in a longer log still counts; it is the LINE that anchors,
+    # not the log.
+    ("some earlier chatter\n   refused by: admission\nmore chatter", True),
+)
+
+
+def check_refusal_predicate() -> None:
+    """Assert the predicate before anything spawns, and refuse to run if it is wrong.
+
+    Cheap enough to run unconditionally: pure string work, no process, no I/O. It
+    sits at the top of `main()` so a regression here cannot hide behind a run whose
+    children all happened to start.
+    """
+    wrong = [
+        f"{'must' if want else 'must NOT'} classify as refused: {sample!r}"
+        for sample, want in _REFUSAL_SELF_CHECK
+        if _looks_refused(sample) is not want
+    ]
+    if wrong:
+        raise AssertionError(
+            "the refusal predicate misclassifies the channel:\n  " + "\n  ".join(wrong)
+        )
 
 
 def wait_for_text(log: Path, text: str, process: subprocess.Popen[bytes]) -> None:
@@ -603,6 +675,10 @@ def main() -> None:
     # Clearing it here, rather than moving the guard in validate.rs, keeps that
     # guard intact for REAL nested runs — which is exactly what it is for.
     os.environ.pop("HERMIT_VALIDATE_ACTIVE", None)
+
+    # Before anything spawns: a misclassifying predicate turns this run's reds into
+    # no-results, so it is checked first rather than trusted.
+    check_refusal_predicate()
 
     unevaluated: list[str] = []
     # ⚠️ A REFUSED CHILD MAKES EVERY SIGNAL CASE UNEVALUABLE, NOT FAILED, so the
