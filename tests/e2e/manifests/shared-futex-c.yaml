@@ -1,4 +1,4 @@
-schema: 2
+schema: 3
 bucket: shared-futex-c
 test:
   - id: shared-futex-c/qemu-exec-init
@@ -10,7 +10,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/shared-futex-verify/qemu_exec_init.c
     observation:
@@ -86,7 +85,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/shared-futex-verify/qemu_hello.c
     observation:
@@ -146,7 +144,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/shared-futex-verify/qemu_init.c
     observation:
@@ -222,7 +219,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/shared-futex-verify/qemu_net_init.c
     observation:

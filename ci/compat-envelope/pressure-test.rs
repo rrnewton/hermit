@@ -797,6 +797,7 @@ struct CellBudget {
 struct ManifestBudgetRow {
     test: String,
     mode: String,
+    backend: String,
     timeout_seconds: i64,
     attempts: JsonValue,
 }
@@ -1605,10 +1606,15 @@ fn print_exact_manifest_command(
     println!("Cell: {}/{}/{}", cell.test, cell.mode, cell.backend);
     let budgets = load_budgets(root)?;
     let budget = budgets
-        .get(&(cell.test.clone(), cell.mode.clone()))
-        .ok_or_else(|| format!("no manifest budget for {}/{}", cell.test, cell.mode))?;
+        .get(&(cell.test.clone(), cell.mode.clone(), cell.backend.clone()))
+        .ok_or_else(|| {
+            format!(
+                "no manifest budget for {}/{}/{}",
+                cell.test, cell.mode, cell.backend
+            )
+        })?;
     println!(
-        "Boxed cell wall cap: {}s (the manifest's per-attempt timeout remains nested and cannot extend this cap)",
+        "Boxed cell wall cap: {}s (the manifest's per-cell timeout remains nested and cannot extend this cap)",
         pressure_timeout(budget, selection.cell_timeout_seconds)?
     );
     println!("Manifest command inside that boxed cell:");
@@ -2180,11 +2186,15 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
         match cell.status.as_str() {
             "red" if selected && !selection.repeats_green_cell() => {
                 let budget = budgets
-                    .get(&(cell.id.test.clone(), cell.id.mode.clone()))
+                    .get(&(
+                        cell.id.test.clone(),
+                        cell.id.mode.clone(),
+                        cell.id.backend.clone(),
+                    ))
                     .ok_or_else(|| {
                         format!(
-                            "no manifest execution budget for {}/{}",
-                            cell.id.test, cell.id.mode
+                            "no manifest execution budget for {}/{}/{}",
+                            cell.id.test, cell.id.mode, cell.id.backend
                         )
                     })?;
                 if budget.attempts.is_some() {
@@ -2201,11 +2211,15 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
             "red" => {}
             "green" if selected && selection.repeats_green_cell() && cell.enabled => {
                 let budget = budgets
-                    .get(&(cell.id.test.clone(), cell.id.mode.clone()))
+                    .get(&(
+                        cell.id.test.clone(),
+                        cell.id.mode.clone(),
+                        cell.id.backend.clone(),
+                    ))
                     .ok_or_else(|| {
                         format!(
-                            "no manifest execution budget for {}/{}",
-                            cell.id.test, cell.id.mode
+                            "no manifest execution budget for {}/{}/{}",
+                            cell.id.test, cell.id.mode, cell.id.backend
                         )
                     })?;
                 if budget.attempts.is_none() {
@@ -2339,7 +2353,7 @@ fn sample_score(cell: &CellId, seed: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-fn load_budgets(root: &Path) -> Result<BTreeMap<(String, String), CellBudget>, String> {
+fn load_budgets(root: &Path) -> Result<BTreeMap<(String, String, String), CellBudget>, String> {
     let output = Command::new("cargo")
         .args([
             "run",
@@ -2362,18 +2376,20 @@ fn load_budgets(root: &Path) -> Result<BTreeMap<(String, String), CellBudget>, S
     decode_budgets(&output.stdout)
 }
 
-fn decode_budgets(matrix_json: &[u8]) -> Result<BTreeMap<(String, String), CellBudget>, String> {
+fn decode_budgets(
+    matrix_json: &[u8],
+) -> Result<BTreeMap<(String, String, String), CellBudget>, String> {
     let rows: Vec<ManifestBudgetRow> = serde_json::from_slice(matrix_json)
         .map_err(|e| format!("manifest-plan emitted invalid matrix JSON: {e}"))?;
     if rows.is_empty() {
         return Err("manifest-plan emitted an empty matrix".into());
     }
-    let mut out: BTreeMap<(String, String), CellBudget> = BTreeMap::new();
+    let mut out: BTreeMap<(String, String, String), CellBudget> = BTreeMap::new();
     for row in rows {
         if !(1..=1800).contains(&row.timeout_seconds) {
             return Err(format!(
-                "manifest-plan emitted timeout {} outside 1..=1800 for {}/{}",
-                row.timeout_seconds, row.test, row.mode
+                "manifest-plan emitted timeout {} outside 1..=1800 for {}/{}/{}",
+                row.timeout_seconds, row.test, row.mode, row.backend
             ));
         }
         let attempts = if row.attempts.is_null() {
@@ -2381,24 +2397,24 @@ fn decode_budgets(matrix_json: &[u8]) -> Result<BTreeMap<(String, String), CellB
         } else {
             Some(row.attempts.as_i64().ok_or_else(|| {
                 format!(
-                    "manifest-plan emitted a non-integer attempt count for {}/{}",
-                    row.test, row.mode
+                    "manifest-plan emitted a non-integer attempt count for {}/{}/{}",
+                    row.test, row.mode, row.backend
                 )
             })?)
         };
         if attempts.is_none() && row.mode != "chaos" {
             return Err(format!(
-                "manifest-plan emitted no attempt count for non-chaos mode {}/{}",
-                row.test, row.mode
+                "manifest-plan emitted no attempt count for non-chaos mode {}/{}/{}",
+                row.test, row.mode, row.backend
             ));
         }
         if attempts.is_some_and(|attempts| attempts <= 0) {
             return Err(format!(
-                "manifest-plan emitted a nonpositive attempt count for {}/{}",
-                row.test, row.mode
+                "manifest-plan emitted a nonpositive attempt count for {}/{}/{}",
+                row.test, row.mode, row.backend
             ));
         }
-        let key = (row.test, row.mode);
+        let key = (row.test, row.mode, row.backend);
         let budget = CellBudget {
             timeout_seconds: row.timeout_seconds,
             attempts,
@@ -2406,8 +2422,8 @@ fn decode_budgets(matrix_json: &[u8]) -> Result<BTreeMap<(String, String), CellB
         if let Some(existing) = out.get(&key) {
             if existing != &budget {
                 return Err(format!(
-                    "manifest-plan emitted conflicting execution budgets for {}/{}",
-                    key.0, key.1
+                    "manifest-plan emitted conflicting execution budgets for {}/{}/{}",
+                    key.0, key.1, key.2
                 ));
             }
         } else {
@@ -2417,16 +2433,15 @@ fn decode_budgets(matrix_json: &[u8]) -> Result<BTreeMap<(String, String), CellB
     Ok(out)
 }
 
-/// The harness may spend one manifest timeout preparing the fixture, then one
-/// timeout per attempt. Every timeout has a documented 10-second TERM/KILL
-/// grace. The final 30 seconds is the existing nextest/reporting grace used by
-/// this repository, not a backend multiplier or a guessed speed ratio.
+/// The harness gives preparation and every invocation one shared manifest
+/// timeout. The extra 10 seconds admits its documented TERM/KILL grace; the
+/// final 30 seconds is the existing nextest/reporting grace used by this
+/// repository, not an invocation multiplier or a guessed speed ratio.
 fn outer_timeout(budget: &CellBudget) -> Result<i64, String> {
-    let attempts = budget.attempts.ok_or(
+    budget.attempts.ok_or(
         "cannot derive a wall cap for a cell whose manifest has no executable attempt recipe",
     )?;
-    let phases = attempts + 1;
-    Ok(phases * (budget.timeout_seconds + 10) + 30)
+    Ok(budget.timeout_seconds + 10 + 30)
 }
 
 fn pressure_timeout(budget: &CellBudget, selected_cap: Option<i64>) -> Result<i64, String> {
@@ -2443,7 +2458,7 @@ fn preparation_node_timeout(budget: &CellBudget, selected_cap: Option<i64>) -> R
 
 fn require_cell_occupancy_fits(
     cells: &[TrackedCell],
-    budgets: &BTreeMap<(String, String), CellBudget>,
+    budgets: &BTreeMap<(String, String, String), CellBudget>,
     selected_cap: Option<i64>,
     run_timeout_seconds: i64,
     repetitions: usize,
@@ -2457,11 +2472,15 @@ fn require_cell_occupancy_fits(
     let mut kvm_seconds = 0_i64;
     for tracked in cells {
         let budget = budgets
-            .get(&(tracked.id.test.clone(), tracked.id.mode.clone()))
+            .get(&(
+                tracked.id.test.clone(),
+                tracked.id.mode.clone(),
+                tracked.id.backend.clone(),
+            ))
             .ok_or_else(|| {
                 format!(
-                    "no manifest budget for {}/{}",
-                    tracked.id.test, tracked.id.mode
+                    "no manifest budget for {}/{}/{}",
+                    tracked.id.test, tracked.id.mode, tracked.id.backend
                 )
             })?;
         let seconds = pressure_timeout(budget, selected_cap)?;
@@ -2756,8 +2775,13 @@ fn write_plan_after_scorecard_check(
     let mut preparation_tags = BTreeMap::new();
     for (test, cell) in preparation_by_test {
         let budget = budgets
-            .get(&(test.clone(), cell.mode.clone()))
-            .ok_or_else(|| format!("no manifest budget for {test}/{}", cell.mode))?;
+            .get(&(test.clone(), cell.mode.clone(), cell.backend.clone()))
+            .ok_or_else(|| {
+                format!(
+                    "no manifest budget for {test}/{}/{}",
+                    cell.mode, cell.backend
+                )
+            })?;
         let job = sanitize(&test);
         let tag = format!("prepare.{job}");
         let status_path = results.join("prepare").join(&job).join("status");
@@ -2832,8 +2856,13 @@ fn write_plan_after_scorecard_check(
     for tracked in &cells {
         let cell = &tracked.id;
         let budget = budgets
-            .get(&(cell.test.clone(), cell.mode.clone()))
-            .ok_or_else(|| format!("no manifest budget for {}/{}", cell.test, cell.mode))?;
+            .get(&(cell.test.clone(), cell.mode.clone(), cell.backend.clone()))
+            .ok_or_else(|| {
+                format!(
+                    "no manifest budget for {}/{}/{}",
+                    cell.test, cell.mode, cell.backend
+                )
+            })?;
         for repetition in repetition_numbers(selection.repetitions) {
             let slug = cell_run_slug(cell, repetition);
             let evidence_run_id = cell_evidence_run_id(
@@ -3355,8 +3384,13 @@ fn validate_run_contract(
     let mut expected_cell_timeouts = BTreeMap::new();
     for cell in expected.keys() {
         let budget = budgets
-            .get(&(cell.test.clone(), cell.mode.clone()))
-            .ok_or_else(|| format!("no manifest budget for {}/{}", cell.test, cell.mode))?;
+            .get(&(cell.test.clone(), cell.mode.clone(), cell.backend.clone()))
+            .ok_or_else(|| {
+                format!(
+                    "no manifest budget for {}/{}/{}",
+                    cell.test, cell.mode, cell.backend
+                )
+            })?;
         for repetition in repetition_numbers(metadata.repetitions) {
             expected_cell_timeouts.insert(
                 format!("cell.{}", cell_run_slug(cell, repetition)),
@@ -4683,29 +4717,50 @@ fn self_test(root: &Path) -> Result<(), String> {
     // plan/run still checks at its command boundary before constructing a plan.
     let checked_scorecard = check_scorecard(root)?;
     let explicit_null = decode_budgets(
-        br#"[{"test":"fixture/test","mode":"chaos","timeout_seconds":90,"attempts":null}]"#,
+        br#"[{"test":"fixture/test","mode":"chaos","backend":"ptrace","timeout_seconds":90,"attempts":null}]"#,
     )?;
     if explicit_null
-        .get(&("fixture/test".into(), "chaos".into()))
+        .get(&("fixture/test".into(), "chaos".into(), "ptrace".into()))
         .is_none_or(|budget| budget.attempts.is_some())
     {
         return Err("explicit null chaos attempts must remain unavailable".into());
     }
+    let backend_specific = decode_budgets(
+        br#"[{"test":"fixture/test","mode":"verify","backend":"ptrace","timeout_seconds":30,"attempts":1},{"test":"fixture/test","mode":"verify","backend":"liteinst","timeout_seconds":15,"attempts":1}]"#,
+    )?;
+    if backend_specific.len() != 2
+        || backend_specific
+            .get(&(
+                "fixture/test".into(),
+                "verify".into(),
+                "ptrace".into(),
+            ))
+            .is_none_or(|budget| budget.timeout_seconds != 30)
+        || backend_specific
+            .get(&(
+                "fixture/test".into(),
+                "verify".into(),
+                "liteinst".into(),
+            ))
+            .is_none_or(|budget| budget.timeout_seconds != 15)
+    {
+        return Err("backend-specific cell timeouts were collapsed together".into());
+    }
     for (matrix, expected) in [
         (
-            br#"[{"test":"fixture/test","mode":"chaos","timeout_seconds":90}]"#.as_slice(),
+            br#"[{"test":"fixture/test","mode":"chaos","backend":"ptrace","timeout_seconds":90}]"#.as_slice(),
             "missing field `attempts`",
         ),
         (
-            br#"[{"test":"fixture/test","mode":"verify","timeout_seconds":90,"attempts":null}]"#.as_slice(),
+            br#"[{"test":"fixture/test","mode":"verify","backend":"ptrace","timeout_seconds":90,"attempts":null}]"#.as_slice(),
             "no attempt count for non-chaos mode",
         ),
         (
-            br#"[{"test":"fixture/test","mode":"verify","timeout_seconds":1801,"attempts":1}]"#.as_slice(),
+            br#"[{"test":"fixture/test","mode":"verify","backend":"ptrace","timeout_seconds":1801,"attempts":1}]"#.as_slice(),
             "outside 1..=1800",
         ),
         (
-            br#"[{"test":"fixture/test","mode":"verify","timeout_seconds":90,"attempts":1},{"test":"fixture/test","mode":"verify","timeout_seconds":91,"attempts":1}]"#.as_slice(),
+            br#"[{"test":"fixture/test","mode":"verify","backend":"ptrace","timeout_seconds":90,"attempts":1},{"test":"fixture/test","mode":"verify","backend":"ptrace","timeout_seconds":91,"attempts":1}]"#.as_slice(),
             "conflicting execution budgets",
         ),
     ] {
@@ -4719,12 +4774,17 @@ fn self_test(root: &Path) -> Result<(), String> {
 
     let manifest_budgets = load_budgets(root)?;
     let omitted_naked_runs = manifest_budgets
-        .get(&("applications/timed-progress-bar".into(), "naked".into()))
+        .get(&(
+            "applications/timed-progress-bar".into(),
+            "naked".into(),
+            "native".into(),
+        ))
         .ok_or("self-test manifest lost applications/timed-progress-bar naked budget")?;
     let explicit_naked_runs = manifest_budgets
         .get(&(
             "determinism-stress-c/producer-consumer".into(),
             "naked".into(),
+            "native".into(),
         ))
         .ok_or("self-test manifest lost determinism-stress-c/producer-consumer naked budget")?;
     if omitted_naked_runs.attempts != Some(3) || explicit_naked_runs.attempts != Some(5) {
@@ -4734,10 +4794,18 @@ fn self_test(root: &Path) -> Result<(), String> {
         ));
     }
     let seeded_chaos = manifest_budgets
-        .get(&("determinism-stress/order-violation".into(), "chaos".into()))
+        .get(&(
+            "determinism-stress/order-violation".into(),
+            "chaos".into(),
+            "ptrace".into(),
+        ))
         .ok_or("self-test manifest lost determinism-stress/order-violation chaos budget")?;
     let unavailable_chaos = manifest_budgets
-        .get(&("applications/timed-progress-bar".into(), "chaos".into()))
+        .get(&(
+            "applications/timed-progress-bar".into(),
+            "chaos".into(),
+            "ptrace".into(),
+        ))
         .ok_or("self-test manifest lost applications/timed-progress-bar chaos budget")?;
     if seeded_chaos.attempts != Some(32) || unavailable_chaos.attempts.is_some() {
         return Err(format!(
@@ -4749,9 +4817,9 @@ fn self_test(root: &Path) -> Result<(), String> {
         timeout_seconds: 7,
         attempts: Some(3),
     };
-    if outer_timeout(&budget)? != 98 {
+    if outer_timeout(&budget)? != 47 {
         return Err(format!(
-            "timeout derivation changed: expected 98, got {}",
+            "timeout derivation changed: expected 47, got {}",
             outer_timeout(&budget)?
         ));
     }

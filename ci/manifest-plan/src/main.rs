@@ -26,6 +26,11 @@ use hermit_manifest_plan::ci_selection::CiSelectionSpec;
 use hermit_manifest_plan::runner::REQUIRES_VOCABULARY;
 use hermit_manifest_plan::runner::requires_capability;
 use hermit_manifest_plan::runner::validate_mode_workdir;
+use hermit_manifest_plan::timeouts::DEFAULTS_FILE;
+use hermit_manifest_plan::timeouts::MANIFEST_SCHEMA;
+use hermit_manifest_plan::timeouts::MAX_TIMEOUT_SECONDS;
+use hermit_manifest_plan::timeouts::MIN_TIMEOUT_SECONDS;
+use hermit_manifest_plan::timeouts::resolve_timeout_seconds;
 use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
 use serde_json::json;
@@ -152,12 +157,62 @@ fn main() {
     let script_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/e2e/manifests");
     let repo_root = script_dir.join("../../..");
 
+    let defaults_path = script_dir.join(DEFAULTS_FILE);
+    let defaults_text = std::fs::read_to_string(&defaults_path)
+        .unwrap_or_else(|error| die(format!("cannot read {}: {error}", defaults_path.display())));
+    let defaults: Value = defaults_text.parse().unwrap_or_else(|error| {
+        die(format!(
+            "{}: invalid YAML: {error}",
+            defaults_path.display()
+        ))
+    });
+    ensure_keys(
+        &defaults,
+        &["schema", "timeout_seconds", "nextest"],
+        DEFAULTS_FILE,
+    );
+    if defaults.get("schema").and_then(Value::as_integer) != Some(MANIFEST_SCHEMA as i64) {
+        die(format!("{DEFAULTS_FILE}: schema must be {MANIFEST_SCHEMA}"));
+    }
+    let global_timeout_seconds = required_timeout_seconds(
+        defaults.get("timeout_seconds"),
+        "global default.timeout_seconds",
+    );
+    if let Some(nextest) = defaults.get("nextest") {
+        let entries = nextest
+            .as_array()
+            .unwrap_or_else(|| die("defaults.nextest must be an array"));
+        let mut filters = BTreeSet::new();
+        for (index, entry) in entries.iter().enumerate() {
+            let context = format!("defaults.nextest[{index}]");
+            ensure_keys(
+                entry,
+                &["filter", "timeout_seconds", "slow_reason"],
+                &context,
+            );
+            let filter = required_string(entry, "filter", &context);
+            let timeout = required_timeout_seconds(entry.get("timeout_seconds"), &context);
+            if timeout == global_timeout_seconds {
+                die(format!(
+                    "{context}: timeout_seconds redundantly repeats the global default"
+                ));
+            }
+            required_string(entry, "slow_reason", &context);
+            if !filters.insert(filter) {
+                die(format!(
+                    "{context}: duplicate nextest timeout filter `{filter}`"
+                ));
+            }
+        }
+    }
+
     let mut manifests: Vec<PathBuf> = std::fs::read_dir(&script_dir)
         .unwrap_or_else(|error| die(format!("cannot read {}: {error}", script_dir.display())))
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| {
             path.extension()
                 .is_some_and(|extension| extension == "yaml")
+                && path.file_name().is_some_and(|name| name != DEFAULTS_FILE)
         })
         .collect();
     manifests.sort();
@@ -180,10 +235,14 @@ fn main() {
             .parse()
             .unwrap_or_else(|error| die(format!("{}: invalid YAML: {error}", path.display())));
         let location = path.file_name().unwrap().to_string_lossy().to_string();
-        ensure_keys(&document, &["schema", "bucket", "test"], &location);
+        ensure_keys(
+            &document,
+            &["schema", "bucket", "timeout_seconds", "slow_reason", "test"],
+            &location,
+        );
 
-        if document.get("schema").and_then(Value::as_integer) != Some(2) {
-            die(format!("{location}: schema must be 2"));
+        if document.get("schema").and_then(Value::as_integer) != Some(MANIFEST_SCHEMA as i64) {
+            die(format!("{location}: schema must be {MANIFEST_SCHEMA}"));
         }
         let bucket = required_string(&document, "bucket", &location);
         let stem = path.file_stem().unwrap().to_string_lossy();
@@ -192,6 +251,30 @@ fn main() {
                 "{location}: bucket `{bucket}` must equal file stem `{stem}`"
             ));
         }
+        let bucket_timeout_seconds = document.get("timeout_seconds").map(|value| {
+            required_timeout_seconds(Some(value), &format!("{bucket}.timeout_seconds"))
+        });
+        let bucket_reason = document
+            .get("slow_reason")
+            .map(|_| required_string(&document, "slow_reason", bucket));
+        match (bucket_timeout_seconds, bucket_reason) {
+            (Some(timeout), Some(_)) if timeout != global_timeout_seconds => {}
+            (Some(_), Some(_)) => die(format!(
+                "{bucket}: bucket timeout_seconds redundantly repeats the global default"
+            )),
+            (Some(_), _) => die(format!(
+                "{bucket}: bucket timeout_seconds requires a non-empty slow_reason"
+            )),
+            (None, Some(_)) => die(format!(
+                "{bucket}: bucket slow_reason has no timeout_seconds"
+            )),
+            (None, None) => {}
+        }
+        let inherited_timeout_seconds = resolve_timeout_seconds(
+            global_timeout_seconds as u64,
+            bucket_timeout_seconds.map(|value| value as u64),
+            None,
+        ) as i64;
         let tests = document
             .get("test")
             .and_then(Value::as_array)
@@ -201,6 +284,7 @@ fn main() {
             validate_and_expand(
                 test,
                 bucket,
+                inherited_timeout_seconds,
                 &location,
                 &repo_root,
                 &mut seen_ids,
@@ -409,7 +493,7 @@ fn enforce_exact_ratchet(label: &str, actual: &BTreeSet<String>, baseline: &BTre
     let stale: Vec<_> = baseline.difference(actual).cloned().collect();
     if !unexpected.is_empty() || !stale.is_empty() {
         die(format!(
-            "matrix symmetry {label} changed; unexpected={unexpected:?}, stale_baseline={stale:?}. New compatibility coverage must enter a shared schema-v2 YAML manifest, establish ptrace first, and declare every backend/mode cell; remove migrated debt from {MATRIX_SYMMETRY_BASELINE}"
+            "matrix symmetry {label} changed; unexpected={unexpected:?}, stale_baseline={stale:?}. New compatibility coverage must enter a shared schema-v3 YAML manifest, establish ptrace first, and declare every backend/mode cell; remove migrated debt from {MATRIX_SYMMETRY_BASELINE}"
         ));
     }
 }
@@ -600,7 +684,7 @@ fn required_string<'a>(value: &'a Value, key: &str, location: &str) -> &'a str {
     value
         .get(key)
         .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| die(format!("{location}: missing non-empty string `{key}`")))
 }
 
@@ -652,6 +736,86 @@ fn ensure_keys(value: &Value, allowed: &[&str], location: &str) {
     }
 }
 
+fn required_timeout_seconds(value: Option<&Value>, context: &str) -> i64 {
+    match value.and_then(Value::as_integer) {
+        Some(timeout)
+            if (MIN_TIMEOUT_SECONDS as i64..=MAX_TIMEOUT_SECONDS as i64).contains(&timeout) =>
+        {
+            timeout
+        }
+        other => die(format!(
+            "{context} must be {MIN_TIMEOUT_SECONDS}..={MAX_TIMEOUT_SECONDS}, got {other:?}"
+        )),
+    }
+}
+
+fn cell_timeout_overrides(
+    spec: &Value,
+    id: &str,
+    mode: &str,
+    enabled: &BTreeSet<String>,
+    inherited_timeout_seconds: i64,
+) -> std::collections::BTreeMap<String, i64> {
+    let timeouts = spec
+        .get("timeout_seconds")
+        .map(|value| {
+            value.as_table().unwrap_or_else(|| {
+                die(format!(
+                    "{id}.modes.{mode}.timeout_seconds must be a backend table"
+                ))
+            })
+        })
+        .cloned()
+        .unwrap_or_default();
+    let reasons = spec
+        .get("slow_reason")
+        .map(|value| {
+            value.as_table().unwrap_or_else(|| {
+                die(format!(
+                    "{id}.modes.{mode}.slow_reason must be a backend table"
+                ))
+            })
+        })
+        .cloned()
+        .unwrap_or_default();
+    let timeout_keys = timeouts.keys().cloned().collect::<BTreeSet<_>>();
+    let reason_keys = reasons.keys().cloned().collect::<BTreeSet<_>>();
+    if timeout_keys != reason_keys {
+        die(format!(
+            "{id}.modes.{mode}: timeout_seconds and slow_reason must name the same backends"
+        ));
+    }
+    let mut resolved = std::collections::BTreeMap::new();
+    for (backend, value) in timeouts {
+        if !enabled.contains(&backend) {
+            die(format!(
+                "{id}.modes.{mode}.timeout_seconds names disabled backend `{backend}`"
+            ));
+        }
+        let timeout = required_timeout_seconds(
+            Some(&value),
+            &format!("{id}.modes.{mode}.timeout_seconds.{backend}"),
+        );
+        let reason = reasons[&backend].as_str().unwrap_or_else(|| {
+            die(format!(
+                "{id}.modes.{mode}.slow_reason.{backend} must be a string"
+            ))
+        });
+        if reason.trim().is_empty() {
+            die(format!(
+                "{id}.modes.{mode}.slow_reason.{backend} must be non-empty"
+            ));
+        }
+        if timeout == inherited_timeout_seconds {
+            die(format!(
+                "{id}.modes.{mode}.timeout_seconds.{backend} redundantly repeats its inherited value"
+            ));
+        }
+        resolved.insert(backend, timeout);
+    }
+    resolved
+}
+
 fn is_file_or_symlink(path: &Path) -> bool {
     path.is_file()
         || std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
@@ -661,6 +825,7 @@ fn is_file_or_symlink(path: &Path) -> bool {
 fn validate_and_expand(
     test: &Value,
     bucket: &str,
+    inherited_timeout_seconds: i64,
     location: &str,
     repo_root: &Path,
     seen_ids: &mut BTreeSet<String>,
@@ -675,14 +840,12 @@ fn validate_and_expand(
             "description",
             "lane",
             "requires",
-            "timeout_seconds",
             "occasional",
             "program",
             "direct",
             "observation",
             "build",
             "modes",
-            "slow_reason",
             "preprocessors",
         ],
         &id,
@@ -710,12 +873,6 @@ fn validate_and_expand(
             "{id}: lane must be portable|privileged, got `{lane}`"
         ));
     }
-    let timeout_seconds = match test.get("timeout_seconds").and_then(Value::as_integer) {
-        Some(timeout) if (1..=1800).contains(&timeout) => timeout,
-        other => die(format!(
-            "{id}: timeout_seconds must be 1..=1800, got {other:?}"
-        )),
-    };
     if test.get("occasional").and_then(Value::as_bool).is_none() {
         die(format!("{id}: occasional must be a boolean"));
     }
@@ -769,11 +926,6 @@ fn validate_and_expand(
             }
         }
     }
-    if let Some(reason) = test.get("slow_reason") {
-        if reason.as_str().is_none_or(str::is_empty) {
-            die(format!("{id}: slow_reason must be a non-empty string"));
-        }
-    }
     if let Some(preprocessors) = test.get("preprocessors") {
         let preprocessors = string_array(Some(preprocessors), &format!("{id}.preprocessors"));
         if preprocessors.iter().any(|value| value != "e9patch") {
@@ -803,7 +955,7 @@ fn validate_and_expand(
             bucket,
             lane,
             mode,
-            timeout_seconds,
+            inherited_timeout_seconds,
             modes.get(mode).unwrap(),
             rows,
         );
@@ -850,7 +1002,7 @@ fn validate_mode(
     bucket: &str,
     lane: &str,
     mode: &str,
-    timeout_seconds: i64,
+    inherited_timeout_seconds: i64,
     spec: &Value,
     rows: &mut Vec<PlanRow>,
 ) {
@@ -865,6 +1017,8 @@ fn validate_mode(
         "backends_disabled",
         "guest_args",
         "workdir",
+        "timeout_seconds",
+        "slow_reason",
     ];
     match mode {
         "naked" => allowed.extend(["runs", "assert"]),
@@ -965,6 +1119,14 @@ fn validate_mode(
         spec.get("backends_enabled"),
         &format!("{id}.modes.{mode}.backends_enabled"),
     );
+    let enabled_set = enabled.iter().cloned().collect::<BTreeSet<_>>();
+    let timeout_overrides = cell_timeout_overrides(
+        spec_value,
+        id,
+        mode,
+        &enabled_set,
+        inherited_timeout_seconds,
+    );
     validate_mode_workdir(id, mode, workdir, &enabled).unwrap_or_else(|error| die(error));
     let disabled = spec
         .get("backends_disabled")
@@ -987,11 +1149,11 @@ fn validate_mode(
     } else {
         KNOWN_BACKENDS.into_iter().collect()
     };
-    let enabled_set: BTreeSet<&str> = enabled.iter().map(String::as_str).collect();
+    let enabled_names: BTreeSet<&str> = enabled.iter().map(String::as_str).collect();
     let disabled_set: BTreeSet<&str> = disabled.keys().map(String::as_str).collect();
-    if enabled_set.len() != enabled.len()
-        || !enabled_set.is_disjoint(&disabled_set)
-        || enabled_set
+    if enabled_names.len() != enabled.len()
+        || !enabled_names.is_disjoint(&disabled_set)
+        || enabled_names
             .union(&disabled_set)
             .copied()
             .collect::<BTreeSet<_>>()
@@ -1014,7 +1176,7 @@ fn validate_mode(
             .as_table()
             .unwrap_or_else(|| die(format!("{id}: modes.{mode}.guest_args must be a table")));
         for (backend, args) in guest_args {
-            if !enabled_set.contains(backend.as_str()) {
+            if !enabled_names.contains(backend.as_str()) {
                 die(format!(
                     "{id}: modes.{mode}.guest_args.{backend} names a backend that is not enabled"
                 ));
@@ -1185,6 +1347,10 @@ fn validate_mode(
 
     let attempts = mode_attempts(id, mode, spec_value);
     for backend in enabled {
+        let timeout_seconds = timeout_overrides
+            .get(&backend)
+            .copied()
+            .unwrap_or(inherited_timeout_seconds);
         let selected = ci.selected(&backend);
         let ci_disabled_reason = ci.reason(&backend).cloned();
         rows.push(PlanRow {
@@ -1215,7 +1381,7 @@ fn validate_mode(
             ci_disabled_reason: None,
             enabled: false,
             not_applicable_reason,
-            timeout_seconds,
+            timeout_seconds: inherited_timeout_seconds,
             attempts,
         });
     }
@@ -1590,6 +1756,68 @@ liteinst = "unsupported"
                 .all(|row| row.timeout_seconds == 90 && row.attempts == Some(1))
         );
         assert_eq!(rows.iter().filter(|row| !row.enabled).count(), 4);
+    }
+
+    #[test]
+    fn exact_cell_timeout_overrides_the_inherited_value() {
+        let spec = parse_mode(
+            r#"
+ci = true
+backends_enabled = ["ptrace"]
+timeout_seconds = { ptrace = 30 }
+slow_reason = { ptrace = "three measured runs exceeded the inherited limit" }
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        let mut rows = Vec::new();
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            15,
+            &spec,
+            &mut rows,
+        );
+        let ptrace = rows.iter().find(|row| row.backend == "ptrace").unwrap();
+        assert_eq!(ptrace.timeout_seconds, 30);
+        assert!(
+            rows.iter()
+                .filter(|row| row.backend != "ptrace")
+                .all(|row| row.timeout_seconds == 15)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "timeout_seconds and slow_reason must name the same backends")]
+    fn rejects_a_cell_timeout_without_its_named_reason() {
+        let spec = parse_mode(
+            r#"
+ci = true
+backends_enabled = ["ptrace"]
+timeout_seconds = { ptrace = 30 }
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            15,
+            &spec,
+            &mut Vec::new(),
+        );
     }
 
     #[test]

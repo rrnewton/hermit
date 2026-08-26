@@ -5,7 +5,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Re-target legacy backend-parity matrix additions into the shared schema-v2 manifest.
+"""Re-target legacy backend-parity matrix additions into the shared schema-v3 manifest.
 
 Background
 ----------
@@ -246,7 +246,6 @@ def render_test_entry(plan: Plan) -> dict:
         "description": f"Strict verification for {plan.program}",
         "lane": plan.lane,
         "requires": requires,
-        "timeout_seconds": 90,
         "occasional": False,
         "program": plan.program,
         "observation": {"status": True, "stdout": True, "stderr": False, "artifacts": []},

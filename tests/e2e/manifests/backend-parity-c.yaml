@@ -1,4 +1,4 @@
-schema: 2
+schema: 3
 bucket: backend-parity-c
 test:
   - id: backend-parity-c/aio-refusal
@@ -10,7 +10,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/aio_refusal.c
     observation:
@@ -82,7 +81,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/set_tid_address.c
     observation:
@@ -154,7 +152,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/personality_domain.c
     observation:
@@ -229,7 +226,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/cachestat_refusal.c
     observation:
@@ -292,7 +288,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/child_subreaper_refusal.c
     observation:
@@ -355,7 +350,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/close_range_fds.c
     observation:
@@ -418,7 +412,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/copy_file_range_refusal.c
     observation:
@@ -482,7 +475,6 @@ test:
       - ptrace
       - cpuid
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/cpuid_probe.c
     observation:
@@ -545,7 +537,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/epoll_pwait2_readiness.c
     observation:
@@ -608,7 +599,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/epoll_readiness.c
     observation:
@@ -671,7 +661,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/faccessat2_flags.c
     observation:
@@ -734,7 +723,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/fadvise_hints.c
     observation:
@@ -802,7 +790,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/fallocate_extents.c
     observation:
@@ -865,7 +852,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/fchmod_bits.c
     observation:
@@ -928,7 +914,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/file_backed_mmap.c
     observation:
@@ -991,7 +976,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/flock_lifecycle.c
     observation:
@@ -1054,7 +1038,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/fsync_durability.c
     observation:
@@ -1117,7 +1100,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/getrusage_self_accounting.c
     observation:
@@ -1189,7 +1171,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/inotify_watch.c
     observation:
@@ -1252,7 +1233,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/ioctl_fionread.c
     observation:
@@ -1315,7 +1295,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/kcmp_refusal.c
     observation:
@@ -1378,7 +1357,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/linkat_flags.c
     observation:
@@ -1441,7 +1419,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/mce_kill_policy.c
     observation:
@@ -1504,7 +1481,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/memfd_create.c
     observation:
@@ -1567,7 +1543,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/mempolicy_default.c
     observation:
@@ -1630,7 +1605,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/mincore_residency.c
     observation:
@@ -1695,7 +1669,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/mkdir_rmdir.c
     observation:
@@ -1767,7 +1740,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/mknod_special.c
     observation:
@@ -1830,7 +1802,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/numa_node_identity.c
     observation:
@@ -1894,7 +1865,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/name_to_handle.c
     observation:
@@ -1957,7 +1927,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/no_new_privs_refusal.c
     observation:
@@ -2020,7 +1989,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/openat2_refusal.c
     observation:
@@ -2083,7 +2051,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/path_file_ops.c
     observation:
@@ -2146,7 +2113,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/pid_probe.c
     observation:
@@ -2210,7 +2176,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/pipe2_flags.c
     observation:
@@ -2273,7 +2238,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/prctl_pdeathsig.c
     observation:
@@ -2336,7 +2300,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/preadv2_flags.c
     observation:
@@ -2399,7 +2362,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/pthread_lifecycle.c
     observation:
@@ -2463,7 +2425,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/readdir_entries.c
     observation:
@@ -2526,7 +2487,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/rename_ops.c
     observation:
@@ -2589,7 +2549,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/renameat2_flags.c
     observation:
@@ -2652,7 +2611,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/robust_list.c
     observation:
@@ -2715,7 +2673,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/seccomp_refusal.c
     observation:
@@ -2778,7 +2735,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/signalfd_create.c
     observation:
@@ -2841,7 +2797,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 120
     occasional: false
     program: tests/backend-parity/fixtures/socket_epoll_ordering.c
     observation:
@@ -2905,7 +2860,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/statfs_free_determinism.c
     observation:
@@ -2968,7 +2922,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/statx_metadata.c
     observation:
@@ -3031,7 +2984,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/symlink_ops.c
     observation:
@@ -3103,7 +3055,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/sync_file_range.c
     observation:
@@ -3166,7 +3117,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/sysv_ipc_refusal.c
     observation:
@@ -3229,7 +3179,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/thp_disable.c
     observation:
@@ -3292,7 +3241,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/umask_mode.c
     observation:
@@ -3364,7 +3312,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/uname_identity.c
     observation:
@@ -3427,7 +3374,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/utimensat_determinism.c
     observation:
@@ -3490,7 +3436,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/socket_options.c
     observation:
@@ -3553,7 +3498,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/shutdown_socketpair.c
     observation:
@@ -3616,7 +3560,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/sockname_unnamed.c
     observation:
@@ -3679,7 +3622,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/bind_getsockname.c
     observation:
@@ -3742,7 +3684,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/msync_writeback.c
     observation:
@@ -3807,7 +3748,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/getpriority_identity.c
     observation:
@@ -3871,7 +3811,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/sendfile_copy.c
     observation:
@@ -3941,7 +3880,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/poll_readiness.c
     observation:
@@ -4004,7 +3942,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/append_pwrite.c
     observation:
@@ -4070,7 +4007,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/prctl_identity.c
     observation:
@@ -4134,7 +4070,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/rlimit_identity.c
     observation:
@@ -4201,7 +4136,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/pipe_ipc.c
     observation:
@@ -4264,7 +4198,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/vectored_io.c
     observation:
@@ -4334,7 +4267,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/eventfd_probe.c
     observation:
@@ -4404,7 +4336,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/ftruncate_sparse.c
     observation:
@@ -4467,7 +4398,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/vectored_file_io.c
     observation:
@@ -4530,7 +4460,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/openat_flags.c
     observation:
@@ -4593,7 +4522,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/fchmodat2_flags.c
     observation:
@@ -4656,7 +4584,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/socketpair_flags.c
     observation:
@@ -4719,7 +4646,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/pidfd_open_self.c
     observation:
@@ -4783,7 +4709,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/cpu_virtualization.c
     observation:
@@ -4847,7 +4772,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/getcpu_identity.c
     observation:
@@ -4911,7 +4835,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/sched_getaffinity_identity.c
     observation:
@@ -4975,7 +4898,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/fd_duplication.c
     observation:
@@ -5039,7 +4961,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/dup_shared_offset.c
     observation:
@@ -5103,7 +5024,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/lseek_positioning.c
     observation:
@@ -5167,7 +5087,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/pipe_capacity.c
     observation:
@@ -5242,7 +5161,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/pipe_capacity_pin.c
     observation:
@@ -5310,7 +5228,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/record_lock.c
     observation:
@@ -5385,7 +5302,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/cwd_roundtrip.c
     observation:
@@ -5460,7 +5376,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/o_tmpfile_anon.c
     observation:
@@ -5535,7 +5450,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/fcntl_owner.c
     observation:
@@ -5610,7 +5524,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/membarrier_query.c
     observation:
@@ -5685,7 +5598,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 120
     occasional: false
     program: tests/backend-parity/fixtures/stat_metadata_identity.c
     observation:
@@ -5750,7 +5662,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 600
     occasional: false
     program: tests/backend-parity/fixtures/mmap_layout_pointer_order.c
     observation:
@@ -5818,7 +5729,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 120
     occasional: false
     program: tests/c/signal_waitstatus_identity.c
     observation:
@@ -5886,7 +5796,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 120
     occasional: false
     program: tests/c/hardware_trap_identity.c
     observation:
@@ -5953,7 +5862,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/host_identity.c
     observation:
@@ -6026,7 +5934,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 120
     occasional: false
     program: tests/backend-parity/fixtures/short_io_split_identity.c
     observation:
@@ -6094,7 +6001,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 120
     occasional: false
     program: tests/backend-parity/fixtures/event_delivery_ordering.c
     observation:
@@ -6169,7 +6075,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/fork_exec_pipeline.c
     observation:
@@ -6232,7 +6137,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/signal_delivery_sequence.c
     observation:
@@ -6302,7 +6206,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/file_io_roundtrip.c
     observation:
@@ -6372,7 +6275,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/pipe_multiwriter_ordering.c
     observation:
@@ -6435,7 +6337,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/mixed_inline_and_libc_syscalls.c
     observation:
@@ -6498,7 +6399,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/inline_syscall_sites.c
     observation:
@@ -6561,7 +6461,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/readdir_order_identity.c
     observation:
@@ -6627,7 +6526,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/static_nolibc_syscall_sites.c
     observation:
@@ -6695,7 +6593,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/backend-parity/fixtures/timer_family_identity.c
     observation:

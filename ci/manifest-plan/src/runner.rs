@@ -28,6 +28,10 @@ pub use crate::canonical_verdict::VerificationReport;
 use crate::ci_selection::CiDisabledReasonSpec;
 use crate::ci_selection::CiSelection;
 use crate::ci_selection::CiSelectionSpec;
+use crate::timeouts::DEFAULTS_FILE;
+use crate::timeouts::MANIFEST_SCHEMA;
+use crate::timeouts::resolve_timeout_seconds;
+use crate::timeouts::validate_timeout_seconds;
 
 const BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
 const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
@@ -85,9 +89,28 @@ pub fn requires_capability(token: &str) -> Result<Option<&'static str>, String> 
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ManifestDefaults {
+    pub schema: u64,
+    pub timeout_seconds: u64,
+    #[serde(default)]
+    pub nextest: Vec<NextestTimeout>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NextestTimeout {
+    pub filter: String,
+    pub timeout_seconds: u64,
+    pub slow_reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestDocument {
     pub schema: u64,
     pub bucket: String,
+    pub timeout_seconds: Option<u64>,
+    pub slow_reason: Option<String>,
     pub test: Vec<TestRecipe>,
 }
 
@@ -99,14 +122,12 @@ pub struct TestRecipe {
     pub lane: String,
     #[serde(default)]
     pub requires: Vec<String>,
-    pub timeout_seconds: u64,
     pub occasional: bool,
     pub program: Option<String>,
     pub direct: Option<DirectCommand>,
     pub observation: Observation,
     pub build: Option<BuildRecipe>,
     pub modes: BTreeMap<String, ModeRecipe>,
-    pub slow_reason: Option<String>,
     #[serde(default)]
     pub preprocessors: Vec<String>,
 }
@@ -159,6 +180,10 @@ pub struct ModeRecipe {
     pub compare_io_buffers_disabled_reason: Option<String>,
     pub rcb_time: Option<bool>,
     pub rcb_time_disabled_reason: Option<String>,
+    #[serde(default)]
+    pub timeout_seconds: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub slow_reason: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -176,7 +201,7 @@ pub struct Assertions {
 #[derive(Clone, Debug)]
 pub struct ManifestSet {
     pub documents: Vec<ManifestDocument>,
-    tests: BTreeMap<String, (String, TestRecipe)>,
+    tests: BTreeMap<String, (String, u64, TestRecipe)>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -242,16 +267,58 @@ pub struct SelectedCell {
     pub test: TestRecipe,
     pub id: CellId,
     pub enabled: bool,
+    pub timeout_seconds: u64,
 }
 
 impl ManifestSet {
     pub fn load(root: &Path) -> Result<Self, String> {
         let dir = root.join("tests/e2e/manifests");
+        let defaults_path = dir.join(DEFAULTS_FILE);
+        let defaults_source = fs::read_to_string(&defaults_path)
+            .map_err(|e| format!("cannot read {}: {e}", defaults_path.display()))?;
+        let defaults: ManifestDefaults = serde_yaml::from_str(&defaults_source)
+            .map_err(|e| format!("{}: invalid YAML: {e}", defaults_path.display()))?;
+        if defaults.schema != MANIFEST_SCHEMA {
+            return Err(format!(
+                "{}: schema must be {MANIFEST_SCHEMA}",
+                defaults_path.display()
+            ));
+        }
+        let global_timeout_seconds =
+            validate_timeout_seconds(defaults.timeout_seconds, "global default")?;
+        let mut nextest_filters = BTreeSet::new();
+        for timeout in &defaults.nextest {
+            if timeout.filter.trim().is_empty() {
+                return Err("nextest timeout filter must not be empty".into());
+            }
+            validate_timeout_seconds(timeout.timeout_seconds, &timeout.filter)?;
+            if timeout.timeout_seconds == global_timeout_seconds {
+                return Err(format!(
+                    "nextest timeout {} redundantly repeats the global default",
+                    timeout.filter
+                ));
+            }
+            if timeout.slow_reason.trim().is_empty() {
+                return Err(format!(
+                    "nextest timeout {} requires a non-empty slow_reason",
+                    timeout.filter
+                ));
+            }
+            if !nextest_filters.insert(timeout.filter.as_str()) {
+                return Err(format!(
+                    "duplicate nextest timeout filter: {}",
+                    timeout.filter
+                ));
+            }
+        }
         let mut paths = fs::read_dir(&dir)
             .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
             .filter_map(Result::ok)
             .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "yaml"))
+            .filter(|path| {
+                path.extension().is_some_and(|ext| ext == "yaml")
+                    && path.file_name().is_some_and(|name| name != DEFAULTS_FILE)
+            })
             .collect::<Vec<_>>();
         paths.sort();
         if paths.is_empty() {
@@ -265,10 +332,19 @@ impl ManifestSet {
             let document: ManifestDocument = serde_yaml::from_str(&source)
                 .map_err(|e| format!("{}: invalid YAML: {e}", path.display()))?;
             let stem = path.file_stem().and_then(OsStr::to_str).unwrap_or_default();
-            validate_document(&document, stem, root)?;
+            validate_document(&document, stem, root, global_timeout_seconds)?;
+            let bucket_timeout_seconds =
+                resolve_timeout_seconds(global_timeout_seconds, document.timeout_seconds, None);
             for test in &document.test {
                 if tests
-                    .insert(test.id.clone(), (document.bucket.clone(), test.clone()))
+                    .insert(
+                        test.id.clone(),
+                        (
+                            document.bucket.clone(),
+                            bucket_timeout_seconds,
+                            test.clone(),
+                        ),
+                    )
                     .is_some()
                 {
                     return Err(format!("duplicate test id: {}", test.id));
@@ -282,7 +358,7 @@ impl ManifestSet {
     pub fn select(&self, selection: &Selection) -> Result<Vec<SelectedCell>, String> {
         let population = selection.population.unwrap_or(Population::Enabled);
         let mut cells = Vec::new();
-        for (id, (category, test)) in &self.tests {
+        for (id, (category, bucket_timeout_seconds, test)) in &self.tests {
             if selection
                 .lane
                 .as_deref()
@@ -332,6 +408,11 @@ impl ManifestSet {
                             backend: None,
                         },
                         enabled,
+                        timeout_seconds: resolve_timeout_seconds(
+                            *bucket_timeout_seconds,
+                            None,
+                            recipe.timeout_seconds.get("native").copied(),
+                        ),
                     });
                     continue;
                 }
@@ -358,6 +439,11 @@ impl ManifestSet {
                     if !population_accepts(population, ci.selected(&backend), enabled) {
                         continue;
                     }
+                    let timeout_seconds = resolve_timeout_seconds(
+                        *bucket_timeout_seconds,
+                        None,
+                        recipe.timeout_seconds.get(&backend).copied(),
+                    );
                     cells.push(SelectedCell {
                         category: category.clone(),
                         test: test.clone(),
@@ -367,6 +453,7 @@ impl ManifestSet {
                             backend: Some(backend),
                         },
                         enabled,
+                        timeout_seconds,
                     });
                 }
             }
@@ -375,10 +462,10 @@ impl ManifestSet {
         Ok(cells)
     }
 
-    pub fn all_tests(&self) -> impl Iterator<Item = (&str, &TestRecipe)> {
+    pub fn all_tests(&self) -> impl Iterator<Item = (&str, u64, &TestRecipe)> {
         self.tests
             .values()
-            .map(|(category, test)| (category.as_str(), test))
+            .map(|(category, timeout_seconds, test)| (category.as_str(), *timeout_seconds, test))
     }
 }
 
@@ -390,9 +477,14 @@ fn population_accepts(population: Population, ci: bool, enabled: bool) -> bool {
     }
 }
 
-fn validate_document(document: &ManifestDocument, stem: &str, root: &Path) -> Result<(), String> {
-    if document.schema != 2 {
-        return Err(format!("{stem}: schema must be 2"));
+fn validate_document(
+    document: &ManifestDocument,
+    stem: &str,
+    root: &Path,
+    global_timeout_seconds: u64,
+) -> Result<(), String> {
+    if document.schema != MANIFEST_SCHEMA {
+        return Err(format!("{stem}: schema must be {MANIFEST_SCHEMA}"));
     }
     if document.bucket != stem {
         return Err(format!(
@@ -403,15 +495,33 @@ fn validate_document(document: &ManifestDocument, stem: &str, root: &Path) -> Re
     if document.test.is_empty() {
         return Err(format!("{stem}: test list must not be empty"));
     }
+    match (document.timeout_seconds, document.slow_reason.as_deref()) {
+        (Some(timeout), Some(reason)) if !reason.trim().is_empty() => {
+            validate_timeout_seconds(timeout, &format!("{stem} bucket"))?;
+            if timeout == global_timeout_seconds {
+                return Err(format!(
+                    "{stem}: bucket timeout_seconds redundantly repeats the global default"
+                ));
+            }
+        }
+        (Some(_), _) => {
+            return Err(format!(
+                "{stem}: bucket timeout_seconds requires a non-empty slow_reason"
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(format!("{stem}: bucket slow_reason has no timeout_seconds"));
+        }
+        (None, None) => {}
+    }
+    let bucket_timeout_seconds =
+        resolve_timeout_seconds(global_timeout_seconds, document.timeout_seconds, None);
     for test in &document.test {
         if !test.id.starts_with(&format!("{stem}/")) {
             return Err(format!("{}: id must start with {stem}/", test.id));
         }
         if !matches!(test.lane.as_str(), "portable" | "privileged") {
             return Err(format!("{}: invalid lane `{}`", test.id, test.lane));
-        }
-        if !(1..=1800).contains(&test.timeout_seconds) {
-            return Err(format!("{}: timeout_seconds must be 1..=1800", test.id));
         }
         for token in &test.requires {
             requires_capability(token).map_err(|error| format!("{}.requires: {error}", test.id))?;
@@ -433,13 +543,18 @@ fn validate_document(document: &ManifestDocument, stem: &str, root: &Path) -> Re
             return Err(format!("{}: modes must be exactly {expected:?}", test.id));
         }
         for (mode, recipe) in &test.modes {
-            validate_mode(&test.id, mode, recipe)?;
+            validate_mode(&test.id, mode, recipe, bucket_timeout_seconds)?;
         }
     }
     Ok(())
 }
 
-fn validate_mode(id: &str, mode: &str, recipe: &ModeRecipe) -> Result<(), String> {
+fn validate_mode(
+    id: &str,
+    mode: &str,
+    recipe: &ModeRecipe,
+    bucket_timeout_seconds: u64,
+) -> Result<(), String> {
     validate_mode_workdir(
         id,
         mode,
@@ -469,6 +584,34 @@ fn validate_mode(id: &str, mode: &str, recipe: &ModeRecipe) -> Result<(), String
         .any(|reason| reason.trim().is_empty())
     {
         return Err(format!("{id}: {mode} has an empty backend-disabled reason"));
+    }
+    for (backend, timeout) in &recipe.timeout_seconds {
+        if !enabled.contains(backend.as_str()) {
+            return Err(format!(
+                "{id}: {mode} timeout_seconds names disabled backend {backend}"
+            ));
+        }
+        validate_timeout_seconds(*timeout, &format!("{id}: {mode}/{backend}"))?;
+        let reason = recipe.slow_reason.get(backend).ok_or_else(|| {
+            format!("{id}: {mode}/{backend} timeout_seconds requires slow_reason")
+        })?;
+        if reason.trim().is_empty() {
+            return Err(format!(
+                "{id}: {mode}/{backend} slow_reason must be non-empty"
+            ));
+        }
+        if *timeout == bucket_timeout_seconds {
+            return Err(format!(
+                "{id}: {mode}/{backend} timeout_seconds redundantly repeats its inherited value"
+            ));
+        }
+    }
+    for backend in recipe.slow_reason.keys() {
+        if !recipe.timeout_seconds.contains_key(backend) {
+            return Err(format!(
+                "{id}: {mode}/{backend} slow_reason has no timeout_seconds"
+            ));
+        }
     }
     let ci = CiSelection::validate(
         &enabled
@@ -886,6 +1029,20 @@ pub fn prepare_test(
     cell: &SelectedCell,
     dir: &Path,
 ) -> Result<Vec<String>, String> {
+    prepare_test_until(
+        context,
+        cell,
+        dir,
+        Instant::now() + Duration::from_secs(cell.timeout_seconds),
+    )
+}
+
+fn prepare_test_until(
+    context: &RunContext,
+    cell: &SelectedCell,
+    dir: &Path,
+    deadline: Instant,
+) -> Result<Vec<String>, String> {
     prepare_dirs(&context.root, dir)?;
     if context.prebuilt && cell.test.program.is_some() {
         let source = context
@@ -924,7 +1081,7 @@ pub fn prepare_test(
                 args.push(context.root.join(program).to_string_lossy().into_owned());
                 args.push("-o".into());
                 args.push(output.to_string_lossy().into_owned());
-                run_preparation(context, dir, "cc", &args, cell.test.timeout_seconds)?;
+                run_preparation(context, dir, "cc", &args, deadline, cell.timeout_seconds)?;
             }
             require_executable_program(&output, &dir.join("captures"))?;
             vec![output.to_string_lossy().into_owned()]
@@ -944,7 +1101,7 @@ pub fn prepare_test(
                 args.push(context.root.join(program).to_string_lossy().into_owned());
                 args.push("-o".into());
                 args.push(output.to_string_lossy().into_owned());
-                run_preparation(context, dir, "rustc", &args, cell.test.timeout_seconds)?;
+                run_preparation(context, dir, "rustc", &args, deadline, cell.timeout_seconds)?;
             }
             require_executable_program(&output, &dir.join("captures"))?;
             vec![output.to_string_lossy().into_owned()]
@@ -957,7 +1114,8 @@ pub fn prepare_test(
                     dir,
                     &path,
                     &["--prepare".into()],
-                    cell.test.timeout_seconds,
+                    deadline,
+                    cell.timeout_seconds,
                 )?;
             }
             vec![path, "--run".into()]
@@ -1035,6 +1193,28 @@ fn with_diagnostic(message: String, captures: &Path) -> String {
     }
 }
 
+fn remaining_cell_time(deadline: Instant) -> Duration {
+    remaining_cell_time_at(deadline, Instant::now())
+}
+
+fn remaining_cell_seconds(deadline: Instant) -> u64 {
+    remaining_cell_seconds_at(deadline, Instant::now())
+}
+
+fn remaining_cell_time_at(deadline: Instant, now: Instant) -> Duration {
+    deadline.saturating_duration_since(now)
+}
+
+fn remaining_cell_seconds_at(deadline: Instant, now: Instant) -> u64 {
+    let remaining = remaining_cell_time_at(deadline, now);
+    if remaining.is_zero() {
+        return 1;
+    }
+    remaining
+        .as_secs()
+        .saturating_add(u64::from(remaining.subsec_nanos() != 0))
+}
+
 fn require_executable_program(path: &Path, captures: &Path) -> Result<(), String> {
     let executable = path
         .metadata()
@@ -1056,9 +1236,16 @@ fn run_preparation(
     dir: &Path,
     program: &str,
     args: &[String],
-    timeout: u64,
+    deadline: Instant,
+    cell_timeout_seconds: u64,
 ) -> Result<(), String> {
     let captures = dir.join("captures");
+    if remaining_cell_time(deadline).is_zero() {
+        return Err(with_diagnostic(
+            format!("cell exceeded {cell_timeout_seconds} s during fixture preparation"),
+            &captures,
+        ));
+    }
     let output = execute_process(
         &context.root,
         program,
@@ -1066,14 +1253,14 @@ fn run_preparation(
         &preparation_env(dir),
         &captures.join("prepare.stdout"),
         &captures.join("prepare.stderr"),
-        timeout,
+        deadline,
     )?;
     if output.timed_out || !output.status.success() {
         // Carry the child's own words back. This used to return the bare sentence
         // and drop `prepare.stderr` on the floor, which turned every denied or
         // broken compile into the same uninformative line.
         let how = if output.timed_out {
-            format!("timed out after {timeout}s")
+            format!("cell exceeded {cell_timeout_seconds} s during fixture preparation")
         } else {
             match output.status.code() {
                 Some(code) => format!("exited {code}"),
@@ -1095,6 +1282,7 @@ pub fn build_spec(
     guest_argv: Vec<String>,
     attempt: &str,
     seed: Option<i64>,
+    timeout_seconds: u64,
 ) -> Result<CellRunSpec, String> {
     let backend = cell.id.backend.as_deref().unwrap_or("native");
     let mode_recipe = &cell.test.modes[&cell.id.mode];
@@ -1202,7 +1390,7 @@ pub fn build_spec(
                 "--data-dir".into(),
                 dir.join("recording").to_string_lossy().into_owned(),
                 "--record-timeout".into(),
-                cell.test.timeout_seconds.to_string(),
+                timeout_seconds.to_string(),
             ]);
             append_execution_root_args(
                 &mut argv,
@@ -1286,7 +1474,7 @@ pub fn build_spec(
         env,
         argv,
         guest_argv,
-        timeout_seconds: cell.test.timeout_seconds,
+        timeout_seconds,
         verdict_path,
         verification_log_dir,
         sabre_path_evidence,
@@ -1295,6 +1483,20 @@ pub fn build_spec(
 }
 
 pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, String> {
+    execute_spec_until(
+        spec,
+        index,
+        Instant::now() + Duration::from_secs(spec.timeout_seconds),
+        spec.timeout_seconds,
+    )
+}
+
+fn execute_spec_until(
+    spec: &CellRunSpec,
+    index: &str,
+    deadline: Instant,
+    cell_timeout_seconds: u64,
+) -> Result<AttemptResult, String> {
     if spec.argv.is_empty() {
         return Err("empty cell argv".into());
     }
@@ -1323,6 +1525,17 @@ pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, St
     let stdout_path = captures.join(format!("{}-{index}.stdout", spec.id.mode));
     let stderr_path = captures.join(format!("{}-{index}.stderr", spec.id.mode));
     let started = Instant::now();
+    let remaining = remaining_cell_time(deadline);
+    if remaining.is_zero() {
+        fs::write(&stdout_path, b"").map_err(|e| e.to_string())?;
+        fs::write(&stderr_path, b"").map_err(|e| e.to_string())?;
+        return Ok(cell_timeout_attempt(
+            spec,
+            index,
+            cell_timeout_seconds,
+            started.elapsed(),
+        ));
+    }
     let output = execute_process(
         &spec.cwd,
         &spec.argv[0],
@@ -1330,7 +1543,7 @@ pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, St
         &spec.env,
         &stdout_path,
         &stderr_path,
-        spec.timeout_seconds,
+        deadline,
     )?;
     if spec.id.mode == "verify" && spec.id.backend.as_deref() == Some("ptrace") {
         if let Some(directory) = &spec.verification_log_dir {
@@ -1347,7 +1560,7 @@ pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, St
     .to_string();
     let mut reason = output
         .timed_out
-        .then(|| format!("cell exceeded {} s", spec.timeout_seconds));
+        .then(|| format!("cell exceeded {cell_timeout_seconds} s"));
     let mut error_kind = None;
     let launch_refusal = spec.id.mode != "naked"
         && !output.status.success()
@@ -1578,7 +1791,7 @@ fn execute_process(
     env: &BTreeMap<String, String>,
     stdout: &Path,
     stderr: &Path,
-    timeout_seconds: u64,
+    deadline: Instant,
 ) -> Result<ProcessOutput, String> {
     let stdout_file = File::create(stdout).map_err(|e| format!("{}: {e}", stdout.display()))?;
     let stderr_file = File::create(stderr).map_err(|e| format!("{}: {e}", stderr.display()))?;
@@ -1601,7 +1814,6 @@ fn execute_process(
     let mut child = command
         .spawn()
         .map_err(|e| format!("cannot execute {program}: {e}"))?;
-    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
     loop {
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
             return Ok(ProcessOutput {
@@ -1639,6 +1851,42 @@ fn execute_process(
     }
 }
 
+fn cell_timeout_attempt(
+    spec: &CellRunSpec,
+    index: &str,
+    cell_timeout_seconds: u64,
+    duration: Duration,
+) -> AttemptResult {
+    AttemptResult {
+        index: index.into(),
+        outcome: "FAIL".into(),
+        error_kind: None,
+        status: None,
+        signal: None,
+        timed_out: true,
+        duration_ms: duration.as_millis(),
+        observation_sha256: None,
+        argv: spec.argv.clone(),
+        guest_argv: spec.guest_argv.clone(),
+        env: spec.env.clone(),
+        cwd: spec.cwd.to_string_lossy().into_owned(),
+        shell_command: shell_command(&spec.cwd.to_string_lossy(), &spec.env, &spec.argv),
+        stdout: String::new(),
+        stderr: String::new(),
+        verification_report: None,
+        verification_report_sha256: None,
+        first_divergent_scheduler_turn: None,
+        first_divergent_virtual_nanoseconds: None,
+        first_divergent_record: None,
+        first_divergent_syscall: None,
+        sabre_path_evidence: None,
+        sabre_path_evidence_sha256: None,
+        reason: Some(format!(
+            "cell exceeded {cell_timeout_seconds} s before attempt {index} started"
+        )),
+    }
+}
+
 /// The one definition of where a cell's retained evidence lives.
 ///
 /// Was duplicated verbatim in `run_cell` and `infrastructure_error_result`.
@@ -1662,10 +1910,11 @@ fn cell_artifact_dir(context: &RunContext, cell: &SelectedCell) -> PathBuf {
 pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult, String> {
     let dir = cell_artifact_dir(context, cell);
     let started = Instant::now();
+    let deadline = started + Duration::from_secs(cell.timeout_seconds);
     let binary_before = fs::read(&context.hermit_bin)
         .ok()
         .map(|bytes| hex_digest(&bytes));
-    let guest = prepare_test(context, cell, &dir)?;
+    let guest = prepare_test_until(context, cell, &dir, deadline)?;
     let mode = cell.test.modes.get(&cell.id.mode).unwrap();
     let mut attempts = Vec::new();
     match cell.id.mode.as_str() {
@@ -1678,13 +1927,19 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
                     guest.clone(),
                     &index.to_string(),
                     None,
+                    remaining_cell_seconds(deadline),
                 )?;
-                attempts.push(execute_observed(
+                attempts.push(execute_observed_until(
                     &spec,
                     &index.to_string(),
                     &cell.test.observation,
                     &dir,
+                    deadline,
+                    cell.timeout_seconds,
                 )?);
+                if attempts.last().is_some_and(|attempt| attempt.timed_out) {
+                    break;
+                }
             }
         }
         "chaos" => {
@@ -1704,13 +1959,19 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
                     guest.clone(),
                     &index,
                     Some(*seed),
+                    remaining_cell_seconds(deadline),
                 )?;
-                attempts.push(execute_observed(
+                attempts.push(execute_observed_until(
                     &spec,
                     &index,
                     &cell.test.observation,
                     &dir,
+                    deadline,
+                    cell.timeout_seconds,
                 )?);
+                if attempts.last().is_some_and(|attempt| attempt.timed_out) {
+                    break;
+                }
             }
         }
         "custom" => {
@@ -1722,18 +1983,39 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
                     guest.clone(),
                     &index.to_string(),
                     None,
+                    remaining_cell_seconds(deadline),
                 )?;
-                attempts.push(execute_observed(
+                attempts.push(execute_observed_until(
                     &spec,
                     &index.to_string(),
                     &cell.test.observation,
                     &dir,
+                    deadline,
+                    cell.timeout_seconds,
                 )?);
+                if attempts.last().is_some_and(|attempt| attempt.timed_out) {
+                    break;
+                }
             }
         }
         _ => {
-            let spec = build_spec(context, cell, dir.clone(), guest.clone(), "1", None)?;
-            attempts.push(execute_observed(&spec, "1", &cell.test.observation, &dir)?);
+            let spec = build_spec(
+                context,
+                cell,
+                dir.clone(),
+                guest.clone(),
+                "1",
+                None,
+                remaining_cell_seconds(deadline),
+            )?;
+            attempts.push(execute_observed_until(
+                &spec,
+                "1",
+                &cell.test.observation,
+                &dir,
+                deadline,
+                cell.timeout_seconds,
+            )?);
         }
     }
     let hashes = attempts
@@ -2580,13 +2862,15 @@ fn command_help_contains(program: &Path, args: &[&str], needle: &str) -> bool {
         })
 }
 
-fn execute_observed(
+fn execute_observed_until(
     spec: &CellRunSpec,
     index: &str,
     observation: &Observation,
     dir: &Path,
+    deadline: Instant,
+    cell_timeout_seconds: u64,
 ) -> Result<AttemptResult, String> {
-    let mut attempt = execute_spec(spec, index)?;
+    let mut attempt = execute_spec_until(spec, index, deadline, cell_timeout_seconds)?;
     attempt.observation_sha256 = Some(observation_hash(observation, &attempt, dir));
     Ok(attempt)
 }
@@ -2624,7 +2908,6 @@ mod tests {
             description: "fixture".into(),
             lane: "portable".into(),
             requires: Vec::new(),
-            timeout_seconds: 10,
             occasional: false,
             program: None,
             direct: Some(DirectCommand::Argv(vec!["/bin/true".into()])),
@@ -2636,7 +2919,6 @@ mod tests {
             },
             build: None,
             modes: BTreeMap::from([("verify".into(), mode)]),
-            slow_reason: None,
             preprocessors: Vec::new(),
         }
     }
@@ -2646,7 +2928,7 @@ mod tests {
         let test = recipe(false);
         let set = ManifestSet {
             documents: Vec::new(),
-            tests: BTreeMap::from([(test.id.clone(), ("fixture".into(), test))]),
+            tests: BTreeMap::from([(test.id.clone(), ("fixture".into(), 15, test))]),
         };
         assert!(
             set.select(&Selection {
@@ -2701,6 +2983,159 @@ mod tests {
     }
 
     #[test]
+    fn exact_cell_timeout_overrides_the_bucket_and_global_defaults() {
+        let mut test = recipe(true);
+        let mode = test.modes.get_mut("verify").unwrap();
+        mode.backends_enabled = vec!["ptrace".into(), "liteinst".into()];
+        mode.backends_disabled.remove("liteinst");
+        mode.timeout_seconds.insert("ptrace".into(), 30);
+        mode.slow_reason.insert(
+            "ptrace".into(),
+            "three complete validation runs measured this cell above the inherited limit".into(),
+        );
+        validate_mode("fixture/test", "verify", mode, 20).unwrap();
+        let set = ManifestSet {
+            documents: Vec::new(),
+            tests: BTreeMap::from([(test.id.clone(), ("fixture".into(), 20, test))]),
+        };
+        let cells = set
+            .select(&Selection {
+                population: Some(Population::Enabled),
+                ..Selection::default()
+            })
+            .unwrap();
+        assert_eq!(cells.len(), 2);
+        assert_eq!(
+            cells
+                .iter()
+                .find(|cell| cell.id.backend.as_deref() == Some("ptrace"))
+                .unwrap()
+                .timeout_seconds,
+            30
+        );
+        assert_eq!(
+            cells
+                .iter()
+                .find(|cell| cell.id.backend.as_deref() == Some("liteinst"))
+                .unwrap()
+                .timeout_seconds,
+            20
+        );
+    }
+
+    #[test]
+    fn bucket_timeout_requires_a_reason_and_must_change_the_global_default() {
+        let mut document = ManifestDocument {
+            schema: MANIFEST_SCHEMA,
+            bucket: "fixture".into(),
+            timeout_seconds: Some(20),
+            slow_reason: Some("measured bucket-wide work needs more than 15 seconds".into()),
+            test: vec![recipe(true)],
+        };
+        document.slow_reason = None;
+        assert_eq!(
+            validate_document(&document, "fixture", Path::new("/"), 15).unwrap_err(),
+            "fixture: bucket timeout_seconds requires a non-empty slow_reason"
+        );
+        document.slow_reason = Some("measured bucket-wide work needs more than 15 seconds".into());
+        document.timeout_seconds = Some(15);
+        assert_eq!(
+            validate_document(&document, "fixture", Path::new("/"), 15).unwrap_err(),
+            "fixture: bucket timeout_seconds redundantly repeats the global default"
+        );
+    }
+
+    #[test]
+    fn cell_timeout_requires_the_same_named_reason() {
+        let mut mode = recipe(true).modes.remove("verify").unwrap();
+        mode.timeout_seconds.insert("ptrace".into(), 30);
+        assert_eq!(
+            validate_mode("fixture/test", "verify", &mode, 15).unwrap_err(),
+            "fixture/test: verify/ptrace timeout_seconds requires slow_reason"
+        );
+        mode.slow_reason
+            .insert("ptrace".into(), "measured above the inherited limit".into());
+        assert!(validate_mode("fixture/test", "verify", &mode, 15).is_ok());
+    }
+
+    #[test]
+    fn later_invocations_receive_only_the_remaining_cell_time() {
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(15);
+        assert_eq!(remaining_cell_seconds_at(deadline, started), 15);
+        assert_eq!(
+            remaining_cell_seconds_at(deadline, started + Duration::from_millis(4_250)),
+            11
+        );
+        assert_eq!(
+            remaining_cell_time_at(deadline, started + Duration::from_secs(15)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn repeated_invocations_share_one_outer_cell_deadline() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-cell-deadline-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let mut test = recipe(true);
+        test.direct = Some(DirectCommand::Argv(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "sleep 0.7; printf complete".into(),
+        ]));
+        let mut mode = test.modes.remove("verify").unwrap();
+        mode.runs = Some(3);
+        test.modes.insert("naked".into(), mode);
+        let cell = SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: test.id.clone(),
+                mode: "naked".into(),
+                backend: None,
+            },
+            test,
+            enabled: true,
+            timeout_seconds: 1,
+        };
+        let context = RunContext {
+            root: root.clone(),
+            hermit_bin: root.join("missing-hermit"),
+            result_root: root.join("results"),
+            build_root: root.join("build"),
+            run_id: "fixture".into(),
+            source_sha: "0".repeat(40),
+            binary_build_sha: None,
+            source_dirty: false,
+            prebuilt: false,
+            keep_logs: false,
+            run_verify_strict: false,
+            record_verify_strict: false,
+            scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
+            isolated_workdir: None,
+        };
+
+        let result = run_cell(&context, &cell).unwrap();
+        assert_eq!(result.attempts.len(), 2);
+        assert!(!result.attempts[0].timed_out);
+        assert!(result.attempts[1].timed_out);
+        assert_eq!(
+            result.attempts[1].reason.as_deref(),
+            Some("cell exceeded 1 s")
+        );
+        assert!(
+            result.duration_ms < 2_000,
+            "three independent one-second bounds would take longer: {}ms",
+            result.duration_ms
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn host_inapplicable_is_a_typed_nonpass_and_a_junit_skip() {
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-host-inapplicable-bracket-{}",
@@ -2719,6 +3154,7 @@ mod tests {
             },
             test,
             enabled: true,
+            timeout_seconds: 15,
         };
         let context = RunContext {
             root: root.clone(),
@@ -2776,6 +3212,7 @@ mod tests {
             },
             test,
             enabled: true,
+            timeout_seconds: 15,
         };
         let context = RunContext {
             root: root.clone(),
@@ -2825,10 +3262,10 @@ mod tests {
                 reason: "canonical comparison diverged at scheduler turn 10".into(),
             },
         )])));
-        validate_mode("fixture/test", "verify", mode).unwrap();
+        validate_mode("fixture/test", "verify", mode, 15).unwrap();
         let set = ManifestSet {
             documents: Vec::new(),
-            tests: BTreeMap::from([(test.id.clone(), ("fixture".into(), test))]),
+            tests: BTreeMap::from([(test.id.clone(), ("fixture".into(), 15, test))]),
         };
         let required = set
             .select(&Selection {
@@ -2873,7 +3310,7 @@ backends_disabled:
 "#,
         )
         .unwrap();
-        validate_mode("fixture/test", "verify", &mode).unwrap();
+        validate_mode("fixture/test", "verify", &mode, 15).unwrap();
         assert_eq!(mode.workdir.as_deref(), Some("/tmp"));
         let policy = ci_selection(&mode).unwrap();
         assert!(policy.selected("ptrace"));
@@ -2889,7 +3326,7 @@ backends_disabled:
         let mut mode = recipe(true).modes.remove("verify").unwrap();
         mode.workdir = Some("tmp".into());
         assert_eq!(
-            validate_mode("fixture/test", "verify", &mode).unwrap_err(),
+            validate_mode("fixture/test", "verify", &mode, 15).unwrap_err(),
             "fixture/test: verify workdir must be an absolute path"
         );
     }
@@ -2936,6 +3373,7 @@ backends_disabled:
             },
             test,
             enabled: true,
+            timeout_seconds: 15,
         };
         let context = RunContext {
             root: PathBuf::from("/repo"),
@@ -2960,6 +3398,7 @@ backends_disabled:
             vec!["/bin/true".into()],
             "1",
             None,
+            cell.timeout_seconds,
         )
         .unwrap();
         let separator = spec.argv.iter().position(|arg| arg == "--").unwrap();
@@ -2983,6 +3422,7 @@ backends_disabled:
             },
             test,
             enabled: true,
+            timeout_seconds: 15,
         };
         let context = RunContext {
             root: PathBuf::from("/repo"),
@@ -3007,6 +3447,7 @@ backends_disabled:
             vec!["/bin/true".into()],
             "1",
             None,
+            cell.timeout_seconds,
         )
         .unwrap();
         let separator = spec.argv.iter().position(|arg| arg == "--").unwrap();
@@ -3058,6 +3499,7 @@ backends_disabled:
             },
             test: replay_test,
             enabled: true,
+            timeout_seconds: 15,
         };
         let replay = build_spec(
             &context,
@@ -3066,8 +3508,16 @@ backends_disabled:
             vec!["/bin/true".into()],
             "1",
             None,
+            7,
         )
         .unwrap();
+        assert!(
+            replay
+                .argv
+                .windows(2)
+                .any(|window| { window[0] == "--record-timeout" && window[1] == "7" })
+        );
+        assert_eq!(replay.timeout_seconds, 7);
         assert!(replay.argv.iter().any(|arg| arg == "--base-env=minimal"));
         assert!(
             replay
@@ -3089,6 +3539,7 @@ backends_disabled:
             },
             test: custom_test,
             enabled: true,
+            timeout_seconds: 15,
         };
         let custom = build_spec(
             &context,
@@ -3097,6 +3548,7 @@ backends_disabled:
             vec!["/bin/true".into()],
             "1",
             None,
+            custom_cell.timeout_seconds,
         )
         .unwrap();
         assert!(
@@ -3132,6 +3584,7 @@ backends_disabled:
             },
             test: naked_test,
             enabled: true,
+            timeout_seconds: 15,
         };
         let naked_error = build_spec(
             &context,
@@ -3140,6 +3593,7 @@ backends_disabled:
             vec!["/bin/true".into()],
             "1",
             None,
+            naked_cell.timeout_seconds,
         )
         .unwrap_err();
         assert_eq!(
@@ -3185,7 +3639,7 @@ backends_disabled:
         mode.rcb_time = Some(false);
         mode.rcb_time_disabled_reason =
             Some("data-dependent assertion work must not perturb virtual time".into());
-        validate_mode("fixture/test", "verify", mode).unwrap();
+        validate_mode("fixture/test", "verify", mode, 15).unwrap();
         let cell = SelectedCell {
             category: "fixture".into(),
             id: CellId {
@@ -3195,6 +3649,7 @@ backends_disabled:
             },
             test,
             enabled: true,
+            timeout_seconds: 15,
         };
         let context = RunContext {
             root: PathBuf::from("/repo"),
@@ -3219,6 +3674,7 @@ backends_disabled:
             vec!["/bin/true".into()],
             "1",
             None,
+            cell.timeout_seconds,
         )
         .unwrap();
         let separator = spec.argv.iter().position(|arg| arg == "--").unwrap();
@@ -3249,7 +3705,7 @@ backends_disabled:
         let mut missing_reason = recipe(true).modes.remove("verify").unwrap();
         missing_reason.compare_io_buffers = Some(false);
         assert!(
-            validate_mode("fixture/test", "verify", &missing_reason)
+            validate_mode("fixture/test", "verify", &missing_reason, 15)
                 .unwrap_err()
                 .contains("requires compare_io_buffers_disabled_reason")
         );
@@ -3257,7 +3713,7 @@ backends_disabled:
         let mut missing_rcb_reason = recipe(true).modes.remove("verify").unwrap();
         missing_rcb_reason.rcb_time = Some(false);
         assert!(
-            validate_mode("fixture/test", "verify", &missing_rcb_reason)
+            validate_mode("fixture/test", "verify", &missing_rcb_reason, 15)
                 .unwrap_err()
                 .contains("requires rcb_time_disabled_reason")
         );
@@ -3275,6 +3731,7 @@ backends_disabled:
             },
             test,
             enabled: true,
+            timeout_seconds: 15,
         };
         let context = RunContext {
             root: PathBuf::from("/repo"),
@@ -3299,6 +3756,7 @@ backends_disabled:
             vec!["/bin/true".into()],
             "1",
             None,
+            cell.timeout_seconds,
         )
         .unwrap();
         assert!(spec.argv.iter().any(|arg| arg == "--verify-strict"));
@@ -3349,6 +3807,7 @@ backends_disabled:
             },
             test: replay_test,
             enabled: true,
+            timeout_seconds: 15,
         };
         let replay = build_spec(
             &context,
@@ -3357,6 +3816,7 @@ backends_disabled:
             vec!["/bin/true".into()],
             "1",
             None,
+            replay_cell.timeout_seconds,
         )
         .unwrap();
         assert!(replay.argv.iter().any(|arg| arg == "--verify-strict"));
@@ -3391,6 +3851,7 @@ backends_disabled:
             },
             test: custom_test,
             enabled: true,
+            timeout_seconds: 15,
         };
         let custom = build_spec(
             &context,
@@ -3399,6 +3860,7 @@ backends_disabled:
             vec!["/bin/true".into()],
             "1",
             None,
+            custom_cell.timeout_seconds,
         )
         .unwrap();
         assert!(
@@ -3945,6 +4407,7 @@ backends_disabled:
                 "-c".into(),
                 "printf 'error: failed to write fixture: Permission denied\\n' >&2; exit 17".into(),
             ],
+            Instant::now() + Duration::from_secs(5),
             5,
         )
         .unwrap_err();
@@ -3985,6 +4448,7 @@ backends_disabled:
             },
             test,
             enabled: true,
+            timeout_seconds: 15,
         };
         let context = RunContext {
             root: root.clone(),

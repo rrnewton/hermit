@@ -1,0 +1,9 @@
+schema: 3
+timeout_seconds: 15
+nextest:
+  - filter: test(/(^|::)every_record_container_site_classifies_a_child_fault_by_name$/)
+    timeout_seconds: 30
+    slow_reason: This source audit runs six record container sites under two injected child-fault classes, making 12 separate Hermit processes, and measured 25.98-26.30s while passing.
+  - filter: binary(=container_init_deadline) & test(/(^|::)bare_timeout_kills_a_hung_hermit_run$/)
+    timeout_seconds: 30
+    slow_reason: This test deliberately waits for a 15-second external deadline before checking cleanup, and the complete three-test binary measured 16.2s while passing; 30 seconds leaves room for the named teardown check without widening its siblings.

@@ -1,4 +1,4 @@
-schema: 2
+schema: 3
 bucket: system-utils
 test:
   - id: system-utils/clock-determinism
@@ -10,7 +10,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/clock_determinism.c
     observation:
@@ -86,7 +85,6 @@ test:
       - x86_64
       - userns
       - ptrace
-    timeout_seconds: 60
     occasional: false
     program: tests/e2e/system-utils/date-nanoseconds.sh
     observation:
@@ -149,7 +147,6 @@ test:
       - userns
       - ptrace
       - date
-    timeout_seconds: 60
     occasional: false
     direct: ./examples/date.sh
     observation:
@@ -208,7 +205,6 @@ test:
       - userns
       - ptrace
       - hexdump
-    timeout_seconds: 60
     occasional: false
     direct: ./examples/devrand.sh
     observation:
@@ -267,7 +263,6 @@ test:
       - x86_64
       - userns
       - ptrace
-    timeout_seconds: 60
     occasional: false
     program: tests/e2e/system-utils/mcookie-random.sh
     observation:
@@ -329,7 +324,6 @@ test:
       - x86_64
       - userns
       - ptrace
-    timeout_seconds: 60
     occasional: false
     program: tests/e2e/system-utils/mktemp-name.sh
     observation:
@@ -394,7 +388,6 @@ test:
       - userns
       - ptrace
       - openssl
-    timeout_seconds: 60
     occasional: false
     program: tests/e2e/system-utils/openssl-enc.sh
     observation:
@@ -457,7 +450,6 @@ test:
       - userns
       - ptrace
       - openssl
-    timeout_seconds: 60
     occasional: false
     program: tests/e2e/system-utils/openssl-genpkey.sh
     observation:
@@ -519,7 +511,6 @@ test:
       - x86_64
       - userns
       - ptrace
-    timeout_seconds: 60
     occasional: false
     program: tests/e2e/system-utils/openssl-passwd.sh
     observation:
@@ -582,7 +573,6 @@ test:
       - userns
       - ptrace
       - openssl
-    timeout_seconds: 60
     occasional: false
     program: tests/e2e/system-utils/openssl-rand.sh
     observation:
@@ -646,7 +636,6 @@ test:
       - x86_64
       - userns
       - ptrace
-    timeout_seconds: 60
     occasional: false
     program: tests/e2e/system-utils/openssl-x509.sh
     observation:
@@ -708,7 +697,6 @@ test:
       - x86_64
       - userns
       - ptrace
-    timeout_seconds: 60
     occasional: false
     program: tests/e2e/system-utils/overflow-gid-resolves.sh
     observation:
@@ -770,7 +758,6 @@ test:
       - x86_64
       - userns
       - ptrace
-    timeout_seconds: 60
     occasional: false
     program: tests/e2e/system-utils/proc-uptime.sh
     observation:
@@ -832,7 +819,6 @@ test:
       - x86_64
       - userns
       - ptrace
-    timeout_seconds: 60
     occasional: false
     program: tests/e2e/system-utils/random-device.sh
     observation:
@@ -895,7 +881,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 60
     occasional: false
     program: tests/c/getpid.c
     observation:
@@ -963,7 +948,6 @@ test:
       - x86_64
       - userns
       - ptrace
-    timeout_seconds: 60
     occasional: false
     program: tests/e2e/system-utils/shuf-permutation.sh
     observation:
@@ -1025,7 +1009,6 @@ test:
       - x86_64
       - userns
       - ptrace
-    timeout_seconds: 60
     occasional: false
     program: tests/e2e/system-utils/sort-random.sh
     observation:
@@ -1087,7 +1070,6 @@ test:
       - x86_64
       - userns
       - ptrace
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/system-utils/ssh-keygen-ed25519.sh
     observation:
@@ -1149,7 +1131,6 @@ test:
       - x86_64
       - userns
       - ptrace
-    timeout_seconds: 60
     occasional: false
     program: tests/e2e/system-utils/uuidgen-random.sh
     observation:
@@ -1213,7 +1194,6 @@ test:
       - x86_64
       - userns
       - ptrace
-    timeout_seconds: 60
     occasional: false
     program: tests/e2e/system-utils/proc-random-uuid.sh
     observation:
@@ -1277,7 +1257,6 @@ test:
       - ptrace
       - bash
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/system-utils/procfs-sanitized-paths.sh
     observation:
@@ -1345,7 +1324,6 @@ test:
       - userns
       - ptrace
       - du
-    timeout_seconds: 90
     occasional: false
     direct:
       - /usr/bin/du
@@ -1408,7 +1386,6 @@ test:
       - userns
       - ptrace
       - find
-    timeout_seconds: 90
     occasional: false
     direct:
       - /usr/bin/find
@@ -1477,7 +1454,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 120
     occasional: false
     program: tests/c/file_timestamp_identity.c
     observation:
@@ -1540,7 +1516,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 120
     occasional: false
     program: tests/c/startup_surface_identity.c
     observation:
@@ -1603,7 +1578,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 120
     occasional: false
     program: tests/c/startup_tls_guards.c
     observation:
@@ -1670,7 +1644,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 120
     occasional: false
     program: tests/c/shm_coherency_identity.c
     observation:
@@ -1733,7 +1706,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/c/clock_exec_continuity.c
     observation:
@@ -1796,7 +1768,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 120
     occasional: false
     program: tests/c/errno_path_identity.c
     observation:
@@ -1858,7 +1829,6 @@ test:
       - x86_64
       - userns
       - ptrace
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/system-utils/auxv-loader-dump.sh
     observation:
@@ -1920,7 +1890,6 @@ test:
       - x86_64
       - userns
       - ptrace
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/system-utils/ps-proc-table.sh
     observation:
@@ -1983,7 +1952,6 @@ test:
       - userns
       - ptrace
       - bash
-    timeout_seconds: 60
     occasional: false
     program: tests/e2e/system-utils/nscd-neutralised.sh
     observation:
@@ -2046,7 +2014,6 @@ test:
       - userns
       - ptrace
       - bash
-    timeout_seconds: 60
     occasional: false
     program: tests/e2e/system-utils/sysfs-sanitized-prefixes.sh
     observation:
@@ -2109,7 +2076,6 @@ test:
       - userns
       - ptrace
       - bash
-    timeout_seconds: 60
     occasional: false
     program: tests/e2e/system-utils/harness-width-contract.sh
     observation:

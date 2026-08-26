@@ -1,4 +1,4 @@
-schema: 2
+schema: 3
 bucket: data-handling
 test:
   - id: data-handling/archive-roundtrip
@@ -9,7 +9,6 @@ test:
       - x86_64
       - userns
       - ptrace
-    timeout_seconds: 60
     occasional: false
     program: tests/e2e/data-handling/archive-roundtrip.sh
     observation:
@@ -67,7 +66,6 @@ test:
       - x86_64
       - userns
       - ptrace
-    timeout_seconds: 60
     occasional: false
     program: tests/e2e/data-handling/shell-pipeline.sh
     observation:
@@ -126,7 +124,6 @@ test:
       - userns
       - ptrace
       - jq
-    timeout_seconds: 60
     occasional: false
     program: tests/e2e/data-handling/jq-json-transform.sh
     observation:
@@ -189,7 +186,6 @@ test:
       - userns
       - ptrace
       - sqlite3
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/data-handling/sqlite-query-determinism.sh
     observation:
@@ -252,7 +248,6 @@ test:
       - userns
       - ptrace
       - zstd
-    timeout_seconds: 120
     occasional: false
     program: tests/e2e/data-handling/zstd-multithread.sh
     observation:
@@ -310,7 +305,6 @@ test:
       - x86_64
       - userns
       - ptrace
-    timeout_seconds: 120
     occasional: false
     program: tests/e2e/data-handling/dd-partial-transfers.sh
     observation:

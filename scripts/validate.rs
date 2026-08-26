@@ -7135,8 +7135,9 @@ mod scheduler_explanation_tests {
 #[cfg(test)]
 mod nextest_timeout_tests {
     #[test]
-    fn nextest_uses_the_measured_default_and_one_named_override() {
+    fn nextest_uses_the_manifest_default_and_named_overrides() {
         let config = include_str!("../.config/nextest.toml");
+        let manifest = include_str!("../tests/e2e/manifests/defaults.yaml");
         let timeouts: Vec<&str> = config
             .lines()
             .map(str::trim)
@@ -7147,14 +7148,29 @@ mod nextest_timeout_tests {
             vec![
                 "slow-timeout = { period = \"15s\", terminate-after = 1, grace-period = \"2s\" }",
                 "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
+                "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
             ],
-            "the per-test timeout must stay at 15s with exactly one measured 30s override"
+            "the per-test timeout must stay at 15s with exactly two justified 30s overrides"
         );
-        assert!(config.contains(
-            "filter = \"test(/(^|::)every_record_container_site_classifies_a_child_fault_by_name$/)\""
-        ));
-        assert!(config.contains("12 separate Hermit processes"));
-        assert!(config.contains("25.98-26.30s while passing"));
+        for required in [
+            "test(/(^|::)every_record_container_site_classifies_a_child_fault_by_name$/)",
+            "binary(=container_init_deadline) & test(/(^|::)bare_timeout_kills_a_hung_hermit_run$/)",
+        ] {
+            assert!(config.contains(required), "nextest config lost {required}");
+            assert!(manifest.contains(required), "manifest lost {required}");
+        }
+        for required in [
+            "12 separate Hermit processes",
+            "25.98-26.30s while passing",
+        ] {
+            assert!(config.contains(required), "nextest config lost {required}");
+            assert!(manifest.contains(required), "manifest lost {required}");
+        }
+        assert!(config.contains("waits for timeout(1)'s 15s deadline"));
+        assert!(config.contains("16.2s while passing"));
+        assert!(manifest.contains("15-second external deadline"));
+        assert!(manifest.contains("named teardown check"));
+        assert!(manifest.contains("timeout_seconds: 15"));
     }
 }
 

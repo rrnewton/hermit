@@ -199,7 +199,7 @@ afterward while the run directory remains retained.
 Enabled red cells use the ordinary exact-cell selector; disabled red cells use
 the harness's explicit `--probe-disabled` selector. Each cell gets at most the
 shipped portable DAG's existing 600-second bucket allowance; the manifest's
-smaller per-attempt timeout still applies inside it. Expected nonzero exits,
+smaller per-cell timeout still applies inside it. Expected nonzero exits,
 timeouts, OOMs, and no-result outcomes stay red but do not stop later cells. If the
 cgroup runner itself stops after a bounded cell is killed, the command keeps a
 conservative attempt marker and starts another DAG pass; completed builds,
@@ -212,7 +212,7 @@ rather than claiming a complete population. The retained runner profile is
 what distinguishes an OOM or boxed cell timeout from an ordinary nonzero
 harness exit. A timeout requires either that exact runner row plus the attempt marker,
 or the test harness's separate GNU-timeout signal report plus its named
-per-attempt timeout result; exit 124 alone is not timeout evidence. Cell results
+per-cell timeout result; exit 124 alone is not timeout evidence. Cell results
 are published from an `in-progress` path only after the harness returns; that
 path is never terminal evidence, so an empty file created before a runner kill
 cannot masquerade as a malformed terminal result. The combined `crash-error`

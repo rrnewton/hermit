@@ -1,4 +1,4 @@
-schema: 2
+schema: 3
 bucket: chaos-c
 test:
   - id: chaos-c/lock-granularity
@@ -10,7 +10,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/chaos/lock_granularity.c
     observation:

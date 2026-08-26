@@ -1,4 +1,4 @@
-schema: 2
+schema: 3
 bucket: determinism-stress-c
 test:
   - id: determinism-stress-c/fork-tree
@@ -10,7 +10,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/determinism-stress/fork_tree.c
     observation:
@@ -70,7 +69,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/determinism-stress/guests/lock_free.c
     observation:
@@ -139,7 +137,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/determinism-stress/mmap_fork_shared.c
     observation:
@@ -199,7 +196,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/determinism-stress/guests/pid_tid.c
     observation:
@@ -258,7 +254,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/determinism-stress/pid_tid_identity.c
     observation:
@@ -324,7 +319,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/determinism-stress/pipe_chain.c
     observation:
@@ -384,7 +378,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/determinism-stress/pipe_prefill.c
     observation:
@@ -443,7 +436,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/determinism-stress/producer_consumer.c
     observation:
@@ -506,7 +498,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/determinism-stress/guests/signal_order.c
     observation:
@@ -575,7 +566,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/determinism-stress/thread_contention.c
     observation:
@@ -685,7 +675,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/e2e/determinism-stress/thread_stress.c
     observation:

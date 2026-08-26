@@ -6,7 +6,7 @@ This source code is licensed under the BSD-style license found in the
 LICENSE file in the root directory of this source tree.
 -->
 
-# Centralized e2e test manifests (schema v2)
+# Centralized e2e test manifests (schema v3)
 
 These YAML files are the load-bearing policy source for Hermit's executable
 end-to-end tests. Test programs contain behavior only; lane, mode, backend,
@@ -14,8 +14,9 @@ timeout, build flags, observation policy, and exclusion reasons belong here.
 `target/debug/test-harness` loads them through the structured Rust parser in
 `ci/manifest-plan`.
 
-The 13 manifests separate calibrated blocking cells from discoverable migration
-inventory. CI creates one independently schedulable run node for every bucket.
+`defaults.yaml` declares the global per-cell timeout. The 13 bucket manifests
+separate calibrated blocking cells from discoverable migration inventory. CI
+creates one independently schedulable run node for every bucket.
 Six buckets currently contain calibrated blocking workloads:
 
 - `system-utils.yaml`
@@ -36,7 +37,7 @@ inventory does not silently imply support.
 
 ## Matrix symmetry and the test front door
 
-Compatibility coverage enters through these shared schema-v2 manifests, not
+Compatibility coverage enters through these shared schema-v3 manifests, not
 through a backend-owned guest list. Every test declares all five modes, and
 every non-naked mode partitions the complete `ptrace`, `dbt`, `kvm`, `sabre`,
 and `liteinst` axis into enabled cells and explicit gaps. Any active mode must
@@ -52,6 +53,32 @@ baseline. This makes the shared test identity the row axis; backend support or
 gaps remain cells of that one row rather than creating backend-private rows.
 
 ## Schema contract
+
+`defaults.yaml` supplies the global `timeout_seconds`; it is 15 seconds. A
+bucket may override that value with top-level `timeout_seconds` plus a
+non-empty `slow_reason`. An exact `(test, mode, backend)` cell may override the
+inherited value under its mode, again with a reason for the same backend. Cell
+values win over bucket values, and bucket values win over the global default.
+The timeout is manifest policy: runners consume the resolved value and do not
+carry a fallback constant.
+
+The same defaults document records the named nextest exceptions. Nextest still
+requires its native TOML syntax at execution time, so validation requires
+`.config/nextest.toml` to carry the same 15-second default, filters, values, and
+reasons.
+
+```yaml
+schema: 3
+bucket: applications
+test:
+  - id: applications/timed-progress-bar
+    modes:
+      verify:
+        timeout_seconds:
+          ptrace: 30
+        slow_reason:
+          ptrace: Three complete validation runs measured this cell above 15 seconds.
+```
 
 Every entry under `test` names either a repo-relative `program` or a `direct` shell
 command. Program extensions select the runner:

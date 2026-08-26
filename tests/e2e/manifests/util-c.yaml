@@ -1,4 +1,4 @@
-schema: 2
+schema: 3
 bucket: util-c
 test:
   - id: util-c/pmu-skid
@@ -10,7 +10,6 @@ test:
       - userns
       - ptrace
       - cc
-    timeout_seconds: 90
     occasional: false
     program: tests/util/pmu_skid.c
     observation:
