@@ -35,6 +35,7 @@
 mod rust_script_prelude;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 
@@ -93,14 +94,48 @@ const ALLOWLIST: &[(&str, &str)] = &[
 ];
 
 /// Directory/prefix pairs that identify a checker entrypoint by convention.
-const CHECKER_PREFIXES: &[&str] = &[
-    "scripts/check-",
-    "scripts/test-",
-    "scripts/test_",
-    "ci/check-",
-    "ci/verify-",
-    "ci/test-",
-];
+/// The smallest population this guard will accept before refusing to answer.
+///
+/// ⚠️ A FLOOR, NOT A TARGET, and it replaces an `is_empty()` assertion that could
+/// not catch the failure that matters. Discovery going to zero was already
+/// caught; discovery COLLAPSING -- a predicate change that leaves five files
+/// instead of seventy -- was not, and would report "OK, 5 scheduled" in exactly
+/// the confident tone this guard exists to avoid. Measured 2026-08-26: 70
+/// entrypoints on main. 50 leaves room for real deletion without admitting a
+/// collapse.
+const POPULATION_FLOOR: usize = 50;
+
+/// Is this tracked file an ENTRYPOINT -- something meant to be run directly?
+///
+/// ⚠️ THIS REPLACED A FILENAME-PREFIX POPULATION, AND THE PREFIX WAS THE DEFECT.
+/// The guard previously asked "is it named check-/test-/verify-?" as a proxy for
+/// "is it a checker?". A naming convention is a habit, not a definition:
+/// `ci/audit-test-binary-registration.py` is a checker, was invisible to the
+/// guard, was scheduled by nothing, and was itself reporting a FAIL. Two guards
+/// and the gap fell exactly between them.
+///
+/// A shebang is a PROPERTY of the file rather than a habit of its author: it is
+/// the file declaring how it is to be executed. Measured on main 2026-08-26,
+/// against the alternatives that were tried and rejected:
+///
+///   filename prefix          24 files -- misses the auditor that motivated this
+///   executable bit           65 files -- ALSO misses it: mode 100644, so the
+///                                        very file that exposed the defect
+///                                        would still be invisible
+///   shebang                  70 files -- a strict superset of executable, and
+///                                        it catches the auditor
+///
+/// It over-matches in one direction only: a shebanged script that is not a
+/// checker still has to be scheduled or allowlisted with a reason. That is a
+/// visible, arguable cost. The prefix's error was invisible, which is worse.
+fn has_shebang(path: &str) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        // Unreadable is not "not an entrypoint". Fail toward inclusion so a
+        // permissions or checkout problem cannot silently shrink the population.
+        return true;
+    };
+    bytes.starts_with(b"#!")
+}
 
 /// This checker's own tracked path.
 const SELF_PATH: &str = "scripts/check-checker-scheduling.rs";
@@ -194,14 +229,16 @@ fn main() {
     // Every checker entrypoint we expect to be scheduled.
     let checkers: BTreeSet<String> = tracked
         .iter()
-        .filter(|p| CHECKER_PREFIXES.iter().any(|pre| p.starts_with(pre)))
+        .filter(|p| p.starts_with("scripts/") || p.starts_with("ci/"))
         .filter(|p| p.ends_with(".sh") || p.ends_with(".rs") || p.ends_with(".py"))
-        .filter(|p| is_executable(p) || p.ends_with(".py"))
+        .filter(|p| has_shebang(p))
         .cloned()
         .collect();
     assert!(
-        !checkers.is_empty(),
-        "discovered no checker entrypoints; the naming convention or this filter moved"
+        checkers.len() >= POPULATION_FLOOR,
+        "discovered {} entrypoints, fewer than the {POPULATION_FLOOR} floor; \
+         the discovery predicate moved and this guard is now looking at the wrong set",
+        checkers.len()
     );
     // A rename must not silently re-enable the self-reference described on
     // `expands_frontier`. If SELF_PATH stops naming a tracked file the exclusion
