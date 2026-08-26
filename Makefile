@@ -151,6 +151,8 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 	./ci/liteinst-strict-node.sh --self-test
 	./scripts/check-checker-scheduling.rs --self-test
 	./scripts/check-checker-scheduling.rs
+	python3 ./scripts/check-refusal-predicate-anchored.py --self-test
+	python3 ./scripts/check-refusal-predicate-anchored.py scripts
 	python3 ./ci/audit-test-binary-registration.py
 	@sh_files="$$(git ls-files '*.sh' ':!:third-party/**')"; \
 		if [ -z "$$sh_files" ]; then \
