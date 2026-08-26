@@ -90,7 +90,35 @@ const ALLOWLIST: &[(&str, &str)] = &[
          reference is ci-portable.yml, which is workflow_dispatch-only. It should \
          be scheduled; doing so belongs in its own head with its own count.",
     ),
+    (
+        "scripts/stress-test.sh",
+        "A stress FRAMEWORK, not a checker. It matches only because the suffix rule \
+         adopted `-test.sh`, and over-inclusion by a convention is exactly what an \
+         allowlist entry is for: the alternative is narrowing the suffix until it \
+         stops seeing the real `-test.sh` checkers too.",
+    ),
+    (
+        "ci/validate-timeout-layers-test.sh",
+        "A LIVE, ON-DEMAND bracket, by its own first line. It exercises validate's \
+         nested wall-time limits, so scheduling it in lint-checks would run a real \
+         validate inside a lint node. Measured 2026-08-26: reached by nothing, and \
+         that is intended rather than an oversight.",
+    ),
+    (
+        "scripts/validate-env-block-test.sh",
+        "An on-demand bracket that SPAWNS VALIDATE: measured 2026-08-26 at 1m18s wall \
+         on an idle box, and it fails with `Could not execute cargo` wherever the \
+         submodules are not initialised -- a setup condition that would read as a \
+         product failure in a lint node. Waived rather than scheduled for that \
+         reason, not because nothing should run it.",
+    ),
 ];
+
+/// Is this tracked path a checker entrypoint by convention?
+fn is_checker_path(path: &str) -> bool {
+    CHECKER_PREFIXES.iter().any(|pre| path.starts_with(pre))
+        || CHECKER_SUFFIXES.iter().any(|suf| path.ends_with(suf))
+}
 
 /// Directory/prefix pairs that identify a checker entrypoint by convention.
 const CHECKER_PREFIXES: &[&str] = &[
@@ -100,7 +128,17 @@ const CHECKER_PREFIXES: &[&str] = &[
     "ci/check-",
     "ci/verify-",
     "ci/test-",
+    "ci/test_",
 ];
+
+/// Suffixes that identify a checker entrypoint by convention.
+///
+/// WARNING -- A CONVENTION EXPRESSED ONLY AS A PREFIX CANNOT SEE ITS OWN FAMILY.
+/// `foo-test.sh` is a checker by every standard this file uses -- it asserts and
+/// exits nonzero -- and five of them were outside the population entirely, so
+/// nothing verified that anything runs them. Two turned out to be scheduled by
+/// NOTHING, which is the condition this checker exists to report and could not.
+const CHECKER_SUFFIXES: &[&str] = &["-test.sh"];
 
 /// This checker's own tracked path.
 const SELF_PATH: &str = "scripts/check-checker-scheduling.rs";
@@ -194,7 +232,7 @@ fn main() {
     // Every checker entrypoint we expect to be scheduled.
     let checkers: BTreeSet<String> = tracked
         .iter()
-        .filter(|p| CHECKER_PREFIXES.iter().any(|pre| p.starts_with(pre)))
+        .filter(|p| is_checker_path(p))
         .filter(|p| p.ends_with(".sh") || p.ends_with(".rs") || p.ends_with(".py"))
         .filter(|p| is_executable(p) || p.ends_with(".py"))
         .cloned()
@@ -536,6 +574,31 @@ fn lint_checks_recipe(makefile: &str) -> String {
 }
 
 fn self_test() {
+    // ⚠️ PINS THE POPULATION RULE, AND THE ASYMMETRY THAT MOTIVATED IT. A convention
+    // expressed only as a PREFIX cannot see its own family: `foo-test.sh` asserts and
+    // exits nonzero by every standard this file uses, and five were outside the
+    // population entirely, so nothing verified that anything ran them -- three were
+    // scheduled by NOTHING and are wired into `lint-checks` by this change. The prefix
+    // list was also asymmetric: it carried `scripts/test_` but not `ci/test_`, so a
+    // Python checker under ci/ was invisible for no reason anyone chose.
+    assert!(
+        is_checker_path("scripts/core-review-protocol-lint-test.sh"),
+        "a -test.sh checker must be in the population"
+    );
+    assert!(
+        is_checker_path("ci/test_audit_test_binary_registration.py"),
+        "ci/test_ must be recognised, as scripts/test_ already was"
+    );
+    // ⚠️ AND THE LIMIT, MEASURED RATHER THAN ASSUMED. Widening the population to every
+    // tracked executable under scripts/ and ci/ was measured 2026-08-26 at 32 checkers
+    // scheduled by NOTHING -- runners, libraries and probes, not checkers. That is a
+    // standing red, which is how a gate gets switched off. The convention stays a
+    // convention; what changed is that it no longer misses its own families.
+    assert!(
+        !is_checker_path("scripts/lib/helper.sh"),
+        "the population must not swallow libraries"
+    );
+
     // Comment stripping is what separates a real invocation from a mention.
     let sh = "# ./scripts/check-a.sh mentioned in a comment\n./scripts/check-b.sh\n";
     let stripped = strip_comments(sh, "x.sh");
