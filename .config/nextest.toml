@@ -15,9 +15,9 @@ failure-output = "immediate-final"
 success-output = "never"
 # This is the per-test-process bound, below the enclosing DAG node's batch
 # bound. Hermit failures commonly stop making progress instead of exiting, so a
-# single test that has not completed in 10 seconds is terminated and named by
+# single test that has not completed in 15 seconds is terminated and named by
 # nextest rather than consuming the rest of a 900-second node allowance.
-slow-timeout = { period = "10s", terminate-after = 1, grace-period = "2s" }
+slow-timeout = { period = "15s", terminate-after = 1, grace-period = "2s" }
 global-timeout = "60m"
 
 [profile.ci]
@@ -32,6 +32,14 @@ path = "junit.xml"
 # each test in a separate process, so keep their shared contract explicit.
 [test-groups.hermit-serialized]
 max-threads = 1
+
+# This source-audit test deliberately runs all six named `record` container
+# sites under both injected child-fault classes: 12 separate Hermit processes.
+# Three complete validation runs measured it at 25.98-26.30s while passing, so
+# 30s covers that observed work without widening any other test's 15s limit.
+[[profile.default.overrides]]
+filter = "test(/(^|::)every_record_container_site_classifies_a_child_fault_by_name$/)"
+slow-timeout = { period = "30s", terminate-after = 1, grace-period = "2s" }
 
 [[profile.default.overrides]]
 filter = "package(=hermit) & kind(=test)"

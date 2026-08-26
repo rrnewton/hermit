@@ -7135,7 +7135,7 @@ mod scheduler_explanation_tests {
 #[cfg(test)]
 mod nextest_timeout_tests {
     #[test]
-    fn every_nextest_test_uses_the_ten_second_process_timeout() {
+    fn nextest_uses_the_measured_default_and_one_named_override() {
         let config = include_str!("../.config/nextest.toml");
         let timeouts: Vec<&str> = config
             .lines()
@@ -7145,10 +7145,16 @@ mod nextest_timeout_tests {
         assert_eq!(
             timeouts,
             vec![
-                "slow-timeout = { period = \"10s\", terminate-after = 1, grace-period = \"2s\" }"
+                "slow-timeout = { period = \"15s\", terminate-after = 1, grace-period = \"2s\" }",
+                "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
             ],
-            "the per-test timeout must stay at ten seconds with no longer test override"
+            "the per-test timeout must stay at 15s with exactly one measured 30s override"
         );
+        assert!(config.contains(
+            "filter = \"test(/(^|::)every_record_container_site_classifies_a_child_fault_by_name$/)\""
+        ));
+        assert!(config.contains("12 separate Hermit processes"));
+        assert!(config.contains("25.98-26.30s while passing"));
     }
 }
 
