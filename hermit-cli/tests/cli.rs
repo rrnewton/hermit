@@ -5371,9 +5371,15 @@ fn a_stopped_stderr_reader_does_not_hang_hermit_on_its_way_out() {
     // finite bound. The test would keep reporting success about a guarantee that
     // had quietly stopped being the one the comment describes.
     let budget = detcore::util::stderr_wait_budget();
+    // Changed deliberately from 5s, and here is why. 5s was this PROCESS's whole
+    // budget, and an invocation runs two hermit processes, so the invocation
+    // ceiling was 2 x 5s = 10s -- exactly equal to RUN_TIMEOUT_UNWIND_GRACE, the
+    // rung enclosing it, which `docs/TIMEOUT_LADDER.md` requires to be strictly
+    // larger. The budget is now the outermost process's SHARE of a 5s
+    // invocation-wide ceiling, which is half of that grace.
     assert_eq!(
         budget,
-        std::time::Duration::from_secs(5),
+        std::time::Duration::from_millis(2_500),
         "the stderr wait budget moved; change this assertion deliberately and say why, \
          or the tests below stop measuring the bound they claim to measure"
     );
@@ -5905,28 +5911,121 @@ fn many_blocked_diagnostic_writes_share_one_budget() {
          {budget:?} budget and a stopped reader under --log info: the diagnostic \
          wait is unbounded"
     );
-    // ⚠️ WHAT THIS PINS IS "BOUNDED", NOT "ONE BUDGET", AND THE DIFFERENCE IS
-    // MEASURED RATHER THAN GUESSED. The accumulator is a `static`, so it bounds one
-    // OS PROCESS -- and an invocation is several. Counting /proc/*/fd/2 for this
-    // pipe during a run found THREE holders: two hermit processes and the guest.
-    // Two of them write diagnostics, so the observed cost is about two budgets:
-    // 10.66s extra over a 0.02s baseline against a 5s budget.
+    // ⚠️ THIS TEST DOES NOT MEASURE THE BUDGET, AND THE PREVIOUS VERSION OF THIS
+    // ASSERTION BELIEVED IT DID. `extra` is elapsed-minus-baseline for a whole
+    // subprocess, and that difference is dominated by something the stderr budget
+    // does not control. Instrumented on 2026-08-26 to print each hermit process's
+    // own accounting at the moment it gives up, three runs of THIS fixture:
     //
-    // The multiple is therefore the number of hermit processes that write, and this
-    // test does NOT pin that number -- if a future change adds another writing
-    // process the cost grows and this still passes. It pins that the wait
-    // terminates and stays within a small multiple, which is the guarantee the code
-    // actually delivers. A per-invocation ceiling is filed separately.
+    //     elapsed=5.51s   spent_ms=2500   one process, depth 0
+    //     elapsed=10.88s  spent_ms=2500   one process, depth 0
+    //     elapsed=5.41s   spent_ms=2500   one process, depth 0
+    //
+    // The wait was EXACTLY the share every time while elapsed varied by 5.5s. So a
+    // threshold on `extra` cannot tell a correct budget from a broken one: the
+    // 10.88s run is the same 2500ms of waiting as the 5.41s run. It is also why
+    // "10.66s extra means two budgets were spent" does not follow -- one budget
+    // produces that number too.
+    //
+    // ⚠️ ONLY ONE PROCESS EVER BLOCKS ON THIS FIXTURE, so it cannot separate a
+    // per-process budget from a per-invocation one either, in the same way its own
+    // comment already says it cannot separate per-call from per-process. The
+    // ceiling is pinned where it can actually be seen -- in
+    // `detcore::util::stderr_wait_tests`, which drives the writer in-process against
+    // a real full pipe -- and the arithmetic against the enclosing rung is pinned by
+    // `stderr_wait_ceiling_stays_inside_the_unwind_grace`.
+    //
+    // What THIS test still contributes, and it is worth keeping: end to end, through
+    // a real hermit binary and a real stopped reader, the process EXITS. That is the
+    // `status.is_some()` assertion above. The bound below is a termination check
+    // sized well clear of the measured variance, not a measurement of the budget.
+    let tree_ceiling = detcore::util::stderr_tree_wait_budget();
+    let termination_bound = tree_ceiling * 4;
     assert!(
-        extra < budget * 4,
-        "a stopped reader cost {extra:?} on top of the {baseline:?} baseline with a \
-         {budget:?} budget: that is past the small multiple a per-process budget can \
-         explain (two writing hermit processes were measured), so the wait is being \
-         charged per write again or another writer appeared"
+        extra < termination_bound,
+        "a stopped reader cost {extra:?} on top of the {baseline:?} baseline, past \
+         the {termination_bound:?} termination bound. This is NOT a statement that \
+         the {tree_ceiling:?} ceiling was exceeded -- see the note above; check \
+         detcore's stderr_wait_tests first, which measure the budget directly"
     );
     assert!(
         extra >= budget,
         "the stopped reader cost only {extra:?} with a {budget:?} budget, so nothing \
          blocked and this test did not exercise the ceiling at all"
+    );
+}
+
+/// The stderr diagnostic wait must stay strictly inside the rung enclosing it.
+///
+/// ⚠️ THIS IS THE ASSERTION THAT WOULD HAVE CAUGHT THE DEFECT, AND NEITHER OF THE
+/// TWO TESTS ABOVE DOES. Both of those measure elapsed time against the budget's
+/// OWN value, so they pass at any value the constant happens to hold -- including
+/// the one that equalled its enclosing bound. What was wrong was not the timing;
+/// it was the ARITHMETIC BETWEEN TWO CONSTANTS THAT NOTHING COMPARED:
+///
+/// ```text
+///   hermit processes writing diagnostics    2   (measured; parent/child chain)
+///   per-process budget                      5s
+///   invocation ceiling                   2 x 5s = 10s
+///   RUN_TIMEOUT_UNWIND_GRACE                     10s   <- EQUAL, not smaller
+/// ```
+///
+/// `docs/TIMEOUT_LADDER.md`: "If an inner bound is greater than or equal to its
+/// outer bound, the inner one can never fire. It is then dead configuration that
+/// reads as protection." Worse here than merely inert: spending the whole grace on
+/// diagnostics makes the unwind fallback fire and print
+/// `HERMIT_RUN_TIMEOUT_FALLBACK`, which that document defines as meaning the
+/// unwind itself wedged -- a hermit defect. So the too-large inner bound
+/// MANUFACTURES a false signal about the outer one.
+///
+/// The ladder notes that nothing enforces the invariant across the manifest,
+/// nextest and native rungs. This enforces it for one pair, by value, so the two
+/// constants cannot drift into equality again without a test going red.
+#[test]
+fn stderr_wait_ceiling_stays_inside_the_unwind_grace() {
+    let grace = hermit::run_timeout_unwind_grace();
+    let tree_ceiling = detcore::util::stderr_tree_wait_budget();
+
+    assert!(
+        tree_ceiling < grace,
+        "the invocation-wide stderr wait ceiling is {tree_ceiling:?} against a \
+         {grace:?} unwind grace. An inner rung at or above its outer rung can never \
+         fire, and here it also makes HERMIT_RUN_TIMEOUT_FALLBACK print for a run \
+         whose unwind was fine. See docs/TIMEOUT_LADDER.md."
+    );
+
+    // Strictly-smaller alone is satisfied by 9.999s, which would leave the unwind
+    // the grace exists for with no time at all. Half is the derivation actually
+    // used; pin it so a later widening has to change this line and say why.
+    assert!(
+        tree_ceiling * 2 <= grace,
+        "the stderr wait ceiling {tree_ceiling:?} is more than half the {grace:?} \
+         unwind grace, so a stopped reader leaves less time for the unwind than the \
+         unwind is budgeted"
+    );
+
+    // ⚠️ AND PIN THE SUM OVER A REAL TREE, NOT AN ASSUMED ONE. The per-process
+    // share halves at each nesting level, so a chain of any depth sums to strictly
+    // under the ceiling. Asserting that here is what makes the ceiling a fact about
+    // the invocation rather than a hope about how many processes there are.
+    let share = detcore::util::stderr_wait_budget();
+    let mut sum = std::time::Duration::ZERO;
+    for depth in 0..16u32 {
+        sum += share / 2u32.pow(depth);
+    }
+    assert!(
+        sum < tree_ceiling,
+        "shares over a 16-deep hermit chain sum to {sum:?}, at or past the \
+         {tree_ceiling:?} invocation ceiling: the halving no longer bounds the total"
+    );
+
+    // The outermost process must actually get the share the other tests assert,
+    // or those tests are measuring a different rung than this one constrains.
+    assert_eq!(
+        detcore::util::stderr_wait_nesting_depth(),
+        0,
+        "this test binary is not itself named `hermit`, so it must read as the \
+         outermost level; a nonzero depth means the /proc walk is matching \
+         something it should not"
     );
 }
