@@ -849,7 +849,8 @@ struct ResultRow {
     outcome: String,
     #[serde(default)]
     timeout_seconds: Option<u64>,
-    duration_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u128>,
     #[serde(default)]
     runtime: Option<JsonValue>,
     argv: Vec<String>,
@@ -2418,6 +2419,7 @@ fn series_self_test() -> Result<(), String> {
         attempt: 1,
         schema: 4,
         run_id: "campaign".into(),
+        run_index: None,
         hermit_sha: metadata.hermit_sha.clone(),
         source_tree_dirty: false,
         test: "language-runtimes/node-v8-jit".into(),
@@ -2428,7 +2430,8 @@ fn series_self_test() -> Result<(), String> {
         classification: "required".into(),
         outcome: "FAIL".into(),
         timeout_seconds: Some(15),
-        duration_ms: 14_800,
+        duration_ms: Some(14_800),
+        runtime: None,
         argv: Vec::new(),
         guest_argv: Vec::new(),
         env: BTreeMap::new(),
@@ -2438,6 +2441,7 @@ fn series_self_test() -> Result<(), String> {
         reason: None,
         error_kind: None,
         artifact_dir: "/retained/runs/campaign/node-v8-jit-verify-ptrace".into(),
+        extra: BTreeMap::new(),
     };
     let rows = series_rows(
         &metadata,
@@ -2459,7 +2463,7 @@ fn series_self_test() -> Result<(), String> {
     let first = row;
     let mut retry = first.clone();
     retry.attempt = 2;
-    retry.duration_ms = 14_900;
+    retry.duration_ms = Some(14_900);
     retry.artifact_dir.push_str("-attempt-2");
     let retry_rows = series_rows(
         &metadata,
@@ -7163,7 +7167,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         classification: "required".into(),
         outcome: "FAIL".into(),
         timeout_seconds: Some(20),
-        duration_ms: 19_000,
+        duration_ms: Some(19_000),
         runtime: None,
         argv: vec!["hermit".into(), "run".into()],
         guest_argv: vec!["fixture".into()],
@@ -7202,7 +7206,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     let mut second_row = result_row.clone();
     second_row.attempt = 2;
     second_row.outcome = "PASS".into();
-    second_row.duration_ms = 19_500;
+    second_row.duration_ms = Some(19_500);
     second_row.timeout_seconds = Some(20);
     second_row.artifact_dir = format!("{}-attempt-2", first_row.artifact_dir);
     second_row.attempts[0]["outcome"] = json!("PASS");
@@ -7221,10 +7225,10 @@ fn self_test(root: &Path) -> Result<(), String> {
     let appended = read_result_rows(&appended_results)?;
     if appended.len() != 2
         || appended[0].attempt != 1
-        || appended[0].duration_ms != 19_000
+        || appended[0].duration_ms != Some(19_000)
         || appended[0].timeout_seconds != Some(20)
         || appended[1].attempt != 2
-        || appended[1].duration_ms != 19_500
+        || appended[1].duration_ms != Some(19_500)
         || appended[1].timeout_seconds != Some(20)
         || !appended.iter().all(|row| {
             result_row_identity_and_invocation_match(
@@ -7352,7 +7356,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         classification: "required".into(),
         outcome: "PASS".into(),
         timeout_seconds: Some(20),
-        duration_ms: 1_000,
+        duration_ms: Some(1_000),
         runtime: None,
         argv: vec!["hermit".into(), "run".into()],
         guest_argv: vec!["fixture".into()],
