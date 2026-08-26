@@ -57,21 +57,23 @@ use std::time::Duration;
 
 // ------------------------------------------------------------------ environmental blocks
 
-/// Retry budget for a failed gate (`VALIDATE_ENV_BLOCK_RETRIES`, validate.sh:903).
-/// Three retries means up to four attempts.
+/// Legacy lane-round backstop (`VALIDATE_ENV_BLOCK_RETRIES`, validate.sh:903).
 ///
 /// ⚠️ THIS IS NO LONGER ENVIRONMENTAL-ONLY. Owner directive 2026-08-26 made EVERY
-/// cell always eligible for retry rather than opt-in, so this bounds retry rounds
-/// for all grounds, not just an environmental block. The name is kept because the
-/// override variable is deployed under it and renaming would silently drop any
-/// caller still setting the old spelling.
+/// cell always eligible for retry rather than opt-in. The name is kept because
+/// the override variable is deployed under it and renaming would silently drop
+/// any caller still setting the old spelling. The per-cell limit below is the
+/// policy; this larger number only prevents a pathological lane loop.
 ///
 /// Why the opt-in had to go, measured: across all 106 recorded runs carrying
 /// `retried_nodes`, 12 rows had a retry and ALL 12 were granted on the
 /// environmental ground. The registry ground has never once granted a retry, and
 /// the registry itself holds a single cell measured 22 days ago -- a cell earned
 /// retry by having already been retried.
-pub const ENV_BLOCK_RETRIES_DEFAULT: usize = 3;
+pub const ENV_BLOCK_RETRIES_DEFAULT: usize = LANE_ROUND_BACKSTOP;
+
+/// Owner ruling 2026-08-26: every failed cell gets exactly two retry attempts.
+pub const RETRIES_PER_CELL: usize = 2;
 
 /// ⚠️ THE BUDGET IS PER CELL, NOT PER LANE. Owner ruling 2026-08-26: a cell gets
 /// THREE ATTEMPTS -- the first plus two retries -- and what any other cell spent
@@ -82,11 +84,11 @@ pub const ENV_BLOCK_RETRIES_DEFAULT: usize = 3;
 /// cell's chance of recovering depends on which OTHER cells happened to fail in
 /// the same run. Per-cell attempts make that impossible by construction.
 ///
-/// `ENV_BLOCK_RETRIES_DEFAULT` above is now only a RUNAWAY BACKSTOP on the number
+/// `ENV_BLOCK_RETRIES_DEFAULT` above is only a RUNAWAY BACKSTOP on the number
 /// of lane rounds, not the policy. It has to exceed the per-cell cap because
 /// different cells fail in different rounds: cell A can exhaust its three while
 /// cell B has not yet failed once, and B must still get its own three.
-pub const MAX_ATTEMPTS_PER_CELL: usize = 3;
+pub const MAX_ATTEMPTS_PER_CELL: usize = 1 + RETRIES_PER_CELL;
 
 /// Lane-round backstop. Per-cell caps are what actually bound the work; this only
 /// stops a pathological loop. It must be large enough never to bind before the
@@ -1515,6 +1517,19 @@ pub fn enter_cleanup_critical_section() {
 /// registers a FAKE peer record held by a short-lived child of this process, which
 /// cannot authorize anything.
 pub fn self_test() -> Result<String, String> {
+    if RETRIES_PER_CELL != 2 || MAX_ATTEMPTS_PER_CELL != 3 {
+        return Err(format!(
+            "retry policy: expected one initial attempt plus exactly two retries, got \
+             RETRIES_PER_CELL={RETRIES_PER_CELL} MAX_ATTEMPTS_PER_CELL={MAX_ATTEMPTS_PER_CELL}"
+        ));
+    }
+    if ENV_BLOCK_RETRIES_DEFAULT < LANE_ROUND_BACKSTOP {
+        return Err(format!(
+            "retry policy: default lane backstop {ENV_BLOCK_RETRIES_DEFAULT} is below the \
+             declared backstop {LANE_ROUND_BACKSTOP}"
+        ));
+    }
+
     // ---- THREE STATES, because two cannot carry three facts ----
     //
     // ⚠️ THE MIDDLE AND LAST CASES ARE THE POINT. Both map to `None` through the
@@ -2217,7 +2232,7 @@ pub fn self_test() -> Result<String, String> {
     let _ = std::fs::remove_dir_all(&sandbox);
 
     Ok(format!(
-        "runtime: environmental classifier bracketed {accepted} accept / {refused} refuse \
+        "runtime: two retries per cell; environmental classifier bracketed {accepted} accept / {refused} refuse \
          (incl. the proxy/VCS classes and the 5 measured build-tool phrasings, one of them \
          spanning a cargo Caused-by block), node-detail extraction 1 hit / 2 miss (incl. partial), \
          retry verdict 1 confirmed / 1 refuted / 1 unconfirmed with all 3 refuted shapes, \

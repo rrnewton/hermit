@@ -7062,6 +7062,14 @@ fn scheduler_not_launched_message(tags: &[String]) -> String {
     )
 }
 
+fn retry_notice(tag: &str, class: &str, attempt: usize) -> String {
+    format!(
+        "⚠️  {tag}: RETRY-ELIGIBLE ({class}) — this attempt remains RED unless an actual \
+         re-execution passes — retrying (attempt {attempt}/{})",
+        validate_runtime::MAX_ATTEMPTS_PER_CELL
+    )
+}
+
 #[cfg(test)]
 mod scheduler_explanation_tests {
     use super::*;
@@ -7104,6 +7112,42 @@ mod scheduler_explanation_tests {
         assert_eq!(
             message,
             "validate: 1 planned node(s) DID NOT RUN; the scheduler returned them in not_launched after it stopped admitting work (fail-fast or outer run budget): test.detcore_misc. They are accounted for, but the lane remains incomplete and cannot be green."
+        );
+    }
+
+    #[test]
+    fn retry_notice_has_two_retries_and_never_advertises_a_fourth_attempt() {
+        assert_eq!(validate_runtime::RETRIES_PER_CELL, 2);
+        assert_eq!(validate_runtime::MAX_ATTEMPTS_PER_CELL, 3);
+        assert!(retry_notice("test.liteinst_strict", "fixture", 2).ends_with("attempt 2/3)"));
+        assert!(retry_notice("test.liteinst_strict", "fixture", 3).ends_with("attempt 3/3)"));
+
+        let tag = "test.liteinst_strict";
+        let mut attempts = vec![unreported_attempt(tag.into(), 1)];
+        assert!(retry_attempt_available(&attempts, tag));
+        attempts.push(unreported_attempt(tag.into(), 2));
+        assert!(retry_attempt_available(&attempts, tag));
+        attempts.push(unreported_attempt(tag.into(), 3));
+        assert!(!retry_attempt_available(&attempts, tag));
+    }
+}
+
+#[cfg(test)]
+mod nextest_timeout_tests {
+    #[test]
+    fn every_nextest_test_uses_the_ten_second_process_timeout() {
+        let config = include_str!("../.config/nextest.toml");
+        let timeouts: Vec<&str> = config
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("slow-timeout ="))
+            .collect();
+        assert_eq!(
+            timeouts,
+            vec![
+                "slow-timeout = { period = \"10s\", terminate-after = 1, grace-period = \"2s\" }"
+            ],
+            "the per-test timeout must stay at ten seconds with no longer test override"
         );
     }
 }
@@ -8683,8 +8727,8 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
 /// * **The classification reads the FAILING NODE's own output**, extracted from
 ///   the runner's `[tag] ----- detail -----` region, not a whole-log tail. A jail
 ///   banner printed by a different concurrent node cannot excuse a real red.
-/// * **Retries are bounded** (`VALIDATE_ENV_BLOCK_RETRIES`, default 2 => 3
-///   attempts). A *persistent* breakage — a bad Reverie pin, a genuinely missing
+/// * **Retries are bounded per cell**: one initial attempt plus exactly two
+///   retry attempts. A *persistent* breakage — a bad Reverie pin, a genuinely missing
 ///   header — fails every attempt and still leaves the run RED. Its per-attempt
 ///   environmental hypothesis is refuted or left unconfirmed, never silently
 ///   promoted to a pass.
@@ -8854,9 +8898,7 @@ fn run_lane_with_env_retries(
                 // The gate is here, ahead of every ground, so it binds uniformly:
                 // an environmental block cannot buy a fourth attempt any more than
                 // the blanket arm can.
-                if attempts_so_far(&attempts, &o.tag)
-                    >= validate_runtime::MAX_ATTEMPTS_PER_CELL
-                {
+                if !retry_attempt_available(&attempts, &o.tag) {
                     return None;
                 }
                 environmental
@@ -8920,9 +8962,8 @@ fn run_lane_with_env_retries(
         // would turn a bounded invocation back into an unbounded one.
         if remaining_budget_s(deadline) == Some(0) {
             eprintln!(
-                "validate: whole-run budget exhausted; NOT starting retry {}/{}.",
-                env_retries + 1,
-                max
+                "validate: whole-run budget exhausted; NOT starting retry round {}.",
+                env_retries + 1
             );
             run_timed_out = true;
             break;
@@ -8935,15 +8976,10 @@ fn run_lane_with_env_retries(
             if let Some(previous) = latest_reported_failure_mut(&mut attempts, tag) {
                 previous.retry_class = Some(class.clone());
             }
-            println!(
-                "⚠️  {tag}: RETRY-ELIGIBLE ({class}) — this attempt remains RED unless an actual \
-                 re-execution passes — retrying (attempt {}/{})",
-                env_retries + 1,
-                max + 1
-            );
+            println!("{}", retry_notice(tag, class, next_attempt_ordinal(&attempts, tag)));
         }
         let mut retry_cfg = cfg.clone();
-        retry_cfg.description = format!("{} — retry {env_retries}/{max}", cfg.description);
+        retry_cfg.description = format!("{} — retry round {env_retries}", cfg.description);
         retry_cfg.steps = steps;
         // Everything before this byte belongs to an earlier scheduler
         // invocation. The retry may emit no detail at all; that must stay
@@ -11271,6 +11307,10 @@ fn attempts_so_far(attempts: &[NodeAttempt], tag: &str) -> usize {
         .map(|a| a.attempt)
         .max()
         .unwrap_or(0)
+}
+
+fn retry_attempt_available(attempts: &[NodeAttempt], tag: &str) -> bool {
+    attempts_so_far(attempts, tag) < validate_runtime::MAX_ATTEMPTS_PER_CELL
 }
 
 /// Cap for every id list in the end-of-run summary, so the block stays roughly
