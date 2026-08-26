@@ -2293,3 +2293,77 @@ lies -- it is that the question a reviewer is asking is one step further on than
 the question the field answers.** So the check is the same in all four cases:
 name the question you actually need answered, and confirm the field answers
 *that* one, rather than one adjacent to it.
+
+## A hold keyed on "the related task is still open" can never clear
+
+⚠️ **If the board withholds a head because a task is open, and that task is the
+one the head closes, the hold is self-sustaining: the change that would close the
+task is the change the hold is preventing.** It never times out and it never
+resolves, because nothing else can close the task either.
+
+**Measured 2026-08-25.** hermit#2594 was held on `hoist_the_backend_name` being
+open. That task's stated fix is the two-line hoist in
+`hermit-cli/src/backend_stats.rs` that hermit#2594 *is*. The head landed at
+18:17:32Z as `9fd184ad6e` and the task closed against that commit at 18:46Z — the
+hold's own precondition was satisfied only by defeating the hold.
+
+**The test to apply before adding any task-state hold:** ask what closes the task
+if the hold holds. If the answer is "the thing being held", the hold is circular
+and must not be added.
+
+Two properly-shaped alternatives, neither circular:
+
+- Key the hold on the task being **unowned or unclaimed** — nobody is driving it,
+  which a landing does not fix.
+- Key it on the head **not naming a task at all**, which is a hazard landing
+  genuinely does not resolve.
+
+**The same MISREADING is recorded elsewhere, though not the same failure.**
+`ci-hub/landing/task_pr_join.py` required `_task_is_open()` and so "excluded
+exactly the population this join exists to find, so population C silently emptied
+as the lifecycle took effect". Both mistakes share one premise: **an open task is
+evidence that work is OUTSTANDING, and a head is how outstanding work stops being
+outstanding.** Reading the first as a reason to withhold the second inverts what
+the signal means.
+
+⚠️ **But the two are NOT the same shape, and an earlier version of this section
+claimed they were — failing its own test.** A reviewer applied the test above to
+the precedent, and it does not have the property:
+
+| | board hold | `task_pr_join.py` |
+| --- | --- | --- |
+| what is withheld | **the head itself** | a row in a *report* |
+| what closes the task | the withheld head | the head, which nothing withheld |
+| loop? | **yes — deadlock** | **no** — the task can still be implemented, landed and closed |
+
+The join emptied a population; it never prevented anything from landing. So it is
+a precedent for the misreading and **not** for the circularity, and citing it as
+"the same shape" overstated the case in exactly the direction that makes a
+section persuasive rather than true.
+
+⚠️ **A stated reason is not a checkable reason, and this hold proves the
+distinction.** An earlier version of this section also claimed the hold was
+invisible — that "nothing in the board's own output said 'held, because a related
+task is open'". **That was false, and a reviewer falsified it from the board's own
+rows:**
+
+```
+#2594  needs both  -> HELD by hoist_the_backend_name
+```
+
+The precondition was printed, by name, in the row. What the row did not say — and
+could not — is that the precondition was **unsatisfiable**, because seeing that
+requires knowing the task's CONTENT: that the fix it names is the head being held.
+A reader has to hold both facts at once, and the board shows one of them.
+
+So the lesson is narrower than "make holds visible", and more useful: **a hold's
+reason being printed is not evidence the reason is reachable.** Every circular
+hold will look perfectly well-documented in the row that states it.
+
+⚠️ **And the legibility is what killed it, within seven minutes.** The row is how
+this surfaced: a reviewer declined the head *citing that row* at 18:00:58Z, and
+`agent(hermit-triage)` challenged the hold *by quoting it* at 18:06:30Z. The
+earlier version credited "a human read the board and asked why the head had not
+moved" — also false; the record shows agents, prompted by the row. Corrected
+because the true story is the stronger one: the printed reason did its job, and
+printing the reason still was not enough.
