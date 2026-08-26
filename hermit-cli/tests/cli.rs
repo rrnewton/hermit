@@ -5286,6 +5286,88 @@ fn record_reports_an_unsupported_syscall_as_a_refusal_not_an_internal_failure() 
 /// by the tail of the panic message, which reads as a complete short error
 /// rather than a severed one.
 #[test]
+fn a_stopped_stderr_reader_does_not_hang_hermit_on_its_way_out() {
+    // ⚠️ THE COMPANION CASE TO THE TEST BELOW, AND THE ONE IT DOES NOT COVER.
+    // That test's reader sleeps 600ms and then drains -- a SLOW reader, which
+    // `RetryingStderr` is right to wait for. This is a STOPPED reader: the read
+    // end stays open so `write` keeps returning EAGAIN rather than EPIPE, and
+    // nothing ever drains.
+    //
+    // Without a ceiling the retry loop never ends, on the path that reports why
+    // hermit is stopping. Measured 2026-08-26 on this exact setup:
+    //
+    //     eprintln! (before RetryingStderr)   exits rc=101 immediately
+    //     RetryingStderr with no ceiling      still running after 25s
+    //     RetryingStderr with the ceiling     exits rc=127 after 5.0s
+    //
+    // Waiting for a slow reader is the feature. Waiting for a stopped one is a
+    // hang, and a supervisor that hangs while reporting an error is harder to
+    // diagnose than one that dies reporting it badly.
+    use std::os::unix::io::FromRawFd;
+    const F_SETPIPE_SZ: i32 = 1031;
+
+    let program = String::from("/nonexistent-guest-program-for-this-test");
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    unsafe { libc::fcntl(write_fd, F_SETPIPE_SZ, 4096) };
+    let filler = vec![b'x'; 3900];
+    assert_eq!(
+        unsafe { libc::write(write_fd, filler.as_ptr().cast(), filler.len()) },
+        filler.len() as isize,
+        "prefill"
+    );
+    let flags = unsafe { libc::fcntl(write_fd, libc::F_GETFL) };
+    unsafe { libc::fcntl(write_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+
+    let started = std::time::Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["run", "--", &program])
+        .stdout(std::process::Stdio::null())
+        .stderr(unsafe { std::process::Stdio::from_raw_fd(write_fd) })
+        .spawn()
+        .expect("spawn hermit");
+
+    // ⚠️ THE READ END IS HELD AND NEVER READ. Holding it is what keeps the
+    // writes returning EAGAIN; closing it would give EPIPE, which is a
+    // different path and already terminates.
+    let held = unsafe { std::fs::File::from_raw_fd(read_fd) };
+
+    // ⚠️ BOUNDED WAIT, NOT `child.wait()`. A plain wait makes the FAILURE MODE OF
+    // THIS TEST A HANG: with the ceiling removed the runner wedges instead of
+    // going red, which is a stuck job somebody has to notice rather than a named
+    // failure. Measured while writing this -- the mutation had to be killed by an
+    // outer timeout. Poll, then kill and assert, so an unbounded loop is a RED.
+    let deadline = std::time::Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => break Some(status),
+            None if started.elapsed() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            None => thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    };
+    let elapsed = started.elapsed();
+    drop(held);
+
+    let status = status.unwrap_or_else(|| {
+        panic!(
+            "hermit had not exited after {elapsed:?} against a STOPPED stderr \
+             reader; the diagnostic retry loop is unbounded and hangs on the \
+             exit path (killed to keep this a red rather than a wedged runner)"
+        )
+    });
+    assert_eq!(
+        status.code(),
+        Some(127),
+        "giving up on an undeliverable diagnostic must not change the exit status"
+    );
+}
+
+#[test]
 fn diagnostics_survive_a_nonblocking_stderr_under_back_pressure() {
     use std::io::Read;
     use std::os::fd::FromRawFd;
