@@ -103,6 +103,34 @@ pub struct RetryingStderr;
 /// write returns `WouldBlock`, `writeln!` gives up, the caller's `let _ =` drops
 /// that line, and hermit exits — which is the pre-existing contract for a
 /// diagnostic that cannot be delivered.
+///
+/// ⚠️ THIS BOUNDS ONE `write()` CALL. IT IS NOT A BOUND ON HERMIT'S EXIT.
+/// `started` is taken inside `fn write`, so every call gets a fresh budget, and
+/// `write_all` — which is what `writeln!` reaches through `write_fmt` — calls
+/// `write` repeatedly. Against a stopped reader each call burns the full ceiling
+/// and the caller's `let _ =` swallows the failure, so the process-level cost is
+/// N x this constant, where N is the number of writes on the way out. Both
+/// production call sites issue many writes per run:
+///
+/// ```text
+///   hermit-cli/src/bin/hermit/main.rs:528,529,531  three writeln! sites: the
+///       failure class, the head of the error chain, then ONE PER CAUSE in a
+///       `for cause in chain` loop -- so 2 + chain length, unbounded by this file
+///   hermit-cli/src/bin/hermit/tracing.rs:263  .with_writer(|| RetryingStderr) --
+///       the writer for the WHOLE tracing subscriber, one write per log event
+///   detcore/src/tool_global.rs:561  write!(.., "{}\n{}", banner, summary) --
+///       a multi-part format, so `write_fmt` issues several `write` calls
+/// ```
+///
+/// The measured 5.0s exit in the test above is N=1: its fixture is a missing
+/// guest program with a short error chain and no `--log`. A `--log info` run
+/// emitting the 138 lines this file measures elsewhere would be bounded at
+/// roughly 138 x 5s, not 5s. Anyone reading this as "hermit exits within five
+/// seconds" has the wrong model of the guarantee.
+///
+/// ⚠️ AND THE EFFECTIVE PER-WRITE CEILING IS ~6s, NOT 5s. The deadline is checked
+/// BEFORE the 1s `poll`, so a call at 4.9s elapsed polls for another second and
+/// only then gives up.
 const STDERR_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl std::io::Write for RetryingStderr {

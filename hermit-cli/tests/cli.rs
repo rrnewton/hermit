@@ -5247,6 +5247,18 @@ fn a_stopped_stderr_reader_does_not_hang_hermit_on_its_way_out() {
         Some(127),
         "giving up on an undeliverable diagnostic must not change the exit status"
     );
+    // ⚠️ PIN THE BOUND, NOT ONLY THAT SOMETHING TERMINATED. Without this the only
+    // timing assertion is the 30s poll deadline above, so this cell stays GREEN for
+    // a STDERR_WRITE_DEADLINE of 5s, 20s or 29s -- the docstring's "exits rc=127
+    // after 5.0s" would be enforced by nothing and the constant could drift upward
+    // unnoticed. 15s is deliberately loose: the ceiling is per `write()` and is
+    // checked BEFORE the 1s poll, so one write can take up to ~6s, and this fixture
+    // issues few enough writes that 15s still fails on any real increase.
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "hermit took {elapsed:?} to exit against a stopped stderr reader; \
+         STDERR_WRITE_DEADLINE is meant to bound this and appears to have grown"
+    );
 }
 
 #[test]
