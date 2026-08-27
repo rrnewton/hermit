@@ -2433,6 +2433,37 @@ fn apply_pressure_summary(
             .verification
             .as_ref()
             .and_then(|report| report.first_divergent_syscall);
+        // ⚠️ "COMPARED AND COULD NOT LOCATE" AND "NEVER COMPARED" ARE DIFFERENT
+        // FACTS, AND THEY LAND ON THE SAME STATE IF THIS IS NOT CHECKED.
+        //
+        // A row claiming a divergence result carries no coordinates in two very
+        // different situations: two runs were compared and differed but the
+        // point could not be located, or no two-run comparison happened at all.
+        // Both previously folded to `diverged-unlocated`, which asserts a
+        // divergence. The second has no evidence for that assertion.
+        //
+        // LATENT, NOT LIVE, and said that way on purpose. The producer never
+        // emits this shape: `pressure-test.rs` records "missing verification
+        // report" whenever a verify or replay cell has no report, and the
+        // evidence_errors skip above then catches the row and names it --
+        // verified against the real message, "verification recorded no
+        // comparison at all (verdict=no_result)". This closes the case where a
+        // hand-written or future summary reaches the fold without that error
+        // set, so the distinction survives the last hop rather than depending on
+        // one producer continuing to be careful. Same class as the absence
+        // semantics one layer down in the result row.
+        if result.carries_divergence_position() && row.verification.is_none() {
+            skipped.push((
+                display_id(&row.cell),
+                format!(
+                    "result {} asserts a divergence with no verification report at all; \
+                     a row that never produced a two-run comparison cannot be recorded as \
+                     diverged-unlocated, which claims one",
+                    row.result
+                ),
+            ));
+            continue;
+        }
         if !result.carries_divergence_position()
             && (turn.is_some()
                 || virtual_nanoseconds.is_some()
