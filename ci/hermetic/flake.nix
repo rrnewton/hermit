@@ -117,8 +117,17 @@
       # image does not populate FHS search paths, so the environment below makes
       # these exact pinned outputs visible to build scripts and the C compiler.
       nativeLibs = with pkgs; [ libunwind elfutils zlib openssl ];
+      # ⚠️ unixtools.xxd IS A BUILD DEPENDENCY, NOT A CONVENIENCE. e9patch's Makefile
+      # generates two C sources by running `xxd -i` over its loader binaries
+      # (Makefile:73 and :79). Without it the build dies at `Error 127` -- command not
+      # found -- AFTER gcc, cmake and the whole C++ toolchain have already succeeded,
+      # so the failure reads as a compiler problem and is not one. Measured
+      # 2026-08-27: every other tool the build needs was already present; xxd was the
+      # single omission, and it is absent from run-split-validate.sh's required-tool
+      # list too, which is why nothing caught it before the build did.
       buildTools = with pkgs; [
         rustToolchain gcc binutils gnumake cmake pkg-config rustScript cargoNextest
+        unixtools.xxd
       ] ++ nativeLibs ++ map (package: package.dev) nativeLibs;
     in
     {
