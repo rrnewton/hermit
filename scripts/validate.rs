@@ -3066,8 +3066,56 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
             "only bracket: unknown-tag refusal omitted its diagnosis or choices: {error}"
         ));
     }
+
+    // Reproduce the focused manifest selection that used to reach dagrun with a
+    // dangling pinned-root edge. `--only` intentionally drops ordinary build
+    // dependencies, but build.manifest_guests cannot use a host-built
+    // test-harness in the pinned root. The transformation must therefore add
+    // exactly that in-image producer without restoring gate.manifest.
+    let manifest_args = parse_argv(&[
+        ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into(),
+        "--only".into(),
+        lane.into(),
+        "build.manifest_guests,e2e.manifest_applications,e2e.manifest_c_programs,e2e.manifest_system_utils"
+            .into(),
+        "--no-label-pr".into(),
+    ])
+    .map_err(|code| format!("only bracket: manifest selection was refused with exit {code}"))?;
+    let mut manifest_plan = build_plan(
+        root,
+        &manifest_args,
+        &std::env::temp_dir().join("validate-only-manifest-plan"),
+    )?;
+    apply_pinned_root(&mut manifest_plan, root, false)?;
+    let manifest_tags: BTreeSet<String> =
+        manifest_plan.cfg.steps.iter().map(|step| step.tag()).collect();
+    for required in [
+        "build.manifest_guests",
+        "setup.manifest_plan_in_pinned_root",
+        "build.manifest_guests_in_pinned_root",
+        "e2e.manifest_applications",
+        "e2e.manifest_c_programs",
+        "e2e.manifest_system_utils",
+    ] {
+        if !manifest_tags.contains(required) {
+            return Err(format!(
+                "only bracket: focused manifest selection omitted required node {required}: {manifest_tags:?}"
+            ));
+        }
+    }
+    if manifest_tags.contains("gate.manifest") || manifest_tags.contains("lint.clippy") {
+        return Err(format!(
+            "only bracket: focused manifest selection broadened into unrelated validation: {manifest_tags:?}"
+        ));
+    }
+    let violations = dagrun::model::graph_structure_violations(&manifest_plan.cfg);
+    if !violations.is_empty() {
+        return Err(format!(
+            "only bracket: focused manifest selection is not dependency-closed and schedulable: {violations:?}"
+        ));
+    }
     println!(
-        "  only plan: real node commands/caps retained, selected edge kept, outside edges dropped, producer unique"
+        "  only plan: real node commands/caps retained, selected edge kept, outside edges dropped, producer unique; focused manifest selection dependency-closed"
     );
     Ok(())
 }
@@ -7287,7 +7335,7 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
         // and the cells depend on THAT copy. The host copy is untouched, so every
         // host consumer keeps working. The cost is a second build: test-harness
         // measured 23s in the image.
-        let producers: Vec<Step> = cfg
+        let mut producers: Vec<Step> = cfg
             .steps
             .iter()
             .filter(|step| {
@@ -7299,6 +7347,23 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
             })
             .cloned()
             .collect();
+        // A focused selection may name build.manifest_guests while deliberately
+        // dropping its ordinary host-side dependencies. Its pinned-root twin is
+        // different: that command directly invokes test-harness inside the image,
+        // where the host-built binary cannot run. Restore only the required
+        // in-image manifest-plan producer; do not restore gate.manifest or the
+        // rest of the full validation spine.
+        if producers.iter().any(|producer| producer.job == "manifest_guests")
+            && !producers
+                .iter()
+                .any(|producer| producer.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
+        {
+            let manifest_plan = validate_plan::preflight_nodes(root, has_cmd("with-proxy"))
+                .into_iter()
+                .find(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
+                .ok_or("pinned-root plan lost its canonical manifest-plan producer")?;
+            producers.push(manifest_plan);
+        }
         let producer_tags: BTreeSet<String> =
             producers.iter().map(|producer| producer.tag()).collect();
         let mut twins = Vec::new();
