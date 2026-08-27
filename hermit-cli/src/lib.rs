@@ -1920,8 +1920,8 @@ async fn run_kvm(
 
 // TODO-HUMAN-REVIEW(PR-743): Review bounded relaunch before DBT guest execution.
 #[cfg(feature = "dbt")]
-fn dbt_coordinator_connect_failed(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::ConnectionAborted
+fn dbt_client_thread_start_failed(status: &std::process::ExitStatus) -> bool {
+    status.code() == Some(reverie_dbt::CLIENT_THREAD_START_FAILURE_EXIT_CODE)
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1980,24 +1980,20 @@ async fn run_dbt(
                 config.clone(),
             )
         };
-        let (output, global) = match launch().await {
-            Ok(output) => output,
-            Err(error) if dbt_coordinator_connect_failed(&error) => {
-                tracing::warn!(
-                    target: "hermit::dbt",
-                    "DynamoRIO client exited before connecting to the coordinator; retrying once",
-                );
-                launch().await.map_err(|error| {
-                    anyhow!("failed to launch drrun ({}): {error}", drrun.display())
-                })?
-            }
-            Err(error) => {
-                return Err(anyhow!(
-                    "failed to launch drrun ({}): {error}",
-                    drrun.display()
-                ));
-            }
-        };
+        let (mut output, mut global) = launch()
+            .await
+            .map_err(|error| anyhow!("failed to launch drrun ({}): {error}", drrun.display()))?;
+        if dbt_client_thread_start_failed(&output.status) {
+            tracing::warn!(
+                target: "hermit::dbt",
+                "DynamoRIO client thread failed before guest start; retrying once",
+            );
+            global.force_shutdown_with_error();
+            global.clean_up(false, &None).await;
+            (output, global) = launch().await.map_err(|error| {
+                anyhow!("failed to launch drrun ({}): {error}", drrun.display())
+            })?;
+        }
         (output.status, output.stdout, output.stderr, global)
     } else {
         let launch = || {
@@ -2007,24 +2003,20 @@ async fn run_dbt(
                 config.clone(),
             )
         };
-        let (status, global) = match launch().await {
-            Ok(output) => output,
-            Err(error) if dbt_coordinator_connect_failed(&error) => {
-                tracing::warn!(
-                    target: "hermit::dbt",
-                    "DynamoRIO client exited before connecting to the coordinator; retrying once",
-                );
-                launch().await.map_err(|error| {
-                    anyhow!("failed to launch drrun ({}): {error}", drrun.display())
-                })?
-            }
-            Err(error) => {
-                return Err(anyhow!(
-                    "failed to launch drrun ({}): {error}",
-                    drrun.display()
-                ));
-            }
-        };
+        let (mut status, mut global) = launch()
+            .await
+            .map_err(|error| anyhow!("failed to launch drrun ({}): {error}", drrun.display()))?;
+        if dbt_client_thread_start_failed(&status) {
+            tracing::warn!(
+                target: "hermit::dbt",
+                "DynamoRIO client thread failed before guest start; retrying once",
+            );
+            global.force_shutdown_with_error();
+            global.clean_up(false, &None).await;
+            (status, global) = launch().await.map_err(|error| {
+                anyhow!("failed to launch drrun ({}): {error}", drrun.display())
+            })?;
+        }
         (status, Vec::new(), Vec::new(), global)
     };
 
@@ -2124,7 +2116,7 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     config.use_thread_local_clock_reads = false;
     config.detect_host_clock_futex_timeouts = backend == Backend::Sabre;
     config.syscall_clobbers_virtualized_by_backend = backend == Backend::Sabre;
-    config.cancel_killed_thread_rpcs = backend == Backend::Sabre;
+    config.cancel_killed_thread_rpcs = matches!(backend, Backend::Sabre | Backend::Dbt);
     config.backend_reports_physical_process_exits = backend == Backend::Sabre;
     // TODO-HUMAN-REVIEW(PR-1122): Review concurrent KVM process-child scheduling.
     config.backend_serializes_fork_children = false;
@@ -3486,6 +3478,7 @@ mod tests {
     #[test]
     fn dbt_backend_config_translates_process_signals_to_host_threads() {
         let config = prepare_backend_config(super::DetConfig::default(), Backend::Dbt);
+        assert!(config.cancel_killed_thread_rpcs);
         assert!(!config.backend_tracks_process_children);
         assert!(config.backend_requires_thread_directed_process_signals);
         assert!(!config.backend_defers_vfork_child_registration);
@@ -3787,11 +3780,16 @@ mod tests {
 
     #[test]
     #[cfg(feature = "dbt")]
-    fn dbt_retries_only_a_pre_guest_coordinator_failure() {
-        let failure = std::io::Error::from(std::io::ErrorKind::ConnectionAborted);
-        assert!(super::dbt_coordinator_connect_failed(&failure));
-        let guest_error = std::io::Error::from(std::io::ErrorKind::InvalidData);
-        assert!(!super::dbt_coordinator_connect_failed(&guest_error));
+    fn dbt_retries_only_the_pre_guest_bootstrap_failure() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let failure = std::process::ExitStatus::from_raw(
+            reverie_dbt::CLIENT_THREAD_START_FAILURE_EXIT_CODE << 8,
+        );
+        assert!(super::dbt_client_thread_start_failed(&failure));
+        assert!(!super::dbt_client_thread_start_failed(
+            &std::process::ExitStatus::from_raw(1 << 8)
+        ));
     }
 
     #[test]

@@ -1487,6 +1487,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_created_v2(
             child_tid_addr as usize,
             flags,
             (flags.bits() & 0xff) as libc::c_int,
+            Some((pid, child_tid)),
         ));
     }
     parent.state.clone_flags = None;
@@ -1652,6 +1653,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_process_clone_result(
         child_tid_addr as usize,
         flags,
         exit_signal,
+        Some((result as i32, result as i32)),
     ));
     0
 }
@@ -2007,99 +2009,17 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
     } else {
         None
     };
-    if sysnum == libc::SYS_execveat {
-        unsafe { result.write(-(Errno::ENOSYS.into_raw() as i64)) };
-        TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
-        return 1;
-    }
-    let clone_properties = process_clone_properties(sysnum, raw_args, |address, bytes| unsafe {
-        read_memory(address, bytes.as_mut_ptr(), bytes.len()) != 0
-    });
-    if clone_properties.shares_files_without_thread {
-        emit_lifecycle_marker(
-            emit,
-            b"detcore-dbt: refusing process clone with CLONE_FILES without CLONE_THREAD; copied child cannot share descriptor-table provenance\n",
-        );
-        return -1;
-    }
-    if clone_properties.shares_memory_without_thread {
-        emit_lifecycle_marker(
-            emit,
-            b"detcore-dbt: refusing process clone with CLONE_VM without CLONE_THREAD or CLONE_VFORK; copied child cannot own inherited Detcore state\n",
-        );
-        return -1;
-    }
-    if clone_properties.blocks_parent
-        && !scratch.runtime_state.is_null()
-        && unsafe { &*scratch.runtime_state }
-            .state
-            .has_unsafe_vfork_flock_state()
-    {
-        emit_lifecycle_marker(
-            emit,
-            b"detcore-dbt: refusing vfork/CLONE_VFORK while an open file description may hold a flock\n",
-        );
-        return -1;
-    }
 
-    // clone(2) and clone3(2) return in both the parent and child. Injecting
-    // either from this callback makes the child return on the client stack.
-    if requires_native_lifecycle(sysnum) {
-        if sysnum == libc::SYS_execve {
-            // Linux permits a nonleader thread to exec. Detcore's PrepareExec
-            // reconnect path accepts that thread's scheduler identity, so
-            // every initialized thread must notify it before entering exec.
-            // Only the external runtime pause below remains process-owner
-            // gated.
-            if !scratch.runtime_state.is_null() {
-                let thread = unsafe { &mut *scratch.runtime_state };
-                if should_send_dbt_prepare_exec(thread.initialized, tid, pid) {
-                    send_dbt_prepare_exec(
-                        context,
-                        thread.tid,
-                        pid,
-                        branches,
-                        &mut thread.state,
-                        invoke_syscall,
-                        read_registers,
-                        write_registers,
-                    );
-                }
-            }
-            if RUNTIME_BACKGROUND_OWNER_PID.load(Ordering::Acquire) == pid {
-                READY_IMAGE.store(0, Ordering::Release);
-                RUNTIME_PAUSE_REQUESTED.store(true, Ordering::Release);
-                while !RUNTIME_PAUSED.load(Ordering::Acquire) {
-                    std::thread::yield_now();
-                }
-                assert_eq!(
-                    IMAGE_GENERATION.load(Ordering::Acquire),
-                    image_generation,
-                    "DBT image generation changed while pausing for exec"
-                );
-            }
-        }
-        return 0;
-    }
+    // Clone-family and exec syscalls return through native lifecycle handling
+    // below. Initialize the local Detcore state before that early return so a
+    // process whose first intercepted syscall is fork/clone/exec still has a
+    // parent state for the post-clone callback and can send PrepareExec.
     TOTAL_BRANCHES.store(branches, Ordering::Relaxed);
-    update_memory_hash(sysnum, raw_args, read_memory);
     let host_pid = Pid::from_raw(pid);
     let det_tid = Pid::from_raw(det_tid.into());
     let tool = runtime
         .tool
         .get_or_init(|| Detcore::new(det_pid, &runtime.config));
-    let syscall = Syscall::from_raw(
-        Sysno::from(sysnum as i32),
-        SyscallArgs::new(
-            dispatch_args[0] as usize,
-            dispatch_args[1] as usize,
-            dispatch_args[2] as usize,
-            dispatch_args[3] as usize,
-            dispatch_args[4] as usize,
-            dispatch_args[5] as usize,
-        ),
-    );
-
     if first_event {
         emit_lifecycle_marker(emit, b"detcore-dbt: initializing Detcore thread state\n");
     }
@@ -2185,6 +2105,88 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         }
         thread.post_exec_pending = false;
     }
+
+    if sysnum == libc::SYS_execveat {
+        unsafe { result.write(-(Errno::ENOSYS.into_raw() as i64)) };
+        TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+        return 1;
+    }
+    let clone_properties = process_clone_properties(sysnum, raw_args, |address, bytes| unsafe {
+        read_memory(address, bytes.as_mut_ptr(), bytes.len()) != 0
+    });
+    if clone_properties.shares_files_without_thread {
+        emit_lifecycle_marker(
+            emit,
+            b"detcore-dbt: refusing process clone with CLONE_FILES without CLONE_THREAD; copied child cannot share descriptor-table provenance\n",
+        );
+        return -1;
+    }
+    if clone_properties.shares_memory_without_thread {
+        emit_lifecycle_marker(
+            emit,
+            b"detcore-dbt: refusing process clone with CLONE_VM without CLONE_THREAD or CLONE_VFORK; copied child cannot own inherited Detcore state\n",
+        );
+        return -1;
+    }
+    if clone_properties.blocks_parent {
+        emit_lifecycle_marker(
+            emit,
+            b"detcore-dbt: refusing vfork/CLONE_VFORK; the copied child cannot register with Detcore before exec\n",
+        );
+        return -1;
+    }
+
+    // clone(2) and clone3(2) return in both the parent and child. Injecting
+    // either from this callback makes the child return on the client stack.
+    if requires_native_lifecycle(sysnum) {
+        if sysnum == libc::SYS_execve {
+            // Linux permits a nonleader thread to exec. Detcore's PrepareExec
+            // reconnect path accepts that thread's scheduler identity, so
+            // every initialized thread must notify it before entering exec.
+            // Only the external runtime pause below remains process-owner
+            // gated.
+            if !scratch.runtime_state.is_null() {
+                let thread = unsafe { &mut *scratch.runtime_state };
+                if should_send_dbt_prepare_exec(thread.initialized, tid, pid) {
+                    send_dbt_prepare_exec(
+                        context,
+                        thread.tid,
+                        pid,
+                        branches,
+                        &mut thread.state,
+                        invoke_syscall,
+                        read_registers,
+                        write_registers,
+                    );
+                }
+            }
+            if RUNTIME_BACKGROUND_OWNER_PID.load(Ordering::Acquire) == pid {
+                READY_IMAGE.store(0, Ordering::Release);
+                RUNTIME_PAUSE_REQUESTED.store(true, Ordering::Release);
+                while !RUNTIME_PAUSED.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                assert_eq!(
+                    IMAGE_GENERATION.load(Ordering::Acquire),
+                    image_generation,
+                    "DBT image generation changed while pausing for exec"
+                );
+            }
+        }
+        return 0;
+    }
+    update_memory_hash(sysnum, raw_args, read_memory);
+    let syscall = Syscall::from_raw(
+        Sysno::from(sysnum as i32),
+        SyscallArgs::new(
+            dispatch_args[0] as usize,
+            dispatch_args[1] as usize,
+            dispatch_args[2] as usize,
+            dispatch_args[3] as usize,
+            dispatch_args[4] as usize,
+            dispatch_args[5] as usize,
+        ),
+    );
 
     if first_event {
         emit_lifecycle_marker(
@@ -2700,7 +2702,7 @@ mod tests {
                 libc::SIGCHLD,
             ),
             None,
-            "vfork keeps its existing child-side registration path"
+            "vfork is refused before any parent-side registration"
         );
         assert!(
             process_child_registration(libc::SYS_clone3, 91_005, 8, 0, libc::SIGUSR2).is_some()
@@ -2838,6 +2840,37 @@ mod tests {
             physical_pid + 1,
             physical_pid
         ));
+    }
+
+    #[test]
+    fn lifecycle_syscalls_follow_thread_state_initialization() {
+        let source = include_str!("lib.rs");
+        let dispatch = source
+            .split_once("pub unsafe extern \"C\" fn reverie_dbt_runtime_pre_syscall")
+            .expect("pre-syscall callback")
+            .1;
+        let initialize = dispatch
+            .find("if scratch.runtime_state.is_null()")
+            .expect("lazy thread-state initialization");
+        let lifecycle = dispatch
+            .find("if requires_native_lifecycle(sysnum)")
+            .expect("native lifecycle early return");
+        let vfork_refusal = dispatch
+            .find("if clone_properties.blocks_parent")
+            .expect("vfork refusal");
+
+        assert!(
+            initialize < lifecycle,
+            "fork/clone/exec must not return before lazy thread-state initialization"
+        );
+        assert!(
+            vfork_refusal < lifecycle,
+            "vfork/CLONE_VFORK must fail before native execution"
+        );
+        assert!(
+            !dispatch[..lifecycle].contains("if tid == pid && !scratch.runtime_state.is_null()"),
+            "nonleader exec must send PrepareExec"
+        );
     }
 
     #[test]

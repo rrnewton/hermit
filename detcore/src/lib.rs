@@ -322,6 +322,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         child_tid_addr: usize,
         flags: CloneFlags,
         exit_signal: libc::c_int,
+        physical_ids: Option<(i32, i32)>,
     ) {
         let child_dettid = DetTid::from_raw(child_tid.into());
         guest.thread_state_mut().clone_flags = Some(flags);
@@ -348,6 +349,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             child_tid_addr,
             Some(flags),
             exit_signal,
+            physical_ids,
         )
         .await;
         guest.thread_state_mut().clone_flags = None;
@@ -1616,7 +1618,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 guest.config()
             );
             if let Some(post_exec_mm) =
-                create_child_thread(guest, new_dettid, 0, None, libc::SIGCHLD).await
+                create_child_thread(guest, new_dettid, 0, None, libc::SIGCHLD, None).await
             {
                 guest.thread_state_mut().mm_id = post_exec_mm;
             }

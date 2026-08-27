@@ -585,6 +585,10 @@ pub struct Scheduler {
     /// Whether exit-group teardown must explicitly cancel parked backend RPCs.
     cancel_killed_thread_rpcs: bool,
 
+    /// Whether scheduler identities must be resolved through a host thread
+    /// pidfd before sending process-directed signals.
+    backend_requires_thread_directed_process_signals: bool,
+
     /// Raw TIDs removed by logical teardown. Tombstones are permanent for the life of this
     /// scheduler: accepting Linux TID reuse would let delayed backend RPCs bind to a new thread.
     logically_killed_threads: BTreeSet<DetTid>,
@@ -1408,6 +1412,8 @@ impl Scheduler {
             cleared_child_tids: Default::default(),
             terminal_deadlock: None,
             cancel_killed_thread_rpcs: cfg.cancel_killed_thread_rpcs,
+            backend_requires_thread_directed_process_signals: cfg
+                .backend_requires_thread_directed_process_signals,
             logically_killed_threads: Default::default(),
             exec_incarnations: Default::default(),
             deregistration_accounted: Default::default(),
@@ -1490,6 +1496,30 @@ impl Scheduler {
         {
             self.physical_thread_pidfds.remove(dettid);
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn physical_thread_identity(&self, dettid: DetTid) -> Option<(MmId, i32, i32)> {
+        self.physical_thread_pidfds
+            .get(&dettid)
+            .map(|(mm, pid, tid, _)| (*mm, *pid, *tid))
+    }
+
+    pub(crate) fn note_process_sigkill(&mut self, dettid: DetTid, detpid: DetPid) {
+        if !self.backend_requires_thread_directed_process_signals {
+            return;
+        }
+        let Some((mm, _, _, _)) = self.physical_thread_pidfds.get(&dettid) else {
+            self.terminal_deadlock.get_or_insert_with(|| {
+                format!(
+                    "HERMIT_DEADLOCK: scheduler cannot complete SIGKILL for dettid {} without its host thread pidfd",
+                    dettid,
+                )
+            });
+            return;
+        };
+        let mm = *mm;
+        self.logically_kill_thread(&dettid, &detpid, mm);
     }
 
     fn should_synthesize_child_exit_signal(&self, parent: DetTid) -> bool {
@@ -2616,6 +2646,14 @@ impl Scheduler {
             } else {
                 Ok(())
             }
+        } else if self.backend_requires_thread_directed_process_signals {
+            self.terminal_deadlock.get_or_insert_with(|| {
+                format!(
+                    "HERMIT_DEADLOCK: scheduler cannot deliver signal {} to dettid {} without its host thread pidfd",
+                    signal, dettid,
+                )
+            });
+            return;
         } else {
             let pid = Pid::from_raw(dettid.as_raw()); // TODO(T78538674): virtualize pid/tid:
             signal::kill(pid, signal)
@@ -5022,6 +5060,48 @@ mod test {
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(scheduler.physical_thread_pidfds.is_empty());
+    }
+
+    #[test]
+    fn required_physical_thread_pidfd_does_not_fall_back_to_virtual_tid() {
+        let config = Config {
+            backend_requires_thread_directed_process_signals: true,
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&config);
+
+        scheduler.signal_guest(DetTid::from_raw(37), Signal::SIGUSR1);
+
+        let report = scheduler
+            .take_terminal_deadlock()
+            .expect("terminal failure");
+        assert!(report.contains("without its host thread pidfd"));
+    }
+
+    #[test]
+    fn dbt_process_sigkill_completes_registered_child_lifecycle() {
+        let config = Config {
+            backend_requires_thread_directed_process_signals: true,
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&config);
+        let parent = DetTid::from_raw(37);
+        let child = DetTid::from_raw(38);
+        let child_mm = MmId::for_clone(MmId::initial(parent), child, false);
+        let physical_pid = std::process::id() as i32;
+        let physical_tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, child, true);
+        register_known_thread(&mut scheduler, child);
+        scheduler
+            .register_physical_thread(child, child_mm, physical_pid, physical_tid)
+            .expect("PIDFD_THREAD must bind the current test thread");
+
+        scheduler.note_process_sigkill(child, child);
+
+        assert!(!scheduler.next_turns.contains_key(&child));
+        assert!(!scheduler.physical_thread_pidfds.contains_key(&child));
+        assert!(scheduler.logically_exited_processes.contains(&child));
     }
 
     fn install_runnable_exec_group(

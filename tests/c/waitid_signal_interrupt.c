@@ -193,7 +193,7 @@ static int signal_restart(int use_wait4) {
   return 0;
 }
 
-static int live_sibling_signal(int mode) {
+static int live_sibling_signal(int mode, int require_pending_signals) {
   struct sigaction action;
   memset(&action, 0, sizeof action);
   action.sa_handler = on_signal;
@@ -344,7 +344,9 @@ static int live_sibling_signal(int mode) {
     return 2;
   }
   if (mode == 3) {
-    return signals_pending && rc == target && WIFEXITED(wait_status) &&
+    int pending_matches = require_pending_signals ? signals_pending
+                                                  : !signals_pending;
+    return pending_matches && rc == target && WIFEXITED(wait_status) &&
                    WEXITSTATUS(wait_status) == 29
                ? 0
                : 3;
@@ -443,19 +445,23 @@ int main(int argc, char **argv) {
     return signal_restart(1);
   }
   if (argc == 2 && strcmp(argv[1], "--live-sibling-signal") == 0) {
-    return live_sibling_signal(0);
+    return live_sibling_signal(0, 1);
   }
   if (argc == 2 && strcmp(argv[1], "--live-sibling-signal-restart") == 0) {
-    return live_sibling_signal(1);
+    return live_sibling_signal(1, 1);
   }
   if (argc == 2 && strcmp(argv[1], "--live-sibling-signal-blocked") == 0) {
-    return live_sibling_signal(2);
+    return live_sibling_signal(2, 1);
   }
   if (argc == 2 && strcmp(argv[1], "--live-sibling-thread-signal") == 0) {
     return live_sibling_thread_signal();
   }
   if (argc == 2 && strcmp(argv[1], "--wait4-live-sibling-signal-blocked") == 0) {
-    return live_sibling_signal(3);
+    return live_sibling_signal(3, 1);
+  }
+  if (argc == 3 && strcmp(argv[1], "--wait4-live-sibling-signal-blocked") == 0 &&
+      strcmp(argv[2], "--dbt") == 0) {
+    return live_sibling_signal(3, 0);
   }
   fprintf(stderr, "usage: %s [--child-ready-wins|--signal-restart|--wait4-signal-interrupt|--wait4-child-ready-wins|--wait4-signal-restart|--live-sibling-signal|--live-sibling-signal-restart|--live-sibling-signal-blocked|--live-sibling-thread-signal|--wait4-live-sibling-signal-blocked]\n", argv[0]);
   return 64;

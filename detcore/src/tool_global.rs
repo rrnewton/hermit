@@ -130,6 +130,7 @@ struct ChildRegistration {
     child_tid_addr: usize,
     flags: Option<CloneFlags>,
     exit_signal: libc::c_int,
+    physical_ids: Option<(i32, i32)>,
     maybe_priority: Option<Priority>,
     parent_is_kernel_blocked: bool,
 }
@@ -644,7 +645,7 @@ impl GlobalTool for GlobalState {
         let (exec_reconnect, is_exec_caller_after_local_mm_swap) = {
             let pending = self.pending_exec_states.lock().unwrap();
             let reconnect = match &request {
-                GlobalRequest::CreateChildThread(child, process, _, None, _, _)
+                GlobalRequest::CreateChildThread(child, process, _, None, _, None, _)
                     if *child == dtid && *child == *process =>
                 {
                     pending.get(process).cloned()
@@ -812,6 +813,7 @@ impl GlobalTool for GlobalState {
                 ctid,
                 flags,
                 exit_signal,
+                physical_ids,
                 priority,
             ) => {
                 if let Some(prepared) = &exec_reconnect {
@@ -867,6 +869,7 @@ impl GlobalTool for GlobalState {
                                 child_tid_addr: ctid,
                                 flags,
                                 exit_signal,
+                                physical_ids,
                                 maybe_priority: priority,
                                 parent_is_kernel_blocked: false,
                             },
@@ -898,6 +901,7 @@ impl GlobalTool for GlobalState {
                         child_tid_addr: ctid,
                         flags: Some(flags),
                         exit_signal,
+                        physical_ids: None,
                         maybe_priority: priority,
                         parent_is_kernel_blocked: true,
                     },
@@ -1010,11 +1014,14 @@ impl GlobalTool for GlobalState {
             GlobalRequest::ResolveKillTargets(dpid) => {
                 R::ResolveKillTargets(self.sched.lock().unwrap().process_signal_targets(dpid))
             }
-            GlobalRequest::NotifySignalPending(dettid, SigWrapper(signal)) => {
-                self.sched
-                    .lock()
-                    .unwrap()
-                    .notify_signal_pending(dettid, SigWrapper(signal));
+            GlobalRequest::NotifySignalPending(dettid, SigWrapper(signal), target_process) => {
+                let mut scheduler = self.sched.lock().unwrap();
+                scheduler.notify_signal_pending(dettid, SigWrapper(signal));
+                if signal == libc::SIGKILL
+                    && let Some(detpid) = target_process
+                {
+                    scheduler.note_process_sigkill(dettid, detpid);
+                }
                 R::NotifySignalPending(())
             }
             GlobalRequest::ThreadIsLive(dtid) => {
@@ -1277,6 +1284,7 @@ impl GlobalState {
             child_tid_addr: ctid,
             flags,
             exit_signal,
+            physical_ids,
             maybe_priority,
             parent_is_kernel_blocked,
         } = registration;
@@ -1350,6 +1358,34 @@ impl GlobalState {
                     flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_PARENT)),
                     exit_signal,
                 );
+            }
+
+            if let Some((physical_pid, physical_tid)) = physical_ids {
+                let child_is_thread =
+                    flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_THREAD));
+                let child_detpid = if child_is_thread {
+                    parent_detpid
+                } else {
+                    child_dettid
+                };
+                let child_mm = MmId::for_clone(
+                    request_mm,
+                    child_dettid,
+                    flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_VM)),
+                );
+                if let Err(open_error) = sched.register_physical_thread(
+                    child_dettid,
+                    child_mm,
+                    physical_pid,
+                    physical_tid,
+                ) {
+                    error!(
+                        "[detcore, dtid {}] cannot bind host process {} thread {} during child registration: {}",
+                        child_dettid, physical_pid, physical_tid, open_error,
+                    );
+                    sched.logically_kill_thread(&child_dettid, &child_detpid, child_mm);
+                    return SchedulerRpcResult::ThreadExited;
+                }
             }
 
             // Record this thread in deterministic creation order so a
@@ -2014,6 +2050,7 @@ pub enum GlobalRequest {
         usize,
         Option<CloneFlags>,
         libc::c_int,
+        Option<(i32, i32)>,
         Option<Priority>,
     ),
 
@@ -2103,7 +2140,7 @@ pub enum GlobalRequest {
     /// Query live threads before translating process-directed signal delivery.
     ResolveKillTargets(DetPid),
     /// A successful kill(2) queued a physical signal for this sole target.
-    NotifySignalPending(DetTid, SigWrapper),
+    NotifySignalPending(DetTid, SigWrapper, Option<DetPid>),
     /// Liveness of one tid, leader or not; see [`thread_is_live`].
     ThreadIsLive(DetTid),
     /// Scheduler-owned lifecycle state for a direct child process.
@@ -2407,6 +2444,7 @@ pub async fn create_child_thread<G, T>(
     ctid: usize,
     flags: Option<CloneFlags>,
     exit_signal: libc::c_int,
+    physical_ids: Option<(i32, i32)>,
 ) -> Option<MmId>
 where
     G: Guest<Detcore<T>>,
@@ -2456,6 +2494,7 @@ where
             ctid,
             flags,
             exit_signal,
+            physical_ids,
             starting_priority,
         ),
     )
@@ -3024,13 +3063,20 @@ fn alarm_signal(sig: SigWrapper) -> Signal {
     })
 }
 
-pub async fn notify_signal_pending<G, T>(guest: &mut G, dettid: DetTid, signal: SigWrapper)
-where
+pub async fn notify_signal_pending<G, T>(
+    guest: &mut G,
+    dettid: DetTid,
+    signal: SigWrapper,
+    target_process: Option<DetPid>,
+) where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let response =
-        send_and_update_time(guest, GlobalRequest::NotifySignalPending(dettid, signal)).await;
+    let response = send_and_update_time(
+        guest,
+        GlobalRequest::NotifySignalPending(dettid, signal, target_process),
+    )
+    .await;
     match response.1 {
         GlobalResponse::NotifySignalPending(()) => {}
         _ => unreachable!(),
@@ -3270,6 +3316,7 @@ mod tests {
                         0,
                         None,
                         libc::SIGCHLD,
+                        None,
                         Some(DEFAULT_PRIORITY),
                     ),
                 ),
@@ -3378,6 +3425,7 @@ mod tests {
                         0,
                         None,
                         libc::SIGCHLD,
+                        None,
                         Some(DEFAULT_PRIORITY),
                     ),
                 ),
@@ -3451,6 +3499,7 @@ mod tests {
                         0,
                         None,
                         libc::SIGCHLD,
+                        None,
                         Some(DEFAULT_PRIORITY),
                     ),
                 ),
@@ -3977,6 +4026,7 @@ mod tests {
                         0,
                         None,
                         libc::SIGCHLD,
+                        None,
                         Some(DEFAULT_PRIORITY),
                     ),
                 ),
@@ -4235,6 +4285,8 @@ mod tests {
         let parent_request = Ivar::new();
         install_test_registration(&state, parent, parent_request.clone());
         let child = DetTid::from_raw(18);
+        let physical_pid = std::process::id() as i32;
+        let physical_tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
         let request = state.receive_rpc(
             reverie::Tid::from_raw(parent.as_raw()),
             (
@@ -4246,6 +4298,7 @@ mod tests {
                     0,
                     None,
                     libc::SIGCHLD,
+                    Some((physical_pid, physical_tid)),
                     Some(DEFAULT_PRIORITY),
                 ),
             ),
@@ -4254,11 +4307,19 @@ mod tests {
             while parent_request.try_read().is_none() {
                 tokio::task::yield_now().await;
             }
-            state.sched.lock().unwrap().logically_kill_thread(
-                &parent,
-                &detpid,
-                MmId::initial(detpid),
+            let mut scheduler = state.sched.lock().unwrap();
+            let (registered_mm, registered_pid, registered_tid) = scheduler
+                .physical_thread_identity(child)
+                .expect("parent registration must install the child pidfd before continuing");
+            assert_eq!(
+                registered_mm,
+                MmId::for_clone(MmId::initial(parent), child, false)
             );
+            assert_eq!(
+                (registered_pid, registered_tid),
+                (physical_pid, physical_tid)
+            );
+            scheduler.logically_kill_thread(&parent, &detpid, MmId::initial(detpid));
         };
 
         let (response, ()) = tokio::join!(request, kill_after_parent_parks);
