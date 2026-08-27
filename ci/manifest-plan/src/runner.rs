@@ -1537,10 +1537,9 @@ pub fn build_spec(
     })
 }
 
-pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, String> {
+pub fn execute_spec(spec: &CellRunSpec) -> Result<AttemptResult, String> {
     execute_spec_until(
         spec,
-        index,
         Instant::now() + Duration::from_secs(spec.timeout_seconds),
         spec.timeout_seconds,
     )
@@ -1548,10 +1547,14 @@ pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, St
 
 fn execute_spec_until(
     spec: &CellRunSpec,
-    index: &str,
     deadline: Instant,
     cell_timeout_seconds: u64,
 ) -> Result<AttemptResult, String> {
+    // The attempt label comes from the spec rather than a parallel parameter.
+    // `build_spec` already stored it, and every caller passed the same value to
+    // both, so a separate argument was a second definition that could go stale
+    // against the workdir and capture paths built from the first.
+    let index = spec.attempt.as_str();
     if spec.argv.is_empty() {
         return Err("empty cell argv".into());
     }
@@ -1584,7 +1587,6 @@ fn execute_spec_until(
         fs::write(&stderr_path, b"").map_err(|e| e.to_string())?;
         return Ok(cell_timeout_attempt(
             spec,
-            index,
             cell_timeout_seconds,
             started.elapsed(),
         ));
@@ -1917,10 +1919,10 @@ fn execute_process(
 
 fn cell_timeout_attempt(
     spec: &CellRunSpec,
-    index: &str,
     cell_timeout_seconds: u64,
     duration: Duration,
 ) -> AttemptResult {
+    let index = spec.attempt.as_str();
     AttemptResult {
         index: index.into(),
         outcome: "FAIL".into(),
@@ -2003,7 +2005,6 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
                 )?;
                 attempts.push(execute_observed_until(
                     &spec,
-                    &index.to_string(),
                     &cell.test.observation,
                     &dir,
                     deadline,
@@ -2035,7 +2036,6 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
                 )?;
                 attempts.push(execute_observed_until(
                     &spec,
-                    &index,
                     &cell.test.observation,
                     &dir,
                     deadline,
@@ -2059,7 +2059,6 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
                 )?;
                 attempts.push(execute_observed_until(
                     &spec,
-                    &index.to_string(),
                     &cell.test.observation,
                     &dir,
                     deadline,
@@ -2082,7 +2081,6 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
             )?;
             attempts.push(execute_observed_until(
                 &spec,
-                "1",
                 &cell.test.observation,
                 &dir,
                 deadline,
@@ -2961,13 +2959,12 @@ fn command_help_contains(program: &Path, args: &[&str], needle: &str) -> bool {
 
 fn execute_observed_until(
     spec: &CellRunSpec,
-    index: &str,
     observation: &Observation,
     dir: &Path,
     deadline: Instant,
     cell_timeout_seconds: u64,
 ) -> Result<AttemptResult, String> {
-    let mut attempt = execute_spec_until(spec, index, deadline, cell_timeout_seconds)?;
+    let mut attempt = execute_spec_until(spec, deadline, cell_timeout_seconds)?;
     attempt.observation_sha256 = Some(observation_hash(observation, &attempt, dir));
     Ok(attempt)
 }
@@ -4610,7 +4607,7 @@ backends_disabled:
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
         };
-        let result = execute_spec(&spec, "1").unwrap();
+        let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
         result
     }
@@ -4654,7 +4651,7 @@ backends_disabled:
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
         };
-        let result = execute_spec(&spec, "1").unwrap();
+        let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
         result
     }
@@ -4833,7 +4830,7 @@ backends_disabled:
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
         };
-        let result = execute_spec(&spec, "1").unwrap();
+        let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
         result
     }
@@ -5303,7 +5300,7 @@ backends_disabled:
             bound.to_string_lossy().into_owned(),
         ];
 
-        let result = execute_spec(&spec, &spec.attempt).unwrap();
+        let result = execute_spec(&spec).unwrap();
         assert_eq!(result.index, "attempt-7");
         assert_eq!(result.outcome, "PASS", "{}", result.stderr);
         assert!(bound.join("myfile.txt").is_file());
