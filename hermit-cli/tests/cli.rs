@@ -1568,8 +1568,24 @@ fn run_dbt_keeps_diagnostics_out_of_guest_stderr() {
             .map(|entry| entry.expect("failed to read retained log entry").path())
             .collect::<Vec<_>>();
         assert_eq!(retained_logs.len(), 2, "unexpected logs: {retained_logs:?}");
-        for log in retained_logs {
-            let contents = fs::read_to_string(&log).expect("failed to read retained DBT log");
+        let retained_log = |prefix: &str| {
+            let matches = retained_logs
+                .iter()
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(prefix))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matches.len(),
+                1,
+                "expected exactly one retained DBT log with prefix {prefix:?}: {retained_logs:?}"
+            );
+            matches[0]
+        };
+        for log in [retained_log("run1_log_"), retained_log("run2_log_")] {
+            let contents = fs::read_to_string(log).expect("failed to read retained DBT log");
             assert!(contents.contains("INFO detcore"), "empty INFO log: {log:?}");
             assert!(
                 !contents.contains("hermit_log="),

@@ -797,7 +797,8 @@ pub(super) fn run_dbt(
         return Ok(output_status(&output));
     }
 
-    let (log1, log2) = temp_log_files_in("dbt-run1", "dbt-run2", verify_log_dir)
+    // Retained-log consumers use one backend-independent naming contract.
+    let (log1, log2) = temp_log_files_in("run1", "run2", verify_log_dir)
         .map_err(|error| Error::msg(format!("failed to create DBT verification logs: {error}")))?;
     let (log1_file, log1_path) = log1.into_parts();
     let (log2_file, log2_path) = log2.into_parts();
