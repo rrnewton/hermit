@@ -2182,7 +2182,14 @@ after it at `8d03485cf8ce2eba307cc13248b9353a23091988` produced:
 | `## APPROVED-AT: claude <sha>` | did not bind, not flagged | **binds** | valid payload is accepted |
 | `## APPROVED-AT: reviewer <sha>` | did not bind, not flagged | does not bind, **flagged malformed** | invalid lane is rejected |
 | `## Posting APPROVED-AT: claude <sha>` | did not bind, not flagged | does not bind, not flagged | prose mention remains a mention |
-| `## CHANGES-REQUESTED-AT: claude <sha>` after an approval | **approval stood** | **refuses, clears the lane** | the negative verdict is reported |
+| `## CHANGES-REQUESTED-AT: claude <sha>` after an approval | **approval stood** | clears the approval; lane is **UNDETERMINED** | the refusal affects admission |
+
+That after-state changed admission, not distinct reporting. At `8d03485c`,
+`lane_shas()` had no refusals out-parameter: both a heading refusal after an
+approval and a lane with no review returned an empty list, and
+`classify_approval()` reported both as `UNDETERMINED`. Dev-hermit commit
+`7820d2be4b5378d16bef450fd0c1a3bc84bd356b` later added the separate `REFUSED`
+state and the refusal output needed to distinguish those cases.
 
 The refusal direction is the one that mattered and it was not in the original finding:
 a *block* wearing markdown could leave an earlier approval standing. This was a real
@@ -2196,9 +2203,10 @@ block-level prefix is stripped. The positive control above proves that a valid
 heading-form payload is newly accepted; the invalid-lane control proves that
 normalization does not bypass the payload grammar; the prose control proves that
 one surrounding-word case remains a mention; and the refusal control proves that
-the same widened context can report bad news. The accepted syntactic context did
-widen, so this change did admit new lines and does require positive and negative
-controls rather than a claim that no corpus re-audit is needed.
+the same widened context no longer lets an earlier approval stand. The accepted
+syntactic context did widen, so this change did admit new lines and does require
+positive and negative controls rather than a claim that no corpus re-audit is
+needed.
 
 The positive and negative paths must be measured separately. The current
 `lane_shas` measurement above shows that a leading word still neither binds an
