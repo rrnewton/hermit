@@ -5876,6 +5876,14 @@ fn run_timeout_refuses_backends_where_it_cannot_bound_the_run() {
 
 /// The diagnostic deadline is spent ONCE across every write, not restarted by each.
 ///
+/// ⚠️ DO NOT DELETE THIS AS REDUNDANT WITH
+/// `the_stderr_deadline_is_spent_once_per_process_counted_not_timed`, WHICH IT OVERLAPS ON
+/// PURPOSE. That cell counts give-ups and so proves the deadline is spent once per process
+/// without any wall clock; it CANNOT prove the bound takes effect in wall time at all --
+/// a deadline of zero would satisfy it. THIS cell is the one that shows a run against a
+/// stopped reader actually stops in about one deadline, which is the property a user
+/// depends on. Owner ruling, 2026-08-26: keep both, and the reason lives next to the pair.
+///
 /// ⚠️ THIS CELL EXISTS BECAUSE THE CELL ABOVE CANNOT DO THIS, AND THAT WAS FOUND BY
 /// ABLATION RATHER THAN BY READING. Reverting the clock in `detcore/src/util.rs`
 /// to per-`write()` and re-running
@@ -5988,6 +5996,31 @@ fn the_stderr_deadline_is_spent_once_across_writes_not_restarted_by_each() {
 }
 
 /// The deadline is spent ONCE PER PROCESS, counted rather than timed.
+///
+/// ⚠️ THIS OVERLAPS `the_stderr_deadline_is_spent_once_across_writes_not_restarted_by_each`
+/// AND THE PAIR IS DELIBERATE. Owner ruling, 2026-08-26, recorded here because two cells
+/// that look redundant WITHOUT their reason get deleted by the next reader who notices the
+/// overlap -- and this project has already paid for a behaviour whose reason was dropped
+/// in a port.
+///
+/// They assert DIFFERENT PROPERTIES and neither covers the other:
+///
+/// ```text
+///   this cell (counted)   the deadline is spent ONCE PER PROCESS rather than per write.
+///                         Exact integers, no wall clock, so no margin to be flaky about.
+///                         CANNOT prove the bound takes any time at all: a deadline of
+///                         zero would still be "spent once".
+///   the timed cell        the bound TAKES EFFECT IN WALL TIME -- that a run against a
+///                         stopped reader actually stops in about one deadline. Counting
+///                         cannot show that, and it is the property a user depends on.
+/// ```
+///
+/// Keeping the timed one costs nothing in reliability: it runs on the SINGLE-process path
+/// where the separation is 4x (2.52s shared against 10.05s per-write) and it measured
+/// 2.558s with no variance. It is not the flaky one. The flaky one would have been a timed
+/// assertion on the TWO-process path, where the separation is 1.5x and the distributions
+/// nearly touch -- and that is the cell that was never written, which is why this one
+/// counts instead.
 ///
 /// ⚠️ THIS REPLACES A TIMING ASSERTION THAT COULD NOT BE MADE TO WORK, AND THE
 /// MEASUREMENTS ARE WHY. The quantity that separates a shared clock from a
