@@ -8,6 +8,7 @@ description: "Current Hermit post-facto human-review protocol: exact trigger set
 Every bot-authored PR description or comment starts with the applicable
 `[impl agent, MODEL]`, `[adversarial-reviewer agent, MODEL]`, or
 `[coordinator, MODEL]` tag. Human comments use `[Human]`.
+The tag belongs in the description or comment body, never in the PR title.
 
 Immediately after that disclosure, every PR description starts with `## Plain
 Language Summary and Project Impact`. It states the substantive outcome, its
