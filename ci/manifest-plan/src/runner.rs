@@ -1015,17 +1015,6 @@ impl RunContext {
                 std::process::id()
             )
         });
-        let attempt = std::env::var("E2E_ATTEMPT")
-            .ok()
-            .map(|value| {
-                value
-                    .parse::<u64>()
-                    .ok()
-                    .filter(|attempt| *attempt > 0)
-                    .ok_or_else(|| format!("E2E_ATTEMPT must be a positive integer, got {value:?}"))
-            })
-            .transpose()?
-            .unwrap_or(1);
         let build_root = std::env::var_os("E2E_BUILD_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| result_root.join("build").join(&source_sha));
@@ -1066,7 +1055,7 @@ impl RunContext {
             result_root,
             build_root,
             run_id,
-            attempt,
+            attempt: 1,
             source_sha,
             source_dirty,
             binary_build_sha,

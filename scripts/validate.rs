@@ -169,15 +169,9 @@ fn validation_step_identity(step: &Step) -> ValidationStepIdentity {
     }
 }
 
-fn set_manifest_attempt(step: &mut Step, attempt: usize) {
-    if validation_step_identity(step) == ValidationStepIdentity::ManifestRun
+fn is_manifest_run_step(step: &Step) -> bool {
+    validation_step_identity(step) == ValidationStepIdentity::ManifestRun
         || step.cmd.contains("target/debug/test-harness run ")
-    {
-        step.env.insert(
-            validate_plan::E2E_ATTEMPT_ENV.into(),
-            attempt.to_string(),
-        );
-    }
 }
 
 const LEDGER_ENV: &str = "HERMIT_VALIDATE_LEDGER";
@@ -2119,14 +2113,9 @@ cleared-caps refusal names {} starved step(s)",
                     consumer.tag(), consumer.cmd
                 ));
             }
-            if consumer
-                .env
-                .get(validate_plan::E2E_ATTEMPT_ENV)
-                .map(String::as_str)
-                != Some("1")
-            {
+            if consumer.env.contains_key("E2E_ATTEMPT") {
                 return Err(format!(
-                    "full-plan bracket: {} does not declare initial E2E attempt 1: {:?}",
+                    "full-plan bracket: {} still receives the outer E2E_ATTEMPT variable: {:?}",
                     consumer.tag(), consumer.env
                 ));
             }
@@ -9662,19 +9651,18 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         ));
     }
 
-    // The E2E harness writes every retry to the same bucket results.jsonl. Its
-    // row must therefore carry the scheduler's actual attempt ordinal rather
-    // than inferring one from whatever rows survived an interrupted attempt.
+    // The E2E harness owns its retry and attempt ordinal. A manifest node that
+    // exhausts both cell attempts must stay red here without the outer DAG
+    // re-running its category and every passing peer beside it.
     let e2e_attempts = tmp.join("e2e-attempts");
     let e2e_log = tmp.join("e2e-attempts.log");
     let e2e_cmd = format!(
-        "printf '%s\\n' \"$E2E_ATTEMPT\" >> {}; exit 1",
+        "printf '%s\\n' run >> {}; exit 1",
         validate_plan::shell_quote(&e2e_attempts.to_string_lossy()),
     );
     let mut e2e_step = step("manifest_attempt", &e2e_cmd);
     e2e_step.group = "e2e".into();
     e2e_step.job = "manifest_attempt".into();
-    set_manifest_attempt(&mut e2e_step, 1);
     let e2e_retry = run_lane_with_env_retries(
         &DagConfig { steps: vec![e2e_step], ..Default::default() },
         1,
@@ -9689,10 +9677,17 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     );
     let recorded_attempts = std::fs::read_to_string(&e2e_attempts)
         .map_err(|e| format!("scheduler accounting: cannot read E2E attempt fixture: {e}"))?;
-    if e2e_retry.ok || recorded_attempts.lines().collect::<Vec<_>>() != ["1", "2"] {
+    if e2e_retry.ok
+        || e2e_retry.env_retries != 0
+        || e2e_retry.attempts.len() != 1
+        || recorded_attempts.lines().collect::<Vec<_>>() != ["run"]
+    {
         return Err(format!(
-            "scheduler accounting: E2E retry did not receive attempts 1 then 2: ok={} rows={recorded_attempts:?}",
-            e2e_retry.ok
+            "scheduler accounting: a manifest node was retried outside its framework: \
+             ok={} retries={} attempts={} rows={recorded_attempts:?}",
+            e2e_retry.ok,
+            e2e_retry.env_retries,
+            e2e_retry.attempts.len(),
         ));
     }
 
@@ -10496,12 +10491,8 @@ fn run_lane_with_env_retries(
         };
     }
     let mut round_log_start = settled_log_len(log_path);
-    let mut first_cfg = cfg.clone();
-    for step in &mut first_cfg.steps {
-        set_manifest_attempt(step, 1);
-    }
     let first = run_dag_boxed_deadline(
-        &first_cfg,
+        cfg,
         jobs,
         keep_going,
         verbosity,
@@ -10621,6 +10612,13 @@ fn run_lane_with_env_retries(
         let blocked: Vec<(String, String)> = failed
             .iter()
             .filter_map(|o| {
+                // Manifest cells already spent their retry inside the test
+                // framework. The DAG's unit is the whole category, so admitting
+                // one here would re-run every peer and duplicate the attempt rows
+                // the framework already published.
+                if is_manifest_run_tag(cfg, &o.tag) {
+                    return None;
+                }
                 // ⚠️ THE BUDGET IS PER CELL. Owner ruling 2026-08-26. This cell has
                 // had `attempts_so_far` attempts; it gets MAX_ATTEMPTS_PER_CELL and
                 // no more, and what any OTHER cell spent does not touch it.
@@ -10743,10 +10741,6 @@ fn run_lane_with_env_retries(
         let mut retry_cfg = cfg.clone();
         retry_cfg.description = format!("{} — retry round {env_retries}", cfg.description);
         retry_cfg.steps = steps;
-        for step in &mut retry_cfg.steps {
-            let attempt = next_attempt_ordinal(&attempts, &step.tag());
-            set_manifest_attempt(step, attempt);
-        }
         // Everything before this byte belongs to an earlier scheduler
         // invocation. The retry may emit no detail at all; that must stay
         // unknown rather than inheriting a stale banner through whole-log rfind.
@@ -13381,6 +13375,10 @@ fn retain_cells_with_retry_attempt_available(
     keep.retain(|tag| retry_attempt_available(attempts, tag));
 }
 
+fn is_manifest_run_tag(cfg: &DagConfig, tag: &str) -> bool {
+    cfg.steps.iter().any(|step| step.tag() == tag && is_manifest_run_step(step))
+}
+
 fn retry_candidate_tags(
     cfg: &DagConfig,
     blocked: &[(String, String)],
@@ -13394,6 +13392,11 @@ fn retry_candidate_tags(
     keep.extend(by_tag.values().filter(|outcome| outcome.aborted).map(|outcome| outcome.tag.clone()));
     keep.extend(unreported_non_intentional_steps(cfg, by_tag, skipped));
     keep.extend(latest_unreported.iter().cloned());
+    // A manifest node can arrive here without being the failure that opened the
+    // retry round: it may be skipped, aborted, or unreported beside some other
+    // failure. It still must not run again. Its framework owns the retry and the
+    // outer unit would be the entire category rather than one cell.
+    keep.retain(|tag| !is_manifest_run_tag(cfg, tag));
     retain_cells_with_retry_attempt_available(&mut keep, attempts);
     keep
 }
@@ -15706,8 +15709,8 @@ mod e2e_attempt_tests {
     use super::*;
 
     #[test]
-    fn only_manifest_harness_steps_receive_the_retry_attempt() {
-        let mut manifest = step_with_caps(
+    fn manifest_harness_steps_do_not_receive_an_outer_attempt() {
+        let manifest = step_with_caps(
             "quick",
             "e2e_verify",
             "fixture",
@@ -15717,16 +15720,25 @@ mod e2e_attempt_tests {
             30,
             64 * 1024 * 1024,
         );
-        set_manifest_attempt(&mut manifest, 2);
-        assert_eq!(
-            manifest
-                .env
-                .get(validate_plan::E2E_ATTEMPT_ENV)
-                .map(String::as_str),
-            Some("2")
-        );
+        assert!(is_manifest_run_step(&manifest));
+        assert!(!manifest.env.contains_key("E2E_ATTEMPT"));
+    }
 
-        let mut unrelated = step_with_caps(
+    #[test]
+    fn manifest_harness_steps_never_enter_an_outer_retry_as_peers() {
+        let mut manifest = step_with_caps(
+            "e2e",
+            "manifest_fixture",
+            "fixture",
+            "target/debug/test-harness run --lane portable --ci-only".into(),
+            Vec::new(),
+            30,
+            30,
+            64 * 1024 * 1024,
+        );
+        manifest.group = "e2e".into();
+        manifest.job = "manifest_fixture".into();
+        let ordinary = step_with_caps(
             "test",
             "unit",
             "fixture",
@@ -15736,7 +15748,21 @@ mod e2e_attempt_tests {
             30,
             64 * 1024 * 1024,
         );
-        set_manifest_attempt(&mut unrelated, 2);
-        assert!(!unrelated.env.contains_key(validate_plan::E2E_ATTEMPT_ENV));
+        let ordinary_tag = ordinary.tag();
+        let manifest_tag = manifest.tag();
+        let cfg = DagConfig {
+            steps: vec![manifest, ordinary],
+            ..Default::default()
+        };
+        let keep = retry_candidate_tags(
+            &cfg,
+            &[(ordinary_tag.clone(), "always-eligible".into())],
+            &[manifest_tag.clone()],
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &[],
+        );
+        assert!(keep.contains(&ordinary_tag));
+        assert!(!keep.contains(&manifest_tag));
     }
 }
