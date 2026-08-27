@@ -56,6 +56,7 @@ use crate::tool_global::ready_child_wait;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_is_live;
 use crate::tool_global::thread_observe_time;
+use crate::tool_global::virtual_process_for_physical_pid;
 use crate::tool_global::wait_for_child_lifecycle;
 use crate::tool_global::yield_once;
 use crate::tool_local::Detcore;
@@ -702,6 +703,16 @@ fn absolute_timeout_uses_host_clock(
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    /// Translate a host process ID from a kernel-restarted DBT child wait back
+    /// to the scheduler identity used by the ordinary wait handler.
+    pub async fn registered_process_for_physical_pid<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        physical_pid: i32,
+    ) -> Option<DetPid> {
+        virtual_process_for_physical_pid(guest, physical_pid).await
+    }
+
     async fn futex_timeout_deadline<G: Guest<Self>>(
         &self,
         guest: &mut G,

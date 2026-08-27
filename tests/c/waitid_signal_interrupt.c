@@ -9,7 +9,8 @@
 /*
  * Blocking `waitid` and `wait4` have signal-sensitive contracts covered here:
  * an interrupt must make progress and run its handler, SA_RESTART must run the
- * handler before resuming the wait, default-ignore signals must not interrupt,
+ * handler before resuming the wait, non-interrupting default dispositions must
+ * not interrupt,
  * blocked signals must remain pending, and an already-ready child status must
  * win when SIGCHLD is pending at the same scheduling boundary.
  */
@@ -22,12 +23,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t handler_ran;
 static volatile sig_atomic_t handler_target;
+static volatile sig_atomic_t restart_handler_ran;
+static volatile sig_atomic_t interrupt_handler_ran;
 
 static void on_signal(int signum) {
   (void)signum;
@@ -40,6 +45,26 @@ static void on_signal_kill_target(int signum) {
   if (handler_target > 0) {
     kill((pid_t)handler_target, SIGKILL);
   }
+}
+
+static void on_restart_signal(int signum) {
+  (void)signum;
+  restart_handler_ran = 1;
+}
+
+static void on_interrupt_signal(int signum) {
+  (void)signum;
+  interrupt_handler_ran = 1;
+}
+
+static void on_signal_change_wait_context(int signum, siginfo_t *info,
+                                          void *context) {
+  (void)signum;
+  (void)info;
+  handler_ran = 1;
+  ucontext_t *signal_context = (ucontext_t *)context;
+  signal_context->uc_mcontext.gregs[REG_RAX] = -EINTR;
+  signal_context->uc_mcontext.gregs[REG_RIP] += 2;
 }
 
 static int signal_interrupt(int use_wait4) {
@@ -258,6 +283,128 @@ static int signal_restart_handler_makes_child_waitable(int use_wait4) {
     return 2;
   }
   return handler_ran ? 0 : 3;
+}
+
+static int signal_restart_then_interrupt(int use_wait4) {
+  struct sigaction restart_action;
+  memset(&restart_action, 0, sizeof restart_action);
+  restart_action.sa_handler = on_restart_signal;
+  sigemptyset(&restart_action.sa_mask);
+  restart_action.sa_flags = SA_RESTART;
+  struct sigaction interrupt_action;
+  memset(&interrupt_action, 0, sizeof interrupt_action);
+  interrupt_action.sa_handler = on_interrupt_signal;
+  sigemptyset(&interrupt_action.sa_mask);
+  if (sigaction(SIGUSR1, &restart_action, NULL) != 0 ||
+      sigaction(SIGUSR2, &interrupt_action, NULL) != 0) {
+    printf("wait-restart-then-interrupt-setup-failed sigaction errno=%d\n",
+           errno);
+    return 1;
+  }
+
+  pid_t target = fork();
+  if (target < 0) {
+    printf("wait-restart-then-interrupt-setup-failed target-fork errno=%d\n",
+           errno);
+    return 1;
+  }
+  if (target == 0) {
+    for (;;) {
+      pause();
+    }
+  }
+
+  pid_t parent = getpid();
+  pid_t signaler = fork();
+  if (signaler < 0) {
+    printf("wait-restart-then-interrupt-setup-failed signaler-fork errno=%d\n",
+           errno);
+    kill(target, SIGKILL);
+    waitpid(target, NULL, 0);
+    return 1;
+  }
+  if (signaler == 0) {
+    const struct timespec first_delay = {
+        .tv_sec = 0, .tv_nsec = 20 * 1000 * 1000};
+    nanosleep(&first_delay, NULL);
+    if (kill(parent, SIGUSR1) != 0) {
+      _exit(1);
+    }
+    const struct timespec second_delay = {
+        .tv_sec = 0, .tv_nsec = 100 * 1000 * 1000};
+    nanosleep(&second_delay, NULL);
+    if (kill(parent, SIGUSR2) != 0) {
+      _exit(2);
+    }
+    for (;;) {
+      pause();
+    }
+  }
+
+  siginfo_t info;
+  memset(&info, 0, sizeof info);
+  int status = 0;
+  errno = 0;
+  int rc = use_wait4 ? waitpid(target, &status, 0)
+                     : waitid(P_PID, target, &info, WEXITED);
+  int saved_errno = errno;
+  int target_live = kill(target, 0) == 0;
+  int sender_live = kill(signaler, 0) == 0;
+  printf(use_wait4
+             ? "wait4-restart-then-interrupt rc=%d errno=%d restart-handler=%d interrupt-handler=%d target-live=%d sender-live=%d\n"
+             : "waitid-restart-then-interrupt rc=%d errno=%d restart-handler=%d interrupt-handler=%d target-live=%d sender-live=%d\n",
+         rc, rc < 0 ? saved_errno : 0, (int)restart_handler_ran,
+         (int)interrupt_handler_ran, target_live, sender_live);
+
+  kill(signaler, SIGKILL);
+  kill(target, SIGKILL);
+  waitpid(signaler, NULL, 0);
+  waitpid(target, NULL, 0);
+  return rc == -1 && saved_errno == EINTR && restart_handler_ran &&
+                 interrupt_handler_ran && target_live && sender_live
+             ? 0
+             : 2;
+}
+
+static int signal_restart_handler_changes_context(int use_wait4) {
+  struct sigaction action;
+  memset(&action, 0, sizeof action);
+  action.sa_sigaction = on_signal_change_wait_context;
+  sigemptyset(&action.sa_mask);
+  action.sa_flags = SA_RESTART | SA_SIGINFO;
+  if (sigaction(SIGALRM, &action, NULL) != 0) {
+    printf("wait-restart-context-setup-failed sigaction errno=%d\n", errno);
+    return 1;
+  }
+
+  pid_t child = fork();
+  if (child < 0) {
+    printf("wait-restart-context-setup-failed fork errno=%d\n", errno);
+    return 1;
+  }
+  if (child == 0) {
+    for (;;) {
+      pause();
+    }
+  }
+
+  siginfo_t info;
+  memset(&info, 0, sizeof info);
+  int status = 0;
+  alarm(1);
+  errno = 0;
+  int rc = use_wait4 ? waitpid(child, &status, 0)
+                     : waitid(P_PID, child, &info, WEXITED);
+  int saved_errno = errno;
+  alarm(0);
+  printf(use_wait4
+             ? "wait4-restart-context rc=%d errno=%d handler=%d\n"
+             : "waitid-restart-context rc=%d errno=%d handler=%d\n",
+         rc, rc < 0 ? saved_errno : 0, (int)handler_ran);
+
+  kill(child, SIGKILL);
+  waitpid(child, NULL, 0);
+  return rc == -1 && saved_errno == EINTR && handler_ran ? 0 : 2;
 }
 
 static int default_disposition_does_not_interrupt(int use_wait4, int signum) {
@@ -585,6 +732,18 @@ int main(int argc, char **argv) {
   if (argc == 2 && strcmp(argv[1], "--wait4-signal-restart-handler") == 0) {
     return signal_restart_handler_makes_child_waitable(1);
   }
+  if (argc == 2 && strcmp(argv[1], "--signal-restart-then-interrupt") == 0) {
+    return signal_restart_then_interrupt(0);
+  }
+  if (argc == 2 && strcmp(argv[1], "--wait4-signal-restart-then-interrupt") == 0) {
+    return signal_restart_then_interrupt(1);
+  }
+  if (argc == 2 && strcmp(argv[1], "--signal-restart-context") == 0) {
+    return signal_restart_handler_changes_context(0);
+  }
+  if (argc == 2 && strcmp(argv[1], "--wait4-signal-restart-context") == 0) {
+    return signal_restart_handler_changes_context(1);
+  }
   if (argc == 3 && strcmp(argv[1], "--waitid-default-disposition") == 0) {
     return default_disposition_does_not_interrupt(0, atoi(argv[2]));
   }
@@ -606,6 +765,6 @@ int main(int argc, char **argv) {
   if (argc == 2 && strcmp(argv[1], "--wait4-live-sibling-signal-blocked") == 0) {
     return live_sibling_signal(3);
   }
-  fprintf(stderr, "usage: %s [--child-ready-wins|--signal-restart|--wait4-signal-interrupt|--wait4-child-ready-wins|--wait4-signal-restart|--signal-restart-handler|--wait4-signal-restart-handler|--waitid-default-disposition SIGNAL|--wait4-default-disposition SIGNAL|--live-sibling-signal|--live-sibling-signal-restart|--live-sibling-signal-blocked|--live-sibling-thread-signal|--wait4-live-sibling-signal-blocked]\n", argv[0]);
+  fprintf(stderr, "usage: %s [--child-ready-wins|--signal-restart|--wait4-signal-interrupt|--wait4-child-ready-wins|--wait4-signal-restart|--signal-restart-handler|--wait4-signal-restart-handler|--signal-restart-then-interrupt|--wait4-signal-restart-then-interrupt|--signal-restart-context|--wait4-signal-restart-context|--waitid-default-disposition SIGNAL|--wait4-default-disposition SIGNAL|--live-sibling-signal|--live-sibling-signal-restart|--live-sibling-signal-blocked|--live-sibling-thread-signal|--wait4-live-sibling-signal-blocked]\n", argv[0]);
   return 64;
 }

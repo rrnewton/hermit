@@ -765,6 +765,40 @@ fn dbt_exact_child_waits_honor_sa_restart() {
 }
 
 #[test]
+fn dbt_exact_child_waits_apply_each_signal_restart_disposition() {
+    if dbt_unavailable("dbt_exact_child_waits_apply_each_signal_restart_disposition") {
+        return;
+    }
+    assert_dbt_wait_case(
+        &["--signal-restart-then-interrupt"],
+        "waitid-restart-then-interrupt rc=-1 errno=4 restart-handler=1 interrupt-handler=1 target-live=1 sender-live=1",
+        None,
+    );
+    assert_dbt_wait_case(
+        &["--wait4-signal-restart-then-interrupt"],
+        "wait4-restart-then-interrupt rc=-1 errno=4 restart-handler=1 interrupt-handler=1 target-live=1 sender-live=1",
+        None,
+    );
+}
+
+#[test]
+fn dbt_exact_child_waits_honor_a_changed_signal_context() {
+    if dbt_unavailable("dbt_exact_child_waits_honor_a_changed_signal_context") {
+        return;
+    }
+    assert_dbt_wait_case(
+        &["--signal-restart-context"],
+        "waitid-restart-context rc=-1 errno=4 handler=1",
+        None,
+    );
+    assert_dbt_wait_case(
+        &["--wait4-signal-restart-context"],
+        "wait4-restart-context rc=-1 errno=4 handler=1",
+        None,
+    );
+}
+
+#[test]
 fn dbt_exact_child_waits_respect_noninterrupting_default_dispositions() {
     if dbt_unavailable("dbt_exact_child_waits_respect_noninterrupting_default_dispositions") {
         return;
