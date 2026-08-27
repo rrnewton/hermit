@@ -195,23 +195,43 @@ both outcomes were non-pass in both; Python strict verification and
 `verify_mode_matrix` passed both. That arithmetic produces the observed 23/5
 split.
 
-The current failure text also changes the debugging order. Six DBT cases
+The `6172478eae28` failure text changes the debugging order for those focused
+runs. Six DBT cases
 (`process_wait_lifecycle`, queued self-signals, self-`prlimit`, shell process
-lifecycle, the env shebang, and process identities) now share an RPC
+lifecycle, the env shebang, and process identities) shared an RPC
 `UnexpectedEnd` followed by “DBT evidence is missing FINAL frames for process
 images.” The earlier per-test failures remain valid history, but this shared
-current failure happens first and should be resolved before assuming each old
-cause remains live. The current LiteInst failures likewise stop at the staged
-runtime revision check before the intended product behavior.
+failure happened first in that mixed-build evidence. The clean matched
+remeasurement below is the authoritative current observation for the six DBT
+tests. The current LiteInst failures likewise stop at the staged-runtime
+revision check before the intended product behavior.
 
 ## Resolve the earlier shared failures first
 
-Do not start by treating the six DBT entries above as six independent defects.
-Their current executions all stop at the same earlier transport/finalization
-failure. Diagnose that path once, using
+Do not treat the six DBT entries above as six independent defects when
+interpreting the two focused `6172478eae28` runs. All six stopped at the same
+earlier transport/finalization failure. Diagnose that path once, using
 [the retained DBT diagnosis](../ai_docs/2026-08-17-reverie-dbt-final-frame-diagnosis.md),
-and only return to an entry's older test-specific failure after the shared
-failure is gone.
+before using that mixed-build evidence to assess the older test-specific
+failures.
+
+That focused `6172478eae288c9f5005545d4f68c00c780f41c0` evidence is not
+authoritative for the current state of these six tests. Those runs paired a
+current binary with a packaged DBT client built from stale Reverie
+`a16e3c466a15c3746a5ef23a76d1f74e11aba935`. A clean remeasurement on
+2026-08-27 at the exact https://github.com/rrnewton/hermit/pull/2731 test head
+`4944fb5b3cc029459056a3b9743f0d0df3ad0209` used a matched packaged client
+from Reverie `ab07a89239150df3726a036bee9f5e897893dfc1`. It produced two
+passes, the three earlier test-specific failures described below, and one
+`simple_env_shebang` failure with a single process image missing `FINAL`; none
+of the six results contained `UnexpectedEnd`. The retained node log is
+`/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-141-4944fb5b3cc0-1787834650301238559-798721-c47ac7c9/safe-ci-dag-runner/test.cli.log`,
+and the full validate log is
+`/home/newton/work/dev-hermit/ignored/validate/validate-hermit-141-4944fb5b3cc0-1787834650301238559-798721-c47ac7c9.log`.
+Hermit source also changed between `6172478eae28` and `4944fb5b3cc0`, so this
+is not same-SHA causal proof that the stale client alone caused the earlier
+shared failure. Pull request 2731 only changes retained-log names and tightens
+the test; it does not repair DBT execution.
 
 Do not count the current LiteInst entries as measured product failures either.
 They stop at a missing staged-runtime revision before reaching the behavior
@@ -314,7 +334,12 @@ stated explicitly.
   `2026-08-25T11:26:31.756955Z`, in
   `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-014-d19c112c7035-1787655221/safe-ci-dag-runner/test.cli.log`.
 - Findings: this is an ESRCH/self-signal failure, distinct from the missing
-  backend build configuration fixed by `740cc656`.
+  backend build configuration fixed by `740cc656`. The clean matched run at
+  `4944fb5b3cc029459056a3b9743f0d0df3ad0209` reached the same historical
+  `rt_sigqueueinfo` failure in 0.447s and emitted no `UnexpectedEnd`. Commit
+  `6ba873cec2316f4f5d662487bf4d2b773795efdd` in draft
+  https://github.com/rrnewton/reverie/pull/479 is a candidate change, not a
+  proven fix.
 
 ### `hermit::cli$run_dbt_verifies_self_prlimit`
 
@@ -327,6 +352,9 @@ stated explicitly.
 - Findings: the guest queries with pid 0, then passes Hermit's virtualized pid
   back to `prlimit64`; that mutation returns `EPERM`. Prior triage places this
   at the DBT process-identity boundary, not in the missing-build configuration.
+  The clean matched run at `4944fb5b3cc029459056a3b9743f0d0df3ad0209`
+  reached the same historical `EPERM` failure in 0.471s and emitted no
+  `UnexpectedEnd`; no draft pull request 479 fix is claimed for this case.
 
 ### `hermit::cli$run_dbt_verifies_shell_process_lifecycle`
 
@@ -342,7 +370,12 @@ stated explicitly.
   evidence. The shared repair landed through
   https://github.com/rrnewton/reverie/pull/506 and
   https://github.com/rrnewton/hermit/pull/2737; current Hermit main contains
-  merge `20226fd5d6fc221da8e4f58341fed411248b1995`.
+  merge `20226fd5d6fc221da8e4f58341fed411248b1995`. The clean matched run at
+  `4944fb5b3cc029459056a3b9743f0d0df3ad0209` reached a terminal comparison
+  divergence on host `getpgrp` values in 2.678s and emitted no `UnexpectedEnd`.
+  Commit `476f42770c2fa4472a3bb80798353503d83fdd2e` in draft
+  https://github.com/rrnewton/reverie/pull/479 is a candidate change, not a
+  proven fix.
 
 ### `hermit::cli$run_dbt_verifies_simple_env_shebang`
 
@@ -355,7 +388,13 @@ stated explicitly.
   `8e2579d4f0640414f563a3f9f5e6eb4c21a0c884`, in that run's retained
   `test.cli.log`.
 - Findings: this is evidence-finalization after a successful DBT guest, not a
-  failure to launch `drrun` and not the earlier missing-feature defect.
+  failure to launch `drrun` and not the earlier missing-feature defect. The
+  clean matched run at `4944fb5b3cc029459056a3b9743f0d0df3ad0209` still
+  lacked `FINAL` for one process image at epoch 0, next sequence 3, after
+  1.074s, but emitted no `UnexpectedEnd`. Commit
+  `9f5e0d9e2c0a51df8d460232ee75faf1a0e50974` in draft
+  https://github.com/rrnewton/reverie/pull/479 is a candidate change, not a
+  proven fix.
 
 ### `hermit::cli$run_dbt_virtualizes_process_identities`
 
@@ -363,12 +402,16 @@ stated explicitly.
   exited 125.
 - Introduced under the current exact ID by `e565b1ab1d5fcbbab492ffb886c893dbcb061ddf`,
   in `hermit-cli/tests/cli.rs`.
-- Last retained green: `PASS 0.748s` at
-  `8e2579d4f0640414f563a3f9f5e6eb4c21a0c884`, in that run's retained
-  `test.cli.log`.
+- Last retained green: `PASS 2.572s` at Hermit
+  `4944fb5b3cc029459056a3b9743f0d0df3ad0209`, in
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-141-4944fb5b3cc0-1787834650301238559-798721-c47ac7c9/safe-ci-dag-runner/test.cli.log`.
 - Findings: prior triage associates the failure with DBT process identity. The
   retained a6 failure does not isolate one identity syscall, so resume from the
-  full stderr rather than assuming it is the same `prlimit64` failure.
+  full stderr rather than assuming it is the same `prlimit64` failure. The
+  clean matched run at `4944fb5b3cc029459056a3b9743f0d0df3ad0209` passed and
+  emitted no `UnexpectedEnd`; because Hermit source and the packaged client
+  both changed, that observation does not prove which change removed the
+  earlier failure.
 
 ### `hermit::cli$run_liteinst_rejects_a_non_runtime_override_before_activation_claim`
 
@@ -553,15 +596,20 @@ stated explicitly.
 - Introduced under the current exact ID by the DBI-to-DBT rename
   `e565b1ab1d5fcbbab492ffb886c893dbcb061ddf`, commit date 2026-08-08
   (author date 2026-08-06), in `hermit-cli/tests/cli.rs`.
-- Last retained green: `PASS 1.012s` at
-  `f630aef3d18e87e49a1e099a5bcf4d2bf43987d1`, in that run's retained
-  `test.cli.log`; the overall run was a non-verdict.
+- Last retained green: `PASS 0.912s` at Hermit
+  `4944fb5b3cc029459056a3b9743f0d0df3ad0209`, in
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-141-4944fb5b3cc0-1787834650301238559-798721-c47ac7c9/safe-ci-dag-runner/test.cli.log`.
 - Findings: the comparator was stable. DBT `wait4`/`waitid` fell back to
   host-timed `InternalIOPolling`, so physical child readiness changed protected
   scheduler records while guest stdout and status agreed. The repair landed via
   https://github.com/rrnewton/reverie/pull/506 and
   https://github.com/rrnewton/hermit/pull/2737, with Hermit merge
-  `20226fd5d6fc221da8e4f58341fed411248b1995` on current main.
+  `20226fd5d6fc221da8e4f58341fed411248b1995` on current main. The clean
+  matched run at `4944fb5b3cc029459056a3b9743f0d0df3ad0209` passed in 0.912s
+  and emitted no `UnexpectedEnd`. The two focused `6172478eae28` results do not
+  describe authoritative current state because they used the stale packaged
+  client described above; the Hermit source change prevents a same-SHA causal
+  conclusion.
 
 ### `hermit::hermit_modes$verify_mode_matrix`
 
