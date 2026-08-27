@@ -5365,6 +5365,72 @@ fn a_stopped_stderr_reader_does_not_hang_hermit_on_its_way_out() {
         Some(127),
         "giving up on an undeliverable diagnostic must not change the exit status"
     );
+
+    // ⚠️ THIS IS THE ASSERTION THAT PINS THE BOUND, AND WITHOUT IT THE CELL WAS
+    // GREEN FOR ANY DEADLINE UNDER 30s. `elapsed` used to be computed and then
+    // used ONLY in the panic message above, so the sole timing check was the 30s
+    // poll deadline: the production constant could drift from 5s to 29s and this
+    // test would not notice. A bound nothing pins is a bound that moves.
+    //
+    // The ceiling is the deadline plus process startup and teardown, not the
+    // deadline alone, so it is stated as the deadline plus a stated margin rather
+    // than as a bare number. Measured on this fixture: 5.0s against a 5s deadline.
+    let ceiling = detcore::util::STDERR_DIAGNOSTIC_DEADLINE * 2 + Duration::from_secs(5);
+    assert!(
+        elapsed < ceiling,
+        "hermit took {elapsed:?} to give up on an undeliverable diagnostic, but the \
+         deadline is {:?} and it is a TOTAL for the process, not a budget per write. \
+         Exceeding it means either the deadline drifted or the clock went back to \
+         being per-`write()`, which multiplies it by the number of diagnostic lines.",
+        detcore::util::STDERR_DIAGNOSTIC_DEADLINE
+    );
+}
+
+/// The diagnostic deadline must fit inside the bound that encloses it.
+///
+/// ⚠️ THIS IS THE CHECK THAT MAKES THE DERIVATION REAL RATHER THAN A COMMENT.
+/// Diagnostics on the exit path run inside `RUN_TIMEOUT_UNWIND_GRACE`: the window
+/// between a `--timeout` expiring and the SIGALRM fallback calling `_exit`.
+/// Overrunning it does not just delay the report, it loses it, and additionally
+/// emits `HERMIT_RUN_TIMEOUT_FALLBACK` -- the marker that is supposed to mean the
+/// teardown wedged. So the failure mode of getting this wrong is a correct run
+/// that reports a false internal defect.
+///
+/// Raising either side alone now fails HERE, by name, instead of silently
+/// producing an inner bound that cannot fit inside its outer one. That is the
+/// third instance of this shape found on 2026-08-26; see docs/TIMEOUT_LADDER.md.
+#[test]
+fn the_stderr_diagnostic_deadline_fits_inside_the_unwind_grace() {
+    // Not imported from hermit-cli: `RUN_TIMEOUT_UNWIND_GRACE` is private to the
+    // crate. Pinning the number here means a change there must also change this
+    // line, which is the point -- the two are only related if something says so.
+    let unwind_grace = Duration::from_secs(10);
+    let per_process = detcore::util::STDERR_DIAGNOSTIC_DEADLINE;
+
+    // ⚠️ TWO, BECAUSE HERMIT FORKS. `Container::run` forks the container init, which
+    // gets its own copy of the process-wide clock in detcore/src/util.rs and spends
+    // its own full deadline; both write to the same fd 2 on the way out. Measured
+    // 2026-08-26 against a stopped reader on a real guest: a 5000ms per-process
+    // deadline produced 10.03s, and 2500ms produced 5.02s. A derivation that forgets
+    // the fork is out by exactly this factor.
+    let writing_processes = 2;
+    let diagnostics = per_process * writing_processes;
+
+    assert!(
+        diagnostics < unwind_grace,
+        "the diagnostic deadline ({diagnostics:?}) must be STRICTLY smaller than the \
+         unwind grace ({unwind_grace:?}) that encloses it; an inner bound at or above \
+         its outer bound can never fire and is dead configuration that reads as \
+         protection"
+    );
+    assert!(
+        diagnostics * 2 <= unwind_grace,
+        "diagnostics across all {writing_processes} writing processes ({diagnostics:?}, \
+         from a per-process deadline of {per_process:?}) must leave at least as much of \
+         the unwind grace ({unwind_grace:?}) for the unwind itself as they take for \
+         reporting; that half-and-half split is the stated derivation in \
+         detcore/src/util.rs and this is what holds the two numbers together"
+    );
 }
 
 #[test]
