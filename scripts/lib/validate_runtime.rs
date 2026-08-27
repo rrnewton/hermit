@@ -90,17 +90,26 @@ pub const RETRIES_PER_CELL: usize = 2;
 /// cell B has not yet failed once, and B must still get its own three.
 pub const MAX_ATTEMPTS_PER_CELL: usize = 1 + RETRIES_PER_CELL;
 
-/// Lane-round backstop. Per-cell caps are what actually bound the work; this only
-/// stops a pathological loop. It must be large enough never to bind before the
-/// per-cell caps do, or the lane budget returns through the back door.
+/// Default lane-round backstop. Production resolves this against the selected
+/// cell count, so it can never bind before every cell's own retry allowance.
 pub const LANE_ROUND_BACKSTOP: usize = 32;
 
-/// Resolve the environmental-block retry budget from the environment.
-pub fn env_block_max_retries() -> usize {
-    match std::env::var("VALIDATE_ENV_BLOCK_RETRIES") {
+fn lane_round_backstop(configured: usize, cell_count: usize) -> usize {
+    configured.max(cell_count.saturating_mul(RETRIES_PER_CELL))
+}
+
+/// Resolve the legacy lane-round backstop from the environment.
+///
+/// The override may raise the runaway guard, but it may not lower it below the
+/// number of rounds needed for every selected cell to spend both of its retries.
+/// Otherwise `VALIDATE_ENV_BLOCK_RETRIES=1` would silently turn the owner's
+/// three-attempt PER-CELL rule back into one shared lane retry.
+pub fn env_block_max_retries(cell_count: usize) -> usize {
+    let configured = match std::env::var("VALIDATE_ENV_BLOCK_RETRIES") {
         Ok(v) if !v.is_empty() => v.parse().unwrap_or(ENV_BLOCK_RETRIES_DEFAULT),
         _ => ENV_BLOCK_RETRIES_DEFAULT,
-    }
+    };
+    lane_round_backstop(configured, cell_count)
 }
 
 // ------------------------------------------------------------------ measured-unstable nodes
@@ -1527,6 +1536,17 @@ pub fn self_test() -> Result<String, String> {
         return Err(format!(
             "retry policy: default lane backstop {ENV_BLOCK_RETRIES_DEFAULT} is below the \
              declared backstop {LANE_ROUND_BACKSTOP}"
+        ));
+    }
+    let cells = LANE_ROUND_BACKSTOP / RETRIES_PER_CELL + 1;
+    let required = cells * RETRIES_PER_CELL;
+    if lane_round_backstop(0, cells) != required
+        || lane_round_backstop(1, cells) != required
+        || lane_round_backstop(required + 1, cells) != required + 1
+    {
+        return Err(format!(
+            "retry policy: the legacy lane-round override can bind before {cells} cells spend \
+             their {RETRIES_PER_CELL} retries each"
         ));
     }
 

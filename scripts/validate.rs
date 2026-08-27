@@ -7292,6 +7292,23 @@ mod scheduler_explanation_tests {
         attempts.push(unreported_attempt(tag.into(), 3));
         assert!(!retry_attempt_available(&attempts, tag));
     }
+
+    #[test]
+    fn retry_set_applies_the_attempt_cap_to_carried_cells_too() {
+        let capped = "test.capped_unknown";
+        let available = "test.available_failure";
+        let attempts = vec![
+            unreported_attempt(capped.into(), 1),
+            unreported_attempt(capped.into(), 2),
+            unreported_attempt(capped.into(), 3),
+            unreported_attempt(available.into(), 1),
+        ];
+        let mut keep = BTreeSet::from([capped.to_string(), available.to_string()]);
+
+        retain_cells_with_retry_attempt_available(&mut keep, &attempts);
+
+        assert_eq!(keep, BTreeSet::from([available.to_string()]));
+    }
 }
 
 #[cfg(test)]
@@ -8563,6 +8580,117 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         ));
     }
 
+    // STAGGERED PER-CELL CAP. `capped_peer` fails in the first pass, then loses
+    // the one serial slot in retry rounds 1 and 2 while two later cells fail in
+    // sequence. It has now spent exactly three attempts: fail, unknown, unknown.
+    // The second later failure starts retry round 3. Before the retry-set cap was
+    // applied to carried peers, `capped_peer` ran a FOURTH time in that round and
+    // passed, even though the failed trigger nodes themselves obeyed the cap.
+    let staggered_log = tmp.join("staggered-cap.log");
+    let capped_first = tmp.join("staggered-capped-first");
+    let capped_passed = tmp.join("staggered-capped-passed");
+    let first_trigger_first = tmp.join("staggered-first-trigger-first");
+    let second_trigger_first = tmp.join("staggered-second-trigger-first");
+    let capped_cmd = format!(
+        "if test ! -e {first}; then : > {first}; printf '%s\\n' \
+         '[fixture.capped_peer] ----- detail -----' \
+         '[fixture.capped_peer] Enforcer: FS, Reason: FILE_OPEN' \
+         '[fixture.capped_peer] ----- end detail -----' > {log}; sleep 0.3; exit 1; fi; \
+         : > {passed}",
+        first = validate_plan::shell_quote(&capped_first.to_string_lossy()),
+        passed = validate_plan::shell_quote(&capped_passed.to_string_lossy()),
+        log = validate_plan::shell_quote(&staggered_log.to_string_lossy()),
+    );
+    let first_trigger_cmd = format!(
+        "if test ! -e {first}; then : > {first}; printf '%s\\n' \
+         '[fixture.first_late_trigger] ----- detail -----' \
+         '[fixture.first_late_trigger] Enforcer: FS, Reason: FILE_OPEN' \
+         '[fixture.first_late_trigger] ----- end detail -----' >> {log}; exit 1; fi",
+        first = validate_plan::shell_quote(&first_trigger_first.to_string_lossy()),
+        log = validate_plan::shell_quote(&staggered_log.to_string_lossy()),
+    );
+    let second_trigger_cmd = format!(
+        "if test ! -e {first}; then : > {first}; printf '%s\\n' \
+         '[fixture.second_late_trigger] ----- detail -----' \
+         '[fixture.second_late_trigger] Enforcer: FS, Reason: FILE_OPEN' \
+         '[fixture.second_late_trigger] ----- end detail -----' >> {log}; exit 1; fi",
+        first = validate_plan::shell_quote(&second_trigger_first.to_string_lossy()),
+        log = validate_plan::shell_quote(&staggered_log.to_string_lossy()),
+    );
+    let mut capped_step = step("capped_peer", &capped_cmd);
+    capped_step.hint.est_duration_s = 10.0;
+    capped_step.hint.resources.insert("serial".into(), 1);
+    let mut first_trigger_step = step("first_late_trigger", &first_trigger_cmd);
+    first_trigger_step.deps = vec!["fixture.staggered_prerequisite".into()];
+    first_trigger_step.hint.est_duration_s = 20.0;
+    first_trigger_step.hint.resources.insert("serial".into(), 1);
+    let mut second_trigger_step = step("second_late_trigger", &second_trigger_cmd);
+    second_trigger_step.deps = vec!["fixture.first_late_trigger".into()];
+    second_trigger_step.hint.est_duration_s = 30.0;
+    second_trigger_step.hint.resources.insert("serial".into(), 1);
+    let mut staggered_cfg = DagConfig {
+        steps: vec![
+            capped_step,
+            step("staggered_prerequisite", "true"),
+            first_trigger_step,
+            second_trigger_step,
+        ],
+        ..Default::default()
+    };
+    staggered_cfg.resource_caps.insert("serial".into(), 1);
+    let staggered = run_lane_with_env_retries(
+        &staggered_cfg,
+        2,
+        false,
+        0,
+        None,
+        &staggered_log,
+        None,
+        3,
+        &BTreeMap::new(),
+        false,
+    );
+    let attempts_for = |tag: &str| -> Vec<&NodeAttempt> {
+        staggered.attempts.iter().filter(|attempt| attempt.tag == tag).collect()
+    };
+    let capped_attempts = attempts_for("fixture.capped_peer");
+    let first_trigger_attempts = attempts_for("fixture.first_late_trigger");
+    let second_trigger_attempts = attempts_for("fixture.second_late_trigger");
+    if staggered.complete
+        || staggered.ok
+        || staggered.env_retries != 3
+        || capped_attempts.len() != validate_runtime::MAX_ATTEMPTS_PER_CELL
+        || capped_attempts.last().is_none_or(|attempt| {
+            attempt.attempt != validate_runtime::MAX_ATTEMPTS_PER_CELL
+                || attempt.execution != AttemptExecution::Unknown
+        })
+        || capped_passed.exists()
+        || first_trigger_attempts.last().is_none_or(|attempt| attempt.ok != Some(true))
+        || second_trigger_attempts.last().is_none_or(|attempt| attempt.ok != Some(true))
+    {
+        return Err(format!(
+            "retry budget: a carried peer crossed its three-attempt per-cell cap when later \
+             failures opened another retry round: complete={} ok={} retries={} capped={:?} \
+             capped_passed={} first_trigger={:?} second_trigger={:?}",
+            staggered.complete,
+            staggered.ok,
+            staggered.env_retries,
+            capped_attempts
+                .iter()
+                .map(|attempt| (attempt.attempt, attempt.execution, attempt.ok))
+                .collect::<Vec<_>>(),
+            capped_passed.exists(),
+            first_trigger_attempts
+                .iter()
+                .map(|attempt| (attempt.attempt, attempt.execution, attempt.ok))
+                .collect::<Vec<_>>(),
+            second_trigger_attempts
+                .iter()
+                .map(|attempt| (attempt.attempt, attempt.execution, attempt.ok))
+                .collect::<Vec<_>>()
+        ));
+    }
+
     // ---- the bound-kill ground, and the two refusals that bound it ----------
     //
     // The measured instance is `scorecard.compatibility` at SHA 485a0ad4: it
@@ -9148,6 +9276,13 @@ fn run_lane_with_env_retries(
         // the prior attempt. Carry the explicit latest-unknown set forward so a
         // different node's later retry trigger can give it another real chance.
         keep.extend(latest_unreported.iter().cloned());
+        // The cap applies to EVERY cell admitted to the retry DAG, not only the
+        // failed cell that triggered this round. Aborted, dependency-skipped, and
+        // unreported peers are carried above so they get another real chance, but
+        // without this filter a different failure could carry one of those peers
+        // through a fourth (or later) attempt. That silently turns the lane-round
+        // backstop into their real budget, contradicting the per-cell ruling.
+        retain_cells_with_retry_attempt_available(&mut keep, &attempts);
         let steps = retry_steps_with_satisfied_prerequisites(cfg, &by_tag, keep);
         let retry_tags: BTreeSet<String> = steps.iter().map(|step| step.tag()).collect();
         if !blocked.iter().any(|(tag, _)| retry_tags.contains(tag)) {
@@ -11564,6 +11699,13 @@ fn retry_attempt_available(attempts: &[NodeAttempt], tag: &str) -> bool {
     attempts_so_far(attempts, tag) < validate_runtime::MAX_ATTEMPTS_PER_CELL
 }
 
+fn retain_cells_with_retry_attempt_available(
+    keep: &mut BTreeSet<String>,
+    attempts: &[NodeAttempt],
+) {
+    keep.retain(|tag| retry_attempt_available(attempts, tag));
+}
+
 /// Cap for every id list in the end-of-run summary, so the block stays roughly
 /// fixed size however wide the failure is.
 const SUMMARY_LIST_CAP: usize = 12;
@@ -12681,7 +12823,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             cgroups.clone(),
             &log_path,
             deadline,
-            validate_runtime::env_block_max_retries(),
+            validate_runtime::env_block_max_retries(cfg.steps.len()),
             &unstable,
             true,
         )
