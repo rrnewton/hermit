@@ -25,14 +25,35 @@
  */
 
 #include <fcntl.h>
+#include <errno.h>
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 
-int main(void) {
+int main(int argc, char **argv) {
     int before = fcntl(STDOUT_FILENO, F_GETFL);
     if (before < 0) {
         perror("fcntl(F_GETFL) before");
         return 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "clear") == 0) {
+        errno = 0;
+        int clear_result = fcntl(STDOUT_FILENO, F_SETFL, before & ~O_APPEND);
+        int clear_errno = errno;
+        int after_clear = fcntl(STDOUT_FILENO, F_GETFL);
+        dprintf(
+            STDERR_FILENO,
+            "clear_result=%d clear_errno=%d append_after=%d\n",
+            clear_result,
+            clear_errno,
+            after_clear >= 0 && (after_clear & O_APPEND) != 0);
+        return before & O_APPEND && clear_result == -1 && clear_errno == EOPNOTSUPP &&
+                after_clear & O_APPEND
+            ? 0
+            : 1;
+    }
+    if (argc != 1) {
+        return 64;
     }
     if (fcntl(STDOUT_FILENO, F_SETFL, before | O_APPEND) < 0) {
         perror("fcntl(F_SETFL, O_APPEND)");
