@@ -111,7 +111,7 @@ def stop_test_env(
         HERMIT_VALIDATE_STOP_TEST_MODE="1",
         HERMIT_VALIDATE_LEDGER=str(ledger),
         DEV_HERMIT_PARENT=str(ROOT.parent),
-        VALIDATE_RUN_ON_DIRTY_TREE="1",
+        VALIDATE_SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS="1",
         VALIDATE_STOP_TEST_TMP_ROOT=str(tmpdir / "validation"),
         TMPDIR=str(tmpdir),
     )
@@ -252,7 +252,10 @@ def warm_validate_binary() -> None:
     subprocess.run(
         [str(VALIDATE), "full", "--show-plan"],
         cwd=ROOT,
-        env={**os.environ, "VALIDATE_RUN_ON_DIRTY_TREE": "1"},
+        env={
+            **os.environ,
+            "VALIDATE_SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS": "1",
+        },
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         timeout=900,
@@ -496,7 +499,7 @@ def run_canonical_adapter_contract(*, refuse: bool) -> None:
             HERMIT_VALIDATE_STOP_TEST_MODE="1",
             DEV_HERMIT_PARENT=str(parent),
             CI_HUB_VALIDATE_LEDGER_TEST_ROOT=str(canonical_root),
-            VALIDATE_RUN_ON_DIRTY_TREE="1",
+            VALIDATE_SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS="1",
             VALIDATE_STOP_TEST_TMP_ROOT=str(tmpdir / "validation"),
             VALIDATE_STOP_TEST_EXIT_EARLY="1",
             TMPDIR=str(tmpdir),
