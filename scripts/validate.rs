@@ -375,6 +375,15 @@ fn usage() -> &'static str {
      \x20                  nested-cgroup check, then exit.\n\
      \x20 -h, --help       Show this help and exit.\n\
      \n\
+     Actual validation attempts end with exactly one machine-readable final line:\n\
+     \x20 FINAL_VALIDATE_STATUS: PASSED          exit 0\n\
+     \x20 FINAL_VALIDATE_STATUS: FAILED          exit 1\n\
+     \x20 FINAL_VALIDATE_STATUS: COULD_NOT_RUN   exit 75\n\
+     The line is validate's last output. Readers take the last occurrence and\n\
+     require the exit code to agree; no line means validate died before reporting.\n\
+     Help, --show-plan, and --probe-host-capability do not attempt validation and\n\
+     therefore do not emit a final validate status.\n\
+     \n\
      Environment: VALIDATE_LEVEL, VALIDATE_LABEL_PR, VALIDATE_RUN_ON_DIRTY_TREE,\n\
      VALIDATE_IGNORE_CACHE, VALIDATE_VERBOSITY, VALIDATE_VERBOSE, VALIDATE_FORCE_FULL,\n\
      HERMIT_VALIDATE_LEDGER, PR_NUMBER, SUPER_REPETITIONS, L4_REPS, ENVELOPE_JSON,\n\
@@ -1186,6 +1195,23 @@ fn self_test() -> Result<(), String> {
             "summary: final-status reader did not take the last occurrence, preserve absence, or reject an unknown value"
                 .into(),
         );
+    }
+    for (verdict, word, exit_code) in [
+        (Verdict::Pass, "PASSED", 0),
+        (Verdict::Fail, "FAILED", 1),
+        (Verdict::NoResult, "COULD_NOT_RUN", COULD_NOT_RUN_EXIT_CODE),
+    ] {
+        let summary = RunSummary::new(verdict, 222, "self-test", Vec::new());
+        let lines = run_summary_lines(&summary, std::time::Instant::now());
+        let expected = format!("{FINAL_VALIDATE_STATUS_PREFIX}{word}");
+        if summary.exit_code != exit_code
+            || lines.last().map(String::as_str) != Some(expected.as_str())
+        {
+            return Err(format!(
+                "summary: {word} did not use fixed exit {exit_code} and the matching final line: exit={} lines={lines:?}",
+                summary.exit_code
+            ));
+        }
     }
     let exe = std::env::current_exe()
         .map_err(|error| format!("summary: cannot resolve self-test executable: {error}"))?;
