@@ -33,10 +33,13 @@ agreeing with each other.
 | `hermit run --timeout N` | **one hermit invocation** = one guest execution, **ptrace and liteinst only** | the caller's argument | hermit drops the guest future and unwinds its own container | exit 124, `HERMIT_RUN_TIMEOUT class=run-timeout` |
 | hermit's unwind fallback | the same invocation, `N + 10s` | `RUN_TIMEOUT_UNWIND_GRACE` in `hermit-cli/src/lib.rs` | `_exit(124)` from a `SIGALRM` handler; no destructors | exit 124, `HERMIT_RUN_TIMEOUT_FALLBACK` |
 | `hermit record --record-timeout N` | one recording | the caller's argument | `_exit(124)` from a `SIGALRM` handler | exit 124 |
-| nextest `slow-timeout` | **one cargo test process**, which may invoke hermit zero or many times | `.config/nextest.toml`: 15s default, two named 30s overrides | `SIGTERM` to the test binary, 2s grace, then `SIGKILL` | wrapper exit 100, test named by nextest |
+| nextest `slow-timeout` | **one cargo test process**, which may invoke hermit zero or many times | `.config/nextest.toml`: 15s default, three named 30s overrides | `SIGTERM` to the test binary, 2s grace, then `SIGKILL` | wrapper exit 100, test named by nextest |
 | manifest cell `timeout_seconds` | **one manifest cell** | `tests/e2e/manifests/*.yaml`, per cell | `timeout --kill-after=10s Ns` around the cell command | exit 124 |
+| dagrun step `cpu_timeout` | **one DAG node's user+system CPU consumption** | `ci/dag/{portable,privileged}.json` | dagrun polls the step cgroup's `cpu.stat` and reaps the node | node failure, `CPU-TIMEOUT` |
 | dagrun step `timeout` | **one DAG node**, i.e. a whole batch of cells or tests | `ci/dag/{portable,privileged}.json` | dagrun stops the step | node failure |
-| validate's nested limits | the validate run and its scope | `VALIDATE_GATE_TIMEOUT_SECONDS`, `HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS`, the scope, the node | see `ci/validate-timeout-layers-test.sh` | ladder `480 < 600 < 660 < 720` |
+| validate whole-run CPU budget | **cumulative user+system CPU across every lane and retry** | `--run-cpu-timeout`, `HERMIT_VALIDATE_RUN_CPU_TIMEOUT_SECONDS`, default 9807 CPU-s | dagrun polls the outer cgroup's `cpu.stat`, stops launching, and reaps in-flight nodes | `RUN CPU TIMEOUT`, incomplete judgement |
+| validate whole-run wall backstop | elapsed time across every lane and retry | `--run-timeout`, `HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS` | dagrun stops launching and reaps in-flight nodes while preserving rows | `RUN TIMEOUT`, incomplete judgement |
+| validate scope wall backstop | elapsed time for the whole cgroup scope | the whole-run wall backstop plus cleanup grace | systemd terminates the scope if the in-process runner wedges | external scope kill |
 | `safehermit --sh-deadline` | **the whole wrapped process tree** | `bin/safehermit`, default 3600s | `systemd-run --user RuntimeMaxSec`, a **cgroup kill** | exit 124, `safehermit: bound.wall=` |
 
 Distribution of the values actually deployed today:
@@ -44,6 +47,19 @@ Distribution of the values actually deployed today:
 - manifest `timeout_seconds`: 90s ×310, 60s ×25, 120s ×22, 600s ×1.
 - dagrun step `timeout`: 600s ×15, 900s ×15, 120s ×11, 180s ×6, 60s ×6, 720s ×5,
   1200s ×4, 300s ×3, 2400s ×1, 40s ×1, 30s ×1.
+
+The whole-run CPU default is based on the qualified full-run history rather than a wall-clock
+conversion: 316 comparable runs had p90 7845.637 CPU-s and maximum 9119.877 CPU-s; the existing
+p90 × 1.25 threshold is 9807.046 CPU-s, represented by the integer 9807. A retained no-result run
+that motivated the wall guard consumed only 5195.284 CPU-s over 1909.456 wall-s, while confirmed
+full green runs consumed 8545.913 and 9211.411 CPU-s. A CPU cap low enough to stop that run would
+therefore also stop healthy validation. The CPU cap controls consumed work; the wall backstop is
+what still bounds waiting and a zero-CPU wedge.
+
+An explicitly requested `--run-cpu-timeout` fails closed when outer-cgroup accounting is absent.
+The existing `--allow-cgroup-failure` compatibility path may proceed unboxed only when using the
+implicit default; it prints that the default whole-run CPU budget cannot be enforced. This keeps
+the explicit unboxed opt-out honest without presenting an unmeasured CPU cap as active.
 
 ## Gentle first, hard as fallback
 

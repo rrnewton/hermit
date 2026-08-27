@@ -106,8 +106,11 @@ use dagrun::model::StepOutcome;
 use dagrun::container_core_budget;
 use dagrun::perflog::append_step_profiles;
 use dagrun::scheduler::run_dag_boxed_deadline;
+use dagrun::scheduler::run_dag_boxed_deadline_with_cpu;
+use dagrun::scheduler::start_run_cpu_budget;
 use dagrun::scheduler::steps_violating_run_timeout;
 use dagrun::scheduler::BoxedCgroups;
+use dagrun::scheduler::RunCpuBudget;
 use dagrun::scheduler::monotonic_now_ns;
 use dagrun::scheduler::STEP_STARTED_MONOTONIC_NS_ENV;
 
@@ -123,6 +126,14 @@ const COVERAGE_LEDGER_SCHEMA_VERSION: i64 = 5;
 /// Recorded in each row so a version-aware reader can tell which driver produced
 /// it without inference.
 const LEDGER_PRODUCER: &str = "hermit-validate-rs";
+
+/// Whole-run CPU ceiling for a full validation when the caller does not provide a tighter one.
+///
+/// The existing qualified full-run history has 316 comparable samples: p90=7845.637 CPU seconds,
+/// maximum=9119.877, and the checked-in CPU-time ratchet's p90 x 1.25 boundary is 9807.046. The
+/// integer floor keeps the execution bound aligned with that already-reviewed threshold while
+/// leaving every retained green sample below it.
+const DEFAULT_RUN_CPU_TIMEOUT_SECONDS: i64 = 9_807;
 
 /// The Reverie-pin preflight node's tag. Named once so the plan that creates it
 /// and the fail-closed assertion that requires it cannot drift apart.
@@ -312,6 +323,8 @@ struct Args {
     allow_cgroup_failure: bool,
     /// Wall budget for the whole validate invocation, across lanes and retries.
     run_timeout: Option<i64>,
+    /// CPU-time budget for the whole validate invocation, across lanes and retries.
+    run_cpu_timeout: Option<i64>,
     merge_lanes: bool,
     reuse_parent_manifest_gate: bool,
     self_test: bool,
@@ -375,6 +388,9 @@ fn usage() -> &'static str {
      \x20                  retries). On breach, in-flight nodes are cut and the run still\n\
      \x20                  reports instead of being killed externally. Also sets a later\n\
      \x20                  systemd-scope backstop. Env: HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS.\n\
+     \x20 --run-cpu-timeout SEC  CPU-time budget for the WHOLE invocation (across lanes\n\
+     \x20                  and retries). Requires exact outer-cgroup cpu.stat accounting.\n\
+     \x20                  Env: HERMIT_VALIDATE_RUN_CPU_TIMEOUT_SECONDS.\n\
      \x20 -k, --keep-going Do not eager-exit on the first failure.\n\
      \x20 --allow-cgroup-failure  Downgrade to an UNBOXED run instead of failing closed.\n\
      \x20 --merge-lanes    Fuse the portable and privileged lanes (the full default).\n\
@@ -479,6 +495,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         keep_going: false,
         allow_cgroup_failure: false,
         run_timeout: None,
+        run_cpu_timeout: None,
         merge_lanes: true,
         reuse_parent_manifest_gate: false,
         self_test: false,
@@ -585,6 +602,18 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
                     Some(v) if v > 0 => args.run_timeout = Some(v),
                     _ => {
                         eprintln!("validate: --run-timeout needs a positive number of SECONDS");
+                        return Err(2);
+                    }
+                }
+            }
+            "--run-cpu-timeout" => {
+                i += 1;
+                match argv.get(i).and_then(|v| v.parse::<i64>().ok()) {
+                    Some(v) if v > 0 => args.run_cpu_timeout = Some(v),
+                    _ => {
+                        eprintln!(
+                            "validate: --run-cpu-timeout needs a positive number of CPU SECONDS"
+                        );
                         return Err(2);
                     }
                 }
@@ -1287,6 +1316,34 @@ fn self_test() -> Result<(), String> {
     }
     if parse_argv(&["--run-timeout".into()]).is_ok() {
         return Err("run-timeout parser accepted a missing value".into());
+    }
+    let parsed = parse_argv(&[
+        "--run-cpu-timeout".into(),
+        "9807".into(),
+        "--self-test".into(),
+    ])
+    .map_err(|code| format!("run-cpu-timeout parser refused 9807 CPU-seconds with exit {code}"))?;
+    if parsed.run_cpu_timeout != Some(9807) {
+        return Err(format!(
+            "run-cpu-timeout parser produced {:?}, expected 9807 CPU-seconds",
+            parsed.run_cpu_timeout
+        ));
+    }
+    for bad in ["0", "-1", "not-seconds"] {
+        if parse_argv(&[
+            "--run-cpu-timeout".into(),
+            bad.into(),
+            "--self-test".into(),
+        ])
+        .is_ok()
+        {
+            return Err(format!(
+                "run-cpu-timeout parser accepted invalid value {bad:?}"
+            ));
+        }
+    }
+    if parse_argv(&["--run-cpu-timeout".into()]).is_ok() {
+        return Err("run-cpu-timeout parser accepted a missing value".into());
     }
     if scope_grace_s(600) != 60 || 600 + scope_grace_s(600) >= 720 {
         return Err("run-timeout scope backstop no longer satisfies 600 < 660 < 720".into());
@@ -7232,6 +7289,10 @@ struct LaneResult {
     env_retries: usize,
     /// The whole-invocation deadline expired during this lane.
     run_timed_out: bool,
+    /// The whole-invocation CPU budget, rather than the wall backstop, caused the cut.
+    run_cpu_timed_out: bool,
+    /// Exact whole-invocation CPU accounting became unreadable after execution started.
+    run_cpu_accounting_failed: bool,
 }
 
 /// Return the durable log's byte length once it has stopped growing.
@@ -9634,6 +9695,34 @@ fn run_lane_with_env_retries(
     log_path: &Path,
     deadline: Option<u64>,
     max: usize,
+    unstable: &BTreeMap<String, String>,
+    record_step_profiles: bool,
+) -> LaneResult {
+    run_lane_with_env_retries_cpu(
+        cfg,
+        jobs,
+        keep_going,
+        verbosity,
+        cgroups,
+        log_path,
+        deadline,
+        None,
+        max,
+        unstable,
+        record_step_profiles,
+    )
+}
+
+fn run_lane_with_env_retries_cpu(
+    cfg: &DagConfig,
+    jobs: i64,
+    keep_going: bool,
+    verbosity: i64,
+    cgroups: BoxedCgroups,
+    log_path: &Path,
+    deadline: Option<u64>,
+    run_cpu_budget: Option<RunCpuBudget>,
+    max: usize,
     // Nodes whose failure is retry-eligible because instability was MEASURED,
     // mapped to the sample that established it. Empty means "no registry was
     // reachable", and only the environmental classes remain eligible.
@@ -9655,6 +9744,8 @@ fn run_lane_with_env_retries(
             ok: false,
             env_retries: 0,
             run_timed_out: true,
+            run_cpu_timed_out: false,
+            run_cpu_accounting_failed: false,
         };
     }
     let mut round_log_start = settled_log_len(log_path);
@@ -9662,7 +9753,7 @@ fn run_lane_with_env_retries(
     for step in &mut first_cfg.steps {
         set_manifest_attempt(step, 1);
     }
-    let first = run_dag_boxed_deadline(
+    let first = run_dag_boxed_deadline_with_cpu(
         &first_cfg,
         jobs,
         keep_going,
@@ -9671,11 +9762,14 @@ fn run_lane_with_env_retries(
         None,
         Some(scheduler_cpu_budget()),
         remaining_budget_s(deadline),
+        run_cpu_budget,
     );
     if record_step_profiles {
         forward_step_profiles(&first, jobs);
     }
     let mut run_timed_out = first.run_timed_out;
+    let mut run_cpu_timed_out = first.run_cpu_timed_out;
+    let mut run_cpu_accounting_failed = first.run_cpu_accounting_failed;
     // Keep the reason attached to the LATEST scheduler attempt for each node. A
     // retry can replace an earlier fail-fast skip with a pre-flight refusal (or a
     // real outcome), so accumulating every historical reason would misreport the
@@ -9885,7 +9979,7 @@ fn run_lane_with_env_retries(
         // invocation. The retry may emit no detail at all; that must stay
         // unknown rather than inheriting a stale banner through whole-log rfind.
         let retry_log_start = settled_log_len(log_path);
-        let again = run_dag_boxed_deadline(
+        let again = run_dag_boxed_deadline_with_cpu(
             &retry_cfg,
             jobs,
             keep_going,
@@ -9894,11 +9988,15 @@ fn run_lane_with_env_retries(
             None,
             Some(scheduler_cpu_budget()),
             remaining_budget_s(deadline),
+            run_cpu_budget,
         );
         if record_step_profiles {
             forward_step_profiles(&again, jobs);
         }
         run_timed_out = run_timed_out || again.run_timed_out;
+        run_cpu_timed_out = run_cpu_timed_out || again.run_cpu_timed_out;
+        run_cpu_accounting_failed =
+            run_cpu_accounting_failed || again.run_cpu_accounting_failed;
         let retry_planned: Vec<String> = retry_cfg.steps.iter().map(|step| step.tag()).collect();
         update_not_run_explanations(
             &retry_planned,
@@ -10022,7 +10120,17 @@ fn run_lane_with_env_retries(
             .iter()
             .all(|outcome| outcome_execution(outcome) == AttemptExecution::Completed);
     let ok = outcomes.iter().all(|o| o.ok || o.aborted);
-    LaneResult { outcomes, skipped, attempts, complete, ok, env_retries, run_timed_out }
+    LaneResult {
+        outcomes,
+        skipped,
+        attempts,
+        complete,
+        ok,
+        env_retries,
+        run_timed_out,
+        run_cpu_timed_out,
+        run_cpu_accounting_failed,
+    }
 }
 
 /// Print every node that took more than one attempt, and every attempt that
@@ -13193,6 +13301,10 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let run_timeout = args
         .run_timeout
         .or_else(|| env_positive("HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS"));
+    let requested_run_cpu_timeout = args
+        .run_cpu_timeout
+        .or_else(|| env_positive("HERMIT_VALIDATE_RUN_CPU_TIMEOUT_SECONDS"));
+    let run_cpu_timeout = requested_run_cpu_timeout.or(Some(DEFAULT_RUN_CPU_TIMEOUT_SECONDS));
     let deadline_ns = if args.show_plan {
         None
     } else {
@@ -13626,11 +13738,16 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
 
     match run_timeout {
         Some(secs) => eprintln!(
-            "validate: whole-run budget {secs}s across lanes and retries; in-flight nodes are cut and rows flushed on breach"
+            "validate: whole-run wall backstop {secs}s across lanes and retries; in-flight nodes are cut and rows flushed on breach"
         ),
         None => eprintln!(
-            "validate: WARNING: no whole-run budget (--run-timeout / HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS); per-node caps do not bound cumulative wall time"
+            "validate: WARNING: no whole-run wall backstop (--run-timeout / HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS); a zero-CPU hang is not bounded"
         ),
+    }
+    if let Some(secs) = run_cpu_timeout {
+        eprintln!(
+            "validate: whole-run CPU budget {secs} CPU-s across lanes and retries; exact outer-cgroup accounting is required"
+        );
     }
 
     let cgroups: BoxedCgroups =
@@ -13661,6 +13778,32 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                 )
             }
         };
+    let run_cpu_budget = match start_run_cpu_budget(&cgroups, run_cpu_timeout) {
+        Ok(budget) => budget,
+        Err(error)
+            if args.allow_cgroup_failure
+                && cgroups.is_none()
+                && requested_run_cpu_timeout.is_none() =>
+        {
+            eprintln!(
+                "validate: WARNING: {error}; the caller explicitly accepted an UNBOXED run, so \
+                 the default whole-run CPU budget cannot be enforced"
+            );
+            None
+        }
+        Err(error) => {
+            return RunSummary::refused(
+                3,
+                &plan.profile,
+                "whole-run CPU accounting",
+                vec![
+                    error,
+                    "the requested CPU cap cannot be enforced exactly; no DAG node was started"
+                        .into(),
+                ],
+            )
+        }
+    };
 
     let commit = git_sha();
     let git_depth = match measure_git_depth(&commit) {
@@ -13846,7 +13989,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // from the same allowance rather than each receiving a fresh 600 seconds.
     let deadline = deadline_ns;
     let lane = |cfg: &DagConfig| -> LaneResult {
-        run_lane_with_env_retries(
+        run_lane_with_env_retries_cpu(
             cfg,
             jobs,
             keep_going,
@@ -13854,12 +13997,15 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             cgroups.clone(),
             &log_path,
             deadline,
+            run_cpu_budget,
             validate_runtime::lane_round_backstop(cfg.steps.len()),
             &unstable,
             true,
         )
     };
     let mut run_timed_out = false;
+    let mut run_cpu_timed_out = false;
+    let mut run_cpu_accounting_failed = false;
 
     let r = lane(&plan.cfg);
     outcomes.extend(r.outcomes.iter().cloned());
@@ -13869,6 +14015,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     execution_complete = execution_complete && r.complete;
     env_retries += r.env_retries;
     run_timed_out = run_timed_out || r.run_timed_out;
+    run_cpu_timed_out = run_cpu_timed_out || r.run_cpu_timed_out;
+    run_cpu_accounting_failed = run_cpu_accounting_failed || r.run_cpu_accounting_failed;
 
     if let Some(second) = &plan.second {
         // Sequential lanes are separate fail-fast families. A failure in the first lane must not
@@ -13882,12 +14030,28 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         execution_complete = execution_complete && r2.complete;
         env_retries += r2.env_retries;
         run_timed_out = run_timed_out || r2.run_timed_out;
+        run_cpu_timed_out = run_cpu_timed_out || r2.run_cpu_timed_out;
+        run_cpu_accounting_failed =
+            run_cpu_accounting_failed || r2.run_cpu_accounting_failed;
     }
 
     let wall = (epoch_now() - started_epoch) as f64;
-    if run_timed_out {
+    if run_cpu_accounting_failed {
         println!(
-            "⏱ VALIDATE RUN BUDGET EXCEEDED after {wall:.0}s (budget {}s): remaining work was \
+            "⏱ VALIDATE RUN CPU ACCOUNTING LOST after {wall:.0}s: remaining work was cut rather \
+             than continuing under an unenforced CPU budget. This is an incomplete judgement, \
+             not a product verdict."
+        );
+    } else if run_cpu_timed_out {
+        println!(
+            "⏱ VALIDATE RUN CPU BUDGET EXCEEDED after {wall:.0}s wall (budget {} CPU-s): \
+             remaining work was cut so its node identities and rows could still be reported. \
+             This is an incomplete judgement, not a product verdict.",
+            run_cpu_timeout.unwrap_or(0)
+        );
+    } else if run_timed_out {
+        println!(
+            "⏱ VALIDATE RUN WALL BUDGET EXCEEDED after {wall:.0}s (budget {}s): remaining work was \
              cut so its node identities and rows could still be reported. This is an incomplete \
              judgement, not a product verdict.",
             run_timeout.unwrap_or(0)
