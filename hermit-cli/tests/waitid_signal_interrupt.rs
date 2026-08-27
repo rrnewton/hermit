@@ -805,6 +805,23 @@ fn dbt_legacy_waitid_signals_return_eintr_without_panicking() {
 }
 
 #[test]
+fn dbt_legacy_waitid_signal_contexts_use_the_guest_pid() {
+    if dbt_unavailable("dbt_legacy_waitid_signal_contexts_use_the_guest_pid") {
+        return;
+    }
+    assert_dbt_wait_case(
+        &["--waitid-wstopped-signal-context"],
+        "waitid-wstopped-signal-context rc=-1 errno=4 handler=1 target-match=1",
+        None,
+    );
+    assert_dbt_wait_case(
+        &["--waitid-wcontinued-signal-context"],
+        "waitid-wcontinued-signal-context rc=-1 errno=4 handler=1 target-match=1",
+        None,
+    );
+}
+
+#[test]
 fn dbt_exact_child_waits_honor_sa_restart() {
     if dbt_unavailable("dbt_exact_child_waits_honor_sa_restart") {
         return;
