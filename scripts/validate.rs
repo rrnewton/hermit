@@ -3087,11 +3087,38 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         ));
     }
 
+    let unrelated_args = parse_argv(&[
+        ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into(),
+        "--only".into(),
+        lane.into(),
+        "test.detcore_unit".into(),
+        "--no-label-pr".into(),
+    ])
+    .map_err(|code| format!("only bracket: unrelated selection was refused with exit {code}"))?;
+    let mut unrelated_plan = build_plan(
+        root,
+        &unrelated_args,
+        &std::env::temp_dir().join("validate-only-unrelated-plan"),
+    )?;
+    apply_pinned_root(&mut unrelated_plan, root, false)?;
+    if unrelated_plan
+        .cfg
+        .steps
+        .iter()
+        .any(|step| step.job.starts_with("manifest_plan"))
+    {
+        return Err(
+            "only bracket: unrelated test.detcore_unit selection admitted a manifest-plan producer"
+                .into(),
+        );
+    }
+
     // Reproduce the focused manifest selection that used to reach dagrun with a
-    // dangling pinned-root edge. `--only` intentionally drops ordinary build
-    // dependencies, but build.manifest_guests cannot use a host-built
-    // test-harness in the pinned root. The transformation must therefore add
-    // exactly that in-image producer without restoring gate.manifest.
+    // dangling pinned-root edge. `--only` intentionally drops unrelated build
+    // dependencies, but both the host and pinned-root manifest commands invoke
+    // target/debug/test-harness. A fresh checkout must therefore retain the
+    // canonical host producer and add its in-image twin without restoring
+    // gate.manifest.
     let manifest_args = parse_argv(&[
         ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into(),
         "--only".into(),
@@ -3111,6 +3138,7 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         manifest_plan.cfg.steps.iter().map(|step| step.tag()).collect();
     for required in [
         "build.manifest_guests",
+        "setup.manifest_plan",
         "setup.manifest_plan_in_pinned_root",
         "build.manifest_guests_in_pinned_root",
         "e2e.manifest_applications",
@@ -3128,6 +3156,58 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
             "only bracket: focused manifest selection broadened into unrelated validation: {manifest_tags:?}"
         ));
     }
+    let manifest_build = manifest_plan
+        .cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == "build.manifest_guests")
+        .ok_or("only bracket: focused manifest selection lost build.manifest_guests")?;
+    if !manifest_build
+        .deps
+        .iter()
+        .any(|dependency| dependency == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
+    {
+        return Err(
+            "only bracket: host manifest build does not wait for setup.manifest_plan".into(),
+        );
+    }
+    let pinned_manifest_build = manifest_plan
+        .cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == "build.manifest_guests_in_pinned_root")
+        .ok_or("only bracket: focused manifest selection lost pinned-root manifest build")?;
+    if !pinned_manifest_build
+        .deps
+        .iter()
+        .any(|dependency| dependency == "setup.manifest_plan_in_pinned_root")
+    {
+        return Err(
+            "only bracket: pinned-root manifest build does not wait for its manifest-plan producer"
+                .into(),
+        );
+    }
+    for selected_cell in [
+        "e2e.manifest_applications",
+        "e2e.manifest_c_programs",
+        "e2e.manifest_system_utils",
+    ] {
+        let step = manifest_plan
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == selected_cell)
+            .ok_or_else(|| format!("only bracket: focused manifest selection lost {selected_cell}"))?;
+        if !step
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.manifest_guests_in_pinned_root")
+        {
+            return Err(format!(
+                "only bracket: {selected_cell} does not wait for the pinned-root manifest build"
+            ));
+        }
+    }
     let violations = dagrun::model::graph_structure_violations(&manifest_plan.cfg);
     if !violations.is_empty() {
         return Err(format!(
@@ -3135,7 +3215,7 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         ));
     }
     println!(
-        "  only plan: real node commands/caps retained, selected edge kept, outside edges dropped, producer unique; focused manifest selection dependency-closed"
+        "  only plan: real node commands/caps retained, selected edge kept, outside edges dropped, producer unique; focused manifest selection has both required producers and is dependency-closed"
     );
     Ok(())
 }
@@ -5014,6 +5094,10 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
     // run. That identity is the whole point of a reproducer — a focused rerun must
     // reproduce what the full run did to that node, budgets included.
     if let Some(Focused::Only { lane, nodes }) = &args.focused {
+        let manifest_plan_producer = pre
+            .iter()
+            .find(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
+            .cloned();
         let mut steps = pre;
         let selected_gate = if args.allow_local_off_the_record_run {
             // Iteration must not be blocked by an unrelated red manifest audit:
@@ -5026,9 +5110,6 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         } else {
             gate
         };
-        // Preflight tags already in the plan; naming one is satisfied by the
-        // preflight itself and must not be looked up in the lane file.
-        let preflight: BTreeSet<String> = steps.iter().map(|s| s.tag()).collect();
         // CARRY the lane's top-level config. `config_from` would substitute
         // DagConfig::default(), dropping resource_caps and default_step_timeout;
         // see config_from_base's note on the 14-minute 0%-CPU hang that caused.
@@ -5040,11 +5121,16 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // preflight node before filtering; otherwise `--only setup.manifest_plan`
         // creates a duplicate tag and a consumer selected with the producer keeps
         // an ambiguous edge. Every non-preflight selected node retains its lane cap.
+        let original_lane_steps = lane_steps.clone();
         validate_plan::reuse_preflight_manifest_producer(
             &mut lane_steps,
             &format!("--only lane {lane}"),
         )?;
-        let available: BTreeSet<String> = lane_steps.iter().map(|s| s.tag()).collect();
+        let manifest_plan_consumers: BTreeSet<String> = original_lane_steps
+            .iter()
+            .filter(|step| step.cmd.contains("target/debug/test-harness"))
+            .map(|step| step.tag())
+            .collect();
 
         let requested: Vec<String> = nodes
             .split(',')
@@ -5055,6 +5141,25 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         if requested.is_empty() {
             return Err("--only needs at least one <group.job> node tag".into());
         }
+        // Local iteration removes the manifest gate, but a fresh checkout still
+        // needs the canonical producer for target/debug/test-harness. Preserve
+        // that producer only when a requested node reaches it through the shipped
+        // lane graph. This keeps unrelated focused checks cheap while making a
+        // selected manifest build/run executable without a stale binary.
+        let needs_manifest_plan = args.allow_local_off_the_record_run
+            && requested.iter().any(|tag| {
+                tag == validate_plan::MANIFEST_PLAN_PRODUCER_TAG
+                    || manifest_plan_consumers.contains(tag)
+            });
+        if needs_manifest_plan {
+            steps.push(manifest_plan_producer.ok_or(
+                "--only: canonical preflight lost setup.manifest_plan",
+            )?);
+        }
+        // Preflight tags already in the plan; naming one is satisfied by the
+        // preflight itself and must not be looked up in the lane file.
+        let preflight: BTreeSet<String> = steps.iter().map(|s| s.tag()).collect();
+        let available: BTreeSet<String> = lane_steps.iter().map(|s| s.tag()).collect();
         // Refuse an unknown tag HERE, naming what is selectable, instead of
         // letting it travel into a child process that reports it 90s later.
         let unknown: Vec<&String> = requested
@@ -5079,11 +5184,32 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             // edges to steps OUTSIDE the selection are dropped (their outputs are
             // assumed already built), edges AMONG the selection are preserved so a
             // selected sub-graph still runs in order.
-            dropped.extend(step.deps.iter().filter(|d| !selected.contains(*d)).cloned());
+            dropped.extend(
+                step.deps
+                    .iter()
+                    .filter(|d| {
+                        !selected.contains(*d)
+                            && !(needs_manifest_plan
+                                && d.as_str()
+                                    == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
+                    })
+                    .cloned(),
+            );
             step.deps.retain(|d| selected.contains(d));
+            if needs_manifest_plan
+                && manifest_plan_consumers.contains(&step.tag())
+                && !step
+                    .deps
+                    .iter()
+                    .any(|dependency| dependency == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
+            {
+                step.deps.push(validate_plan::MANIFEST_PLAN_PRODUCER_TAG.to_string());
+            }
             if step.deps.is_empty() {
                 step.deps.push(selected_gate.to_string());
             }
+            step.deps.sort();
+            step.deps.dedup();
             steps.push(step);
         }
         // SAY that this mode assumes an already-built tree, and name the build
