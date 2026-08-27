@@ -1716,11 +1716,12 @@ fn execute_spec_until(
                             first_divergent_right_message =
                                 report.first_divergent_right_message.clone();
                         }
-                        if launch_refusal || backend_unavailable {
-                            // The process never created a guest.  A report at
+                        if launch_refusal || backend_unavailable || output.timed_out {
+                            // The process either never created a guest or was
+                            // terminated by the cell deadline. A report at
                             // this point is the invocation's pre-stamped
-                            // no-result record or otherwise unrelated, and
-                            // cannot supersede the refusal classification.
+                            // no-result record or otherwise incomplete, and
+                            // cannot supersede the process classification.
                         } else if report.verdict == "no_result"
                             && !output.timed_out
                             && output.status.code().is_some_and(|code| code != 0)
@@ -1760,7 +1761,7 @@ fn execute_spec_until(
                             ));
                         }
                     }
-                    Err(error) if !backend_unavailable => {
+                    Err(error) if !backend_unavailable && !output.timed_out => {
                         outcome = "ERROR".into();
                         error_kind = Some("incomplete-verification-evidence".into());
                         reason = Some(format!("verification report is unreadable: {error}"));
@@ -1768,7 +1769,7 @@ fn execute_spec_until(
                     Err(_) => {}
                 }
             }
-            Err(_error) if launch_refusal || backend_unavailable => {}
+            Err(_error) if launch_refusal || backend_unavailable || output.timed_out => {}
             Err(error) => {
                 outcome = "ERROR".into();
                 error_kind = Some("incomplete-verification-evidence".into());
@@ -4773,6 +4774,51 @@ backends_disabled:
             Some("incomplete-verification-evidence")
         );
         assert_eq!(unknown.status, Some(0));
+        assert!(!unknown.timed_out);
+    }
+
+    #[test]
+    fn timed_out_process_is_not_relabelled_by_a_no_result_report() {
+        let dir = std::env::temp_dir().join(format!(
+            "hermit-runner-timeout-no-result-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let verdict = dir.join("verdict.json");
+        let report = r#"{"verified":false,"bitwise_parity":false,"verdict":"no_result","comparison":null,"compared_log_messages":null}"#;
+        let spec = CellRunSpec {
+            id: CellId {
+                test: "fixture/timeout-no-result".into(),
+                mode: "verify".into(),
+                backend: Some("ptrace".into()),
+            },
+            lane: "portable".into(),
+            category: "fixture".into(),
+            cwd: dir.clone(),
+            env: BTreeMap::new(),
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf %s \"$1\" > \"$2\"; sleep 5".into(),
+                "sh".into(),
+                report.into(),
+                verdict.to_string_lossy().into_owned(),
+            ],
+            guest_argv: vec!["fixture".into()],
+            timeout_seconds: 1,
+            verdict_path: Some(verdict),
+            verification_log_dir: None,
+            sabre_path_evidence: None,
+            cell_dir: dir.clone(),
+        };
+
+        let result = execute_spec(&spec, "1").unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        assert!(result.timed_out);
+        assert_eq!(result.outcome, "FAIL");
+        assert_eq!(result.error_kind, None);
+        assert_eq!(result.reason.as_deref(), Some("cell exceeded 1 s"));
     }
 
     #[test]
