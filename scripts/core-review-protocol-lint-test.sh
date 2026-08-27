@@ -12,6 +12,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly LINT="$SCRIPT_DIR/core-review-protocol-lint.sh"
+readonly CONTRACT_ADAPTER="$SCRIPT_DIR/review_contract_adapter.py"
 
 # A complete, valid non-KVM PR body containing every required section.
 readonly FULL_BODY='## Summary
@@ -101,6 +102,58 @@ run_case "round label out of range (round 5) does not count, blocks" 1 \
     $'post-facto-human-review\nadversarial-review-codex5\nadversarial-review-claude5\npassed-review-codex\npassed-review-claude' \
     "$FULL_BODY"
 
+run_case "non-label review-round-codex does not count, blocks" 1 \
+    $'post-facto-human-review\nreview-round-codex\nadversarial-review-claude1\npassed-review-codex\npassed-review-claude' \
+    "$FULL_BODY"
+
+# Every numbered label accepted by the writer's shared contract must also pass
+# this reader when the other families use their first accepted label.
+contract_output=$(python3 "$CONTRACT_ADAPTER" --format lint-records)
+declare -a contract_families=()
+declare -A contract_approval=()
+declare -A contract_rounds=()
+contract_post_facto=
+while IFS=$'\t' read -r first second third; do
+    if [ "$first" = post-facto ]; then
+        contract_post_facto=$second
+        continue
+    fi
+    contract_families+=("$first")
+    contract_approval[$first]=$second
+    contract_rounds[$first]=$third
+done <<<"$contract_output"
+
+for family in "${contract_families[@]}"; do
+    IFS=, read -r -a family_rounds <<<"${contract_rounds[$family]}"
+    for candidate in "${family_rounds[@]}"; do
+        labels=$contract_post_facto
+        for fixture_family in "${contract_families[@]}"; do
+            IFS=, read -r first_round _ <<<"${contract_rounds[$fixture_family]}"
+            if [ "$fixture_family" = "$family" ]; then
+                labels+=$'\n'"$candidate"
+            else
+                labels+=$'\n'"$first_round"
+            fi
+            labels+=$'\n'"${contract_approval[$fixture_family]}"
+        done
+        run_case "accepted label ${candidate} passes through the reader" 0 \
+            "$labels" "$FULL_BODY"
+    done
+done
+
+diagnostic_status=0
+diagnostic=$(PR_LABELS=$'post-facto-human-review\nreview-round-codex\nadversarial-review-claude1\npassed-review-codex\npassed-review-claude' \
+    PR_BODY="$FULL_BODY" PR_NUMBER=test bash "$LINT" 2>&1) || diagnostic_status=$?
+if [ "$diagnostic_status" -eq 1 ] \
+    && [[ $diagnostic == *"adversarial-review-codex1, adversarial-review-codex2, adversarial-review-codex3, adversarial-review-codex4"* ]] \
+    && [[ $diagnostic != *"review-round-codex"* ]]; then
+    echo "ok   - missing-round diagnostic names exact accepted alternatives"
+    pass=$((pass + 1))
+else
+    echo "FAIL - missing-round diagnostic did not name exact accepted alternatives"
+    fail=$((fail + 1))
+fi
+
 # --- Missing body sections blocks --------------------------------------------
 run_case "missing Summary section blocks" 1 \
     "$FULL_LABELS" \
@@ -156,6 +209,43 @@ run_unset_case "PR_BODY unset is IGNORED when the protocol does not apply" 0 PR_
 # The genuinely-empty label set must still take the not-applicable path, so the
 # refusal above cannot be mistaken for "any missing label now blocks".
 run_case "empty labels + empty body still passes (not applicable)" 0 "" ""
+
+# Prove that an unreviewed local or fetched parent contract cannot become the
+# authority silently. A changed local file falls back to the reviewed bytes;
+# changed fetched bytes are refused by the content pin.
+ROOT_DIR="$SCRIPT_DIR/.." python3 - <<'PY'
+import hashlib
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+root = Path(os.environ["ROOT_DIR"])
+sys.path.insert(0, str(root / "scripts"))
+import review_contract_adapter as adapter
+
+source = adapter._verified_source()
+assert hashlib.sha256(source).hexdigest() == adapter.AUTHORITY_SHA256
+
+with tempfile.TemporaryDirectory(prefix="review-contract-adapter-") as tmp:
+    parent = Path(tmp)
+    authority = parent / adapter.AUTHORITY_RELATIVE_PATH
+    authority.parent.mkdir(parents=True)
+    authority.write_text("raise RuntimeError('unreviewed local contract executed')\n")
+    os.environ["DEV_HERMIT_PARENT"] = str(parent)
+    adapter._fetch_pinned_source = lambda: source
+    assert adapter._verified_source() == source
+
+    adapter._fetch_pinned_source = lambda: source + b"# changed\n"
+    try:
+        adapter._verified_source()
+    except RuntimeError as error:
+        assert "digest mismatch" in str(error)
+    else:
+        raise AssertionError("changed fetched review contract passed its content pin")
+PY
+echo "ok   - review-contract adapter accepts only content-pinned authority bytes"
+pass=$((pass + 1))
 
 echo
 echo "core-review-protocol-lint self-test: ${pass} passed, ${fail} failed."
