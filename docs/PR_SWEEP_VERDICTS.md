@@ -2141,43 +2141,48 @@ is independently established by the fix commit and its tests: the same leading
 decoration defeated both the strict parser and the check intended to report malformed
 marker lines. It was one observed input, not the whole input set.
 
-⚠️ **AND THE PART THAT MATTERS MOST: THE CLASS IS STILL OPEN AFTER THE FIX.**
-Measured 2026-08-27 against dev-hermit
+⚠️ **THE TABLE MUST DISTINGUISH ASSERTIONS FROM MENTIONS.** Measured
+2026-08-27 against dev-hermit
 `a76221a934d500691b59ca0bcfe6ff85ec57b57e`, by driving `lane_shas` from
 `ci-hub/health/approval_binding.py`, one comment per probe, role tag present,
-`author_association=MEMBER`, against a control that binds:
+`author_association=MEMBER`. The expected intent was assigned before running the
+parser: an assertion row uses the marker line as the comment's review statement;
+a mention row quotes, hides or discusses the marker rather than issuing it.
 
-| line form | binds? | flagged malformed? |
-|---|---|---|
-| `APPROVED-AT: claude <sha>` — the control | **yes** | – |
-| `## APPROVED-AT: claude <sha>` | **yes** | – |
-| `+ APPROVED-AT: claude <sha>` | **yes** | – |
-| `* APPROVED-AT: claude <sha>` | **yes** | – |
-| `1. APPROVED-AT: claude <sha>` | no | **no** |
-| `1) APPROVED-AT: claude <sha>` | no | **no** |
-| `> > APPROVED-AT: claude <sha>` | no | **no** |
-| `<!-- APPROVED-AT: claude <sha> -->` | no | **no** |
-| `<p>APPROVED-AT: claude <sha></p>` | no | **no** |
-| `- [x] APPROVED-AT: claude <sha>` | no | **no** |
-| `• APPROVED-AT: claude <sha>` | no | **no** |
-| `<U+200B>APPROVED-AT: claude <sha>` | no | **no** |
-| `Posting APPROVED-AT: claude <sha>` | no | **no** |
+| line form | expected intent | parser sees assertion? | binds? | flagged malformed? |
+|---|---|---|---|---|
+| `APPROVED-AT: claude <sha>` — the control | assertion | **yes** | **yes** | – |
+| `## APPROVED-AT: claude <sha>` | assertion | **yes** | **yes** | – |
+| `+ APPROVED-AT: claude <sha>` | assertion | **yes** | **yes** | – |
+| `* APPROVED-AT: claude <sha>` | assertion | **yes** | **yes** | – |
+| `1. APPROVED-AT: claude <sha>` | assertion | no | no | **no** |
+| `1) APPROVED-AT: claude <sha>` | assertion | no | no | **no** |
+| `> > APPROVED-AT: claude <sha>` | mention | no | no | **no** |
+| `<!-- APPROVED-AT: claude <sha> -->` | mention | no | no | **no** |
+| `<p>APPROVED-AT: claude <sha></p>` | assertion | no | no | **no** |
+| `- [x] APPROVED-AT: claude <sha>` | assertion | no | no | **no** |
+| `• APPROVED-AT: claude <sha>` | assertion | no | no | **no** |
+| `<U+200B>APPROVED-AT: claude <sha>` | assertion | no | no | **no** |
+| `Posting APPROVED-AT: claude <sha>` | mention | no | no | **no** |
 
-**Nine forms still bind nothing and are still not flagged.** The heading case was
-closed; the class was not. Reporting the fix as complete would be the same defect
-this section is about, one layer along — so it is recorded here as open rather than
-as history.
+Of the ten hand-labelled assertions, four bind and **six are silently missed**.
+The three mention rows are correctly ignored and are controls, not missed
+verdicts. The numbered-list rows alone demonstrate the remaining failure: a
+reviewer can use a Markdown list item as the complete review statement while the
+parser neither binds it nor reports it malformed. This result does not treat every
+line containing marker text as an assertion.
 
 **The block-level-prefix case was fixed, and the fix validated the reasoning.**
-`8d03485c` strips block-level prefixes before matching. Re-measured against main
-afterwards, driving `lane_shas` directly:
+`8d03485c` strips block-level prefixes before matching. Direct execution before
+the change at dev-hermit `9c735c1364cb02832058c3bcd441474c99a73acb` and
+after it at `8d03485cf8ce2eba307cc13248b9353a23091988` produced:
 
-*(measured at dev-hermit `8d03485c`; re-confirmed at main `8b4b6e137b87`)*
-
-| line form | before | after `8d03485c` |
-|---|---|---|
-| `## APPROVED-AT: claude <sha>` | did not bind, not flagged | **binds** |
-| `## CHANGES-REQUESTED-AT: …` | **failed open — approval stood** | **refuses, clears the lane** |
+| line form | before `8d03485c` | after `8d03485c` | control |
+|---|---|---|---|
+| `## APPROVED-AT: claude <sha>` | did not bind, not flagged | **binds** | valid payload is accepted |
+| `## APPROVED-AT: reviewer <sha>` | did not bind, not flagged | does not bind, **flagged malformed** | invalid lane is rejected |
+| `## Posting APPROVED-AT: claude <sha>` | did not bind, not flagged | does not bind, not flagged | prose mention remains a mention |
+| `## CHANGES-REQUESTED-AT: claude <sha>` after an approval | **approval stood** | **refuses, clears the lane** | the negative verdict is reported |
 
 The refusal direction is the one that mattered and it was not in the original finding:
 a *block* wearing markdown could leave an earlier approval standing. This was a real
@@ -2185,11 +2190,15 @@ failure mode, but it was **not** the mechanism in
 https://github.com/rrnewton/hermit/pull/2591. That pull request's refusal was plain,
 exact-head and parsed; the landing path failed to invoke the refusal gate.
 
-⚠️ **The relaxation was safe for the reason claimed, and this is the transferable part:**
-stripping decoration cannot admit anything new, because the strict grammar still has to
-match afterwards — it can only promote a line that was *already* a well-formed binding
-modulo decoration. A relaxation that widens what is **read** while leaving what is
-**accepted** unchanged has no false-positive surface, so it needs no corpus re-audit.
+⚠️ **The supportable claim is narrower: normalization leaves the marker
+payload grammar strict.** A valid lane and full SHA still have to match after the
+block-level prefix is stripped. The positive control above proves that a valid
+heading-form payload is newly accepted; the invalid-lane control proves that
+normalization does not bypass the payload grammar; the prose control proves that
+one surrounding-word case remains a mention; and the refusal control proves that
+the same widened context can report bad news. The accepted syntactic context did
+widen, so this change did admit new lines and does require positive and negative
+controls rather than a claim that no corpus re-audit is needed.
 
 The positive and negative paths must be measured separately. The current
 `lane_shas` measurement above shows that a leading word still neither binds an
