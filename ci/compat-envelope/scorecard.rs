@@ -34,7 +34,7 @@ use sha2::Sha256;
 const SCORECARD: &str = "SCORECARD.md";
 const CELLS: &str = "ci/compat-envelope/cells.json";
 const EXPECTED_PLAN: &str = "ci/expected-e2e-plan.json";
-const SCHEMA: u64 = 4;
+const SCHEMA: u64 = 5;
 const PRESSURE_SUMMARY_SCHEMA: u64 = 4;
 const CELL_RESULT_SCHEMA: u64 = 4;
 
@@ -71,6 +71,8 @@ struct ManifestRow {
     backend: String,
     bucket: String,
     ci: bool,
+    #[serde(default)]
+    ci_disabled_reason: Option<CiDisabledReasonData>,
     enabled: bool,
     lane: String,
     mode: String,
@@ -104,9 +106,20 @@ struct TrackedCell {
     #[serde(default)]
     enabled: bool,
     status: CellStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ci_disabled_reason: Option<CiDisabledReasonData>,
     /// Filled only by the periodic all-red pressure test. Ordinary validate
     /// never changes this array.
     observations: Vec<Observation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct CiDisabledReasonData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    evidence: Option<String>,
+    reason: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -423,6 +436,7 @@ impl ResultRow {
 struct Derived {
     population: BTreeSet<CellId>,
     enabled: BTreeSet<CellId>,
+    ci_disabled_reasons: BTreeMap<CellId, CiDisabledReasonData>,
     selected: BTreeSet<CellId>,
     green: BTreeSet<CellId>,
 }
@@ -602,6 +616,7 @@ fn derive(root: &Path) -> Result<Derived, String> {
     let mut population = BTreeSet::new();
     let mut enabled = BTreeSet::new();
     let mut ci_enabled = BTreeSet::new();
+    let mut ci_disabled_reasons = BTreeMap::new();
     for row in rows {
         let comparable = row.mode != "custom";
         let id = CellId {
@@ -629,8 +644,27 @@ fn derive(root: &Path) -> Result<Derived, String> {
                 enabled.insert(id.clone());
             }
             if row.ci {
+                if row.ci_disabled_reason.is_some() {
+                    return Err(format!(
+                        "CI-enabled cell carries ci_disabled_reason: {}",
+                        display_id(&id)
+                    ));
+                }
                 ci_enabled.insert(id);
+            } else {
+                let reason = row.ci_disabled_reason.ok_or_else(|| {
+                    format!(
+                        "enabled cell omitted from ordinary CI has no reason: {}",
+                        display_id(&id)
+                    )
+                })?;
+                ci_disabled_reasons.insert(id, reason);
             }
+        } else if row.ci_disabled_reason.is_some() {
+            return Err(format!(
+                "disabled cell carries ci_disabled_reason: {}",
+                display_id(&id)
+            ));
         }
     }
     let selected: BTreeSet<CellId> = expected.cells.into_iter().collect();
@@ -655,6 +689,7 @@ fn derive(root: &Path) -> Result<Derived, String> {
     Ok(Derived {
         population,
         enabled,
+        ci_disabled_reasons,
         selected,
         green,
     })
@@ -909,10 +944,12 @@ fn tracked_from(
                 CellStatus::Red
             };
             let enabled = derived.enabled.contains(&id);
+            let ci_disabled_reason = derived.ci_disabled_reasons.get(&id).cloned();
             TrackedCell {
                 id,
                 enabled,
                 status,
+                ci_disabled_reason,
                 observations,
             }
         })
@@ -1723,18 +1760,38 @@ fn self_test() -> Result<(), String> {
     if selected_green(&BTreeSet::new(), &population).contains(&chaos_id) {
         return Err("an unselected chaos cell was accepted as green".into());
     }
+    let visible_reason = CiDisabledReasonData {
+        result: Some("determinism-failure".into()),
+        evidence: Some("ignored/results/liteinst.jsonl".into()),
+        reason: "canonical comparison diverged at scheduler turn 10".into(),
+    };
+    let visible_red = Derived {
+        population: BTreeSet::from([id.clone()]),
+        enabled: BTreeSet::from([id.clone()]),
+        ci_disabled_reasons: BTreeMap::from([(id.clone(), visible_reason.clone())]),
+        selected: BTreeSet::new(),
+        green: BTreeSet::new(),
+    };
+    let visible_tracked = tracked_from(&visible_red, None, true, false)?;
+    if visible_tracked.cells[0].ci_disabled_reason.as_ref() != Some(&visible_reason)
+        || !encoded_cells(&visible_tracked)?.contains("ci_disabled_reason")
+    {
+        return Err("per-backend CI reason was not emitted into tracked scorecard data".into());
+    }
     let old_green = TrackedCells {
         schema: SCHEMA,
         cells: vec![TrackedCell {
             id: id.clone(),
             enabled: true,
             status: CellStatus::Green,
+            ci_disabled_reason: None,
             observations: Vec::new(),
         }],
     };
     let regressed = Derived {
         population: BTreeSet::from([id.clone()]),
         enabled: BTreeSet::from([id.clone()]),
+        ci_disabled_reasons: BTreeMap::new(),
         selected: BTreeSet::new(),
         green: BTreeSet::new(),
     };
@@ -1747,6 +1804,7 @@ fn self_test() -> Result<(), String> {
             id: id.clone(),
             enabled: true,
             status: CellStatus::Green,
+            ci_disabled_reason: None,
             observations: Vec::new(),
         }],
     };
@@ -1759,6 +1817,7 @@ fn self_test() -> Result<(), String> {
             id: id.clone(),
             enabled: false,
             status: CellStatus::Red,
+            ci_disabled_reason: None,
             observations: Vec::new(),
         }],
     };

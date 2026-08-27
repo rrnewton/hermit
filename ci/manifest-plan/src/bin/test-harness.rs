@@ -1096,8 +1096,10 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             // bucket is killed before its JUnit/summary epilogue.
             if let Err(error) = append_result(&results_path, &result) {
                 eprintln!(
-                    "ERROR {}: completed cell result could not be published: {error}",
-                    result.test
+                    "ERROR {} ({}/{}): completed cell result could not be published: {error}",
+                    result.test,
+                    result.mode,
+                    result.backend.as_deref().unwrap_or("native")
                 );
                 result.outcome = "ERROR".into();
                 result.error_kind = Some("result-publication".into());
@@ -1108,12 +1110,20 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             } else {
                 if result.outcome == "ERROR" {
                     eprintln!(
-                        "ERROR {}: {}",
+                        "ERROR {} ({}/{}): {}",
                         result.test,
+                        result.mode,
+                        result.backend.as_deref().unwrap_or("native"),
                         result.reason.as_deref().unwrap_or("infrastructure error")
                     );
                 }
-                println!("{} {}", result.outcome, result.test);
+                println!(
+                    "{} {} ({}/{})",
+                    result.outcome,
+                    result.test,
+                    result.mode,
+                    result.backend.as_deref().unwrap_or("native")
+                );
                 failed |= result.outcome != "PASS";
             }
             indexed_results.push((index, result));
