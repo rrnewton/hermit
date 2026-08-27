@@ -11892,10 +11892,14 @@ impl FinalValidateStatus {
 }
 
 fn final_validate_status_from_output(output: &str) -> Result<Option<FinalValidateStatus>, String> {
+    // `next_back()`, not `last()`: both yield the final matching line, but `last()`
+    // walks the whole iterator to get there and clippy refuses it on a
+    // double-ended iterator. The LAST occurrence is deliberate -- a nested run can
+    // emit the prefix more than once and the outermost status is the one that counts.
     let Some(value) = output
         .lines()
         .filter_map(|line| line.strip_prefix(FINAL_VALIDATE_STATUS_PREFIX))
-        .last()
+        .next_back()
     else {
         return Ok(None);
     };
