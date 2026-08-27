@@ -7536,29 +7536,20 @@ test:
       stderr: false
       artifacts: []
     modes:
-      # PINS CURRENT BEHAVIOUR; it does not assert the behaviour is correct.
-      # Detcore handles the WRITE side (handle_setsid / handle_setpgid) but has
-      # no handler for getsid/getpgid/getpgrp, which pass through to the kernel.
-      # classify_syscall says so: all three sit in its PASS-THRU arm, described
-      # as "conditionally repeatable under Hermit's fixed-container,
-      # stable-filesystem, and serialization assumptions".
-      # ⚠️ THIS CELL IS THE TEST FOR THAT STATED CONDITION — the stability it
-      # observes comes from the PID and user NAMESPACE, and nothing else checks
-      # that the fixed-container assumption still holds. It is NOT evidence
-      # that the read side is determinized. See the guest source.
-      # There is an open question on whether Hermit should model process
-      # groups and sessions at all; if that is answered by building a model,
-      # these values are expected to change and this cell to be updated.
+      # getpgid/getpgrp read Detcore's process-group model; successful setpgid
+      # and setsid calls update that same model. getsid remains a kernel query,
+      # so this cell pins the mixed modeled/kernel surface without claiming
+      # complete session-identity virtualization. See the guest source.
       verify:
         ci:
           ptrace: true
         backends_enabled:
           - ptrace
         backends_disabled:
-          dbt: Session and process-group identity is unmodelled on every backend; qualify DBT separately rather than pinning a second passthrough
-          kvm: Session and process-group identity is unmodelled on every backend; qualify KVM separately rather than pinning a second passthrough
-          sabre: Session and process-group identity is unmodelled on every backend; qualify SaBRe separately rather than pinning a second passthrough
-          liteinst: Session and process-group identity is unmodelled on every backend; qualify LiteInst separately rather than pinning a second passthrough
+          dbt: getpgid/getpgrp share Detcore's model, but the complete mixed session-identity cell has not been qualified on DBT
+          kvm: getpgid/getpgrp share Detcore's model, but the complete mixed session-identity cell has not been qualified on KVM
+          sabre: getpgid/getpgrp share Detcore's model, but the complete mixed session-identity cell has not been qualified on SaBRe
+          liteinst: getpgid/getpgrp share Detcore's model, but the complete mixed session-identity cell has not been qualified on LiteInst
       naked:
         ci: false
         ci_disabled_reason: This cell pins the container's session and process-group values; it makes no claim about native variation, so naked is not selected.

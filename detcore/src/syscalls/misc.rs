@@ -25,9 +25,11 @@ use crate::consts::DEFAULT_HOSTNAME;
 use crate::detlog;
 use crate::record_or_replay::RecordOrReplay;
 use crate::tool_global::create_session;
+use crate::tool_global::process_group_for_task;
 use crate::tool_global::set_process_group;
 use crate::tool_local::Detcore;
 use crate::types::DetPid;
+use crate::types::DetTid;
 
 const ARCH_GET_XCOMP_SUPP: libc::c_int = 0x1021;
 const ARCH_GET_XCOMP_PERM: libc::c_int = 0x1022;
@@ -47,6 +49,14 @@ const SECCOMP_SET_MODE_FILTER: u32 = 1;
 const SECCOMP_GET_ACTION_AVAIL: u32 = 2;
 const SECCOMP_GET_NOTIF_SIZES: u32 = 3;
 const SECCOMP_FILTER_FLAG_TSYNC: u32 = 1;
+
+fn getpgid_task(requested: libc::pid_t, current: DetTid) -> Result<DetTid, Errno> {
+    match requested {
+        requested if requested < 0 => Err(Errno::ESRCH),
+        0 => Ok(current),
+        requested => Ok(DetTid::from_raw(requested)),
+    }
+}
 
 fn seccomp_result(op: u32, flags: u32, has_args: bool) -> Result<i64, Errno> {
     if op > SECCOMP_GET_NOTIF_SIZES {
@@ -639,6 +649,35 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(n as i64)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1933): Review process-group identity virtualization.
+    /// Return the process group recorded in Detcore's virtual process tree.
+    /// Linux treats pid zero as the caller and rejects negative pids. A positive
+    /// pid names a process in the guest-visible namespace; an absent process is
+    /// ESRCH. No host process-group identifier reaches the guest.
+    pub async fn handle_getpgid<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Getpgid,
+    ) -> Result<i64, Error> {
+        let requested = syscalls::SyscallArgs::from(call).arg0 as libc::pid_t;
+        let current = guest.thread_state().dettid;
+        let task = getpgid_task(requested, current)?;
+        process_group_for_task(guest, task)
+            .await
+            .map(|group| i64::from(group.as_raw()))
+            .ok_or_else(|| Errno::ESRCH.into())
+    }
+
+    /// `getpgrp(2)` is the no-argument alias of `getpgid(0)`.
+    pub async fn handle_getpgrp<G: Guest<Self>>(&self, guest: &mut G) -> Result<i64, Error> {
+        let current = guest.thread_state().dettid;
+        process_group_for_task(guest, current)
+            .await
+            .map(|group| i64::from(group.as_raw()))
+            .ok_or_else(|| Errno::ESRCH.into())
+    }
+
     /// setsid system call
     pub async fn handle_setsid<G: Guest<Self>>(
         &self,
@@ -841,6 +880,14 @@ impl<T: RecordOrReplay> Detcore<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn getpgid_preserves_linux_target_validation() {
+        let current = DetTid::from_raw(3);
+        assert_eq!(getpgid_task(0, current), Ok(current));
+        assert_eq!(getpgid_task(7, current), Ok(DetTid::from_raw(7)));
+        assert_eq!(getpgid_task(-1, current), Err(Errno::ESRCH));
+    }
 
     #[test]
     fn prctl_support_covers_deterministic_controls() {

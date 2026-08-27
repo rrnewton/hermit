@@ -1055,13 +1055,9 @@ impl GlobalTool for GlobalState {
             GlobalRequest::ConsumeChildWait(parent, child) => {
                 R::ConsumeChildWait(self.sched.lock().unwrap().consume_child_wait(parent, child))
             }
-            GlobalRequest::ProcessGroup(process) => R::ProcessGroup(
-                self.sched
-                    .lock()
-                    .unwrap()
-                    .thread_tree
-                    .process_group(process),
-            ),
+            GlobalRequest::ProcessGroupForTask(task) => {
+                R::ProcessGroup(self.sched.lock().unwrap().process_group_for_task(task))
+            }
             GlobalRequest::SetProcessGroup(process, group) => R::SetProcessGroup(
                 self.sched
                     .lock()
@@ -2146,8 +2142,8 @@ pub enum GlobalRequest {
     ReadyChildWait(DetPid, ChildWaitSpec),
     /// Retire a consumed terminal child wait status.
     ConsumeChildWait(DetPid, DetPid),
-    /// Query scheduler-owned process-group membership.
-    ProcessGroup(DetPid),
+    /// Query scheduler-owned process-group membership for a visible task ID.
+    ProcessGroupForTask(DetTid),
     /// Apply a successful setpgid transition.
     SetProcessGroup(DetPid, DetPid),
     /// Apply a successful setsid transition.
@@ -2997,16 +2993,24 @@ where
     }
 }
 
+pub async fn process_group_for_task<G, T>(guest: &mut G, task: DetTid) -> Option<DetPid>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::ProcessGroupForTask(task)).await;
+    match response.1 {
+        GlobalResponse::ProcessGroup(group) => group,
+        _ => unreachable!(),
+    }
+}
+
 pub async fn process_group<G, T>(guest: &mut G, process: DetPid) -> Option<DetPid>
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let response = send_and_update_time(guest, GlobalRequest::ProcessGroup(process)).await;
-    match response.1 {
-        GlobalResponse::ProcessGroup(group) => group,
-        _ => unreachable!(),
-    }
+    process_group_for_task(guest, process).await
 }
 
 pub async fn set_process_group<G, T>(guest: &mut G, process: DetPid, group: DetPid) -> bool

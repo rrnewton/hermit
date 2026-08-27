@@ -27,15 +27,15 @@
  * below is a path it does NOT cover: procfs text, wait-status, execve, pgid,
  * and a control-flow branch.
  *
- * UNVALIDATED OBSERVATION, pinned deliberately: under hermit `getpgid(0)`
- * returns 0, where the host returns a real pgid. 0 is not a valid process
- * group, so this looks like a virtualization gap rather than a virtualized
- * value. It is printed here so the fixture CATCHES A CHANGE to it -- that is
- * not an assertion that 0 is correct. See the task note; it needs its own fix.
+ * Process-group identity has its own correctness oracle: the current process's
+ * group must be positive and stable through both aliases, a live nonleader TID
+ * must resolve to that same group, namespace init must remain visible, and
+ * negative or absent task IDs must retain Linux's ESRCH error.
  *
  * Deliberately covered here, because each is a distinct leak path:
- *   - getpid / gettid / getppid / getpgid on the main thread
- *   - gettid from a NON-MAIN thread (a separate task in the scheduler)
+ *   - getpid / gettid / getppid / getpgid / getpgrp on the main thread
+ *   - gettid and getpgid(tid) for a LIVE NON-MAIN thread
+ *   - getpgid for namespace init, a negative pid, and an absent pid
  *   - the pid field of /proc/self/stat (procfs text, a different code path
  *     from the syscall return)
  *   - a child's pid as seen by the child AND as returned by wait() to the
@@ -45,14 +45,24 @@
  *     program's output shape and not merely a printed number
  */
 
+#include <errno.h>
+#include <limits.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <pthread.h>
 #include <unistd.h>
+
+static pthread_barrier_t thread_query_barrier;
+static pid_t worker_tid;
+
+static int barrier_wait_ok(void) {
+    int rc = pthread_barrier_wait(&thread_query_barrier);
+    return rc == 0 || rc == PTHREAD_BARRIER_SERIAL_THREAD;
+}
 
 static pid_t sys_gettid(void) {
     return (pid_t)syscall(SYS_gettid);
@@ -76,9 +86,13 @@ static pid_t procfs_self_pid(void) {
 static void *thread_body(void *arg) {
     (void)arg;
     /* A non-main thread is a distinct scheduler task; its tid must be
-       virtualized too, and must differ from the main thread's. */
-    printf("thread.gettid=%d\n", (int)sys_gettid());
+       virtualized too, and getpgid must accept that live task ID. */
+    worker_tid = sys_gettid();
+    printf("thread.gettid=%d\n", (int)worker_tid);
     fflush(stdout);
+    if (!barrier_wait_ok() || !barrier_wait_ok()) {
+        return (void *)1;
+    }
     return NULL;
 }
 
@@ -87,13 +101,39 @@ int main(void) {
     pid_t tid = sys_gettid();
     pid_t ppid = getppid();
     pid_t pgid = getpgid(0);
+    pid_t pgid_repeat = getpgid(0);
+    pid_t pgrp = getpgrp();
+    pid_t pgid_by_pid = getpgid(pid);
+    pid_t init_pgid = getpgid(1);
     pid_t stat_pid = procfs_self_pid();
 
     printf("main.getpid=%d\n", (int)pid);
     printf("main.gettid=%d\n", (int)tid);
     printf("main.getppid=%d\n", (int)ppid);
     printf("main.getpgid=%d\n", (int)pgid);
+    printf("init.getpgid=%d\n", (int)init_pgid);
     printf("procfs.stat_pid=%d\n", (int)stat_pid);
+
+    if (pgid <= 0 || pgid_repeat != pgid || pgrp != pgid ||
+        pgid_by_pid != pgid || init_pgid != 1) {
+        fprintf(stderr,
+                "invalid process-group identity: pgid=%d repeat=%d "
+                "getpgrp=%d by-pid=%d init=%d self=%d\n",
+                (int)pgid, (int)pgid_repeat, (int)pgrp, (int)pgid_by_pid,
+                (int)init_pgid, (int)pid);
+        return 1;
+    }
+    errno = 0;
+    if (getpgid(-1) != -1 || errno != ESRCH) {
+        fprintf(stderr, "getpgid(-1) did not report ESRCH: errno=%d\n", errno);
+        return 1;
+    }
+    errno = 0;
+    if (getpgid(INT_MAX) != -1 || errno != ESRCH) {
+        fprintf(stderr, "getpgid(INT_MAX) did not report ESRCH: errno=%d\n", errno);
+        return 1;
+    }
+    printf("branch.process_group_identity=yes\n");
 
     /* CONTRACT: the main thread's tid equals its pid, and procfs agrees with
        the syscall. Branch on the comparisons so a mismatch changes control
@@ -114,13 +154,39 @@ int main(void) {
     printf("branch.pid_is_small=%s\n", pid < 100000 ? "yes" : "no");
     fflush(stdout);
 
+    if (pthread_barrier_init(&thread_query_barrier, NULL, 2) != 0) {
+        fprintf(stderr, "pthread_barrier_init failed\n");
+        return 1;
+    }
     pthread_t thread;
     if (pthread_create(&thread, NULL, thread_body, NULL) != 0) {
         fprintf(stderr, "pthread_create failed\n");
         return 1;
     }
-    if (pthread_join(thread, NULL) != 0) {
+    if (!barrier_wait_ok()) {
+        fprintf(stderr, "pthread_barrier_wait failed\n");
+        return 1;
+    }
+    pid_t thread_pgid = getpgid(worker_tid);
+    printf("thread.getpgid=%d\n", (int)thread_pgid);
+    if (thread_pgid != pgid) {
+        fprintf(stderr, "live nonleader getpgid=%d, expected %d\n",
+                (int)thread_pgid, (int)pgid);
+        return 1;
+    }
+    if (!barrier_wait_ok()) {
+        fprintf(stderr, "pthread_barrier_wait failed\n");
+        return 1;
+    }
+    void *thread_result = NULL;
+    if (pthread_join(thread, &thread_result) != 0 || thread_result != NULL) {
         fprintf(stderr, "pthread_join failed\n");
+        return 1;
+    }
+    pthread_barrier_destroy(&thread_query_barrier);
+    errno = 0;
+    if (getpgid(worker_tid) != -1 || errno != ESRCH) {
+        fprintf(stderr, "exited nonleader remained visible: errno=%d\n", errno);
         return 1;
     }
 

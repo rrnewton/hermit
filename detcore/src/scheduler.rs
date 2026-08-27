@@ -959,9 +959,13 @@ impl ThreadTree {
         self.process_parent.get(pid).copied()
     }
 
-    pub fn process_group(&self, pid: DetPid) -> Option<DetPid> {
+    fn process_for_task(&self, task: DetTid) -> Option<DetPid> {
+        self.thread_to_leader.get(&task).copied()
+    }
+
+    pub fn process_group(&self, process: DetPid) -> Option<DetPid> {
         self.process_wait
-            .get(&pid)
+            .get(&process)
             .map(|metadata| metadata.process_group)
     }
 
@@ -2482,6 +2486,22 @@ impl Scheduler {
     /// filters its own result by, so the two agree about what "live" means.
     pub fn thread_is_live(&self, dettid: DetTid) -> bool {
         self.next_turns.contains_key(&dettid)
+    }
+
+    /// Resolve the process group for a task visible in the guest PID namespace.
+    /// Linux accepts a live nonleader TID as the `getpgid(2)` argument, while a
+    /// reaped process or exited nonleader is no longer visible. PID 1 is the
+    /// namespace init process supplied by Hermit's container rather than an
+    /// instrumented task, so its stable group identity is 1.
+    pub fn process_group_for_task(&self, task: DetTid) -> Option<DetPid> {
+        if task.as_raw() == 1 {
+            return Some(DetPid::from_raw(1));
+        }
+        let process = self.thread_tree.process_for_task(task)?;
+        if task != process && !self.next_turns.contains_key(&task) {
+            return None;
+        }
+        self.thread_tree.process_group(process)
     }
 
     /// Return scheduler-owned lifecycle state for an exact child-process wait.
@@ -6775,6 +6795,48 @@ mod test {
                 },
             ),
             Some(normal)
+        );
+    }
+
+    #[test]
+    fn getpgid_resolves_visible_leaders_threads_init_and_missing_tasks() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let root = DetPid::from_raw(3);
+        let root_thread = DetTid::from_raw(4);
+        let child = DetPid::from_raw(5);
+        let child_thread = DetTid::from_raw(6);
+        for task in [root, root_thread, child, child_thread] {
+            register_known_thread(&mut scheduler, task);
+        }
+        scheduler.thread_tree.add_child(root, root, true);
+        scheduler.thread_tree.add_child(root, root_thread, false);
+        scheduler.thread_tree.add_child(root, child, true);
+        scheduler.thread_tree.add_child(child, child_thread, false);
+
+        assert_eq!(
+            scheduler.process_group_for_task(DetTid::from_raw(1)),
+            Some(DetPid::from_raw(1)),
+            "the visible namespace init process has its stable group"
+        );
+        assert_eq!(scheduler.process_group_for_task(root), Some(root));
+        assert_eq!(scheduler.process_group_for_task(root_thread), Some(root));
+        assert_eq!(scheduler.process_group_for_task(child), Some(root));
+        assert_eq!(scheduler.process_group_for_task(child_thread), Some(root));
+
+        assert!(scheduler.thread_tree.set_process_group(child, child));
+        assert_eq!(scheduler.process_group_for_task(child), Some(child));
+        assert_eq!(scheduler.process_group_for_task(child_thread), Some(child));
+
+        scheduler.next_turns.remove(&child_thread);
+        assert_eq!(
+            scheduler.process_group_for_task(child_thread),
+            None,
+            "an exited nonleader is no longer a visible getpgid target"
+        );
+        assert_eq!(
+            scheduler.process_group_for_task(DetTid::from_raw(99)),
+            None,
+            "an unknown task must report ESRCH"
         );
     }
 
