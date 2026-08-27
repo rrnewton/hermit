@@ -86,3 +86,556 @@
 # system-utils
 
 # util-c
+
+# Validate test-ID debugging guide — 2026-08-27
+
+This guide preserves the evidence behind the test IDs observed red in the
+retry-aware validation at Hermit
+`a6b0c37648df774d5859aad23a535caf03a6d392`. It is a debugging handoff, not a
+failure-rate estimate and not a suppression list.
+
+## Measurement boundaries
+
+The `a6b0c37648df` run was on `devbig014.atn7.facebook.com`, kernel
+`6.13.2-0_fbk17_hardened_0_g2ae417e0caa0`, from
+`2026-08-27T02:37:48Z` through `03:08:02Z`, at DAG width 16. One other full
+validate was active during part of it. The retained evidence contains 677
+individual nextest IDs and 1,350 attempts: 21 IDs failed every recorded attempt,
+7 had both a pass and a non-pass, and 649 passed every recorded attempt. Those
+are observations from at most two attempts per ID, not rates.
+
+The attempt to replace that population with a current-main full validate ran at
+`ff125248383e7d4ed04eb7e93b5fa8354d972483` on the same host and kernel. It is a
+non-verdict: `pre.reverie_pin` failed both attempts because Hermit's pinned
+Reverie commit `1393db6279331feb4af2533220e4786ab104a1b9` was not reachable
+from then-current `reverie/main` `ab07a89239150df3726a036bee9f5e897893dfc1`.
+Only 2 nodes executed; 64 were dependency-skipped and 2 were host-inapplicable.
+No individual test ID ran. The durable full log is
+`/home/newton/work/dev-hermit/ignored/validate/validate-full-ff125248383e-validate-hermit-134-debug-guide-ff125248383e.log`
+and the ledger event is `devbig014-1787831073-3959920`.
+
+A focused remeasurement of the 28 inherited IDs was therefore started at the
+newer current-main SHA `6172478eae288c9f5005545d4f68c00c780f41c0` through
+`validate-lock`. It uses `cargo nextest`, `--features third-party-backends`,
+`-j 1`, two independent invocations, and the checked-in 15-second default
+per-test cap plus named overrides. The validate runner owns the one-retry,
+two-total-attempt cell policy; nextest's default profile does not. The focused
+fallback therefore repeats the exact invocation instead of mislabeling one
+nextest execution as two attempts. It can say which inherited IDs still fail;
+it cannot discover a newly failing ID outside the inherited 28-ID population.
+
+Primary retained evidence:
+
+- prior full log:
+  `/home/newton/work/dev-hermit/ignored/validate/validate-full-a6b0c37648df-validate-hermit-137-a6b0c37648df-1787798057339452591-387681-9a8a881f.log`
+- prior artifacts:
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-137-a6b0c37648df-1787798057339452591-387681-9a8a881f/`
+- prior ledger event: `devbig014-1787800082-538574`
+- focused current-main attempt 1 stderr:
+  `/home/newton/work/dev-hermit/ignored/validate/validate-hermit-134-focused-6172478eae28-5.stderr.log`
+- focused current-main attempt 2 stderr:
+  `/home/newton/work/dev-hermit/ignored/validate/validate-hermit-134-focused-6172478eae28-6.stderr.log`
+
+## Focused observations at `6172478eae28`
+
+The two independent invocations ran on `devbig014.atn7.facebook.com`, kernel
+`6.13.2-0_fbk17_hardened_0_g2ae417e0caa0`, booted 2026-08-26 05:51:32, at the
+same SHA and with the same filter. Nextest reported 201.542 seconds for the
+first and 150.391 seconds for the second. `validate-lock` reported the other
+slot anchor held when each invocation acquired its slot, so these are not
+quiet-box timings. The first run record's free-text `measurement` field says
+“two attempts each”; that label is wrong. Its stderr contains one nextest run.
+The second run record and the two stderr logs are the evidence for the actual
+two-invocation comparison.
+
+The same 23 IDs were non-pass in both invocations and the same 5 passed in
+both. That is an observation about this selected population, not a failure
+rate. It also is not a replacement for a full validate: the filter cannot find
+a newly failing ID outside these 28, and the full DAG prerequisites did not
+run. In particular, the LiteInst cases reached an unrecorded staged runtime;
+`ci/liteinst-strict-node.sh` defines that as a setup condition where nothing
+about LiteInst was measured. Preserve those results as evidence about the
+blocked path, not as product verdicts.
+
+| Test ID | Invocation 1 | Invocation 2 |
+|---|---:|---:|
+| `hermit::app_strict_verify$go_goroutines_are_deterministic_under_strict_verify` | TIMEOUT 15.003s | FAIL 9.570s |
+| `hermit::app_strict_verify$go_hello_is_deterministic_under_strict_verify` | TIMEOUT 15.003s | FAIL 13.272s |
+| `hermit::app_strict_verify$python_is_deterministic_under_strict_verify` | PASS 1.264s | PASS 3.073s |
+| `hermit::cli$every_record_container_site_classifies_a_child_fault_by_name` | TIMEOUT 30.002s | TIMEOUT 30.002s |
+| `hermit::cli$run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls` | TIMEOUT 15.002s | TIMEOUT 15.002s |
+| `hermit::cli$run_dbt_verifies_process_wait_lifecycle` | FAIL 1.619s | FAIL 5.584s |
+| `hermit::cli$run_dbt_verifies_queued_self_signals` | FAIL 2.246s | FAIL 3.826s |
+| `hermit::cli$run_dbt_verifies_self_prlimit` | FAIL 9.084s | FAIL 0.765s |
+| `hermit::cli$run_dbt_verifies_shell_process_lifecycle` | FAIL 0.752s | FAIL 7.192s |
+| `hermit::cli$run_dbt_verifies_simple_env_shebang` | FAIL 3.561s | FAIL 3.951s |
+| `hermit::cli$run_dbt_virtualizes_process_identities` | FAIL 7.664s | FAIL 2.334s |
+| `hermit::cli$run_liteinst_rejects_a_non_runtime_override_before_activation_claim` | FAIL 0.011s | FAIL 0.010s |
+| `hermit::cli$run_liteinst_rejects_an_inert_dso_before_activation_claim` | FAIL 0.040s | FAIL 0.038s |
+| `hermit::cli$run_liteinst_verifies_detcore_backend` | TIMEOUT 15.002s | FAIL 5.233s |
+| `hermit::command_strict_verify$kernel_pseudofile_commands_are_deterministic_under_strict_verify` | FAIL 8.493s | FAIL 3.937s |
+| `hermit::hermit_modes$verify_mode_matrix` | PASS 12.986s | PASS 12.762s |
+| `hermit::hermit_modes$verify_reports_exit_status_divergence` | FAIL 1.620s | FAIL 0.820s |
+| `hermit::hermit_modes$verify_reports_stdout_divergence` | FAIL 5.329s | FAIL 2.722s |
+| `hermit::hermit_modes$verify_verbose_compares_the_full_trace` | FAIL 3.872s | FAIL 3.614s |
+| `hermit::liteinst_advanced$liteinst_fork_fails_closed_without_hanging` | TIMEOUT 15.015s | FAIL 3.639s |
+| `hermit::liteinst_advanced$liteinst_strict_verify_python_random_example` | TIMEOUT 15.003s | FAIL 1.678s |
+| `hermit::liteinst_advanced$liteinst_strict_verify_round2_arithmetic_and_predicate_utilities` | FAIL 5.915s | FAIL 6.239s |
+| `hermit::liteinst_advanced$liteinst_strict_verify_round3_stdin_filter_utilities` | FAIL 4.878s | FAIL 3.567s |
+| `hermit::liteinst_advanced$liteinst_strict_verify_semantic_text_utilities` | FAIL 1.770s | FAIL 1.692s |
+| `hermit::liteinst_advanced$liteinst_thread_clone_fails_closed_without_sigsys` | FAIL 6.539s | FAIL 6.342s |
+| `hermit::sabre_examples$sabre_non_racy_examples_verify_current_envelope` | PASS 0.005s | PASS 0.004s |
+| `hermit::signal_determinism$sigsuspend_without_signal_reports_terminal_deadlock` | PASS 3.847s | PASS 3.508s |
+| `hermit::bin/hermit$run::detects_symlink_resolution_through_implicit_mounts` | PASS 0.007s | PASS 0.005s |
+
+Relative to the earlier classification, 18 of the 21 IDs that had failed every
+recorded attempt remained non-pass in both focused invocations; the symlink,
+SaBRe-envelope, and `sigsuspend` IDs passed both. Five of the 7 IDs that had
+both outcomes were non-pass in both; Python strict verification and
+`verify_mode_matrix` passed both. That arithmetic produces the observed 23/5
+split.
+
+The current failure text also changes the debugging order. Six DBT cases
+(`process_wait_lifecycle`, queued self-signals, self-`prlimit`, shell process
+lifecycle, the env shebang, and process identities) now share an RPC
+`UnexpectedEnd` followed by “DBT evidence is missing FINAL frames for process
+images.” The earlier per-test failures remain valid history, but this shared
+current failure happens first and should be resolved before assuming each old
+cause remains live. The current LiteInst failures likewise stop at the staged
+runtime revision check before the intended product behavior.
+
+## Resolve the earlier shared failures first
+
+Do not start by treating the six DBT entries above as six independent defects.
+Their current executions all stop at the same earlier transport/finalization
+failure. Diagnose that path once, using
+[the retained DBT diagnosis](../ai_docs/2026-08-17-reverie-dbt-final-frame-diagnosis.md),
+and only return to an entry's older test-specific failure after the shared
+failure is gone.
+
+Do not count the current LiteInst entries as measured product failures either.
+They stop at a missing staged-runtime revision before reaching the behavior
+their names describe. This is distinct from the missing `xxd` dependency that
+blocks e9patch and SaBRe staging and is addressed by
+https://github.com/rrnewton/hermit/pull/2744. The two setup failures affect
+multiple backend measurements and review paths, but they have different causes
+and must remain separate in debugging and reporting.
+
+“Last green” below means the newest retained line for that exact nextest ID that
+says `PASS`, joined to its run record. It does not turn a run-level non-verdict
+into a green run. “Introduced” means the first commit containing the exact
+current test ID; where a DBI-to-DBT rename created the current spelling, that is
+stated explicitly.
+
+## IDs that failed every recorded attempt at `a6b0c37648df`
+
+### `hermit::app_strict_verify$go_goroutines_are_deterministic_under_strict_verify`
+
+- Observation: `TIMEOUT 15.001s`, then `FAIL 10.032s` under one concurrent
+  validate. The timeout was the configured cap; the failure says
+  `hermit run --strict --verify was not deterministic (L2)`.
+- Introduced: `6219d923ddc99db64af48afae8261cfe2ba2afc2`,
+  2026-07-22, in `hermit-cli/tests/app_strict_verify.rs`.
+- Last retained green: `PASS 9.984s` at Hermit
+  `f77d7c44067a12ba11e75b5a85864ce0bc23e8f4`, run finished
+  `2026-08-26T23:24:13.766596Z`; exact line in
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-105-f77d7c44067a-1787783997/safe-ci-dag-runner/test.app_strict_verify.log`.
+- Findings: one attempt hit the cap and one produced a real L2 mismatch. Do not
+  combine those as one cause. The retained failure does not yet localize the
+  first divergent record.
+
+### `hermit::app_strict_verify$go_hello_is_deterministic_under_strict_verify`
+
+- Observation: `FAIL 11.093s`, then `FAIL 10.161s`; both say
+  `hermit run --strict --verify was not deterministic (L2)`.
+- Introduced: `6219d923ddc99db64af48afae8261cfe2ba2afc2`,
+  2026-07-22, in `hermit-cli/tests/app_strict_verify.rs`.
+- Last retained green: `PASS 9.904s` at `f77d7c44067a12ba11e75b5a85864ce0bc23e8f4`,
+  same run and log as the preceding ID.
+- Findings: this is a repeatable strict-verification mismatch in the retained
+  sample, not a timeout. No narrower cause was established.
+
+### `hermit::bin/hermit$run::detects_symlink_resolution_through_implicit_mounts`
+
+- Observation: `FAIL 0.007s` twice. Exact assertion:
+  `path_resolution_visits_prefix(&proc_fd, Path::new("/tmp")).unwrap()`.
+- Introduced: `720a059f0fb33dedf8025aebe5ceca8ecdf0f271`,
+  2026-07-25, in `hermit-cli/src/bin/hermit/run.rs`.
+- Last retained green before diagnosis: `PASS 0.004s` at
+  `f77d7c44067a12ba11e75b5a85864ce0bc23e8f4`, in
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-105-f77d7c44067a-1787783997/safe-ci-dag-runner/test.hermit_unit.log`.
+- Findings: `NamedTempFile` follows `TMPDIR`, while validate redirects `TMPDIR`
+  away from literal `/tmp`. This was a test environment assumption, not a
+  product failure. Commit `e2d89097f1baa8af260c68994201121ac4c557da`
+  now compares with `std::env::temp_dir()` and is on current main.
+
+### `hermit::cli$every_record_container_site_classifies_a_child_fault_by_name`
+
+- Observation: `TIMEOUT 30.002s`, then `TIMEOUT 30.003s`. This test has a
+  measured 30-second override; both attempts reached that bound under a
+  concurrent validate.
+- Introduced: `1c738e76763a5f6016531debaadfa113f7ab2fc8`,
+  2026-08-25, in `hermit-cli/tests/cli.rs`.
+- Last retained green: `PASS 28.818s` at
+  `f630aef3d18e87e49a1e099a5bcf4d2bf43987d1`, run finished
+  `2026-08-27T10:51:24.977917Z`, in
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-130-f630aef3d18e-1787825672660163077-1370230-b619c59f/safe-ci-dag-runner/test.cli.log`.
+  That overall run was a non-verdict; the individual PASS line remains direct
+  evidence.
+- Findings: the green observation consumed 28.818 of its 30 seconds, so the
+  test remains deadline-sensitive. No product failure text was emitted in the
+  two capped attempts.
+
+### `hermit::cli$run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls`
+
+- Observation: `FAIL 3.739s`, then `FAIL 3.696s`. The opt-out `fork-exec`
+  invocation exited 125 at the shared `cli.rs` command assertion.
+- Introduced: `1f15510a6bb116c604a69d65975b3272a304ab7b`, commit date
+  2026-08-24 (author date 2026-08-12), in `hermit-cli/tests/cli.rs`.
+- Last retained green: `PASS 1.989s` at
+  `8e2579d4f0640414f563a3f9f5e6eb4c21a0c884`, run finished
+  `2026-08-26T20:55:44.967642Z`, in
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-001-8e2579d4f064-1787774099/safe-ci-dag-runner/test.cli.log`.
+- Findings: this is a DBT copied-process path. Earlier apparent DBT failures
+  caused by building without `third-party-backends` were separately fixed by
+  `740cc656`; the failing a6 run did build those features, so that older
+  configuration defect does not explain this observation.
+
+### `hermit::cli$run_dbt_verifies_queued_self_signals`
+
+- Observation: `FAIL 0.491s`, then `FAIL 0.481s`. Exact inner text includes
+  `rt_sigqueueinfo failed: result=-1 errno=3 delivered=1`; Hermit's first verify
+  run exited 125.
+- Introduced under the current exact ID by the DBI-to-DBT rename
+  `e565b1ab1d5fcbbab492ffb886c893dbcb061ddf`, commit date 2026-08-08
+  (author date 2026-08-06), in `hermit-cli/tests/cli.rs`.
+- Last retained green: `PASS 0.455s` at
+  `d19c112c7035672437b2a78d90a42fe7d690c6cb`, run finished
+  `2026-08-25T11:26:31.756955Z`, in
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-014-d19c112c7035-1787655221/safe-ci-dag-runner/test.cli.log`.
+- Findings: this is an ESRCH/self-signal failure, distinct from the missing
+  backend build configuration fixed by `740cc656`.
+
+### `hermit::cli$run_dbt_verifies_self_prlimit`
+
+- Observation: `FAIL 0.484s`, then `FAIL 0.478s`. Exact inner text:
+  `prlimit64 virtual-self mutation: Operation not permitted`; Hermit exited 125.
+- Introduced under the current exact ID by `e565b1ab1d5fcbbab492ffb886c893dbcb061ddf`,
+  same date and file as the preceding DBT ID.
+- Last retained green: `PASS 0.428s` at `d19c112c7035672437b2a78d90a42fe7d690c6cb`,
+  in the same retained `test.cli.log`.
+- Findings: the guest queries with pid 0, then passes Hermit's virtualized pid
+  back to `prlimit64`; that mutation returns `EPERM`. Prior triage places this
+  at the DBT process-identity boundary, not in the missing-build configuration.
+
+### `hermit::cli$run_dbt_verifies_shell_process_lifecycle`
+
+- Observation: `FAIL 2.759s`, then `FAIL 2.700s`; the `/bin/sh` verify command
+  exited 125 after protected records diverged around `wait4` and
+  `InternalIOPolling`.
+- Introduced under the current exact ID by `e565b1ab1d5fcbbab492ffb886c893dbcb061ddf`,
+  in `hermit-cli/tests/cli.rs`.
+- Last retained green: `PASS 0.745s` at
+  `8e2579d4f0640414f563a3f9f5e6eb4c21a0c884`, in that run's retained
+  `test.cli.log`.
+- Findings: host-timed DBT child waiting changed the protected scheduler
+  evidence. The shared repair landed through
+  https://github.com/rrnewton/reverie/pull/506 and
+  https://github.com/rrnewton/hermit/pull/2737; current Hermit main contains
+  merge `20226fd5d6fc221da8e4f58341fed411248b1995`.
+
+### `hermit::cli$run_dbt_verifies_simple_env_shebang`
+
+- Observation: `FAIL 1.231s`, then `FAIL 1.224s`. Exact inner error says the DBT
+  guest exited 0 but protected evidence lacked `FINAL` frames for a process
+  image, so the DBT run failed and Hermit exited 125.
+- Introduced under the current exact ID by `e565b1ab1d5fcbbab492ffb886c893dbcb061ddf`,
+  in `hermit-cli/tests/cli.rs`.
+- Last retained green: `PASS 0.622s` at
+  `8e2579d4f0640414f563a3f9f5e6eb4c21a0c884`, in that run's retained
+  `test.cli.log`.
+- Findings: this is evidence-finalization after a successful DBT guest, not a
+  failure to launch `drrun` and not the earlier missing-feature defect.
+
+### `hermit::cli$run_dbt_virtualizes_process_identities`
+
+- Observation: `FAIL 2.402s`, then `FAIL 2.323s`; the strict DBT verify command
+  exited 125.
+- Introduced under the current exact ID by `e565b1ab1d5fcbbab492ffb886c893dbcb061ddf`,
+  in `hermit-cli/tests/cli.rs`.
+- Last retained green: `PASS 0.748s` at
+  `8e2579d4f0640414f563a3f9f5e6eb4c21a0c884`, in that run's retained
+  `test.cli.log`.
+- Findings: prior triage associates the failure with DBT process identity. The
+  retained a6 failure does not isolate one identity syscall, so resume from the
+  full stderr rather than assuming it is the same `prlimit64` failure.
+
+### `hermit::cli$run_liteinst_rejects_a_non_runtime_override_before_activation_claim`
+
+- Observation: `FAIL 0.011s`, then `FAIL 0.009s`. Exact error: the `/bin/true`
+  override `records no Reverie revision`, so it cannot be shown to match the
+  Hermit pin.
+- Introduced: `7f893d097270a3029c074b970a18ef9311e54958`,
+  2026-07-30, in `hermit-cli/tests/cli.rs`.
+- Last retained green: `PASS 0.012s` at
+  `992b7eb5b7922d55233ceda5a29afedcace03242`, run finished
+  `2026-08-25T15:21:08.052800Z`, in
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-005-992b7eb5b792-1787669771/safe-ci-dag-runner/test.cli.log`.
+- Findings: the expected-refusal test was itself rejected earlier than the
+  assertion it meant to exercise. The dedicated staging fix was developed as
+  `8f7b74095e57aaea73bd5e0539b92622a6a6003a`, but that commit is not an
+  ancestor of current main as of `6172478eae28`.
+
+### `hermit::cli$run_liteinst_rejects_an_inert_dso_before_activation_claim`
+
+- Observation: `FAIL 0.042s`, then `FAIL 0.037s`. Exact error: the staged inert
+  DSO `records no Reverie revision`, so it cannot be shown to match the pin.
+- Introduced: `7f893d097270a3029c074b970a18ef9311e54958`,
+  2026-07-30, in `hermit-cli/tests/cli.rs`.
+- Last retained green: `PASS 0.044s` at `992b7eb5b7922d55233ceda5a29afedcace03242`,
+  in the same retained `test.cli.log`.
+- Findings: same staging-marker precondition as the preceding test, not a
+  LiteInst guest-behavior failure. The unlanded staging commit named above must
+  not be described as present on current main.
+
+### `hermit::cli$run_liteinst_verifies_detcore_backend`
+
+- Observation: `TIMEOUT 15.002s` twice; no product assertion was reached.
+- Introduced: `138922c767e2415851dea1201956cfd43b7867eb`,
+  2026-07-26, in `hermit-cli/tests/cli.rs`.
+- Last retained green: `PASS 132.155s` at
+  `992b7eb5b7922d55233ceda5a29afedcace03242`, in that run's retained
+  `test.cli.log`.
+- Findings: the retained green is far above the later 15-second cap. The a6
+  observations therefore establish a bound kill, not a product verdict. Any
+  debugging run must name which timeout configuration it used.
+
+### `hermit::command_strict_verify$kernel_pseudofile_commands_are_deterministic_under_strict_verify`
+
+- Observation: `FAIL 0.278s`, then `FAIL 0.274s`. Exact failure:
+  `findmnt did not reach L2 under strict verification`; the protected
+  comparison reported nondeterminism.
+- Introduced: `2def556e3d50fae6d0f51a2fae11f400aa19782a`,
+  2026-07-27, in `hermit-cli/tests/command_strict_verify.rs`.
+- Last retained green: `PASS 1.735s` at
+  `f77d7c44067a12ba11e75b5a85864ce0bc23e8f4`, in
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-105-f77d7c44067a-1787783997/safe-ci-dag-runner/test.command_strict_verify.log`.
+- Findings: this is a strict-verification failure in `findmnt`, not a timeout.
+  No narrower retained root cause was found.
+
+### `hermit::hermit_modes$verify_reports_exit_status_divergence`
+
+- Observation: `FAIL 5.753s`, then `FAIL 0.208s`. Exact assertion:
+  `assertion left == right failed: unexpected status`; observed left
+  `Some(125)`, expected right `Some(1)`.
+- Introduced: `3dbff1c4fa651b599570a8544fae970755eb014b`,
+  2026-07-21, in `hermit-cli/tests/hermit_modes.rs`.
+- Last retained green: `PASS 0.238s` at
+  `55cb93a9fd76ddba7c9de853e2ce6bee012c1708`, run finished
+  `2026-08-25T14:50:30Z`, in
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-004-55cb93a9fd76-1787667933/safe-ci-dag-runner/test.hermit_modes.log`.
+- Findings: the onset was narrowed to `556efd6f9e` against parent
+  `9f258c6c64`, each checked three times. The verifier correctly finds the
+  intended exit-status divergence, but returns Hermit's internal-failure status
+  125 while the test still expects 1. Prior review explicitly rejected merely
+  accepting 125 because verification divergence is a product result that needs
+  the intended exit classification.
+
+### `hermit::hermit_modes$verify_reports_stdout_divergence`
+
+- Observation: `FAIL 0.261s`, then `FAIL 0.189s`; same exact status assertion,
+  left `Some(125)`, right `Some(1)`. The expected stdout-mismatch diagnostic is
+  present.
+- Introduced: `3dbff1c4fa651b599570a8544fae970755eb014b`,
+  2026-07-21, in `hermit-cli/tests/hermit_modes.rs`.
+- Last retained green: `PASS 0.222s` at `55cb93a9fd76ddba7c9de853e2ce6bee012c1708`,
+  in the same retained `test.hermit_modes.log`.
+- Findings: same `556efd6f9e` onset and exit-classification issue as the
+  preceding test; the comparator still detects the deliberately different
+  stdout.
+
+### `hermit::hermit_modes$verify_verbose_compares_the_full_trace`
+
+- Observation: `FAIL 0.148s`, then `FAIL 0.121s`; same exact status assertion,
+  left `Some(125)`, right `Some(1)`. The full-trace and nondeterminism
+  diagnostics remain present.
+- Introduced: `3dbff1c4fa651b599570a8544fae970755eb014b`,
+  2026-07-21, in `hermit-cli/tests/hermit_modes.rs`.
+- Last retained green: `PASS 0.148s` at `55cb93a9fd76ddba7c9de853e2ce6bee012c1708`,
+  in the same retained `test.hermit_modes.log`.
+- Findings: same `556efd6f9e` onset and product exit-classification question;
+  do not weaken the full-trace comparison to clear this assertion.
+
+### `hermit::liteinst_advanced$liteinst_fork_fails_closed_without_hanging`
+
+- Observation: `FAIL 6.320s`, then `FAIL 6.521s`. Exact text includes
+  `status=ExitStatus(unix_wait_status(32000))`, `LiteInst cancellation cleanup failed`,
+  and `notifier did not acknowledge terminal cleanup`; left `Some(125)`, expected
+  `Some(1)`.
+- Introduced: `138922c767e2415851dea1201956cfd43b7867eb`,
+  2026-07-26, in `hermit-cli/tests/liteinst_advanced.rs`.
+- Last retained green: `PASS 6.618s` at
+  `55cb93a9fd76ddba7c9de853e2ce6bee012c1708`, in
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-004-55cb93a9fd76-1787667933/safe-ci-dag-runner/test.liteinst_strict.log`.
+- Findings: reproduced with a matching release Hermit/runtime, so it is not the
+  missing-revision staging problem. Activation succeeds, then the unsupported
+  fork path reaches cancellation cleanup and that cleanup is not acknowledged.
+  It remained after the `/proc/maps` fix in
+  https://github.com/rrnewton/hermit/pull/2693. It is a backend-mechanism test,
+  not a compatibility-corpus cell.
+
+### `hermit::liteinst_advanced$liteinst_thread_clone_fails_closed_without_sigsys`
+
+- Observation: `FAIL 2.487s`, then `FAIL 2.371s`. Exact text includes
+  `status=ExitStatus(unix_wait_status(32000))` and `-524 ENOTSUPP`; left
+  `Some(125)`, expected `Some(1)`.
+- Introduced: `138922c767e2415851dea1201956cfd43b7867eb`,
+  2026-07-26, in `hermit-cli/tests/liteinst_advanced.rs`.
+- Last retained green: `PASS 2.540s` at `55cb93a9fd76ddba7c9de853e2ce6bee012c1708`,
+  in the same retained `test.liteinst_strict.log`.
+- Findings: same matched-runtime fail-closed boundary as the preceding test,
+  without the missing-revision staging explanation. It is also a
+  backend-mechanism test rather than a compatibility-corpus cell.
+
+### `hermit::sabre_examples$sabre_non_racy_examples_verify_current_envelope`
+
+- Observation: one `TIMEOUT 15.004s`; the node did not retry this ID, so there
+  is one recorded attempt, not two, and no product assertion text.
+- Introduced: `61d8df393b88e7654fd1bf6427c1f0abb381e696`,
+  2026-07-31, in `hermit-cli/tests/sabre_examples.rs`.
+- Last retained green: `PASS 12.814s` at
+  `55cb93a9fd76ddba7c9de853e2ce6bee012c1708`, in
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-004-55cb93a9fd76-1787667933/safe-ci-dag-runner/test.sabre_examples.log`.
+- Findings: separate retained diagnosis shows a real SaBRe divergence in
+  CPython shutdown/glibc arena trimming: the two runs had 2,989 versus 2,985
+  syscall records and first differed at `madvise` address/length and virtual
+  time. That rules out record loss, I/O-buffer content, native CPython, ptrace,
+  and a minimal C allocator guest. A shared-address-space explanation remains
+  unproved. Retained diagnosis directories are
+  `/home/newton/work/dev-hermit/ignored/sabre-verify`, `sv-bin`, `sv-run1`,
+  `sv-rep1`, `sv-rep2`, `sv-rep3`, `sv-noverify`, `sv-nv2`, `sv-c`, and
+  `sv-native` below `/home/newton/work/dev-hermit/ignored/`.
+
+### `hermit::signal_determinism$sigsuspend_without_signal_reports_terminal_deadlock`
+
+- Observation: `FAIL 0.108s` twice. The scheduler emitted the intended terminal
+  result, but the assertion saw left `Some(125)`, expected `Some(1)`.
+- Introduced: `fa9a9418cb4fe99c762e05cbc57ff56728ce0b92`,
+  2026-08-12, in `hermit-cli/tests/signal_determinism.rs`.
+- Last retained green before the failing observation: `PASS 0.181s` at
+  `55cb93a9fd76ddba7c9de853e2ce6bee012c1708`, in
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-004-55cb93a9fd76-1787667933/safe-ci-dag-runner/test.hermit_integration.log`.
+- Findings: the scheduler did not hang; the test had a stale exit-status literal
+  after `556efd6f9e`. Commit `2dd8565bee2d13e7fa42edd1f5d6987f4e4191bf`
+  replaced it with `HERMIT_INTERNAL_FAILURE_EXIT` and is on current main. No
+  retained full-validate PASS after that fix was available when this guide was
+  written.
+
+## IDs with both outcomes at `a6b0c37648df`
+
+### `hermit::app_strict_verify$python_is_deterministic_under_strict_verify`
+
+- Observation: `FAIL 0.888s`, then `PASS 0.555s`. The failure says
+  `hermit run --strict --verify was not deterministic (L2)`.
+- Introduced: `fb573eed36adeb1bcf96ebfddf8e856f2807777e`,
+  2026-07-28, in `hermit-cli/tests/app_strict_verify.rs`.
+- Last retained green: `PASS 0.484s` at
+  `f630aef3d18e87e49a1e099a5bcf4d2bf43987d1`, run finished
+  `2026-08-27T10:51:24.977917Z`, in that run's retained
+  `test.app_strict_verify.log`. The overall run was a non-verdict.
+- Findings: fail/pass movement is established; no test-specific mechanism has
+  been localized.
+
+### `hermit::cli$run_dbt_verifies_process_wait_lifecycle`
+
+- Observation: `PASS 0.987s`, then `FAIL 0.993s`; the failing strict DBT verify
+  exited 125.
+- Introduced under the current exact ID by the DBI-to-DBT rename
+  `e565b1ab1d5fcbbab492ffb886c893dbcb061ddf`, commit date 2026-08-08
+  (author date 2026-08-06), in `hermit-cli/tests/cli.rs`.
+- Last retained green: `PASS 1.012s` at
+  `f630aef3d18e87e49a1e099a5bcf4d2bf43987d1`, in that run's retained
+  `test.cli.log`; the overall run was a non-verdict.
+- Findings: the comparator was stable. DBT `wait4`/`waitid` fell back to
+  host-timed `InternalIOPolling`, so physical child readiness changed protected
+  scheduler records while guest stdout and status agreed. The repair landed via
+  https://github.com/rrnewton/reverie/pull/506 and
+  https://github.com/rrnewton/hermit/pull/2737, with Hermit merge
+  `20226fd5d6fc221da8e4f58341fed411248b1995` on current main.
+
+### `hermit::hermit_modes$verify_mode_matrix`
+
+- Observation: `TIMEOUT 15.002s`, then `PASS 2.766s`, during the concurrent
+  validate.
+- Introduced: `53649eb86d812dcecc9cc1593c8e9f4f43c461da`,
+  2026-07-21, in `hermit-cli/tests/hermit_modes.rs`.
+- Last retained green: `PASS 2.954s` at
+  `f630aef3d18e87e49a1e099a5bcf4d2bf43987d1`, in that run's retained
+  `test.hermit_modes.log`; the overall run was a non-verdict.
+- Findings: the two attempts show cap/pass movement. The test exercises the
+  verify-mode matrix with `base-env=minimal`; no deeper test-specific cause was
+  established.
+
+### `hermit::liteinst_advanced$liteinst_strict_verify_python_random_example`
+
+- Observation: `FAIL 2.847s`, then `PASS 3.039s`. The failing first verify run
+  terminated with signal 11 (`SIGSEGV`) and the enclosing test observed status
+  125.
+- Introduced: `06f33c90a475b19c75b7c551d113e3bc65efecbe`,
+  2026-07-30, in `hermit-cli/tests/liteinst_advanced.rs`.
+- Last retained green: `PASS 3.342s` at
+  `f630aef3d18e87e49a1e099a5bcf4d2bf43987d1`, in that run's retained
+  `test.liteinst_strict.log`; the overall run was a non-verdict.
+- Findings: it was never red in four pre-fix `/proc/maps` mutation runs, so the
+  a6 failure must not be attributed to the padding defect fixed by
+  https://github.com/rrnewton/hermit/pull/2693. No narrower cause is established.
+
+### `hermit::liteinst_advanced$liteinst_strict_verify_round2_arithmetic_and_predicate_utilities`
+
+- Observation: `TIMEOUT 15.002s`, then `PASS 5.690s`, during the concurrent
+  validate.
+- Introduced: `0c2de18cdbff2cd742d6d9e4ef1e33b3be764aa2`,
+  2026-07-31, in `hermit-cli/tests/liteinst_advanced.rs`.
+- Last retained green: `PASS 7.508s` at
+  `f630aef3d18e87e49a1e099a5bcf4d2bf43987d1`; a later attempt in that same
+  run timed out at `15.001s`, and the run itself was a non-verdict.
+- Findings: repeated cap/pass movement is established; no product failure text
+  or narrower cause is retained.
+
+### `hermit::liteinst_advanced$liteinst_strict_verify_round3_stdin_filter_utilities`
+
+- Observation: `TIMEOUT 15.002s`, then `PASS 4.083s`, during the concurrent
+  validate.
+- Introduced: `57a3ea41b9a474f7311aaaa643583ade1cc7f5a3`,
+  2026-07-31, in `hermit-cli/tests/liteinst_advanced.rs`.
+- Last retained green: `PASS 8.573s` at
+  `f630aef3d18e87e49a1e099a5bcf4d2bf43987d1`, in that run's retained
+  `test.liteinst_strict.log`; the overall run was a non-verdict.
+- Findings: cap/pass movement is established; no deeper per-ID cause was found.
+
+### `hermit::liteinst_advanced$liteinst_strict_verify_semantic_text_utilities`
+
+- Observation: `PASS 6.726s`, then `TIMEOUT 15.003s`, during the concurrent
+  validate. This ID appeared in the old final-red list only because that reader
+  kept the final attempt; order-independent classification puts it here.
+- Introduced: `4867b52f2d180648968e9449f43fc9d20dac5935`,
+  2026-07-31, in `hermit-cli/tests/liteinst_advanced.rs`.
+- Last retained green: `PASS 6.807s` at
+  `f630aef3d18e87e49a1e099a5bcf4d2bf43987d1`, in that run's retained
+  `test.liteinst_strict.log`; the overall run was a non-verdict.
+- Findings: this family once diverged through raw `/proc/maps` padding, fixed by
+  https://github.com/rrnewton/hermit/pull/2693. The a6 non-pass is a timeout,
+  so it must not be relabeled as that older divergence.
+
+## How to continue
+
+For a new run, classify each exact `BINARY$TEST` ID by all of its attempt
+verdicts. Do not use the last verdict, and do not count nextest's repeated
+failure recap as another attempt. Retry occurrence counts come from non-null
+`attempts[].retry_class`, not `retried_nodes`, because `retried_nodes` includes
+peer nodes rerun with a failing node.
+
+When a current full validate can pass `pre.reverie_pin`, replace the focused
+28-ID result with a full-population classification. Preserve the host, kernel,
+SHA, concurrency, timeout, and attempt-count conditions; do not compare raw node
+counts across hosts with different `cpuid_fault` capability.
