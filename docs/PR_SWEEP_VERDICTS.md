@@ -2148,12 +2148,49 @@ stripped. Measured against the four forms seen in the wild:
 | `APPROVED-AT: <sha>` — bare, no lane token | no | yes |
 | `## APPROVED-AT: claude <sha>` — heading | **no** | **no** |
 
-The last row was the whole finding. That line has the lane token, the colon and a
-correct 40-hex head; only `## ` defeated it. And the *one decoration that defeats the
-anchor defeated both regexes*, so the near-miss detector was blind to precisely the
-near-misses that were near-missing because of the anchor. Two live heads carried a
-real, current, correct-sha review in that form and the board showed them as
-un-reviewed.
+The last row was the finding. That line has the lane token, the colon and a correct
+40-hex head; the heading prefix alone defeated it, and it defeated BOTH regexes, so
+the near-miss detector was blind to precisely the near-misses that were near-missing
+because of the anchor. Two live heads carried a real, current, correct-sha review in
+that form and the board showed them as un-reviewed.
+
+⚠️ **THE TABLE ABOVE IS FOUR FORMS SEEN IN THE WILD, NOT THE CLASS, AND AN EARLIER
+DRAFT OF THIS SECTION CALLED IT "the one decoration". THAT WAS WRONG.** A leading
+marker is not one decoration; it is a prefix class, and the class is larger than the
+heading. `agent(codex-rev-2602)` raised this and I re-measured it independently
+rather than copying the list.
+
+⚠️ **AND THE PART THAT MATTERS MOST: THE CLASS IS STILL OPEN AFTER THE FIX.**
+Measured 2026-08-27 by driving `lane_shas` in the COORDINATOR copy at
+`ci-hub/health/approval_binding.py`, one comment per probe, role tag present,
+`author_association=MEMBER`, against a control that binds:
+
+| line form | binds? | flagged malformed? |
+|---|---|---|
+| `APPROVED-AT: claude <sha>` — the control | **yes** | – |
+| `## APPROVED-AT: claude <sha>` | **yes** | – |
+| `+ APPROVED-AT: claude <sha>` | **yes** | – |
+| `* APPROVED-AT: claude <sha>` | **yes** | – |
+| `1. APPROVED-AT: claude <sha>` | no | **no** |
+| `1) APPROVED-AT: claude <sha>` | no | **no** |
+| `> > APPROVED-AT: claude <sha>` | no | **no** |
+| `<!-- APPROVED-AT: claude <sha> -->` | no | **no** |
+| `<p>APPROVED-AT: claude <sha></p>` | no | **no** |
+| `- [x] APPROVED-AT: claude <sha>` | no | **no** |
+| `• APPROVED-AT: claude <sha>` | no | **no** |
+| `<U+200B>APPROVED-AT: claude <sha>` | no | **no** |
+| `Posting APPROVED-AT: claude <sha>` | no | **no** |
+
+**Eight forms still bind nothing and are still not flagged.** The heading case was
+closed; the class was not. Reporting the fix as complete would be the same defect
+this section is about, one layer along — so it is recorded here as open rather than
+as history.
+
+⚠️ **THE PRE-FIX TABLE IS NOT PINNED TO A COMMIT AND CANNOT BE RE-DERIVED FROM THIS
+DOCUMENT.** The before/after pair below names `8d03485c` and `8b4b6e137b87`; the
+four-row table above does not name the bytes it was measured against. Anyone
+re-checking it must pin their own commit first. That is the stale-table failure this
+document exists to name, present in this document.
 
 **FIXED, and the fix validated the reasoning.** `8d03485c` strips block-level prefixes
 before matching. Re-measured against main afterwards, driving `lane_shas` directly:
@@ -2231,6 +2268,23 @@ differing:
 Both positions are defensible; they cannot both be the rule. Recorded here rather than
 resolved, because which one is normative is a policy call.
 
+⚠️ **PIN THE COPY AND THE COMMIT BEFORE QUOTING ANY OF THIS. THE "authority" DRIFTS,
+AND IT DRIFTED TWICE WHILE THIS SECTION WAS BEING REVIEWED.** There is not one
+`approval_binding.py`; there is a coordinator copy under `ci-hub/health/` and a copy
+stamped into dev-hermit, and they have disagreed at every measurement so far:
+
+| when | copy | `WITHDRAWN` occurrences |
+|---|---|---|
+| at `agent(codex-rev-2602)`'s review | coordinator `ci-hub/health/approval_binding.py` | **0** — a well-formed withdrawal produced `binds=False, malformed=1` |
+| at `agent(codex-rev-2602)`'s review | dev-hermit stamped at `8b4b6e137b87` | **11** — the same probe produced `malformed=0` |
+| 2026-08-27, `agent(hermit-139)` | coordinator `ci-hub/health/approval_binding.py` | **12** |
+
+So the symptom described above is version-dependent, and **the copy divergence is
+itself part of the finding** rather than a detail. A sentence here naming
+"`approval_binding.py`" without saying WHICH ONE and AT WHAT COMMIT is unfalsifiable
+by the time anyone reads it — which is the failure this document is about, appearing
+in the document's own evidence.
+
 `ci-hub/bin/changes-requested-gate` is pinned **72/72 against the marker LINE-SHAPE
 matrix** (lead x trail x sha-form). ⚠️ That is not the variant space: composition
 between comments is a separate axis the line-shape matrix structurally cannot see, and
@@ -2254,8 +2308,29 @@ $ approval_binding.py --repo rrnewton/hermit --json | jq .malformed_source_lines
 
 $ # independent sweep of every PR touched that day, counting lines where an
 $ # APPROVED-AT keyword shares a line with a 40-hex sha but the grammar rejects it
-18 unparseable attempted bindings across 14 pull requests
+[withdrawn -- see below]
 ```
+
+⚠️ **THE HEADLINE COUNT THAT STOOD HERE — "18 unparseable attempted bindings across
+14 pull requests" — IS WITHDRAWN BECAUSE IT DOES NOT REPRODUCE.** It was published
+with no query, no cutoff and no exclusion rule, so nobody could check it. Three
+independent attempts have now produced three answers:
+
+| who | population and grammar | result |
+|---|---|---|
+| the original claim | unstated | 18 lines / 14 PRs |
+| `agent(codex-rev-2602)` | repository issue comments on 2026-08-25, cut at this pull request's creation time 18:23:15Z | broad keyword **25 / 17**; exact `APPROVED-AT:` token **14 / 8** |
+| `agent(hermit-139)`, 2026-08-27 | `gh api repos/rrnewton/hermit/issues/comments?since=2026-08-25T00:00:00Z --paginate`, 75,584 comment rows, line must contain a 40-hex sha and fail `^APPROVED-AT:[ \t]*(claude\|codex)[ \t]+[0-9a-f]{40}$` | broad **14 / 13**; exact token **4 / 3** |
+
+The three disagree because the population and the grammar are unstated, and mine
+differs from the codex lane's partly because I did not cut the corpus at the same
+instant. **That is the point, and it belongs in this document rather than being
+quietly repaired: a number published without its query is not evidence, and this
+one was in a document about instruments that report confidently wrong figures.**
+
+Instance 2's mechanism does not depend on the count and stands without it: the
+counter is gated behind the label it exists to validate, so a binding that failed
+badly enough never to earn a label is exactly the binding it cannot see.
 
 hermit#2589 alone carries two and is reported as zero: it has no
 `passed-review-*` label, so it is never examined. **A binding that failed so badly
@@ -2303,7 +2378,7 @@ render blocked and unreviewed identically.
 
 ### The fix shape, and it is already in this codebase twice
 
-Both instances share one repair: **give the negative outcome a first-class value
+All three instances share one repair: **give the negative outcome a first-class value
 and a counter of its own, sourced independently of the positive path.** This
 project has built that twice already, and they are the models to copy.
 
