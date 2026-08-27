@@ -45,6 +45,40 @@ fn collect_results_files(path: &Path, output: &mut Vec<PathBuf>) -> Result<(), S
     Ok(())
 }
 
+fn read_result_rows(path: &Path) -> Result<Vec<(PathBuf, usize, Value)>, String> {
+    let mut files = Vec::new();
+    collect_results_files(path, &mut files)?;
+    files.sort();
+    let mut rows = Vec::new();
+    for file in files {
+        let text = fs::read_to_string(&file)
+            .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
+        for (line_number, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let row = serde_json::from_str(line).map_err(|error| {
+                format!(
+                    "{}:{} malformed result row: {error}",
+                    file.display(),
+                    line_number + 1
+                )
+            })?;
+            rows.push((file.clone(), line_number + 1, row));
+        }
+    }
+    Ok(rows)
+}
+
+/// Read every retained cell attempt from the harness's appended result files.
+///
+/// This is the same population `retain` validates. Keeping one reader prevents
+/// the history writer from silently omitting retries that the terminal-verdict
+/// projection deliberately reduces to the latest attempt.
+pub fn all_result_rows(path: &Path) -> Result<Vec<Value>, String> {
+    read_result_rows(path).map(|rows| rows.into_iter().map(|(_, _, row)| row).collect())
+}
+
 fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
     value
         .get(key)
@@ -219,36 +253,19 @@ pub fn retain(
     commit: &str,
     expected: &[Value],
 ) -> Result<RetainedCellResults, String> {
-    let mut files = Vec::new();
-    collect_results_files(result_root, &mut files)?;
-    files.sort();
     let mut run_id: Option<String> = None;
     let mut selected = Vec::new();
     let mut identities = BTreeSet::new();
     let mut observations = BTreeSet::new();
     let mut terminal_rows = BTreeMap::new();
-    for file in files {
-        let text = fs::read_to_string(&file)
-            .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
-        for (line_number, line) in text.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let row: Value = serde_json::from_str(line).map_err(|error| {
-                format!(
-                    "{}:{} malformed result row: {error}",
-                    file.display(),
-                    line_number + 1
-                )
-            })?;
+    for (file, line_number, row) in read_result_rows(result_root)? {
             if row.get("schema").and_then(Value::as_u64) != Some(4)
                 || string(&row, "hermit_sha")? != commit
                 || row.get("source_tree_dirty").and_then(Value::as_bool) != Some(false)
             {
                 return Err(format!(
-                    "{}:{} is not an exact clean schema-4 cell result for {commit}",
-                    file.display(),
-                    line_number + 1
+                    "{}:{line_number} is not an exact clean schema-4 cell result for {commit}",
+                    file.display()
                 ));
             }
             let row_run_id = string(&row, "run_id")?;
@@ -279,7 +296,6 @@ pub fn retain(
             {
                 terminal_rows.insert(key, (attempt, row));
             }
-        }
     }
     let mut cells = terminal_rows
         .into_values()
@@ -522,6 +538,8 @@ mod tests {
         assert_eq!(observations[1]["attempt"], 2);
         assert_eq!(observations[1]["duration_ms"], 222);
         assert_eq!(observations[1]["timeout_seconds"], 15);
+        let history_rows = all_result_rows(&results).unwrap();
+        assert_eq!(history_rows, observations);
         fs::remove_dir_all(root).unwrap();
     }
 
