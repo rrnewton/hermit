@@ -3648,15 +3648,10 @@ fn runner_observed_terminal_attempt(runner: RunnerEvidence, harness_status: Opti
 /// flake is precisely "diverged, then passed", which is the population the
 /// standing retries-must-record-the-flake work exists to stop hiding.
 ///
-/// These are emitted as ADDITIONAL summary rows carrying the repeat ordinal, which
-/// is the mechanism the scorecard already has for several observations of one
-/// cell: it keys its duplicate guard on (cell, repetition) precisely so repeats
-/// merge rather than collide. Nothing new is introduced to express this.
-///
-/// ⚠️ RED CELLS ONLY. The caller applies this on the red-cell path alone. Doing it
-/// for green cells would change what the scorecard reports about cells nobody
-/// currently considers suspect, which is a decision about what green means rather
-/// than an accuracy improvement, and it is not taken here.
+/// These are emitted as additional summary rows carrying the same repetition and
+/// their own framework-written attempt ordinal. The scorecard keys its duplicate
+/// guard on all three values, so retries remain distinct without changing what a
+/// repetition means.
 fn earlier_attempts_that_located(rows: &[ResultRow], terminal: u64) -> Vec<&ResultRow> {
     let mut earlier: Vec<&ResultRow> = rows
         .iter()
@@ -3764,6 +3759,18 @@ fn invocation_attempts(row: &ResultRow) -> Result<Vec<InvocationAttempt>, String
         return Err("result row has an incomplete attempt invocation".into());
     }
     Ok(attempts)
+}
+
+fn result_row_invocation(row: &ResultRow) -> Result<JsonValue, String> {
+    Ok(json!({
+        "run_id": row.run_id,
+        "argv": row.argv,
+        "guest_argv": row.guest_argv,
+        "env": row.env,
+        "cwd": row.cwd,
+        "shell_command": row.shell_command,
+        "attempts": invocation_attempts(row)?,
+    }))
 }
 
 fn classify_result(
@@ -4215,7 +4222,15 @@ fn summarize(
             let result_file = cell_dir.join("results.jsonl");
             let mut observations = Vec::new();
             let mut result_rows_for_history = Vec::new();
-            let (outcome, row_valid, reason, error_kind, invocation, artifact_dir) = if result_file.is_file() {
+            let (
+                outcome,
+                row_valid,
+                reason,
+                error_kind,
+                attempt,
+                invocation,
+                artifact_dir,
+            ) = if result_file.is_file() {
                 match read_result_rows(&result_file) {
                     Ok(result_rows) => {
                         observations = result_rows
@@ -4270,22 +4285,14 @@ fn summarize(
                                     && row_matches
                                     && (proven_oom || runner_completed) =>
                             {
-                                match invocation_attempts(row) {
-                                    Ok(attempts) => {
-                                        let invocation = json!({
-                                            "run_id": row.run_id,
-                                            "argv": row.argv,
-                                            "guest_argv": row.guest_argv,
-                                            "env": row.env,
-                                            "cwd": row.cwd,
-                                            "shell_command": row.shell_command,
-                                            "attempts": attempts,
-                                        });
+                                match result_row_invocation(row) {
+                                    Ok(invocation) => {
                                         (
                                             row.outcome.clone(),
                                             true,
                                             row.reason.clone(),
                                             row.error_kind.clone(),
+                                            row.attempt,
                                             Some(invocation),
                                             artifact_dirs.last().cloned(),
                                         )
@@ -4295,7 +4302,7 @@ fn summarize(
                                             "{} does not carry complete literal attempt invocations: {error}",
                                             result_file.display()
                                         ));
-                                        ("NO_RESULT".to_string(), false, None, None, None, None)
+                                        ("NO_RESULT".to_string(), false, None, None, 1, None, None)
                                     }
                                 }
                             }
@@ -4304,24 +4311,24 @@ fn summarize(
                                     "{} does not match every selected-cell observation, the terminal harness exit, or retained runner result",
                                     result_file.display()
                                 ));
-                                ("NO_RESULT".to_string(), false, None, None, None, None)
+                                ("NO_RESULT".to_string(), false, None, None, 1, None, None)
                             }
                             Err(error) => {
                                 evidence_errors.push(error);
-                                ("NO_RESULT".to_string(), false, None, None, None, None)
+                                ("NO_RESULT".to_string(), false, None, None, 1, None, None)
                             }
                         }
                     }
                     Err(error) => {
                         evidence_errors.push(error);
-                        ("NO_RESULT".to_string(), false, None, None, None, None)
+                        ("NO_RESULT".to_string(), false, None, None, 1, None, None)
                     }
                 }
             } else if !proven_oom && !proven_timeout {
                 evidence_errors.push(format!("missing result row {}", result_file.display()));
-                ("NO_RESULT".to_string(), false, None, None, None, None)
+                ("NO_RESULT".to_string(), false, None, None, 1, None, None)
             } else {
-                ("NO_RESULT".to_string(), false, None, None, None, None)
+                ("NO_RESULT".to_string(), false, None, None, 1, None, None)
             };
             let verification = match artifact_dir.as_deref() {
                 Some(artifact_dir) => match read_verification_report(cell, artifact_dir) {
@@ -4418,81 +4425,77 @@ fn summarize(
             }
             // ⚠️ AN EARLIER ATTEMPT THAT DIVERGED IS STILL AN OBSERVATION.
             // The row above reports the TERMINAL attempt, which is what the
-            // harness exit describes. On the red-cell path, an attempt before it
-            // that located a divergence is emitted as its own row carrying the
-            // repeat ordinal, so the observation is recorded instead of being
-            // dropped when a retry happens to pass. A flake is exactly
+            // harness exit describes. An attempt before it that located a
+            // divergence is emitted as its own row carrying the same repetition
+            // and its own attempt ordinal, so the observation is recorded instead
+            // of being dropped when a retry happens to pass. A flake is exactly
             // "diverged, then passed".
-            //
-            // ⚠️ RED CELLS ONLY, and `metadata.repetitions.is_none()` is what
-            // makes that so: it is the existing discriminator for the red-cell
-            // campaign, the same one that decides whether a pass is recorded as a
-            // promotion candidate. Doing this for green cells would change what
-            // the scorecard reports about cells nobody currently considers
-            // suspect. That is a decision about what green means and it is
-            // deliberately not taken here.
             //
             // ⚠️ THIS CANNOT MOVE A STATUS. These rows only add observations, and
             // observations feed `measurement`; `status` is owned by a different
             // writer and the scorecard enforces that boundary.
-            if metadata.repetitions.is_none() && row_valid {
-                let earlier: Vec<JsonValue> = result_rows_for_history
-                    .last()
-                    .map(|terminal| {
-                        earlier_attempts_that_located(
-                            &result_rows_for_history,
-                            terminal.attempt,
-                        )
-                            .into_iter()
-                            .map(|earlier_row| {
-                                json!({
-                                    "cell": cell,
-                                    "repetition": earlier_row.attempt,
-                                    "harness_exit": harness_status,
-                                    "outcome": earlier_row.outcome,
-                                    "reason": earlier_row.reason,
-                                    "error_kind": earlier_row.error_kind,
-                                    "invocation": invocation,
-                                    "result_row_valid": true,
-                                    // The attempt located a divergence, so the
-                                    // result that describes it is the one that
-                                    // carries a divergence position.
-                                    "result": "determinism-failure",
-                                    "verification": {
-                                        "first_divergent_record":
-                                            earlier_row.first_divergent_record,
-                                        "first_divergent_syscall":
-                                            earlier_row.first_divergent_syscall,
-                                        "first_divergent_scheduler_turn":
-                                            earlier_row.first_divergent_scheduler_turn,
-                                        "first_divergent_virtual_nanoseconds":
-                                            earlier_row.first_divergent_virtual_nanoseconds,
-                                        "first_divergent_left_message":
-                                            earlier_row.first_divergent_left_message,
-                                        "first_divergent_right_message":
-                                            earlier_row.first_divergent_right_message,
-                                    },
-                                    "verification_logs": verification_logs,
-                                    "normalized_ptrace_golden": normalized_ptrace_golden,
-                                    "evidence_errors": Vec::<String>::new(),
-                                    "runner_seen": runner.seen,
-                                    "runner_ok": runner.ok,
-                                    "runner_timed_out": runner.timed_out,
-                                    "runner_oom": runner.oom,
-                                    "oom_proven_by_runner_and_attempt_marker": false,
-                                    "timeout_proven_by_runner_and_attempt_marker": false,
-                                })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                for earlier_row in earlier {
-                    rows.push(earlier_row);
+            if row_valid {
+                if let Some(terminal) = result_rows_for_history.last() {
+                    for earlier_row in earlier_attempts_that_located(
+                        &result_rows_for_history,
+                        terminal.attempt,
+                    ) {
+                        let earlier_invocation = result_row_invocation(earlier_row)?;
+                        let earlier_artifact_dir = result_artifact_dir(results, earlier_row)?;
+                        let earlier_verification = read_verification_report(
+                            cell,
+                            &earlier_artifact_dir,
+                        )?
+                        .ok_or_else(|| {
+                            format!(
+                                "earlier attempt {} located a divergence but has no verification report at {}",
+                                earlier_row.attempt,
+                                verification_report_path(&earlier_artifact_dir).display()
+                            )
+                        })?;
+                        let earlier_verification_logs =
+                            retained_verification_logs(cell, &earlier_artifact_dir)?;
+                        let earlier_normalized_ptrace_golden =
+                            crate::normalized_ptrace_golden(cell, &earlier_artifact_dir)?;
+                        rows.push(json!({
+                            "cell": cell,
+                            "repetition": repetition,
+                            "attempt": earlier_row.attempt,
+                            "harness_exit": harness_status,
+                            "outcome": earlier_row.outcome,
+                            "reason": earlier_row.reason,
+                            "error_kind": earlier_row.error_kind,
+                            "invocation": earlier_invocation,
+                            "result_row_valid": true,
+                            "result": classify_result(
+                                runner,
+                                harness_status,
+                                &earlier_row.outcome,
+                                true,
+                                earlier_row.reason.as_deref(),
+                                &cell.mode,
+                                earlier_verification.get("verdict").and_then(JsonValue::as_str),
+                                earlier_verification_logs.len() == 2,
+                                true,
+                            ),
+                            "verification": earlier_verification,
+                            "verification_logs": earlier_verification_logs,
+                            "normalized_ptrace_golden": earlier_normalized_ptrace_golden,
+                            "evidence_errors": Vec::<String>::new(),
+                            "runner_seen": runner.seen,
+                            "runner_ok": runner.ok,
+                            "runner_timed_out": runner.timed_out,
+                            "runner_oom": runner.oom,
+                            "oom_proven_by_runner_and_attempt_marker": false,
+                            "timeout_proven_by_runner_and_attempt_marker": false,
+                        }));
+                    }
                 }
             }
             rows.push(json!({
                 "cell": cell,
                 "repetition": repetition,
+                "attempt": attempt,
                 "harness_exit": harness_status,
                 "outcome": outcome,
                 "reason": reason,
