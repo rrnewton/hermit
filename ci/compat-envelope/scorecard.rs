@@ -826,15 +826,20 @@ struct PressureSummaryRow {
     /// ⚠️ THIS FIELD IS WHY THE RANGES WERE UNFILLABLE. `pressure-test.rs run
     /// --repetitions N` emits ONE ROW PER REPETITION, each stamped with its
     /// repetition and carrying its own verification report. This consumer had
-    /// no such field and treated the second row for a cell as a DUPLICATE,
+    /// no such field and treated the second row for a cell as a duplicate,
     /// refusing the whole summary -- so the one workflow that can produce a
     /// distribution could never reach the scorecard, and `samples` could never
     /// exceed one.
     ///
-    /// Repeats are now distinguished, and the duplicate guard is keyed on
-    /// `(cell, repetition)` so a genuinely repeated row is still refused.
+    /// Repeats are now distinguished. The attempt below additionally separates
+    /// a failed observation from a passing retry inside one repetition.
     #[serde(default)]
     repetition: Option<u64>,
+    /// Which framework-written attempt within this repetition produced the
+    /// row. Older summaries contain one row per repetition and therefore
+    /// default to attempt 1.
+    #[serde(default = "default_attempt")]
+    attempt: u64,
     result: String,
     #[serde(default)]
     verification: Option<canonical_verdict::VerificationReport>,
@@ -2759,13 +2764,16 @@ fn apply_pressure_summary(
     let mut skipped: Vec<(String, String)> = Vec::new();
     let mut prepared = Vec::new();
     for row in &summary.rows {
-        // Keyed on (cell, repetition): repeats of one cell are the POINT of a
-        // stress campaign, while two rows claiming the same repetition are
-        // still a malformed summary that would double-count.
-        if !seen.insert((row.cell.clone(), row.repetition)) {
+        // Keyed on (cell, repetition, attempt): repeats of one cell and retries
+        // within one repetition are both real observations, while two rows
+        // claiming the same attempt would double-count.
+        if !seen.insert((row.cell.clone(), row.repetition, row.attempt)) {
             skipped.push((
                 display_id(&row.cell),
-                format!("duplicate row for repetition {:?}", row.repetition),
+                format!(
+                    "duplicate row for repetition {:?}, attempt {}",
+                    row.repetition, row.attempt
+                ),
             ));
             continue;
         }
@@ -5931,6 +5939,7 @@ red/`measured-and-passed` count is **0**.",
     let pressure_row = |result: &str, turn: Option<u64>, virtual_nanoseconds| PressureSummaryRow {
         cell: id.clone(),
         repetition: None,
+        attempt: 1,
         result: result.into(),
         verification: Some(pressure_verification(
             result,
@@ -6002,6 +6011,40 @@ red/`measured-and-passed` count is **0**.",
         }
         row
     };
+    let mut retried = observed.clone();
+    let first_attempt = pressure_repeat(1, "determinism-failure", Some(20), Some(500));
+    let mut second_attempt = pressure_repeat(1, "pass", None, None);
+    second_attempt.attempt = 2;
+    if let Some(invocation) = second_attempt.invocation.as_mut() {
+        invocation.run_id = "fixture-pass-rep1-attempt2".into();
+    }
+    let retried_outcome = apply_pressure_summary(
+        &mut retried,
+        &pressure_summary("sha-1", "tree-1", vec![first_attempt, second_attempt]),
+        "sha-1",
+        "tree-1",
+        &depth_fixture,
+    )
+    .map_err(|e| format!("green retry pressure-observation bracket failed: {e}"))?;
+    let retry_observation = &retried.cells[0].observations[0];
+    if retried_outcome.rows != 2
+        || retry_observation.results
+            != BTreeSet::from([ObservedResult::Pass, ObservedResult::DeterminismFailure])
+        || retry_observation
+            .first_divergent_scheduler_turn
+            .range()
+            != Some(ObservedRange {
+                earliest: 20,
+                latest: 20,
+                samples: 1,
+            })
+        || retry_observation.invocations.len() != 2
+    {
+        return Err(
+            "a passing retry did not preserve the earlier divergence as a separate observation"
+                .into(),
+        );
+    }
     // Kept as a single-row summary for the refusal brackets below, which need a
     // valid summary to corrupt.
     let first = pressure_summary(
@@ -7304,6 +7347,7 @@ red/`measured-and-passed` count is **0**.",
         vec![PressureSummaryRow {
             cell: id.clone(),
             repetition: None,
+            attempt: 1,
             result: "infrastructure-error".into(),
             verification: None,
             evidence_errors: vec!["fixture missing".into()],
