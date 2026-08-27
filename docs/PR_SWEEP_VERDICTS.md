@@ -2125,43 +2125,25 @@ instance is this document's own lane-status board, which merged a blocked head.
 
 ### Instance 1 — the malformed-binding detector shares the grammar's anchor
 
-`ci-hub/health/approval_binding.py` deliberately carries a second regex beside the
-approval grammar, and its comment says why: *"LOUD ON THE UNKNOWN. A line that is
-plainly trying to be a verdict binding … but which matches neither grammar is
-reported, never ignored. Silently skipping an unrecognised variant is how variant
-three went unnoticed."* Exactly the right instinct. But both regexes are anchored
-at line start:
+Before dev-hermit commit `8d03485cf8ce2eba307cc13248b9353a23091988`,
+`ci-hub/health/approval_binding.py` carried a second regex beside the approval
+grammar. Both were anchored at line start:
 
 ```python
 approve = re.compile(r"^APPROVED-AT:\s*(claude|codex)\s+([0-9a-f]{40})$", re.I)
 suspect = re.compile(r"^(?:APPROV|CHANGES-REQUESTED|REQUEST\s+CHANGES|…)[^\n]*\b[0-9a-f]{40}\b", re.I)
 ```
 
-`undecorate()` strips *symmetric* wrappers (`**…**`, `` `…` ``) before matching, so
-whole-line emphasis is handled. A **leading** marker is not symmetric and is not
-stripped. Measured against the four forms seen in the wild:
-
-| line form | binds? | flagged malformed? |
-|---|---|---|
-| `APPROVED-AT: claude <sha>` | **yes** | – |
-| bold + backtick wrapper, no lane token | no | yes |
-| `APPROVED-AT: <sha>` — bare, no lane token | no | yes |
-| `## APPROVED-AT: claude <sha>` — heading | **no** | **no** |
-
-The last row was the finding. That line has the lane token, the colon and a correct
-40-hex head; the heading prefix alone defeated it, and it defeated BOTH regexes, so
-the near-miss detector was blind to precisely the near-misses that were near-missing
-because of the anchor. Two live heads carried a real, current, correct-sha review in
-that form and the board showed them as un-reviewed.
-
-⚠️ **THE TABLE ABOVE IS FOUR FORMS SEEN IN THE WILD, NOT THE CLASS, AND AN EARLIER
-DRAFT OF THIS SECTION CALLED IT "the one decoration". THAT WAS WRONG.** A leading
-marker is not one decoration; it is a prefix class, and the class is larger than the
-heading. `agent(codex-rev-2602)` raised this and I re-measured it independently
-rather than copying the list.
+An early draft published a four-row result without recording either the source
+commit or the command that produced it. That table is withdrawn: a parser result
+without the parser bytes is not reproducible evidence. The underlying heading case
+is independently established by the fix commit and its tests: the same leading
+decoration defeated both the strict parser and the check intended to report malformed
+marker lines. It was one observed input, not the whole input set.
 
 ⚠️ **AND THE PART THAT MATTERS MOST: THE CLASS IS STILL OPEN AFTER THE FIX.**
-Measured 2026-08-27 by driving `lane_shas` in the COORDINATOR copy at
+Measured 2026-08-27 against dev-hermit
+`a76221a934d500691b59ca0bcfe6ff85ec57b57e`, by driving `lane_shas` from
 `ci-hub/health/approval_binding.py`, one comment per probe, role tag present,
 `author_association=MEMBER`, against a control that binds:
 
@@ -2181,19 +2163,14 @@ Measured 2026-08-27 by driving `lane_shas` in the COORDINATOR copy at
 | `<U+200B>APPROVED-AT: claude <sha>` | no | **no** |
 | `Posting APPROVED-AT: claude <sha>` | no | **no** |
 
-**Eight forms still bind nothing and are still not flagged.** The heading case was
+**Nine forms still bind nothing and are still not flagged.** The heading case was
 closed; the class was not. Reporting the fix as complete would be the same defect
 this section is about, one layer along — so it is recorded here as open rather than
 as history.
 
-⚠️ **THE PRE-FIX TABLE IS NOT PINNED TO A COMMIT AND CANNOT BE RE-DERIVED FROM THIS
-DOCUMENT.** The before/after pair below names `8d03485c` and `8b4b6e137b87`; the
-four-row table above does not name the bytes it was measured against. Anyone
-re-checking it must pin their own commit first. That is the stale-table failure this
-document exists to name, present in this document.
-
-**FIXED, and the fix validated the reasoning.** `8d03485c` strips block-level prefixes
-before matching. Re-measured against main afterwards, driving `lane_shas` directly:
+**The block-level-prefix case was fixed, and the fix validated the reasoning.**
+`8d03485c` strips block-level prefixes before matching. Re-measured against main
+afterwards, driving `lane_shas` directly:
 
 *(measured at dev-hermit `8d03485c`; re-confirmed at main `8b4b6e137b87`)*
 
@@ -2203,8 +2180,10 @@ before matching. Re-measured against main afterwards, driving `lane_shas` direct
 | `## CHANGES-REQUESTED-AT: …` | **failed open — approval stood** | **refuses, clears the lane** |
 
 The refusal direction is the one that mattered and it was not in the original finding:
-a *block* wearing markdown read as *approved*. That is the mechanism behind hermit#2591
-merging over a bound changes-request.
+a *block* wearing markdown could leave an earlier approval standing. This was a real
+failure mode, but it was **not** the mechanism in
+https://github.com/rrnewton/hermit/pull/2591. That pull request's refusal was plain,
+exact-head and parsed; the landing path failed to invoke the refusal gate.
 
 ⚠️ **The relaxation was safe for the reason claimed, and this is the transferable part:**
 stripping decoration cannot admit anything new, because the strict grammar still has to
@@ -2212,95 +2191,34 @@ match afterwards — it can only promote a line that was *already* a well-formed
 modulo decoration. A relaxation that widens what is **read** while leaving what is
 **accepted** unchanged has no false-positive surface, so it needs no corpus re-audit.
 
-⚠️ **THE LEADING-WORD CLASS WAS OPEN AND IS NOW CLOSED, AND THE FACT THAT THIS
-PARAGRAPH HAD TO BE REWRITTEN IS THE SECTION'S OWN POINT.** When first written, a
-leading WORD defeated both regexes: `## CODEX-LANE CHANGES-REQUESTED-AT: codex <sha>`
-is not block-level markdown, so normalisation did not reach it, and the refusal path
-FAILED OPEN. That is no longer true.
+The positive and negative paths must be measured separately. The current
+`lane_shas` measurement above shows that a leading word still neither binds an
+approval nor reaches the malformed counter. A refusal gate may deliberately accept
+more spellings in order to fail closed, but that result does not establish what the
+approval parser accepts.
 
-**Re-measured 2026-08-25 at dev-hermit main `8b4b6e137b87`**, driving `lane_shas`
-directly for the positive and `changes-requested-gate --from-json` for the negative:
+⚠️ **`scripts/core-review-protocol-lint.sh` IS NOT A SECOND IMPLEMENTATION OF THIS
+GRAMMAR.** At this document's head it reads supplied labels and required PR-body
+sections; it does not read review comments or parse `APPROVED-AT` at all. The exact-head
+binding check lives in dev-hermit's `approval_binding.py` and the landing wrapper.
+Calling the shell lint a disagreeing parser attributed behavior to code that has no
+such path.
 
-| line form | approval binds | refusal blocks |
-|---|---|---|
-| `APPROVED-AT: claude <sha>` | yes | yes |
-| `## …` heading, `**…**` bold, `- …` list, `> …` quote | yes | yes |
-| `Posting APPROVED-AT: claude <sha>` — leading word | **no, and FLAGGED malformed** | **yes, blocks** |
-| `CODEX-LANE CHANGES-REQUESTED-AT: claude <sha>` | **no, and FLAGGED malformed** | **yes, blocks** |
-| `CHANGES-REQUESTED: claude <sha>` — no `-AT` | – | **yes, blocks** |
+⚠️ **PIN THE PATH AND COMMIT BEFORE QUOTING THIS BEHAVIOR.** The parser changed
+several times while this section was reviewed. The current table above names both:
+dev-hermit `ci-hub/health/approval_binding.py` at
+`a76221a934d500691b59ca0bcfe6ff85ec57b57e`. A statement that names only
+`approval_binding.py` cannot be reproduced after the file moves again.
 
-⚠️ **The two directions closed asymmetrically, and the asymmetry is correct.** A
-leading word makes an *approval* fail to bind AND be reported malformed — it cannot
-silently grant. The same word no longer hides a *refusal* at all: every shape above
-blocks. Each direction fails toward refusing, which is the only safe polarity for a
-gate whose two errors are not symmetric.
+### Instance 2 — a detector gated behind the label could not see missing bindings
 
-⚠️ **DO NOT COPY THE PRESCRIPTION THIS PARAGRAPH USED TO CARRY.** It said the remedy
-for a decoration you cannot enumerate is to key the gate on the marker's **presence**
-rather than its parse. That was wrong for the positive direction and is now
-unnecessary for the negative one — the unanchored matcher closed the class without
-giving up the sha test. See the next subsection for what presence-keying costs.
+Before dev-hermit commit `7820d2be4b5378d16bef450fd0c1a3bc84bd356b`,
+the default fleet scan called `lane_shas()` only for pull requests already carrying
+a tracked `passed-review-*` label. The scan therefore examined heads already
+credited with a lane and omitted heads whose binding failed badly enough never to
+earn the label.
 
-⚠️ **BUT PRESENCE-KEYING IS RIGHT FOR THE NEGATIVE AND WRONG FOR THE POSITIVE, AND THE
-NEGATIVE STILL HAS TO BIND THE CURRENT HEAD.** Unqualified, that sentence is dangerous
-in both directions and this is where people will copy it from:
-
-- **A refusal keyed on presence with no sha test can never be cleared by pushing** —
-  the one legitimate clearing path. Measured today: `_REFUSAL_SHAPED` in
-  `gh-merge-verified` is presence-keyed with no sha condition and returns **6 blockers
-  on hermit#2611, all false** — 11 of 17 refusal-shaped lines there carry no 40-hex at
-  all, 6 carry a stale one, and zero bind the current head.
-- **An approval keyed on presence is the stale-label defect** this document catalogues
-  elsewhere.
-
-The rule is: **presence for the negative, binding for the positive, and the negative
-must still name the current head to block.**
-
-⚠️ **AND TWO IMPLEMENTATIONS OF THIS GRAMMAR CURRENTLY DISAGREE ABOUT WHAT GRANTS
-AUTHORITY**, which is Instance 3 one level up — a consumer and an authority silently
-differing:
-
-| input | verdict |
-|---|---|
-| dev-hermit `approval_binding.py` (authority) | **grants** `## APPROVED-AT: claude <sha>` |
-| hermit `core-review-protocol-lint.sh` | **refuses** it, deliberately — *"an approval still binds only when APPROVE_RE matches the original undecorated line exactly"* |
-
-Both positions are defensible; they cannot both be the rule. Recorded here rather than
-resolved, because which one is normative is a policy call.
-
-⚠️ **PIN THE COPY AND THE COMMIT BEFORE QUOTING ANY OF THIS. THE "authority" DRIFTS,
-AND IT DRIFTED TWICE WHILE THIS SECTION WAS BEING REVIEWED.** There is not one
-`approval_binding.py`; there is a coordinator copy under `ci-hub/health/` and a copy
-stamped into dev-hermit, and they have disagreed at every measurement so far:
-
-| when | copy | `WITHDRAWN` occurrences |
-|---|---|---|
-| at `agent(codex-rev-2602)`'s review | coordinator `ci-hub/health/approval_binding.py` | **0** — a well-formed withdrawal produced `binds=False, malformed=1` |
-| at `agent(codex-rev-2602)`'s review | dev-hermit stamped at `8b4b6e137b87` | **11** — the same probe produced `malformed=0` |
-| 2026-08-27, `agent(hermit-139)` | coordinator `ci-hub/health/approval_binding.py` | **12** |
-
-So the symptom described above is version-dependent, and **the copy divergence is
-itself part of the finding** rather than a detail. A sentence here naming
-"`approval_binding.py`" without saying WHICH ONE and AT WHAT COMMIT is unfalsifiable
-by the time anyone reads it — which is the failure this document is about, appearing
-in the document's own evidence.
-
-`ci-hub/bin/changes-requested-gate` is pinned **72/72 against the marker LINE-SHAPE
-matrix** (lead x trail x sha-form). ⚠️ That is not the variant space: composition
-between comments is a separate axis the line-shape matrix structurally cannot see, and
-`test_marker_axis_space.py` covers 480 cells over seven axes. The gate runs the 72, not
-the 480 — **it is unpinned against composition.** Stated precisely because the closing
-rule of this section is *report the denominator*, and a denominator that names more
-than it covers is the one error this section cannot afford.
-
-### Instance 2 — the detector is gated behind the label it exists to validate
-
-The malformed counter lives inside `lane_shas()`, and `lane_shas()` is only called
-for pull requests that already carry a tracked `passed-review-*` label. So the
-scan runs on heads that have already been credited with a lane, and never on heads
-whose binding failed.
-
-**Measured 2026-08-25, same repository, same moment:**
+One historical measurement reported:
 
 ```console
 $ approval_binding.py --repo rrnewton/hermit --json | jq .malformed_source_lines
@@ -2328,19 +2246,14 @@ instant. **That is the point, and it belongs in this document rather than being
 quietly repaired: a number published without its query is not evidence, and this
 one was in a document about instruments that report confidently wrong figures.**
 
-Instance 2's mechanism does not depend on the count and stands without it: the
-counter is gated behind the label it exists to validate, so a binding that failed
-badly enough never to earn a label is exactly the binding it cannot see.
+The historical mechanism does not depend on the withdrawn count: a binding that
+failed badly enough never to earn a label was exactly the binding the scan could
+not see.
 
-hermit#2589 alone carries two and is reported as zero: it has no
-`passed-review-*` label, so it is never examined. **A binding that failed so badly
-it never earned a label is exactly the binding the detector cannot see**, and the
-counter reads `0` with total confidence.
-
-**Fix:** scan for the negative marker over the *candidate* population, not the
-*credited* one. The set to sweep is "pull requests whose comments mention the
-verdict keyword", which is strictly larger than "pull requests carrying the
-success label" and does not depend on the thing being measured.
+**Fixed in `7820d2be4b5378d16bef450fd0c1a3bc84bd356b`.** The current fleet scan also
+calls `lane_shas()` for unlabelled Claude and Codex lanes and retains a row when it
+finds either an approval or a refusal. Targeted `--pr` mode does the same. The
+population is no longer selected only by the success label it is checking.
 
 ### Instance 3 — a sweep that extracts only the success marker cannot see a block
 
@@ -2354,27 +2267,29 @@ current, correctly-formatted **block** rendered on the board exactly like a head
 that had simply not been reviewed yet — and a head carrying an approval *followed*
 by a block rendered as **ready to land**.
 
-**hermit#2591, measured.** A reviewer posted `CHANGES-REQUESTED-AT: claude <head>`
-at the exact current head. The lane-status still showed the earlier approval, a
-lander read "carries a valid non-author lane", and the head merged over the block
-at 18:09:01Z. The content that landed was worse than no change: three defects the
-block existed to stop, including a recipe that fails on its second run.
+**https://github.com/rrnewton/hermit/pull/2591, measured.** A reviewer posted a
+plain `CHANGES-REQUESTED-AT: claude <head>` at the exact current head. The marker
+parsed; the landing path did not invoke the refusal gate. The lane-status still
+showed the earlier approval, a lander read "carries a valid non-author lane", and
+the head merged over the block at 18:09:01Z. The content that landed was worse than
+no change: three defects the block existed to stop, including a recipe that fails
+on its second run.
 
-**hermit#2176, the same blindness caught before it cost anything.** Re-running the
-sweep with both markers showed `claude=BLOCKED` at the current head. The
-approval-only board had it as "awaiting a codex lane" — which would have routed the
-only codex-family agent on the fleet onto a blocked head.
+**https://github.com/rrnewton/hermit/pull/2176, the same blindness caught before it
+cost anything.** Re-running the sweep with both markers showed `claude=BLOCKED` at
+the current head. The approval-only board had it as "awaiting a codex lane" — which
+would have routed the only codex-family agent on the fleet onto a blocked head.
 
-Note that `approval_binding.py` gets this **right**: a rejection calls
-`found.clear()`, so the authority correctly reported `UNDETERMINED`. The defect was
-in a downstream sweep that reimplemented half of the authority's grammar. That is
-the general hazard — *a consumer that re-implements only the half of a protocol it
-is interested in inherits none of the other half's protections.*
+Current `approval_binding.py` returns approvals and outstanding refusals separately,
+so a consumer can distinguish `REFUSED` from an unreviewed lane. The defect was in a
+downstream sweep that reimplemented only the success half of the authority's
+grammar.
 
-**Fix:** extract both verdict markers and let the **newest verdict per lane** win,
-which is the rule the authority already applies. A lane then has three states, not
-two, and a board that cannot distinguish them must say so on its face rather than
-render blocked and unreviewed identically.
+**Fix:** extract both verdict markers and preserve issuer-owned refusal handling. A
+later approval by a different reviewer does not discharge another reviewer's
+refusal; the refusing reviewer must approve or withdraw it. A lane then has three
+states, not two, and a board that cannot distinguish them must say so on its face
+rather than render blocked and unreviewed identically.
 
 ### The fix shape, and it is already in this codebase twice
 
@@ -2382,18 +2297,18 @@ All three instances share one repair: **give the negative outcome a first-class 
 and a counter of its own, sourced independently of the positive path.** This
 project has built that twice already, and they are the models to copy.
 
-- **`detcore/src/logdiff.rs` — `verdict: no_result`.** A comparison that could not
-  read its inputs refuses instead of reporting a match, and the refusal is a named
-  verdict rather than a fallthrough. Its regression tests are named for the
-  property: `nothing_written_yet_is_a_no_result_not_a_match`,
-  `empty_selection_is_a_no_result_not_a_match`. `AGENTS.md` states the policy
-  directly — *"an unreadable or truncated comparison must refuse with `verdict:
-  no_result` rather than report a match."*
-- **`approval_binding.py` — `landing_observability()`.** It *refuses an empty
-  window* — *"zero commits measured is not zero unobserved landings, it is no
-  measurement"* — and where coverage cannot be established it emits the literal
-  string `"NOT MEASURED"` instead of a number it cannot justify. The same file
-  therefore contains both the defect and its cure.
+- **`detcore/src/logdiff.rs` and `hermit-cli/src/bin/hermit/logdiff.rs`.** Detcore's
+  `matched_with_evidence()` requires nonzero compared-message counts; its tests
+  `nothing_written_yet_is_a_no_result_not_a_match` and
+  `empty_selection_is_a_no_result_not_a_match` pin the negative direction. The CLI
+  gives the resulting states names: an empty selection is `no_comparable_messages`,
+  an input it cannot compare is `refused`, and `no_result` is the report written
+  before comparison starts so a crash cannot leave a false match.
+- **dev-hermit `ci-hub/health/approval_binding.py` — `landing_observability()`.** At
+  dev-hermit `a76221a934d500691b59ca0bcfe6ff85ec57b57e` it refuses an empty window —
+  *"zero commits measured is not zero unobserved landings, it is no measurement"*
+  — and emits the literal string `"NOT MEASURED"` when coverage cannot be
+  established. This is a separate repository and the commit is part of the claim.
 
 ### The check to apply
 
