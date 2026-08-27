@@ -120,6 +120,10 @@ const RELEASE_GRACE_TICKS: u32 = 25;
 pub struct GdbClientWatch {
     container_done: Arc<AtomicBool>,
     client_exited_early: Arc<AtomicBool>,
+    // Test synchronization: set only after the watcher has reaped the client
+    // and confirmed that the container has not finished.
+    #[cfg(test)]
+    client_exited_before_container_finished: Arc<AtomicBool>,
     watcher: Option<JoinHandle<()>>,
 }
 
@@ -134,6 +138,10 @@ impl GdbClientWatch {
         let client_exited_early = Arc::new(AtomicBool::new(false));
         let done = Arc::clone(&container_done);
         let exited_early = Arc::clone(&client_exited_early);
+        #[cfg(test)]
+        let client_exited_before_container_finished = Arc::new(AtomicBool::new(false));
+        #[cfg(test)]
+        let observed_exit_before_finish = Arc::clone(&client_exited_before_container_finished);
 
         let watcher = thread::spawn(move || {
             // ⚠️ POLL, DO NOT BLOCK. This was `client.wait()`, which blocks until
@@ -187,6 +195,8 @@ impl GdbClientWatch {
             if done.load(Ordering::SeqCst) {
                 return;
             }
+            #[cfg(test)]
+            observed_exit_before_finish.store(true, Ordering::SeqCst);
 
             // ⚠️ THE CLIENT IS GONE AND THE CONTAINER IS NOT. Whatever the
             // container is doing, no debugger will ever attach to it, so a
@@ -320,6 +330,8 @@ impl GdbClientWatch {
         Self {
             container_done,
             client_exited_early,
+            #[cfg(test)]
+            client_exited_before_container_finished,
             watcher: Some(watcher),
         }
     }
@@ -414,6 +426,8 @@ impl Drop for GdbClientWatch {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+    use std::io::Write;
     use std::net::TcpListener;
     use std::time::Instant;
 
@@ -935,14 +949,14 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind a test listener");
         let port = listener.local_addr().expect("no local addr").port();
 
-        // A stand-in for `gdb -batch ... quit`: connect, hold the session open
-        // briefly, then exit. The hold is what makes the ordering deterministic
-        // -- it lets the accept and the listener drop happen while the client is
-        // still alive, so the watcher cannot race in before the session exists.
+        // A stand-in for `gdb -batch ... quit`: connect, wait for the server to
+        // finish the session, then exit. Waiting on the accepted connection makes
+        // the ordering a fact rather than a delay: the client cannot exit before
+        // the accept and listener drop have happened.
         let client = std::process::Command::new("bash")
             .arg("-c")
             .arg(format!(
-                "exec 3<>/dev/tcp/127.0.0.1/{port} || exit 1; sleep 1; exec 3>&-"
+                "exec 3<>/dev/tcp/127.0.0.1/{port} || exit 1; IFS= read -r -n 1 <&3; exec 3>&-"
             ))
             .spawn()
             .expect("failed to spawn the stand-in client");
@@ -967,27 +981,55 @@ mod tests {
                 Err(e) => panic!("accept failed: {e}"),
             }
         };
-        let accepted = accepted.expect("the stand-in client never connected within 30s");
+        let (mut accepted, _) = accepted.expect("the stand-in client never connected within 30s");
 
         // ⚠️ THE REVERIE CONTRACT, REPRODUCED. `wait_for_tcp_connection` returns
         // the stream and drops the listener; from here on the port answers
         // nothing, while the session itself stays open.
         drop(listener);
 
-        // Let the client finish its session and exit, and give the watcher time
-        // to observe that and attempt its release connect.
-        thread::sleep(Duration::from_millis(2000));
+        // End the accepted session, then wait for the peer to close it. EOF is
+        // direct evidence that the client completed the session; no elapsed time
+        // is used as a substitute for that fact.
+        accepted
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("failed to bound the wait for the stand-in client to close");
+        accepted
+            .write_all(b"q")
+            .expect("failed to finish the stand-in client's session");
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            accepted
+                .read(&mut byte)
+                .expect("the stand-in client did not close its session within 30s"),
+            0,
+            "the stand-in client sent unexpected data instead of closing its session"
+        );
+
+        // `finish()` publishes container completion. Wait until the watcher has
+        // reaped the client and confirmed that the container is still running,
+        // so this cell cannot silently take the container-finished-first branch
+        // and pass without exercising its case.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !watch
+            .client_exited_before_container_finished
+            .load(Ordering::SeqCst)
+            && Instant::now() < deadline
+        {
+            thread::sleep(CLIENT_POLL_INTERVAL);
+        }
+        assert!(
+            watch
+                .client_exited_before_container_finished
+                .load(Ordering::SeqCst),
+            "the watcher did not observe the stand-in client exit while the container was still running"
+        );
 
         assert!(
             !watch.finish(),
             "a client that connected, finished its session and exited was reported as having \
              exited before connecting -- the flag's own documented meaning, inverted"
         );
-        assert!(
-            !watch.client_exited_early.load(Ordering::SeqCst),
-            "the flag was set for a session that completed normally"
-        );
-
         drop(accepted);
     }
 }
