@@ -27,8 +27,10 @@
 # What is NOT claimed: that the fetch phase needs no upstreams. It does. It just
 # cannot lie to us about what it got.
 #
-# OPT-IN: nothing calls this by default and the ordinary validate path is
-# unchanged.
+# The canonical host-side validate plan calls `--fetch-only` once, then wraps
+# each build/test DAG node in the pinned root. Invoking this script without
+# `--fetch-only` remains the explicit whole-split diagnostic path, where one
+# container drives the selected node sequence itself.
 #
 # ---------------------------------------------------------------------------
 # WHERE THE NODE SETS COME FROM -- and why they are not invented here.
