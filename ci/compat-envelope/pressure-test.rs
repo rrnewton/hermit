@@ -6935,8 +6935,8 @@ fn self_test(root: &Path) -> Result<(), String> {
             true,
             Some(0),
         )
-        || result_artifact_dir(&scratch, &appended[1])?
-            != PathBuf::from(&second_row.artifact_dir)
+        || result_artifact_dir(&scratch, &appended[1])?.as_path()
+            != Path::new(&second_row.artifact_dir)
     {
         return Err(format!(
             "two appended result observations were not retained independently: {appended:?}"
