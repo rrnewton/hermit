@@ -647,6 +647,42 @@ fn waitid_honors_sa_restart_after_running_the_handler() {
 }
 
 #[test]
+fn waitid_wcontinued_signal_interrupts_without_panicking() {
+    let run = run_bounded(&["--waitid-wcontinued-signal-interrupt"], true, None);
+    assert!(
+        run.status.success(),
+        "hermit exited with {}\nguest stdout:\n{}\nhermit stderr:\n{}",
+        run.status,
+        run.stdout,
+        run.stderr,
+    );
+    assert!(
+        run.stdout
+            .contains("waitid-wcontinued-signal-interrupt rc=-1 errno=4 handler=1"),
+        "WCONTINUED waitid did not return EINTR after its handler\nguest stdout:\n{}",
+        run.stdout,
+    );
+}
+
+#[test]
+fn waitid_wstopped_signal_interrupts_without_panicking() {
+    let run = run_bounded(&["--waitid-wstopped-signal-interrupt"], true, None);
+    assert!(
+        run.status.success(),
+        "hermit exited with {}\nguest stdout:\n{}\nhermit stderr:\n{}",
+        run.status,
+        run.stdout,
+        run.stderr,
+    );
+    assert!(
+        run.stdout
+            .contains("waitid-wstopped-signal-interrupt rc=-1 errno=4 handler=1"),
+        "WSTOPPED waitid did not return EINTR after its handler\nguest stdout:\n{}",
+        run.stdout,
+    );
+}
+
+#[test]
 fn waitid_ready_child_path_is_ptrace_l2() {
     let build_root = waitid_guest()
         .parent()
@@ -748,6 +784,23 @@ fn dbt_exact_child_waits_return_eintr_without_sa_restart() {
         &["--wait4-signal-interrupt"],
         "wait4-signal-interrupt rc=-1 errno=4 handler=1 target-match=1",
         Some("wait4-signal-interrupt-done"),
+    );
+}
+
+#[test]
+fn dbt_legacy_waitid_signals_return_eintr_without_panicking() {
+    if dbt_unavailable("dbt_legacy_waitid_signals_return_eintr_without_panicking") {
+        return;
+    }
+    assert_dbt_wait_case(
+        &["--waitid-wstopped-signal-interrupt"],
+        "waitid-wstopped-signal-interrupt rc=-1 errno=4 handler=1",
+        None,
+    );
+    assert_dbt_wait_case(
+        &["--waitid-wcontinued-signal-interrupt"],
+        "waitid-wcontinued-signal-interrupt rc=-1 errno=4 handler=1",
+        None,
     );
 }
 

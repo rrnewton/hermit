@@ -608,7 +608,6 @@ where
 async fn interrupted_child_wait_result<G, T, S>(
     guest: &mut G,
     call: S,
-    _spec: ChildWaitSpec,
     disposition: WaitSignalDisposition,
 ) -> Result<i64, Error>
 where
@@ -1442,7 +1441,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                                         break interrupted_child_wait_result(
                                             guest,
                                             call,
-                                            spec,
                                             pending_signal.expect("signal checked above"),
                                         )
                                         .await;
@@ -1463,13 +1461,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                                 break Ok(value);
                             }
                             if let Some(disposition) = pending_signal {
-                                break interrupted_child_wait_result(
-                                    guest,
-                                    call,
-                                    spec,
-                                    disposition,
-                                )
-                                .await;
+                                break interrupted_child_wait_result(guest, call, disposition)
+                                    .await;
                             }
                         }
                         Err(errno) => break Err(errno.into()),
@@ -1778,7 +1771,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                                     break interrupted_child_wait_result(
                                         guest,
                                         call,
-                                        managed_spec.expect("managed spec"),
                                         pending_signal.expect("signal checked above"),
                                     )
                                     .await;
@@ -1819,7 +1811,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                                 break interrupted_child_wait_result(
                                     guest,
                                     call,
-                                    managed_spec.expect("managed spec"),
                                     pending_signal.expect("signal checked above"),
                                 )
                                 .await;
