@@ -11,6 +11,7 @@
   "preflight_nodes": [
     "check.reverie_pin",
     "check.skill_discovery",
+    "check.exit_status_class",
     "check.backend_abstraction",
     "check.backend_parity_mutation",
     "check.backend_parity_suites",
