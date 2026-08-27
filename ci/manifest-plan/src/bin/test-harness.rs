@@ -19,6 +19,7 @@ use hermit_manifest_plan::runner::Selection;
 use hermit_manifest_plan::runner::append_result;
 use hermit_manifest_plan::runner::host_inapplicable_result;
 use hermit_manifest_plan::runner::infrastructure_error_result;
+use hermit_manifest_plan::runner::prepare_result_path;
 use hermit_manifest_plan::runner::requires_capability;
 use hermit_manifest_plan::runner::run_cell;
 use hermit_manifest_plan::runner::write_junit;
@@ -1255,10 +1256,12 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         .junit
         .clone()
         .unwrap_or_else(|| context.result_root.join(&context.run_id).join("junit.xml"));
-    if let Some(parent) = results_path.parent() {
-        fs::create_dir_all(parent).unwrap();
-    }
-    fs::write(&results_path, b"").unwrap();
+    prepare_result_path(&results_path).unwrap_or_else(|error| {
+        fail(format!(
+            "cannot prepare result path {}: {error}",
+            results_path.display()
+        ))
+    });
     let mut indexed_results = Vec::new();
     let mut failed = false;
     let expected = cells.len();

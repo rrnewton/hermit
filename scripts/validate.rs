@@ -148,6 +148,17 @@ fn validation_step_identity(step: &Step) -> ValidationStepIdentity {
     }
 }
 
+fn set_manifest_attempt(step: &mut Step, attempt: usize) {
+    if validation_step_identity(step) == ValidationStepIdentity::ManifestRun
+        || step.cmd.contains("target/debug/test-harness run ")
+    {
+        step.env.insert(
+            validate_plan::E2E_ATTEMPT_ENV.into(),
+            attempt.to_string(),
+        );
+    }
+}
+
 const LEDGER_ENV: &str = "HERMIT_VALIDATE_LEDGER";
 const PARENT_ENV: &str = "DEV_HERMIT_PARENT";
 const OWN_SCOPE_DEADLINE_ENV: &str = "HERMIT_VALIDATE_SCOPE_DEADLINE_MONOTONIC_NS";
@@ -1924,6 +1935,17 @@ cleared-caps refusal names {} starved step(s)",
                 return Err(format!(
                     "full-plan bracket: {} does not have one unique result path: {}",
                     consumer.tag(), consumer.cmd
+                ));
+            }
+            if consumer
+                .env
+                .get(validate_plan::E2E_ATTEMPT_ENV)
+                .map(String::as_str)
+                != Some("1")
+            {
+                return Err(format!(
+                    "full-plan bracket: {} does not declare initial E2E attempt 1: {:?}",
+                    consumer.tag(), consumer.env
                 ));
             }
             if consumer.cmd.matches("--junit").count() != 1
@@ -8470,6 +8492,40 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         ));
     }
 
+    // The E2E harness writes every retry to the same bucket results.jsonl. Its
+    // row must therefore carry the scheduler's actual attempt ordinal rather
+    // than inferring one from whatever rows survived an interrupted attempt.
+    let e2e_attempts = tmp.join("e2e-attempts");
+    let e2e_log = tmp.join("e2e-attempts.log");
+    let e2e_cmd = format!(
+        "printf '%s\\n' \"$E2E_ATTEMPT\" >> {}; exit 1",
+        validate_plan::shell_quote(&e2e_attempts.to_string_lossy()),
+    );
+    let mut e2e_step = step("manifest_attempt", &e2e_cmd);
+    e2e_step.group = "e2e".into();
+    e2e_step.job = "manifest_attempt".into();
+    set_manifest_attempt(&mut e2e_step, 1);
+    let e2e_retry = run_lane_with_env_retries(
+        &DagConfig { steps: vec![e2e_step], ..Default::default() },
+        1,
+        true,
+        0,
+        None,
+        &e2e_log,
+        None,
+        1,
+        &BTreeMap::new(),
+        false,
+    );
+    let recorded_attempts = std::fs::read_to_string(&e2e_attempts)
+        .map_err(|e| format!("scheduler accounting: cannot read E2E attempt fixture: {e}"))?;
+    if e2e_retry.ok || recorded_attempts.lines().collect::<Vec<_>>() != ["1", "2"] {
+        return Err(format!(
+            "scheduler accounting: E2E retry did not receive attempts 1 then 2: ok={} rows={recorded_attempts:?}",
+            e2e_retry.ok
+        ));
+    }
+
     // REPORTED IS NOT EXECUTED. A real first execution classifies, then the
     // wrapper removes itself so the retry's `Command::spawn` fails. Dagrun
     // reports that failure as non-aborted so the DAG cannot wedge, but its
@@ -9185,8 +9241,12 @@ fn run_lane_with_env_retries(
         };
     }
     let mut round_log_start = settled_log_len(log_path);
+    let mut first_cfg = cfg.clone();
+    for step in &mut first_cfg.steps {
+        set_manifest_attempt(step, 1);
+    }
     let first = run_dag_boxed_deadline(
-        cfg,
+        &first_cfg,
         jobs,
         keep_going,
         verbosity,
@@ -9400,6 +9460,10 @@ fn run_lane_with_env_retries(
         let mut retry_cfg = cfg.clone();
         retry_cfg.description = format!("{} — retry round {env_retries}", cfg.description);
         retry_cfg.steps = steps;
+        for step in &mut retry_cfg.steps {
+            let attempt = next_attempt_ordinal(&attempts, &step.tag());
+            set_manifest_attempt(step, attempt);
+        }
         // Everything before this byte belongs to an earlier scheduler
         // invocation. The retry may emit no detail at all; that must stay
         // unknown rather than inheriting a stale banner through whole-log rfind.
@@ -13674,4 +13738,44 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     s.cpu_wall = Some((wall, cpu_user, cpu_sys));
     s.ledger = Some(ledger);
     s
+}
+
+#[cfg(test)]
+mod e2e_attempt_tests {
+    use super::*;
+
+    #[test]
+    fn only_manifest_harness_steps_receive_the_retry_attempt() {
+        let mut manifest = step_with_caps(
+            "quick",
+            "e2e_verify",
+            "fixture",
+            "target/debug/test-harness run --lane portable --ci-only".into(),
+            Vec::new(),
+            30,
+            30,
+            64 * 1024 * 1024,
+        );
+        set_manifest_attempt(&mut manifest, 2);
+        assert_eq!(
+            manifest
+                .env
+                .get(validate_plan::E2E_ATTEMPT_ENV)
+                .map(String::as_str),
+            Some("2")
+        );
+
+        let mut unrelated = step_with_caps(
+            "test",
+            "unit",
+            "fixture",
+            "cargo test".into(),
+            Vec::new(),
+            30,
+            30,
+            64 * 1024 * 1024,
+        );
+        set_manifest_attempt(&mut unrelated, 2);
+        assert!(!unrelated.env.contains_key(validate_plan::E2E_ATTEMPT_ENV));
+    }
 }

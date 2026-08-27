@@ -828,6 +828,8 @@ struct PressureVerification {
 struct ResultRow {
     schema: u64,
     run_id: String,
+    #[serde(default = "default_attempt")]
+    attempt: u64,
     hermit_sha: String,
     source_tree_dirty: bool,
     binary_sha256: Option<String>,
@@ -839,6 +841,8 @@ struct ResultRow {
     backend: Option<String>,
     classification: String,
     outcome: String,
+    #[serde(default)]
+    timeout_seconds: u64,
     log_level: Option<String>,
     effective_args: Vec<String>,
     argv: Vec<String>,
@@ -868,6 +872,10 @@ struct ResultRow {
     first_divergent_record: Option<u64>,
     #[serde(default)]
     first_divergent_syscall: Option<u64>,
+}
+
+fn default_attempt() -> u64 {
+    1
 }
 
 impl ResultRow {
@@ -966,6 +974,7 @@ impl ResultRow {
     fn evidence_identity(&self) -> Result<String, String> {
         let evidence = serde_json::json!({
             "run_id": self.run_id,
+            "attempt": self.attempt,
             "hermit_sha": self.hermit_sha,
             "binary_sha256": self.binary_sha256,
             "test_sha256": self.test_sha256,
@@ -976,6 +985,7 @@ impl ResultRow {
             "backend": self.backend,
             "classification": self.classification,
             "outcome": self.outcome,
+            "timeout_seconds": self.timeout_seconds,
             "log_level": self.log_level,
             "effective_args": self.effective_args,
             "argv": self.argv,
@@ -3269,11 +3279,13 @@ fn read_result_candidates(
             if row.classification != "required" {
                 continue;
             }
-            row.require_provenance()
-                .map_err(|error| format!("{}:{} {error}", path.display(), index + 1))?;
-            row.require_canonical_pass_evidence().map_err(|error| {
-                format!("{}:{} {error}", path.display(), index + 1)
-            })?;
+            if row.attempt == 0 {
+                return Err(format!(
+                    "{}:{} has non-positive attempt 0",
+                    path.display(),
+                    index + 1
+                ));
+            }
             let evidence_identity = row.evidence_identity().map_err(|error| {
                 format!("{}:{} {error}", path.display(), index + 1)
             })?;
@@ -3319,8 +3331,27 @@ fn verify_candidate_set(
             missing.push(display_id(id));
             continue;
         };
+        let run_ids = rows
+            .iter()
+            .map(|candidate| candidate.row.run_id.as_str())
+            .collect::<BTreeSet<_>>();
+        if run_ids.len() != 1 {
+            return Err(format!(
+                "fresh result set mixes run ids for {}: {}",
+                display_id(id),
+                run_ids.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        let terminal_attempt = rows
+            .iter()
+            .map(|candidate| candidate.row.attempt)
+            .max()
+            .expect("candidate rows are nonempty");
         let mut distinct = BTreeMap::new();
-        for candidate in rows {
+        for candidate in rows
+            .iter()
+            .filter(|candidate| candidate.row.attempt == terminal_attempt)
+        {
             distinct
                 .entry(candidate.evidence_identity.as_str())
                 .or_insert(candidate);
@@ -3648,6 +3679,7 @@ fn self_test() -> Result<(), String> {
         let row = ResultRow {
             schema: CELL_RESULT_SCHEMA,
             run_id: "fixture-run".into(),
+            attempt: 1,
             hermit_sha: "fixture".into(),
             source_tree_dirty: false,
             binary_sha256: Some("b".repeat(64)),
@@ -3659,6 +3691,7 @@ fn self_test() -> Result<(), String> {
             backend: Some(id.backend.clone()),
             classification: "required".into(),
             outcome: outcome.into(),
+            timeout_seconds: 15,
             log_level: Some("info".into()),
             effective_args: vec!["run".into()],
             argv: vec!["hermit".into(), "run".into()],
@@ -3738,6 +3771,7 @@ fn self_test() -> Result<(), String> {
     let first = candidate("PASS");
     let mut distinct = candidate("PASS");
     distinct.row.run_id = "different-run".into();
+    distinct.row.attempt = 2;
     distinct.evidence_identity = distinct.row.evidence_identity().unwrap();
     if verify_candidate_set(
         &expected,
@@ -3789,6 +3823,15 @@ fn self_test() -> Result<(), String> {
     {
         return Err("negative result bracket accepted a failing row".into());
     }
+    let failed_first = candidate("FAIL");
+    let mut passed_retry = candidate("PASS");
+    passed_retry.row.attempt = 2;
+    passed_retry.evidence_identity = passed_retry.row.evidence_identity().unwrap();
+    verify_candidate_set(
+        &expected,
+        BTreeMap::from([(id.clone(), vec![failed_first, passed_retry])]),
+    )
+    .map_err(|e| format!("a passing retry did not supersede attempt 1 for admission: {e}"))?;
     let mut weak = candidate("PASS").row;
     let mut report: JsonValue = serde_json::from_str(
         weak.attempts[0]["verification_report"].as_str().unwrap(),
@@ -4128,6 +4171,7 @@ fn self_test() -> Result<(), String> {
     let validate_row = ResultRow {
         schema: CELL_RESULT_SCHEMA,
         run_id: "validate-bracket".into(),
+        attempt: 1,
         hermit_sha: "sha-1".into(),
         source_tree_dirty: false,
         binary_sha256: Some("b".repeat(64)),
@@ -4139,6 +4183,7 @@ fn self_test() -> Result<(), String> {
         backend: Some(validate_id.backend.clone()),
         classification: "required".into(),
         outcome: "FAIL".into(),
+        timeout_seconds: 15,
         log_level: Some("info".into()),
         effective_args: vec!["run".into()],
         argv: vec!["hermit".into(), "run".into()],
@@ -4760,6 +4805,7 @@ fn self_test() -> Result<(), String> {
     let native = ResultRow {
         schema: CELL_RESULT_SCHEMA,
         run_id: "fixture-run".into(),
+        attempt: 1,
         hermit_sha: "fixture".into(),
         source_tree_dirty: false,
         binary_sha256: Some("b".repeat(64)),
@@ -4771,6 +4817,7 @@ fn self_test() -> Result<(), String> {
         backend: None,
         classification: "required".into(),
         outcome: "PASS".into(),
+        timeout_seconds: 15,
         log_level: None,
         effective_args: Vec::new(),
         argv: vec!["fixture".into()],

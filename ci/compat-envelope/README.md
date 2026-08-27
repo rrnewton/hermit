@@ -46,10 +46,11 @@ The path is deliberately direct:
 1. `hermit-manifest-plan` validates the complete matrix and emits the enabled
    execution plan.
 2. `ci/expected-e2e-plan.json` identifies the cells ordinary validation runs.
-3. Each manifest bucket writes schema-4 `results.jsonl` rows, including the
-   literal argv, explicit environment, working directory, and pasteable shell
-   command, to a unique durable
-   result directory.
+3. Each manifest bucket appends schema-4 `results.jsonl` rows to a unique
+   durable result directory. Every row includes the validate attempt number,
+   cell `duration_ms`, the `timeout_seconds` used for that attempt, literal
+   argv, explicit environment, working directory, and pasteable shell command.
+   A retry adds another row; it does not replace the earlier observation.
 4. The final `scorecard.compatibility` node requires a clean, exact-HEAD PASS
    row for every selected cell and prints the table.
 5. The checked-in table and cell identities must still equal what the manifest

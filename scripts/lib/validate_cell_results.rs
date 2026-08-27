@@ -2,6 +2,7 @@
 //
 // Retain the per-cell result population carried by one full validate run.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -222,9 +223,10 @@ pub fn retain(
     collect_results_files(result_root, &mut files)?;
     files.sort();
     let mut run_id: Option<String> = None;
-    let mut cells = Vec::new();
     let mut selected = Vec::new();
     let mut identities = BTreeSet::new();
+    let mut observations = BTreeSet::new();
+    let mut terminal_rows = BTreeMap::new();
     for file in files {
         let text = fs::read_to_string(&file)
             .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
@@ -261,15 +263,33 @@ pub fn retain(
             }
             let id = identity(&row)?;
             let key = sort_key(&id)?;
-            if !identities.insert(key) {
-                return Err("per-cell results contain a duplicate identity".into());
+            let attempt = row.get("attempt").and_then(Value::as_u64).unwrap_or(1);
+            if attempt == 0 {
+                return Err("per-cell result attempt must be positive".into());
             }
-            let mut cell = id.as_object().expect("identity object").clone();
-            cell.insert("cell_verdict".into(), cell_verdict(&row)?);
-            selected.push(id);
-            cells.push(Value::Object(cell));
+            if !observations.insert((key.clone(), attempt)) {
+                return Err("per-cell results contain a duplicate identity and attempt".into());
+            }
+            if identities.insert(key.clone()) {
+                selected.push(id);
+            }
+            if terminal_rows
+                .get(&key)
+                .is_none_or(|(seen, _): &(u64, Value)| attempt > *seen)
+            {
+                terminal_rows.insert(key, (attempt, row));
+            }
         }
     }
+    let mut cells = terminal_rows
+        .into_values()
+        .map(|(_, row)| {
+            let id = identity(&row)?;
+            let mut cell = id.as_object().expect("identity object").clone();
+            cell.insert("cell_verdict".into(), cell_verdict(&row)?);
+            Ok(Value::Object(cell))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let run_id = run_id.ok_or("full validation retained zero per-cell result rows")?;
     selected.sort_by_key(|value| sort_key(value).expect("validated identity"));
     cells.sort_by_key(|value| sort_key(value).expect("validated identity"));
@@ -427,6 +447,19 @@ mod tests {
         .unwrap();
     }
 
+    fn append_result_row(root: &Path, row: &Value) {
+        use std::io::Write;
+
+        let directory = root.join("bucket");
+        fs::create_dir_all(&directory).unwrap();
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(directory.join("results.jsonl"))
+            .unwrap();
+        writeln!(file, "{}", serde_json::to_string(row).unwrap()).unwrap();
+    }
+
     #[test]
     fn retains_one_closed_schema6_population() {
         let root = fixture_root();
@@ -450,6 +483,45 @@ mod tests {
         let bytes = fs::read(&artifact).unwrap();
         assert_eq!(hex_digest(&bytes), retained.evidence["artifact"]["sha256"]);
         assert!(bytes.ends_with(b"\n"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retains_terminal_attempt_without_rejecting_preserved_history() {
+        let root = fixture_root();
+        let results = root.join("results");
+        let commit = "abababababababababababababababababababab";
+        let mut first = result_row("validate-retry", commit);
+        first["attempt"] = Value::from(1);
+        first["outcome"] = Value::String("FAIL".into());
+        first["reason"] = Value::String("forced first failure".into());
+        first["duration_ms"] = Value::from(111);
+        first["timeout_seconds"] = Value::from(15);
+        let mut second = result_row("validate-retry", commit);
+        second["attempt"] = Value::from(2);
+        second["duration_ms"] = Value::from(222);
+        second["timeout_seconds"] = Value::from(15);
+        append_result_row(&results, &first);
+        append_result_row(&results, &second);
+
+        let retained = retain(&root, &results, commit, &expected(&second)).unwrap();
+        assert_eq!(retained.evidence["recorded_count"], 1);
+        assert_eq!(
+            retained.evidence["cells"][0]["cell_verdict"]["state"],
+            "compared-and-matched"
+        );
+        let raw = fs::read_to_string(results.join("bucket/results.jsonl")).unwrap();
+        let observations = raw
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0]["attempt"], 1);
+        assert_eq!(observations[0]["duration_ms"], 111);
+        assert_eq!(observations[0]["timeout_seconds"], 15);
+        assert_eq!(observations[1]["attempt"], 2);
+        assert_eq!(observations[1]["duration_ms"], 222);
+        assert_eq!(observations[1]["timeout_seconds"], 15);
         fs::remove_dir_all(root).unwrap();
     }
 

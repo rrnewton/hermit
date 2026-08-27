@@ -833,6 +833,10 @@ struct SabrePathRecord {
 pub struct CellResult {
     pub schema: u64,
     pub run_id: String,
+    /// The validate node attempt that produced this observation. A retry is a
+    /// second observation, so it receives the next positive ordinal instead of
+    /// replacing the earlier row.
+    pub attempt: u64,
     /// HEAD of the CHECKOUT the harness ran in. NOT the provenance of the
     /// binary that produced this measurement, despite the name.
     ///
@@ -866,6 +870,8 @@ pub struct CellResult {
     pub classification: String,
     pub outcome: String,
     pub error_kind: Option<String>,
+    /// The cell wall-clock bound used for this observation.
+    pub timeout_seconds: u64,
     pub duration_ms: u128,
     pub log_level: Option<String>,
     pub effective_args: Vec<String>,
@@ -901,10 +907,11 @@ pub struct CellResult {
     /// Where this cell's retained evidence lives.
     ///
     /// Carried on the result rather than recomputed by readers: the directory
-    /// is `<result_root>/runs/<run_id>/<slug>` and the slug is built in exactly
-    /// one place (`run_cell`). A consumer that rebuilds it from `test`, `mode`
-    /// and `backend` becomes a second definition that goes stale silently, and
-    /// a path that points at nothing is worse than no path at all.
+    /// is `<result_root>/runs/<run_id>/<slug>` for attempt 1 and uses an
+    /// `-attempt-N` suffix for a retry. The slug is built in exactly one place
+    /// (`cell_artifact_dir`). A consumer that rebuilds it from `test`, `mode`,
+    /// `backend`, and `attempt` becomes a second definition that goes stale
+    /// silently, and a path that points at nothing is worse than no path at all.
     pub artifact_dir: String,
 }
 
@@ -932,6 +939,7 @@ pub struct RunContext {
     pub result_root: PathBuf,
     pub build_root: PathBuf,
     pub run_id: String,
+    pub attempt: u64,
     pub source_sha: String,
     pub source_dirty: bool,
     /// Provenance the hermit binary reports about itself, probed once per run.
@@ -963,6 +971,17 @@ impl RunContext {
                 std::process::id()
             )
         });
+        let attempt = std::env::var("E2E_ATTEMPT")
+            .ok()
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|attempt| *attempt > 0)
+                    .ok_or_else(|| format!("E2E_ATTEMPT must be a positive integer, got {value:?}"))
+            })
+            .transpose()?
+            .unwrap_or(1);
         let build_root = std::env::var_os("E2E_BUILD_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| result_root.join("build").join(&source_sha));
@@ -1003,6 +1022,7 @@ impl RunContext {
             result_root,
             build_root,
             run_id,
+            attempt,
             source_sha,
             source_dirty,
             binary_build_sha,
@@ -1894,12 +1914,17 @@ fn cell_timeout_attempt(
 /// directory that does not exist, so surfacing the path made collapsing them a
 /// prerequisite rather than a tidy-up.
 fn cell_artifact_dir(context: &RunContext, cell: &SelectedCell) -> PathBuf {
-    let slug = format!(
+    let base_slug = format!(
         "{}-{}-{}",
         cell.id.test.replace('/', "-"),
         cell.id.mode,
         cell.id.backend.as_deref().unwrap_or("none")
     );
+    let slug = if context.attempt == 1 {
+        base_slug
+    } else {
+        format!("{base_slug}-attempt-{}", context.attempt)
+    };
     context
         .result_root
         .join("runs")
@@ -2136,6 +2161,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         artifact_dir: dir.display().to_string(),
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
+        attempt: context.attempt,
         hermit_sha: context.source_sha.clone(),
         binary_build_sha: context.binary_build_sha.clone(),
         source_tree_dirty: context.source_dirty,
@@ -2153,6 +2179,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         classification: if cell.enabled { "required" } else { "disabled" }.into(),
         outcome,
         error_kind,
+        timeout_seconds: cell.timeout_seconds,
         duration_ms: started.elapsed().as_millis(),
         log_level: (cell.id.mode != "naked").then(|| "info".into()),
         effective_args: literal_argv.iter().skip(1).cloned().collect(),
@@ -2201,6 +2228,7 @@ pub fn infrastructure_error_result(
         artifact_dir: dir.display().to_string(),
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
+        attempt: context.attempt,
         hermit_sha: context.source_sha.clone(),
         binary_build_sha: context.binary_build_sha.clone(),
         source_tree_dirty: context.source_dirty,
@@ -2216,6 +2244,7 @@ pub fn infrastructure_error_result(
         classification: if cell.enabled { "required" } else { "disabled" }.into(),
         outcome: "ERROR".into(),
         error_kind: Some("infrastructure".into()),
+        timeout_seconds: cell.timeout_seconds,
         duration_ms: 0,
         log_level: (cell.id.mode != "naked").then(|| "info".into()),
         effective_args: Vec::new(),
@@ -2258,6 +2287,7 @@ pub fn host_inapplicable_result(
         artifact_dir: dir.display().to_string(),
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
+        attempt: context.attempt,
         hermit_sha: context.source_sha.clone(),
         binary_build_sha: context.binary_build_sha.clone(),
         source_tree_dirty: context.source_dirty,
@@ -2271,6 +2301,7 @@ pub fn host_inapplicable_result(
         classification: if cell.enabled { "required" } else { "disabled" }.into(),
         outcome: "HOST-INAPPLICABLE".into(),
         error_kind: None,
+        timeout_seconds: cell.timeout_seconds,
         duration_ms: 0,
         log_level: None,
         effective_args: Vec::new(),
@@ -2440,6 +2471,18 @@ fn diversity_evidence(
         "class_histogram": histogram,
         "min_normalized_entropy": min_normalized_entropy,
     })
+}
+
+pub fn prepare_result_path(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 pub fn append_result(path: &Path, result: &CellResult) -> Result<(), String> {
@@ -2966,6 +3009,7 @@ mod tests {
             result_root: root.join("results"),
             build_root: root.join("build"),
             run_id: "fixture".into(),
+            attempt: 1,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -3108,6 +3152,7 @@ mod tests {
             result_root: root.join("results"),
             build_root: root.join("build"),
             run_id: "fixture".into(),
+            attempt: 1,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -3162,6 +3207,7 @@ mod tests {
             result_root: root.join("results"),
             build_root: root.join("build"),
             run_id: "fixture".into(),
+            attempt: 1,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -3195,7 +3241,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_rows_are_readable_after_each_append() {
+    fn retry_preserves_both_failed_rows_with_elapsed_bound_and_attempt() {
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-durable-row-bracket-{}",
             std::process::id()
@@ -3214,12 +3260,13 @@ mod tests {
             enabled: true,
             timeout_seconds: 15,
         };
-        let context = RunContext {
+        let mut context = RunContext {
             root: root.clone(),
             hermit_bin: root.join("hermit"),
             result_root: root.join("results"),
             build_root: root.join("build"),
             run_id: "fixture".into(),
+            attempt: 1,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -3231,16 +3278,43 @@ mod tests {
             isolated_workdir: None,
         };
         let path = root.join("results.jsonl");
-        for expected in 1..=2 {
-            let result = infrastructure_error_result(&context, &cell, "fixture".into());
-            append_result(&path, &result).unwrap();
-            let rows = fs::read_to_string(&path).unwrap();
-            assert_eq!(rows.lines().count(), expected);
-            assert!(
-                rows.lines()
-                    .all(|line| serde_json::from_str::<JsonValue>(line).is_ok())
-            );
-        }
+        prepare_result_path(&path).unwrap();
+        let mut first = infrastructure_error_result(&context, &cell, "forced failure".into());
+        first.outcome = "FAIL".into();
+        first.error_kind = None;
+        first.duration_ms = 111;
+        append_result(&path, &first).unwrap();
+
+        // A validate retry starts a fresh harness process and prepares the same
+        // path again. This call is the negative-control boundary: replacing it
+        // with the former fs::write(path, b"") drops the first observation.
+        prepare_result_path(&path).unwrap();
+        context.attempt = 2;
+        let mut second = infrastructure_error_result(&context, &cell, "forced retry".into());
+        second.outcome = "FAIL".into();
+        second.error_kind = None;
+        second.duration_ms = 222;
+        append_result(&path, &second).unwrap();
+
+        let rows = fs::read_to_string(&path).unwrap();
+        let rows = rows
+            .lines()
+            .map(|line| serde_json::from_str::<JsonValue>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["attempt"], 1);
+        assert_eq!(rows[0]["duration_ms"], 111);
+        assert_eq!(rows[0]["timeout_seconds"], 15);
+        assert_eq!(rows[1]["attempt"], 2);
+        assert_eq!(rows[1]["duration_ms"], 222);
+        assert_eq!(rows[1]["timeout_seconds"], 15);
+        assert_ne!(rows[0]["artifact_dir"], rows[1]["artifact_dir"]);
+        assert!(
+            rows[1]["artifact_dir"]
+                .as_str()
+                .unwrap()
+                .ends_with("-attempt-2")
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3381,6 +3455,7 @@ backends_disabled:
             result_root: PathBuf::from("/repo/results"),
             build_root: PathBuf::from("/repo/build"),
             run_id: "fixture".into(),
+            attempt: 1,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -3430,6 +3505,7 @@ backends_disabled:
             result_root: PathBuf::from("/repo/results"),
             build_root: PathBuf::from("/repo/build"),
             run_id: "fixture".into(),
+            attempt: 1,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -3657,6 +3733,7 @@ backends_disabled:
             result_root: PathBuf::from("/repo/results"),
             build_root: PathBuf::from("/repo/build"),
             run_id: "fixture".into(),
+            attempt: 1,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -3739,6 +3816,7 @@ backends_disabled:
             result_root: PathBuf::from("/repo/results"),
             build_root: PathBuf::from("/repo/build"),
             run_id: "fixture".into(),
+            attempt: 1,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -4389,6 +4467,7 @@ backends_disabled:
             result_root: root.join("results"),
             build_root: root.join("build"),
             run_id: "fixture".into(),
+            attempt: 1,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -4456,6 +4535,7 @@ backends_disabled:
             result_root: root.join("results"),
             build_root,
             run_id: "fixture".into(),
+            attempt: 1,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
