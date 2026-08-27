@@ -319,7 +319,12 @@ field unit          "$unit"
 field bound.wall      "$wall_state"
 field bound.cgroup    "$( [ "$runner_state" = APPLIED ] && echo "APPLIED:MemoryMax=$mem_max MemorySwapMax=0" || echo "NOT_APPLIED:systemd --user unavailable" )"
 field bound.disk      "$disk_state"
-field bound.bytes     "APPLIED:$max_log_bytes (LETHAL: the run is cgroup-killed at the cap)"
+if [ "$runner_state" = APPLIED ]; then
+    byte_bound_state="APPLIED:$max_log_bytes (LETHAL: the run is cgroup-killed at the cap)"
+else
+    byte_bound_state="APPLIED:$max_log_bytes (TRUNCATION ONLY: no cgroup kill is available; stderr is still drained so the child can finish)"
+fi
+field bound.bytes     "$byte_bound_state"
 field bound.logfilter "$logfilter_state"
 field env.forwarded   "$env_state"
 field note.run_record "$reg_state"

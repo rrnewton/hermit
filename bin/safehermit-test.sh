@@ -52,21 +52,58 @@ if systemd-run --user --unit=sht-probe-$$ --collect --quiet --property=RuntimeMa
       || no "wall bound" "systemd --user works here but the bound was declared unavailable"
 fi
 
-# T4 byte cap truncates AND records it; the child must not be SIGPIPEd.
-"$SH" --sh-max-log-bytes 4096 "$t/hermit-arbitrary" --log=info run -- /bin/echo hi >/dev/null 2>"$t/4.err"
+# T4 the byte cap FIRES under a deliberately tiny threshold and records
+# `truncated=true`. A boolean-only assertion passed when the old 4096-byte
+# fixture never reached the cap, so it proved only that the metadata parser ran.
+#
+# Keep the child semantics explicit too. With a cgroup, the wrapper deliberately
+# kills the run and returns 125. Without one, the cap must keep draining stderr
+# rather than closing the pipe: the child reaches its own exit 42, not SIGPIPE
+# (128+signal 13 = 141), while the retained log is still truncated.
+cat > "$t/stderr-flood" <<'PY'
+#!/usr/bin/env python3
+import os
+import sys
+import time
+
+for _ in range(128):
+    os.write(2, b"x" * 1023 + b"\n")
+time.sleep(2)
+sys.exit(42)
+PY
+chmod +x "$t/stderr-flood"
+"$SH" --sh-max-log-bytes 64 "$t/stderr-flood" >/dev/null 2>"$t/4.err"
 rc=$?
 tr_val=$(sed -n 's/^safehermit: truncated=//p' "$t/4.err")
-# `[ p -o q ]` is SC2166: POSIX leaves -o undefined for more than a couple of
-# arguments and shells disagree, so the two comparisons are separate tests joined
-# by ||. This is the only shellcheck finding at the gate's severity anywhere under
-# bin/, and it had to go before bin/ could be added to the lint gate at all.
-if [ "$rc" = 0 ] && { [ "$tr_val" = true ] || [ "$tr_val" = false ]; }; then
-    ok "truncation is RECORDED as a boolean (got '$tr_val') and the child was not SIGPIPEd"
+killed_val=$(sed -n 's/^safehermit: killed_at_cap=//p' "$t/4.err")
+if [ "$tr_val" != true ]; then
+    no "byte cap" "rc=$rc truncated='$tr_val'; the reduced 64-byte threshold did not fire"
+elif [ "$killed_val" = cgroup-killed ] && [ "$rc" -eq 125 ]; then
+    ok "byte cap records truncated=true and returns the wrapper's cgroup-kill code 125"
+elif [ "$killed_val" = no-cgroup-available ] && [ "$rc" -eq 42 ]; then
+    ok "byte cap records truncated=true and drains stderr without SIGPIPE (child exit 42, not 141)"
 else
-    no "truncation record" "rc=$rc truncated='$tr_val' (must be true/false, never unknown)"
+    no "byte cap semantics" "rc=$rc truncated='$tr_val' killed_at_cap='$killed_val'; expected cgroup-killed/125 or no-cgroup-available/42, never SIGPIPE/141"
 fi
 
-# T5 a genuine hang is killed by its deadline. Assert the fixture first.
+# Force the degraded arm even on a host with systemd. This independently proves
+# that stopping writes to the retained log does not close the child's stderr.
+mkdir -p "$t/nosd"; printf '#!/bin/sh\nexit 127\n' > "$t/nosd/systemd-run"; chmod +x "$t/nosd/systemd-run"
+PATH="$t/nosd:$PATH" "$SH" --sh-max-log-bytes 64 "$t/stderr-flood" >/dev/null 2>"$t/4-degraded.err"
+rc=$?
+tr_val=$(sed -n 's/^safehermit: truncated=//p' "$t/4-degraded.err")
+killed_val=$(sed -n 's/^safehermit: killed_at_cap=//p' "$t/4-degraded.err")
+if [ "$tr_val" = true ] && [ "$killed_val" = no-cgroup-available ] && [ "$rc" -eq 42 ]; then
+    ok "degraded byte cap truncates, keeps draining, and preserves child exit 42 rather than SIGPIPE 141"
+else
+    no "degraded byte cap" "rc=$rc truncated='$tr_val' killed_at_cap='$killed_val'; expected true/no-cgroup-available/42"
+fi
+
+# T5 an ad-hoc Hermit binary copied under /tmp is bounded by the wrapper while
+# the exact same invocation is not self-bounded when run bare. The outer
+# eight-second `timeout` is test containment, not the property being credited to
+# the bare run: exit 124 proves the fixture was still running when containment
+# stopped it.
 timeout 8 "$t/hermit-arbitrary" run -- /bin/sh -c 'while :; do :; done' >/dev/null 2>&1
 [ $? -eq 124 ] || { no "hang fixture" "fixture does not actually hang bare; test would be vacuous"; }
 s=$(date +%s)
@@ -77,11 +114,16 @@ rc=$?; e=$(( $(date +%s) - s ))
   || no "deadline" "rc=$rc after ${e}s; expected 124 well under 60s"
 
 # T6 FAIL LOUD: with systemd unavailable the run still proceeds and SAYS so.
-mkdir -p "$t/nosd"; printf '#!/bin/sh\nexit 127\n' > "$t/nosd/systemd-run"; chmod +x "$t/nosd/systemd-run"
+# The byte limit still truncates retained evidence, but cannot kill the child;
+# its bound line must not call that degraded behaviour lethal.
 out=$(PATH="$t/nosd:$PATH" "$SH" "$t/hermit-arbitrary" run -- /bin/echo marker-t6 2>"$t/6.err")
 grep -q marker-t6 <<<"$out" && grep -q 'bound.wall=NOT_APPLIED' "$t/6.err" \
   && ok "with no systemd the run proceeds AND declares the bound NOT_APPLIED" \
   || no "fail-loud" "either the run did not proceed or the missing bound was not declared"
+grep -q 'bound.bytes=APPLIED:.*(TRUNCATION ONLY:' "$t/6.err" \
+  && ! grep -q 'bound.bytes=.*(LETHAL:' "$t/6.err" \
+  && ok "without a cgroup the byte bound reports truncation only, not a lethal cap" \
+  || no "degraded byte report" "bound.bytes called a truncation-only cap lethal or did not explain the degraded behaviour"
 
 # T7 THE CALLER'S ENVIRONMENT ACTUALLY REACHES HERMIT.
 # This is a regression test for a defect the first six tests all passed over.
