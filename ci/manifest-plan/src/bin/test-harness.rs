@@ -10,6 +10,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Instant;
 
 use hermit_manifest_plan::runner::ManifestSet;
 use hermit_manifest_plan::runner::Population;
@@ -371,56 +372,113 @@ fn main() -> ExitCode {
 }
 
 fn validate(root: &Path, manifests: &ManifestSet) -> ExitCode {
+    let started = Instant::now();
+    let cpu_started = process_and_children_cpu_seconds();
     // Keep the existing Rust manifest-plan front door as the authority for
     // inventory, schema, lane, workflow, and DAG consistency.  The cell
     // runner owns execution; it must not silently narrow `validate` to only
     // the expected-plan comparison during the shell removal.
-    audit_dag_correspondence(root, manifests).unwrap_or_else(|error| fail(error));
-    audit_budget_ordering(root).unwrap_or_else(|error| fail(error));
-    run_audit(
-        root,
-        &root.join("target/debug/generate-test-footprints"),
-        &["--check"],
-    );
-    run_audit(
-        root,
-        &root.join("tests/backend-parity/split_asymmetric_pr.py"),
-        &["--self-test"],
-    );
-    audit_determinism_stress_evidence(root);
-    run_audit(root, &root.join("tests/manifest-cli.rs"), &["self-test"]);
+    timed_audit("audit_dag_correspondence", || {
+        audit_dag_correspondence(root, manifests).unwrap_or_else(|error| fail(error))
+    });
+    timed_audit("audit_budget_ordering", || {
+        audit_budget_ordering(root).unwrap_or_else(|error| fail(error))
+    });
+    timed_audit("generate-test-footprints", || {
+        run_audit(
+            root,
+            &root.join("target/debug/generate-test-footprints"),
+            &["--check"],
+        )
+    });
+    timed_audit("split_asymmetric_pr", || {
+        run_audit(
+            root,
+            &root.join("tests/backend-parity/split_asymmetric_pr.py"),
+            &["--self-test"],
+        )
+    });
+    timed_audit("determinism_stress_evidence", || {
+        audit_determinism_stress_evidence(root)
+    });
+    timed_audit("manifest_cli", || {
+        run_audit(root, &root.join("tests/manifest-cli.rs"), &["self-test"])
+    });
     // The DBT budget wrapper gates roughly twenty portable nodes and fails
     // CLOSED on a pin it is not calibrated for. Nothing else notices: a
     // truncated node reads like a fast one. This asserts end to end that the
     // wrapper still REACHES its wrapped command at the recorded pin.
-    run_audit(
-        root,
-        &root.join("ci/run-with-reverie-dbt-budget-test.sh"),
-        &[],
-    );
-    run_audit(
-        root,
-        &root.join("ci/compat-envelope/scorecard.rs"),
-        &["self-test-and-check"],
-    );
-    run_audit(
-        root,
-        &root.join("ci/compat-envelope/pressure-test.rs"),
-        &["self-test"],
-    );
+    timed_audit("run-with-reverie-dbt-budget-test", || {
+        run_audit(
+            root,
+            &root.join("ci/run-with-reverie-dbt-budget-test.sh"),
+            &[],
+        )
+    });
+    timed_audit("scorecard", || {
+        run_audit(
+            root,
+            &root.join("ci/compat-envelope/scorecard.rs"),
+            &["self-test-and-check"],
+        )
+    });
+    timed_audit("pressure-test", || {
+        run_audit(
+            root,
+            &root.join("ci/compat-envelope/pressure-test.rs"),
+            &["self-test"],
+        )
+    });
     // The removed shell front door accumulated plan/scheduler/receipt guards
     // that now belong to the Rust validate driver.  Exercise those brackets
     // here without executing the validation DAG; otherwise deleting the shell
     // would also silently delete its protection against incomplete plans.
-    run_audit(root, &root.join("scripts/validate.rs"), &["--self-test"]);
-    audit_cli_brackets(root);
-    let cells = audit_expected_plan(root, manifests);
+    timed_audit("validate-self-test", || {
+        run_audit(root, &root.join("scripts/validate.rs"), &["--self-test"])
+    });
+    timed_audit("audit_cli_brackets", || audit_cli_brackets(root));
+    let cells = timed_audit("audit_expected_plan", || {
+        audit_expected_plan(root, manifests)
+    });
+    if std::env::var_os("HERMIT_MANIFEST_AUDIT_TIMINGS").is_some() {
+        eprintln!(
+            "manifest-audit-timing total wall={:.6} cpu={:.6}",
+            started.elapsed().as_secs_f64(),
+            process_and_children_cpu_seconds() - cpu_started
+        );
+    }
     println!(
         "PASS: {} YAML manifests, {} required cells",
         manifests.documents.len(),
         cells
     );
     ExitCode::SUCCESS
+}
+
+fn timed_audit<T>(name: &str, operation: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let cpu_started = process_and_children_cpu_seconds();
+    let result = operation();
+    if std::env::var_os("HERMIT_MANIFEST_AUDIT_TIMINGS").is_some() {
+        eprintln!(
+            "manifest-audit-timing {name} wall={:.6} cpu={:.6}",
+            started.elapsed().as_secs_f64(),
+            process_and_children_cpu_seconds() - cpu_started
+        );
+    }
+    result
+}
+
+fn process_and_children_cpu_seconds() -> f64 {
+    fn usage(who: libc::c_int) -> f64 {
+        let mut value: libc::rusage = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::getrusage(who, &mut value) }, 0);
+        value.ru_utime.tv_sec as f64
+            + value.ru_utime.tv_usec as f64 / 1_000_000.0
+            + value.ru_stime.tv_sec as f64
+            + value.ru_stime.tv_usec as f64 / 1_000_000.0
+    }
+    usage(libc::RUSAGE_SELF) + usage(libc::RUSAGE_CHILDREN)
 }
 
 fn audit_cli_brackets(root: &Path) {
