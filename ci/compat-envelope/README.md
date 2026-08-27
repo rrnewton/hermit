@@ -153,9 +153,11 @@ history, and selects the newest such commit independently for every selected
 cell. If several retained runs at that commit disagree, it imports every result
 so the conflict makes the cell red instead of resolving it by file order.
 
-All three commands refuse a dirty tracked tree. `observe-results` additionally
-refuses rows that are not clean at `HEAD`; `import-results` preserves each
-historical row's SHA and Detcore tree instead of relabelling it as current.
+The writers refuse unrelated tracked changes. `import-results` may replace its
+own two generated outputs so the same retained corpus can be imported again.
+`observe-results` additionally refuses rows that are not clean at `HEAD`;
+`import-results` preserves each historical row's SHA and Detcore tree instead
+of relabelling it as current.
 `ERROR` rows are reported but not recorded as product behaviour. Pressure-test
 observations cannot change scorecard colour. Validate observations can: a
 selected cell is green only when the results at its recorded latest SHA are
