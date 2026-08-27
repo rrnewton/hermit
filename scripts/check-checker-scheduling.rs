@@ -73,13 +73,6 @@ const ALLOWLIST: &[(&str, &str)] = &[
          checker, not to this list.",
     ),
     (
-        "ci/check-shard-coverage.sh",
-        "Unscheduled, and a WORKING guard: it caught a real error in the change \
-         that added check.lint_checks (a node assigned to no shard). Its only \
-         reference is ci-portable.yml, which is workflow_dispatch-only. It should \
-         be scheduled; doing so belongs in its own head with its own count.",
-    ),
-    (
         "scripts/stress-test.sh",
         "A stress FRAMEWORK, not a checker. It matches only because the suffix rule \
          adopted `-test.sh`, and over-inclusion by a convention is exactly what an \
