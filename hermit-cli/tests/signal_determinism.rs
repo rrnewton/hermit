@@ -22,6 +22,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::Instant;
 
+use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
+
 const DETERMINISM_RUNS: usize = 5;
 const DEADLOCK_RUNS: usize = 3;
 const DEADLOCK_BOUND: Duration = Duration::from_secs(5);
@@ -332,7 +334,7 @@ fn sigsuspend_without_signal_reports_terminal_deadlock() {
         );
         assert_eq!(
             output.status.code(),
-            Some(1),
+            Some(HERMIT_INTERNAL_FAILURE_EXIT),
             "{label} did not exit with the scheduler deadlock status in {elapsed:?}\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
