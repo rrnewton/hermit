@@ -95,6 +95,7 @@ mod validate_super; // Normalizes and audits extracted Cargo tests/synthetic arg
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -14275,10 +14276,7 @@ fn path_is_outside(path: &Path, boundary: &Path) -> bool {
     !path.starts_with(boundary)
 }
 
-fn create_run_owned_cache(
-    root: &Path,
-    parent: Option<&Path>,
-) -> Result<tempfile::TempDir, String> {
+fn create_safe_cache(root: &Path, parent: Option<&Path>) -> Result<PathBuf, String> {
     let boundary = cargo_manifest_boundary(root);
     let mut bases = Vec::new();
     if let Some(parent) = parent {
@@ -14300,44 +14298,100 @@ fn create_run_owned_cache(
             ));
             continue;
         }
-        if let Err(error) = std::fs::create_dir_all(&base) {
-            failures.push(format!("cannot create {}: {error}", base.display()));
-            continue;
-        }
-        let cache = match tempfile::Builder::new().prefix("run-").tempdir_in(&base) {
-            Ok(cache) => cache,
+        let created = match std::fs::symlink_metadata(&base) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                failures.push(format!("cache path {} is a symlink", base.display()));
+                continue;
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                failures.push(format!("cache path {} is not a directory", base.display()));
+                continue;
+            }
+            Ok(metadata) => {
+                let mode = metadata.mode() & 0o777;
+                let owner = metadata.uid();
+                let effective_uid = unsafe { libc::geteuid() };
+                if owner != effective_uid {
+                    failures.push(format!(
+                        "cache path {} is owned by uid {owner}, not effective uid {effective_uid}",
+                        base.display()
+                    ));
+                    continue;
+                }
+                if mode & 0o022 != 0 {
+                    failures.push(format!(
+                        "cache path {} has unsafe mode {mode:04o}",
+                        base.display()
+                    ));
+                    continue;
+                }
+                false
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Err(error) = std::fs::create_dir_all(&base) {
+                    failures.push(format!("cannot create {}: {error}", base.display()));
+                    continue;
+                }
+                match std::fs::symlink_metadata(&base) {
+                    Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => true,
+                    Ok(_) => {
+                        failures.push(format!(
+                            "cache path {} was not created as a real directory",
+                            base.display()
+                        ));
+                        continue;
+                    }
+                    Err(error) => {
+                        failures.push(format!(
+                            "cannot verify created cache {}: {error}",
+                            base.display()
+                        ));
+                        continue;
+                    }
+                }
+            }
             Err(error) => {
+                failures.push(format!("cannot inspect {}: {error}", base.display()));
+                continue;
+            }
+        };
+        if created {
+            if let Err(error) =
+                std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
+            {
                 failures.push(format!(
-                    "cannot create a unique cache under {}: {error}",
+                    "cannot restrict new cache {} to mode 0700: {error}",
                     base.display()
                 ));
                 continue;
             }
-        };
-        if let Err(error) = std::fs::set_permissions(
-            cache.path(),
-            std::fs::Permissions::from_mode(0o700),
-        ) {
-            failures.push(format!(
-                "cannot restrict cache {} to mode 0700: {error}",
-                cache.path().display()
-            ));
-            continue;
         }
-        if !path_is_outside(cache.path(), &boundary) {
+        if !path_is_outside(&base, &boundary) {
             failures.push(format!(
                 "created cache {} inside Cargo workspace {}",
-                cache.path().display(),
+                base.display(),
                 boundary.display()
             ));
             continue;
         }
-        return Ok(cache);
+        return Ok(base);
     }
     Err(format!(
-        "cannot create a run-owned cache outside the Cargo workspace: {}",
+        "cannot create a cache outside the Cargo workspace: {}",
         failures.join("; ")
     ))
+}
+
+fn effective_cache_path() -> Option<PathBuf> {
+    std::env::var_os("XDG_CACHE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .map(|home| home.join(".cache"))
+        })
 }
 
 fn run_owned_cache_bracket() -> Result<(), String> {
@@ -14356,13 +14410,66 @@ fn run_owned_cache_bracket() -> Result<(), String> {
     std::fs::write(workspace.join("probe.rs"), "fn main() {}\n")
         .map_err(|error| format!("run-owned cache: cannot write probe: {error}"))?;
 
+    let generated_manifest = |cache: &Path, label: &str| -> Result<PathBuf, String> {
+        let output = Command::new("rust-script")
+            .args(["--package", "probe.rs"])
+            .current_dir(&workspace)
+            .env("XDG_CACHE_HOME", cache)
+            .output()
+            .map_err(|error| {
+                format!("run-owned cache: cannot generate {label} probe package: {error}")
+            })?;
+        if !output.status.success() {
+            return Err(format!(
+                "run-owned cache: cannot generate {label} probe package: status={} stderr={:?}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let stdout = std::str::from_utf8(&output.stdout).map_err(|error| {
+            format!("run-owned cache: {label} package path is not UTF-8: {error}")
+        })?;
+        let mut paths = stdout.lines().map(str::trim).filter(|line| !line.is_empty());
+        let Some(package) = paths.next() else {
+            return Err(format!(
+                "run-owned cache: {label} package generation printed no path"
+            ));
+        };
+        if paths.next().is_some() {
+            return Err(format!(
+                "run-owned cache: {label} package generation printed multiple paths: {stdout:?}"
+            ));
+        }
+        let package = PathBuf::from(package);
+        if package.as_os_str().is_empty() || !package.starts_with(cache) {
+            return Err(format!(
+                "run-owned cache: {label} probe package {} is not under cache {}",
+                package.display(),
+                cache.display()
+            ));
+        }
+        let manifest = package.join("Cargo.toml");
+        if !manifest.is_file() {
+            return Err(format!(
+                "run-owned cache: {label} probe package omitted {}",
+                manifest.display()
+            ));
+        }
+        Ok(manifest)
+    };
+
+    let cargo_metadata = |manifest: &Path| {
+        Command::new("cargo")
+            .args(["metadata", "--no-deps", "--format-version", "1", "--manifest-path"])
+            .arg(manifest)
+            .current_dir(&workspace)
+            .output()
+    };
+
     let inside = workspace.join("cache");
-    let failed = Command::new("rust-script")
-        .args(["--force", "probe.rs"])
-        .current_dir(&workspace)
-        .env("XDG_CACHE_HOME", &inside)
-        .output()
-        .map_err(|error| format!("run-owned cache: cannot launch inside probe: {error}"))?;
+    let inside_manifest = generated_manifest(&inside, "inside-workspace")?;
+    let failed = cargo_metadata(&inside_manifest)
+        .map_err(|error| format!("run-owned cache: cannot inspect inside probe: {error}"))?;
     let failed_stderr = String::from_utf8_lossy(&failed.stderr);
     if failed.status.success()
         || !failed_stderr.contains("current package believes it's in a workspace when it's not")
@@ -14374,8 +14481,26 @@ fn run_owned_cache_bracket() -> Result<(), String> {
         ));
     }
 
-    let outside = create_run_owned_cache(&workspace, None)?;
-    let outside_path = outside.path().to_path_buf();
+    let unsafe_parent = fixture.path().join("unsafe-parent");
+    let unsafe_cache = unsafe_parent.join("ignored/validate/cache");
+    std::fs::create_dir_all(&unsafe_cache)
+        .map_err(|error| format!("run-owned cache: cannot create unsafe control: {error}"))?;
+    std::fs::set_permissions(&unsafe_cache, std::fs::Permissions::from_mode(0o777))
+        .map_err(|error| format!("run-owned cache: cannot chmod unsafe control: {error}"))?;
+
+    let outside_path = create_safe_cache(&workspace, Some(&unsafe_parent))?;
+    let unsafe_mode = std::fs::symlink_metadata(&unsafe_cache)
+        .map_err(|error| format!("run-owned cache: cannot re-read unsafe control: {error}"))?
+        .mode()
+        & 0o777;
+    if outside_path == unsafe_cache || unsafe_mode != 0o777 {
+        return Err(format!(
+            "run-owned cache: unsafe existing directory was accepted or mutated: selected={} \
+             unsafe={} mode={unsafe_mode:04o}",
+            outside_path.display(),
+            unsafe_cache.display()
+        ));
+    }
     if !path_is_outside(&outside_path, &workspace) {
         return Err(format!(
             "run-owned cache: selected path {} is still inside {}",
@@ -14383,24 +14508,14 @@ fn run_owned_cache_bracket() -> Result<(), String> {
             workspace.display()
         ));
     }
-    let passed = Command::new("rust-script")
-        .args(["--force", "probe.rs"])
-        .current_dir(&workspace)
-        .env("XDG_CACHE_HOME", &outside_path)
-        .output()
-        .map_err(|error| format!("run-owned cache: cannot launch outside probe: {error}"))?;
+    let outside_manifest = generated_manifest(&outside_path, "outside-workspace")?;
+    let passed = cargo_metadata(&outside_manifest)
+        .map_err(|error| format!("run-owned cache: cannot inspect outside probe: {error}"))?;
     if !passed.status.success() {
         return Err(format!(
             "run-owned cache: outside-workspace probe failed: status={} stderr={:?}",
             passed.status,
             String::from_utf8_lossy(&passed.stderr)
-        ));
-    }
-    drop(outside);
-    if outside_path.exists() {
-        return Err(format!(
-            "run-owned cache: temporary cache survived guard drop: {}",
-            outside_path.display()
         ));
     }
     Ok(())
@@ -14810,27 +14925,24 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // rust-script asks Cargo to build a generated package under XDG_CACHE_HOME.
     // If that cache is anywhere below this checkout (or an enclosing Cargo
     // workspace), Cargo refuses the generated package as an undeclared member.
-    // Hold an RAII directory outside every Cargo-manifest ancestor for the
-    // complete top-level run; nested payloads inherit it.
-    let mut _run_owned_cache = None;
+    // Keep one stable cache outside every Cargo-manifest ancestor so focused
+    // runs remain warm; nested payloads inherit it.
     if !nesting.nested && !args.show_plan {
         let boundary = cargo_manifest_boundary(&root);
-        let inherited_cache = std::env::var_os("XDG_CACHE_HOME")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from);
-        if inherited_cache
+        let effective_cache = effective_cache_path();
+        if effective_cache
             .as_deref()
             .is_none_or(|path| !path_is_outside(path, &boundary))
         {
-            if let Some(path) = inherited_cache {
+            if let Some(path) = effective_cache {
                 eprintln!(
-                    "validate: XDG_CACHE_HOME={} is inside Cargo workspace {}; using a \
-                     run-owned cache outside it",
+                    "validate: effective cache path {} is inside Cargo workspace {}; using a \
+                     shared cache outside it",
                     path.display(),
                     boundary.display()
                 );
             }
-            let cache = match create_run_owned_cache(&root, parent.as_deref()) {
+            let cache = match create_safe_cache(&root, parent.as_deref()) {
                 Ok(cache) => cache,
                 Err(error) => {
                     return RunSummary::refused(
@@ -14841,8 +14953,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                     )
                 }
             };
-            std::env::set_var("XDG_CACHE_HOME", cache.path());
-            _run_owned_cache = Some(cache);
+            std::env::set_var("XDG_CACHE_HOME", cache);
         }
     }
 
