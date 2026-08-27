@@ -8253,35 +8253,105 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     // FAILURE banner ABSENT. A summary that printed both would be telling the
     // reader a green run had failed.
     {
-        let failed_finally: BTreeSet<String> = retried
-            .outcomes
-            .iter()
-            .filter(|o| outcome_is_failure(o))
-            .map(|o| o.tag.clone())
-            .collect();
-        let flaky = flaky_nodes_from_attempts(&retried.attempts, &failed_finally);
+        let log = "[fixture.environmental] ▶ START fixture\n\
+[fixture.environmental] FAIL [ 0.100s] hermit::fixture hard_failure\n\
+[fixture.environmental] FAIL [ 0.200s] hermit::fixture recovered_on_retry\n\
+[fixture.environmental] FAIL [ 0.200s] hermit::fixture recovered_on_retry\n\
+[fixture.environmental] ▶ START fixture\n\
+[fixture.environmental] FAIL [ 0.100s] (1/2) hermit::fixture hard_failure\n\
+[fixture.environmental] PASS [ 0.200s] (2/2) hermit::fixture recovered_on_retry\n";
+        let observations = nextest_test_observations(log);
+        // Six terminal-looking lines contain only four executions: nextest's
+        // repeated failure recap in attempt 1 is not a retry.
+        if observations.len() != 4 {
+            return Err(format!(
+                "end-of-run summary: nextest duplicate recap was counted as an execution: {:?}",
+                observations
+            ));
+        }
+        let e2e_root = tmp.join("summary-e2e");
+        std::fs::create_dir_all(&e2e_root)
+            .map_err(|e| format!("end-of-run summary: cannot create E2E fixture: {e}"))?;
+        std::fs::write(
+            e2e_root.join("results.jsonl"),
+            "{\"attempt\":1,\"test\":\"applications/example\",\"category\":\"applications\",\"lane\":\"portable\",\"mode\":\"verify\",\"backend\":\"ptrace\",\"outcome\":\"FAIL\"}\n\
+{\"attempt\":2,\"test\":\"applications/example\",\"category\":\"applications\",\"lane\":\"portable\",\"mode\":\"verify\",\"backend\":\"ptrace\",\"outcome\":\"PASS\"}\n",
+        )
+        .map_err(|e| format!("end-of-run summary: cannot write E2E fixture: {e}"))?;
+        let e2e = e2e_test_observations(&e2e_root)?;
+        if e2e.len() != 2
+            || e2e[0].node != "e2e.manifest_applications"
+            || e2e[0].id != "applications/example [ptrace/verify]"
+            || e2e[0].passed
+            || !e2e[1].passed
+        {
+            return Err(format!(
+                "end-of-run summary: E2E rows did not retain test id, backend, mode, attempt, \
+                 node, and verdict: {e2e:?}"
+            ));
+        }
+        let failed_nodes = BTreeSet::from(["fixture.environmental".to_string()]);
+        let split = test_id_summary(observations, &retried.attempts, &failed_nodes);
+        if split.recovered.len() != 1
+            || split.recovered[0].id != "hermit::fixture$recovered_on_retry"
+            || split.recovered[0].retry_classes != ["bpfjailer-banner"]
+            || split.failed.len() != 1
+            || split.failed[0].id != "hermit::fixture$hard_failure"
+            || split.failed[0].retry_classes != ["bpfjailer-banner"]
+            || !split.failed_nodes_without_test_ids.is_empty()
+            || split.retry_occurrences != 1
+        {
+            return Err(format!(
+                "end-of-run summary: failed and recovered test ids were conflated, retry counts \
+                 did not come from attempts[].retry_class, or a node tag leaked into the test-id \
+                 list: {split:?}"
+            ));
+        }
+
+        let mut red = RunSummary::new(Verdict::Fail, 1, "self-test", Vec::new());
+        red.flaky = split.recovered.clone();
+        red.failed_ids = split.failed.clone();
+        red.retry_occurrences = split.retry_occurrences;
+        red.wall_s = Some(0.0);
+        red.nodes_executed = 1;
+        let red_rendered = run_summary_lines(&red, std::time::Instant::now()).join("\n");
+        if !red_rendered.contains(SUMMARY_FLAKY_HEADING)
+            || !red_rendered.contains("1 test id(s) recovered")
+            || !red_rendered.contains("1 test id(s) failed and did NOT recover")
+            || !red_rendered.contains("hermit::fixture$recovered_on_retry  (1 retry")
+            || !red_rendered.contains("hermit::fixture$hard_failure  (1 retry")
+            || !red_rendered.contains(
+                "retries: 1 occurrence(s) recorded from attempts[].retry_class",
+            )
+        {
+            return Err(format!(
+                "end-of-run summary: one hard failure and one recovered test id were not shown \
+                 as separate counts with their retry counts: {red_rendered}"
+            ));
+        }
+
         let mut green = RunSummary::new(Verdict::Pass, 0, "self-test", Vec::new());
-        green.flaky = flaky.clone();
+        green.flaky = split.recovered.clone();
+        green.retry_occurrences = split.retry_occurrences;
         green.wall_s = Some(0.0);
+        green.nodes_executed = 1;
         let rendered = run_summary_lines(&green, std::time::Instant::now()).join("\n");
-        let names_the_node = rendered.contains("fixture.environmental");
+        let names_the_test = rendered.contains("hermit::fixture$recovered_on_retry");
         let names_the_ground = rendered.contains("bpfjailer-banner");
         if !retried.ok
-            || flaky.len() != 1
-            || flaky[0].1 != 1
             || !rendered.contains(SUMMARY_FLAKY_HEADING)
-            || !names_the_node
+            || !names_the_test
             || !names_the_ground
             || rendered.contains("❌ FAILURE")
         {
             return Err(format!(
                 "end-of-run summary: a GREEN run carrying a recovered flake did not warn about \
-                 it, or warned as a failure: lane_ok={} flaky={:?} heading={} node={} \
+                 it, or warned as a failure: lane_ok={} flaky={:?} heading={} test={} \
                  ground={} failure_banner={}",
                 retried.ok,
-                flaky,
+                split.recovered,
                 rendered.contains(SUMMARY_FLAKY_HEADING),
-                names_the_node,
+                names_the_test,
                 names_the_ground,
                 rendered.contains("❌ FAILURE"),
             ));
@@ -8296,7 +8366,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         clean.wall_s = Some(0.0);
         clean.nodes_executed = 3;
         let clean_rendered = run_summary_lines(&clean, std::time::Instant::now()).join("\n");
-        if !clean_rendered.contains("no retries and no flaky tests")
+        if !clean_rendered.contains("no retries, no flaky tests, and no failed test ids")
             || clean_rendered.contains(SUMMARY_FLAKY_HEADING)
             || clean_rendered.contains("\u{274c} FAILURE")
         {
@@ -8304,7 +8374,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
                 "end-of-run summary: a CLEAN run must state that it found no retries and no \
                  flaky tests, so silence cannot be confused with the accounting having \
                  produced nothing: stated={} flaky_heading={} failure_banner={}",
-                clean_rendered.contains("no retries and no flaky tests"),
+                clean_rendered.contains("no retries, no flaky tests, and no failed test ids"),
                 clean_rendered.contains(SUMMARY_FLAKY_HEADING),
                 clean_rendered.contains("\u{274c} FAILURE"),
             ));
@@ -8315,7 +8385,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         nothing_ran.wall_s = None;
         let nothing_rendered =
             run_summary_lines(&nothing_ran, std::time::Instant::now()).join("\n");
-        if nothing_rendered.contains("no retries and no flaky tests") {
+        if nothing_rendered.contains("no retries, no flaky tests, and no failed test ids") {
             return Err(
                 "end-of-run summary: a run that stopped before the DAG claimed it found no \
                  flaky tests; it counted nothing and must claim nothing"
@@ -8323,18 +8393,6 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             );
         }
 
-        // A node that exhausted its retries and STILL failed is a failure, not a
-        // flake. Feed the same attempts with that node marked failed-finally and
-        // the flake list must empty out, or a red would read as a flaky green.
-        let as_failure: BTreeSet<String> =
-            ["fixture.environmental".to_string()].into_iter().collect();
-        if !flaky_nodes_from_attempts(&retried.attempts, &as_failure).is_empty() {
-            return Err(
-                "end-of-run summary: a node that failed finally was still counted as a flake; \
-                 an unrecovered red must not be reported as a recovered one"
-                    .into(),
-            );
-        }
     }
 
     // The same node must still report its TERMINAL verdict as PASS. Preserving
@@ -12003,11 +12061,18 @@ struct RunSummary {
     /// Counted separately from `nodes_executed` and `nodes_skipped` so the
     /// one-line accounting can never read as though everything planned ran.
     nodes_host_inapplicable: usize,
-    /// `(tag, retries, class)` for every node that was RETRIED AND THEN PASSED.
-    /// Rendered even on a green run: see `SUMMARY_FLAKY_HEADING`.
-    flaky: Vec<(String, usize, String)>,
-    /// Tags of nodes that failed FINALLY, after any retries were exhausted.
-    failed_ids: Vec<String>,
+    /// Individual test ids that failed and then passed, with the retry grants
+    /// that followed their failed attempts. Rendered even on a green run.
+    flaky: Vec<TestIdRetry>,
+    /// Individual test ids that failed FINALLY, after any retries were exhausted.
+    failed_ids: Vec<TestIdRetry>,
+    /// Failed DAG nodes for which no individual failing test id was emitted.
+    /// Kept separate so a node tag is never presented as a test id.
+    failed_nodes_without_test_ids: Vec<String>,
+    /// Exact count of retry grants, read from non-null
+    /// `attempts[].retry_class`. This is deliberately not `retried_nodes`, which
+    /// includes successful peers re-run as part of a lane.
+    retry_occurrences: usize,
     wall_s: Option<f64>,
     jobs: Option<i64>,
     log: Option<PathBuf>,
@@ -12039,6 +12104,8 @@ impl RunSummary {
             nodes_host_inapplicable: 0,
             flaky: Vec::new(),
             failed_ids: Vec::new(),
+            failed_nodes_without_test_ids: Vec::new(),
+            retry_occurrences: 0,
             wall_s: None,
             jobs: None,
             log: None,
@@ -12112,33 +12179,38 @@ fn retry_candidate_tags(
     keep
 }
 
-/// Cap for every id list in the end-of-run summary, so the block stays roughly
-/// fixed size however wide the failure is.
-const SUMMARY_LIST_CAP: usize = 12;
-
 const SUMMARY_FLAKY_HEADING: &str =
-    "⚠️  FLAKY — these passed only after a retry, and this run is GREEN anyway:";
+    "⚠️  FLAKY — these test ids passed only after a retry:";
 
-/// Render one id list, truncated, with the count of what was dropped.
-///
-/// Truncation is stated, never silent: a list that ends in "+N more" is a
-/// different claim from a list that ends.
-fn summary_id_list(ids: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = ids
-        .iter()
-        .take(SUMMARY_LIST_CAP)
-        .map(|id| format!("     - {id}"))
-        .collect();
-    if ids.len() > SUMMARY_LIST_CAP {
-        out.push(format!(
-            "     … and {} more (truncated at {SUMMARY_LIST_CAP})",
-            ids.len() - SUMMARY_LIST_CAP
-        ));
-    }
-    out
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TestIdRetry {
+    id: String,
+    retry_classes: Vec<String>,
 }
 
-/// Nodes that were retried and then PASSED, with how many retries each took.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TestAttemptObservation {
+    node: String,
+    attempt: usize,
+    id: String,
+    passed: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct TestIdSummary {
+    recovered: Vec<TestIdRetry>,
+    failed: Vec<TestIdRetry>,
+    failed_nodes_without_test_ids: Vec<String>,
+    retry_occurrences: usize,
+}
+
+/// Render the complete id list. Failure output is complete by contract, and a
+/// truncated summary would not answer which tests failed.
+fn summary_id_list(ids: &[String]) -> Vec<String> {
+    ids.iter().map(|id| format!("     - {id}")).collect()
+}
+
+/// Retry grants attributable to one individual test id's failed observations.
 ///
 /// ⚠️ READ `attempts[].retry_class`, NEVER `retried_nodes`. THIS IS NOT A STYLE
 /// PREFERENCE AND THE WRONG FIELD PRODUCES A PLAUSIBLE NUMBER. `retried_nodes` is
@@ -12155,27 +12227,223 @@ fn summary_id_list(ids: &[String]) -> Vec<String> {
 /// looks entirely reasonable, which is why nothing would catch it. `retry_class`
 /// is set only on an attempt for which a retry was actually GRANTED, per node,
 /// and carries the reason in the words the retry line printed.
-fn flaky_nodes_from_attempts(
+fn retry_classes_for_test(
+    observations: &[TestAttemptObservation],
     attempts: &[NodeAttempt],
-    failed_finally: &BTreeSet<String>,
-) -> Vec<(String, usize, String)> {
-    let mut granted: BTreeMap<String, (usize, String)> = BTreeMap::new();
-    for attempt in attempts {
-        if let Some(class) = attempt.retry_class.as_deref() {
-            let entry = granted
-                .entry(attempt.tag.clone())
-                .or_insert((0, class.to_string()));
-            entry.0 += 1;
+) -> Vec<String> {
+    observations
+        .iter()
+        .filter(|observation| !observation.passed)
+        .filter_map(|observation| {
+            attempts
+                .iter()
+                .find(|attempt| {
+                    attempt.tag == observation.node && attempt.attempt == observation.attempt
+                })
+                .and_then(|attempt| attempt.retry_class.clone())
+        })
+        .collect()
+}
+
+/// Parse a nextest terminal line after the `[node]` prefix.
+///
+/// nextest prints a failing test once when it executes and again in its failure
+/// recap. The caller deduplicates within one node attempt; this function only
+/// identifies the terminal row and returns its stable `binary$test` id.
+fn nextest_test_observation(rest: &str) -> Option<(bool, String)> {
+    let rest = rest.trim_start();
+    let (passed, after_verdict) = if let Some(rest) = rest.strip_prefix("PASS") {
+        (true, rest)
+    } else {
+        let verdicts = ["FAIL", "TIMEOUT", "LEAK", "ABORT", "SIGSEGV", "SIGABRT"];
+        if let Some(rest) = verdicts.iter().find_map(|verdict| rest.strip_prefix(verdict)) {
+            (false, rest)
+        } else if let Some(rest) = rest.strip_prefix("TRY ") {
+            let (_ordinal, rest) = rest.split_once(" FAIL")?;
+            (false, rest)
+        } else {
+            return None;
+        }
+    };
+    let after_verdict = after_verdict.trim_start();
+    let close = after_verdict.find(']')?;
+    if !after_verdict.starts_with('[') {
+        return None;
+    }
+    let mut identity = after_verdict[close + 1..].trim_start();
+    // Newer nextest versions may print `(n/N)` between the elapsed time and the
+    // binary id. It is progress, not part of the id.
+    if identity.starts_with('(') {
+        identity = identity[identity.find(')')? + 1..].trim_start();
+    }
+    let (binary, test) = identity.split_once(char::is_whitespace)?;
+    let test = test.trim();
+    if binary.is_empty() || test.is_empty() {
+        return None;
+    }
+    Some((passed, format!("{binary}${test}")))
+}
+
+fn nextest_test_observations(log: &str) -> Vec<TestAttemptObservation> {
+    let mut node_attempts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut seen: BTreeSet<(String, usize, String)> = BTreeSet::new();
+    let mut observations = Vec::new();
+    for line in log.lines() {
+        let Some(after_open) = line.strip_prefix('[') else { continue };
+        let Some((node, rest)) = after_open.split_once(']') else { continue };
+        if rest.trim_start().starts_with("▶ START") {
+            *node_attempts.entry(node.to_string()).or_default() += 1;
+            continue;
+        }
+        let Some((passed, id)) = nextest_test_observation(rest) else { continue };
+        let attempt = node_attempts.get(node).copied().unwrap_or(1);
+        // The first row is the actual execution. A later identical row in the
+        // same node attempt is nextest's recap, not another retry.
+        if seen.insert((node.to_string(), attempt, id.clone())) {
+            observations.push(TestAttemptObservation {
+                node: node.to_string(), attempt, id, passed,
+            });
         }
     }
-    granted
-        .into_iter()
-        // A node that exhausted its retries and still failed is a FAILURE, not a
-        // flake. It belongs in the failure list, and counting it here would let a
-        // red read as a flaky green.
-        .filter(|(tag, _)| !failed_finally.contains(tag))
-        .map(|(tag, (n, class))| (tag, n, class))
-        .collect()
+    observations
+}
+
+fn collect_e2e_result_files(path: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
+    for entry in std::fs::read_dir(path)
+        .map_err(|error| format!("cannot read per-cell result root {}: {error}", path.display()))?
+    {
+        let entry = entry.map_err(|error| format!("cannot read per-cell result entry: {error}"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("cannot classify {}: {error}", entry.path().display()))?;
+        if file_type.is_dir() {
+            collect_e2e_result_files(&entry.path(), output)?;
+        } else if file_type.is_file() && entry.file_name() == "results.jsonl" {
+            output.push(entry.path());
+        }
+    }
+    Ok(())
+}
+
+fn e2e_test_observations(root: &Path) -> Result<Vec<TestAttemptObservation>, String> {
+    let mut files = Vec::new();
+    collect_e2e_result_files(root, &mut files)?;
+    files.sort();
+    let mut seen = BTreeSet::new();
+    let mut observations = Vec::new();
+    for file in files {
+        let text = std::fs::read_to_string(&file)
+            .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
+        for (line_number, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let row: serde_json::Value = serde_json::from_str(line).map_err(|error| {
+                format!("{}:{} malformed result row: {error}", file.display(), line_number + 1)
+            })?;
+            let field = |name: &str| {
+                row.get(name)
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| format!("{}:{} has no {name}", file.display(), line_number + 1))
+            };
+            let lane = field("lane")?;
+            let category = field("category")?;
+            let test = field("test")?;
+            let mode = field("mode")?;
+            let backend = field("backend")?;
+            let outcome = field("outcome")?;
+            let attempt = row.get("attempt").and_then(serde_json::Value::as_u64).unwrap_or(1);
+            let attempt = usize::try_from(attempt)
+                .map_err(|_| format!("{}:{} attempt does not fit usize", file.display(), line_number + 1))?;
+            if attempt == 0 {
+                return Err(format!("{}:{} attempt must be positive", file.display(), line_number + 1));
+            }
+            let id = format!("{test} [{backend}/{mode}]");
+            if !seen.insert((lane.to_string(), id.clone(), attempt)) {
+                return Err(format!(
+                    "{}:{} duplicates test id {id} attempt {attempt}",
+                    file.display(), line_number + 1
+                ));
+            }
+            let group = match lane {
+                "portable" => "e2e",
+                "privileged" => "privileged-e2e",
+                _ => {
+                    return Err(format!(
+                        "{}:{} has unrecognized lane {lane}",
+                        file.display(), line_number + 1
+                    ));
+                }
+            };
+            let category = category.replace('-', "_");
+            observations.push(TestAttemptObservation {
+                node: format!("{group}.manifest_{category}"),
+                attempt,
+                id,
+                passed: outcome == "PASS",
+            });
+        }
+    }
+    observations.sort_by(|left, right| {
+        (&left.id, left.attempt, &left.node).cmp(&(&right.id, right.attempt, &right.node))
+    });
+    Ok(observations)
+}
+
+fn test_id_summary(
+    mut observations: Vec<TestAttemptObservation>,
+    attempts: &[NodeAttempt],
+    failed_nodes: &BTreeSet<String>,
+) -> TestIdSummary {
+    observations.sort_by(|left, right| {
+        (&left.id, left.attempt, &left.node).cmp(&(&right.id, right.attempt, &right.node))
+    });
+    let mut by_id: BTreeMap<String, Vec<TestAttemptObservation>> = BTreeMap::new();
+    for observation in observations {
+        by_id.entry(observation.id.clone()).or_default().push(observation);
+    }
+    let mut recovered = Vec::new();
+    let mut failed = Vec::new();
+    let mut failed_nodes_with_test_ids = BTreeSet::new();
+    for (id, observations) in by_id {
+        let Some(last) = observations.last() else { continue };
+        let retry_classes = retry_classes_for_test(&observations, attempts);
+        let was_retried = !retry_classes.is_empty();
+        let item = TestIdRetry { id, retry_classes };
+        if last.passed {
+            if was_retried {
+                recovered.push(item);
+            }
+        } else if failed_nodes.contains(&last.node) {
+            failed_nodes_with_test_ids.insert(last.node.clone());
+            failed.push(item);
+        }
+    }
+    TestIdSummary {
+        recovered,
+        failed,
+        failed_nodes_without_test_ids: failed_nodes
+            .difference(&failed_nodes_with_test_ids)
+            .cloned()
+            .collect(),
+        retry_occurrences: attempts.iter().filter(|attempt| attempt.retry_class.is_some()).count(),
+    }
+}
+
+fn render_test_id_retry(item: &TestIdRetry) -> String {
+    let retries = item.retry_classes.len();
+    let classes = if item.retry_classes.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", item.retry_classes.join("; "))
+    };
+    format!(
+        "{}  ({retries} retr{}{})",
+        item.id,
+        if retries == 1 { "y" } else { "ies" },
+        classes
+    )
 }
 
 /// The ONE summary renderer. Called from exactly one place.
@@ -12209,28 +12477,32 @@ fn run_summary_lines(s: &RunSummary, started: std::time::Instant) -> Vec<String>
     if !s.flaky.is_empty() {
         lines.push(String::new());
         lines.push(format!("   {SUMMARY_FLAKY_HEADING}"));
-        let ids: Vec<String> = s
-            .flaky
-            .iter()
-            .map(|(tag, n, class)| {
-                format!("{tag}  ({n} retr{}, {class})", if *n == 1 { "y" } else { "ies" })
-            })
-            .collect();
+        let ids: Vec<String> = s.flaky.iter().map(render_test_id_retry).collect();
         lines.extend(summary_id_list(&ids));
-        let total: usize = s.flaky.iter().map(|(_, n, _)| n).sum();
-        lines.push(format!(
-            "     {} test(s) retried, {total} retr{} spent in total",
-            s.flaky.len(),
-            if total == 1 { "y" } else { "ies" }
-        ));
+        lines.push(format!("     {} test id(s) recovered", s.flaky.len()));
     }
     if !s.failed_ids.is_empty() {
         lines.push(String::new());
         lines.push(format!(
-            "   ❌ FAILURE — {} test(s) failed and did NOT recover on retry:",
+            "   ❌ FAILURE — {} test id(s) failed and did NOT recover on retry:",
             s.failed_ids.len()
         ));
-        lines.extend(summary_id_list(&s.failed_ids));
+        let ids: Vec<String> = s.failed_ids.iter().map(render_test_id_retry).collect();
+        lines.extend(summary_id_list(&ids));
+    }
+    if !s.failed_nodes_without_test_ids.is_empty() {
+        lines.push(String::new());
+        lines.push(format!(
+            "   ❌ FAILURE — {} node(s) failed without emitting an individual test id:",
+            s.failed_nodes_without_test_ids.len()
+        ));
+        lines.extend(summary_id_list(&s.failed_nodes_without_test_ids));
+    }
+    if s.wall_s.is_some() && s.nodes_executed > 0 {
+        lines.push(format!(
+            "   retries: {} occurrence(s) recorded from attempts[].retry_class",
+            s.retry_occurrences
+        ));
     }
     // ⚠️ A CLEAN RUN SAYS SO, RATHER THAN SAYING NOTHING. With both blocks above
     // conditional and no else, a run with nothing to report rendered IDENTICALLY
@@ -12242,11 +12514,18 @@ fn run_summary_lines(s: &RunSummary, started: std::time::Instant) -> Vec<String>
     //
     // Only when a DAG actually ran. Before that there is genuinely nothing to
     // have counted, and claiming otherwise would be the same error inverted.
-    if s.flaky.is_empty() && s.failed_ids.is_empty() && s.wall_s.is_some() && s.nodes_executed > 0
+    if s.flaky.is_empty()
+        && s.failed_ids.is_empty()
+        && s.failed_nodes_without_test_ids.is_empty()
+        && s.retry_occurrences == 0
+        && s.wall_s.is_some()
+        && s.nodes_executed > 0
     {
         lines.push(String::new());
-        lines.push("   no retries and no flaky tests: every executed node passed first time"
-            .to_string());
+        lines.push(
+            "   no retries, no flaky tests, and no failed test ids: every executed node passed first time"
+                .to_string(),
+        );
     }
     // Node accounting is printed whenever a DAG ran, and deliberately printed as
     // an explicit zero when one did not, so "no nodes ran" is a stated fact
@@ -13707,6 +13986,35 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         }
     }
 
+    // Read the individual results before removing the disposable build root: a
+    // caller may deliberately place E2E_RESULT_ROOT there. The scheduler is
+    // finished, and `read_log_since_settled` flushes the live tee before reading.
+    let failed_finally: BTreeSet<String> = outcomes
+        .iter()
+        .filter(|o| outcome_is_failure(o))
+        .map(|o| o.tag.clone())
+        .collect();
+    let mut test_summary_errors = Vec::new();
+    let mut test_observations = match read_log_since_settled(&log_path, 0) {
+        Some(log) => nextest_test_observations(&log),
+        None => {
+            test_summary_errors.push(
+                "individual nextest test ids could not be read from the durable log; failed DAG \
+                 nodes are listed separately below rather than mislabeled as test ids"
+                    .to_string(),
+            );
+            Vec::new()
+        }
+    };
+    match e2e_test_observations(&e2e_result_root) {
+        Ok(mut observations) => test_observations.append(&mut observations),
+        Err(error) => test_summary_errors.push(format!(
+            "individual E2E test ids could not be read from the per-cell results: {error}; \
+             failed DAG nodes are listed separately below rather than mislabeled as test ids"
+        )),
+    }
+    let test_summary = test_id_summary(test_observations, &attempts, &failed_finally);
+
     drop(run_record);
     let _ = std::fs::remove_dir_all(&tmp);
 
@@ -13813,6 +14121,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                 .into(),
         ),
     }
+    detail.extend(test_summary_errors);
+
     let mut s = RunSummary::new(
         match exit_code {
             0 => Verdict::Pass,
@@ -13825,13 +14135,10 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     );
     s.nodes_executed = outcomes.len();
     s.nodes_failed = failures;
-    let failed_finally: BTreeSet<String> = outcomes
-        .iter()
-        .filter(|o| outcome_is_failure(o))
-        .map(|o| o.tag.clone())
-        .collect();
-    s.failed_ids = failed_finally.iter().cloned().collect();
-    s.flaky = flaky_nodes_from_attempts(&attempts, &failed_finally);
+    s.flaky = test_summary.recovered;
+    s.failed_ids = test_summary.failed;
+    s.failed_nodes_without_test_ids = test_summary.failed_nodes_without_test_ids;
+    s.retry_occurrences = test_summary.retry_occurrences;
     s.nodes_skipped = skipped.len();
     s.nodes_host_inapplicable = plan.host_inapplicable.len();
     s.wall_s = Some(wall);
