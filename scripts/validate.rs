@@ -9243,7 +9243,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     ];
     let retry_set = retry_candidate_tags(
         &retry_set_cfg,
-        &[(available.to_string(), "always-eligible: exit 1".to_string())],
+        &[(available.to_string(), "always-eligible".to_string())],
         &[capped.to_string()],
         &BTreeMap::new(),
         &BTreeSet::new(),
@@ -9310,7 +9310,11 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         || bound_attempts.len() != 2
         || bound_attempts[0].ok != Some(false)
         || bound_attempts[1].ok != Some(true)
-        || !bound_ground.starts_with("bound-kill under contention")
+        // ⚠️ EQUALITY, NOT `starts_with`. The prefix form passed both before and
+        // after the message was removed from this class, so it could not have
+        // caught the defect it looks like it covers, and would not catch the
+        // message coming back.
+        || bound_ground != "bound-kill under contention"
     {
         return Err(format!(
             "scheduler accounting: a node killed by its own wall budget was not retried on the \
@@ -9365,6 +9369,30 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             ordinary_only.ok,
             ordinary_only.env_retries,
             ordinary_only.attempts.len()
+        ));
+    }
+
+    // ⚠️ THE GRANTED CLASS MUST BE A CATEGORY, NOT THE FAILURE MESSAGE.
+    // Owner ruling 2026-08-27, the condition attached to always-eligible retry.
+    //
+    // This fixture IS the blanket path -- nothing classified `plain_red` -- so it
+    // is where the catch-all value is observable. Two things are asserted, and
+    // the second is the one that generalises: the class must not contain this
+    // attempt's own `reason`. A class carrying a per-failure message groups into
+    // buckets of one, which leaves the field populated, non-null, and unable to
+    // answer the only question it exists for. The text is not lost -- `reason`
+    // sits beside it on the same attempt row and is published with it.
+    let blanket_attempt = ordinary_only.attempts.iter().find(|a| a.attempt == 1);
+    let blanket = blanket_attempt.and_then(|a| a.retry_class.clone()).unwrap_or_default();
+    let blanket_reason =
+        blanket_attempt.map(|a| a.reason.trim().to_string()).unwrap_or_default();
+    if blanket != "always-eligible"
+        || (!blanket_reason.is_empty() && blanket.contains(&blanket_reason))
+    {
+        return Err(format!(
+            "scheduler accounting: the blanket retry ground must publish the bare category \
+             \"always-eligible\" and must never embed the attempt's own failure message, or \
+             `retry_class` cannot be grouped: retry_class={blanket:?} reason={blanket_reason:?}"
         ));
     }
 
@@ -9797,8 +9825,13 @@ fn run_lane_with_env_retries(
                     .get(&o.tag)
                     .cloned()
                     .or_else(|| {
-                        outcome_hit_its_budget(o)
-                            .then(|| format!("bound-kill under contention: {}", o.reason.trim()))
+                        // ⚠️ A CATEGORY, NOT A MESSAGE. This arm used to append
+                        // `o.reason` and so produced a near-unique value per
+                        // failure; see the block under the always-eligible arm
+                        // below for why that empties the field of its purpose.
+                        // The message is not lost: it is already on the same
+                        // attempt row, in `reason`, one key away.
+                        outcome_hit_its_budget(o).then(|| "bound-kill under contention".to_string())
                     })
                     .or_else(|| validate_runtime::measured_unstable_class(unstable, &o.tag))
                     // ALWAYS-ELIGIBLE FALLBACK (owner directive 2026-08-26): every
@@ -9822,7 +9855,30 @@ fn run_lane_with_env_retries(
                     // a failure whose prerequisite did not complete is dropped by
                     // `retry_steps_with_satisfied_prerequisites` below, and the whole
                     // loop is bounded by `max` rounds.
-                    .or_else(|| Some(format!("always-eligible: {}", o.reason.trim())))
+                    //
+                    // ⚠️ THIS IS A CATEGORY AND IT MUST NOT CARRY THE MESSAGE.
+                    // Owner ruling 2026-08-27, granting the eligibility above on
+                    // condition that the field stay groupable.
+                    //
+                    // Both this arm and the bound-kill arm above used to append
+                    // `o.reason`. That reads as more information and is less:
+                    // the paragraph above says this field is "the signal a
+                    // multi-week flakiness timeline is built from", and a
+                    // timeline is built by GROUPING. Interpolating a per-failure
+                    // message makes every group hold one row, so the field is
+                    // populated, non-null, and answers nothing -- while looking
+                    // entirely reasonable in any single row you inspect.
+                    //
+                    // This arm is the catch-all, so it takes every failure the
+                    // three named grounds did not match. Left as free text it
+                    // would become the dominant value AND the least analysable
+                    // one, which inverts the purpose of granting the retry.
+                    //
+                    // NOTHING IS LOST. The failure text is already published on
+                    // the same attempt object as `reason` (see NodeAttempt and
+                    // the envelope writer): one field for a human reading a row,
+                    // one for a machine counting rows.
+                    .or_else(|| Some("always-eligible".to_string()))
                     .map(|class| (o.tag.clone(), class))
             })
             .collect();
