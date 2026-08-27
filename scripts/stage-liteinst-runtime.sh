@@ -29,13 +29,18 @@ fi
 mkdir -p -- "$liteinst_stage_dir"
 liteinst_stage_dir=$(realpath -e -- "$liteinst_stage_dir")
 liteinst_stable_stage=$liteinst_stage_dir/$liteinst_stage_name
+liteinst_stable_marker=${liteinst_stable_stage}.revision
 liteinst_temp_dir=$(
     mktemp -d --tmpdir="$liteinst_stage_dir" ".${liteinst_stage_name}.stage.XXXXXX"
 )
 liteinst_temp_stage=$liteinst_temp_dir/runtime.so
+liteinst_temp_marker=${liteinst_temp_dir}/runtime.so.revision
 cleanup_liteinst_temp_stage() {
     if [[ -n ${liteinst_temp_stage:-} ]]; then
         rm -f -- "$liteinst_temp_stage"
+    fi
+    if [[ -n ${liteinst_temp_marker:-} ]]; then
+        rm -f -- "$liteinst_temp_marker"
     fi
     if [[ -n ${liteinst_temp_dir:-} ]]; then
         rmdir -- "$liteinst_temp_dir"
@@ -54,9 +59,18 @@ if [[ ! -s $liteinst_temp_stage || ! -f $liteinst_temp_stage || -L $liteinst_tem
     exit 1
 fi
 
-# The unique destination above forces Cargo to rerun the staging build script.
-# It is adjacent to the stable path, so this rename is an atomic replacement.
+# Record the same pin that selected the target directory. Hermit requires this
+# sibling marker before it will load the runtime, so the standalone staging
+# command must produce both halves of that contract.
+printf '%s\n' "$reverie_pin" >"$liteinst_temp_marker"
+
+# The unique destinations above force Cargo to rerun the staging build script.
+# They are adjacent to the stable paths, so each rename is atomic. Move the DSO
+# first: while the two renames are in flight, a new DSO with an old or absent
+# marker is refused. Moving the marker first could make an old DSO look current.
 mv -fT -- "$liteinst_temp_stage" "$liteinst_stable_stage"
 liteinst_temp_stage=
+mv -fT -- "$liteinst_temp_marker" "$liteinst_stable_marker"
+liteinst_temp_marker=
 rmdir -- "$liteinst_temp_dir"
 liteinst_temp_dir=
