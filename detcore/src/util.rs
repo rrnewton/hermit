@@ -8,6 +8,9 @@
 
 //! Widely useful small utilities.
 
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::types::NANOS_PER_RCB;
@@ -130,13 +133,11 @@ pub struct RetryingStderr;
 /// `HERMIT_RUN_TIMEOUT_FALLBACK`, which is supposed to mean the teardown wedged.
 /// So the arithmetic is:
 ///
-/// ⚠️ AND IT APPLIES TWICE, BECAUSE HERMIT FORKS. `Container::run` forks the
-/// container init, so the init gets its own COPY of the process-wide clock below
-/// and spends its own full deadline. Both processes write diagnostics to the same
-/// fd 2 on the way out. "Process total" is therefore NOT "exit total", and a
-/// derivation that forgets the fork is out by exactly a factor of two. Measured
-/// 2026-08-26 against a stopped reader on a real guest, which is the case where
-/// both processes report:
+/// ⚠️ IT USED TO APPLY ONCE PER PROCESS, BECAUSE HERMIT FORKS. `Container::run`
+/// forks the container init, which got its own COPY of the process-wide clock and
+/// spent its own full deadline; both write diagnostics to the same fd 2 on the way
+/// out. Measured 2026-08-26 against a stopped reader on a real guest, which is the
+/// case where both processes report:
 ///
 /// ```text
 ///   deadline 5000ms   ->  10.03s observed   two processes, one deadline each
@@ -144,17 +145,32 @@ pub struct RetryingStderr;
 ///   deadline 2500ms   ->   2.52s observed   missing guest: only ONE process reports
 /// ```
 ///
-/// So the arithmetic is:
+/// ⚠️ AND THE MULTIPLIER WAS NOT ALWAYS TWO, WHICH IS WHY IT IS NO LONGER A
+/// CONSTANT. `hermit run --verify` runs the guest twice and forks once per run, so
+/// it is the outer hermit plus TWO container inits -- three writers, and siblings
+/// rather than a chain. From the call structure, so it needs no sampling:
+///
+/// ```text
+///   run.rs  fn verify()      Run1 -> self.run_verify(..)   Run2 -> self.run_verify(..)
+///           fn run_verify()  -> with_container(..) forks a container init
+/// ```
+///
+/// At three, `3 x 2500ms x 2 = 15s` against a 10s grace: the stated split does not
+/// hold. Correcting the constant to three would force the deadline to ~1666ms and
+/// leave a hardcoded count for the next differently-forking path to falsify.
+///
+/// So the ORIGIN is shared across the invocation instead (see
+/// `STDERR_ORIGIN_ADDR`): every hermit process measures from the same start, the
+/// invocation spends ONE deadline however many processes write, and the count
+/// stops being an input. The arithmetic no longer contains it:
 ///
 /// ```text
 ///   RUN_TIMEOUT_UNWIND_GRACE                    10s     the enclosing bound
 ///   diagnostics may have half of it              5s     leaving 5s for the unwind
-///   processes that write diagnostics              2     hermit + the forked init
-///   this deadline, per process                2500ms    = 5s / 2
+///   this deadline, per INVOCATION             2500ms    comfortably inside the 5s
 /// ```
 ///
-/// Half is a split, not a measurement, and is stated as one; the factor of two is
-/// a fact about the process tree and is measured above. What is ALSO measured is
+/// Half is a split, not a measurement, and is stated as one. What is ALSO measured is
 /// that the previous arrangement could not fit: at 5s per CALL, the same real-guest
 /// fixture took 15.04s -- three blocked writes -- against a 10s grace, so the inner
 /// bound exceeded its outer bound before any unwind work happened at all.
@@ -170,7 +186,148 @@ pub const STDERR_DIAGNOSTIC_DEADLINE: std::time::Duration = std::time::Duration:
 /// `RetryingStderr`, which is what makes the deadline above a process total.
 /// Set on the first `EAGAIN` and never reset: a run that recovers and later
 /// blocks again has still spent that earlier time on its exit path.
+///
+/// Fallback only: used when the invocation-wide origin below is unavailable.
 static STDERR_BLOCKED_SINCE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// The same instant, shared by every hermit process of ONE INVOCATION.
+///
+/// ⚠️ WITHOUT THIS THE DEADLINE IS MULTIPLIED BY THE NUMBER OF PROCESSES, AND
+/// THAT NUMBER IS NOT 2. A `static` lives per process, so each hermit sets its
+/// own origin and spends its own full deadline. The comment above states the
+/// multiplier as "2 -- hermit + the forked init", which is right for `hermit
+/// run` and wrong for `hermit run --verify`. From the call structure, not from
+/// sampling a process table:
+///
+/// ```text
+///   hermit-cli/src/bin/hermit/run.rs
+///     fn verify()                      -> Run1: self.run_verify(log1_file, global)
+///                                      -> Run2: self.run_verify(log2_file, global)
+///     fn run_verify()                  -> with_container(..) forks a container init
+/// ```
+///
+/// So `--verify` is the outer hermit plus TWO container inits, which share the
+/// outer as their parent. Three writing processes, and siblings rather than a
+/// chain. `record --verify` forks twice for the same reason, at
+/// `record_verify.record` and `record_verify.replay` in record_start.rs.
+///
+/// At three the stated derivation does not hold: 3 x 2500ms x 2 = 15s against a
+/// 10s grace. Correcting the constant to 3 would force the deadline to ~1666ms
+/// and would leave a hardcoded count that the next differently-forking path
+/// falsifies again. Sharing the ORIGIN makes the multiplier 1 by construction --
+/// every process measures from the same start, so the invocation spends one
+/// deadline however many processes write -- and the count stops being an input.
+///
+/// ⚠️ THE CARRIER IS AN INHERITED SHARED MAPPING, DELIBERATELY NOT AN ENVIRONMENT
+/// VARIABLE AND NOT A FILE. A variable set on hermit reaches the GUEST by default
+/// (`BaseEnv::Host` does not clear it), and a per-run-varying value visible to the
+/// guest, in a determinism tool, on a surface the argv/env hashing covers, would
+/// be a worse defect than the one being fixed. A file would put I/O on the path
+/// that runs while hermit is already failing. `exec` drops the mapping, so the
+/// guest never shares it.
+///
+/// `CLOCK_MONOTONIC` rather than `Instant`: an `Instant` is not meaningful in
+/// another process, while `CLOCK_MONOTONIC` is system-wide on Linux, so the same
+/// nanosecond count is directly comparable between parent and child. 0 means
+/// unset; the first blocked write in ANY process installs the origin.
+static STDERR_ORIGIN_ADDR: OnceLock<usize> = OnceLock::new();
+
+/// Create the origin cell every hermit process of this invocation shares.
+///
+/// ⚠️ MUST BE CALLED BEFORE THE FIRST FORK, and is called from the top of `main`.
+/// A mapping made after a fork is not shared with the child that already exists,
+/// so a late call would silently give each process its own origin -- the exact
+/// failure this removes. `main` dominates every `with_container` and
+/// `run_guarded_at` site in run.rs, replay.rs and record_start.rs.
+pub fn init_shared_stderr_deadline_origin() {
+    STDERR_ORIGIN_ADDR.get_or_init(|| {
+        // SAFETY: an anonymous shared mapping of one page, no fd, no fixed
+        // address. Never unmapped: it must outlive every child, and one page per
+        // invocation does not justify a teardown path on an exit route.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                std::mem::size_of::<AtomicU64>(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if addr == libc::MAP_FAILED {
+            // Not fatal and NOT silent: `stderr_deadline_is_shared` reports false
+            // and the per-process fallback still bounds each process.
+            return 0;
+        }
+        // SAFETY: freshly mapped, aligned for u64, sole owner at this point.
+        unsafe { (addr as *mut AtomicU64).write(AtomicU64::new(0)) };
+        addr as usize
+    });
+}
+
+fn shared_origin_cell() -> Option<&'static AtomicU64> {
+    match STDERR_ORIGIN_ADDR.get() {
+        None | Some(0) => None,
+        // SAFETY: the address came from `mmap` above, was initialised there, is
+        // never unmapped, and `AtomicU64` is safe to share across processes in a
+        // `MAP_SHARED` page.
+        Some(&addr) => Some(unsafe { &*(addr as *const AtomicU64) }),
+    }
+}
+
+fn monotonic_nanos() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: one initialised `timespec`, a clock id the kernel always supports.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
+}
+
+/// Whether the deadline is bounded per INVOCATION or only per process.
+///
+/// ⚠️ EXISTS SO THE WEAKER STATE CANNOT BE SILENT. If the mapping failed, or
+/// something forks before `init_shared_stderr_deadline_origin`, the bound
+/// degrades to per-process and is multiplied by however many processes write.
+#[doc(hidden)]
+pub fn stderr_deadline_is_shared() -> bool {
+    shared_origin_cell().is_some()
+}
+
+/// How long this invocation has been blocked on stderr, from the shared origin
+/// when there is one and from this process's own first block otherwise.
+fn stderr_blocked_for() -> std::time::Duration {
+    match shared_origin_cell() {
+        Some(cell) => {
+            let now = monotonic_nanos();
+            // The first blocked write in ANY process installs the origin; every
+            // later one, in any process, reads the value that won.
+            let origin = match cell.compare_exchange(
+                0,
+                now,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => now,
+                Err(existing) => existing,
+            };
+            std::time::Duration::from_nanos(now.saturating_sub(origin))
+        }
+        None => STDERR_BLOCKED_SINCE
+            .get_or_init(std::time::Instant::now)
+            .elapsed(),
+    }
+}
+
+/// Reset the shared origin. Test-only: brackets that measure the deadline need
+/// each case to start from zero, and nothing in a real run wants this.
+#[doc(hidden)]
+pub fn reset_stderr_deadline_origin_for_test() {
+    if let Some(cell) = shared_origin_cell() {
+        cell.store(0, Ordering::Release);
+    }
+}
 
 impl std::io::Write for RetryingStderr {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -194,8 +351,10 @@ impl std::io::Write for RetryingStderr {
                     // top of `write` is what makes the deadline a total: the first
                     // blocked write sets it and every later one inherits it, so N
                     // writes cost the deadline once instead of N times.
-                    let blocked_since = *STDERR_BLOCKED_SINCE.get_or_init(std::time::Instant::now);
-                    let spent = blocked_since.elapsed();
+                    // Measured from the origin shared by every hermit process
+                    // of this invocation when there is one, so N processes spend
+                    // ONE deadline rather than N. See STDERR_ORIGIN_ADDR.
+                    let spent = stderr_blocked_for();
                     let Some(remaining) = STDERR_DIAGNOSTIC_DEADLINE.checked_sub(spent) else {
                         return Err(err);
                     };
@@ -228,5 +387,93 @@ impl std::io::Write for RetryingStderr {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod shared_stderr_origin_tests {
+    use super::*;
+
+    /// The origin must actually be SHARED across a fork, or nothing else holds.
+    ///
+    /// ⚠️ THIS IS THE ONE THING THAT CANNOT BE CHECKED BY READING THE CODE.
+    /// `MAP_SHARED` versus `MAP_PRIVATE` is a single token; get it wrong and every
+    /// single-process test still passes while each container init silently gets its
+    /// own deadline again -- the exact defect this removes. So this forks for real
+    /// and checks that a value written by the child is visible in the parent.
+    #[test]
+    fn the_origin_is_shared_across_a_fork() {
+        init_shared_stderr_deadline_origin();
+        let cell = shared_origin_cell().expect("mapping must exist after init");
+        cell.store(0, Ordering::Release);
+
+        // SAFETY: the child does no allocation and no locking -- one atomic store
+        // and `_exit` -- so forking from a test harness thread is safe here.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            shared_origin_cell()
+                .expect("child inherited no mapping")
+                .store(4242, Ordering::Release);
+            unsafe { libc::_exit(0) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid, "waitpid");
+        assert_eq!(status, 0, "child exited nonzero");
+
+        assert_eq!(
+            cell.load(Ordering::Acquire),
+            4242,
+            "the parent cannot see the child's write, so each container init would \
+             start its OWN deadline and the invocation would spend one per process -- \
+             check MAP_SHARED in init_shared_stderr_deadline_origin"
+        );
+        cell.store(0, Ordering::Release);
+    }
+
+    /// The first blocked write installs the origin; later ones inherit it.
+    ///
+    /// This is what makes the deadline a TOTAL rather than a fresh allowance per
+    /// caller, and it must hold across processes, not just across calls.
+    #[test]
+    fn the_first_writer_installs_the_origin_and_others_inherit_it() {
+        init_shared_stderr_deadline_origin();
+        reset_stderr_deadline_origin_for_test();
+        let cell = shared_origin_cell().expect("mapping must exist after init");
+
+        let first = stderr_blocked_for();
+        let installed = cell.load(Ordering::Acquire);
+        assert_ne!(installed, 0, "the first call must install a nonzero origin");
+        // A fresh origin means almost no time has been spent yet.
+        assert!(first < Duration::from_millis(50), "first call saw {first:?}");
+
+        std::thread::sleep(Duration::from_millis(20));
+        let second = stderr_blocked_for();
+        assert_eq!(
+            cell.load(Ordering::Acquire),
+            installed,
+            "a later call moved the origin, so each caller would get a fresh \
+             allowance and the deadline would stop being a total"
+        );
+        assert!(
+            second >= Duration::from_millis(15),
+            "the second call reported {second:?}, so it is not measuring from the \
+             origin the first call installed"
+        );
+        reset_stderr_deadline_origin_for_test();
+    }
+
+    /// Which bound is in force must be answerable, not assumed.
+    #[test]
+    fn whether_the_deadline_is_invocation_wide_is_observable() {
+        init_shared_stderr_deadline_origin();
+        // ⚠️ THE WEAKER STATE MUST NOT BE SILENT. If the mapping failed, or something
+        // forks before the init call, the deadline degrades to per-process and is
+        // multiplied by however many processes write.
+        assert!(
+            stderr_deadline_is_shared(),
+            "the origin is not shared after init, so the deadline is per-process and \
+             is multiplied by the number of writing processes"
+        );
     }
 }
