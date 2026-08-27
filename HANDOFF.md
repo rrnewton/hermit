@@ -21,12 +21,12 @@ No validate is running for this task. The devbig030 SSH control socket was live 
 
 The prior devbig014 measurement unit is inactive and ran no child. Its refusal log is `/home/newton/work/dev-hermit/worktrees/122-goal5/ignored/hermit-122/manifest-audits-systemd.log`; its record is `/home/newton/work/dev-hermit/ignored/validate/runs/validate-hermit-122-manifest-audits-d4d9fe5effe31.json`.
 
-Uncommitted/unpushed work at checkpoint:
+Pushed work at checkpoint:
 
-- This slot has staged timing-only changes in `ci/manifest-plan/src/bin/test-harness.rs`. The attempted commit had not completed when the reboot instruction arrived.
+- This slot is branch `hermit-122/goal5-manifest-timing` at `772ddc9519f1e6b7dece5f70a8a76fa966c74ff6`, pushed to the same branch on `rrnewton/hermit`. Its parent `ff9cb20b47319257ffbb623df5013a606f718234` contains the timing-only edit to `ci/manifest-plan/src/bin/test-harness.rs`; `772ddc9519` adds this handoff.
 - `ignored/hermit-122/measure-manifest-audits.sh`, `launch-manifest-audits.py`, and `summarize-manifest-audits.py` are local ignored measurement helpers.
-- The checker-sharing candidate has uncommitted edits in `ci/run-reverie-pin-check.sh` and `ci/run-with-reverie-dbt-budget-test.sh`; `bash -n`, `shellcheck`, and `git diff --check` pass, but real tests have not run.
-- The removed-fix control has only the compiler-count test edit in `ci/run-with-reverie-dbt-budget-test.sh`; it is intentionally expected to refuse the identical-source reuse assertion.
+- The checker-sharing candidate is branch `hermit-122/checker-compilation-sharing` at `2698802d7b2798c2cde1ec3d11d83407f6493d93`, pushed to `rrnewton/hermit`. `bash -n`, `shellcheck`, and `git diff --check` pass, but real tests have not run.
+- The removed-fix control is branch `hermit-122/checker-compilation-removed-fix-control` at `e745664e51404533659defb33c120137a16d2ce1`, pushed to `rrnewton/hermit`. It intentionally retains the old runner and is expected to refuse the identical-source reuse assertion.
 
 ## Next action
 
