@@ -1045,14 +1045,6 @@ impl GlobalTool for GlobalState {
                     .unwrap()
                     .exact_child_wait_state(parent, child),
             ),
-            GlobalRequest::VirtualProcessForPhysicalPid(physical_pid) => {
-                R::VirtualProcessForPhysicalPid(
-                    self.sched
-                        .lock()
-                        .unwrap()
-                        .virtual_process_for_physical_pid(physical_pid),
-                )
-            }
             GlobalRequest::ReadyChildWait(parent, selector) => {
                 let sched = self.sched.lock().unwrap();
                 R::ReadyChildWait((
@@ -2165,8 +2157,6 @@ pub enum GlobalRequest {
     ThreadIsLive(DetTid),
     /// Scheduler-owned lifecycle state for a direct child process.
     ExactChildWaitState(DetPid, DetPid),
-    /// Translate a registered host process ID back to its scheduler process ID.
-    VirtualProcessForPhysicalPid(i32),
 
     /// The container is shutting down.  Exit the scheduler "thread".
     UnrecoverableShutdown,
@@ -2231,7 +2221,6 @@ pub enum GlobalResponse {
     NotifySignalPending(()),
     ThreadIsLive(bool),
     ExactChildWaitState(ExactChildWaitState),
-    VirtualProcessForPhysicalPid(Option<DetPid>),
     // TODO: use void_send_rpc, and remove this bogus response:
     UnrecoverableShutdown(()),
 
@@ -2950,25 +2939,6 @@ where
         send_and_update_time(guest, GlobalRequest::ExactChildWaitState(parent, child)).await;
     match response.1 {
         GlobalResponse::ExactChildWaitState(state) => state,
-        _ => unreachable!(),
-    }
-}
-
-pub async fn virtual_process_for_physical_pid<G, T>(
-    guest: &mut G,
-    physical_pid: i32,
-) -> Option<DetPid>
-where
-    G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
-{
-    let response = send_and_update_time(
-        guest,
-        GlobalRequest::VirtualProcessForPhysicalPid(physical_pid),
-    )
-    .await;
-    match response.1 {
-        GlobalResponse::VirtualProcessForPhysicalPid(process) => process,
         _ => unreachable!(),
     }
 }

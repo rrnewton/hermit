@@ -741,11 +741,6 @@ struct ProcessWaitMetadata {
     exit_signal: libc::c_int,
     process_group: DetPid,
     session: DetPid,
-    /// Host process ID retained until terminal wait status is consumed. A
-    /// restarted DBT wait returns through the kernel with this ID in its saved
-    /// signal frame and must translate it back to `DetPid` before re-entering
-    /// the ordinary wait handler.
-    physical_pid: Option<i32>,
 }
 
 use pretty::Doc;
@@ -904,7 +899,6 @@ impl ThreadTree {
                         exit_signal: libc::SIGCHLD,
                         process_group: child_dettid,
                         session: child_dettid,
-                        physical_pid: None,
                     },
                 );
             } else {
@@ -920,7 +914,6 @@ impl ThreadTree {
                         exit_signal: libc::SIGCHLD,
                         process_group: parent_process,
                         session: parent_process,
-                        physical_pid: None,
                     },
                 );
                 let (wait_parent, wait_owner) = if clone_parent {
@@ -939,7 +932,6 @@ impl ThreadTree {
                         exit_signal,
                         process_group: parent_metadata.process_group,
                         session: parent_metadata.session,
-                        physical_pid: None,
                     },
                 );
             }
@@ -1493,21 +1485,7 @@ impl Scheduler {
         let pidfd = unsafe { OwnedFd::from_raw_fd(raw_fd as libc::c_int) };
         self.physical_thread_pidfds
             .insert(dettid, (mm, physical_pid, physical_tid, pidfd));
-        if self.thread_tree.thread_group_leaders.contains(&dettid)
-            && let Some(metadata) = self.thread_tree.process_wait.get_mut(&dettid)
-        {
-            metadata.physical_pid = Some(physical_pid);
-        }
         Ok(())
-    }
-
-    pub(crate) fn virtual_process_for_physical_pid(&self, physical_pid: i32) -> Option<DetPid> {
-        self.thread_tree
-            .process_wait
-            .iter()
-            .find_map(|(detpid, metadata)| {
-                (metadata.physical_pid == Some(physical_pid)).then_some(*detpid)
-            })
     }
 
     fn remove_physical_thread(&mut self, dettid: &DetTid, mm: MmId) {
@@ -5054,41 +5032,6 @@ mod test {
 
         scheduler.remove_physical_thread(&dettid, mm);
         assert!(!scheduler.physical_thread_pidfds.contains_key(&dettid));
-    }
-
-    #[test]
-    fn physical_process_identity_survives_until_wait_status_is_consumed() {
-        let mut scheduler = Scheduler::new(&Config::default());
-        let parent = DetPid::from_raw(36);
-        let child = DetPid::from_raw(37);
-        let mm = MmId::initial(child);
-        let physical_pid = std::process::id() as i32;
-        let physical_tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
-        scheduler.thread_tree.add_child(parent, parent, true);
-        scheduler.thread_tree.add_child(parent, child, true);
-
-        scheduler
-            .register_physical_thread(child, mm, physical_pid, physical_tid)
-            .expect("PIDFD_THREAD must bind the current test thread");
-        assert_eq!(
-            scheduler.virtual_process_for_physical_pid(physical_pid),
-            Some(child)
-        );
-
-        scheduler.remove_physical_thread(&child, mm);
-        assert_eq!(
-            scheduler.virtual_process_for_physical_pid(physical_pid),
-            Some(child),
-            "logical exit must retain the identity needed by a restarted wait"
-        );
-
-        scheduler.logically_exited_processes.insert(child);
-        assert!(scheduler.consume_child_wait(parent, child));
-        assert_eq!(
-            scheduler.virtual_process_for_physical_pid(physical_pid),
-            None,
-            "reaping terminal status must retire the host process identity"
-        );
     }
 
     #[test]

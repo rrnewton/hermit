@@ -530,16 +530,6 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// thread hang a `waitid` that a `kill` from a sibling process could
     /// interrupt. Self-directed signals are excluded: the sender is running, so
     /// it is not parked waiting to be woken.
-    ///
-    /// KNOWN GAP, pre-existing and inherited from `handle_kill`: `nix`'s
-    /// `Signal` models only 1..=31, so `Signal::try_from` rejects every realtime
-    /// signal and this silently does not notify for `SIGRTMIN..SIGRTMAX`. A
-    /// realtime `pthread_kill`/`sigqueue` to a target parked in a child wait
-    /// therefore still hangs, and the `rt_sigqueueinfo` callers above are wired
-    /// up but inert for their canonical realtime use. Closing it means carrying
-    /// a raw signal number through `GlobalRequest`, `SigWrapper` and
-    /// `ResourceID`, which is a wider change than this one; tracked separately
-    /// rather than smuggled into a review round.
     async fn notify_cross_task_signal<G: Guest<Self>>(
         &self,
         guest: &mut G,

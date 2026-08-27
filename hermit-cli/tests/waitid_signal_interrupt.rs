@@ -463,8 +463,9 @@ fn waitid_interrupted_by_a_signal_returns_instead_of_spinning() {
     );
     assert!(
         run.stdout
-            .contains("waitid-signal-interrupt rc=-1 errno=4 handler=1"),
-        "waitid did not report EINTR with its handler run\nguest stdout:\n{}",
+            .contains("waitid-signal-interrupt rc=-1 errno=4 handler=1 target-match=1"),
+        "waitid did not report EINTR with its handler seeing the guest child ID\n\
+         guest stdout:\n{}",
         run.stdout,
     );
     assert!(
@@ -727,12 +728,12 @@ fn dbt_exact_child_waits_return_eintr_without_sa_restart() {
     }
     assert_dbt_wait_case(
         &[],
-        "waitid-signal-interrupt rc=-1 errno=4 handler=1",
+        "waitid-signal-interrupt rc=-1 errno=4 handler=1 target-match=1",
         Some("waitid-signal-interrupt-done"),
     );
     assert_dbt_wait_case(
         &["--wait4-signal-interrupt"],
-        "wait4-signal-interrupt rc=-1 errno=4 handler=1",
+        "wait4-signal-interrupt rc=-1 errno=4 handler=1 target-match=1",
         Some("wait4-signal-interrupt-done"),
     );
 }
@@ -788,12 +789,29 @@ fn dbt_exact_child_waits_honor_a_changed_signal_context() {
     }
     assert_dbt_wait_case(
         &["--signal-restart-context"],
-        "waitid-restart-context rc=-1 errno=4 handler=1",
+        "waitid-restart-context rc=-1 errno=4 handler=1 target-match=1",
         None,
     );
     assert_dbt_wait_case(
         &["--wait4-signal-restart-context"],
-        "wait4-restart-context rc=-1 errno=4 handler=1",
+        "wait4-restart-context rc=-1 errno=4 handler=1 target-match=1",
+        None,
+    );
+}
+
+#[test]
+fn dbt_exact_child_waits_preserve_a_handler_changed_target() {
+    if dbt_unavailable("dbt_exact_child_waits_preserve_a_handler_changed_target") {
+        return;
+    }
+    assert_dbt_wait_case(
+        &["--signal-restart-target"],
+        "waitid-restart-target rc=0 errno=0 handler=1 target-match=1 replacement-match=1 code=2 status=9 original-live=1",
+        None,
+    );
+    assert_dbt_wait_case(
+        &["--wait4-signal-restart-target"],
+        "wait4-restart-target rc-ok=1 errno=0 handler=1 target-match=1 replacement-match=1 signaled=1 signal=9 original-live=1",
         None,
     );
 }
@@ -831,6 +849,11 @@ fn dbt_exact_child_waits_preserve_mask_and_result_for_blocked_signals() {
         &["--live-sibling-signal-blocked"],
         "waitid-live-sibling-blocked rc=0 errno=0 handler=0 pid-match=1 code=1 status=29 mask-preserved=1 sender-live=1",
         Some("waitid-live-sibling-done"),
+    );
+    assert_dbt_wait_case(
+        &["--wait4-live-sibling-signal-blocked"],
+        "wait4-live-sibling-blocked rc-ok=1 errno=0 handler=0 pid-match=1 exited=1 status=29 mask-preserved=1 signals-pending=1 sender-live=1",
+        Some("wait4-live-sibling-done"),
     );
 }
 
