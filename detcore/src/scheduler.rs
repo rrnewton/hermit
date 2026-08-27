@@ -18,6 +18,9 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::iter::Peekable;
+use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -510,6 +513,11 @@ pub struct Scheduler {
     /// contents, and BTreeMap gives us a predictable order, unlike HashMap.)
     pub next_turns: BTreeMap<DetTid, ThreadNextTurn>,
 
+    /// Thread pidfds for backends whose scheduler identities do not name host
+    /// tasks directly. The address-space identity prevents stale exec cleanup
+    /// from removing a replacement image's descriptor.
+    physical_thread_pidfds: BTreeMap<DetTid, (MmId, i32, i32, OwnedFd)>,
+
     /// The current set of actions in the background.
     #[allow(dead_code)]
     pub bg_action_pool: HashMap<ActionID, Action>,
@@ -576,6 +584,10 @@ pub struct Scheduler {
 
     /// Whether exit-group teardown must explicitly cancel parked backend RPCs.
     cancel_killed_thread_rpcs: bool,
+
+    /// Whether scheduler identities must be resolved through a host thread
+    /// pidfd before sending process-directed signals.
+    backend_requires_thread_directed_process_signals: bool,
 
     /// Raw TIDs removed by logical teardown. Tombstones are permanent for the life of this
     /// scheduler: accepting Linux TID reuse would let delayed backend RPCs bind to a new thread.
@@ -1392,6 +1404,7 @@ impl Scheduler {
             ),
             turn: 0,
             next_turns: Default::default(),
+            physical_thread_pidfds: Default::default(),
             bg_action_pool: Default::default(),
             committed_time: Default::default(),
             blocked: Default::default(),
@@ -1402,6 +1415,8 @@ impl Scheduler {
             cleared_child_tids: Default::default(),
             terminal_deadlock: None,
             cancel_killed_thread_rpcs: cfg.cancel_killed_thread_rpcs,
+            backend_requires_thread_directed_process_signals: cfg
+                .backend_requires_thread_directed_process_signals,
             logically_killed_threads: Default::default(),
             exec_incarnations: Default::default(),
             deregistration_accounted: Default::default(),
@@ -1431,6 +1446,88 @@ impl Scheduler {
         if let Some(hb) = self.happens_before.as_mut() {
             hb.note_spawn(dettid);
         }
+    }
+
+    pub(crate) fn register_physical_thread(
+        &mut self,
+        dettid: DetTid,
+        mm: MmId,
+        physical_pid: i32,
+        physical_tid: i32,
+    ) -> std::io::Result<()> {
+        if physical_pid <= 0 || physical_tid <= 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "host process and thread IDs must be positive",
+            ));
+        }
+        if let Some((known_mm, known_pid, known_tid, _)) = self.physical_thread_pidfds.get(&dettid)
+        {
+            if *known_mm == mm && *known_pid == physical_pid && *known_tid == physical_tid {
+                return Ok(());
+            }
+            if *known_mm == mm {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "scheduler identity {dettid} already names host process {known_pid} thread {known_tid}"
+                    ),
+                ));
+            }
+        }
+        let raw_fd = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_open,
+                physical_tid,
+                libc::O_EXCL as libc::c_uint,
+            )
+        };
+        if raw_fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: pidfd_open returned a new descriptor owned by this process.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(raw_fd as libc::c_int) };
+        self.physical_thread_pidfds
+            .insert(dettid, (mm, physical_pid, physical_tid, pidfd));
+        Ok(())
+    }
+
+    fn remove_physical_thread(&mut self, dettid: &DetTid, mm: MmId) {
+        if self
+            .physical_thread_pidfds
+            .get(dettid)
+            .is_some_and(|(registered_mm, ..)| *registered_mm == mm)
+        {
+            self.physical_thread_pidfds.remove(dettid);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn physical_thread_identity(&self, dettid: DetTid) -> Option<(MmId, i32, i32)> {
+        self.physical_thread_pidfds
+            .get(&dettid)
+            .map(|(mm, pid, tid, _)| (*mm, *pid, *tid))
+    }
+
+    pub(crate) fn note_process_sigkill(&mut self, dettid: DetTid, detpid: DetPid) {
+        if !self.backend_requires_thread_directed_process_signals {
+            return;
+        }
+        let Some((mm, _, _, _)) = self.physical_thread_pidfds.get(&dettid) else {
+            self.terminal_deadlock.get_or_insert_with(|| {
+                format!(
+                    "HERMIT_DEADLOCK: scheduler cannot complete SIGKILL for dettid {} without its host thread pidfd",
+                    dettid,
+                )
+            });
+            return;
+        };
+        let mm = *mm;
+        self.logically_kill_thread(&dettid, &detpid, mm);
+    }
+
+    fn should_synthesize_child_exit_signal(&self, parent: DetTid) -> bool {
+        !self.physical_thread_pidfds.contains_key(&parent)
     }
 
     /// Handle a happens-before checkpoint issued by `dettid` after its `count`th
@@ -1718,6 +1815,7 @@ impl Scheduler {
         self.deschedule_or_defer(*dtid);
         // Remove from all non-runnable pools:
         self.remove_blocking_entries(dtid);
+        self.remove_physical_thread(dtid, mm);
 
         let _ = self.priorities.remove(dtid);
         match self.next_turns.remove(dtid) {
@@ -2537,8 +2635,34 @@ impl Scheduler {
             "[dtid {}] deliver signal {} physically to guest thread.",
             dettid, signal
         );
-        let pid = Pid::from_raw(dettid.as_raw()); // TODO(T78538674): virtualize pid/tid:
-        match signal::kill(pid, signal) {
+        let result = if let Some((_, _, _, pidfd)) = self.physical_thread_pidfds.get(&dettid) {
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pidfd.as_raw_fd(),
+                    signal as libc::c_int,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            };
+            if rc < 0 {
+                Err(nix::errno::Errno::last())
+            } else {
+                Ok(())
+            }
+        } else if self.backend_requires_thread_directed_process_signals {
+            self.terminal_deadlock.get_or_insert_with(|| {
+                format!(
+                    "HERMIT_DEADLOCK: scheduler cannot deliver signal {} to dettid {} without its host thread pidfd",
+                    signal, dettid,
+                )
+            });
+            return;
+        } else {
+            let pid = Pid::from_raw(dettid.as_raw()); // TODO(T78538674): virtualize pid/tid:
+            signal::kill(pid, signal)
+        };
+        match result {
             Ok(()) => {}
             // ⚠️ ESRCH IS AN EXPECTED OUTCOME HERE, NOT AN ERROR. The target
             // chose to exit between the moment it was selected and the moment
@@ -3630,8 +3754,16 @@ impl Scheduler {
             // logical time by `step2b_process_timed`, instead of relying on the
             // host-async kernel `SIGCHLD` whose arrival time is host-timed (the
             // `make -jN` / redis `--strict --verify` nondeterminism source).
+            // A backend that registered a PIDFD_THREAD already preserves the
+            // kernel's native child-exit signal. Sending another SIGCHLD through
+            // that pidfd would make the application observe both CLD_EXITED and
+            // SI_TKILL for one child, so only the scheduler wait readiness is
+            // synthesized on that path.
             ResourceID::Exit { group, process, .. } => {
-                if *group && let Some(parent) = self.thread_tree.parent_process(process) {
+                if *group
+                    && let Some(parent) = self.thread_tree.parent_process(process)
+                    && self.should_synthesize_child_exit_signal(parent)
+                {
                     // Fire strictly after the current committed time so the event
                     // is dispatched on a subsequent scheduler pass (DetTid == DetPid
                     // for a group leader, so `parent` is also the parent thread id).
@@ -4881,6 +5013,108 @@ mod test {
         );
     }
 
+    #[test]
+    fn physical_thread_pidfd_is_bound_to_address_space_identity() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let dettid = DetTid::from_raw(37);
+        let detpid = DetPid::from_raw(37);
+        let mm = MmId::initial(detpid);
+        let physical_pid = std::process::id() as i32;
+        let physical_tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+
+        scheduler
+            .register_physical_thread(dettid, mm, physical_pid, physical_tid)
+            .expect("PIDFD_THREAD must bind the current test thread");
+        let (_, registered_pid, registered_tid, pidfd) =
+            scheduler.physical_thread_pidfds.get(&dettid).unwrap();
+        assert_eq!(
+            (*registered_pid, *registered_tid),
+            (physical_pid, physical_tid)
+        );
+        assert!(pidfd.as_raw_fd() >= 0);
+
+        let conflicting = scheduler
+            .register_physical_thread(dettid, mm, physical_pid, physical_tid + 1)
+            .unwrap_err();
+        assert_eq!(conflicting.kind(), std::io::ErrorKind::AlreadyExists);
+
+        scheduler.remove_physical_thread(&dettid, mm.for_exec(detpid));
+        assert!(scheduler.physical_thread_pidfds.contains_key(&dettid));
+
+        scheduler.remove_physical_thread(&dettid, mm);
+        assert!(!scheduler.physical_thread_pidfds.contains_key(&dettid));
+    }
+
+    #[test]
+    fn physical_thread_pidfd_uses_native_child_exit_signal() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let parent = DetTid::from_raw(37);
+        let mm = MmId::initial(parent);
+        let physical_pid = std::process::id() as i32;
+        let physical_tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+
+        assert!(scheduler.should_synthesize_child_exit_signal(parent));
+        scheduler
+            .register_physical_thread(parent, mm, physical_pid, physical_tid)
+            .expect("PIDFD_THREAD must bind the current test thread");
+        assert!(!scheduler.should_synthesize_child_exit_signal(parent));
+    }
+
+    #[test]
+    fn physical_thread_pidfd_rejects_invalid_host_identity() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let dettid = DetTid::from_raw(37);
+        let detpid = DetPid::from_raw(37);
+        let error = scheduler
+            .register_physical_thread(dettid, MmId::initial(detpid), 0, 0)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(scheduler.physical_thread_pidfds.is_empty());
+    }
+
+    #[test]
+    fn required_physical_thread_pidfd_does_not_fall_back_to_virtual_tid() {
+        let config = Config {
+            backend_requires_thread_directed_process_signals: true,
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&config);
+
+        scheduler.signal_guest(DetTid::from_raw(37), Signal::SIGUSR1);
+
+        let report = scheduler
+            .take_terminal_deadlock()
+            .expect("terminal failure");
+        assert!(report.contains("without its host thread pidfd"));
+    }
+
+    #[test]
+    fn dbt_process_sigkill_completes_registered_child_lifecycle() {
+        let config = Config {
+            backend_requires_thread_directed_process_signals: true,
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&config);
+        let parent = DetTid::from_raw(37);
+        let child = DetTid::from_raw(38);
+        let child_mm = MmId::for_clone(MmId::initial(parent), child, false);
+        let physical_pid = std::process::id() as i32;
+        let physical_tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, child, true);
+        register_known_thread(&mut scheduler, child);
+        scheduler
+            .register_physical_thread(child, child_mm, physical_pid, physical_tid)
+            .expect("PIDFD_THREAD must bind the current test thread");
+
+        scheduler.note_process_sigkill(child, child);
+
+        assert!(!scheduler.next_turns.contains_key(&child));
+        assert!(!scheduler.physical_thread_pidfds.contains_key(&child));
+        assert!(scheduler.logically_exited_processes.contains(&child));
+    }
+
     fn install_runnable_exec_group(
         sched: &mut Scheduler,
         leader: DetTid,
@@ -5140,6 +5374,7 @@ mod test {
     fn nonleader_exec_removal_preserves_replacement_admission() {
         let config = Config {
             cancel_killed_thread_rpcs: true,
+            backend_requires_thread_directed_process_signals: true,
             ..Config::default()
         };
         let mut sched = Scheduler::new(&config);
@@ -5156,12 +5391,21 @@ mod test {
         sched.runqueue_push_back(caller);
 
         let old_leader_request = sched.next_turns.get(&leader).unwrap().req.clone();
+        let post_exec_mm = pre_exec_mm.for_exec(detpid);
+        let physical_pid = std::process::id() as i32;
+        let physical_tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+        sched
+            .register_physical_thread(leader, pre_exec_mm, physical_pid, physical_tid)
+            .expect("old leader PIDFD_THREAD registration must succeed");
+        sched
+            .register_physical_thread(leader, post_exec_mm, physical_pid, physical_tid)
+            .expect("post-exec PIDFD_THREAD registration must replace the old address space");
         let retired = sched.reconnect_after_exec(ExecReconnect {
             caller,
             new_leader: leader,
             detpid,
             pre_exec_mm,
-            post_exec_mm: pre_exec_mm.for_exec(detpid),
+            post_exec_mm,
             child_tid_addr: 0,
             reconnect_priority: Some(DEFAULT_PRIORITY),
         });
@@ -5170,6 +5414,11 @@ mod test {
         assert!(matches!(old_leader_request.try_read(), Some(Err(_))));
         assert!(sched.pending_run_queue_removals.contains_key(&leader));
         assert!(sched.pending_run_queue_admissions.contains_key(&leader));
+        assert_eq!(
+            sched.physical_thread_identity(leader),
+            Some((post_exec_mm, physical_pid, physical_tid)),
+            "old-leader cleanup must not remove the replacement leader's PIDFD_THREAD"
+        );
 
         sched.drain_pending_run_queue_removals();
         sched.drain_pending_run_queue_admissions();
