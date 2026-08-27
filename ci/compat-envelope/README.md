@@ -1,8 +1,8 @@
 # Compatibility scorecard
 
 The compatibility scorecard answers one question from a Hermit checkout: how
-many manifest-declared test, mode, and backend combinations are inside the
-known-green regression envelope at this commit?
+many manifest-declared test, mode, and backend combinations are both selected
+for ordinary validation and backed by a latest imported canonical INFO pass?
 
 Start at [`SCORECARD.md`](../../SCORECARD.md). It is intentionally a small,
 versioned table. The stable per-cell identities behind the totals live in
@@ -29,8 +29,8 @@ partition. It also emits the validated per-test timeout and the number of
 `execute_attempt` calls the existing harness makes for each mode. A seedless
 chaos mode has `attempts: null`: it remains red but has no command to run. The
 pressure-test entry point consumes this output instead of parsing the manifest
-a second way. A disabled combination is red; a cell that cannot run is not
-green. The existing `--format json` and text views remain enabled-only because
+a second way. A disabled combination is not applicable. The existing `--format
+json` and text views remain enabled-only because
 they are execution plans rather than scorecards.
 
 ## Ordinary validation
@@ -68,10 +68,10 @@ do not establish strict INFO-log determinism or cross-backend parity. The
 scorecard says this directly and reports no cross-backend parity count until
 the manifest has cells that really compare fresh ptrace and non-ptrace logs.
 
-A green cell turning red makes validate fail. The normal response is to fix the
-regression. Moving the cell out of the selected plan is not a fix, and
-`scorecard.rs update` refuses green-to-red movement unless an explicit
-compatibility-standard transition requests it.
+A selected cell remains required whether its scorecard colour is green or red.
+An imported divergence turns it red without removing the check. Moving the cell
+out of the selected plan is not a fix, and `scorecard.rs update` refuses that
+plan removal unless an explicit compatibility-standard transition requests it.
 
 See every command and the exact green definition with:
 
@@ -81,8 +81,7 @@ See every command and the exact green definition with:
 
 ## Updating the checked-in table
 
-After deliberately adding a newly proven cell to `ci/expected-e2e-plan.json`,
-run:
+After deliberately adding a cell to `ci/expected-e2e-plan.json`, run:
 
 ```console
 ./ci/compat-envelope/scorecard.rs update
@@ -91,14 +90,15 @@ git diff -- SCORECARD.md ci/compat-envelope/cells.json
 ```
 
 Review the table delta and the exact cell identity. The update command does not
-run a test and cannot turn a red cell green by itself; the subsequent validate
-must execute the newly selected cell.
+run a test and cannot turn a red cell green by itself. Import a canonical
+validate result after the run; selection alone is not evidence.
 
 ## Red cells and the periodic full-matrix run
 
-Every manifest cell outside the green set is red, including cells that have not
-run and cells that cannot currently run. That conservative classification is
-intentional: absence of evidence is not green.
+Every enabled manifest cell outside the selected-and-passing set is red,
+including selected cells with an imported divergence, selected cells with no
+imported comparison, and cells outside the selected plan. Manifest-disabled
+cells are not applicable. Absence of imported evidence is not green.
 
 ## Divergence positions: where a cell diverged, and how well you know it
 
@@ -136,19 +136,34 @@ six COMMIT records, every divergence between two of them reports the same turn.
 
 ### Writing observations
 
-Two commands write these arrays, both explicit and opt-in. **Ordinary validation
+Three commands write these arrays, all explicit and opt-in. **Ordinary validation
 still changes no tracked scorecard file.**
 
 ```console
 ./ci/compat-envelope/scorecard.rs update-observations --summary FILE   # pressure test
 ./ci/compat-envelope/scorecard.rs observe-results --results DIR        # validate
+./ci/compat-envelope/scorecard.rs import-results --results DIR         # retained validate history
 ```
 
 `observe-results` walks every `results.jsonl` under `DIR`, so several runs fold
 in one invocation — which is how a validate-side range widens beyond a point.
-Both refuse a dirty tracked tree and refuse rows that are not clean at `HEAD`.
-`ERROR` rows are refused rather than recorded: an infrastructure fault is not
-product behaviour. Neither command can change which cells are green.
+`import-results` walks retained history without executing a guest, keeps only
+clean schema-4 `BitwiseInfoV1` terminal comparisons from commits on `HEAD`'s
+history, and selects the newest such commit independently for every selected
+cell. If several retained runs at that commit disagree, it imports every result
+so the conflict makes the cell red instead of resolving it by file order.
+
+All three commands refuse a dirty tracked tree. `observe-results` additionally
+refuses rows that are not clean at `HEAD`; `import-results` preserves each
+historical row's SHA and Detcore tree instead of relabelling it as current.
+`ERROR` rows are reported but not recorded as product behaviour. Pressure-test
+observations cannot change scorecard colour. Validate observations can: a
+selected cell is green only when the results at its recorded latest SHA are
+passes.
+
+The historical `never-measured` value in `cells.json` means no observation was
+imported. It is not proof that the cell was never run; retained results can
+exist before this projection is refreshed.
 
 During investigation, probe one exact red cell with a tight wall-clock cap:
 
