@@ -1997,13 +1997,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         // Only route writes through the nonblockable-fd path when the fd is actually
-        // physically nonblocking (the "hermit run" case, where pipe2/eventfd2 injected
-        // O_NONBLOCK and we can nonblockize-and-retry deterministically). On a physically
-        // blocking fd (e.g. record/replay mode, where O_NONBLOCK is intentionally not
-        // injected) that path would treat the write as BlockingExternalIO and deschedule it
-        // to run in the background, which assumes non-interference -- but a pipe/socket write
-        // and its paired read are not independent, deadlocking the scheduler. Blocking-fd
-        // writes therefore use the original synchronous path, as before this feature.
+        // physically nonblocking. Detcore-created pipes are physically nonblocking in every
+        // sequential mode, including record/replay, so their logically blocking writes use
+        // the completion helper below. A physically blocking fd instead uses the original
+        // synchronous path: treating an internal pipe as BlockingExternalIO would assume the
+        // writer and reader were independent and could deadlock the scheduler.
         let res = if physically_nonblocking && fd_type == FdType::Pipe && !logically_nonblocking {
             self.execute_blocking_pipe_write(guest, call, open_file_id)
                 .await
