@@ -190,9 +190,9 @@ the Stripped retained-log comparison for ptrace, DBT, and KVM;
 statuses above predate that change and came from the older guest-output and
 exit-status comparison; they must not be reused as current log-comparison
 results. A fresh matrix run must be judged from its typed `--verify-json`
-report. The matrix's KVM tier allowlist still records only `guest` or `gap`, so
-it must be updated before those 28 cells can be remeasured under the current
-comparator.
+report. The matrix still hard-codes KVM's expected tier, printed ratchet, and
+observation description to `guest`; those three consumers must be updated
+before the 28 cells can be remeasured under the current comparator.
 
 Because `--verify` diverts the guest's own stdout into per-run temporary logs,
 this path cannot re-check stdout the way the L1 path does; instead it enforces
