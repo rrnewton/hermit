@@ -323,6 +323,7 @@ struct Args {
     focused: Option<Focused>,
     force_full: bool,
     baseline: Option<String>,
+    allow_local_off_the_record_run: bool,
     skip_inner_dirty_working_tree_and_rebase_freshness_checks: bool,
     ignore_cache: bool,
     label_pr: bool,
@@ -343,6 +344,7 @@ const SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION: &str =
     "--skip-inner-dirty-working-tree-and-rebase-freshness-checks";
 const SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_ENV: &str =
     "VALIDATE_SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS";
+const ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION: &str = "--allow-local-off-the-record-run";
 
 fn usage() -> &'static str {
     "Usage: ./scripts/validate.rs [LEVEL] [OPTIONS]\n\
@@ -381,6 +383,10 @@ fn usage() -> &'static str {
      \x20 --all, --full-run             Assert the COMPLETE suite explicitly.\n\
      \n\
      Other options:\n\
+     \x20 --allow-local-off-the-record-run\n\
+     \x20                  Permit a clean, commit-anchored quick or focused local run for\n\
+     \x20                  iterative testing. It writes no ledger row, publishes no receipt,\n\
+     \x20                  and cannot be cited as validation evidence.\n\
      \x20 --verbose        Verbosity level 2: stream tagged per-step output.\n\
      \x20 --verbosity N    Output level 1..5 (default 1; levels 3/4 currently equal 2;\n\
      \x20                  level 5 prefixes every streamed line with test identity).\n\
@@ -489,6 +495,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         focused: None,
         force_full: env_flag("VALIDATE_FORCE_FULL", "1"),
         baseline: None,
+        allow_local_off_the_record_run: false,
         skip_inner_dirty_working_tree_and_rebase_freshness_checks: env_flag(
             SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_ENV,
             "1",
@@ -574,6 +581,10 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
                 shallow = true;
             }
             "--all" | "--full-run" => args.force_full = true,
+            ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION => {
+                args.allow_local_off_the_record_run = true;
+                args.label_pr = false;
+            }
             SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION => {
                 args.skip_inner_dirty_working_tree_and_rebase_freshness_checks = true
             }
@@ -675,6 +686,9 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
     }
     args.show_plan = show_plan;
     args.focused = focused.pop();
+    if args.allow_local_off_the_record_run {
+        args.label_pr = false;
+    }
     if args.reuse_parent_manifest_gate
         && (!matches!(args.focused, Some(Focused::PortableStrictCompat))
             || !args.no_label_pr_explicit)
@@ -4020,6 +4034,31 @@ fn product_front_door_applies(
     parent_detected && ci_hub_dir_present && !show_plan
 }
 
+/// A local off-the-record run is an iteration tool, not a cheaper publication
+/// path. It therefore requires both a commit anchor and an explicitly narrowed
+/// profile. Full-cost validation and every publishable result stay in ci-hub.
+fn local_off_the_record_refusal(args: &Args, dirty: bool) -> Option<String> {
+    if !args.allow_local_off_the_record_run {
+        return None;
+    }
+    if dirty {
+        return Some(format!(
+            "validate: REFUSED — {ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION} still requires a clean, \
+             commit-anchored tree. Commit the work in progress first so this run records a SHA, \
+             then retry the narrowed command."
+        ));
+    }
+    if args.focused.is_none() && args.level != Level::Quick {
+        return Some(format!(
+            "validate: REFUSED — {ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION} is only for quick or \
+             focused iterative testing. A full-cost validate belongs in ci-hub.\n\
+             Example (one step, one test node ID):\n\n  \
+             ./scripts/validate.rs {ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION} --only portable test.cli"
+        ));
+    }
+    None
+}
+
 /// Construct the refusal for an unadmitted product run. Production supplies
 /// `canonically_admitted` only from [`canonical_validate_lock_admission`].
 fn product_front_door_refusal(
@@ -4038,22 +4077,25 @@ fn product_front_door_refusal(
     let checkout = validate_plan::shell_quote(&root.to_string_lossy());
     let remediation = if ci_hub_launcher_available {
         format!(
-            "Run through the canonical launcher instead:\n\n  {ci_hub} validate-run --checkout \
+            "Publishing because the code is ready requires ci-hub:\n\n  {ci_hub} validate-run --checkout \
              {checkout} --agent '<registered-agent-name>' --target {commit} -- {requested_args}"
         )
     } else {
         format!(
             "The canonical ci-hub launcher is unavailable at {ci_hub}. Repair or sync the parent \
-             checkout, then invoke validation through ci-hub; do not run this driver directly."
+             checkout before publishing validation evidence."
         )
     };
     Some(format!(
-        "validate: REFUSED — product validation inside dev-hermit must enter through canonical \
-         ci-hub admission.\n\
-         A naked run from {checkout} can consume the validation box without exact commit, host, \
-         and live lock-owner ancestry authority, and can write an unadmitted ledger row.\n\
+        "validate: REFUSED — choose whether this is iterative testing or publishing evidence.\n\
+         A direct run from {checkout} is not admitted to publish evidence.\n\
          \n\
-         {remediation}"
+         {remediation}\n\
+         \n\
+         Iterative testing must be narrow and off the record; its result cannot be cited as \
+         validation evidence. Commit the work in progress first, then run one step by test node \
+         ID, for example:\n\n  \
+         ./scripts/validate.rs {ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION} --only portable test.cli"
     ))
 }
 
@@ -4843,6 +4885,17 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
     // reproduce what the full run did to that node, budgets included.
     if let Some(Focused::Only { lane, nodes }) = &args.focused {
         let mut steps = pre;
+        let selected_gate = if args.allow_local_off_the_record_run {
+            // Iteration must not be blocked by an unrelated red manifest audit:
+            // that would make reproducing one failing node require first making
+            // the whole validation spine green. Keep the cheap source/pin checks
+            // that anchor the checkout, then run the selected node against the
+            // already-built tree exactly as --only already promises.
+            steps.retain(|step| matches!(step.tag().as_str(), "pre.submodules" | PIN_GATE_TAG));
+            PIN_GATE_TAG
+        } else {
+            gate
+        };
         // Preflight tags already in the plan; naming one is satisfied by the
         // preflight itself and must not be looked up in the lane file.
         let preflight: BTreeSet<String> = steps.iter().map(|s| s.tag()).collect();
@@ -4899,7 +4952,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             dropped.extend(step.deps.iter().filter(|d| !selected.contains(*d)).cloned());
             step.deps.retain(|d| selected.contains(d));
             if step.deps.is_empty() {
-                step.deps.push(gate.to_string());
+                step.deps.push(selected_gate.to_string());
             }
             steps.push(step);
         }
@@ -4908,7 +4961,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // precondition. A fast exit 127 may mean one of those artifacts is absent,
         // but it can also mean a missing host tool or a command typo, so both the
         // pre-run and post-run diagnostics keep that distinction explicit.
-        dropped.remove(gate);
+        dropped.remove(selected_gate);
         if dropped.is_empty() {
             eprintln!(
                 "validate: --only runs the selected node(s) against the CURRENT tree; \
@@ -11459,9 +11512,12 @@ fn product_front_door_bracket() -> Result<(), String> {
         false,
     )
     .ok_or_else(|| "product front door omitted the naked-run refusal".to_string())?;
-    if !refusal.contains("unadmitted ledger row")
+    if !refusal.contains("Publishing because the code is ready requires ci-hub")
         || !refusal.contains(commit)
         || !refusal.contains("ci-hub/ci-hub validate-run")
+        || !refusal.contains(ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION)
+        || !refusal.contains("--only portable test.cli")
+        || !refusal.contains("cannot be cited as validation evidence")
     {
         return Err(format!("product front-door refusal lost remediation detail: {refusal}"));
     }
@@ -11493,9 +11549,45 @@ fn product_front_door_bracket() -> Result<(), String> {
         return Err(format!("missing-launcher refusal printed a false remedy: {unavailable}"));
     }
 
+    let focused = parse_argv(&[
+        ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into(),
+        "--only".into(),
+        "portable".into(),
+        "test.cli".into(),
+    ])
+    .map_err(|code| format!("off-the-record focused form did not parse: exit {code}"))?;
+    if focused.label_pr
+        || local_off_the_record_refusal(&focused, false).is_some()
+        || !local_off_the_record_refusal(&focused, true)
+            .is_some_and(|message| message.contains("Commit the work in progress first"))
+    {
+        return Err(
+            "off-the-record focused form did not disable publication or enforce a clean commit"
+                .into(),
+        );
+    }
+
+    let full = parse_argv(&[ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into(), "full".into()])
+        .map_err(|code| format!("off-the-record full form did not parse: exit {code}"))?;
+    let full_refusal = local_off_the_record_refusal(&full, false)
+        .ok_or_else(|| "off-the-record full run was not refused".to_string())?;
+    if !full_refusal.contains("full-cost validate belongs in ci-hub")
+        || !full_refusal.contains("--only portable test.cli")
+    {
+        return Err(format!(
+            "off-the-record full refusal lost required guidance: {full_refusal}"
+        ));
+    }
+
+    let quick = parse_argv(&[ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into(), "quick".into()])
+        .map_err(|code| format!("off-the-record quick form did not parse: exit {code}"))?;
+    if local_off_the_record_refusal(&quick, false).is_some() {
+        return Err("off-the-record quick run was incorrectly refused".into());
+    }
+
     println!(
-        "  product front door: parent+ci-hub and nested payloads require authority; generic/\
-         standalone/show-plan paths allowed; exact authority and diagnostics bracketed"
+        "  product front door: publishing requires authority; clean quick/focused local iteration \
+         is off the record; dirty/full local forms and diagnostics bracketed"
     );
     Ok(())
 }
@@ -11538,7 +11630,7 @@ fn product_front_door_process_bracket() -> Result<(), String> {
                 ],
                 false,
                 true,
-                "Run through the canonical launcher",
+                "Publishing because the code is ready requires ci-hub",
             ),
             (
                 "nested-marker-invalid-authority",
@@ -11548,7 +11640,7 @@ fn product_front_door_process_bracket() -> Result<(), String> {
                 ],
                 true,
                 true,
-                "Run through the canonical launcher",
+                "Publishing because the code is ready requires ci-hub",
             ),
         ];
 
@@ -11629,8 +11721,9 @@ fn product_front_door_process_bracket() -> Result<(), String> {
                 String::from_utf8_lossy(&output.stderr)
             );
             if output.status.code() != Some(i32::from(COULD_NOT_RUN_EXIT_CODE))
-                || !rendered.contains("product validation inside dev-hermit")
+                || !rendered.contains("choose whether this is iterative testing or publishing")
                 || !rendered.contains(expected_remediation)
+                || !rendered.contains("--only portable test.cli")
                 || stdout.lines().last()
                     != Some("FINAL_VALIDATE_STATUS: COULD_NOT_RUN")
             {
@@ -13792,6 +13885,23 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         return stop_test_seam(&root, &profile_name, parent.as_deref());
     }
 
+    if args.allow_local_off_the_record_run {
+        if let Some(refusal) = local_off_the_record_refusal(&args, tree_dirty()) {
+            eprintln!("{refusal}");
+            return RunSummary::refused(
+                2,
+                &profile_name,
+                "the local off-the-record run policy",
+                refusal.lines().map(str::to_string).collect(),
+            );
+        }
+        eprintln!(
+            "validate: local iterative run is OFF THE RECORD: it may help find and fix a failure, \
+             but it writes no ledger row, publishes no receipt, and cannot be cited as validation \
+             evidence."
+        );
+    }
+
     // ---- dev-hermit product front door -------------------------------------
     //
     // Refuse real product work before the invocation lock, cache, cgroup boxing,
@@ -13805,12 +13915,14 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // explicitly inert here.
     let ci_hub_dir_present =
         parent.as_ref().is_some_and(|candidate| candidate.join("ci-hub").is_dir());
-    if product_front_door_applies(
+    if !args.allow_local_off_the_record_run
+        && product_front_door_applies(
         parent.is_some(),
         ci_hub_dir_present,
         nesting.nested,
         args.show_plan,
-    ) {
+    )
+    {
         let parent = parent.as_deref().expect("front-door predicate requires a parent");
         let commit = git_sha();
         let host = short_hostname();
@@ -14248,6 +14360,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // A nested payload never consults the cache: the outer run already did, and a
     // payload that "hit" would report a green for a lane it never ran.
     if !nesting.nested
+        && !args.allow_local_off_the_record_run
         && !args.ignore_cache
         && plan.cacheable
         && !wt_dirty
@@ -14596,7 +14709,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // INT TERM HUP` bought the bash.
     validate_runtime::enter_cleanup_critical_section();
     let interruption = interrupted_by().map(|s| s.to_string());
-    let series_error = if nesting.nested {
+    let series_error = if nesting.nested || args.allow_local_off_the_record_run {
         None
     } else {
         match append_validate_series(parent.as_deref(), &root, &e2e_result_root, &commit) {
@@ -14705,7 +14818,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // no_result verdict. A TIMEOUT, by contrast, is a completed run and falls
     // through to the normal verdict below.
     if let Some(sig) = &interruption {
-        if !nesting.nested {
+        if !nesting.nested && !args.allow_local_off_the_record_run {
             write_ledger(
                 &ledger,
                 &ctx,
@@ -14749,7 +14862,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         s.jobs = Some(jobs);
         s.log = Some(log_path);
         s.cpu_wall = Some((wall, cpu_user, cpu_sys));
-        if !nesting.nested {
+        if !nesting.nested && !args.allow_local_off_the_record_run {
             s.ledger = Some(ledger);
         }
         return s;
@@ -14925,7 +15038,11 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // rows before appending the ledger entry so schema 7 is emitted only when
     // the artifact has actually been published and bound by checksum.
     let should_retain_cells = plan.suite_complete || plan.cell_evidence_expected.is_some();
-    let retained_cell_results = if !nesting.nested && should_retain_cells && execution_complete {
+    let retained_cell_results = if !nesting.nested
+        && !args.allow_local_off_the_record_run
+        && should_retain_cells
+        && execution_complete
+    {
         let expected = match &plan.cell_evidence_expected {
             Some(expected) => Ok(expected.clone()),
             None => validate_cell_results::expected_plan(&root),
@@ -14970,7 +15087,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // A NESTED payload writes nothing: the outer run owns the ledger and the
     // receipt, and a second row for one logical run is exactly the duplication
     // the re-entrancy guard exists to prevent.
-    if !nesting.nested {
+    if !nesting.nested && !args.allow_local_off_the_record_run {
         write_ledger(
             &ledger,
             &ctx,
@@ -15147,6 +15264,13 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         ),
     }
     detail.extend(test_summary_errors);
+    if args.allow_local_off_the_record_run {
+        detail.push(
+            "this was local iterative testing off the record: no ledger row or receipt was \
+             published, and the result cannot be cited as validation evidence"
+                .into(),
+        );
+    }
 
     let mut s = RunSummary::new(
         match exit_code {
@@ -15170,7 +15294,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     s.jobs = Some(jobs);
     s.log = Some(log_path);
     s.cpu_wall = Some((wall, cpu_user, cpu_sys));
-    if !nesting.nested {
+    if !nesting.nested && !args.allow_local_off_the_record_run {
         s.ledger = Some(ledger);
     }
     s
