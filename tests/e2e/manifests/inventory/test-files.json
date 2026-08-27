@@ -2182,7 +2182,7 @@
       "disposition": "manifest-test",
       "path": "tests/e2e/determinism-stress/pid_tid_identity.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/determinism-stress-c.yaml (verify/ptrace ci=true)",
-      "why": "tests/e2e/determinism-stress/pid_tid_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/determinism-stress-c.yaml (verify/ptrace ci=true): Contract fixture pinning pid/tid virtualization identity on the paths determinism-stress-c/pid-tid does not cover -- the /proc/self/stat pid text, the pid returned by wait(), a fork/exec tree spanning execve, getpgid, and a control-flow branch on a pid comparison so a divergence changes output shape rather than a digit."
+      "why": "tests/e2e/determinism-stress/pid_tid_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/determinism-stress-c.yaml (verify/ptrace ci=true): Contract fixture pinning pid/tid and process-group identity on paths determinism-stress-c/pid-tid does not cover -- live nonleader and namespace-init getpgid lookups, Linux error cases, /proc/self/stat pid text, wait-returned pids, and a fork/exec tree."
     },
     {
       "disposition": "manifest-test",

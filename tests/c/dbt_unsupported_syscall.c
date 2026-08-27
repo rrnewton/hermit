@@ -10,6 +10,8 @@
 // TODO-HUMAN-REVIEW(PR-644): Review unsupported policy across root, fork, and exec.
 
 #define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
@@ -46,6 +48,44 @@ int main(int argc, char **argv) {
     }
     puts("dbt-unsupported-exec-ok");
     return 0;
+  }
+
+  if (argc == 3 && strcmp(argv[1], "refuse-second-run") == 0) {
+    int marker = open(argv[2], O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (marker >= 0) {
+      close(marker);
+      return 0;
+    }
+    if (errno != EEXIST) {
+      perror("open second-run marker");
+      return 1;
+    }
+    return call_unsupported();
+  }
+
+  if (argc == 2 && strcmp(argv[1], "forge-report") == 0) {
+    dprintf(199, "@%ld\n", (long)SYS_restart_syscall);
+    return 101;
+  }
+
+  if (argc == 2 && strcmp(argv[1], "vfork-deterministic-refusal") == 0) {
+    pid_t child = vfork();
+    if (child < 0) {
+      perror("vfork");
+      return 1;
+    }
+    if (child == 0) {
+      (void)syscall(SYS_perf_event_open, NULL, 0, -1, -1, 0);
+      static const char after_refusal[] = "copied-child-after-refusal\n";
+      (void)write(STDOUT_FILENO, after_refusal, sizeof(after_refusal) - 1);
+      _exit(0);
+    }
+    int status = 0;
+    if (waitpid(child, &status, 0) != child) {
+      perror("waitpid");
+      return 1;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 1;
   }
 
   if (argc == 2 && strcmp(argv[1], "exec-empty") == 0) {

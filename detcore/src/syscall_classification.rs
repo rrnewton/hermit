@@ -110,6 +110,9 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::getdents
         | Sysno::getdents64
         // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::getpgid
+        | Sysno::getpgrp
+        // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-892): Query logical interval-timer state.
         | Sysno::getitimer
         | Sysno::getrandom
@@ -696,10 +699,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::brk
         | Sysno::getcwd
         | Sysno::getpid
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#663)
-        | Sysno::getpgid
-        | Sysno::getpgrp
         | Sysno::getppid
         | Sysno::getsid
         | Sysno::gettid
@@ -1454,6 +1453,8 @@ mod tests {
         "getgid",
         "getitimer",
         "getpeername",
+        "getpgid",
+        "getpgrp",
         "getpmsg",
         "getpriority",
         "getrandom",
@@ -1702,8 +1703,6 @@ mod tests {
         "get_thread_area",
         "getcwd",
         "getgroups",
-        "getpgid",
-        "getpgrp",
         "getpid",
         "getppid",
         "getsid",
@@ -2003,6 +2002,8 @@ mod tests {
             Sysno::epoll_pwait2,
             Sysno::clock_settime,
             Sysno::getpeername,
+            Sysno::getpgid,
+            Sysno::getpgrp,
             Sysno::getsockname,
             Sysno::getsockopt,
             Sysno::getitimer,
@@ -2064,8 +2065,6 @@ mod tests {
             Sysno::getgroups,
             Sysno::getppid,
             Sysno::getxattr,
-            Sysno::getpgid,
-            Sysno::getpgrp,
             Sysno::getsid,
             Sysno::lgetxattr,
             Sysno::link,

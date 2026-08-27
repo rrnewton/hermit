@@ -155,7 +155,16 @@ fi
 #     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
 #     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
 # so the measured key and conservative threshold carry unchanged.
-expected_pin=1f226acd5bd0a942279e2acbf22c7e75c6527af7
+# CARRY TO bbbf4e87 (2026-08-27): 1f226acd..bbbf4e87 changes the native client
+# and Rust evidence collector, but all three source_recipe_key repository
+# inputs remain byte-identical:
+#     reverie-dbt/vendor/dynamorio  a3c41e5d3630 -> a3c41e5d3630
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+#     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
+# so the measured key and conservative threshold carry unchanged. The changed
+# native client still rebuilds and requires fresh validation; this carry does
+# not reuse a receipt.
+expected_pin=bbbf4e8734818a20176b1777e8c423ad5578e374
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

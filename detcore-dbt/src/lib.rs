@@ -77,11 +77,12 @@ const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | l
 const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 4;
 const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 48;
 
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-644): Review the inherited DBT report descriptor.
-/// Fixed inherited descriptor receiving unsupported syscall records.
-pub const UNSUPPORTED_SYSCALL_REPORT_FD: i32 = 199;
-
+const UNSUPPORTED_SYSCALL_REPORT_FD_MIN: i32 = 199;
+/// Prefix for an unsupported-syscall record sent through Reverie's protected
+/// evidence channel. The numeric syscall suffix is validated by the CLI before
+/// it can classify a run as a policy refusal.
+pub const UNSUPPORTED_SYSCALL_EVIDENCE_PREFIX: &str =
+    "1970-01-01T00:00:00.000000Z ERROR detcore_dbt::policy: unsupported syscall @";
 type DetcoreThreadState = <Detcore as Tool>::ThreadState;
 type Emitter = reverie_dbt::RuntimeEmitter;
 type Idler = reverie_dbt::RuntimeIdler;
@@ -398,8 +399,7 @@ fn requires_native_lifecycle(sysnum: i64) -> bool {
 }
 
 // TODO-HUMAN-REVIEW(PR-1038): Review DBT self-target queued-signal identity translation.
-// TODO-HUMAN-REVIEW(PR-1065): Review DBT self-target prlimit64 translation.
-fn translate_self_identity_targets(
+fn translate_self_signal_targets(
     sysnum: i64,
     args: &mut [u64; 6],
     virtual_pid: i32,
@@ -407,14 +407,7 @@ fn translate_self_identity_targets(
     host_pid: i32,
     host_tid: i32,
 ) {
-    if virtual_pid <= 0 || host_pid <= 0 {
-        return;
-    }
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    if sysnum == libc::SYS_prlimit64 && args[0] as i32 == virtual_pid {
-        args[0] = host_pid as u32 as u64;
-    }
-    if virtual_tid <= 0 || host_tid <= 0 {
+    if virtual_pid <= 0 || host_pid <= 0 || virtual_tid <= 0 || host_tid <= 0 {
         return;
     }
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -869,11 +862,7 @@ fn advance_getrandom_prng(prng: &mut impl rand::Rng, bytes: usize) {
     }
 }
 
-fn report_fd_is_available() -> bool {
-    (unsafe { libc::fcntl(UNSUPPORTED_SYSCALL_REPORT_FD, libc::F_GETFD) }) != -1
-}
-
-fn append_copied_syscall_record(sysnum: i64) {
+fn append_unsupported_syscall_record(sysnum: i64) {
     let report_fd = COPIED_UNSUPPORTED_REPORT_FD.load(Ordering::Acquire);
     if report_fd == -1 {
         return;
@@ -899,6 +888,15 @@ fn append_copied_syscall_record(sysnum: i64) {
             buffer.len() - index,
         )
     };
+}
+
+fn emit_unsupported_syscall_evidence(sysnum: i64) {
+    tracing::error!(target: "detcore_dbt::policy", "unsupported syscall @{sysnum}");
+}
+
+fn copied_child_policy_refusal(sysnum: i64) -> i32 {
+    let _ = sysnum;
+    1
 }
 
 fn error_result(error: Error) -> i64 {
@@ -1119,18 +1117,23 @@ unsafe fn runtime_background_init(callbacks: &reverie_dbt::DbtRuntimeCallbacks, 
             // the DBT callback (the `-panic-on-unsupported-syscalls` client
             // argument), because DynamoRIO re-injects the client across execve
             // while an empty-env exec would drop the serialized config. Set up
-            // the protected report descriptor the guest children write aggregated
-            // unsupported-syscall records to, and force the exit+report path so a
-            // child terminates the process tree deterministically.
+            // the native client's diagnostic report file and force the exit+report
+            // path so a child terminates the process tree deterministically. This
+            // report is diagnostic only; the parent classifies a refusal from
+            // authenticated protected evidence instead.
             let panic_on_unsupported_syscalls = callbacks.panic_on_unsupported_syscalls != 0;
             config.panic_on_unsupported_syscalls = panic_on_unsupported_syscalls;
             COPIED_PANIC_ON_UNSUPPORTED.store(panic_on_unsupported_syscalls, Ordering::Release);
-            let copied_report_fd = unsafe {
-                libc::fcntl(
-                    UNSUPPORTED_SYSCALL_REPORT_FD,
-                    libc::F_DUPFD_CLOEXEC,
-                    UNSUPPORTED_SYSCALL_REPORT_FD + 1,
-                )
+            let copied_report_fd = if callbacks.unsupported_report_fd > 2 {
+                unsafe {
+                    libc::fcntl(
+                        callbacks.unsupported_report_fd,
+                        libc::F_DUPFD_CLOEXEC,
+                        UNSUPPORTED_SYSCALL_REPORT_FD_MIN,
+                    )
+                }
+            } else {
+                -1
             };
             COPIED_UNSUPPORTED_REPORT_FD.store(copied_report_fd, Ordering::Release);
             // The DBT backend reports and aborts through the exit path plus the
@@ -1142,7 +1145,7 @@ unsafe fn runtime_background_init(callbacks: &reverie_dbt::DbtRuntimeCallbacks, 
             config.exit_on_unsupported_syscall = true;
             config.shutdown_on_unsupported_syscall = false;
             config.unsupported_syscall_report_fd =
-                report_fd_is_available().then_some(UNSUPPORTED_SYSCALL_REPORT_FD);
+                (copied_report_fd >= 0).then_some(copied_report_fd);
             config.validate();
 
             emit_lifecycle_marker(
@@ -1789,11 +1792,11 @@ fn copied_child_flock_action(operation: Option<i32>) -> i32 {
 ///
 /// A copied pre-exec child runs natively on the DynamoRIO client stack with no
 /// Detcore tool, so every syscall it makes bypasses `handle_syscall_event`.
-/// Returning 0 lets the syscall run natively; returning 1 fail-closes by
-/// aborting the runtime tree. A negative return value injects that deterministic
-/// errno without executing the syscall. Syscalls that need guest-memory access
-/// still have to fail closed because this ABI exposes arguments but no memory
-/// reader or writer.
+/// Returning 0 lets the syscall run natively; returning 1 makes the native
+/// client publish protected policy evidence and immediately terminate the
+/// runtime tree. A negative return value injects a deterministic errno without
+/// executing the syscall. Syscalls that need guest-memory access still have to
+/// fail closed because this ABI exposes arguments but no memory reader or writer.
 ///
 /// The gate covers the classic Unsupported set plus the broader fixed-error
 /// boundary. Unconditional deterministic refusals fail closed in every mode;
@@ -1832,7 +1835,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_copied_syscall(sysnum: i64, args: *
         if request == Some(libc::TIOCGPGRP) {
             return -libc::ENOTTY;
         }
-        return 1;
+        return copied_child_policy_refusal(sysnum);
     }
     // TODO-HUMAN-REVIEW(PR-981): Copied DBT children cannot enter the Rust
     // Detcore Tool. Strict mode therefore fails closed for receive syscalls that
@@ -1851,10 +1854,15 @@ pub unsafe extern "C" fn reverie_dbt_runtime_copied_syscall(sysnum: i64, args: *
     }
     if matches!(
         sysno,
-        Sysno::recvmsg | Sysno::recvmmsg | Sysno::readlink | Sysno::readlinkat
+        Sysno::getpgid
+            | Sysno::getpgrp
+            | Sysno::recvmsg
+            | Sysno::recvmmsg
+            | Sysno::readlink
+            | Sysno::readlinkat
     ) && strict
     {
-        return 1;
+        return copied_child_policy_refusal(sysnum);
     }
     // setpgid FAILS CLOSED IN STRICT MODE BECAUSE THE COPIED CHILD CAN PERFORM
     // IT BUT CANNOT RECORD IT.
@@ -1882,20 +1890,22 @@ pub unsafe extern "C" fn reverie_dbt_runtime_copied_syscall(sysnum: i64, args: *
     // copied children keep native behaviour, and only strict execution -- which
     // is where determinism is actually claimed -- refuses.
     if sysno == Sysno::setpgid && strict {
-        return 1;
+        return copied_child_policy_refusal(sysnum);
     }
     if detcore::is_deterministically_refused_syscall(sysno)
         && (strict || !detcore::is_strict_only_deterministic_refusal_syscall(sysno))
     {
-        return 1;
+        return copied_child_policy_refusal(sysnum);
     }
     if !detcore::is_unsupported_syscall(sysno) {
         return 0;
     }
     if strict {
-        1
+        emit_unsupported_syscall_evidence(sysnum);
+        copied_child_policy_refusal(sysnum)
     } else {
-        append_copied_syscall_record(sysnum);
+        append_unsupported_syscall_record(sysnum);
+        emit_unsupported_syscall_evidence(sysnum);
         0
     }
 }
@@ -1963,7 +1973,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
     };
     let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
     let mut dispatch_args: [u64; 6] = raw_args.try_into().expect("six syscall arguments");
-    translate_self_identity_targets(
+    translate_self_signal_targets(
         sysnum,
         &mut dispatch_args,
         scratch.virtual_pid,
@@ -2181,8 +2191,12 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         return 0;
     }
     update_memory_hash(sysnum, raw_args, read_memory);
+    let sysno = Sysno::from(sysnum as i32);
+    if detcore::is_unsupported_syscall(sysno) {
+        emit_unsupported_syscall_evidence(sysnum);
+    }
     let syscall = Syscall::from_raw(
-        Sysno::from(sysnum as i32),
+        sysno,
         SyscallArgs::new(
             dispatch_args[0] as usize,
             dispatch_args[1] as usize,
@@ -2249,6 +2263,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         }
         Err(Error::Tool(error)) => {
             if let Some(unsupported) = error.downcast_ref::<UnsupportedSyscallError>() {
+                append_unsupported_syscall_record(sysnum);
                 let message = format!("detcore-dbt: {unsupported}\n");
                 unsafe { emit(message.as_ptr(), message.len()) };
                 -1
@@ -2378,7 +2393,7 @@ mod tests {
             emit: test_emit,
             idle: test_idle,
             panic_on_unsupported_syscalls: 1,
-            unsupported_report_fd: UNSUPPORTED_SYSCALL_REPORT_FD,
+            unsupported_report_fd: UNSUPPORTED_SYSCALL_REPORT_FD_MIN,
             emit_stdout: test_stdout,
         };
         let current = upgrade_runtime_callbacks_v1(&legacy);
@@ -2386,7 +2401,10 @@ mod tests {
         assert_eq!(current.emit as *const (), test_emit as *const ());
         assert_eq!(current.idle as *const (), test_idle as *const ());
         assert_eq!(current.panic_on_unsupported_syscalls, 1);
-        assert_eq!(current.unsupported_report_fd, UNSUPPORTED_SYSCALL_REPORT_FD);
+        assert_eq!(
+            current.unsupported_report_fd,
+            UNSUPPORTED_SYSCALL_REPORT_FD_MIN
+        );
         assert_eq!(current.emit_stdout as *const (), test_stdout as *const ());
         assert_eq!(current.emit_evidence as *const (), test_emit as *const ());
         assert_eq!(current.evidence_log_level, 0);
@@ -2398,7 +2416,7 @@ mod tests {
             emit: test_emit,
             idle: test_idle,
             panic_on_unsupported_syscalls: 1,
-            unsupported_report_fd: UNSUPPORTED_SYSCALL_REPORT_FD,
+            unsupported_report_fd: UNSUPPORTED_SYSCALL_REPORT_FD_MIN,
             emit_stdout: test_stdout,
             emit_evidence: test_emit_evidence,
             evidence_log_level: 3,
@@ -3055,15 +3073,9 @@ mod tests {
     }
 
     #[test]
-    fn self_identity_translation_uses_virtual_targets_even_with_v1_physical_scheduler_ids() {
-        let (v1_scheduler_tid, v1_process_pid) = RuntimeAbi::V1
-            .runtime_identity(4, 3, 10_004, 10_003)
-            .expect("ABI v1 physical callback identities are valid");
-        assert_eq!(i32::from(v1_scheduler_tid), 10_004);
-        assert_eq!(i32::from(v1_process_pid), 10_003);
-
+    fn only_queued_signal_targets_are_translated_before_detcore() {
         let mut targeted = [3, 4, libc::SIGUSR1 as u64, 0, 0, 0];
-        translate_self_identity_targets(
+        translate_self_signal_targets(
             libc::SYS_rt_tgsigqueueinfo,
             &mut targeted,
             3,
@@ -3074,7 +3086,7 @@ mod tests {
         assert_eq!(targeted[..2], [10_003, 10_004]);
 
         let mut process = [3, libc::SIGUSR1 as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(
+        translate_self_signal_targets(
             libc::SYS_rt_sigqueueinfo,
             &mut process,
             3,
@@ -3084,8 +3096,12 @@ mod tests {
         );
         assert_eq!(process[0], 10_003);
 
+        let mut prlimit = [3, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
+        translate_self_signal_targets(libc::SYS_prlimit64, &mut prlimit, 3, 4, 10_003, 10_004);
+        assert_eq!(prlimit[0], 3);
+
         let mut other = [5, 6, libc::SIGUSR1 as u64, 0, 0, 0];
-        translate_self_identity_targets(
+        translate_self_signal_targets(
             libc::SYS_rt_tgsigqueueinfo,
             &mut other,
             3,
@@ -3094,47 +3110,6 @@ mod tests {
             10_004,
         );
         assert_eq!(other[..2], [5, 6]);
-
-        let mut process_group = [0, libc::SIGUSR1 as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(
-            libc::SYS_rt_sigqueueinfo,
-            &mut process_group,
-            0,
-            0,
-            10_003,
-            10_004,
-        );
-        assert_eq!(process_group[0], 0);
-
-        let mut prlimit = [3, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(libc::SYS_prlimit64, &mut prlimit, 3, 4, 10_003, 10_004);
-        assert_eq!(prlimit[0], 10_003);
-
-        let mut prlimit_without_tid = [3, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(
-            libc::SYS_prlimit64,
-            &mut prlimit_without_tid,
-            3,
-            0,
-            10_003,
-            0,
-        );
-        assert_eq!(prlimit_without_tid[0], 10_003);
-
-        let mut current = [0, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(libc::SYS_prlimit64, &mut current, 3, 4, 10_003, 10_004);
-        assert_eq!(current[0], 0);
-
-        let mut other_process = [5, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(
-            libc::SYS_prlimit64,
-            &mut other_process,
-            3,
-            4,
-            10_003,
-            10_004,
-        );
-        assert_eq!(other_process[0], 5);
     }
 
     #[test]
@@ -3720,8 +3695,8 @@ mod tests {
 
         // Strict (panic-on-unsupported): keyring syscalls are refused so the
         // copied child cannot mutate host keyrings or trigger request-key
-        // upcalls. `1` tells the native client to exit the isolated runtime
-        // tree (fail closed), matching the pre-848 Unsupported behavior.
+        // upcalls. `1` tells the native client to publish protected refusal
+        // evidence and terminate the isolated runtime tree immediately.
         COPIED_PANIC_ON_UNSUPPORTED.store(true, Ordering::Release);
         assert_eq!(copied_child_action(libc::SYS_keyctl), 1);
         assert_eq!(copied_child_action(libc::SYS_add_key), 1);
@@ -3872,7 +3847,7 @@ mod tests {
         // classic Unsupported set but for the full deterministic-refusal
         // boundary (splice/tee/vmsplice, perf_event_open, the keyring family),
         // otherwise strict guests execute those syscalls natively against the
-        // host. Report fd is left at its -1 default so `append_copied_syscall_record`
+        // host. Report fd is left at its -1 default so `append_unsupported_syscall_record`
         // is a no-op and the non-strict branch has no observable side effect.
         let previous = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
 

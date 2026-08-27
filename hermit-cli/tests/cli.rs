@@ -230,6 +230,11 @@ fn liteinst_inert_runtime() -> &'static Path {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
+        fs::write(
+            PathBuf::from(format!("{}.revision", runtime.display())),
+            format!("{}\n", env!("HERMIT_REVERIE_PIN")),
+        )
+        .expect("failed to record inert LiteInst runtime revision");
         runtime
     })
 }
@@ -1132,7 +1137,6 @@ fn run_ptrace_fails_closed_by_default_on_unsupported_syscall() {
         "",
         "unsupported guest published its success marker"
     );
-
     let compatibility_args = [
         "run",
         "--allow-unsupported-syscalls",
@@ -1206,6 +1210,17 @@ fn run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls()
         "",
         "unsupported guest published its success marker"
     );
+    assert_eq!(
+        default.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "default DBT refusal did not report the policy-refusal exit:\n{}",
+        stderr(&default)
+    );
+    assert!(
+        stderr(&default).contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "default DBT refusal omitted the policy-refusal marker:\n{}",
+        stderr(&default)
+    );
 
     let normal_args = [
         "run",
@@ -1231,47 +1246,6 @@ fn run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls()
         normal_stderr.matches(warning).count(),
         1,
         "expected one aggregate warning:\n{normal_stderr}"
-    );
-
-    let tamper_args = [
-        "run",
-        "--backend",
-        "dbt",
-        "--allow-unsupported-syscalls",
-        "--",
-        program,
-        "report-tamper",
-    ];
-    let tamper = hermit(&tamper_args);
-    assert_success(&tamper, &tamper_args);
-    assert_eq!(stdout(&tamper), "dbt-unsupported-report-tamper-ok\n");
-    assert_eq!(
-        stderr(&tamper).matches(warning).count(),
-        1,
-        "report tampering suppressed the aggregate warning:\n{}",
-        stderr(&tamper)
-    );
-
-    let fork_tamper_args = [
-        "run",
-        "--backend",
-        "dbt",
-        "--allow-unsupported-syscalls",
-        "--",
-        program,
-        "fork-report-tamper",
-    ];
-    let fork_tamper = hermit(&fork_tamper_args);
-    assert_success(&fork_tamper, &fork_tamper_args);
-    assert_eq!(
-        stdout(&fork_tamper),
-        "dbt-unsupported-fork-report-tamper-ok\n"
-    );
-    assert_eq!(
-        stderr(&fork_tamper).matches(warning).count(),
-        1,
-        "fork-child report tampering suppressed the aggregate warning:\n{}",
-        stderr(&fork_tamper)
     );
 
     let strict_args = ["run", "--backend", "dbt", "--strict", "--", program];
@@ -1343,6 +1317,148 @@ fn run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls()
             stderr(&output)
         );
     }
+}
+
+#[test]
+fn run_dbt_nonverify_report_is_private_from_root_and_fork_guests() {
+    if dbt_unavailable("run_dbt_nonverify_report_is_private_from_root_and_fork_guests") {
+        return;
+    }
+    let program = dbt_unsupported_syscall_guest()
+        .to_str()
+        .expect("DBT unsupported-syscall guest path should be UTF-8");
+    let warning = "syscalls restart_syscall used but not yet supported";
+
+    for (mode, expected_stdout) in [
+        ("report-tamper", "dbt-unsupported-report-tamper-ok\n"),
+        (
+            "fork-report-tamper",
+            "dbt-unsupported-fork-report-tamper-ok\n",
+        ),
+    ] {
+        let args = [
+            "run",
+            "--backend",
+            "dbt",
+            "--allow-unsupported-syscalls",
+            "--",
+            program,
+            mode,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected_stdout);
+        assert_eq!(
+            stderr(&output).matches(warning).count(),
+            1,
+            "{mode} suppressed the non-verify aggregate warning:\n{}",
+            stderr(&output)
+        );
+    }
+}
+
+#[test]
+fn run_dbt_policy_refusals_precede_verify_allow_and_ignore_guest_report_data() {
+    if dbt_unavailable("run_dbt_policy_refusals_precede_verify_allow_and_ignore_guest_report_data")
+    {
+        return;
+    }
+    let program = dbt_unsupported_syscall_guest()
+        .to_str()
+        .expect("DBT unsupported-syscall guest path should be UTF-8");
+
+    for verify_allow in [None, Some("failure"), Some("both")] {
+        let mut args = vec!["run", "--backend", "dbt", "--verify"];
+        let allow;
+        if let Some(value) = verify_allow {
+            allow = format!("--verify-allow={value}");
+            args.push(&allow);
+        }
+        args.extend(["--", program]);
+        let refusal = hermit(&args);
+        assert_eq!(
+            refusal.status.code(),
+            Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+            "verify_allow={verify_allow:?} accepted a DBT policy refusal:\n{}",
+            stderr(&refusal)
+        );
+        assert!(
+            stderr(&refusal).contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+            "verify_allow={verify_allow:?} omitted the policy-refusal marker:\n{}",
+            stderr(&refusal)
+        );
+    }
+
+    let second_run_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create second-run refusal directory");
+    let second_run_marker = second_run_directory.path().join("first-run-complete");
+    let second_run_marker = second_run_marker
+        .to_str()
+        .expect("second-run refusal marker path should be UTF-8");
+    let second_run_args = [
+        "run",
+        "--backend",
+        "dbt",
+        "--verify",
+        "--verify-allow=both",
+        "--",
+        program,
+        "refuse-second-run",
+        second_run_marker,
+    ];
+    let second_run = hermit(&second_run_args);
+    assert_eq!(
+        second_run.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "second-run refusal escaped --verify-allow=both:\n{}",
+        stderr(&second_run)
+    );
+
+    let copied_child_args = [
+        "run",
+        "--backend",
+        "dbt",
+        "--verify",
+        "--verify-allow=both",
+        "--",
+        program,
+        "vfork-deterministic-refusal",
+    ];
+    let copied_child = hermit(&copied_child_args);
+    assert_eq!(
+        copied_child.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "a copied-child deterministic refusal escaped --verify-allow=both:\n{}",
+        stderr(&copied_child)
+    );
+    let copied_child_stderr = stderr(&copied_child);
+    assert_eq!(
+        copied_child_stderr
+            .matches("copied-child policy refusal: perf_event_open")
+            .count(),
+        1,
+        "copied-child refusal did not produce exactly one protected policy record:\n{copied_child_stderr}"
+    );
+    assert!(
+        !copied_child_stderr.contains("protected evidence failed")
+            && !copied_child_stderr.contains("protected evidence transport failed"),
+        "copied-child refusal damaged the protected evidence transport:\n{copied_child_stderr}"
+    );
+    assert!(
+        !stdout(&copied_child).contains("copied-child-after-refusal"),
+        "guest code after the copied-child refusal executed:\n{}",
+        stdout(&copied_child)
+    );
+
+    let forged_args = ["run", "--backend", "dbt", "--", program, "forge-report"];
+    let forged = hermit(&forged_args);
+    assert_eq!(
+        forged.status.code(),
+        Some(101),
+        "guest fd 199 data was treated as authoritative policy evidence:\n{}",
+        stderr(&forged)
+    );
+    assert!(!stderr(&forged).contains("HERMIT_POLICY_REFUSAL"));
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1535,6 +1651,15 @@ fn inherited_container_output_does_not_expose_capture_offset() {
 
 #[test]
 fn run_liteinst_rejects_a_non_runtime_override_before_activation_claim() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create false LiteInst runtime directory");
+    let false_runtime = directory.path().join("not-a-liteinst-runtime.so");
+    fs::copy("/bin/true", &false_runtime).expect("failed to copy false LiteInst runtime");
+    fs::write(
+        PathBuf::from(format!("{}.revision", false_runtime.display())),
+        format!("{}\n", env!("HERMIT_REVERIE_PIN")),
+    )
+    .expect("failed to record false LiteInst runtime revision");
     let args = [
         "run",
         "--backend",
@@ -1544,7 +1669,7 @@ fn run_liteinst_rejects_a_non_runtime_override_before_activation_claim() {
         "/bin/true",
     ];
     let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .env("HERMIT_LITEINST_RUNTIME", "/bin/true")
+        .env("HERMIT_LITEINST_RUNTIME", &false_runtime)
         .args(args)
         .output()
         .expect("failed to run Hermit with a false LiteInst runtime");

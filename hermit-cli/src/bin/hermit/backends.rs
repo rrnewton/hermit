@@ -39,8 +39,6 @@ use std::io::SeekFrom;
 use std::io::Write;
 #[cfg(feature = "dbt")]
 use std::os::fd::AsRawFd;
-#[cfg(feature = "dbt")]
-use std::os::fd::FromRawFd;
 use std::os::unix::fs::PermissionsExt;
 #[cfg(any(feature = "dbt", test))]
 use std::os::unix::process::ExitStatusExt as _;
@@ -64,6 +62,8 @@ use reverie_dbt::backend_stats::DbtBackendStatsAggregator;
 use reverie_dbt::backend_stats::DbtBackendStatsSnapshot;
 use tracing::metadata::LevelFilter;
 
+#[cfg(feature = "dbt")]
+use super::container::PolicyRefusal;
 #[cfg(feature = "dbt")]
 use super::record_envelope::RecordEnvelope;
 use super::run::VerifyAllow;
@@ -356,167 +356,77 @@ fn apply_exact_environment(command: &mut StdCommand, environment: &BTreeMap<OsSt
     }
     command.envs(environment);
 }
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-644): Review inherited DBT policy descriptors and bounded reports.
 #[cfg(feature = "dbt")]
-struct InstalledFd {
-    target: i32,
-    backup: Option<i32>,
-    original_flags: Option<i32>,
-}
-
-#[cfg(feature = "dbt")]
-impl InstalledFd {
-    fn install(source: i32, target: i32) -> std::io::Result<Self> {
-        // Keep the backup above the reserved transport descriptor so installing the target
-        // cannot overwrite its backup.
-        let backup = unsafe {
-            libc::fcntl(
-                target,
-                libc::F_DUPFD_CLOEXEC,
-                detcore_dbt::UNSUPPORTED_SYSCALL_REPORT_FD + 1,
-            )
-        };
-        let backup = if backup == -1 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EBADF) {
-                None
-            } else {
-                return Err(error);
-            }
-        } else {
-            Some(backup)
-        };
-        let original_flags = if let Some(backup_fd) = backup {
-            let flags = unsafe { libc::fcntl(target, libc::F_GETFD) };
-            if flags == -1 {
-                let error = std::io::Error::last_os_error();
-                let _ = unsafe { libc::close(backup_fd) };
-                return Err(error);
-            }
-            Some(flags)
-        } else {
-            None
-        };
-        let installed = Self {
-            target,
-            backup,
-            original_flags,
-        };
-        if unsafe { libc::dup2(source, target) } == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if unsafe { libc::fcntl(target, libc::F_SETFD, 0) } == -1 {
-            let error = std::io::Error::last_os_error();
-            drop(installed);
-            return Err(error);
-        }
-        Ok(installed)
-    }
-}
-
-#[cfg(feature = "dbt")]
-impl Drop for InstalledFd {
-    fn drop(&mut self) {
-        if let Some(backup) = self.backup {
-            let _ = unsafe { libc::dup2(backup, self.target) };
-            if let Some(flags) = self.original_flags {
-                let _ = unsafe { libc::fcntl(self.target, libc::F_SETFD, flags) };
-            }
-            let _ = unsafe { libc::close(backup) };
-        } else {
-            let _ = unsafe { libc::close(self.target) };
-        }
-    }
-}
-
-#[cfg(feature = "dbt")]
-struct DbtUnsupportedSyscallReport {
-    reader: std::fs::File,
-    _writer: std::fs::File,
-    _report_fd: InstalledFd,
-}
-
-#[cfg(feature = "dbt")]
-impl DbtUnsupportedSyscallReport {
-    fn new() -> std::io::Result<Self> {
-        let mut descriptors = [-1; 2];
-        let result =
-            unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
-        if result == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: pipe2 initialized both descriptors, transferring their ownership here.
-        let reader = unsafe { std::fs::File::from_raw_fd(descriptors[0]) };
-        let writer = unsafe { std::fs::File::from_raw_fd(descriptors[1]) };
-        let report_fd = InstalledFd::install(
-            writer.as_raw_fd(),
-            detcore_dbt::UNSUPPORTED_SYSCALL_REPORT_FD,
-        )?;
-        Ok(Self {
-            reader,
-            _writer: writer,
-            _report_fd: report_fd,
+fn dbt_unsupported_syscalls(records: &[Vec<u8>]) -> BTreeSet<String> {
+    let prefix = detcore_dbt::UNSUPPORTED_SYSCALL_EVIDENCE_PREFIX.as_bytes();
+    records
+        .iter()
+        .filter_map(|record| {
+            let raw = record.strip_suffix(b"\n")?.strip_prefix(prefix)?;
+            let raw = std::str::from_utf8(raw).ok()?;
+            let sysno = raw
+                .parse::<i32>()
+                .ok()
+                .map(reverie::syscalls::Sysno::from)?;
+            detcore::is_unsupported_syscall(sysno).then(|| sysno.to_string())
         })
-    }
+        .collect()
+}
 
-    fn emit(&mut self) -> std::io::Result<()> {
-        const MAX_REPORT_BYTES: usize = 1024 * 1024;
-        let mut contents = Vec::new();
-        let mut buffer = [0_u8; 4096];
-        loop {
-            match self.reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => {
-                    if contents.len() + read > MAX_REPORT_BYTES {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "DBT unsupported-syscall report exceeded 1 MiB",
-                        ));
-                    }
-                    contents.extend_from_slice(&buffer[..read]);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) => return Err(error),
-            }
-        }
-        let contents = String::from_utf8_lossy(&contents);
-        let syscalls = contents
-            .lines()
-            .filter_map(|line| {
-                if let Some(raw) = line.strip_prefix("@") {
-                    let sysno = raw
-                        .parse::<i32>()
-                        .ok()
-                        .map(reverie::syscalls::Sysno::from)?;
-                    detcore::is_unsupported_syscall(sysno).then(|| sysno.to_string())
-                } else if !line.is_empty()
-                    && line.len() <= 64
-                    && line
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-                {
-                    Some(line.to_owned())
-                } else {
-                    None
-                }
-            })
-            .take(512)
-            .collect::<BTreeSet<_>>();
-        if let Some(message) = detcore::format_unsupported_syscall_warning(&syscalls) {
-            eprintln!("WARNING: {message}");
-        }
-        Ok(())
+#[cfg(feature = "dbt")]
+fn emit_dbt_unsupported_warning(records: &[Vec<u8>]) {
+    let syscalls = dbt_unsupported_syscalls(records);
+    if let Some(message) = detcore::format_unsupported_syscall_warning(&syscalls) {
+        eprintln!("WARNING: {message}");
     }
 }
 
 #[cfg(feature = "dbt")]
-impl Drop for DbtUnsupportedSyscallReport {
-    fn drop(&mut self) {
-        if let Err(error) = self.emit() {
-            eprintln!("WARNING: failed to read DBT unsupported-syscall report: {error}");
-        }
+fn dbt_copied_child_policy_refusals(records: &[Vec<u8>]) -> BTreeSet<String> {
+    let prefix = reverie_dbt::COPIED_CHILD_POLICY_REFUSAL_EVIDENCE_PREFIX.as_bytes();
+    records
+        .iter()
+        .filter_map(|record| {
+            let raw = record.strip_suffix(b"\n")?.strip_prefix(prefix)?;
+            let raw = std::str::from_utf8(raw).ok()?;
+            let raw = raw.parse::<i32>().ok()?;
+            let sysno = reverie::syscalls::Sysno::from(raw);
+            (sysno.id() == raw).then(|| sysno.to_string())
+        })
+        .collect()
+}
+
+#[cfg(feature = "dbt")]
+fn dbt_policy_refusal(
+    status: ExitStatus,
+    panic_on_unsupported_syscalls: bool,
+    records: &[Vec<u8>],
+) -> Option<Error> {
+    let copied_child_refusals = dbt_copied_child_policy_refusals(records);
+    if !copied_child_refusals.is_empty() {
+        return Some(
+            Error::msg(format!(
+                "copied-child policy refusal: {}",
+                copied_child_refusals
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ))
+            .context(PolicyRefusal),
+        );
     }
+    if !panic_on_unsupported_syscalls || status.success() {
+        return None;
+    }
+    let syscalls = dbt_unsupported_syscalls(records);
+    (!syscalls.is_empty()).then(|| {
+        Error::msg(format!(
+            "unsupported syscall: {}",
+            syscalls.iter().cloned().collect::<Vec<_>>().join(",")
+        ))
+        .context(PolicyRefusal)
+    })
 }
 
 #[cfg(feature = "dbt")]
@@ -746,12 +656,31 @@ pub(super) fn run_dbt(
         runner = runner.client_argument("-panic-on-unsupported-syscalls");
     }
 
+    // Policy refusals and non-strict unsupported-syscall warnings must use
+    // evidence the guest cannot write. Reverie's protected evidence channel
+    // accepts records only while the native client is executing a protected
+    // callback, authenticates every followed process, and publishes the
+    // artifact only after the complete process tree is reaped.
+    let mut policy_evidence = if !verify {
+        Some(tempfile::tempfile()?)
+    } else {
+        None
+    };
+    if let Some(evidence) = policy_evidence.as_ref() {
+        runner = runner
+            .evidence_file(evidence)
+            .map_err(|error| {
+                Error::msg(format!(
+                    "failed to configure protected DBT policy evidence: {error}"
+                ))
+            })?
+            .evidence_log_level(DbtEvidenceLogLevel::Error);
+    }
     eprintln!(
         "hermit: [dbt backend] Detcore Tool active; running {program:?} under DynamoRIO ({})",
         drrun.display()
     );
 
-    let _unsupported_report = DbtUnsupportedSyscallReport::new()?;
     let prepared = prepare_dbt_guest_command(
         program,
         args,
@@ -784,7 +713,18 @@ pub(super) fn run_dbt(
                      (run without a terminal on stdin for the labeled block)"
                 );
             }
-            return Ok(process_status(status));
+            let status = process_status(status);
+            let records = match policy_evidence.as_mut() {
+                Some(evidence) => decode_dbt_evidence(evidence)?,
+                None => Vec::new(),
+            };
+            if let Some(refusal) =
+                dbt_policy_refusal(status, panic_on_unsupported_syscalls, &records)
+            {
+                return Err(refusal);
+            }
+            emit_dbt_unsupported_warning(&records);
+            return Ok(status);
         }
         let output = run_once(&runtime, &runner, &guest, &drrun, config, std::io::stdin())?;
         write_output(&output)?;
@@ -794,7 +734,16 @@ pub(super) fn run_dbt(
                 Err(error) => eprintln!(":: DBT summary unavailable: {error}"),
             }
         }
-        return Ok(output_status(&output));
+        let status = output_status(&output);
+        let records = match policy_evidence.as_mut() {
+            Some(evidence) => decode_dbt_evidence(evidence)?,
+            None => Vec::new(),
+        };
+        if let Some(refusal) = dbt_policy_refusal(status, panic_on_unsupported_syscalls, &records) {
+            return Err(refusal);
+        }
+        emit_dbt_unsupported_warning(&records);
+        return Ok(status);
     }
 
     // The capture names are READ BY THE HARNESS, so they are not a local choice.
@@ -902,7 +851,16 @@ pub(super) fn run_dbt(
     if print_verify_logs {
         std::io::stderr().write_all(&fs::read(&log1_path)?)?;
     }
-    if !verify_allow.satisfies(process_status(first_raw.status)) {
+    let first_status = process_status(first_raw.status);
+    if let Some(refusal) =
+        dbt_policy_refusal(first_status, panic_on_unsupported_syscalls, &first_records)
+    {
+        if keep_logs {
+            retain_verification_logs([("run 1", log1_path)])?;
+        }
+        return Err(refusal);
+    }
+    if !verify_allow.satisfies(first_status) {
         let first = dbt_verification_output(first_raw);
         eprintln!(
             "First run errored during --verify, not continuing to a second. Stdout:\n{}\nStderr:\n{}",
@@ -983,6 +941,32 @@ pub(super) fn run_dbt(
         }
         return Err(error);
     }
+    let second_status = process_status(second_raw.status);
+    if let Some(refusal) = dbt_policy_refusal(
+        second_status,
+        panic_on_unsupported_syscalls,
+        &second_records,
+    ) {
+        if keep_logs {
+            retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
+        }
+        return Err(refusal);
+    }
+    if !verify_allow.satisfies(second_status) {
+        let second = dbt_verification_output(second_raw);
+        eprintln!(
+            "Second run errored during --verify. Stdout:\n{}\nStderr:\n{}",
+            String::from_utf8_lossy(&second.stdout),
+            String::from_utf8_lossy(&second.stderr),
+        );
+        if keep_logs {
+            retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
+        }
+        return Err(Error::msg("Second run during --verify exited in error"));
+    }
+    let mut unsupported_records = first_records;
+    unsupported_records.extend(second_records);
+    emit_dbt_unsupported_warning(&unsupported_records);
     let second_summary = match detcore_summary(&second_raw) {
         Ok(summary) => summary,
         Err(error) => {
@@ -1175,10 +1159,11 @@ fn run_status(
 fn clean_up_dbt_global(
     runtime: &tokio::runtime::Runtime,
     status: &std::process::ExitStatus,
-    global: detcore::GlobalState,
+    mut global: detcore::GlobalState,
 ) {
     if !status.success() {
         global.force_shutdown_with_error();
+        runtime.block_on(global.cancel_internal_scheduler());
     }
     runtime.block_on(global.clean_up(false, &None));
 }
@@ -1819,6 +1804,44 @@ mod tests {
         let mut malformed = tempfile::tempfile().unwrap();
         malformed.write_all(b"not framed evidence").unwrap();
         assert!(decode_dbt_evidence(&mut malformed).is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn policy_refusal_requires_protected_tool_evidence() {
+        let sysno = reverie::syscalls::Sysno::restart_syscall.id();
+        let protected = vec![
+            format!(
+                "{}{sysno}\n",
+                detcore_dbt::UNSUPPORTED_SYSCALL_EVIDENCE_PREFIX
+            )
+            .into_bytes(),
+        ];
+        let refusal = dbt_policy_refusal(ExitStatus::Exited(101), true, &protected)
+            .expect("protected evidence must classify the refusal");
+        assert!(refusal.downcast_ref::<PolicyRefusal>().is_some());
+
+        let guest_text = vec![format!("unsupported syscall @{sysno}\n").into_bytes()];
+        assert!(dbt_policy_refusal(ExitStatus::Exited(101), true, &guest_text).is_none());
+        assert!(dbt_policy_refusal(ExitStatus::Exited(0), true, &protected).is_none());
+        assert!(dbt_policy_refusal(ExitStatus::Exited(101), false, &protected).is_none());
+
+        let copied_sysno = reverie::syscalls::Sysno::perf_event_open.id();
+        assert!(!detcore::is_unsupported_syscall(
+            reverie::syscalls::Sysno::perf_event_open
+        ));
+        let copied = vec![
+            format!(
+                "{}{copied_sysno}\n",
+                reverie_dbt::COPIED_CHILD_POLICY_REFUSAL_EVIDENCE_PREFIX
+            )
+            .into_bytes(),
+        ];
+        let refusal = dbt_policy_refusal(ExitStatus::Exited(101), true, &copied)
+            .expect("protected copied-child evidence must classify the refusal");
+        assert!(refusal.downcast_ref::<PolicyRefusal>().is_some());
+        assert!(dbt_policy_refusal(ExitStatus::Exited(0), true, &copied).is_some());
+        assert!(dbt_policy_refusal(ExitStatus::Exited(0), false, &copied).is_some());
     }
 
     #[test]

@@ -246,7 +246,7 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
   - id: determinism-stress-c/pid-tid-identity
-    description: Pid/tid virtualization identity across procfs, wait-status, exec, and a pid branch
+    description: Pid/tid and process-group identity across threads, procfs, wait-status, and exec
     lane: portable
     requires:
       - linux
