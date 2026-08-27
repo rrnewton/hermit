@@ -310,13 +310,18 @@ check("'detlog' is no longer a tier name", "detlog" not in L2_RANK, repr(L2_RANK
 
 print("case MODE — the summary and Hermit flags come from one comparison policy")
 stripped_summary = DEFAULT_VERIFY_POLICY.mode_summary()
+mode_host_tmp = Path("/host-tmp")
 stripped_command = hermit_command(
     Path("/hermit"), "ptrace", ["/bin/true"], "hello_stdout", True,
+    host_tmp=mode_host_tmp,
     verify=True,
 )
 expected_prefix = ["/hermit", "run", *DEFAULT_VERIFY_POLICY.displayed_flags()]
 check("the policy supplies the exact Hermit command prefix",
       stripped_command[:len(expected_prefix)] == expected_prefix,
+      repr(stripped_command))
+check("the command uses the supplied host temporary directory",
+      f"--tmp={mode_host_tmp}" in stripped_command,
       repr(stripped_command))
 check("the summary prints the exact requested flags",
       shlex.join(DEFAULT_VERIFY_POLICY.displayed_flags()) in stripped_summary,
