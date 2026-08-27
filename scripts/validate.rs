@@ -13537,10 +13537,8 @@ fn dbt_parity_test_observation(rest: &str) -> Option<(bool, String)> {
     let rest = rest.trim_start();
     let (passed, result) = if let Some(result) = rest.strip_prefix("PASS ") {
         (true, result)
-    } else if let Some(result) = rest.strip_prefix("FAIL ") {
-        (false, result)
     } else {
-        return None;
+        (false, rest.strip_prefix("FAIL ")?)
     };
     let (identity, _detail) = result.split_once(':')?;
     let case = identity.strip_prefix("dbt/")?;
