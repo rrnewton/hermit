@@ -26467,9 +26467,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "hermit-cli/src/bin/hermit/run.rs:2163",
-        "reason": "DBT completes both guest executions, but its dedicated path returns without a terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without counting it green."
+        "result": "infrastructure-error",
+        "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence",
+        "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."
       },
       "observations": [],
       "measurement": "never-measured"
@@ -27492,9 +27492,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "hermit-cli/src/bin/hermit/run.rs:2163",
-        "reason": "DBT completes both guest executions, but its dedicated path returns without a terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without counting it green."
+        "result": "infrastructure-error",
+        "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence",
+        "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."
       },
       "observations": [],
       "measurement": "never-measured"
@@ -31029,9 +31029,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "hermit-cli/src/bin/hermit/run.rs:2163",
-        "reason": "DBT completes both guest executions, but its dedicated path returns without a terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without counting it green."
+        "result": "infrastructure-error",
+        "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence",
+        "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."
       },
       "observations": [],
       "measurement": "never-measured"
@@ -31705,9 +31705,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "hermit-cli/src/bin/hermit/run.rs:2163",
-        "reason": "DBT completes both guest executions, but its dedicated path returns without a terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without counting it green."
+        "result": "infrastructure-error",
+        "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence",
+        "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."
       },
       "observations": [],
       "measurement": "never-measured"
@@ -34364,9 +34364,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "hermit-cli/src/bin/hermit/run.rs:2163",
-        "reason": "DBT completes both guest executions, but its dedicated path returns without a terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without counting it green."
+        "result": "infrastructure-error",
+        "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence",
+        "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."
       },
       "observations": [],
       "measurement": "never-measured"
@@ -35361,9 +35361,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "hermit-cli/src/bin/hermit/run.rs:2163",
-        "reason": "DBT completes both guest executions, but its dedicated path returns without a terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without counting it green."
+        "result": "infrastructure-error",
+        "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence",
+        "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."
       },
       "observations": [],
       "measurement": "never-measured"
@@ -35643,9 +35643,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "hermit-cli/src/bin/hermit/run.rs:2163",
-        "reason": "DBT completes both guest executions, but its dedicated path returns without a terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without counting it green."
+        "result": "infrastructure-error",
+        "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence",
+        "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."
       },
       "observations": [],
       "measurement": "never-measured"
@@ -36203,9 +36203,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "hermit-cli/src/bin/hermit/run.rs:2163",
-        "reason": "DBT completes both guest executions, but its dedicated path returns without a terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without counting it green."
+        "result": "infrastructure-error",
+        "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence",
+        "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."
       },
       "observations": [],
       "measurement": "never-measured"
