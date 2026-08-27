@@ -827,19 +827,31 @@ impl GlobalTool for GlobalState {
                         (pending, post_exec_mm)
                     };
                     assert_eq!(pending.process, parent_detpid);
-                    let retired = self
-                        .sched
-                        .lock()
-                        .unwrap()
-                        .reconnect_after_exec(ExecReconnect {
-                            caller: pending.caller,
-                            new_leader: dettid,
-                            detpid: parent_detpid,
-                            pre_exec_mm: pending.mm,
+                    let mut sched = self.sched.lock().unwrap();
+                    if let Some((physical_pid, physical_tid)) = physical_ids
+                        && let Err(open_error) = sched.register_physical_thread(
+                            dettid,
                             post_exec_mm,
-                            child_tid_addr: ctid,
-                            reconnect_priority: priority,
-                        });
+                            physical_pid,
+                            physical_tid,
+                        )
+                    {
+                        error!(
+                            "[detcore, dtid {}] failed to register post-exec host process {} thread {}: {}",
+                            dettid, physical_pid, physical_tid, open_error,
+                        );
+                        return (None, R::ThreadExited);
+                    }
+                    let retired = sched.reconnect_after_exec(ExecReconnect {
+                        caller: pending.caller,
+                        new_leader: dettid,
+                        detpid: parent_detpid,
+                        pre_exec_mm: pending.mm,
+                        post_exec_mm,
+                        child_tid_addr: ctid,
+                        reconnect_priority: priority,
+                    });
+                    drop(sched);
                     if pending.caller != dettid {
                         self.global_time
                             .lock()

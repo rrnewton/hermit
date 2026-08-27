@@ -25,6 +25,7 @@ use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::WaitPidFlag;
 use tracing::debug;
@@ -539,36 +540,43 @@ struct KernelSigaction {
     mask: u64,
 }
 
-fn interrupting_wait_signals(
-    status: ResumeStatus,
-    guest_signal_mask: &libc::sigset_t,
-) -> Option<Vec<SigWrapper>> {
-    match status {
-        ResumeStatus::Normal => None,
-        ResumeStatus::Signaled(Some(signals)) => {
-            let signals: Vec<_> = signals
-                .into_iter()
-                .filter(|signal| !signal_is_blocked(guest_signal_mask, *signal))
-                .collect();
-            (!signals.is_empty()).then_some(signals)
-        }
-        ResumeStatus::Signaled(None) => Some(Vec::new()),
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WaitSignalDisposition {
+    Interrupt,
+    Restart,
 }
 
-async fn wait_signals_use_sa_restart<G, T>(
+fn signal_default_action_is_ignore(signal: SigWrapper) -> bool {
+    matches!(signal.raw(), libc::SIGCHLD | libc::SIGURG | libc::SIGWINCH)
+}
+
+async fn wait_signal_disposition<G, T>(
     guest: &mut G,
-    signals: &[SigWrapper],
+    status: ResumeStatus,
+    guest_signal_mask: &libc::sigset_t,
     action_addr: AddrMut<'_, KernelSigaction>,
-) -> Result<bool, Error>
+) -> Result<Option<WaitSignalDisposition>, Error>
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    if signals.is_empty() {
-        return Ok(false);
-    }
+    let ResumeStatus::Signaled(signals) = status else {
+        return Ok(None);
+    };
+    let Some(mut signals) = signals else {
+        return Ok(Some(WaitSignalDisposition::Interrupt));
+    };
+    let inspect_action = guest
+        .config()
+        .backend_requires_thread_directed_process_signals;
+    signals.sort_by_key(|signal| signal.raw());
     for signal in signals {
+        if signal_is_blocked(guest_signal_mask, signal) {
+            continue;
+        }
+        if !inspect_action {
+            return Ok(Some(WaitSignalDisposition::Interrupt));
+        }
         let call = syscalls::RtSigaction::new()
             .with_signum(signal.raw())
             .with_action(None)
@@ -576,21 +584,46 @@ where
             .with_sigsetsize(std::mem::size_of::<u64>());
         guest.inject_with_retry(call).await?;
         let action: KernelSigaction = guest.memory().read_value(action_addr)?;
-        if action.handler != libc::SIG_IGN as u64 && action.flags & libc::SA_RESTART as u64 == 0 {
-            return Ok(false);
+        if action.handler == libc::SIG_IGN as u64
+            || action.handler == libc::SIG_DFL as u64 && signal_default_action_is_ignore(signal)
+        {
+            continue;
         }
+        return Ok(Some(
+            if action.handler != libc::SIG_DFL as u64 && action.flags & libc::SA_RESTART as u64 != 0
+            {
+                WaitSignalDisposition::Restart
+            } else {
+                WaitSignalDisposition::Interrupt
+            },
+        ));
     }
-    Ok(true)
+    Ok(None)
 }
 
-fn wait_signal_errno(dbt: bool, uses_sa_restart: bool) -> Option<Errno> {
-    if !dbt {
-        Some(Errno::ERESTARTSYS)
-    } else if uses_sa_restart {
-        None
-    } else {
-        Some(Errno::EINTR)
+async fn interrupted_child_wait_result<G, T, S>(
+    guest: &mut G,
+    call: S,
+    spec: ChildWaitSpec,
+    disposition: WaitSignalDisposition,
+) -> Result<i64, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+    S: SyscallInfo,
+{
+    if !guest
+        .config()
+        .backend_requires_thread_directed_process_signals
+    {
+        return Err(Errno::ERESTARTSYS.into());
     }
+    if disposition == WaitSignalDisposition::Interrupt {
+        return Err(Errno::EINTR.into());
+    }
+
+    guest.thread_state_mut().restarted_child_wait = Some(spec);
+    guest.tail_inject(call).await
 }
 
 fn snapshot_process_group(pid: Pid) -> Result<libc::pid_t, Errno> {
@@ -666,6 +699,28 @@ fn absolute_timeout_uses_host_clock(
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    /// Wait for the scheduler's child lifecycle result before a backend lets
+    /// Linux return from `rt_sigreturn` and restart the original child wait.
+    pub async fn complete_restarted_child_wait<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<(), Error> {
+        let Some(spec) = guest.thread_state_mut().restarted_child_wait.take() else {
+            return Ok(());
+        };
+        loop {
+            let (ready, has_child) = ready_child_wait(guest, spec).await;
+            if let Some(child) = ready {
+                let _ = await_exact_child_physical_exit(guest, child).await;
+                return Ok(());
+            }
+            if !has_child {
+                return Ok(());
+            }
+            let _ = wait_for_child_lifecycle(guest, spec).await;
+        }
+    }
+
     async fn futex_timeout_deadline<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1352,7 +1407,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 guest.inject_with_retry(call).await?
             }
         } else if let Some(spec) = managed_spec {
-            'restart_wait: loop {
+            {
                 // The ptrace backend must block ordinary signals until child
                 // readiness is resolved. DBT already delays application signal
                 // delivery while this callback is active, and replacing its
@@ -1382,20 +1437,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let guest_signal_mask: libc::sigset_t = guest.memory().read_value(old_mask_addr)?;
 
                 let poll_call = call.with_options(call.options() | WaitPidFlag::WNOHANG);
-                let mut pending_signal = false;
-                let mut pending_signal_uses_sa_restart = true;
-                let mut restart_after_restore = false;
+                let mut pending_signal = None;
                 let result: Result<i64, Error> = loop {
                     let status = wait_for_child_lifecycle(guest, spec).await;
-                    if let Some(signals) = interrupting_wait_signals(status, &guest_signal_mask) {
-                        pending_signal = true;
-                        if guest
-                            .config()
-                            .backend_requires_thread_directed_process_signals
-                        {
-                            pending_signal_uses_sa_restart &=
-                                wait_signals_use_sa_restart(guest, &signals, action_addr).await?;
-                        }
+                    if pending_signal.is_none() {
+                        pending_signal =
+                            wait_signal_disposition(guest, status, &guest_signal_mask, action_addr)
+                                .await?;
                     }
                     let (ready, has_child) = ready_child_wait(guest, spec).await;
                     if let Some(child) = ready {
@@ -1406,17 +1454,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                                 let _ = consume_child_wait(guest, child).await;
                                 if child_wait_can_retry_after_stale(spec) {
                                     let (next_ready, _) = ready_child_wait(guest, spec).await;
-                                    if stale_any_wait_must_interrupt(pending_signal, next_ready) {
-                                        if let Some(errno) = wait_signal_errno(
-                                            guest
-                                                .config()
-                                                .backend_requires_thread_directed_process_signals,
-                                            pending_signal_uses_sa_restart,
-                                        ) {
-                                            break Err(errno.into());
-                                        }
-                                        restart_after_restore = true;
-                                        break Ok(0);
+                                    if stale_any_wait_must_interrupt(
+                                        pending_signal.is_some(),
+                                        next_ready,
+                                    ) {
+                                        return interrupted_child_wait_result(
+                                            guest,
+                                            call,
+                                            spec,
+                                            pending_signal.expect("signal checked above"),
+                                        )
+                                        .await;
                                     }
                                     continue;
                                 }
@@ -1433,17 +1481,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                             if value > 0 {
                                 break Ok(value);
                             }
-                            if pending_signal {
-                                if let Some(errno) = wait_signal_errno(
-                                    guest
-                                        .config()
-                                        .backend_requires_thread_directed_process_signals,
-                                    pending_signal_uses_sa_restart,
-                                ) {
-                                    break Err(errno.into());
-                                }
-                                restart_after_restore = true;
-                                break Ok(0);
+                            if let Some(disposition) = pending_signal {
+                                return interrupted_child_wait_result(
+                                    guest,
+                                    call,
+                                    spec,
+                                    disposition,
+                                )
+                                .await;
                             }
                         }
                         Err(errno) => break Err(errno.into()),
@@ -1461,10 +1506,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .with_sigsetsize(std::mem::size_of::<u64>());
                     guest.inject_with_retry(restore_signals).await?;
                 }
-                if restart_after_restore {
-                    continue 'restart_wait;
-                }
-                break result?;
+                result?
             }
         } else {
             // wait4 is a scheduler poll, not a record/replay data read (see doc above),
@@ -1665,7 +1707,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         }
 
-        'restart_wait: loop {
+        {
             // A signal can arrive after the scheduler wakes this logical wait but
             // before the zero-timeout kernel probe that resolves Linux's
             // child-ready-versus-interrupt precedence. The ptrace backend blocks
@@ -1697,9 +1739,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let guest_signal_mask: libc::sigset_t = guest.memory().read_value(old_mask_addr)?;
 
             let poll_call = call.with_options(call.options() | libc::WNOHANG);
-            let mut pending_signal = false;
-            let mut pending_signal_uses_sa_restart = true;
-            let mut restart_after_restore = false;
+            let mut pending_signal = None;
             let result: Result<i64, Error> = loop {
                 // Match the polling protocol used by wait4: the first request with
                 // poll_attempt zero establishes an ordinary runnable turn, while later
@@ -1720,15 +1760,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 } else {
                     resource_request(guest, rsrc.clone()).await
                 };
-                if let Some(signals) = interrupting_wait_signals(status, &guest_signal_mask) {
-                    pending_signal = true;
-                    if guest
-                        .config()
-                        .backend_requires_thread_directed_process_signals
-                    {
-                        pending_signal_uses_sa_restart &=
-                            wait_signals_use_sa_restart(guest, &signals, action_addr).await?;
-                    }
+                if pending_signal.is_none() {
+                    pending_signal =
+                        wait_signal_disposition(guest, status, &guest_signal_mask, action_addr)
+                            .await?;
                 }
                 let (ready, has_child) = if let Some(spec) = managed_spec {
                     ready_child_wait(guest, spec).await
@@ -1755,17 +1790,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                                 let (next_ready, _) =
                                     ready_child_wait(guest, managed_spec.expect("managed spec"))
                                         .await;
-                                if stale_any_wait_must_interrupt(pending_signal, next_ready) {
-                                    if let Some(errno) = wait_signal_errno(
-                                        guest
-                                            .config()
-                                            .backend_requires_thread_directed_process_signals,
-                                        pending_signal_uses_sa_restart,
-                                    ) {
-                                        break Err(errno.into());
-                                    }
-                                    restart_after_restore = true;
-                                    break Ok(0);
+                                if stale_any_wait_must_interrupt(
+                                    pending_signal.is_some(),
+                                    next_ready,
+                                ) {
+                                    return interrupted_child_wait_result(
+                                        guest,
+                                        call,
+                                        managed_spec.expect("managed spec"),
+                                        pending_signal.expect("signal checked above"),
+                                    )
+                                    .await;
                                 }
                                 continue;
                             }
@@ -1791,21 +1826,22 @@ impl<T: RecordOrReplay> Detcore<T> {
                         // waitid writes the SIGCHLD variant of siginfo_t. A zeroed
                         // structure is used only for the no-event WNOHANG result.
                         let child_pid = unsafe { info_value.si_pid() };
-                        match exact_wait_poll_decision(child_pid != 0, pending_signal, None) {
+                        match exact_wait_poll_decision(
+                            child_pid != 0,
+                            pending_signal.is_some(),
+                            None,
+                        ) {
                             ExactWaitPollDecision::ChildReady => {
                                 break finish_waitid_result(guest, call, value, info_value);
                             }
                             ExactWaitPollDecision::Interrupted => {
-                                if let Some(errno) = wait_signal_errno(
-                                    guest
-                                        .config()
-                                        .backend_requires_thread_directed_process_signals,
-                                    pending_signal_uses_sa_restart,
-                                ) {
-                                    break Err(errno.into());
-                                }
-                                restart_after_restore = true;
-                                break Ok(0);
+                                return interrupted_child_wait_result(
+                                    guest,
+                                    call,
+                                    managed_spec.expect("managed spec"),
+                                    pending_signal.expect("signal checked above"),
+                                )
+                                .await;
                             }
                             ExactWaitPollDecision::Retry => {}
                             ExactWaitPollDecision::AwaitPhysicalExit
@@ -1824,7 +1860,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                         );
                         record_retry_event(guest, poll_call).await;
                     }
-                    Err(Errno::ERESTARTSYS) if pending_signal => break Err(Errno::EINTR.into()),
+                    Err(Errno::ERESTARTSYS) if pending_signal.is_some() => {
+                        break Err(Errno::EINTR.into());
+                    }
                     Err(errno) => break Err(errno.into()),
                 }
             };
@@ -1840,9 +1878,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .with_sigsetsize(std::mem::size_of::<u64>());
                 guest.inject_with_retry(restore_signals).await?;
             }
-            if restart_after_restore {
-                continue 'restart_wait;
-            }
             if result.is_ok() && call.options() & libc::WNOWAIT == 0 {
                 let info_value: libc::siginfo_t = guest.memory().read_value(info)?;
                 let child_pid = unsafe { info_value.si_pid() };
@@ -1850,7 +1885,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let _ = consume_child_wait(guest, DetPid::from_raw(child_pid)).await;
                 }
             }
-            break result;
+            result
         }
     }
 
@@ -2230,11 +2265,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dbt_wait_signal_result_matches_sa_restart() {
-        assert_eq!(wait_signal_errno(true, false), Some(Errno::EINTR));
-        assert_eq!(wait_signal_errno(true, true), None);
-        assert_eq!(wait_signal_errno(false, false), Some(Errno::ERESTARTSYS));
-        assert_eq!(wait_signal_errno(false, true), Some(Errno::ERESTARTSYS));
+    fn linux_default_ignored_signals_do_not_interrupt_child_waits() {
+        for signal in [libc::SIGCHLD, libc::SIGURG, libc::SIGWINCH] {
+            assert!(signal_default_action_is_ignore(SigWrapper(signal)));
+        }
+        for signal in [libc::SIGALRM, libc::SIGCONT, libc::SIGUSR1] {
+            assert!(!signal_default_action_is_ignore(SigWrapper(signal)));
+        }
     }
 
     #[test]

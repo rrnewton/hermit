@@ -1461,6 +1461,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     dettid,
                     detpid: None, // Initialized later.
                     physical_tid: None,
+                    restarted_child_wait: None,
                     open_file_creator: None,
                     mm_id: MmId::for_clone(
                         pts.1.mm_id,
@@ -1617,8 +1618,22 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 &new_dettid,
                 guest.config()
             );
+            let physical_ids = if guest
+                .config()
+                .backend_requires_thread_directed_process_signals
+            {
+                Some((
+                    guest.pid().as_raw(),
+                    guest
+                        .thread_state()
+                        .physical_tid
+                        .expect("backend requires a host thread ID before registration"),
+                ))
+            } else {
+                None
+            };
             if let Some(post_exec_mm) =
-                create_child_thread(guest, new_dettid, 0, None, libc::SIGCHLD, None).await
+                create_child_thread(guest, new_dettid, 0, None, libc::SIGCHLD, physical_ids).await
             {
                 guest.thread_state_mut().mm_id = post_exec_mm;
             }

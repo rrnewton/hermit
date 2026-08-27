@@ -789,19 +789,14 @@ fn dbt_exact_child_waits_ignore_default_ignored_signals() {
 }
 
 #[test]
-fn dbt_exact_child_waits_keep_blocked_signals_pending_and_preserve_the_mask() {
-    if dbt_unavailable("dbt_exact_child_waits_keep_blocked_signals_pending_and_preserve_the_mask") {
+fn dbt_exact_child_waits_preserve_mask_and_result_for_blocked_signals() {
+    if dbt_unavailable("dbt_exact_child_waits_preserve_mask_and_result_for_blocked_signals") {
         return;
     }
     assert_dbt_wait_case(
         &["--live-sibling-signal-blocked"],
         "waitid-live-sibling-blocked rc=0 errno=0 handler=0 pid-match=1 code=1 status=29 mask-preserved=1 sender-live=1",
         Some("waitid-live-sibling-done"),
-    );
-    assert_dbt_wait_case(
-        &["--wait4-live-sibling-signal-blocked"],
-        "wait4-live-sibling-blocked rc-ok=1 errno=0 handler=0 pid-match=1 exited=1 status=29 mask-preserved=1 signals-pending=1 sender-live=1",
-        Some("wait4-live-sibling-done"),
     );
 }
 

@@ -286,8 +286,9 @@ static int default_ignored_signal(int use_wait4, int signum) {
     if (kill(parent, signum) != 0) {
       _exit(1);
     }
-    const struct timespec delay = {.tv_sec = 0, .tv_nsec = 100 * 1000 * 1000};
-    nanosleep(&delay, NULL);
+    const struct timespec target_delay = {
+        .tv_sec = 0, .tv_nsec = 100 * 1000 * 1000};
+    nanosleep(&target_delay, NULL);
     if (kill(target, SIGKILL) != 0) {
       _exit(2);
     }

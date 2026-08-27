@@ -2141,6 +2141,27 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         return -1;
     }
 
+    if sysnum == libc::SYS_rt_sigreturn {
+        let mut guest = DbtGuest::<Detcore>::new(
+            context as usize,
+            det_tid,
+            host_pid,
+            None,
+            branches,
+            &mut thread.state,
+            &runtime.global,
+            &runtime.config,
+            invoke_syscall,
+            read_registers,
+            write_registers,
+        );
+        if let Err(error) = run_ready(tool.complete_restarted_child_wait(&mut guest)) {
+            unsafe { result.write(error_result(error)) };
+            TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+            return 1;
+        }
+    }
+
     // clone(2) and clone3(2) return in both the parent and child. Injecting
     // either from this callback makes the child return on the client stack.
     if requires_native_lifecycle(sysnum) {
