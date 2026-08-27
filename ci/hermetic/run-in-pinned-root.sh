@@ -28,6 +28,11 @@
 # present or it cannot even resolve the dependency graph. This is the local
 # equivalent of the shard jobs' `Swatinem/rust-cache` restore, not a workaround:
 # in both cases the cache is an input carried across the phase boundary.
+#
+# DAGRUN_TEST_COUNTS_PATH is scheduler-owned on the host. When requested through
+# --env, its parent directory is mounted at /dagrun-test-counts and the child is
+# given the translated path. This lets an in-container test producer atomically
+# publish the same evidence file the host scheduler will read after podman exits.
 
 set -euo pipefail
 
@@ -134,6 +139,17 @@ for name in "${pass_env[@]}"; do
             ;;
         E2E_BUILD_ROOT)
             env_args+=(-e E2E_BUILD_ROOT=/src/target/e2e-build)
+            ;;
+        DAGRUN_TEST_COUNTS_PATH)
+            [[ ${!name} == /* ]] || {
+                echo "run-in-pinned-root: DAGRUN_TEST_COUNTS_PATH must be absolute" >&2
+                exit 2
+            }
+            counts_dir=$(dirname -- "${!name}")
+            counts_file=$(basename -- "${!name}")
+            mkdir -p "$counts_dir"
+            extra_mounts+=(--mount "type=bind,source=$counts_dir,destination=/dagrun-test-counts")
+            env_args+=(-e "DAGRUN_TEST_COUNTS_PATH=/dagrun-test-counts/$counts_file")
             ;;
         *) env_args+=(--env "$name") ;;
     esac

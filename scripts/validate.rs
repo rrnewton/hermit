@@ -406,7 +406,8 @@ fn usage() -> &'static str {
      \x20 --allow-cgroup-failure  Downgrade to an UNBOXED run instead of failing closed.\n\
      \x20 --merge-lanes    Fuse the portable and privileged lanes (the full default).\n\
      \x20 --sequential-lanes  Diagnostic fallback: run full lanes back to back.\n\
-     \x20 --show-plan      Print the boxed DAG plan (nodes, caps, deps) and exit.\n\
+     \x20 --show-plan      Print the outer boxed DAG nodes, caps, and dependencies and exit.\n\
+     \x20                  It does not enumerate Rust test IDs or E2E cells.\n\
      \x20 --self-test      Run inert policy/data brackets plus one bounded disposable\n\
      \x20                  nested-cgroup check, then exit.\n\
      \x20 -h, --help       Show this help and exit.\n\
@@ -3258,6 +3259,68 @@ fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
         return Err(
             "verbosity: envelope markers and Hermit diagnostics must share stderr ordering".into(),
         );
+    }
+    for fixture in [
+        "trap publish_counts EXIT",
+        "EXECUTED=$((EXECUTED + 1))",
+        "./ci/write-structured-test-counts.sh \"$EXECUTED\" 0",
+    ] {
+        if !envelope.cmd.contains(fixture) {
+            return Err(format!(
+                "verbosity: envelope lost structured count fixture {fixture:?}"
+            ));
+        }
+    }
+    let non_nextest_test_nodes = plan
+        .cfg
+        .steps
+        .iter()
+        .chain(plan.second.iter().flat_map(|cfg| cfg.steps.iter()))
+        .filter(|step| step.group == "test" && !step.cmd.contains("run-nextest-counted.sh"))
+        .map(|step| step.tag())
+        .collect::<BTreeSet<_>>();
+    let expected_non_nextest = BTreeSet::from([
+        "test.applications_e2e".to_string(),
+        "test.dbt_parity".to_string(),
+        "test.envelope_levels".to_string(),
+        "test.strict_compat".to_string(),
+    ]);
+    if non_nextest_test_nodes != expected_non_nextest {
+        return Err(format!(
+            "verbosity: non-nextest test nodes changed without a structured-count audit: \
+             {non_nextest_test_nodes:?}"
+        ));
+    }
+    for (relative, marker) in [
+        (
+            "tests/e2e/lib/applications/run_all.sh",
+            "write-structured-test-counts.sh",
+        ),
+        (
+            "tests/backend-parity/run_matrix.py",
+            "DAGRUN_TEST_COUNTS_PATH",
+        ),
+    ] {
+        let source = std::fs::read_to_string(root.join(relative))
+            .map_err(|error| format!("verbosity: cannot read {relative}: {error}"))?;
+        if !source.contains(marker) {
+            return Err(format!(
+                "verbosity: {relative} no longer publishes structured test counts"
+            ));
+        }
+    }
+    let pinned_root_wrapper = std::fs::read_to_string(root.join("ci/hermetic/run-in-pinned-root.sh"))
+        .map_err(|error| format!("verbosity: cannot read pinned-root wrapper: {error}"))?;
+    for fixture in [
+        "DAGRUN_TEST_COUNTS_PATH)",
+        "destination=/dagrun-test-counts",
+        "DAGRUN_TEST_COUNTS_PATH=/dagrun-test-counts/$counts_file",
+    ] {
+        if !pinned_root_wrapper.contains(fixture) {
+            return Err(format!(
+                "verbosity: pinned-root wrapper lost structured count mapping {fixture:?}"
+            ));
+        }
     }
     propagate_verbosity(&mut plan, 5);
     let missing = plan
@@ -7261,6 +7324,9 @@ const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
 
 fn pinned_root_command(root: &Path, out: &Path, step: &Step) -> String {
     let mut env_names: BTreeSet<&str> = PINNED_ROOT_FORWARDED_ENV.iter().copied().collect();
+    if validation_step_identity(step) == ValidationStepIdentity::ManifestRun {
+        env_names.insert("DAGRUN_TEST_COUNTS_PATH");
+    }
     env_names.extend(step.env.keys().map(String::as_str));
     let mut argv = vec![
         root.join("ci/hermetic/run-in-pinned-root.sh")
@@ -7562,6 +7628,7 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
         || !wrapped
             .cmd
             .contains(&format!("--env {STEP_STARTED_MONOTONIC_NS_ENV}"))
+        || !wrapped.cmd.contains("--env DAGRUN_TEST_COUNTS_PATH")
         || !wrapped.cmd.contains("--env HERMIT_E2E_EMPTY_WORKDIR")
         || !wrapped.cmd.contains("/src/ci/hermetic/assert-no-network.sh")
         || !wrapped
@@ -7578,7 +7645,6 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
             wrapped.cmd, wrapped.env, wrapped.deps
         ));
     }
-
     // ⚠️ SEPARATE ASSERTION WITH ITS OWN MESSAGE, because the combined check above
     // would report a dependency fault as "lost its image wrapper" and send the reader
     // to the wrong place. Depending on the HOST producer orders the cell correctly and
@@ -11185,7 +11251,6 @@ struct LedgerCtx {
 }
 
 struct ReceiptEvidence {
-    coverage: serde_json::Value,
     base_sha: serde_json::Value,
     base_tree: serde_json::Value,
     reverie_base_sha: serde_json::Value,
@@ -11195,7 +11260,6 @@ struct ReceiptEvidence {
 impl Default for ReceiptEvidence {
     fn default() -> Self {
         Self {
-            coverage: serde_json::Value::Null,
             base_sha: serde_json::Value::Null,
             base_tree: serde_json::Value::Null,
             reverie_base_sha: serde_json::Value::Null,
@@ -11204,7 +11268,7 @@ impl Default for ReceiptEvidence {
     }
 }
 
-/// Ask the parent's single receipt finalizer for coverage and base identities.
+/// Ask the parent's single receipt finalizer for base identities.
 /// Any missing helper, failed command, or malformed output stays explicit null;
 /// the schema-5 consumer then refuses qualification.
 fn receipt_evidence(
@@ -11237,11 +11301,8 @@ fn receipt_evidence(
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
         return ReceiptEvidence::default();
     };
-    let coverage = value.get("coverage").cloned().unwrap_or(serde_json::Value::Null);
-    let (_, coverage) = ledger_schema_and_coverage(coverage);
     let field = |name: &str| value.get(name).cloned().unwrap_or(serde_json::Value::Null);
     ReceiptEvidence {
-        coverage,
         base_sha: field("base_sha"),
         base_tree: field("base_tree"),
         reverie_base_sha: field("reverie_base_sha"),
@@ -11970,93 +12031,68 @@ fn libtest_counts(outcomes: &[StepOutcome]) -> (Option<i64>, Option<i64>) {
     )
 }
 
-/// Correct only an incorrect zero classification from the parent finalizer when this
-/// driver's typed final outcome proves that the same planned node ran tests.
-/// The parent remains the plan/coverage authority. Every other classification,
-/// and every malformed or incomplete coverage object, is preserved fail-closed.
-fn correct_test_node_coverage(
-    mut coverage: serde_json::Value,
+fn publish_structured_test_counts(executed: i64, filtered: i64) -> Result<(), String> {
+    let Some(path) = std::env::var_os("DAGRUN_TEST_COUNTS_PATH") else {
+        return Ok(());
+    };
+    if executed < 0 || filtered < 0 {
+        return Err("structured test counts must be nonnegative".into());
+    }
+    let path = PathBuf::from(path);
+    let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
+    let counts = serde_json::json!({
+        "schema": 1,
+        "executed_tests": executed,
+        "filtered_tests": filtered,
+    });
+    let publish = std::fs::write(&temporary, format!("{counts}\n"))
+        .and_then(|()| std::fs::rename(&temporary, &path));
+    if let Err(error) = publish {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!(
+            "cannot publish structured test counts to {}: {error}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Derive the per-node coverage obligation from dagrun's structured test counts.
+///
+/// A terminal node with no structured count file has no executed-test evidence.
+/// It belongs in `absent_nodes` even if its captured stdout contains a line that
+/// resembles libtest output. `Some(0)` remains the distinct, demonstrated
+/// zero-execution state. Only a positive producer-written count satisfies one
+/// planned `test.*` node.
+fn typed_test_node_coverage(
     planned_test_nodes: &BTreeSet<String>,
     outcomes: &[StepOutcome],
 ) -> serde_json::Value {
-    let Some(planned_count) = coverage
-        .get("planned_test_nodes")
-        .and_then(serde_json::Value::as_u64)
-    else {
-        return coverage;
-    };
-    let Some(executed_count) = coverage
-        .get("executed_test_nodes")
-        .and_then(serde_json::Value::as_u64)
-    else {
-        return coverage;
-    };
-    let strings = |field: &str| -> Option<Vec<String>> {
-        coverage
-            .get(field)?
-            .as_array()?
-            .iter()
-            .map(|value| value.as_str().map(str::to_string))
-            .collect()
-    };
-    let Some(zero_executed_nodes) = strings("zero_executed_nodes") else {
-        return coverage;
-    };
-    let Some(absent_nodes) = strings("absent_nodes") else {
-        return coverage;
-    };
-
-    let zero_set: BTreeSet<String> = zero_executed_nodes.iter().cloned().collect();
-    let absent_set: BTreeSet<String> = absent_nodes.iter().cloned().collect();
-    let shape_is_valid = planned_count == planned_test_nodes.len() as u64
-        && zero_set.len() == zero_executed_nodes.len()
-        && absent_set.len() == absent_nodes.len()
-        && zero_set.is_disjoint(&absent_set)
-        && zero_set.iter().chain(absent_set.iter()).all(|tag| planned_test_nodes.contains(tag))
-        && executed_count
-            .checked_add(zero_set.len() as u64)
-            .and_then(|count| count.checked_add(absent_set.len() as u64))
-            == Some(planned_count);
-    if !shape_is_valid {
-        return coverage;
-    }
-
     let final_outcomes: BTreeMap<&str, &StepOutcome> =
         outcomes.iter().map(|outcome| (outcome.tag.as_str(), outcome)).collect();
-    let corrected: BTreeSet<String> = zero_set
-        .iter()
-        .filter(|tag| {
-            final_outcomes
-                .get(tag.as_str())
-                .is_some_and(|outcome| {
-                    !outcome.ok
-                        && !outcome.aborted
-                        && outcome.executed_tests.is_some_and(|n| n > 0)
-                })
-        })
-        .cloned()
-        .collect();
-    if corrected.is_empty() {
-        return coverage;
+    let mut executed = 0usize;
+    let mut zero_executed_nodes = Vec::new();
+    let mut absent_nodes = Vec::new();
+    for tag in planned_test_nodes {
+        match final_outcomes.get(tag.as_str()) {
+            Some(outcome) if !outcome.aborted && outcome.executed_tests.is_some_and(|n| n > 0) => {
+                executed += 1;
+            }
+            Some(outcome) if !outcome.aborted && outcome.executed_tests == Some(0) => {
+                zero_executed_nodes.push(tag.clone());
+            }
+            _ => absent_nodes.push(tag.clone()),
+        }
     }
-    let Some(new_executed_count) = executed_count.checked_add(corrected.len() as u64) else {
-        return coverage;
-    };
-    let remaining_zero: Vec<String> = zero_executed_nodes
-        .into_iter()
-        .filter(|tag| !corrected.contains(tag.as_str()))
-        .collect();
-    let Some(object) = coverage.as_object_mut() else {
-        return coverage;
-    };
-    object.insert("executed_test_nodes".into(), serde_json::json!(new_executed_count));
-    object.insert("zero_executed_nodes".into(), serde_json::json!(remaining_zero));
-    coverage
+    serde_json::json!({
+        "planned_test_nodes": planned_test_nodes.len(),
+        "executed_test_nodes": executed,
+        "zero_executed_nodes": zero_executed_nodes,
+        "absent_nodes": absent_nodes,
+    })
 }
 
-/// Two-sided bracket for the narrow zero-classification correction. It proves that a
-/// failed node with a positive typed count is corrected without changing its
-/// failure, while every unproved or malformed case remains byte-for-value.
+/// Two-sided bracket for the structured per-node coverage judgement.
 fn test_node_coverage_bracket() -> Result<(), String> {
     let outcome = |tag: &str, ok: bool, aborted: bool, executed_tests| StepOutcome {
         tag: tag.into(),
@@ -12070,90 +12106,37 @@ fn test_node_coverage_bracket() -> Result<(), String> {
         aborted,
     };
 
-    let planned = BTreeSet::from(["test.ran_failed".to_string()]);
-    let parent_zero = serde_json::json!({
-        "planned_test_nodes": 1,
-        "executed_test_nodes": 0,
-        "zero_executed_nodes": ["test.ran_failed"],
-        "absent_nodes": [],
+    let planned = BTreeSet::from([
+        "test.aborted".to_string(),
+        "test.banner_only".to_string(),
+        "test.missing".to_string(),
+        "test.ran_failed".to_string(),
+        "test.ran_passed".to_string(),
+        "test.zero".to_string(),
+    ]);
+    let outcomes = vec![
+        outcome("test.aborted", false, true, Some(9)),
+        outcome("test.banner_only", true, false, None),
+        outcome("test.ran_failed", false, false, Some(23)),
+        outcome("test.ran_passed", true, false, Some(17)),
+        outcome("test.zero", true, false, Some(0)),
+        outcome("test.unplanned", true, false, Some(99)),
+    ];
+    let coverage = typed_test_node_coverage(&planned, &outcomes);
+    let expected = serde_json::json!({
+        "planned_test_nodes": 6,
+        "executed_test_nodes": 2,
+        "zero_executed_nodes": ["test.zero"],
+        "absent_nodes": ["test.aborted", "test.banner_only", "test.missing"],
     });
-    let ran_failed = outcome("test.ran_failed", false, false, Some(23));
-    let coverage = correct_test_node_coverage(
-        parent_zero.clone(),
-        &planned,
-        std::slice::from_ref(&ran_failed),
-    );
-    if coverage
-        != serde_json::json!({
-            "planned_test_nodes": 1,
-            "executed_test_nodes": 1,
-            "zero_executed_nodes": [],
-            "absent_nodes": [],
-        })
-        || ran_failed.ok
-    {
-        return Err(
-            "test-node coverage: a 23-test failed node must be executed and remain failed".into(),
-        );
-    }
-
-    for (name, outcomes) in [
-        ("missing", Vec::new()),
-        ("zero", vec![outcome("test.ran_failed", true, false, Some(0))]),
-        ("passing", vec![outcome("test.ran_failed", true, false, Some(23))]),
-        ("count-unknown", vec![outcome("test.ran_failed", true, false, None)]),
-        ("aborted", vec![outcome("test.ran_failed", false, true, Some(23))]),
-        ("unplanned", vec![outcome("test.other", false, false, Some(23))]),
-    ] {
-        let unchanged = correct_test_node_coverage(parent_zero.clone(), &planned, &outcomes);
-        if unchanged != parent_zero {
-            return Err(format!(
-                "test-node coverage: {name} evidence must not change the parent's classification"
-            ));
-        }
-    }
-
-    let parent_absent = serde_json::json!({
-        "planned_test_nodes": 1,
-        "executed_test_nodes": 0,
-        "zero_executed_nodes": [],
-        "absent_nodes": ["test.ran_failed"],
-    });
-    if correct_test_node_coverage(parent_absent.clone(), &planned, std::slice::from_ref(&ran_failed))
-        != parent_absent
-    {
-        return Err("test-node coverage: an absent classification must not be rewritten".into());
-    }
-    let parent_executed = serde_json::json!({
-        "planned_test_nodes": 1,
-        "executed_test_nodes": 1,
-        "zero_executed_nodes": [],
-        "absent_nodes": [],
-    });
-    if correct_test_node_coverage(parent_executed.clone(), &planned, std::slice::from_ref(&ran_failed))
-        != parent_executed
-    {
-        return Err("test-node coverage: an already-executed classification must not change".into());
-    }
-    for malformed in [
-        serde_json::Value::Null,
-        serde_json::json!({"planned_test_nodes": 1}),
-        serde_json::json!({
-            "planned_test_nodes": 1,
-            "executed_test_nodes": 1,
-            "zero_executed_nodes": ["test.ran_failed"],
-            "absent_nodes": [],
-        }),
-    ] {
-        if correct_test_node_coverage(malformed.clone(), &planned, std::slice::from_ref(&ran_failed))
-            != malformed
-        {
-            return Err("test-node coverage: malformed evidence must remain unchanged".into());
-        }
+    if coverage != expected {
+        return Err(format!(
+            "test-node coverage: structured outcome classification disagrees: {coverage}"
+        ));
     }
 
     println!(
-        "  test-node coverage: one incorrect zero corrected; unproved and malformed cases unchanged"
+        "  test-node coverage: 2 structured-positive / 1 structured-zero / 3 absent; printed banners alone remain absent"
     );
     Ok(())
 }
@@ -12843,6 +12826,13 @@ fn write_ledger(
         .map(String::as_str)
         .filter(|tag| !accounted.contains(tag))
         .collect();
+    let environment_run_id = std::env::var("E2E_RUN_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let run_id = cell_results
+        .map(|results| results.run_id.as_str())
+        .or_else(|| coverage.get("run_id").and_then(serde_json::Value::as_str))
+        .or(environment_run_id.as_deref());
     let record = serde_json::json!({
         "schema_version": ledger_schema,
         "repo": "hermit",
@@ -12852,7 +12842,7 @@ fn write_ledger(
         // repeats this shape with `corrects` set to the id it supersedes.
         "record_id": record_id,
         "corrects": serde_json::Value::Null,
-        "run_id": cell_results.map(|results| results.run_id.as_str()),
+        "run_id": run_id,
         "started_at": ctx.started_at,
         "finished_at": utc_now(),
         "host": ctx.host,
@@ -12942,6 +12932,11 @@ fn write_ledger(
         // counted receipt consumes the explicit test fields above rather than
         // treating this node count as test evidence.
         "executed_nodes": gates_run,
+        // Exact outer plan identity. `profile=full` does not imply the nodes in
+        // quick or super, so the receipt carries the names it actually planned
+        // instead of asking readers to infer a set from the profile label.
+        "planned_node_count": planned_tags.len(),
+        "planned_nodes": planned_tags,
         "real_seconds": wall_s,
         "log_file": log_file,
         "coverage": coverage,
@@ -14014,6 +14009,11 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             vec![format!("cannot cd to repo root {}", root.display())],
         );
     }
+    // Receipt-bearing runs accept test counts only through dagrun's structured
+    // per-step file. Human-readable output remains diagnostic, but a command
+    // that merely prints a libtest-looking banner cannot manufacture evidence
+    // that tests executed.
+    unsafe { std::env::set_var("DAGRUN_REQUIRE_STRUCTURED_TEST_COUNTS", "1") };
     let parent = find_parent(&root);
     if std::env::var_os(PARENT_ENV).is_none() {
         if let Some(parent) = &parent {
@@ -14551,13 +14551,19 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             }
         }
         let total: usize = all.iter().map(|c| c.steps.len()).sum();
-        println!("\ntotal boxed nodes: {total}; all have declared wall+cpu+memory caps (audited above).");
+        println!(
+            "\ntotal outer boxed nodes: {total}; all have declared wall+cpu+memory caps (audited above)."
+        );
+        println!(
+            "This output does not enumerate Rust test IDs or E2E cells inside those outer nodes."
+        );
         return RunSummary::new(
             Verdict::PlanOnly,
             0,
             &plan.profile,
             vec![
-                format!("--show-plan: {total} boxed node(s) printed, all with declared wall+cpu+memory caps"),
+                format!("--show-plan: {total} outer boxed node(s) printed, all with declared wall+cpu+memory caps"),
+                "Rust test IDs and E2E cells inside those nodes were not enumerated".into(),
                 "nothing was executed and no ledger row was written".into(),
             ],
         );
@@ -14968,15 +14974,11 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         );
     }
 
-    // The parent remains the plan/coverage authority. Correct only the one case
-    // it cannot see in a failed nextest log: a planned node it classified as zero
-    // whose typed final outcome carries a positive executed-test count.
+    // The parent still supplies exact base and pin evidence, but its historical
+    // per-node coverage parser reads printable banners. Rebuild coverage from
+    // dagrun's structured producer results so stdout cannot qualify a node.
     let receipt = receipt_evidence(parent.as_deref(), &root, &log_path, &commit);
-    let coverage = correct_test_node_coverage(
-        receipt.coverage.clone(),
-        &plan.planned_test_nodes,
-        &outcomes,
-    );
+    let coverage = typed_test_node_coverage(&plan.planned_test_nodes, &outcomes);
 
     let behind_ahead = sh("git", &["rev-list", "--left-right", "--count", "origin/main...HEAD"])
         .unwrap_or_else(|| "0 0".into());
@@ -15259,6 +15261,32 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         pin_gate_bypassed = true;
     }
 
+    // The full plan runs portable strict compatibility as one outer `test.*`
+    // node whose payload is this focused validate. Publish the nested measured
+    // program count to the scheduler-owned path so the outer receipt can prove
+    // that node executed work. The value comes from the typed compatibility
+    // outcomes, never from the nested process's printable summary.
+    if nesting.nested {
+        let nested_counts = compat_measured
+            .and_then(|count| i64::try_from(count).ok())
+            .map(|count| (count, 0))
+            .or_else(|| executed_tests.zip(filtered_tests));
+        match nested_counts {
+            Some((executed, filtered)) => {
+                if let Err(error) = publish_structured_test_counts(executed, filtered) {
+                    eprintln!("validate: ERROR: {error}");
+                    exit_code = 1;
+                }
+            }
+            None => {
+                eprintln!(
+                    "validate: ERROR: nested validation produced no structured executed-test count"
+                );
+                exit_code = 1;
+            }
+        }
+    }
+
     // A full top-level run must carry the exact per-cell population it just
     // judged. Older schema-5 rows could say only that buckets passed; they could
     // not open or satisfy a cell-specific failure obligation. Retain the typed
@@ -15296,6 +15324,78 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     } else {
         None
     };
+    let retained_coverage = if plan.suite_complete
+        && !nesting.nested
+        && !args.allow_local_off_the_record_run
+    {
+        let selected = retained_cell_results
+            .as_ref()
+            .and_then(|results| results.evidence.get("selected").and_then(serde_json::Value::as_array))
+            .cloned()
+            .map(Ok)
+            .unwrap_or_else(|| validate_cell_results::expected_plan(&root));
+        let run_id = retained_cell_results
+            .as_ref()
+            .map(|results| results.run_id.clone())
+            .or_else(|| {
+                std::env::var("E2E_RUN_ID").ok().filter(|value| !value.trim().is_empty())
+            })
+            .ok_or("E2E_RUN_ID is missing after the validate run".to_string());
+        match run_id.and_then(|run_id| {
+            selected.and_then(|selected| {
+                validate_cell_results::retain_coverage_evidence(
+                    parent.as_deref().unwrap_or(&root),
+                    &root,
+                    &run_id,
+                    &commit,
+                    &plan.profile,
+                    &plan.selection_mode,
+                    &planned_tags,
+                    &plan.planned_test_nodes,
+                    &coverage,
+                    &selected,
+                )
+            })
+        }) {
+                Ok(scope) => {
+                    let retained_plan = &scope.evidence["plan"];
+                    let e2e = &scope.evidence["e2e"];
+                    let binaries = &scope.evidence["integration_test_binaries"];
+                    let plan_name = retained_plan["name"].as_str().unwrap_or("unknown");
+                    let selected = e2e["selected_count"].as_u64().unwrap_or(0);
+                    let enabled_not_selected =
+                        e2e["enabled_not_selected_count"].as_u64().unwrap_or(0);
+                    println!(
+                        "Coverage: plan {} selected {} outer nodes; E2E selected {selected} of {} selected-or-enabled cells; \
+                         {enabled_not_selected} enabled cells were not selected; integration \
+                         binaries CI-registered {} of {} ({} reason-recorded, {} none-recorded).",
+                        plan_name,
+                        retained_plan["outer_node_count"],
+                        selected + enabled_not_selected,
+                        binaries["ci_registered_count"],
+                        binaries["present_count"],
+                        binaries["reason_recorded_count"],
+                        binaries["none_recorded_count"],
+                    );
+                    println!("Coverage artifact: {}", scope.evidence["artifact"]["path"]);
+                    Some(scope)
+                }
+                Err(error) => {
+                    eprintln!(
+                        "validate: ERROR: cannot retain complete coverage evidence: {error}; \
+                         refusing a full receipt"
+                    );
+                    exit_code = 1;
+                    None
+                }
+            }
+    } else {
+        None
+    };
+    let coverage = retained_coverage
+        .as_ref()
+        .map(|retained| retained.evidence.clone())
+        .unwrap_or(coverage);
     // `--only` deliberately drops build dependencies, so a fast 127 there is
     // useful evidence of an absent prerequisite. It is still a red result and
     // only a possibility: exit 127 can also mean a missing host tool or typo.

@@ -6,6 +6,7 @@ from __future__ import annotations
 import subprocess
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 
@@ -46,6 +47,14 @@ class RegistrationAuditTest(unittest.TestCase):
             check=False,
         )
 
+    def audit_json(self) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["python3", str(SCRIPT), "--root", str(self.root), "--json"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
     def test_none_recorded_is_a_distinct_unknown_not_a_pass(self) -> None:
         result = self.audit()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -55,6 +64,17 @@ class RegistrationAuditTest(unittest.TestCase):
         )
         self.assertIn("ACCOUNTED-WITH-UNKNOWN", result.stdout)
         self.assertNotIn("PASS", result.stdout)
+
+    def test_json_names_every_member_of_the_partition(self) -> None:
+        result = self.audit_json()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        evidence = json.loads(result.stdout)
+        self.assertEqual(evidence["schema"], 1)
+        self.assertEqual(evidence["present"], ["registered", "unknown"])
+        self.assertEqual(evidence["ci_registered"], ["registered"])
+        self.assertEqual(evidence["reason_recorded"], [])
+        self.assertEqual(evidence["none_recorded"], ["unknown"])
+        self.assertEqual(evidence["undeclared"], [])
 
     def test_new_tracked_top_level_binary_is_refused_and_named(self) -> None:
         probe = self.root / "hermit-cli/tests/zz_unregistered_probe.rs"

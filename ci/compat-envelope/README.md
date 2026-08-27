@@ -56,6 +56,17 @@ The path is deliberately direct:
 5. The checked-in table and cell identities must still equal what the manifest
    and expected plan derive. Normal validation changes no tracked scorecard
    file.
+6. A top-level full run retains `ignored/validate/artifacts/<run-id>/coverage.json`.
+   It names the exact plan and outer nodes, every selected E2E cell, every
+   enabled-but-unselected E2E cell with its recorded reason and observed
+   pass/fail counts, and the complete integration-test-binary registration
+   partition. The ledger row carries the same counts and binds the artifact by
+   SHA-256.
+
+`./scripts/validate.rs --show-plan` lists outer DAG nodes only. It does not list
+the Rust test IDs or E2E cells inside those nodes; `coverage.json` records the
+E2E population after a full run, while exact per-plan Rust test-ID enumeration
+remains unavailable.
 
 `SCORECARD.md` reports the current regression-cell count. Explicit custom
 commands remain required validation checks even though they are outside this

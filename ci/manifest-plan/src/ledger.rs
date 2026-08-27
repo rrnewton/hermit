@@ -50,11 +50,11 @@ pub struct HistoryRow {
     /// truncate a run after only passing gates; it is not a product failure.
     #[serde(default)]
     pub exit_code: Option<i32>,
-    /// Tests EXECUTED per the run's own test-runner banners. `None` = unknown (no
-    /// banner in the log), distinct from `Some(0)` = a demonstrably inert green
-    /// (a `--features`-gated build that compiled the tests out). A green carries
-    /// this so a reader — and the landing predicate — can tell a real pass from a
-    /// no-result wearing a success badge.
+    /// Tests EXECUTED per the run's structured producer records. `None` =
+    /// unknown (no usable record), distinct from `Some(0)` = a demonstrably
+    /// inert green (a `--features`-gated build that compiled the tests out). A
+    /// green carries this so a reader — and the landing predicate — can tell a
+    /// real pass from a no-result wearing a success badge.
     #[serde(default)]
     pub executed_tests: Option<i64>,
     /// Tests FILTERED OUT by the run's selection. `Some(0)` alongside
@@ -63,7 +63,7 @@ pub struct HistoryRow {
     #[serde(default)]
     pub filtered_tests: Option<i64>,
     /// Per-DAG-node test-coverage obligation outcome, written by the producer
-    /// (Hermit's Rust driver) from the run's own per-node banners/terminal lines. Carries
+    /// (Hermit's Rust driver) from structured per-node counts and terminal outcomes. Carries
     /// the CONDITION with the value (Proxy Binding): the NAMES of any inert or
     /// absent nodes travel in the receipt, so the landing predicate decides from
     /// receipt fields alone and never re-reads a log. `None` on a pre-coverage
@@ -123,11 +123,11 @@ pub struct HistoryRow {
     pub extra: BTreeMap<String, Value>,
 }
 
-/// Per-DAG-node test-coverage obligation outcome. The producer computes this from
-/// the run's per-node `[node] test result:` banners (executed/filtered sums, and
-/// whether the node emitted any banner) and `[node] ✓ PASS/✗ FAIL` terminal lines
-/// (which nodes actually RAN), crossed against the PLANNED set of `test.*` DAG
-/// nodes in the lane manifests. The obligation is SATISFIED iff
+/// Per-DAG-node test-coverage obligation outcome. Current producers compute this
+/// from dagrun's structured per-step test-count files and terminal outcomes,
+/// crossed against the PLANNED set of `test.*` DAG nodes in the lane manifests.
+/// Historical rows were reconstructed from human-readable banners. The
+/// obligation is SATISFIED iff
 /// `planned_test_nodes > 0` and both failure lists were reported and empty.
 /// This is the per-node replacement for the blunt aggregate `filtered_tests == 0`
 /// predicate, which could not distinguish a full run's legitimate cross-shard
@@ -139,13 +139,12 @@ pub struct CoverageRow {
     /// never treated as a satisfied obligation.
     #[serde(default)]
     pub planned_test_nodes: u64,
-    /// Planned test nodes that actually executed tests (ran, and — where they emit
-    /// libtest banners — with a positive passed-sum). Diagnostic.
+    /// Planned test nodes that supplied a positive structured executed-test
+    /// count. Diagnostic.
     #[serde(default)]
     pub executed_test_nodes: u64,
-    /// NAMES of planned test nodes that RAN and emitted libtest banner(s) whose
-    /// passed-sum was 0 — an inert green (every crate filtered-to-empty or
-    /// compiled-out). A banner-less node (legit shell/e2e) is NOT listed here.
+    /// NAMES of planned test nodes that supplied a structured zero executed-test
+    /// count — an inert green (every crate filtered-to-empty or compiled-out).
     ///
     /// `None` = THE PRODUCER DID NOT REPORT THIS LIST, which is not the same as
     /// reporting an empty one. It must never satisfy the obligation: an absent
@@ -157,8 +156,8 @@ pub struct CoverageRow {
     /// this input, with Rust the permissive one.
     #[serde(default)]
     pub zero_executed_nodes: Option<Vec<String>>,
-    /// NAMES of planned test nodes that produced NO terminal PASS/FAIL line at all
-    /// — never ran / skipped / absent from the run.
+    /// NAMES of planned test nodes that produced no usable structured count —
+    /// never ran, were aborted, or ran without the required producer record.
     ///
     /// `None` = not reported; see [`Self::zero_executed_nodes`]. Refused, never
     /// treated as "no absent nodes".
