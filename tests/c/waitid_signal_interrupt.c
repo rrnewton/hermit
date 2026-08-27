@@ -33,7 +33,7 @@ static void on_signal(int signum) {
   handler_ran = 1;
 }
 
-static int signal_interrupt(void) {
+static int signal_interrupt(int use_wait4) {
   struct sigaction action;
   memset(&action, 0, sizeof action);
   action.sa_handler = on_signal;
@@ -59,25 +59,25 @@ static int signal_interrupt(void) {
 
   siginfo_t info;
   memset(&info, 0, sizeof info);
+  int status = 0;
   alarm(1);
-  int rc = waitid(P_PID, child, &info, WEXITED);
+  int rc = use_wait4 ? waitpid(child, &status, 0)
+                     : waitid(P_PID, child, &info, WEXITED);
   int saved_errno = errno;
   alarm(0);
 
-  printf(
-      "waitid-signal-interrupt rc=%d errno=%d handler=%d\n",
-      rc,
-      rc < 0 ? saved_errno : 0,
-      (int)handler_ran);
+  printf(use_wait4 ? "wait4-signal-interrupt rc=%d errno=%d handler=%d\n"
+                   : "waitid-signal-interrupt rc=%d errno=%d handler=%d\n",
+         rc, rc < 0 ? saved_errno : 0, (int)handler_ran);
 
-  int status;
   kill(child, SIGKILL);
   waitpid(child, &status, 0);
-  printf("waitid-signal-interrupt-done\n");
+  printf(use_wait4 ? "wait4-signal-interrupt-done\n"
+                   : "waitid-signal-interrupt-done\n");
   return 0;
 }
 
-static int child_ready_wins(void) {
+static int child_ready_wins(int use_wait4) {
   struct sigaction action;
   memset(&action, 0, sizeof action);
   action.sa_handler = on_signal;
@@ -106,33 +106,38 @@ static int child_ready_wins(void) {
 
   siginfo_t info;
   memset(&info, 0, sizeof info);
+  int status = 0;
   errno = 0;
-  int rc = waitid(P_PID, child, &info, WEXITED);
+  int rc = use_wait4 ? waitpid(child, &status, 0)
+                     : waitid(P_PID, child, &info, WEXITED);
   int saved_errno = errno;
 
-  printf(
-      "waitid-ready-wins rc=%d errno=%d handler=%d pid-match=%d code=%d status=%d\n",
-      rc,
-      rc < 0 ? saved_errno : 0,
-      (int)handler_ran,
-      info.si_pid == child,
-      info.si_code,
-      info.si_status);
+  if (use_wait4) {
+    printf(
+        "wait4-ready-wins rc-ok=%d errno=%d handler=%d pid-match=%d exited=%d status=%d\n",
+        rc >= 0, rc < 0 ? saved_errno : 0, (int)handler_ran, rc == child,
+        WIFEXITED(status), WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+  } else {
+    printf(
+        "waitid-ready-wins rc=%d errno=%d handler=%d pid-match=%d code=%d status=%d\n",
+        rc, rc < 0 ? saved_errno : 0, (int)handler_ran,
+        info.si_pid == child, info.si_code, info.si_status);
+  }
 
-  if (rc != 0) {
+  int correct = use_wait4
+                    ? rc == child && WIFEXITED(status) && WEXITSTATUS(status) == 23
+                    : rc == 0 && info.si_pid == child &&
+                          info.si_code == CLD_EXITED && info.si_status == 23;
+  if (!correct) {
     // The rejected implementation reaches this path: it observes SIGCHLD and
     // returns EINTR without first polling the now-ready child status.
     waitpid(child, NULL, 0);
     return 2;
   }
-  if (info.si_pid != child || info.si_code != CLD_EXITED ||
-      info.si_status != 23) {
-    return 3;
-  }
   return 0;
 }
 
-static int signal_restart(void) {
+static int signal_restart(int use_wait4) {
   struct sigaction action;
   memset(&action, 0, sizeof action);
   action.sa_handler = on_signal;
@@ -155,32 +160,40 @@ static int signal_restart(void) {
 
   siginfo_t info;
   memset(&info, 0, sizeof info);
+  int status = 0;
   alarm(1);
-  int rc = waitid(P_PID, child, &info, WEXITED);
+  int rc = use_wait4 ? waitpid(child, &status, 0)
+                     : waitid(P_PID, child, &info, WEXITED);
   int saved_errno = errno;
   alarm(0);
-  printf(
-      "waitid-signal-restart rc=%d errno=%d handler=%d pid-match=%d code=%d status=%d\n",
-      rc,
-      rc < 0 ? saved_errno : 0,
-      (int)handler_ran,
-      info.si_pid == child,
-      info.si_code,
-      info.si_status);
+  if (use_wait4) {
+    printf(
+        "wait4-signal-restart rc-ok=%d errno=%d handler=%d pid-match=%d exited=%d status=%d\n",
+        rc >= 0, rc < 0 ? saved_errno : 0, (int)handler_ran, rc == child,
+        WIFEXITED(status), WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+  } else {
+    printf(
+        "waitid-signal-restart rc=%d errno=%d handler=%d pid-match=%d code=%d status=%d\n",
+        rc, rc < 0 ? saved_errno : 0, (int)handler_ran,
+        info.si_pid == child, info.si_code, info.si_status);
+  }
 
-  if (rc != 0) {
+  int correct = use_wait4
+                    ? rc == child && WIFEXITED(status) && WEXITSTATUS(status) == 17
+                    : rc == 0 && info.si_pid == child &&
+                          info.si_code == CLD_EXITED && info.si_status == 17;
+  if (!correct) {
     kill(child, SIGKILL);
     waitpid(child, NULL, 0);
     return 2;
   }
-  if (!handler_ran || info.si_pid != child || info.si_code != CLD_EXITED ||
-      info.si_status != 17) {
+  if (!handler_ran) {
     return 3;
   }
   return 0;
 }
 
-static int live_sibling_signal(int mode) {
+static int live_sibling_signal(int mode, int require_pending_signals) {
   struct sigaction action;
   memset(&action, 0, sizeof action);
   action.sa_handler = on_signal;
@@ -331,7 +344,9 @@ static int live_sibling_signal(int mode) {
     return 2;
   }
   if (mode == 3) {
-    return signals_pending && rc == target && WIFEXITED(wait_status) &&
+    int pending_matches = require_pending_signals ? signals_pending
+                                                  : !signals_pending;
+    return pending_matches && rc == target && WIFEXITED(wait_status) &&
                    WEXITSTATUS(wait_status) == 29
                ? 0
                : 3;
@@ -412,29 +427,42 @@ static int live_sibling_thread_signal(void) {
 
 int main(int argc, char **argv) {
   if (argc == 1) {
-    return signal_interrupt();
+    return signal_interrupt(0);
   }
   if (argc == 2 && strcmp(argv[1], "--child-ready-wins") == 0) {
-    return child_ready_wins();
+    return child_ready_wins(0);
   }
   if (argc == 2 && strcmp(argv[1], "--signal-restart") == 0) {
-    return signal_restart();
+    return signal_restart(0);
+  }
+  if (argc == 2 && strcmp(argv[1], "--wait4-signal-interrupt") == 0) {
+    return signal_interrupt(1);
+  }
+  if (argc == 2 && strcmp(argv[1], "--wait4-child-ready-wins") == 0) {
+    return child_ready_wins(1);
+  }
+  if (argc == 2 && strcmp(argv[1], "--wait4-signal-restart") == 0) {
+    return signal_restart(1);
   }
   if (argc == 2 && strcmp(argv[1], "--live-sibling-signal") == 0) {
-    return live_sibling_signal(0);
+    return live_sibling_signal(0, 1);
   }
   if (argc == 2 && strcmp(argv[1], "--live-sibling-signal-restart") == 0) {
-    return live_sibling_signal(1);
+    return live_sibling_signal(1, 1);
   }
   if (argc == 2 && strcmp(argv[1], "--live-sibling-signal-blocked") == 0) {
-    return live_sibling_signal(2);
+    return live_sibling_signal(2, 1);
   }
   if (argc == 2 && strcmp(argv[1], "--live-sibling-thread-signal") == 0) {
     return live_sibling_thread_signal();
   }
   if (argc == 2 && strcmp(argv[1], "--wait4-live-sibling-signal-blocked") == 0) {
-    return live_sibling_signal(3);
+    return live_sibling_signal(3, 1);
   }
-  fprintf(stderr, "usage: %s [--child-ready-wins|--signal-restart|--live-sibling-signal|--live-sibling-signal-restart|--live-sibling-signal-blocked|--live-sibling-thread-signal|--wait4-live-sibling-signal-blocked]\n", argv[0]);
+  if (argc == 3 && strcmp(argv[1], "--wait4-live-sibling-signal-blocked") == 0 &&
+      strcmp(argv[2], "--dbt") == 0) {
+    return live_sibling_signal(3, 0);
+  }
+  fprintf(stderr, "usage: %s [--child-ready-wins|--signal-restart|--wait4-signal-interrupt|--wait4-child-ready-wins|--wait4-signal-restart|--live-sibling-signal|--live-sibling-signal-restart|--live-sibling-signal-blocked|--live-sibling-thread-signal|--wait4-live-sibling-signal-blocked]\n", argv[0]);
   return 64;
 }
