@@ -43,7 +43,12 @@
 //! a test id is not one cell (measured: 237 distinct portable ids expand to 304
 //! required cells, median 1, max 3).
 //!
-//! **But `plan` does not fail closed on an unmatched id, and this driver must.**
+//! **`plan` now refuses an id that is in no manifest, but this driver still must
+//! check, for a different reason.** This probe asks `plan` for the WHOLE LANE and
+//! never passes the requested ids to it, so `plan`'s unknown-id guard is never
+//! consulted here. An id that exists but selects no cell in this lane is a correct,
+//! empty answer to `plan` and still has to be UNSELECTED for a bisection. The two
+//! checks answer different questions and this one does not become redundant.
 //! Measured three times, `rc` captured on its own line each time:
 //!
 //! ```text
@@ -254,9 +259,11 @@ fn main() {
              3 if any id was not measured (UNSELECTED / MISSING / ERROR); 2 if the\n\
              probe itself could not run.\n\
              \n\
-             An id that matches no cell is UNSELECTED and exits 3. It is NEVER a pass:\n\
-             `test-harness plan` returns 0 for an unmatched id, so this driver supplies\n\
-             the guard that plan does not have."
+             An id that matches no cell is UNSELECTED and exits 3. It is NEVER a pass.\n\
+             `test-harness plan` refuses an id that is in no manifest, but this probe\n\
+             asks for the whole lane WITHOUT the ids, so that guard never sees them --\n\
+             and a real id with no cells in this lane is a legitimate empty answer to\n\
+             plan while still being unusable here."
         );
         std::process::exit(RC_UNUSABLE);
     }
@@ -299,8 +306,10 @@ fn main() {
         }
         eprintln!(
             "bisect-probe: REFUSED: {} of {} requested id(s) matched no cell: {}. \
-             An unmatched id is NOT a pass -- `test-harness plan` exits 0 for one, which is \
-             why this driver checks. Nothing was run; fix the list and re-probe.",
+             An unmatched id is NOT a pass. `test-harness plan` refuses an id that is in no \
+             manifest, but this probe requests the whole lane without the ids, so that guard \
+             never sees them -- and a real id with no cells here is legitimately empty to plan \
+             yet unusable for a bisection. Nothing was run; fix the list and re-probe.",
             unselected.len(),
             ids.len(),
             unselected.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
