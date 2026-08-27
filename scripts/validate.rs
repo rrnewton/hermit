@@ -4764,8 +4764,11 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
                 matches.len()
             ));
         };
+        // The outer validate publishes these rows after all attempts finish.
+        // Suppress pressure-test's standalone publisher here so one physical
+        // cell run cannot appear twice under two producer names.
         let command = format!(
-            "./ci/compat-envelope/pressure-test.rs run --results \"$E2E_RESULT_ROOT\" \
+            "env -u DEV_HERMIT_PARENT ./ci/compat-envelope/pressure-test.rs run --results \"$E2E_RESULT_ROOT\" \
              --test {} --mode {} --backend {} --repetitions 1 \
              --run-id-prefix \"$E2E_RUN_ID-pid$$\" --jobs 1",
             validate_plan::shell_quote(test),
@@ -11385,6 +11388,7 @@ fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
         );
     }
     for token in [
+        "env -u DEV_HERMIT_PARENT ./ci/compat-envelope/pressure-test.rs run",
         "--test applications/timed-progress-bar",
         "--mode verify",
         "--backend ptrace",
