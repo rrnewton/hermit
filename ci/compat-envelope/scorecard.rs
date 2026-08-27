@@ -5398,6 +5398,91 @@ fn self_test() -> Result<(), String> {
     if attempt.shell_command != literal_shell_command(&attempt.cwd, &attempt.env, &attempt.argv) {
         return Err("path normalisation desynchronised a nested attempt's shell_command".into());
     }
+    // ── divergence-without-a-comparison bracket ──────────────────────────────
+    //
+    // ⚠️ THIS GUARD HAD NO BRACKET AND NOTHING FAILED WHEN IT WAS DISABLED.
+    // A reviewer disabled it outright with `if false && ...` and this self-test
+    // stayed green across all eighteen brackets, so nothing pinned the behaviour
+    // in either direction. That matters more here than usual: the guard's own
+    // thesis is that two different facts must not fold into one, and a guard
+    // nothing pins can silently stop working, after which they fold again -- the
+    // failure it was written to prevent, arriving by another route.
+    //
+    // Both directions, because a guard that fires on everything is as wrong as
+    // one that fires on nothing.
+    {
+        let mut refused = TrackedCells {
+            schema: SCHEMA,
+            projection: None,
+            cells: vec![bare_cell(&id)],
+        };
+        // A row asserting a divergence with NO verification report at all: the
+        // comparison never happened, so there is nothing to have located.
+        let mut no_report = pressure_row("determinism-failure", Some(10), Some(20));
+        no_report.verification = None;
+        // ⚠️ EXPECTS AN Err. When every offered row is untrustworthy the fold
+        // reports that as an error rather than an empty success, so the bracket
+        // asserts on the message. Asserting Ok here would have quietly passed on
+        // the wrong path.
+        let refused = apply_pressure_summary(
+            &mut refused,
+            &pressure_summary("sha-nc", "tree-nc", vec![no_report]),
+            "sha-nc",
+            "tree-nc",
+            &depth_fixture,
+        );
+        match refused {
+            Ok(outcome) => {
+                return Err(format!(
+                    "a divergence-claiming row with no verification report was ADMITTED \
+                     ({} row(s)); it asserts a divergence nothing measured",
+                    outcome.rows
+                ));
+            }
+            Err(why) if why.contains("no verification report at all") => {}
+            Err(why) => {
+                return Err(format!(
+                    "the row was refused, but not for the reason this guard exists for: {why}"
+                ));
+            }
+        }
+
+        // THE OTHER DIRECTION. An otherwise identical row that DOES carry a
+        // verification report must still fold, or the guard has quietly become a
+        // refusal of every divergence.
+        let mut admitted = TrackedCells {
+            schema: SCHEMA,
+            projection: None,
+            cells: vec![bare_cell(&id)],
+        };
+        let admitted_fold = apply_pressure_summary(
+            &mut admitted,
+            &pressure_summary(
+                "sha-nc",
+                "tree-nc",
+                vec![pressure_row("determinism-failure", Some(10), Some(20))],
+            ),
+            "sha-nc",
+            "tree-nc",
+            &depth_fixture,
+        )
+        .map_err(|e| format!("no-comparison bracket, admitted arm, failed: {e}"))?;
+        if admitted_fold.rows != 1 {
+            return Err(format!(
+                "the guard refused a divergence that HAS a verification report; \
+                 rows={} skipped={:?}",
+                admitted_fold.rows, admitted_fold.skipped
+            ));
+        }
+        refresh_measurement(&mut admitted);
+        if admitted.cells[0].measurement != MeasurementState::Diverged {
+            return Err(format!(
+                "a located divergence with a report folded to {:?}, not Diverged",
+                admitted.cells[0].measurement
+            ));
+        }
+    }
+
     // Idempotence: regenerating an already-normalised file must be a no-op, or
     // `check_tracked` would report drift on every second run.
     let once = fixture.clone();
@@ -5409,7 +5494,7 @@ fn self_test() -> Result<(), String> {
     }
 
     println!(
-        "compatibility scorecard self-test: provenance, distinct-evidence, result, selected-chaos, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, source-identity, writer-boundary, projection, path-independence, and infrastructure-refusal brackets pass"
+        "compatibility scorecard self-test: provenance, distinct-evidence, result, selected-chaos, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, source-identity, writer-boundary, projection, path-independence, infrastructure-refusal, and divergence-without-a-comparison brackets pass"
     );
     Ok(())
 }
