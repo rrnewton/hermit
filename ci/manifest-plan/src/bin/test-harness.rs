@@ -11,6 +11,8 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::thread;
 
+use hermit_manifest_plan::runner::CellResult;
+use hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL;
 use hermit_manifest_plan::runner::ManifestSet;
 use hermit_manifest_plan::runner::Population;
 use hermit_manifest_plan::runner::RunContext;
@@ -18,10 +20,9 @@ use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 use hermit_manifest_plan::runner::Selection;
 use hermit_manifest_plan::runner::append_result;
 use hermit_manifest_plan::runner::host_inapplicable_result;
-use hermit_manifest_plan::runner::infrastructure_error_result;
 use hermit_manifest_plan::runner::prepare_result_path;
 use hermit_manifest_plan::runner::requires_capability;
-use hermit_manifest_plan::runner::run_cell;
+use hermit_manifest_plan::runner::run_cell_with_retry;
 use hermit_manifest_plan::runner::write_junit;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -1330,105 +1331,151 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             if let Some((_, reason)) =
                 host_inapplicable_reason(&cell.test.requires, &host_capabilities)
             {
-                host_inapplicable_result(&context, cell, reason)
+                vec![host_inapplicable_result(&context, cell, reason)]
             } else {
-                match run_cell(&context, cell) {
-                    Ok(result) => result,
-                    Err(error) => infrastructure_error_result(&context, cell, error),
-                }
+                // Retry lives HERE, one cell at a time, so a retry cannot reach
+                // any other cell. See `run_cell_with_retry`. Every attempt comes
+                // back, oldest first; the consumer below publishes all of them
+                // and takes the verdict from the last.
+                run_cell_with_retry(&context, cell)
             }
         },
-        |index, mut result| {
-            // Publish before announcing the outcome. After a visible PASS line,
-            // the complete typed row is already present even if the containing
-            // bucket is killed before its JUnit/summary epilogue.
-            if let Err(error) = append_result(&results_path, &result) {
-                eprintln!(
-                    "ERROR {} ({}/{}): completed cell result could not be published: {error}",
-                    result.test,
-                    result.mode,
-                    result.backend.as_deref().unwrap_or("native")
-                );
-                result.outcome = "ERROR".into();
-                result.error_kind = Some("result-publication".into());
-                result.reason = Some(format!(
-                    "completed cell result could not be published: {error}"
-                ));
-                failed = true;
-            } else {
-                if result.outcome == "ERROR" {
+        |index, cell_attempts: Vec<CellResult>| {
+            // ⚠️ EVERY ATTEMPT IS PUBLISHED AND ANNOUNCED; ONLY THE LAST ONE
+            // CARRIES THE VERDICT.
+            //
+            // A cell that failed and then passed still failed. Publishing only
+            // the terminal attempt would make the run green AND erase the single
+            // observation that says the cell is flaky rather than healthy, which
+            // is the shape this project exists to eliminate. So attempt 1's row
+            // is appended and its line printed exactly as if nothing followed it,
+            // and the retry cannot quietly absorb it.
+            //
+            // The verdict comes from the last attempt because that is what the
+            // cell's state actually is now. `indexed_results` feeds JUnit and the
+            // summary counts, so a retried-and-passed cell counts once, as a
+            // pass, with its failure still on disk in results.jsonl.
+            let terminal = cell_attempts.len().saturating_sub(1);
+            for (ordinal, mut result) in cell_attempts.into_iter().enumerate() {
+                let is_terminal = ordinal == terminal;
+                // Publish before announcing the outcome. After a visible PASS line,
+                // the complete typed row is already present even if the containing
+                // bucket is killed before its JUnit/summary epilogue.
+                if let Err(error) = append_result(&results_path, &result) {
                     eprintln!(
-                        "ERROR {} ({}/{}): {}",
+                        "ERROR {} ({}/{}): completed cell result could not be published: {error}",
+                        result.test,
+                        result.mode,
+                        result.backend.as_deref().unwrap_or("native")
+                    );
+                    result.outcome = "ERROR".into();
+                    result.error_kind = Some("result-publication".into());
+                    result.reason = Some(format!(
+                        "completed cell result could not be published: {error}"
+                    ));
+                    failed = true;
+                } else {
+                    if result.outcome == "ERROR" {
+                        eprintln!(
+                            "ERROR {} ({}/{}): {}",
+                            result.test,
+                            result.mode,
+                            result.backend.as_deref().unwrap_or("native"),
+                            result.reason.as_deref().unwrap_or("infrastructure error")
+                        );
+                    }
+                    // A FAILURE MUST SAY ENOUGH TO BE CLASSIFIED, NOT JUST COUNTED.
+                    //
+                    // This line was `FAIL <cell> (verify/ptrace)` and nothing else,
+                    // while `CellResult` already carried the divergence coordinates
+                    // and the reason. So a bucket failure could not be sorted into a
+                    // divergence class -- let alone located -- without re-running the
+                    // cell, and this class is INTERMITTENT: the c-programs bucket was
+                    // measured at 3 of 6 runs on the modern harness, so the
+                    // re-roll is not reliably available. Every observation was
+                    // costing a reproduction that might not come.
+                    //
+                    // PASS lines are deliberately untouched: they are the overwhelming
+                    // majority and carry nothing worth saying.
+                    let located = if result.outcome == "PASS" {
+                        String::new()
+                    } else if result.outcome == "HOST-INAPPLICABLE" {
+                        format!(
+                            " {}",
+                            result.reason.as_deref().unwrap_or("host-inapplicable")
+                        )
+                    } else {
+                        let coords = [
+                            ("turn", result.first_divergent_scheduler_turn),
+                            ("vns", result.first_divergent_virtual_nanoseconds),
+                            ("rec", result.first_divergent_record),
+                            ("sys", result.first_divergent_syscall),
+                        ]
+                        .iter()
+                        .filter_map(|(k, v)| v.map(|v| format!("{k}={v}")))
+                        .collect::<Vec<_>>();
+                        // Absent coordinates are OMITTED rather than printed as
+                        // null: a cell that failed without ever reaching comparison
+                        // has no location, and an empty bracket would suggest the
+                        // lookup failed instead of that there is nothing to locate.
+                        let mut suffix = String::new();
+                        if !coords.is_empty() {
+                            suffix.push_str(&format!(" [{}]", coords.join(" ")));
+                        }
+                        if let Some(reason) = result.reason.as_deref() {
+                            suffix.push_str(&format!(" {reason}"));
+                        }
+                        // POINT AT THE EVIDENCE THAT ALREADY EXISTS.
+                        //
+                        // The per-cell artifacts are retained -- verify report,
+                        // captures, the whole directory -- and the bucket log was
+                        // the only thing standing between an investigator and them.
+                        // 28 failures across 305 runs were investigable all along
+                        // and were not investigated, because a FAIL line named the
+                        // cell and no path. The coordinates above say WHERE the
+                        // divergence is; this says WHAT ELSE IS AVAILABLE.
+                        suffix.push_str(&format!("\n    evidence: {}", result.artifact_dir));
+                        suffix
+                    };
+                    // A superseded attempt says so. Without this a reader sees
+                    // FAIL then PASS for one cell and cannot tell a retry from
+                    // two different cells scrolling past.
+                    //
+                    // ⚠️ IT GOES BEFORE `located`, NOT AFTER. `located` ENDS WITH
+                    // A NEWLINE AND AN EVIDENCE PATH, so appending put this note
+                    // on the continuation line, flush against a directory name,
+                    // where it read as part of the path and was invisible to
+                    // anyone grepping the outcome lines. Measured before the
+                    // move: "evidence: /...-verify-ptrace [attempt 1 of at most
+                    // 2; retrying this cell only]".
+                    let retry_note = if is_terminal {
+                        String::new()
+                    } else {
+                        format!(
+                            " [attempt {} of at most {}; retrying this cell only]",
+                            result.attempt, MAX_ATTEMPTS_PER_CELL
+                        )
+                    };
+                    println!(
+                        "{} {} ({}/{}){}{}",
+                        result.outcome,
                         result.test,
                         result.mode,
                         result.backend.as_deref().unwrap_or("native"),
-                        result.reason.as_deref().unwrap_or("infrastructure error")
+                        retry_note,
+                        located
                     );
+                    // Only the terminal attempt decides the run. A failure that a
+                    // retry superseded stays on disk and on screen, but does not
+                    // fail the bucket -- that is what retrying is for.
+                    if is_terminal {
+                        failed |= matches!(result.outcome.as_str(), "FAIL" | "ERROR");
+                    }
                 }
-                // A FAILURE MUST SAY ENOUGH TO BE CLASSIFIED, NOT JUST COUNTED.
-                //
-                // This line was `FAIL <cell> (verify/ptrace)` and nothing else,
-                // while `CellResult` already carried the divergence coordinates
-                // and the reason. So a bucket failure could not be sorted into a
-                // divergence class -- let alone located -- without re-running the
-                // cell, and this class is INTERMITTENT: the c-programs bucket was
-                // measured at 3 of 6 runs on the modern harness, so the
-                // re-roll is not reliably available. Every observation was
-                // costing a reproduction that might not come.
-                //
-                // PASS lines are deliberately untouched: they are the overwhelming
-                // majority and carry nothing worth saying.
-                let located = if result.outcome == "PASS" {
-                    String::new()
-                } else if result.outcome == "HOST-INAPPLICABLE" {
-                    format!(
-                        " {}",
-                        result.reason.as_deref().unwrap_or("host-inapplicable")
-                    )
-                } else {
-                    let coords = [
-                        ("turn", result.first_divergent_scheduler_turn),
-                        ("vns", result.first_divergent_virtual_nanoseconds),
-                        ("rec", result.first_divergent_record),
-                        ("sys", result.first_divergent_syscall),
-                    ]
-                    .iter()
-                    .filter_map(|(k, v)| v.map(|v| format!("{k}={v}")))
-                    .collect::<Vec<_>>();
-                    // Absent coordinates are OMITTED rather than printed as
-                    // null: a cell that failed without ever reaching comparison
-                    // has no location, and an empty bracket would suggest the
-                    // lookup failed instead of that there is nothing to locate.
-                    let mut suffix = String::new();
-                    if !coords.is_empty() {
-                        suffix.push_str(&format!(" [{}]", coords.join(" ")));
-                    }
-                    if let Some(reason) = result.reason.as_deref() {
-                        suffix.push_str(&format!(" {reason}"));
-                    }
-                    // POINT AT THE EVIDENCE THAT ALREADY EXISTS.
-                    //
-                    // The per-cell artifacts are retained -- verify report,
-                    // captures, the whole directory -- and the bucket log was
-                    // the only thing standing between an investigator and them.
-                    // 28 failures across 305 runs were investigable all along
-                    // and were not investigated, because a FAIL line named the
-                    // cell and no path. The coordinates above say WHERE the
-                    // divergence is; this says WHAT ELSE IS AVAILABLE.
-                    suffix.push_str(&format!("\n    evidence: {}", result.artifact_dir));
-                    suffix
-                };
-                println!(
-                    "{} {} ({}/{}){}",
-                    result.outcome,
-                    result.test,
-                    result.mode,
-                    result.backend.as_deref().unwrap_or("native"),
-                    located
-                );
-                failed |= matches!(result.outcome.as_str(), "FAIL" | "ERROR");
+                if is_terminal {
+                    indexed_results.push((index, result));
+                }
             }
-            indexed_results.push((index, result));
         },
     );
     if indexed_results.len() != expected {

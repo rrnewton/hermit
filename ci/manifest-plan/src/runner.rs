@@ -963,6 +963,7 @@ impl ScheduledWorkerCapacity {
     }
 }
 
+#[derive(Clone)]
 pub struct RunContext {
     pub root: PathBuf,
     pub hermit_bin: PathBuf,
@@ -984,6 +985,19 @@ pub struct RunContext {
 }
 
 impl RunContext {
+    /// A copy of this context whose results are labelled as the given attempt.
+    ///
+    /// `attempt` reaches both the published row and `cell_artifact_dir`, which
+    /// already gives anything past the first its own `-attempt-N` directory, so
+    /// two attempts at one cell neither overwrite each other's evidence nor
+    /// collide in the strict reader's reused-directory check.
+    pub fn with_attempt(&self, attempt: u64) -> Self {
+        Self {
+            attempt,
+            ..self.clone()
+        }
+    }
+
     pub fn from_env(root: PathBuf, prebuilt: bool) -> Result<Self, String> {
         let source_sha = git(&root, &["rev-parse", "HEAD"])?;
         let source_dirty =
@@ -1979,6 +1993,59 @@ fn cell_artifact_dir(context: &RunContext, cell: &SelectedCell) -> PathBuf {
         .join("runs")
         .join(&context.run_id)
         .join(slug)
+}
+
+/// A cell gets this many executions in total: the first plus one retry.
+///
+/// ⚠️ THE BUDGET IS PER CELL. Owner ruling 2026-08-26, and the reasoning is
+/// unchanged by moving the retry in here: a lane- or node-wide budget lets one
+/// permanently broken cell consume the retries other cells needed, so a cell's
+/// chance of recovering depends on which OTHER cells happened to fail beside
+/// it. Retrying one cell at a time makes that impossible by construction --
+/// `run_cell_with_retry` can only ever see the one cell it was handed.
+pub const MAX_ATTEMPTS_PER_CELL: u64 = 2;
+
+/// Run one cell, retrying it ALONE if it does not pass, and return every
+/// attempt oldest-first.
+///
+/// ⚠️ RETRYING ONE CELL MUST NOT RE-RUN ANY OTHER, WHICH IS THE WHOLE POINT.
+/// Owner directive 2026-08-27. Retry used to live in the validate DAG, whose
+/// smallest re-runnable unit is a whole category node: one failing cell in
+/// `c-programs` re-ran all 139, and the retry set deliberately widened further
+/// to include skipped and aborted peer NODES. Measured 2026-08-27, that node is
+/// 95.77s wall at --jobs 8 against 3.31s median for the one cell, so the
+/// re-run cost roughly 29x what the failure was worth.
+///
+/// Here the caller is already iterating cells, so the second execution is
+/// scoped to the failing cell by construction rather than by a filter anyone
+/// has to maintain.
+///
+/// ⚠️ EVERY ATTEMPT IS RETURNED, NEVER JUST THE LAST ONE. A cell that failed
+/// and then passed still failed, and that first observation is the only thing
+/// that distinguishes a flake from a cell that happens to be green today. The
+/// caller publishes each returned attempt as its own appended row, which is the
+/// shape `results.jsonl` already has -- `cell_artifact_dir` gives attempt 2 its
+/// own `-attempt-2` directory, so the retained evidence does not collide either.
+///
+/// EVERY NON-PASS IS ELIGIBLE, matching the ground the DAG already applied
+/// (owner directive 2026-08-26): this relocates the existing policy rather than
+/// narrowing it. `HOST-INAPPLICABLE` is excluded because it is not a failure --
+/// the host cannot run the cell, and running it again will not change that.
+pub fn run_cell_with_retry(context: &RunContext, cell: &SelectedCell) -> Vec<CellResult> {
+    let mut attempts = Vec::new();
+    for attempt in 1..=MAX_ATTEMPTS_PER_CELL {
+        let context = context.with_attempt(attempt);
+        let result = match run_cell(&context, cell) {
+            Ok(result) => result,
+            Err(error) => infrastructure_error_result(&context, cell, error),
+        };
+        let retryable = !matches!(result.outcome.as_str(), "PASS" | "HOST-INAPPLICABLE");
+        attempts.push(result);
+        if !retryable {
+            break;
+        }
+    }
+    attempts
 }
 
 pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult, String> {
@@ -3319,6 +3386,138 @@ mod tests {
             remaining_cell_time_at(deadline, started + Duration::from_secs(15)),
             Duration::ZERO
         );
+    }
+
+    /// Build a one-cell fixture whose guest runs `script`, plus a context
+    /// rooted in `dir`. Modelled on `repeated_invocations_share_one_outer_cell_deadline`
+    /// below, which is the existing way this crate drives a real `run_cell`.
+    ///
+    /// `naked` mode is used because it needs no hermit binary. ⚠️ ITS VERDICT IS
+    /// INVERTED RELATIVE TO EVERY OTHER MODE, which is easy to write a
+    /// wrong-but-green test against: naked exists to demonstrate that a guest is
+    /// nondeterministic, so it PASSES on two distinct outcomes and FAILS a
+    /// deterministic guest with "naked observed 1 distinct outcomes, need 2".
+    /// Both callers below rely on that, so read it before changing either script.
+    fn retry_fixture(dir: &Path, script: &str) -> (SelectedCell, RunContext) {
+        let mut test = recipe(true);
+        test.direct = Some(DirectCommand::Argv(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            script.into(),
+        ]));
+        let mut mode = test.modes.remove("verify").unwrap();
+        mode.runs = Some(2);
+        test.modes.insert("naked".into(), mode);
+        let cell = SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: test.id.clone(),
+                mode: "naked".into(),
+                backend: None,
+            },
+            test,
+            enabled: true,
+            timeout_seconds: 30,
+        };
+        let context = RunContext {
+            root: dir.to_path_buf(),
+            hermit_bin: dir.join("missing-hermit"),
+            result_root: dir.join("results"),
+            build_root: dir.join("build"),
+            run_id: "fixture".into(),
+            attempt: 1,
+            source_sha: "0".repeat(40),
+            binary_build_sha: None,
+            source_dirty: false,
+            prebuilt: false,
+            keep_logs: false,
+            run_verify_strict: false,
+            record_verify_strict: false,
+            scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
+            isolated_workdir: None,
+        };
+        (cell, context)
+    }
+
+    /// ⚠️ THE FAILING ATTEMPT MUST SURVIVE THE RETRY, NOT BE REPLACED BY IT.
+    ///
+    /// This is the owner's condition on moving retry into the framework: a
+    /// retry that erases the failure it retried buys a second sample and throws
+    /// away the only evidence that distinguishes a flake from a healthy cell.
+    /// So the contract asserted here is that BOTH attempts come back, in order.
+    ///
+    /// The distinct artifact directories are not cosmetic: the strict reader in
+    /// `ci/compat-envelope/pressure-test.rs` rejects a results file whose rows
+    /// reuse one, so two attempts sharing a directory would be unreadable
+    /// downstream rather than merely confusing.
+    #[test]
+    fn a_failing_cell_is_retried_alone_and_both_attempts_are_returned() {
+        let root =
+            std::env::temp_dir().join(format!("hermit-runner-retry-fail-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        // Deterministic on purpose: naked wants two distinct outcomes and
+        // this guest gives it one, so the cell genuinely fails the mode
+        // rather than failing to start.
+        let (cell, context) = retry_fixture(&root, "printf complete");
+        let attempts = run_cell_with_retry(&context, &cell);
+
+        assert_eq!(
+            attempts.len(),
+            MAX_ATTEMPTS_PER_CELL as usize,
+            "a cell that never passes must spend its whole per-cell allowance: {:?}",
+            attempts
+                .iter()
+                .map(|a| (a.attempt, &a.outcome))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(attempts[0].attempt, 1);
+        assert_eq!(attempts[1].attempt, 2);
+        assert!(
+            attempts.iter().all(|a| a.outcome != "PASS"),
+            "a deterministic guest cannot satisfy naked mode, so neither attempt may pass"
+        );
+        assert_ne!(
+            attempts[0].artifact_dir, attempts[1].artifact_dir,
+            "two attempts sharing an artifact directory are rejected by the strict reader"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A passing cell costs exactly one execution. Retrying on success would
+    /// double the run's work for no evidence, so the absence of a second
+    /// attempt is the property, not an implementation detail.
+    #[test]
+    fn a_passing_cell_is_not_retried() {
+        let root =
+            std::env::temp_dir().join(format!("hermit-runner-retry-pass-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        // A counter in the test's own directory, so the two runs differ BY
+        // CONSTRUCTION. A clock or a pid would differ almost always, and
+        // "almost always" in a test is a flake waiting for a fast host.
+        let counter = root.join("counter");
+        let script = format!(
+            "i=$(cat {c} 2>/dev/null || echo 0); i=$((i+1)); echo $i > {c}; echo $i",
+            c = counter.display()
+        );
+        let (cell, context) = retry_fixture(&root, &script);
+        let attempts = run_cell_with_retry(&context, &cell);
+
+        assert_eq!(
+            attempts.len(),
+            1,
+            "a passing cell must not be retried: {:?}",
+            attempts
+                .iter()
+                .map(|a| (a.attempt, &a.outcome, &a.error_kind, &a.reason))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(attempts[0].attempt, 1);
+        assert_eq!(attempts[0].outcome, "PASS");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
