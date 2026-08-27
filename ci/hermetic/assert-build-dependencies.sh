@@ -73,7 +73,8 @@ check_native_libraries() {
     local library
 
     if ! path_has_file "$include_path" libunwind.h \
-        || ! path_has_file "$library_path" libunwind.so; then
+        || ! path_has_file "$library_path" libunwind.so \
+        || ! path_has_file "$library_path" libunwind-ptrace.so; then
         missing+=(libunwind)
     fi
     if ! path_has_file "$include_path" elfutils/libdw.h \
@@ -153,6 +154,7 @@ self_test() {
         "$fixture/include/zlib.h" \
         "$fixture/include/openssl/ssl.h" \
         "$fixture/lib/libunwind.so" \
+        "$fixture/lib/libunwind-ptrace.so" \
         "$fixture/lib/libdw.so" \
         "$fixture/lib/libelf.so" \
         "$fixture/lib/libz.so" \
