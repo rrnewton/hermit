@@ -13,9 +13,41 @@ use sha2::Digest;
 use sha2::Sha256;
 
 const IDENTITY_KEYS: [&str; 5] = ["lane", "category", "test", "mode", "backend"];
+// Exact keys in a schema-7 compared verdict. Requiring both this length and
+// every member makes additions and omissions fail closed until the outer
+// ledger schema advances.
+const LEDGER_COMPARISON_KEYS: [&str; 16] = [
+    "strictness",
+    "display_name",
+    "compare_logs",
+    "compare_io_buffers",
+    "log_scope",
+    "record_envelope",
+    "virtualize_time",
+    "strip_lines",
+    "canonicalize_addresses",
+    "full_trace",
+    "exact_remainder",
+    "stripped_prefixes",
+    "canonicalizations",
+    "ignore_lines",
+    "skip_commit",
+    "skip_detlog",
+];
+const LEDGER_COMPARED_LOG_MESSAGE_KEYS: [&str; 2] = ["left", "right"];
+
+/// Outer ledger schema for rows carrying [`RetainedCellResults`].
+///
+/// Schema 6 contains two historical rows written before the current comparison
+/// fields existed. Schema 7 guarantees that every compared verdict carries the
+/// complete current comparison object; a missing or additional field is kept
+/// out of the compared-verdict projection instead of changing this shape under
+/// the same version.
+pub const CELL_RESULTS_LEDGER_SCHEMA_VERSION: i64 = 7;
 
 #[derive(Debug)]
 pub struct RetainedCellResults {
+    pub schema_version: i64,
     pub run_id: String,
     pub evidence: Value,
 }
@@ -96,15 +128,37 @@ fn identity(value: &Value) -> Result<Value, String> {
 }
 
 fn comparison_tier(report: &Value) -> Option<&'static str> {
-    let comparison = report.get("comparison")?;
-    let counts = report.get("compared_log_messages")?;
+    let comparison = report.get("comparison")?.as_object()?;
+    if comparison.len() != LEDGER_COMPARISON_KEYS.len()
+        || LEDGER_COMPARISON_KEYS
+            .iter()
+            .any(|key| !comparison.contains_key(*key))
+    {
+        return None;
+    }
+    let counts = report.get("compared_log_messages")?.as_object()?;
+    if counts.len() != LEDGER_COMPARED_LOG_MESSAGE_KEYS.len()
+        || LEDGER_COMPARED_LOG_MESSAGE_KEYS
+            .iter()
+            .any(|key| !counts.contains_key(*key))
+    {
+        return None;
+    }
     let canonical = comparison.get("strictness")?.as_str()? == "canonical"
+        && comparison.get("display_name")?.as_str()? == "BitwiseInfoV1"
         && comparison.get("compare_logs")?.as_bool()?
+        && comparison.get("compare_io_buffers")?.as_bool()?
         && comparison.get("log_scope")?.as_str()? == "info"
+        && comparison.get("record_envelope")?.as_str()? == "all_records_v1"
+        && comparison.get("virtualize_time")?.as_bool()?
         && !comparison.get("strip_lines")?.as_bool()?
         && comparison.get("canonicalize_addresses")?.as_bool()?
         && comparison.get("full_trace")?.as_bool()?
         && comparison.get("exact_remainder")?.as_bool()?
+        && comparison.get("stripped_prefixes")?
+            == &serde_json::json!(["real-wall-clock-prefix/v1"])
+        && comparison.get("canonicalizations")?
+            == &serde_json::json!(["host-address-to-first-appearance-ordinal/v1"])
         && !comparison.get("ignore_lines")?.as_bool()?
         && !comparison.get("skip_commit")?.as_bool()?
         && !comparison.get("skip_detlog")?.as_bool()?
@@ -246,7 +300,7 @@ pub fn expected_plan(repo_root: &Path) -> Result<Vec<Value>, String> {
 }
 
 /// Transform all result rows for one validate invocation into the closed
-/// schema-6 cell-verdict artifact and summary used by ci-hub.
+/// schema-7 cell-verdict artifact and summary used by ci-hub.
 pub fn retain(
     parent: &Path,
     result_root: &Path,
@@ -366,6 +420,7 @@ pub fn retain(
         .to_string_lossy()
         .into_owned();
     Ok(RetainedCellResults {
+        schema_version: CELL_RESULTS_LEDGER_SCHEMA_VERSION,
         run_id: run_id.clone(),
         evidence: serde_json::json!({
             "run_id": run_id,
@@ -407,14 +462,18 @@ mod tests {
             "bitwise_parity": matched,
             "comparison": {
                 "strictness": "canonical",
+                "display_name": "BitwiseInfoV1",
                 "compare_logs": true,
+                "compare_io_buffers": true,
                 "log_scope": log_scope,
+                "record_envelope": "all_records_v1",
+                "virtualize_time": true,
                 "strip_lines": false,
                 "canonicalize_addresses": true,
                 "full_trace": true,
                 "exact_remainder": true,
-                "stripped_prefixes": [],
-                "canonicalizations": ["bitwise-info-v1"],
+                "stripped_prefixes": ["real-wall-clock-prefix/v1"],
+                "canonicalizations": ["host-address-to-first-appearance-ordinal/v1"],
                 "ignore_lines": false,
                 "skip_commit": false,
                 "skip_detlog": false
@@ -422,6 +481,11 @@ mod tests {
             "compared_log_messages": {"left": 123, "right": if matched { 123 } else { 124 }}
         })
         .to_string()
+    }
+
+    fn replace_report(row: &mut Value, report: &Value) {
+        let raw = serde_json::to_string(report).unwrap();
+        row["attempts"][0] = attempt(&raw);
     }
 
     fn attempt(raw: &str) -> Value {
@@ -477,13 +541,14 @@ mod tests {
     }
 
     #[test]
-    fn retains_one_closed_schema6_population() {
+    fn retains_one_closed_schema7_population() {
         let root = fixture_root();
         let results = root.join("results");
         let commit = "1111111111111111111111111111111111111111";
         let row = result_row("validate-one", commit);
         write_result(&results, &row);
         let retained = retain(&root, &results, commit, &expected(&row)).unwrap();
+        assert_eq!(retained.schema_version, 7);
         assert_eq!(retained.run_id, "validate-one");
         assert_eq!(retained.evidence["selected_count"], 1);
         assert_eq!(retained.evidence["recorded_count"], 1);
@@ -495,10 +560,77 @@ mod tests {
             retained.evidence["cells"][0]["cell_verdict"]["state"],
             "compared-and-matched"
         );
+        let expected_comparison: Value =
+            serde_json::from_str::<Value>(&report("matched", "info")).unwrap()["comparison"]
+                .clone();
+        assert_eq!(
+            retained.evidence["cells"][0]["cell_verdict"]["comparison"],
+            expected_comparison
+        );
         let artifact = root.join(retained.evidence["artifact"]["path"].as_str().unwrap());
         let bytes = fs::read(&artifact).unwrap();
         assert_eq!(hex_digest(&bytes), retained.evidence["artifact"]["sha256"]);
         assert!(bytes.ends_with(b"\n"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn schema7_refuses_a_missing_comparison_field() {
+        let root = fixture_root();
+        let results = root.join("results");
+        let commit = "1212121212121212121212121212121212121212";
+        let mut row = result_row("validate-missing-field", commit);
+        let mut report: Value = serde_json::from_str(&report("matched", "info")).unwrap();
+        report["comparison"]
+            .as_object_mut()
+            .unwrap()
+            .remove("virtualize_time");
+        replace_report(&mut row, &report);
+        write_result(&results, &row);
+
+        let retained = retain(&root, &results, commit, &expected(&row)).unwrap();
+        let verdict = &retained.evidence["cells"][0]["cell_verdict"];
+        assert_eq!(retained.schema_version, 7);
+        assert_eq!(verdict["state"], "unavailable-with-reason");
+        assert!(verdict.get("comparison").is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn schema7_refuses_an_unknown_comparison_field() {
+        let root = fixture_root();
+        let results = root.join("results");
+        let commit = "1313131313131313131313131313131313131313";
+        let mut row = result_row("validate-unknown-field", commit);
+        let mut report: Value = serde_json::from_str(&report("matched", "info")).unwrap();
+        report["comparison"]["future_comparison_field"] = Value::Bool(true);
+        replace_report(&mut row, &report);
+        write_result(&results, &row);
+
+        let retained = retain(&root, &results, commit, &expected(&row)).unwrap();
+        let verdict = &retained.evidence["cells"][0]["cell_verdict"];
+        assert_eq!(retained.schema_version, 7);
+        assert_eq!(verdict["state"], "unavailable-with-reason");
+        assert!(verdict.get("comparison").is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn schema7_refuses_an_unknown_compared_log_messages_field() {
+        let root = fixture_root();
+        let results = root.join("results");
+        let commit = "1414141414141414141414141414141414141414";
+        let mut row = result_row("validate-unknown-count-field", commit);
+        let mut report: Value = serde_json::from_str(&report("matched", "info")).unwrap();
+        report["compared_log_messages"]["future_count_field"] = Value::from(123);
+        replace_report(&mut row, &report);
+        write_result(&results, &row);
+
+        let retained = retain(&root, &results, commit, &expected(&row)).unwrap();
+        let verdict = &retained.evidence["cells"][0]["cell_verdict"];
+        assert_eq!(retained.schema_version, 7);
+        assert_eq!(verdict["state"], "unavailable-with-reason");
+        assert!(verdict.get("compared_log_messages").is_none());
         fs::remove_dir_all(root).unwrap();
     }
 
