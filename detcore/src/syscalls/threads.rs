@@ -546,8 +546,11 @@ enum WaitSignalDisposition {
     Restart,
 }
 
-fn signal_default_action_is_ignore(signal: SigWrapper) -> bool {
-    matches!(signal.raw(), libc::SIGCHLD | libc::SIGURG | libc::SIGWINCH)
+fn signal_default_disposition_does_not_interrupt_child_wait(signal: SigWrapper) -> bool {
+    matches!(
+        signal.raw(),
+        libc::SIGCHLD | libc::SIGCONT | libc::SIGURG | libc::SIGWINCH
+    )
 }
 
 async fn wait_signal_disposition<G, T>(
@@ -585,7 +588,8 @@ where
         guest.inject_with_retry(call).await?;
         let action: KernelSigaction = guest.memory().read_value(action_addr)?;
         if action.handler == libc::SIG_IGN as u64
-            || action.handler == libc::SIG_DFL as u64 && signal_default_action_is_ignore(signal)
+            || action.handler == libc::SIG_DFL as u64
+                && signal_default_disposition_does_not_interrupt_child_wait(signal)
         {
             continue;
         }
@@ -604,7 +608,7 @@ where
 async fn interrupted_child_wait_result<G, T, S>(
     guest: &mut G,
     call: S,
-    spec: ChildWaitSpec,
+    _spec: ChildWaitSpec,
     disposition: WaitSignalDisposition,
 ) -> Result<i64, Error>
 where
@@ -622,7 +626,6 @@ where
         return Err(Errno::EINTR.into());
     }
 
-    guest.thread_state_mut().restarted_child_wait = Some(spec);
     guest.tail_inject(call).await
 }
 
@@ -699,28 +702,6 @@ fn absolute_timeout_uses_host_clock(
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
-    /// Wait for the scheduler's child lifecycle result before a backend lets
-    /// Linux return from `rt_sigreturn` and restart the original child wait.
-    pub async fn complete_restarted_child_wait<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-    ) -> Result<(), Error> {
-        let Some(spec) = guest.thread_state_mut().restarted_child_wait.take() else {
-            return Ok(());
-        };
-        loop {
-            let (ready, has_child) = ready_child_wait(guest, spec).await;
-            if let Some(child) = ready {
-                let _ = await_exact_child_physical_exit(guest, child).await;
-                return Ok(());
-            }
-            if !has_child {
-                return Ok(());
-            }
-            let _ = wait_for_child_lifecycle(guest, spec).await;
-        }
-    }
-
     async fn futex_timeout_deadline<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2265,12 +2246,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn linux_default_ignored_signals_do_not_interrupt_child_waits() {
-        for signal in [libc::SIGCHLD, libc::SIGURG, libc::SIGWINCH] {
-            assert!(signal_default_action_is_ignore(SigWrapper(signal)));
+    fn linux_default_dispositions_that_do_not_interrupt_child_waits() {
+        for signal in [libc::SIGCHLD, libc::SIGCONT, libc::SIGURG, libc::SIGWINCH] {
+            assert!(signal_default_disposition_does_not_interrupt_child_wait(
+                SigWrapper(signal)
+            ));
         }
-        for signal in [libc::SIGALRM, libc::SIGCONT, libc::SIGUSR1] {
-            assert!(!signal_default_action_is_ignore(SigWrapper(signal)));
+        for signal in [libc::SIGALRM, libc::SIGSTOP, libc::SIGUSR1] {
+            assert!(!signal_default_disposition_does_not_interrupt_child_wait(
+                SigWrapper(signal)
+            ));
         }
     }
 

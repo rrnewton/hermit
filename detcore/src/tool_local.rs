@@ -1614,11 +1614,6 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub physical_tid: Option<i32>,
 
-    /// Scheduler child wait that Linux will restart after the current DBT
-    /// signal handler returns through `rt_sigreturn`.
-    #[serde(default)]
-    pub(crate) restarted_child_wait: Option<ChildWaitSpec>,
-
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1063): Review backend-supplied open-file creator identity.
     /// Stable identity used when allocating deterministic open-file descriptions.
@@ -1793,7 +1788,6 @@ impl<T> std::fmt::Debug for ThreadState<T> {
             .field("dettid", &self.dettid)
             .field("detpid", &self.detpid)
             .field("physical_tid", &self.physical_tid)
-            .field("restarted_child_wait", &self.restarted_child_wait)
             .field("mm_id", &self.mm_id)
             .field("memory_metadata", &self.memory_metadata)
             .field("stats", &self.stats)
@@ -2039,7 +2033,6 @@ impl<T> ThreadState<T> {
             dettid: pid,
             detpid: None, // Initialized later.
             physical_tid: None,
-            restarted_child_wait: None,
             open_file_creator: None,
             mm_id: MmId::initial(pid),
             memory_metadata: Arc::new(Mutex::new(MemoryMetadata::new())),

@@ -765,23 +765,23 @@ fn dbt_exact_child_waits_honor_sa_restart() {
 }
 
 #[test]
-fn dbt_exact_child_waits_ignore_default_ignored_signals() {
-    if dbt_unavailable("dbt_exact_child_waits_ignore_default_ignored_signals") {
+fn dbt_exact_child_waits_respect_noninterrupting_default_dispositions() {
+    if dbt_unavailable("dbt_exact_child_waits_respect_noninterrupting_default_dispositions") {
         return;
     }
-    for signal in [libc::SIGCHLD, libc::SIGURG, libc::SIGWINCH] {
+    for signal in [libc::SIGCHLD, libc::SIGCONT, libc::SIGURG, libc::SIGWINCH] {
         let signal = signal.to_string();
         assert_dbt_wait_case(
-            &["--waitid-default-ignore", &signal],
+            &["--waitid-default-disposition", &signal],
             &format!(
-                "waitid-default-ignore signal={signal} rc=0 errno=0 pid-match=1 code=2 signal-status=9 sender-live=1"
+                "waitid-default-disposition signal={signal} rc=0 errno=0 pid-match=1 code=2 signal-status=9 sender-live=1"
             ),
             None,
         );
         assert_dbt_wait_case(
-            &["--wait4-default-ignore", &signal],
+            &["--wait4-default-disposition", &signal],
             &format!(
-                "wait4-default-ignore signal={signal} rc-ok=1 errno=0 pid-match=1 signaled=1 signal-status=9 sender-live=1"
+                "wait4-default-disposition signal={signal} rc-ok=1 errno=0 pid-match=1 signaled=1 signal-status=9 sender-live=1"
             ),
             None,
         );

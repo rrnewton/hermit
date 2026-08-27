@@ -260,10 +260,10 @@ static int signal_restart_handler_makes_child_waitable(int use_wait4) {
   return handler_ran ? 0 : 3;
 }
 
-static int default_ignored_signal(int use_wait4, int signum) {
+static int default_disposition_does_not_interrupt(int use_wait4, int signum) {
   pid_t target = fork();
   if (target < 0) {
-    printf("wait-default-ignore-setup-failed target-fork errno=%d\n", errno);
+    printf("wait-default-disposition-setup-failed target-fork errno=%d\n", errno);
     return 1;
   }
   if (target == 0) {
@@ -275,7 +275,7 @@ static int default_ignored_signal(int use_wait4, int signum) {
   pid_t parent = getpid();
   pid_t signaler = fork();
   if (signaler < 0) {
-    printf("wait-default-ignore-setup-failed signaler-fork errno=%d\n", errno);
+    printf("wait-default-disposition-setup-failed signaler-fork errno=%d\n", errno);
     kill(target, SIGKILL);
     waitpid(target, NULL, 0);
     return 1;
@@ -308,13 +308,13 @@ static int default_ignored_signal(int use_wait4, int signum) {
 
   if (use_wait4) {
     printf(
-        "wait4-default-ignore signal=%d rc-ok=%d errno=%d pid-match=%d signaled=%d signal-status=%d sender-live=%d\n",
+        "wait4-default-disposition signal=%d rc-ok=%d errno=%d pid-match=%d signaled=%d signal-status=%d sender-live=%d\n",
         signum, rc >= 0, rc < 0 ? saved_errno : 0, rc == target,
         WIFSIGNALED(status), WIFSIGNALED(status) ? WTERMSIG(status) : 0,
         sender_live);
   } else {
     printf(
-        "waitid-default-ignore signal=%d rc=%d errno=%d pid-match=%d code=%d signal-status=%d sender-live=%d\n",
+        "waitid-default-disposition signal=%d rc=%d errno=%d pid-match=%d code=%d signal-status=%d sender-live=%d\n",
         signum, rc, rc < 0 ? saved_errno : 0, info.si_pid == target,
         info.si_code, info.si_status, sender_live);
   }
@@ -585,11 +585,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && strcmp(argv[1], "--wait4-signal-restart-handler") == 0) {
     return signal_restart_handler_makes_child_waitable(1);
   }
-  if (argc == 3 && strcmp(argv[1], "--waitid-default-ignore") == 0) {
-    return default_ignored_signal(0, atoi(argv[2]));
+  if (argc == 3 && strcmp(argv[1], "--waitid-default-disposition") == 0) {
+    return default_disposition_does_not_interrupt(0, atoi(argv[2]));
   }
-  if (argc == 3 && strcmp(argv[1], "--wait4-default-ignore") == 0) {
-    return default_ignored_signal(1, atoi(argv[2]));
+  if (argc == 3 && strcmp(argv[1], "--wait4-default-disposition") == 0) {
+    return default_disposition_does_not_interrupt(1, atoi(argv[2]));
   }
   if (argc == 2 && strcmp(argv[1], "--live-sibling-signal") == 0) {
     return live_sibling_signal(0);
@@ -606,6 +606,6 @@ int main(int argc, char **argv) {
   if (argc == 2 && strcmp(argv[1], "--wait4-live-sibling-signal-blocked") == 0) {
     return live_sibling_signal(3);
   }
-  fprintf(stderr, "usage: %s [--child-ready-wins|--signal-restart|--wait4-signal-interrupt|--wait4-child-ready-wins|--wait4-signal-restart|--signal-restart-handler|--wait4-signal-restart-handler|--waitid-default-ignore SIGNAL|--wait4-default-ignore SIGNAL|--live-sibling-signal|--live-sibling-signal-restart|--live-sibling-signal-blocked|--live-sibling-thread-signal|--wait4-live-sibling-signal-blocked]\n", argv[0]);
+  fprintf(stderr, "usage: %s [--child-ready-wins|--signal-restart|--wait4-signal-interrupt|--wait4-child-ready-wins|--wait4-signal-restart|--signal-restart-handler|--wait4-signal-restart-handler|--waitid-default-disposition SIGNAL|--wait4-default-disposition SIGNAL|--live-sibling-signal|--live-sibling-signal-restart|--live-sibling-signal-blocked|--live-sibling-thread-signal|--wait4-live-sibling-signal-blocked]\n", argv[0]);
   return 64;
 }
