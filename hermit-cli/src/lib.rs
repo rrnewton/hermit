@@ -2189,6 +2189,18 @@ impl std::error::Error for GuestTimedOut {}
 /// racing on different numbers.
 const RUN_TIMEOUT_UNWIND_GRACE: Duration = Duration::from_secs(10);
 
+/// The unwind grace, exposed so the rungs INSIDE it can be pinned against it.
+///
+/// `docs/TIMEOUT_LADDER.md` requires each rung to be strictly smaller than the
+/// one enclosing it, and says nothing enforces that across every pair. The
+/// stderr diagnostic wait in `detcore::util` sits inside this grace and is
+/// derived from it, so a bracket needs the real value rather than a restated
+/// literal that could drift away from it.
+#[doc(hidden)]
+pub fn run_timeout_unwind_grace() -> Duration {
+    RUN_TIMEOUT_UNWIND_GRACE
+}
+
 /// Bound `guest` by `timeout`, preferring an unwind over a kill.
 ///
 /// ⚠️ THE UNWIND IS THE POINT. `tokio::time::timeout` DROPS the guest future on
