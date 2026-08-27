@@ -110586,7 +110586,7 @@
       "backend": "liteinst",
       "enabled": false,
       "status": "not-applicable",
-      "not_applicable_reason": "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately",
+      "not_applicable_reason": "The LiteInst host-hybrid backend refuses clone3 with ENOTSUPP before the guest creates its first thread, so this multi-threaded guest cannot run there yet; unrelated to robust-futex owner death",
       "observations": [],
       "measurement": "never-measured"
     },

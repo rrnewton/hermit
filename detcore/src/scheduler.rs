@@ -2193,17 +2193,15 @@ impl Scheduler {
         vec.split_off(vec.len() - num_woken)
     }
 
-    /// Reschedule all threads blocked on a particular futex.
-    pub fn wake_futex_waiters(
+    fn take_futex_wakees(
         &mut self,
-        _waker_dettid: DetTid,
         futexid: FutexID,
         max_to_wake: i32,
         wake_mask: u32,
-    ) -> u64 {
+    ) -> Vec<FutexWaiter> {
         if max_to_wake == 0 {
             trace!("[detcore] Futex wake of 0 waiters necessarily fizzles...");
-            return 0;
+            return Vec::new();
         }
         let mut vec: Vec<FutexWaiter> = {
             match self.blocked.futex_waiters.get_mut(&futexid) {
@@ -2212,7 +2210,7 @@ impl Scheduler {
                         "[detcore] Futex wake {} waiters FIZZLED -- none waiting",
                         max_to_wake
                     );
-                    return 0;
+                    return Vec::new();
                 }
                 Some(r) => std::mem::take(r),
             }
@@ -2227,16 +2225,55 @@ impl Scheduler {
         let to_wake = self.choose_futex_wakees(&mut matching, num_woken);
 
         assert_eq!(to_wake.len(), num_woken);
-        for waiter in to_wake {
-            self.wake_futex_waiter(waiter);
-        }
         vec.extend(matching);
         // Put back what wasn't woken up:
         if !vec.is_empty() {
             let junk = self.blocked.futex_waiters.insert(futexid, vec);
             assert!(junk.unwrap().is_empty());
         }
+        to_wake
+    }
+
+    /// Reschedule all threads blocked on a particular futex.
+    pub fn wake_futex_waiters(
+        &mut self,
+        _waker_dettid: DetTid,
+        futexid: FutexID,
+        max_to_wake: i32,
+        wake_mask: u32,
+    ) -> u64 {
+        let to_wake = self.take_futex_wakees(futexid, max_to_wake, wake_mask);
+        let num_woken = to_wake.len();
+        for waiter in to_wake {
+            self.wake_futex_waiter(waiter);
+        }
         num_woken as u64
+    }
+
+    /// Record futex wakes delivered by a physical-exit callback for the next
+    /// deterministic run-queue drain.
+    pub(crate) fn wake_futex_waiters_after_exit(
+        &mut self,
+        wakes: &[(DetTid, FutexID)],
+    ) -> Vec<u64> {
+        wakes
+            .iter()
+            .map(|(_owner, futexid)| {
+                let to_wake = self.take_futex_wakees(*futexid, 1, u32::MAX);
+                let num_woken = to_wake.len();
+                for waiter in to_wake {
+                    let waiterid = waiter.dettid;
+                    self.blocked.timed_waiters.remove(waiterid);
+                    let next_turn = self
+                        .next_turns
+                        .get_mut(&waiterid)
+                        .expect("Thread must have an entry in next_turns");
+                    assert_futex_request(next_turn);
+                    self.admit_to_run_queue(waiterid, AdmitIntent::Fixed(AdmitSide::Back));
+                }
+                num_woken as u64
+            })
+            .collect()
     }
 
     /// Simulate the effect of CLONE_CHILD_CLEARTID.
@@ -5029,6 +5066,10 @@ impl Scheduler {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::DetTime;
+    use crate::tool_local::RobustListExit;
+    use crate::tool_local::RobustListWake;
+    use crate::tool_local::ThreadState;
 
     #[test]
     fn every_scheduler_commit_shape_uses_the_same_typed_record() {
@@ -5348,6 +5389,109 @@ mod test {
         );
         assert_eq!(baseline, drained_order([higher, lower], false), "both");
         assert!(baseline.contains(&lower) && baseline.contains(&higher));
+    }
+
+    #[test]
+    fn robust_list_wake_batches_are_arrival_order_independent() {
+        let lower = DetTid::from_raw(21);
+        let higher = DetTid::from_raw(23);
+        let first_owner = DetTid::from_raw(31);
+        let second_owner = DetTid::from_raw(33);
+        let mm = MmId::initial(DetTid::from_raw(5));
+        let lower_futex = FutexID::private(mm, 0x404100);
+        let higher_futex = FutexID::private(mm, 0x404200);
+
+        let deliver = |reverse: bool| {
+            let mut first = ThreadState::<()>::new(first_owner, &Config::default(), ());
+            let mut second = first.clone();
+            second.dettid = second_owner;
+            first.record_robust_list_head(Some(0x404100));
+            second.record_robust_list_head(Some(0x404200));
+            first.stage_robust_list_wakes(
+                RobustListExit::ExitGroup,
+                vec![
+                    (
+                        second_owner,
+                        vec![RobustListWake {
+                            futex: higher_futex,
+                        }],
+                    ),
+                    (first_owner, vec![RobustListWake { futex: lower_futex }]),
+                ],
+            );
+            let first_time = DetTime::default();
+            let mut second_time = first_time.clone();
+            second_time.add_syscall();
+            let ready = if reverse {
+                assert_eq!(
+                    second.take_robust_list_wakes_after_exit(None, second_time.clone()),
+                    None,
+                    "the first physical exit must not send a partial request"
+                );
+                first
+                    .take_robust_list_wakes_after_exit(None, first_time)
+                    .expect("the final physical exit must release the group")
+                    .1
+            } else {
+                assert_eq!(
+                    first.take_robust_list_wakes_after_exit(None, first_time),
+                    None,
+                    "the first physical exit must not send a partial request"
+                );
+                second
+                    .take_robust_list_wakes_after_exit(None, second_time)
+                    .expect("the final physical exit must release the group")
+                    .1
+            };
+            let request: Vec<_> = ready
+                .into_iter()
+                .map(|(owner, wake)| (owner, wake.futex))
+                .collect();
+            assert_eq!(
+                request,
+                vec![(first_owner, lower_futex), (second_owner, higher_futex)],
+                "one owner/futex-sorted request must carry the complete group"
+            );
+
+            let mut sched = Scheduler::new(&Config::default());
+            let anchor = DetTid::from_raw(5);
+            register_known_thread(&mut sched, anchor);
+            sched.runqueue_push_back(anchor);
+            register_known_thread(&mut sched, lower);
+            register_known_thread(&mut sched, higher);
+            sched.sleep_futex_waiter(&lower, lower_futex, None, u32::MAX);
+            sched.sleep_futex_waiter(&higher, higher_futex, None, u32::MAX);
+
+            assert_eq!(sched.wake_futex_waiters_after_exit(&request), vec![1, 1]);
+
+            let pending: Vec<_> = sched
+                .pending_run_queue_admissions
+                .iter()
+                .map(|(tid, intent)| (*tid, *intent))
+                .collect();
+            assert_eq!(
+                pending,
+                vec![
+                    (lower, AdmitIntent::Fixed(AdmitSide::Back)),
+                    (higher, AdmitIntent::Fixed(AdmitSide::Back)),
+                ]
+            );
+            assert_eq!(
+                sched.run_queue.tids().copied().collect::<Vec<_>>(),
+                vec![anchor],
+                "physical-exit wakes must wait for the deterministic drain"
+            );
+
+            sched.drain_pending_run_queue_admissions();
+            let drained = sched.run_queue.tids().copied().collect::<Vec<_>>();
+            assert!(sched.pending_run_queue_admissions.is_empty());
+            (pending, drained)
+        };
+
+        let forward = deliver(false);
+        let reverse = deliver(true);
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.1, vec![DetTid::from_raw(5), lower, higher]);
     }
 
     /// F3: a run-queue removal requested while a tentative_pop window is live

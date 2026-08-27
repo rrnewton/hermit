@@ -20,10 +20,10 @@
 //! `futex_waiters` pool rather than in a kernel futex queue, so the kernel's
 //! internal owner-death wake cannot reach them. This module re-implements the
 //! kernel algorithm inside Detcore so the wake is issued against the modeled
-//! waiter pool, deterministically and identically on every backend.
+//! waiter pool.
 //!
-//! Detcore always performs the modeled wake. On ptrace, it leaves the
-//! owner-word transition to the real Linux task-exit path:
+//! On ptrace, Detcore performs the modeled wake while leaving the owner-word
+//! transition to the real Linux task-exit path:
 //!
 //! * Linux performs the required compare/exchange atomically, so a process
 //!   outside Hermit's scheduler cannot have its newly acquired process-shared
@@ -33,10 +33,10 @@
 //!   changes the word before the exit callback releases another scheduler turn.
 //!
 //! DBT and SaBRe invoke their task-exit callback before executing the native
-//! exit, and KVM has no Linux task-exit path. Detcore therefore retains the
-//! separate read and write on those backends. The fake below models that window
-//! so the remaining process-shared race is visible rather than hidden by an
-//! atomic test double.
+//! exit, and KVM has no Linux task-exit path. Those backends do not run this
+//! owner-death path until they can provide an atomic update or a post-cleanup
+//! callback. The fake below models the unsafe separate read/write window so a
+//! future implementation cannot hide it behind an atomic test double.
 //!
 //! # Lifecycle scope
 //!

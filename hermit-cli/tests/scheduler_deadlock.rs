@@ -34,7 +34,7 @@ const TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DEADLOCK_HEADLINE: &str =
     "Deadlock detected: thread(s) waiting on futex, but no runnable threads left.";
-const NATIVE_PASS: &str = "PASS: robust mutex waiter received EOWNERDEAD\n";
+const UNREACHABLE: &str = "UNREACHABLE: AB-BA deadlock resolved\n";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ProcessIdentity {
@@ -871,35 +871,44 @@ fn terminal_scheduler_deadlock_reports_and_tears_down_tracees() {
         .expect("hermit-cli should be inside the repository");
     let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("scheduler-deadlock");
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
-    let guest = build_root.join("robust_futex_test");
+    let guest = build_root.join("scheduler_deadlock");
 
     let mut compiler = Command::new("cc");
     compiler
         .args(["-O2", "-Wall", "-Wextra", "-Werror", "-pthread"])
-        .arg(repository.join("tests/bin/robust_futex_test.c"))
+        .arg(repository.join("hermit-cli/tests/fixtures/scheduler_deadlock.c"))
         .arg("-o")
         .arg(&guest);
     let compile = bounded_output(
         &mut compiler,
         TOTAL_TIMEOUT,
-        "robust-futex guest compilation",
+        "scheduler-deadlock guest compilation",
     )
-    .expect("failed to compile robust futex guest");
+    .expect("failed to compile scheduler deadlock guest");
     assert!(
         compile.status.success(),
-        "robust futex guest compilation failed\nstdout:\n{}\nstderr:\n{}",
+        "scheduler deadlock guest compilation failed\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&compile.stdout),
         String::from_utf8_lossy(&compile.stderr)
     );
 
+    let mut native_command = Command::new("timeout");
+    native_command
+        .args(["--kill-after", "1s", "1s"])
+        .arg(&guest)
+        .stdin(Stdio::null());
     let native = bounded_output(
-        &mut Command::new(&guest),
+        &mut native_command,
         TOTAL_TIMEOUT,
-        "native robust-futex control",
+        "native scheduler-deadlock control",
     )
-    .expect("failed to run native robust futex control");
-    assert_eq!(native.status.code(), Some(0), "native control must exit 0");
-    assert_eq!(String::from_utf8_lossy(&native.stdout), NATIVE_PASS);
+    .expect("failed to run native scheduler deadlock control");
+    assert_eq!(
+        native.status.code(),
+        Some(124),
+        "native control must remain deadlocked until its one-second bound"
+    );
+    assert_eq!(String::from_utf8_lossy(&native.stdout), "ready\n");
     assert!(
         native.stderr.is_empty(),
         "native control wrote stderr:\n{}",
@@ -916,7 +925,6 @@ fn terminal_scheduler_deadlock_reports_and_tears_down_tracees() {
     command
         .args(["run", "--backend=ptrace", "--strict", "--"])
         .arg(&guest)
-        .arg("--wait-before-owner-exit")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(
@@ -942,7 +950,7 @@ fn terminal_scheduler_deadlock_reports_and_tears_down_tracees() {
         .expect("Hermit stdout was not piped");
 
     let ready = read_ready_line(&mut stdout, &mut owned, deadline)
-        .expect("failed while waiting for the held robust-futex guest");
+        .expect("failed while waiting for the held scheduler-deadlock guest");
     assert_eq!(ready, b"ready\n", "unexpected guest readiness output");
 
     let snapshot = stable_descendants(owned.root.identity, deadline);
@@ -977,7 +985,7 @@ fn terminal_scheduler_deadlock_reports_and_tears_down_tracees() {
     let release_started = Instant::now();
     stdin
         .write_all(b"x")
-        .expect("failed to release robust-futex owner thread");
+        .expect("failed to release scheduler-deadlock guest");
     drop(stdin);
 
     let status = wait_for_exit(&mut owned, deadline);
@@ -1037,8 +1045,8 @@ fn terminal_scheduler_deadlock_reports_and_tears_down_tracees() {
         "missing futex-waiter population evidence\nstderr:\n{stderr_text}"
     );
     assert!(
-        !String::from_utf8_lossy(&all_stdout).contains(NATIVE_PASS.trim()),
-        "Hermit unexpectedly took the native owner-death wake path"
+        !String::from_utf8_lossy(&all_stdout).contains(UNREACHABLE.trim()),
+        "scheduler deadlock unexpectedly resolved"
     );
 
     owned.disarm();

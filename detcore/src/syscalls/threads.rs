@@ -1038,9 +1038,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// Linux runs this from `mm_release()` while a task dies. Detcore performs
     /// the same walk and issues the wake against its own modeled waiter pool,
-    /// which is where precise-mode futex waiters actually live. It either
-    /// applies the word transition or, on ptrace, leaves the atomic operation
-    /// to Linux. The algorithm is in
+    /// which is where precise-mode futex waiters actually live. Ptrace leaves
+    /// the atomic word transition to Linux; backends without that ordering do
+    /// not enter this path. The algorithm is in
     /// [`crate::syscalls::robust_list`]; this function only supplies guest
     /// memory and the scheduler wake.
     ///
@@ -1052,7 +1052,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     // TODO-HUMAN-REVIEW(PR-2223): Review owner-death wakeup
     // emulation, which changes how a dying thread's peers are scheduled.
     async fn run_robust_list_owner_death<G: Guest<Self>>(&self, guest: &mut G) {
-        if !self.cfg.sequentialize_threads || self.cfg.debug_futex_mode != BlockingMode::Precise {
+        if !self.cfg.backend_runs_exit_robust_list
+            || !self.cfg.sequentialize_threads
+            || self.cfg.debug_futex_mode != BlockingMode::Precise
+        {
             return;
         }
         let Some(head) = guest.thread_state().robust_list_head else {
@@ -1076,7 +1079,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut effects = GuestRobustEffects::<'_, G, T> {
             guest,
             dettid,
-            defer_owner_death_to_backend: self.cfg.backend_runs_exit_robust_list,
+            defer_owner_death_to_backend: true,
             staged_wakes: None,
             tool: PhantomData,
         };
@@ -1111,6 +1114,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let heads = guest.thread_state().robust_list_heads();
+        let mut staged = Vec::with_capacity(heads.len());
         for (owner, head) in heads {
             let mut wakes = Vec::new();
             let mut effects = GuestRobustEffects::<'_, G, T> {
@@ -1128,10 +1132,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     owner, outcome,
                 );
             }
-            guest
-                .thread_state()
-                .stage_robust_list_wakes(owner, reason, wakes);
+            staged.push((owner, wakes));
         }
+        guest.thread_state().stage_robust_list_wakes(reason, staged);
     }
 
     /// Exit system call
@@ -1169,16 +1172,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             Permission::RW,
         );
         resource_request(guest, request).await;
-        if self.cfg.backend_runs_exit_robust_list {
-            self.stage_thread_group_robust_list_wakes(guest, RobustListExit::ExitGroup)
-                .await;
-        } else {
-            // DBT and SaBRe report exit before native cleanup, while KVM has no
-            // native Linux cleanup. Their existing current-thread walk remains
-            // the best available behavior until they have an atomic update or
-            // a post-cleanup callback.
-            self.run_robust_list_owner_death(guest).await;
-        }
+        self.stage_thread_group_robust_list_wakes(guest, RobustListExit::ExitGroup)
+            .await;
         // It's ok here that we skip running the posthook:
         guest.tail_inject(call).await
     }

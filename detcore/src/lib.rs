@@ -2840,30 +2840,25 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             thread_state.account_process_cpu_time();
         }
         let mm_id = thread_state.mm_id;
-        if let Some(pending) = thread_state.take_robust_list_wakes() {
-            let should_wake = match (pending.reason, &exit_status) {
-                (tool_local::RobustListExit::ExitGroup, _) => true,
-                (tool_local::RobustListExit::Signal(expected), ExitStatus::Signaled(actual, _)) => {
-                    expected == *actual as i32
-                }
-                (tool_local::RobustListExit::Signal(_), ExitStatus::Exited(_)) => false,
-            };
-            if should_wake {
-                let futexes: Vec<_> = pending.wakes.iter().map(|wake| wake.futex).collect();
-                let counts = robust_list_wakes_after_exit(
-                    thread_state.thread_logical_time.clone(),
-                    global_state,
-                    mm_id,
-                    dettid,
-                    pending.wakes,
-                )
-                .await;
-                for (futex, count) in futexes.into_iter().zip(counts) {
-                    info!(
-                        "[detcore, dtid {}] robust-list owner death woke {} waiter(s) on futex {:?} after physical exit",
-                        dettid, count, futex,
-                    );
-                }
+        let exit_signal = match &exit_status {
+            ExitStatus::Signaled(signal, _) => Some(*signal as i32),
+            ExitStatus::Exited(_) => None,
+        };
+        if let Some((request_time, ready)) = thread_state.take_robust_list_wakes_after_exit(
+            exit_signal,
+            thread_state.thread_logical_time.clone(),
+        ) {
+            let identities: Vec<_> = ready
+                .iter()
+                .map(|(owner, wake)| (*owner, wake.futex))
+                .collect();
+            let counts =
+                robust_list_wakes_after_exit(request_time, global_state, mm_id, ready).await;
+            for ((owner, futex), count) in identities.into_iter().zip(counts) {
+                info!(
+                    "[detcore, dtid {}] robust-list owner death woke {} waiter(s) on futex {:?} after physical exit",
+                    owner, count, futex,
+                );
             }
         }
         let pending_chaos_epochs = thread_state.take_pending_chaos_epochs();

@@ -104,9 +104,9 @@ $ timeout 20s target/release/hermit --log error run --strict --verify \
 
 ### Current strict result
 
-Detcore now replays Linux's `exit_robust_list()` when a thread exits
-(`detcore/src/syscalls/robust_list.rs`), so the default precise futex model
-wakes the waiter itself:
+On the ptrace backend, Detcore now follows Linux's `exit_robust_list()` walk
+(`detcore/src/syscalls/robust_list.rs`) and wakes the waiter in its precise
+futex model:
 
 ```text
 $ target/release/hermit run --strict -- ./robust_futex_test
@@ -120,52 +120,29 @@ with, at DEBUG:
 [detcore, dtid 5] robust-list owner death woke 1 waiter(s) on futex Private { ..., address: 4210944 }
 ```
 
-That is the ptrace path: Linux performs the atomic owner-word transition before
-the backend's exit callback releases another modeled thread. DBT, KVM, and
-SaBRe still use Detcore's separate read and write and therefore do not yet
-satisfy the process-shared atomicity requirement.
+Linux performs the atomic owner-word transition before ptrace reports physical
+exit. Detcore reads the registered robust lists while guest memory is still
+available and delays only its modeled wakes until that callback, so another
+modeled thread cannot observe a partially updated word.
 
-The futex word after owner death, probed directly, shows which half was missing
-where — the host kernel already performed the transition under ptrace, so only
-the wake was absent there, while KVM performed no transition at all:
+`hermit-cli/tests/robust_futex_owner_death.rs` is the automated regression. It
+requires the voluntary-exit guest to produce a nonempty canonical L2 report and
+checks the process-shared lifecycle guest under native Linux and the supported
+ptrace paths.
 
-| Run | Futex word after owner death |
-| --- | --- |
-| native | `0x40000000` |
-| ptrace, before the fix | `0x40000000` (host kernel wrote it) |
-| KVM, before the fix | `0x00000004` (no write at all) |
-| ptrace, after | `0x40000000` |
-| KVM, after | `0x40000000` (Detcore performs it) |
+### Ptrace scope and remaining backend work
 
-Measured per backend with
-`run --strict --verify --verify-strict --verify-json <path>`, all guests exiting
-0 and printing the PASS line:
+The ptrace path covers voluntary thread exit, `exit_group`, and fatal signals
+that reach Detcore's callback while guest memory is readable. The lifecycle
+test keeps a native `de_thread` control, but the pinned Reverie currently fails
+that Hermit path before robust-list cleanup can run. An externally delivered
+fatal signal received while the owner is inside an injected blocking syscall
+also bypasses the callback needed to collect its robust list before exit.
 
-| Backend | Result |
-| --- | --- |
-| ptrace | L2 canonical, `bitwise_parity: true` (189 \| 189 INFO messages) |
-| SaBRe | L2 canonical, `bitwise_parity: true` (187 \| 187 INFO messages) |
-| KVM | verified; `bitwise_parity: false` because KVM compares only exit status/stdout/stderr |
-| DBT | `Determinism verified` with matching guest-memory hashes; `--verify-json` still records `no_result` for the DBT comparator |
-| LiteInst | unrelated backend gap: `clone3` is refused with `-524 ENOTSUPP` before the guest creates a thread |
-
-Record/replay also matches:
-`record start --strict --verify` reports `replay matched recording`
-(154 \| 154 DETLOG messages).
-
-`hermit-cli/tests/robust_futex_owner_death.rs` is the automated regression test
-and asserts the ptrace L2 row above.
-
-### Scope: voluntary thread exit only
-
-Detcore replays the walk from the `exit` and `exit_group` syscall handlers, so it
-covers a thread that exits of its own accord — which is what this guest does.
-Linux walks the robust list of *every* task in a dying thread group. A sibling
-torn down by `exit_group`, by `execve`'s `de_thread`, or by a fatal signal never
-reaches those handlers, so its list is not replayed. Single-process guests are
-unaffected, because every waiter dies with the group; a process-shared robust
-mutex is not. Tracked in
-<https://github.com/rrnewton/hermit/issues/2082>.
+DBT, KVM, and SaBRe retain Detcore's separate read/write owner-word update and
+are not claimed by this change. Their lifecycle ordering or guest-memory API
+must provide an atomic transition before they can safely use this behavior.
+LiteInst refuses `clone3` before this multi-threaded guest starts.
 
 # POSIX timer signal-delivery probe
 
