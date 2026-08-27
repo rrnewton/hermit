@@ -802,7 +802,11 @@ struct ManifestBudgetRow {
     attempts: JsonValue,
 }
 
-#[derive(Debug, Deserialize)]
+fn first_attempt() -> u64 {
+    1
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ResultRow {
     schema: u64,
     run_id: String,
@@ -838,6 +842,9 @@ struct ResultRow {
     backend: Option<String>,
     classification: String,
     outcome: String,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+    duration_ms: u128,
     argv: Vec<String>,
     guest_argv: Vec<String>,
     env: BTreeMap<String, String>,
@@ -848,6 +855,101 @@ struct ResultRow {
     reason: Option<String>,
     #[serde(default)]
     error_kind: Option<String>,
+    artifact_dir: String,
+}
+
+fn read_result_rows(path: &Path) -> Result<Vec<ResultRow>, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let mut rows: Vec<ResultRow> = Vec::new();
+    let mut attempts = BTreeSet::new();
+    let mut artifact_dirs = BTreeSet::new();
+    let mut previous_attempt = None;
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: ResultRow = serde_json::from_str(line)
+            .map_err(|e| format!("invalid {}:{}: {e}", path.display(), index + 1))?;
+        if row.attempt == 0 {
+            return Err(format!(
+                "{}:{} has non-positive result attempt 0",
+                path.display(),
+                index + 1
+            ));
+        }
+        let expected_attempt = previous_attempt.map_or(1, |previous| previous + 1);
+        if row.attempt != expected_attempt {
+            return Err(format!(
+                "{}:{} result attempt {} does not follow the preceding attempts; expected {}",
+                path.display(),
+                index + 1,
+                row.attempt,
+                expected_attempt
+            ));
+        }
+        if !attempts.insert(row.attempt) {
+            return Err(format!(
+                "{} contains duplicate result attempt {}",
+                path.display(),
+                row.attempt
+            ));
+        }
+        if row.attempt > 1 && row.timeout_seconds.is_none() {
+            return Err(format!(
+                "{}:{} retry attempt {} has no wall-clock bound",
+                path.display(),
+                index + 1,
+                row.attempt
+            ));
+        }
+        if row.artifact_dir.is_empty() || !artifact_dirs.insert(row.artifact_dir.clone()) {
+            return Err(format!(
+                "{}:{} result attempt {} has an empty or reused artifact directory",
+                path.display(),
+                index + 1,
+                row.attempt
+            ));
+        }
+        if row.schema != CELL_RESULT_SCHEMA {
+            return Err(format!(
+                "{}:{} has unsupported cell-result schema {}",
+                path.display(),
+                index + 1,
+                row.schema
+            ));
+        }
+        if let Some(first) = rows.first() {
+            if row.run_id != first.run_id
+                || row.hermit_sha != first.hermit_sha
+                || row.source_tree_dirty != first.source_tree_dirty
+                || row.test != first.test
+                || row.category != first.category
+                || row.lane != first.lane
+                || row.mode != first.mode
+                || row.backend != first.backend
+                || row.classification != first.classification
+            {
+                return Err(format!(
+                    "{}:{} mixes a different cell identity into one result file",
+                    path.display(),
+                    index + 1
+                ));
+            }
+        }
+        previous_attempt = Some(row.attempt);
+        rows.push(row);
+    }
+    if rows.is_empty() {
+        return Err(format!("{} contains no result rows", path.display()));
+    }
+    if rows.len() > 1 && rows[0].timeout_seconds.is_none() {
+        return Err(format!(
+            "{}:1 retry history attempt 1 has no wall-clock bound",
+            path.display()
+        ));
+    }
+    Ok(rows)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1737,6 +1839,26 @@ fn series_run_index(dir_name: &str) -> u64 {
         .unwrap_or(0)
 }
 
+fn series_result_run_index(
+    metadata: &RunMetadata,
+    dir_name: &str,
+    attempt: u64,
+) -> Result<u64, String> {
+    if attempt == 0 {
+        return Err("series result attempt must be positive".into());
+    }
+    let repetition = series_run_index(dir_name);
+    let stride = u64::try_from(metadata.repetitions.unwrap_or(1))
+        .map_err(|_| "series repetition count does not fit u64")?;
+    repetition
+        .checked_add(
+            (attempt - 1)
+                .checked_mul(stride)
+                .ok_or("series result-attempt index overflow")?,
+        )
+        .ok_or_else(|| "series run index overflow".into())
+}
+
 /// Pull the located coordinates out of a row's attempts.
 ///
 /// FIRST attempt that located each coordinate wins, matching the runner's own
@@ -1771,6 +1893,7 @@ fn series_rows(
     let mut rows = Vec::new();
     for (dir_name, row) in results {
         let outcome = series_outcome(&row.outcome)?;
+        let run_index = series_result_run_index(metadata, dir_name, row.attempt)?;
         let mut payload = serde_json::Map::new();
         payload.insert(
             "cell".into(),
@@ -1781,9 +1904,23 @@ fn series_rows(
         payload.insert("tree".into(), JsonValue::from(metadata.hermit_sha.clone()));
         payload.insert(
             "run_index".into(),
-            JsonValue::from(series_run_index(dir_name)),
+            JsonValue::from(run_index),
         );
         payload.insert("outcome".into(), JsonValue::from(outcome));
+        payload.insert("attempt".into(), JsonValue::from(row.attempt));
+        if let Some(timeout_seconds) = row.timeout_seconds {
+            payload.insert(
+                "timeout_seconds".into(),
+                JsonValue::from(timeout_seconds),
+            );
+        }
+        payload.insert(
+            "runtime".into(),
+            serde_json::json!({
+                "wall_time_min_ms": row.duration_ms,
+                "wall_time_max_ms": row.duration_ms,
+            }),
+        );
         if let Some(coordinates) = series_coordinates(&row.attempts) {
             payload.insert("coordinates".into(), coordinates);
         }
@@ -1804,7 +1941,11 @@ fn series_rows(
         envelope.insert("schema".into(), JsonValue::from("stress-series/v1"));
         envelope.insert(
             "event_id".into(),
-            JsonValue::from(format!("{}-{}", row.run_id, dir_name)),
+            JsonValue::from(if row.attempt == 1 {
+                format!("{}-{}", row.run_id, dir_name)
+            } else {
+                format!("{}-{}-attempt-{}", row.run_id, dir_name, row.attempt)
+            }),
         );
         envelope.insert("event_type".into(), JsonValue::from("series.cell"));
         envelope.insert("emitted_at".into(), JsonValue::from(emitted_at));
@@ -1876,15 +2017,10 @@ fn emit_series(results: &Path) -> Result<(), String> {
         if !result_file.is_file() {
             continue;
         }
-        let text = fs::read_to_string(&result_file)
-            .map_err(|e| format!("cannot read {}: {e}", result_file.display()))?;
-        let Some(row) = terminal_attempt_row(&result_file, &text)? else {
-            return Err(format!(
-                "{} contains no nonempty rows",
-                result_file.display()
-            ));
-        };
-        collected.push((entry.file_name().to_string_lossy().into_owned(), row));
+        let dir_name = entry.file_name().to_string_lossy().into_owned();
+        for row in read_result_rows(&result_file)? {
+            collected.push((dir_name.clone(), row));
+        }
     }
     if collected.is_empty() {
         return Err(format!(
@@ -1892,7 +2028,10 @@ fn emit_series(results: &Path) -> Result<(), String> {
             results.display()
         ));
     }
-    collected.sort_by(|a, b| a.0.cmp(&b.0));
+    collected.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.attempt.cmp(&b.1.attempt))
+    });
 
     let emitted_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let rows = series_rows(&metadata, &collected, &emitted_at)?;
@@ -1987,39 +2126,76 @@ fn series_self_test() -> Result<(), String> {
     // its verification report had already located. These brackets pin the three
     // behaviours that replaced that refusal.
     {
-        let path = Path::new("results.jsonl");
-        let one = r#"{"schema":4,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"FAIL","argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null}"#;
-        let two = r#"{"schema":4,"attempt":2,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"PASS","argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null}"#;
-        // A row with no ordinal is attempt 1, not a missing value.
-        let single = terminal_attempt_row(path, one)?.ok_or("one row must select")?;
-        if single.attempt != 1 || single.outcome != "FAIL" {
+        let path = std::env::temp_dir().join(format!(
+            "pressure-series-result-rows-{}",
+            std::process::id()
+        ));
+        let legacy_one = r#"{"schema":4,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"FAIL","duration_ms":100,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null,"artifact_dir":"/retained/runs/r/t-verify-ptrace"}"#;
+        let one = r#"{"schema":4,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"FAIL","timeout_seconds":15,"duration_ms":100,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null,"artifact_dir":"/retained/runs/r/t-verify-ptrace"}"#;
+        let two = r#"{"schema":4,"attempt":2,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"PASS","timeout_seconds":15,"duration_ms":200,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null,"artifact_dir":"/retained/runs/r/t-verify-ptrace-attempt-2"}"#;
+        // A pre-retry row with no ordinal or bound remains readable as attempt
+        // 1; once a retry exists, every observation must carry its own bound.
+        fs::write(&path, format!("{legacy_one}\n"))
+            .map_err(|e| format!("cannot write one-row series fixture: {e}"))?;
+        let single = read_result_rows(&path)?;
+        if single.len() != 1 || single[0].attempt != 1 || single[0].outcome != "FAIL" {
             return Err("a row without an ordinal must read as attempt 1".into());
         }
-        // Two attempts select the TERMINAL one, which is what the harness exit
-        // reports; taking the first would compare an earlier outcome to a later exit.
-        let retried = terminal_attempt_row(path, &format!("{one}\n{two}\n"))?
-            .ok_or("a retried cell must still select a row")?;
-        if retried.attempt != 2 || retried.outcome != "PASS" {
+        // Both attempts remain readable, while the last one is the terminal row
+        // whose outcome is compared with the harness exit.
+        fs::write(&path, format!("{one}\n{two}\n"))
+            .map_err(|e| format!("cannot write retry series fixture: {e}"))?;
+        let retried = read_result_rows(&path)?;
+        if retried.len() != 2
+            || retried[0].attempt != 1
+            || retried[0].outcome != "FAIL"
+            || retried[1].attempt != 2
+            || retried[1].outcome != "PASS"
+        {
             return Err("a retried cell must select the terminal attempt".into());
         }
-        // Order in the file must not decide it.
-        let reversed = terminal_attempt_row(path, &format!("{two}\n{one}\n"))?
-            .ok_or("a retried cell must still select a row")?;
-        if reversed.attempt != 2 {
-            return Err("selection must be by ordinal, not by position in the file".into());
+        // Append order is evidence. Reversing it is malformed rather than an
+        // invitation for the reader to silently reorder the retained file.
+        fs::write(&path, format!("{two}\n{one}\n"))
+            .map_err(|e| format!("cannot write reversed series fixture: {e}"))?;
+        if read_result_rows(&path).is_ok() {
+            return Err("result attempt order was silently rewritten by the reader".into());
         }
         // A repeated ordinal is a malformed file, not a retry.
-        if terminal_attempt_row(path, &format!("{one}\n{one}\n")).is_ok() {
+        fs::write(&path, format!("{one}\n{one}\n"))
+            .map_err(|e| format!("cannot write duplicate series fixture: {e}"))?;
+        if read_result_rows(&path).is_ok() {
             return Err("a repeated attempt ordinal must be refused".into());
+        }
+        // A retained retry history must include every attempt in order. A gap
+        // would make the missing observation look as though it never ran.
+        let three = two.replace("\"attempt\":2", "\"attempt\":3");
+        fs::write(&path, format!("{one}\n{three}\n"))
+            .map_err(|e| format!("cannot write skipped-attempt series fixture: {e}"))?;
+        if read_result_rows(&path).is_ok() {
+            return Err("a retry history with a missing attempt must be refused".into());
+        }
+        // elapsed without the bound it ran against is not a usable retry
+        // observation. The old single-row shape above remains readable.
+        fs::write(&path, format!("{legacy_one}\n{two}\n"))
+            .map_err(|e| format!("cannot write missing-bound series fixture: {e}"))?;
+        if read_result_rows(&path).is_ok() {
+            return Err("a retry history missing attempt 1's bound must be refused".into());
         }
         // Rows from different cells are not one cell's log.
         let other = one.replace("\"test\":\"t\"", "\"test\":\"other\"");
-        if terminal_attempt_row(path, &format!("{one}\n{other}\n")).is_ok() {
+        fs::write(&path, format!("{one}\n{other}\n"))
+            .map_err(|e| format!("cannot write mixed-cell series fixture: {e}"))?;
+        if read_result_rows(&path).is_ok() {
             return Err("rows from more than one cell must be refused".into());
         }
-        if terminal_attempt_row(path, "\n  \n")?.is_some() {
-            return Err("an empty file must select nothing".into());
+        fs::write(&path, "\n  \n")
+            .map_err(|e| format!("cannot write empty series fixture: {e}"))?;
+        if read_result_rows(&path).is_ok() {
+            return Err("an empty result file must be refused".into());
         }
+        fs::remove_file(&path)
+            .map_err(|e| format!("cannot remove series result fixture: {e}"))?;
     }
 
     // ⚠️ A DIVERGENCE ON AN EARLIER ATTEMPT MUST SURVIVE A PASSING RETRY.
@@ -2027,10 +2203,15 @@ fn series_self_test() -> Result<(), String> {
     // attempt 2 passes, the terminal row reports the pass and the coordinate the
     // first attempt located is never seen by any cell.
     {
-        let path = Path::new("results.jsonl");
-        let diverged = r#"{"schema":4,"attempt":1,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"FAIL","first_divergent_record":93,"first_divergent_syscall":37,"first_divergent_scheduler_turn":68,"first_divergent_virtual_nanoseconds":7,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null}"#;
-        let passed = r#"{"schema":4,"attempt":2,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"PASS","first_divergent_record":null,"first_divergent_syscall":null,"first_divergent_scheduler_turn":null,"first_divergent_virtual_nanoseconds":null,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null}"#;
-        let all = all_attempt_rows(path, &format!("{diverged}\n{passed}\n"))?;
+        let path = std::env::temp_dir().join(format!(
+            "pressure-series-divergence-rows-{}",
+            std::process::id()
+        ));
+        let diverged = r#"{"schema":4,"attempt":1,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"FAIL","first_divergent_record":93,"first_divergent_syscall":37,"first_divergent_scheduler_turn":68,"first_divergent_virtual_nanoseconds":7,"timeout_seconds":15,"duration_ms":100,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null,"artifact_dir":"/retained/runs/r/t-verify-ptrace"}"#;
+        let passed = r#"{"schema":4,"attempt":2,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"PASS","first_divergent_record":null,"first_divergent_syscall":null,"first_divergent_scheduler_turn":null,"first_divergent_virtual_nanoseconds":null,"timeout_seconds":15,"duration_ms":200,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null,"artifact_dir":"/retained/runs/r/t-verify-ptrace-attempt-2"}"#;
+        fs::write(&path, format!("{diverged}\n{passed}\n"))
+            .map_err(|e| format!("cannot write divergence retry fixture: {e}"))?;
+        let all = read_result_rows(&path)?;
         if all.len() != 2 {
             return Err("both attempts must parse".into());
         }
@@ -2045,8 +2226,7 @@ fn series_self_test() -> Result<(), String> {
             return Err("the earlier attempt must carry its own coordinate".into());
         }
         // The terminal attempt is still the one the cell's own row reports.
-        let terminal = terminal_attempt_row(path, &format!("{diverged}\n{passed}\n"))?
-            .ok_or("a terminal row must still be selected")?;
+        let terminal = all.last().ok_or("a terminal row must still be selected")?;
         if terminal.attempt != 2 || terminal.outcome != "PASS" {
             return Err("the terminal attempt must still be the cell's reported row".into());
         }
@@ -2064,13 +2244,17 @@ fn series_self_test() -> Result<(), String> {
                 .replace("\"first_divergent_virtual_nanoseconds\":7", "\"first_divergent_virtual_nanoseconds\":null"),
             passed
         );
-        let clean = all_attempt_rows(path, &both_clean)?;
+        fs::write(&path, both_clean)
+            .map_err(|e| format!("cannot write clean retry fixture: {e}"))?;
+        let clean = read_result_rows(&path)?;
         if !earlier_attempts_that_located(&clean, 2).is_empty() {
             return Err(
                 "an earlier attempt that located NOTHING must not be reported as a divergence"
                     .into(),
             );
         }
+        fs::remove_file(&path)
+            .map_err(|e| format!("cannot remove divergence retry fixture: {e}"))?;
     }
 
     if series_run_index("a-cell-with-no-suffix") != 0 {
@@ -2135,6 +2319,8 @@ fn series_self_test() -> Result<(), String> {
         backend: Some("ptrace".into()),
         classification: "required".into(),
         outcome: "FAIL".into(),
+        timeout_seconds: Some(15),
+        duration_ms: 14_800,
         argv: Vec::new(),
         guest_argv: Vec::new(),
         env: BTreeMap::new(),
@@ -2143,10 +2329,11 @@ fn series_self_test() -> Result<(), String> {
         attempts: Vec::new(),
         reason: None,
         error_kind: None,
+        artifact_dir: "/retained/runs/campaign/node-v8-jit-verify-ptrace".into(),
     };
     let rows = series_rows(
         &metadata,
-        &[("a-cell-repetition-0000".to_string(), row)],
+        &[("a-cell-repetition-0000".to_string(), row.clone())],
         "2026-08-25T00:00:00Z",
     )?;
     if rows.len() != 1 {
@@ -2160,6 +2347,33 @@ fn series_self_test() -> Result<(), String> {
     }
     if payload.get("coordinates").is_some() {
         return Err("an unlocated divergence must carry NO coordinates object".into());
+    }
+    let first = row;
+    let mut retry = first.clone();
+    retry.attempt = 2;
+    retry.duration_ms = 14_900;
+    retry.artifact_dir.push_str("-attempt-2");
+    let retry_rows = series_rows(
+        &metadata,
+        &[
+            ("a-cell-repetition-0000".to_string(), first),
+            ("a-cell-repetition-0000".to_string(), retry),
+        ],
+        "2026-08-25T00:00:00Z",
+    )?;
+    if retry_rows.len() != 2
+        || retry_rows[0]["series"]["run_index"] != 0
+        || retry_rows[0]["series"]["attempt"] != 1
+        || retry_rows[0]["series"]["runtime"]["wall_time_min_ms"] != 14_800
+        || retry_rows[0]["series"]["timeout_seconds"] != 15
+        || retry_rows[1]["series"]["run_index"] != 1
+        || retry_rows[1]["series"]["attempt"] != 2
+        || retry_rows[1]["series"]["runtime"]["wall_time_min_ms"] != 14_900
+        || retry_rows[0]["event_id"] == retry_rows[1]["event_id"]
+    {
+        return Err(format!(
+            "appended result observations did not emit independently with elapsed times and bounds: {retry_rows:?}"
+        ));
     }
     Ok(())
 }
@@ -3702,85 +3916,6 @@ fn runner_observed_terminal_attempt(runner: RunnerEvidence, harness_status: Opti
         })
 }
 
-fn first_attempt() -> u64 {
-    1
-}
-
-/// The TERMINAL attempt's row out of an appended per-cell `results.jsonl`.
-///
-/// ⚠️ THIS FILE STOPPED HAVING EXACTLY ONE ROW, AND BOTH READERS STILL REQUIRED
-/// ONE. https://github.com/rrnewton/hermit/pull/2708 made the runner APPEND a row
-/// per attempt -- "a retry is a second observation, so it receives the next
-/// positive ordinal instead of replacing the earlier row"
-/// (`ci/manifest-plan/src/runner.rs`). Both readers here refused any such file
-/// with "contains N nonempty rows; expected exactly one", so a cell that retried
-/// contributed NO evidence at all: not its outcome, not its invocation, and not
-/// the divergence coordinates its verification report had already located.
-/// Retries happen on flaky and failing cells, which is exactly the red population
-/// a first-divergence point has to come from.
-///
-/// WHY THE TERMINAL ATTEMPT AND NOT THE FIRST. The row has to agree with the
-/// harness exit status -- `result_row_matches_cell` checks `outcome` against it --
-/// and the harness exits once, on the last attempt. Picking the first attempt
-/// would compare an earlier outcome against a later exit and refuse every
-/// retried cell for a second, more confusing reason. This is also the attempt
-/// `runner_observed_terminal_attempt` reasons about, so the two agree.
-///
-/// ⚠️ WHAT THIS DOES NOT DO, said plainly because it is a real limit. The
-/// divergence coordinates reaching the scorecard come from the verification
-/// REPORT, not from these rows, and a cell whose first attempt diverged and whose
-/// retry passed still reports the terminal pass. Recording the earlier
-/// divergence is a separate change about what a flake is worth, and it is not
-/// made here.
-fn terminal_attempt_row(
-    result_file: &Path,
-    text: &str,
-) -> Result<Option<ResultRow>, String> {
-    let lines: Vec<&str> = text.lines().filter(|line| !line.trim().is_empty()).collect();
-    if lines.is_empty() {
-        return Ok(None);
-    }
-    let mut rows: Vec<ResultRow> = Vec::with_capacity(lines.len());
-    for line in &lines {
-        rows.push(
-            serde_json::from_str(line)
-                .map_err(|e| format!("invalid {}: {e}", result_file.display()))?,
-        );
-    }
-    // Two rows claiming the same attempt are a malformed file, not a retry, and
-    // silently taking one of them would pick an arbitrary observation.
-    let mut ordinals: Vec<u64> = rows.iter().map(|row| row.attempt).collect();
-    ordinals.sort_unstable();
-    let distinct = {
-        let mut seen = ordinals.clone();
-        seen.dedup();
-        seen.len()
-    };
-    if distinct != ordinals.len() {
-        return Err(format!(
-            "{} contains {} rows but only {} distinct attempt ordinal(s); a retry must \
-             take the next ordinal rather than repeating one",
-            result_file.display(),
-            rows.len(),
-            distinct
-        ));
-    }
-    // Every row must describe the same cell, or the file is not one cell's log.
-    if let Some(first) = rows.first() {
-        for row in &rows {
-            if (&row.test, &row.mode, &row.backend, &row.run_id)
-                != (&first.test, &first.mode, &first.backend, &first.run_id)
-            {
-                return Err(format!(
-                    "{} mixes rows from more than one cell or run",
-                    result_file.display()
-                ));
-            }
-        }
-    }
-    Ok(rows.into_iter().max_by_key(|row| row.attempt))
-}
-
 /// Attempts BEFORE the terminal one that located a divergence, earliest first.
 ///
 /// ⚠️ A CELL THAT DIVERGED AND THEN PASSED ON RETRY STILL DIVERGED. The terminal
@@ -3813,25 +3948,12 @@ fn earlier_attempts_that_located(rows: &[ResultRow], terminal: u64) -> Vec<&Resu
     earlier
 }
 
-/// Every parsed row of one cell's appended log, in file order.
-fn all_attempt_rows(result_file: &Path, text: &str) -> Result<Vec<ResultRow>, String> {
-    let mut rows = Vec::new();
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        rows.push(
-            serde_json::from_str(line)
-                .map_err(|e| format!("invalid {}: {e}", result_file.display()))?,
-        );
-    }
-    Ok(rows)
-}
-
-fn result_row_matches_cell(
+fn result_row_identity_and_invocation_match(
     row: &ResultRow,
     slug: &str,
     metadata: &RunMetadata,
     cell: &CellId,
     expected_required: bool,
-    harness_status: Option<i32>,
 ) -> bool {
     let observed_backend = row.backend.as_deref().or_else(|| {
         if row.mode == "naked" {
@@ -3855,11 +3977,6 @@ fn result_row_matches_cell(
             } else {
                 "disabled"
             };
-    let exit_matches = match row.outcome.as_str() {
-        "PASS" => harness_status == Some(0),
-        "FAIL" | "ERROR" => harness_status.is_some_and(|status| status != 0),
-        _ => false,
-    };
     let invocation_is_bound = !row.argv.is_empty()
         && !row.guest_argv.is_empty()
         && !row.env.is_empty()
@@ -3877,7 +3994,24 @@ fn result_row_matches_cell(
                 && attempt.get("shell_command")
                     == Some(&JsonValue::String(row.shell_command.clone()))
         });
-    identity_matches && exit_matches && invocation_is_bound
+    identity_matches && invocation_is_bound
+}
+
+fn result_row_matches_cell(
+    row: &ResultRow,
+    slug: &str,
+    metadata: &RunMetadata,
+    cell: &CellId,
+    expected_required: bool,
+    harness_status: Option<i32>,
+) -> bool {
+    let exit_matches = match row.outcome.as_str() {
+        "PASS" => harness_status == Some(0),
+        "FAIL" | "ERROR" => harness_status.is_some_and(|status| status != 0),
+        _ => false,
+    };
+    result_row_identity_and_invocation_match(row, slug, metadata, cell, expected_required)
+        && exit_matches
 }
 
 fn invocation_attempts(row: &ResultRow) -> Result<Vec<InvocationAttempt>, String> {
@@ -4006,29 +4140,40 @@ fn top_level_repeated_result_description(
     }
 }
 
-fn verification_report_path(results: &Path, cell: &CellId, run_id: &str) -> PathBuf {
-    let harness_cell = format!(
-        "{}-{}-{}",
-        cell.test.replace('/', "-"),
-        cell.mode,
-        cell.backend
-    );
-    results
-        .join("runs")
-        .join(run_id)
-        .join(harness_cell)
-        .join("verify-1.json")
+fn result_artifact_dir(results: &Path, row: &ResultRow) -> Result<PathBuf, String> {
+    let path = PathBuf::from(&row.artifact_dir);
+    let retained_root = results.join("runs").join(&row.run_id);
+    if row.artifact_dir.is_empty()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+        || !path.starts_with(&retained_root)
+    {
+        return Err(format!(
+            "result attempt {} carries artifact directory {} outside {}",
+            row.attempt,
+            path.display(),
+            retained_root.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn verification_report_path(artifact_dir: &Path) -> PathBuf {
+    artifact_dir.join("verify-1.json")
 }
 
 fn retained_verification_logs(
-    results: &Path,
     cell: &CellId,
-    run_id: &str,
+    artifact_dir: &Path,
 ) -> Result<Vec<String>, String> {
     if cell.mode != "verify" {
         return Ok(Vec::new());
     }
-    let directory = verification_report_path(results, cell, run_id)
+    let directory = verification_report_path(artifact_dir)
         .parent()
         .expect("verification report has a parent")
         .join("verify-logs")
@@ -4094,14 +4239,13 @@ fn retained_verification_logs(
 }
 
 fn normalized_ptrace_golden(
-    results: &Path,
     cell: &CellId,
-    run_id: &str,
+    artifact_dir: &Path,
 ) -> Result<Option<String>, String> {
     if cell.mode != "verify" || cell.backend != "ptrace" {
         return Ok(None);
     }
-    let directory = verification_report_path(results, cell, run_id)
+    let directory = verification_report_path(artifact_dir)
         .parent()
         .expect("verification report has a parent")
         .join("verify-logs")
@@ -4149,14 +4293,13 @@ fn normalized_ptrace_golden(
 }
 
 fn read_verification_report(
-    results: &Path,
     cell: &CellId,
-    run_id: &str,
+    artifact_dir: &Path,
 ) -> Result<Option<JsonValue>, String> {
     if !matches!(cell.mode.as_str(), "verify" | "replay") {
         return Ok(None);
     }
-    let path = verification_report_path(results, cell, run_id);
+    let path = verification_report_path(artifact_dir);
     if !path.is_file() {
         return Ok(None);
     }
@@ -4342,116 +4485,159 @@ fn summarize(
             let proven_oom = is_proven_oom_attempt(runner, harness_status);
             let proven_timeout = is_proven_timeout_attempt(runner, harness_status);
             let result_file = cell_dir.join("results.jsonl");
-            let (outcome, row_valid, reason, error_kind, invocation) = if result_file.is_file() {
-                match fs::read_to_string(&result_file) {
-                    Ok(text) => {
-                        match terminal_attempt_row(&result_file, &text) {
-                            Err(error) => {
-                                evidence_errors.push(error);
-                                ("NO_RESULT".to_string(), false, None, None, None)
-                            }
-                            Ok(None) => {
-                                evidence_errors.push(format!(
-                                    "{} contains no nonempty rows",
-                                    result_file.display()
-                                ));
-                                ("NO_RESULT".to_string(), false, None, None, None)
-                            }
-                            Ok(Some(row)) => {
-                                {
-                                    let row_matches = result_row_matches_cell(
-                                        &row,
-                                        &evidence_run_id,
-                                        &metadata,
-                                        cell,
-                                        expected.get(cell).copied().unwrap_or(false),
-                                        harness_status,
-                                    );
-                                    let runner_completed =
-                                        runner_observed_terminal_attempt(runner, harness_status);
-                                    if row_matches && (proven_oom || runner_completed) {
-                                        match invocation_attempts(&row) {
-                                            Ok(attempts) => {
-                                                let invocation = json!({
-                                                    "run_id": row.run_id,
-                                                    "argv": row.argv,
-                                                    "guest_argv": row.guest_argv,
-                                                    "env": row.env,
-                                                    "cwd": row.cwd,
-                                                    "shell_command": row.shell_command,
-                                                    "attempts": attempts,
-                                                });
-                                                (row.outcome, true, row.reason, row.error_kind, Some(invocation))
-                                            }
-                                            Err(error) => {
-                                                evidence_errors.push(format!(
-                                                    "{} does not carry complete literal attempt invocations: {error}",
-                                                    result_file.display()
-                                                ));
-                                                ("NO_RESULT".to_string(), false, None, None, None)
-                                            }
-                                        }
-                                    } else {
+            let mut observations = Vec::new();
+            let mut result_rows_for_history = Vec::new();
+            let (outcome, row_valid, reason, error_kind, invocation, artifact_dir) = if result_file.is_file() {
+                match read_result_rows(&result_file) {
+                    Ok(result_rows) => {
+                        observations = result_rows
+                            .iter()
+                            .map(|row| {
+                                json!({
+                                    "attempt": row.attempt,
+                                    "outcome": row.outcome,
+                                    "reason": row.reason,
+                                    "error_kind": row.error_kind,
+                                    "duration_ms": row.duration_ms,
+                                    "timeout_seconds": row.timeout_seconds,
+                                    "artifact_dir": row.artifact_dir,
+                                    "first_divergent_record": row.first_divergent_record,
+                                    "first_divergent_syscall": row.first_divergent_syscall,
+                                    "first_divergent_scheduler_turn": row.first_divergent_scheduler_turn,
+                                    "first_divergent_virtual_nanoseconds": row.first_divergent_virtual_nanoseconds,
+                                })
+                            })
+                            .collect();
+                        result_rows_for_history = result_rows.clone();
+                        let expected_required = expected.get(cell).copied().unwrap_or(false);
+                        let identities_match = result_rows.iter().all(|row| {
+                            result_row_identity_and_invocation_match(
+                                row,
+                                &evidence_run_id,
+                                &metadata,
+                                cell,
+                                expected_required,
+                            )
+                        });
+                        let artifact_dirs = result_rows
+                            .iter()
+                            .map(|row| result_artifact_dir(results, row))
+                            .collect::<Result<Vec<_>, _>>();
+                        let row = result_rows.last().expect("nonempty result rows");
+                        let row_matches = result_row_matches_cell(
+                            row,
+                            &evidence_run_id,
+                            &metadata,
+                            cell,
+                            expected_required,
+                            harness_status,
+                        );
+                        let runner_completed =
+                            runner_observed_terminal_attempt(runner, harness_status);
+                        match artifact_dirs {
+                            Ok(artifact_dirs)
+                                if identities_match
+                                    && row_matches
+                                    && (proven_oom || runner_completed) =>
+                            {
+                                match invocation_attempts(row) {
+                                    Ok(attempts) => {
+                                        let invocation = json!({
+                                            "run_id": row.run_id,
+                                            "argv": row.argv,
+                                            "guest_argv": row.guest_argv,
+                                            "env": row.env,
+                                            "cwd": row.cwd,
+                                            "shell_command": row.shell_command,
+                                            "attempts": attempts,
+                                        });
+                                        (
+                                            row.outcome.clone(),
+                                            true,
+                                            row.reason.clone(),
+                                            row.error_kind.clone(),
+                                            Some(invocation),
+                                            artifact_dirs.last().cloned(),
+                                        )
+                                    }
+                                    Err(error) => {
                                         evidence_errors.push(format!(
-                                        "{} does not match the selected cell, harness exit, or retained runner result",
-                                        result_file.display()
-                                    ));
-                                        ("NO_RESULT".to_string(), false, None, None, None)
+                                            "{} does not carry complete literal attempt invocations: {error}",
+                                            result_file.display()
+                                        ));
+                                        ("NO_RESULT".to_string(), false, None, None, None, None)
                                     }
                                 }
+                            }
+                            Ok(_) => {
+                                evidence_errors.push(format!(
+                                    "{} does not match every selected-cell observation, the terminal harness exit, or retained runner result",
+                                    result_file.display()
+                                ));
+                                ("NO_RESULT".to_string(), false, None, None, None, None)
+                            }
+                            Err(error) => {
+                                evidence_errors.push(error);
+                                ("NO_RESULT".to_string(), false, None, None, None, None)
                             }
                         }
                     }
                     Err(error) => {
-                        evidence_errors.push(format!(
-                            "cannot read result row {}: {error}",
-                            result_file.display()
-                        ));
-                        ("NO_RESULT".to_string(), false, None, None, None)
+                        evidence_errors.push(error);
+                        ("NO_RESULT".to_string(), false, None, None, None, None)
                     }
                 }
             } else if !proven_oom && !proven_timeout {
                 evidence_errors.push(format!("missing result row {}", result_file.display()));
-                ("NO_RESULT".to_string(), false, None, None, None)
+                ("NO_RESULT".to_string(), false, None, None, None, None)
             } else {
-                ("NO_RESULT".to_string(), false, None, None, None)
+                ("NO_RESULT".to_string(), false, None, None, None, None)
             };
-            let verification = match read_verification_report(results, cell, &evidence_run_id) {
-                Ok(Some(report)) => Some(report),
-                Ok(None)
-                    if matches!(cell.mode.as_str(), "verify" | "replay")
-                        && !proven_oom
-                        && !proven_timeout =>
-                {
-                    evidence_errors.push(format!(
-                        "missing verification report {}",
-                        verification_report_path(results, cell, &evidence_run_id).display()
-                    ));
-                    None
-                }
-                Ok(None) => None,
-                Err(error) => {
-                    evidence_errors.push(error);
-                    None
-                }
+            let verification = match artifact_dir.as_deref() {
+                Some(artifact_dir) => match read_verification_report(cell, artifact_dir) {
+                    Ok(Some(report)) => Some(report),
+                    Ok(None)
+                        if matches!(cell.mode.as_str(), "verify" | "replay")
+                            && !proven_oom
+                            && !proven_timeout =>
+                    {
+                        evidence_errors.push(format!(
+                            "missing verification report {}",
+                            verification_report_path(artifact_dir).display()
+                        ));
+                        None
+                    }
+                    Ok(None) => None,
+                    Err(error) => {
+                        evidence_errors.push(error);
+                        None
+                    }
+                },
+                None => None,
             };
             let verification_verdict = verification
                 .as_ref()
                 .and_then(|report| report.get("verdict"))
                 .and_then(JsonValue::as_str);
-            let verification_logs = match retained_verification_logs(results, cell, &evidence_run_id) {
-                Ok(logs) => logs,
-                Err(error) => {
-                    evidence_errors.push(error);
-                    Vec::new()
-                }
+            let verification_logs = match artifact_dir.as_deref() {
+                Some(artifact_dir) => match retained_verification_logs(cell, artifact_dir) {
+                    Ok(logs) => logs,
+                    Err(error) => {
+                        evidence_errors.push(error);
+                        Vec::new()
+                    }
+                },
+                None => Vec::new(),
             };
-            let normalized_ptrace_golden = match normalized_ptrace_golden(results, cell, &evidence_run_id) {
-                Ok(path) => path,
-                Err(error) => {
-                    evidence_errors.push(error);
-                    None
-                }
+            let normalized_ptrace_golden = match artifact_dir.as_deref() {
+                Some(artifact_dir) => match normalized_ptrace_golden(cell, artifact_dir) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        evidence_errors.push(error);
+                        None
+                    }
+                },
+                None => None,
             };
             if cell.mode == "verify"
                 && matches!(verification_verdict, Some("matched" | "diverged"))
@@ -4520,13 +4706,13 @@ fn summarize(
             // observations feed `measurement`; `status` is owned by a different
             // writer and the scorecard enforces that boundary.
             if metadata.repetitions.is_none() && row_valid {
-                let earlier: Vec<JsonValue> = match fs::read_to_string(&result_file)
-                    .ok()
-                    .and_then(|text| all_attempt_rows(&result_file, &text).ok())
-                {
-                    Some(all) => {
-                        let terminal = all.iter().map(|row| row.attempt).max().unwrap_or(1);
-                        earlier_attempts_that_located(&all, terminal)
+                let earlier: Vec<JsonValue> = result_rows_for_history
+                    .last()
+                    .map(|terminal| {
+                        earlier_attempts_that_located(
+                            &result_rows_for_history,
+                            terminal.attempt,
+                        )
                             .into_iter()
                             .map(|earlier_row| {
                                 json!({
@@ -4564,20 +4750,20 @@ fn summarize(
                                 })
                             })
                             .collect()
-                    }
-                    None => Vec::new(),
-                };
+                    })
+                    .unwrap_or_default();
                 for earlier_row in earlier {
                     rows.push(earlier_row);
                 }
             }
             rows.push(json!({
                 "cell": cell,
-                    "repetition": repetition,
+                "repetition": repetition,
                 "harness_exit": harness_status,
                 "outcome": outcome,
                 "reason": reason,
                 "error_kind": error_kind,
+                "observations": observations,
                 "invocation": invocation,
                 "result_row_valid": row_valid,
                 "result": result,
@@ -6834,6 +7020,10 @@ fn self_test(root: &Path) -> Result<(), String> {
         eligible_cells: 1,
         cells: vec![sample_a.clone()],
     };
+    let sample_artifact_dir = scratch
+        .join("runs")
+        .join(&sample_slug)
+        .join("sample-a-verify-ptrace");
     let mut result_row = ResultRow {
         first_divergent_record: None,
         first_divergent_syscall: None,
@@ -6851,6 +7041,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         backend: Some(sample_a.backend.clone()),
         classification: "required".into(),
         outcome: "FAIL".into(),
+        timeout_seconds: Some(20),
+        duration_ms: 19_000,
         argv: vec!["hermit".into(), "run".into()],
         guest_argv: vec!["fixture".into()],
         env: BTreeMap::from([("LC_ALL".into(), "C".into())]),
@@ -6870,6 +7062,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         })],
         reason: None,
         error_kind: None,
+        artifact_dir: sample_artifact_dir.to_string_lossy().into_owned(),
     };
     if !result_row_matches_cell(
         &result_row,
@@ -6880,6 +7073,102 @@ fn self_test(root: &Path) -> Result<(), String> {
         Some(INCOMPLETE_ATTEMPT_STATUS),
     ) {
         return Err("matching retained result-row identity was refused".into());
+    }
+    let appended_results = scratch.join("appended-results.jsonl");
+    let first_row = result_row.clone();
+    let mut second_row = result_row.clone();
+    second_row.attempt = 2;
+    second_row.outcome = "PASS".into();
+    second_row.duration_ms = 19_500;
+    second_row.timeout_seconds = Some(20);
+    second_row.artifact_dir = format!("{}-attempt-2", first_row.artifact_dir);
+    second_row.attempts[0]["outcome"] = json!("PASS");
+    second_row.attempts[0]["status"] = json!(0);
+    fs::write(
+        &appended_results,
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&first_row)
+                .map_err(|e| format!("cannot encode first appended-row fixture: {e}"))?,
+            serde_json::to_string(&second_row)
+                .map_err(|e| format!("cannot encode retry appended-row fixture: {e}"))?,
+        ),
+    )
+    .map_err(|e| format!("cannot write appended-row fixture: {e}"))?;
+    let appended = read_result_rows(&appended_results)?;
+    if appended.len() != 2
+        || appended[0].attempt != 1
+        || appended[0].duration_ms != 19_000
+        || appended[0].timeout_seconds != Some(20)
+        || appended[1].attempt != 2
+        || appended[1].duration_ms != 19_500
+        || appended[1].timeout_seconds != Some(20)
+        || !appended.iter().all(|row| {
+            result_row_identity_and_invocation_match(
+                row,
+                &sample_slug,
+                &sample_metadata,
+                &sample_a,
+                true,
+            )
+        })
+        || result_row_matches_cell(
+            &appended[0],
+            &sample_slug,
+            &sample_metadata,
+            &sample_a,
+            true,
+            Some(0),
+        )
+        || !result_row_matches_cell(
+            &appended[1],
+            &sample_slug,
+            &sample_metadata,
+            &sample_a,
+            true,
+            Some(0),
+        )
+        || result_artifact_dir(&scratch, &appended[1])?
+            != PathBuf::from(&second_row.artifact_dir)
+    {
+        return Err(format!(
+            "two appended result observations were not retained independently: {appended:?}"
+        ));
+    }
+    let mut reused_artifact = second_row.clone();
+    reused_artifact.artifact_dir = first_row.artifact_dir.clone();
+    fs::write(
+        &appended_results,
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&first_row)
+                .map_err(|e| format!("cannot encode reused-artifact fixture: {e}"))?,
+            serde_json::to_string(&reused_artifact)
+                .map_err(|e| format!("cannot encode reused-artifact fixture: {e}"))?,
+        ),
+    )
+    .map_err(|e| format!("cannot write reused-artifact fixture: {e}"))?;
+    if read_result_rows(&appended_results).is_ok() {
+        return Err("two result attempts were allowed to reuse one artifact directory".into());
+    }
+    fs::write(
+        &appended_results,
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&first_row)
+                .map_err(|e| format!("cannot encode duplicate-attempt fixture: {e}"))?,
+            serde_json::to_string(&first_row)
+                .map_err(|e| format!("cannot encode duplicate-attempt fixture: {e}"))?,
+        ),
+    )
+    .map_err(|e| format!("cannot write duplicate-attempt fixture: {e}"))?;
+    if read_result_rows(&appended_results).is_ok() {
+        return Err("duplicate appended result attempts were accepted".into());
+    }
+    fs::write(&appended_results, "{\n")
+        .map_err(|e| format!("cannot write malformed appended-row fixture: {e}"))?;
+    if read_result_rows(&appended_results).is_ok() {
+        return Err("a malformed appended result row was accepted".into());
     }
     result_row.attempts[0]["argv"] = json!(["hermit", "run", "--hidden-policy"]);
     if result_row_matches_cell(
@@ -6938,6 +7227,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         backend: Some(green_id.backend.clone()),
         classification: "required".into(),
         outcome: "PASS".into(),
+        timeout_seconds: Some(20),
+        duration_ms: 1_000,
         argv: vec!["hermit".into(), "run".into()],
         guest_argv: vec!["fixture".into()],
         env: BTreeMap::from([("LC_ALL".into(), "C".into())]),
@@ -6957,6 +7248,12 @@ fn self_test(root: &Path) -> Result<(), String> {
         })],
         reason: None,
         error_kind: None,
+        artifact_dir: scratch
+            .join("runs")
+            .join(&first_repetition_slug)
+            .join("green-a-verify-ptrace")
+            .to_string_lossy()
+            .into_owned(),
     };
     if !result_row_matches_cell(
         &repeated_result_row,
@@ -6976,10 +7273,10 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err("retained result-row evidence crossed between repetitions".into());
     }
 
-    if !retained_verification_logs(&scratch, &sample_a, &sample_slug)?.is_empty() {
+    if !retained_verification_logs(&sample_a, &sample_artifact_dir)?.is_empty() {
         return Err("missing verify-log directory produced retained logs".into());
     }
-    let verification_path = verification_report_path(&scratch, &sample_a, &sample_slug);
+    let verification_path = verification_report_path(&sample_artifact_dir);
     let verification_directory = verification_path
         .parent()
         .expect("verification path has parent");
@@ -6990,24 +7287,24 @@ fn self_test(root: &Path) -> Result<(), String> {
     let run2_log = verify_log_directory.join("run2_log_fixture.log");
     fs::write(&run1_log, "run one\n")
         .map_err(|e| format!("cannot write run1 verify-log fixture: {e}"))?;
-    if retained_verification_logs(&scratch, &sample_a, &sample_slug).is_ok() {
+    if retained_verification_logs(&sample_a, &sample_artifact_dir).is_ok() {
         return Err("retained verify-log evidence accepted a missing run2 capture".into());
     }
     fs::write(&run2_log, "run two\n")
         .map_err(|e| format!("cannot write run2 verify-log fixture: {e}"))?;
-    if retained_verification_logs(&scratch, &sample_a, &sample_slug)?.len() != 2 {
+    if retained_verification_logs(&sample_a, &sample_artifact_dir)?.len() != 2 {
         return Err("one nonempty run1/run2 verify-log pair was refused".into());
     }
     let duplicate_run1 = verify_log_directory.join("run1_log_duplicate.log");
     fs::write(&duplicate_run1, "duplicate\n")
         .map_err(|e| format!("cannot write duplicate run1 fixture: {e}"))?;
-    if retained_verification_logs(&scratch, &sample_a, &sample_slug).is_ok() {
+    if retained_verification_logs(&sample_a, &sample_artifact_dir).is_ok() {
         return Err("duplicate retained run1 verify-log capture was accepted".into());
     }
     fs::remove_file(&duplicate_run1)
         .map_err(|e| format!("cannot remove duplicate run1 fixture: {e}"))?;
     fs::write(&run2_log, "").map_err(|e| format!("cannot empty run2 verify-log fixture: {e}"))?;
-    if retained_verification_logs(&scratch, &sample_a, &sample_slug).is_ok() {
+    if retained_verification_logs(&sample_a, &sample_artifact_dir).is_ok() {
         return Err("empty retained run2 verify-log capture was accepted".into());
     }
     fs::write(&run2_log, "run two\n")
@@ -7015,35 +7312,35 @@ fn self_test(root: &Path) -> Result<(), String> {
 
     let golden_status = verify_log_directory.join("normalized-ptrace-golden.status");
     let golden_log = verify_log_directory.join("normalized-ptrace-golden.log");
-    if normalized_ptrace_golden(&scratch, &sample_a, &sample_slug)?.is_some() {
+    if normalized_ptrace_golden(&sample_a, &sample_artifact_dir)?.is_some() {
         return Err("absent normalized ptrace golden produced an artifact".into());
     }
     fs::write(&golden_log, "canonical INFO\n")
         .map_err(|e| format!("cannot write normalized golden fixture: {e}"))?;
-    if normalized_ptrace_golden(&scratch, &sample_a, &sample_slug).is_ok() {
+    if normalized_ptrace_golden(&sample_a, &sample_artifact_dir).is_ok() {
         return Err("normalized ptrace golden without status was accepted".into());
     }
     fs::remove_file(&golden_log)
         .map_err(|e| format!("cannot remove normalized golden fixture: {e}"))?;
     fs::write(&golden_status, "0\n")
         .map_err(|e| format!("cannot write normalized golden status: {e}"))?;
-    if normalized_ptrace_golden(&scratch, &sample_a, &sample_slug).is_ok() {
+    if normalized_ptrace_golden(&sample_a, &sample_artifact_dir).is_ok() {
         return Err("normalized ptrace golden status without output was accepted".into());
     }
     fs::write(&golden_log, "canonical INFO\n")
         .map_err(|e| format!("cannot restore normalized golden fixture: {e}"))?;
-    if normalized_ptrace_golden(&scratch, &sample_a, &sample_slug)?.is_none() {
+    if normalized_ptrace_golden(&sample_a, &sample_artifact_dir)?.is_none() {
         return Err("complete normalized ptrace golden output/status pair was refused".into());
     }
     fs::write(&golden_status, "not-a-status\n")
         .map_err(|e| format!("cannot mutate normalized golden status: {e}"))?;
-    if normalized_ptrace_golden(&scratch, &sample_a, &sample_slug).is_ok() {
+    if normalized_ptrace_golden(&sample_a, &sample_artifact_dir).is_ok() {
         return Err("nonnumeric normalized ptrace golden status was accepted".into());
     }
 
     fs::write(&verification_path, "{")
         .map_err(|e| format!("cannot write malformed verification fixture: {e}"))?;
-    if read_verification_report(&scratch, &sample_a, &sample_slug).is_ok() {
+    if read_verification_report(&sample_a, &sample_artifact_dir).is_ok() {
         return Err("malformed existing verification report was accepted".into());
     }
     fs::remove_file(&verification_path)
