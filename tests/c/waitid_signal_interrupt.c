@@ -648,6 +648,52 @@ static int legacy_waitid_signal(int options) {
   return rc == -1 && saved_errno == EINTR && handler_ran ? 0 : 2;
 }
 
+static int legacy_waitid_signal_context(int options) {
+  struct sigaction action;
+  memset(&action, 0, sizeof action);
+  action.sa_sigaction = on_signal_change_wait_context;
+  sigemptyset(&action.sa_mask);
+  action.sa_flags = SA_RESTART | SA_SIGINFO;
+  if (sigaction(SIGALRM, &action, NULL) != 0) {
+    printf("waitid-legacy-context-setup-failed sigaction errno=%d\n", errno);
+    return 1;
+  }
+
+  pid_t child = fork();
+  if (child < 0) {
+    printf("waitid-legacy-context-setup-failed fork errno=%d\n", errno);
+    return 1;
+  }
+  if (child == 0) {
+    for (;;) {
+      pause();
+    }
+  }
+
+  handler_expected_wait_target = (sig_atomic_t)child;
+  handler_wait_uses_wait4 = 0;
+  siginfo_t info;
+  memset(&info, 0, sizeof info);
+  errno = 0;
+  alarm(1);
+  int rc = waitid(P_PID, child, &info, options);
+  int saved_errno = errno;
+  alarm(0);
+
+  printf(options == WSTOPPED
+             ? "waitid-wstopped-signal-context rc=%d errno=%d handler=%d target-match=%d\n"
+             : "waitid-wcontinued-signal-context rc=%d errno=%d handler=%d target-match=%d\n",
+         rc, rc < 0 ? saved_errno : 0, (int)handler_ran,
+         (int)handler_saw_expected_wait_target);
+
+  kill(child, SIGKILL);
+  waitpid(child, NULL, 0);
+  return rc == -1 && saved_errno == EINTR && handler_ran &&
+                 handler_saw_expected_wait_target
+             ? 0
+             : 2;
+}
+
 static int live_sibling_signal(int mode) {
   struct sigaction action;
   memset(&action, 0, sizeof action);
@@ -933,6 +979,12 @@ int main(int argc, char **argv) {
   if (argc == 2 && strcmp(argv[1], "--waitid-wstopped-signal-interrupt") == 0) {
     return legacy_waitid_signal(WSTOPPED);
   }
+  if (argc == 2 && strcmp(argv[1], "--waitid-wcontinued-signal-context") == 0) {
+    return legacy_waitid_signal_context(WCONTINUED);
+  }
+  if (argc == 2 && strcmp(argv[1], "--waitid-wstopped-signal-context") == 0) {
+    return legacy_waitid_signal_context(WSTOPPED);
+  }
   if (argc == 2 && strcmp(argv[1], "--live-sibling-signal") == 0) {
     return live_sibling_signal(0);
   }
@@ -948,6 +1000,6 @@ int main(int argc, char **argv) {
   if (argc == 2 && strcmp(argv[1], "--wait4-live-sibling-signal-blocked") == 0) {
     return live_sibling_signal(3);
   }
-  fprintf(stderr, "usage: %s [--child-ready-wins|--signal-restart|--wait4-signal-interrupt|--wait4-child-ready-wins|--wait4-signal-restart|--signal-restart-handler|--wait4-signal-restart-handler|--signal-restart-then-interrupt|--wait4-signal-restart-then-interrupt|--signal-restart-context|--wait4-signal-restart-context|--signal-restart-target|--wait4-signal-restart-target|--waitid-default-disposition SIGNAL|--wait4-default-disposition SIGNAL|--waitid-wcontinued-signal-interrupt|--waitid-wstopped-signal-interrupt|--live-sibling-signal|--live-sibling-signal-restart|--live-sibling-signal-blocked|--live-sibling-thread-signal|--wait4-live-sibling-signal-blocked]\n", argv[0]);
+  fprintf(stderr, "usage: %s [--child-ready-wins|--signal-restart|--wait4-signal-interrupt|--wait4-child-ready-wins|--wait4-signal-restart|--signal-restart-handler|--wait4-signal-restart-handler|--signal-restart-then-interrupt|--wait4-signal-restart-then-interrupt|--signal-restart-context|--wait4-signal-restart-context|--signal-restart-target|--wait4-signal-restart-target|--waitid-default-disposition SIGNAL|--wait4-default-disposition SIGNAL|--waitid-wcontinued-signal-interrupt|--waitid-wstopped-signal-interrupt|--waitid-wcontinued-signal-context|--waitid-wstopped-signal-context|--live-sibling-signal|--live-sibling-signal-restart|--live-sibling-signal-blocked|--live-sibling-thread-signal|--wait4-live-sibling-signal-blocked]\n", argv[0]);
   return 64;
 }
