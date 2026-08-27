@@ -274,6 +274,24 @@ use crate::types::SigWrapper;
 #[macro_use]
 extern crate bitflags;
 
+/// Does `map` enclose the observed program break `[start, end)`?
+///
+/// Split out of `Detcore::detlog_brk_heap` so the selection is directly
+/// testable without a live guest or a real `/proc/pid/maps`. The predicate has
+/// two independent halves and each admits a distinct wrong answer:
+///
+/// * `MMapPath::Anonymous` -- this fallback exists ONLY for a heap the kernel
+///   did NOT label. A labelled `[heap]` is already reported by the loop above
+///   the caller, so admitting one here would emit the heap twice.
+/// * full containment -- the reported extent is the break, taken from the
+///   enclosing mapping's columns. A mapping that merely OVERLAPS the break
+///   would supply columns for a region that does not contain it.
+fn encloses_observed_break(map: &procmaps::MemoryMap, start: u64, end: u64) -> bool {
+    matches!(map.pathname, procmaps::MMapPath::Anonymous)
+        && map.address.0 <= start
+        && end <= map.address.1
+}
+
 #[cold]
 fn report_rcb_overshoot(
     panic_on_rcb_overshoot: bool,
@@ -1008,11 +1026,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         else {
             return Ok(());
         };
-        let enclosing = procmaps::from_pid(guest.pid(), |map| {
-            matches!(map.pathname, procmaps::MMapPath::Anonymous)
-                && map.address.0 <= start
-                && end <= map.address.1
-        })?;
+        let enclosing =
+            procmaps::from_pid(guest.pid(), |map| encloses_observed_break(map, start, end))?;
         let Some(mmap) = enclosing.into_iter().next() else {
             return Ok(());
         };
@@ -3075,6 +3090,101 @@ mod subscription_tests {
                 .iter_syscalls()
                 .any(|sysno| sysno == Sysno::pidfd_open)
         );
+    }
+}
+
+#[cfg(test)]
+mod brk_heap_selection_tests {
+    use procfs::process::MMPermissions;
+    use procfs::process::MMapPath;
+    use procfs::process::MemoryMap;
+
+    use super::encloses_observed_break;
+    use super::procmaps;
+
+    const BRK_START: u64 = 0x60_2000;
+    const BRK_END: u64 = 0x62_3000;
+
+    fn map(pathname: MMapPath, start: u64, end: u64) -> MemoryMap {
+        MemoryMap {
+            address: (start, end),
+            perms: MMPermissions::READ | MMPermissions::WRITE | MMPermissions::PRIVATE,
+            offset: 0,
+            dev: (0, 0),
+            inode: 0,
+            pathname,
+            extension: Default::default(),
+        }
+    }
+
+    #[test]
+    fn selects_an_anonymous_mapping_that_encloses_the_break() {
+        assert!(encloses_observed_break(
+            &map(MMapPath::Anonymous, BRK_START - 0x1000, BRK_END + 0x1000),
+            BRK_START,
+            BRK_END
+        ));
+    }
+
+    #[test]
+    fn exact_coincidence_still_encloses() {
+        assert!(encloses_observed_break(
+            &map(MMapPath::Anonymous, BRK_START, BRK_END),
+            BRK_START,
+            BRK_END
+        ));
+    }
+
+    #[test]
+    fn rejects_a_mapping_that_only_overlaps_the_break() {
+        assert!(!encloses_observed_break(
+            &map(MMapPath::Anonymous, BRK_START + 0x1000, BRK_END + 0x1000),
+            BRK_START,
+            BRK_END
+        ));
+        assert!(!encloses_observed_break(
+            &map(MMapPath::Anonymous, BRK_START - 0x1000, BRK_END - 0x1000),
+            BRK_START,
+            BRK_END
+        ));
+    }
+
+    #[test]
+    fn rejects_a_labelled_heap_even_when_it_encloses() {
+        assert!(!encloses_observed_break(
+            &map(MMapPath::Heap, BRK_START - 0x1000, BRK_END + 0x1000),
+            BRK_START,
+            BRK_END
+        ));
+    }
+
+    #[test]
+    fn rejects_a_file_backed_mapping_that_encloses() {
+        assert!(!encloses_observed_break(
+            &map(
+                MMapPath::Path(std::path::PathBuf::from("/lib/libc.so.6")),
+                BRK_START - 0x1000,
+                BRK_END + 0x1000
+            ),
+            BRK_START,
+            BRK_END
+        ));
+    }
+
+    /// THE EXTENT IS THE BREAK, NOT THE ENCLOSING ARENA.
+    #[test]
+    fn the_reported_extent_is_the_break_not_the_enclosing_mapping() {
+        let arena = map(MMapPath::Anonymous, BRK_START - 0x4000, BRK_END + 0x4000);
+        let rendered = procmaps::display_range_as(&arena, BRK_START, BRK_END, "[heap]");
+        assert!(
+            rendered.starts_with(&format!("{:#x}-{:#x} ", BRK_START, BRK_END)),
+            "extent must be the observed break, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("{:#x}", BRK_START - 0x4000)),
+            "the enclosing arena's start must not appear: {rendered}"
+        );
+        assert!(rendered.ends_with(" [heap]"), "got: {rendered}");
     }
 }
 
