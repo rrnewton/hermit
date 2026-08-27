@@ -10,6 +10,8 @@
 // TODO-HUMAN-REVIEW(PR-644): Review unsupported policy across root, fork, and exec.
 
 #define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
@@ -46,6 +48,19 @@ int main(int argc, char **argv) {
     }
     puts("dbt-unsupported-exec-ok");
     return 0;
+  }
+
+  if (argc == 3 && strcmp(argv[1], "refuse-second-run") == 0) {
+    int marker = open(argv[2], O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (marker >= 0) {
+      close(marker);
+      return 0;
+    }
+    if (errno != EEXIST) {
+      perror("open second-run marker");
+      return 1;
+    }
+    return call_unsupported();
   }
 
   if (argc == 2 && strcmp(argv[1], "exec-empty") == 0) {

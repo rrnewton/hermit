@@ -57,6 +57,14 @@ slow-timeout = { period = "30s", terminate-after = 1, grace-period = "2s" }
 filter = "test(/(^|::)run_timeout_fallback_fires_when_the_unwind_does_not_finish$/)"
 slow-timeout = { period = "30s", terminate-after = 1, grace-period = "2s" }
 
+# This test performs two complete LiteInst/ptrace executions and compares their
+# retained logs. The baseline validation killed it at 15.002s, while a bounded
+# diagnostic run reached the first completed execution at 11.04s. Give this one
+# two-run test the existing 30s exception without widening the rest of test.cli.
+[[profile.default.overrides]]
+filter = "test(/(^|::)run_liteinst_verifies_detcore_backend$/)"
+slow-timeout = { period = "30s", terminate-after = 1, grace-period = "2s" }
+
 # This binary deliberately exercises a 15s timeout and a 20s teardown budget.
 # Once the previously unregistered binary actually ran, one of
 # its sibling tests hit the 15s default at 15.002s. Give all three tests the

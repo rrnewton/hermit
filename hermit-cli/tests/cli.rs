@@ -230,6 +230,11 @@ fn liteinst_inert_runtime() -> &'static Path {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
+        fs::write(
+            PathBuf::from(format!("{}.revision", runtime.display())),
+            format!("{}\n", env!("HERMIT_REVERIE_PIN")),
+        )
+        .expect("failed to record inert LiteInst runtime revision");
         runtime
     })
 }
@@ -1132,7 +1137,6 @@ fn run_ptrace_fails_closed_by_default_on_unsupported_syscall() {
         "",
         "unsupported guest published its success marker"
     );
-
     let compatibility_args = [
         "run",
         "--allow-unsupported-syscalls",
@@ -1205,6 +1209,74 @@ fn run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls()
         stdout(&default),
         "",
         "unsupported guest published its success marker"
+    );
+    assert_eq!(
+        default.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "default DBT refusal did not report the policy-refusal exit:\n{}",
+        stderr(&default)
+    );
+    assert!(
+        stderr(&default).contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "default DBT refusal omitted the policy-refusal marker:\n{}",
+        stderr(&default)
+    );
+
+    let guest_101_args = ["run", "--backend", "dbt", "--", "/bin/sh", "-c", "exit 101"];
+    let guest_101 = hermit(&guest_101_args);
+    assert_eq!(
+        guest_101.status.code(),
+        Some(101),
+        "a guest-selected exit 101 was relabelled:\n{}",
+        stderr(&guest_101)
+    );
+    assert!(
+        !stderr(&guest_101).contains("HERMIT_POLICY_REFUSAL"),
+        "a guest failure was reported as a policy refusal:\n{}",
+        stderr(&guest_101)
+    );
+
+    let verify_refusal_args = ["run", "--backend", "dbt", "--verify", "--", program];
+    let verify_refusal = hermit(&verify_refusal_args);
+    assert_eq!(
+        verify_refusal.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "first-run DBT refusal under --verify had the wrong class:\n{}",
+        stderr(&verify_refusal)
+    );
+    assert!(
+        stderr(&verify_refusal).contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "first-run DBT refusal under --verify omitted its marker:\n{}",
+        stderr(&verify_refusal)
+    );
+
+    let second_run_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create second-run refusal directory");
+    let second_run_marker = second_run_directory.path().join("first-run-complete");
+    let second_run_marker = second_run_marker
+        .to_str()
+        .expect("second-run refusal marker path should be UTF-8");
+    let second_run_refusal_args = [
+        "run",
+        "--backend",
+        "dbt",
+        "--verify",
+        "--",
+        program,
+        "refuse-second-run",
+        second_run_marker,
+    ];
+    let second_run_refusal = hermit(&second_run_refusal_args);
+    assert_eq!(
+        second_run_refusal.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "second-run DBT refusal under --verify had the wrong class:\n{}",
+        stderr(&second_run_refusal)
+    );
+    assert!(
+        stderr(&second_run_refusal).contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "second-run DBT refusal under --verify omitted its marker:\n{}",
+        stderr(&second_run_refusal)
     );
 
     let normal_args = [
@@ -1535,6 +1607,15 @@ fn inherited_container_output_does_not_expose_capture_offset() {
 
 #[test]
 fn run_liteinst_rejects_a_non_runtime_override_before_activation_claim() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create false LiteInst runtime directory");
+    let false_runtime = directory.path().join("not-a-liteinst-runtime.so");
+    fs::copy("/bin/true", &false_runtime).expect("failed to copy false LiteInst runtime");
+    fs::write(
+        PathBuf::from(format!("{}.revision", false_runtime.display())),
+        format!("{}\n", env!("HERMIT_REVERIE_PIN")),
+    )
+    .expect("failed to record false LiteInst runtime revision");
     let args = [
         "run",
         "--backend",
@@ -1544,7 +1625,7 @@ fn run_liteinst_rejects_a_non_runtime_override_before_activation_claim() {
         "/bin/true",
     ];
     let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .env("HERMIT_LITEINST_RUNTIME", "/bin/true")
+        .env("HERMIT_LITEINST_RUNTIME", &false_runtime)
         .args(args)
         .output()
         .expect("failed to run Hermit with a false LiteInst runtime");

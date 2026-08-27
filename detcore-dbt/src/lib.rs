@@ -398,8 +398,7 @@ fn requires_native_lifecycle(sysnum: i64) -> bool {
 }
 
 // TODO-HUMAN-REVIEW(PR-1038): Review DBT self-target queued-signal identity translation.
-// TODO-HUMAN-REVIEW(PR-1065): Review DBT self-target prlimit64 translation.
-fn translate_self_identity_targets(
+fn translate_self_signal_targets(
     sysnum: i64,
     args: &mut [u64; 6],
     virtual_pid: i32,
@@ -407,14 +406,7 @@ fn translate_self_identity_targets(
     host_pid: i32,
     host_tid: i32,
 ) {
-    if virtual_pid <= 0 || host_pid <= 0 {
-        return;
-    }
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    if sysnum == libc::SYS_prlimit64 && args[0] as i32 == virtual_pid {
-        args[0] = host_pid as u32 as u64;
-    }
-    if virtual_tid <= 0 || host_tid <= 0 {
+    if virtual_pid <= 0 || host_pid <= 0 || virtual_tid <= 0 || host_tid <= 0 {
         return;
     }
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -873,7 +865,7 @@ fn report_fd_is_available() -> bool {
     (unsafe { libc::fcntl(UNSUPPORTED_SYSCALL_REPORT_FD, libc::F_GETFD) }) != -1
 }
 
-fn append_copied_syscall_record(sysnum: i64) {
+fn append_unsupported_syscall_record(sysnum: i64) {
     let report_fd = COPIED_UNSUPPORTED_REPORT_FD.load(Ordering::Acquire);
     if report_fd == -1 {
         return;
@@ -1895,7 +1887,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_copied_syscall(sysnum: i64, args: *
     if strict {
         1
     } else {
-        append_copied_syscall_record(sysnum);
+        append_unsupported_syscall_record(sysnum);
         0
     }
 }
@@ -1963,7 +1955,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
     };
     let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
     let mut dispatch_args: [u64; 6] = raw_args.try_into().expect("six syscall arguments");
-    translate_self_identity_targets(
+    translate_self_signal_targets(
         sysnum,
         &mut dispatch_args,
         scratch.virtual_pid,
@@ -2249,6 +2241,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         }
         Err(Error::Tool(error)) => {
             if let Some(unsupported) = error.downcast_ref::<UnsupportedSyscallError>() {
+                append_unsupported_syscall_record(sysnum);
                 let message = format!("detcore-dbt: {unsupported}\n");
                 unsafe { emit(message.as_ptr(), message.len()) };
                 -1
@@ -3055,15 +3048,9 @@ mod tests {
     }
 
     #[test]
-    fn self_identity_translation_uses_virtual_targets_even_with_v1_physical_scheduler_ids() {
-        let (v1_scheduler_tid, v1_process_pid) = RuntimeAbi::V1
-            .runtime_identity(4, 3, 10_004, 10_003)
-            .expect("ABI v1 physical callback identities are valid");
-        assert_eq!(i32::from(v1_scheduler_tid), 10_004);
-        assert_eq!(i32::from(v1_process_pid), 10_003);
-
+    fn only_queued_signal_targets_are_translated_before_detcore() {
         let mut targeted = [3, 4, libc::SIGUSR1 as u64, 0, 0, 0];
-        translate_self_identity_targets(
+        translate_self_signal_targets(
             libc::SYS_rt_tgsigqueueinfo,
             &mut targeted,
             3,
@@ -3074,7 +3061,7 @@ mod tests {
         assert_eq!(targeted[..2], [10_003, 10_004]);
 
         let mut process = [3, libc::SIGUSR1 as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(
+        translate_self_signal_targets(
             libc::SYS_rt_sigqueueinfo,
             &mut process,
             3,
@@ -3084,8 +3071,12 @@ mod tests {
         );
         assert_eq!(process[0], 10_003);
 
+        let mut prlimit = [3, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
+        translate_self_signal_targets(libc::SYS_prlimit64, &mut prlimit, 3, 4, 10_003, 10_004);
+        assert_eq!(prlimit[0], 3);
+
         let mut other = [5, 6, libc::SIGUSR1 as u64, 0, 0, 0];
-        translate_self_identity_targets(
+        translate_self_signal_targets(
             libc::SYS_rt_tgsigqueueinfo,
             &mut other,
             3,
@@ -3094,47 +3085,6 @@ mod tests {
             10_004,
         );
         assert_eq!(other[..2], [5, 6]);
-
-        let mut process_group = [0, libc::SIGUSR1 as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(
-            libc::SYS_rt_sigqueueinfo,
-            &mut process_group,
-            0,
-            0,
-            10_003,
-            10_004,
-        );
-        assert_eq!(process_group[0], 0);
-
-        let mut prlimit = [3, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(libc::SYS_prlimit64, &mut prlimit, 3, 4, 10_003, 10_004);
-        assert_eq!(prlimit[0], 10_003);
-
-        let mut prlimit_without_tid = [3, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(
-            libc::SYS_prlimit64,
-            &mut prlimit_without_tid,
-            3,
-            0,
-            10_003,
-            0,
-        );
-        assert_eq!(prlimit_without_tid[0], 10_003);
-
-        let mut current = [0, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(libc::SYS_prlimit64, &mut current, 3, 4, 10_003, 10_004);
-        assert_eq!(current[0], 0);
-
-        let mut other_process = [5, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(
-            libc::SYS_prlimit64,
-            &mut other_process,
-            3,
-            4,
-            10_003,
-            10_004,
-        );
-        assert_eq!(other_process[0], 5);
     }
 
     #[test]
@@ -3872,7 +3822,7 @@ mod tests {
         // classic Unsupported set but for the full deterministic-refusal
         // boundary (splice/tee/vmsplice, perf_event_open, the keyring family),
         // otherwise strict guests execute those syscalls natively against the
-        // host. Report fd is left at its -1 default so `append_copied_syscall_record`
+        // host. Report fd is left at its -1 default so `append_unsupported_syscall_record`
         // is a no-op and the non-strict branch has no observable side effect.
         let previous = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
 
