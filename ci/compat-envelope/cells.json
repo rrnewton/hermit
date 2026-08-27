@@ -1,5 +1,11 @@
 {
   "schema": 6,
+  "projection": {
+    "source": "../../series",
+    "refreshed_at": "2026-08-27T09:23:50Z",
+    "rows_read": 9,
+    "pre_series_corpus": true
+  },
   "cells": [
     {
       "lane": "portable",
@@ -794,9 +800,27 @@
             }
           ],
           "invocations": []
+        },
+        {
+          "detcore_tree": "d65d0a7468fa74989ffe4cf7b468074cc9936c58",
+          "provenance": "pressure-test",
+          "depth": {
+            "hermit": {
+              "commits": 1926,
+              "first_parent": 1851
+            }
+          },
+          "hermit_shas": [
+            "dee8cf49ce6a7e3e9e2c87c930f3aa55ae83da18"
+          ],
+          "results": [
+            "pass",
+            "determinism-failure"
+          ],
+          "invocations": []
         }
       ],
-      "measurement": "measured-and-passed"
+      "measurement": "diverged-unlocated"
     },
     {
       "lane": "portable",

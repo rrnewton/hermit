@@ -75,10 +75,10 @@ The count table includes all **5728** tracked cells; no row is omitted. The curr
 
 | Status | `never-measured` | `measured-and-passed` | `measured-no-verdict` | `diverged-unlocated` | `diverged` | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `green` | 0 | 302 | 0 | 2 | 0 | 304 |
+| `green` | 0 | 301 | 0 | 3 | 0 | 304 |
 | `red` | 362 | 1 | 0 | 0 | 8 | 371 |
 | `not-applicable` | 5052 | 0 | 0 | 0 | 1 | 5053 |
-| **Total** | **5414** | **303** | **0** | **2** | **9** | **5728** |
+| **Total** | **5414** | **302** | **0** | **3** | **9** | **5728** |
 
 Cells whose stored `measurement` is not `never-measured` are shown individually so status and measurement remain visible together.
 
@@ -86,7 +86,7 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | --- | --- | --- | --- | --- |
 | `applications/c-toolchain-workflow` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `applications/example-timed-progress-bar` | `verify` | `ptrace` | `red` | `measured-and-passed` |
-| `applications/git-repository-workflow` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `applications/git-repository-workflow` | `verify` | `ptrace` | `green` | `diverged-unlocated` |
 | `applications/timed-progress-bar` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/aio-refusal` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/append-pwrite` | `verify` | `ptrace` | `green` | `measured-and-passed` |
