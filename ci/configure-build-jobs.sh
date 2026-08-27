@@ -140,8 +140,11 @@ fi
 # while this layer declines with 2 reports the SAME condition as two different
 # things depending on which guard fired first. Both are "could not determine",
 # which is what EX_TEMPFAIL means to scripts/validate.rs.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 86d9003a7a2a8d5399ef94a251e4d991d6c504a5 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to calibrated Reverie 86d9003a7a2a8d5399ef94a251e4d991d6c504a5 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# 86d9003a..7137c5dd leaves reverie-dbt/vendor/dynamorio,
+# reverie-dbt/build.rs, and third-party byte-identical by git object ID, so the
+# measured budget carries unchanged with the Reverie pin.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 7137c5ddba398728f8fc8e7068a198ce4223f9c3 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to calibrated Reverie 7137c5ddba398728f8fc8e7068a198ce4223f9c3 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
