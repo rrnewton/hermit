@@ -120,6 +120,10 @@ const RELEASE_GRACE_TICKS: u32 = 25;
 pub struct GdbClientWatch {
     container_done: Arc<AtomicBool>,
     client_exited_early: Arc<AtomicBool>,
+    // Test synchronization: set only after the watcher has reaped the client
+    // and confirmed that the container has not finished.
+    #[cfg(test)]
+    client_exited_before_container_finished: Arc<AtomicBool>,
     watcher: Option<JoinHandle<()>>,
 }
 
@@ -134,6 +138,10 @@ impl GdbClientWatch {
         let client_exited_early = Arc::new(AtomicBool::new(false));
         let done = Arc::clone(&container_done);
         let exited_early = Arc::clone(&client_exited_early);
+        #[cfg(test)]
+        let client_exited_before_container_finished = Arc::new(AtomicBool::new(false));
+        #[cfg(test)]
+        let observed_exit_before_finish = Arc::clone(&client_exited_before_container_finished);
 
         let watcher = thread::spawn(move || {
             // ⚠️ POLL, DO NOT BLOCK. This was `client.wait()`, which blocks until
@@ -187,6 +195,8 @@ impl GdbClientWatch {
             if done.load(Ordering::SeqCst) {
                 return;
             }
+            #[cfg(test)]
+            observed_exit_before_finish.store(true, Ordering::SeqCst);
 
             // ⚠️ THE CLIENT IS GONE AND THE CONTAINER IS NOT. Whatever the
             // container is doing, no debugger will ever attach to it, so a
@@ -320,6 +330,8 @@ impl GdbClientWatch {
         Self {
             container_done,
             client_exited_early,
+            #[cfg(test)]
+            client_exited_before_container_finished,
             watcher: Some(watcher),
         }
     }
@@ -414,6 +426,8 @@ impl Drop for GdbClientWatch {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+    use std::io::Write;
     use std::net::TcpListener;
     use std::time::Instant;
 
@@ -892,5 +906,130 @@ mod tests {
             !watch.client_exited_early.load(Ordering::SeqCst),
             "the flag was set after the fact for a container that was never blocked"
         );
+    }
+    /// A client that CONNECTED, completed its session and exited must not be
+    /// reported as having exited before connecting.
+    ///
+    /// [`CLIENT_EXITED_BEFORE_CONNECTING`] says the client "exited before it
+    /// finished connecting", so the negation -- connected, served, quit -- is what
+    /// must never be flagged. The other cells pin clients that never connect at
+    /// all; this is the path a real `gdb -batch ... quit` takes on every
+    /// successful run, and it is named here so the record has it.
+    ///
+    /// ⚠️ THIS IS A SCENARIO CELL, NOT INDEPENDENT COVERAGE, AND SAYING SO IS THE
+    /// POINT. Reverting the defect-2 correction fails this cell AND
+    /// `a_client_that_exits_first_but_strands_nobody`, because both end with
+    /// NOTHING LISTENING on the port -- that cell binds nothing, this one drops
+    /// the listener after the accept -- so both exercise the same branch: connect
+    /// fails, loop spins, `done` arrives, no flag. Fail-on-revert therefore does
+    /// not establish that this cell catches anything the suite would otherwise
+    /// miss. Raised by `agent(hermit-001)` on the review of this change.
+    ///
+    /// ⚠️ AND IT CANNOT DETECT A REVERIE CONTRACT CHANGE, WHICH AN EARLIER VERSION
+    /// OF THIS COMMENT CLAIMED. The `drop(listener)` below is this test's OWN, not
+    /// `reverie-ptrace`'s. If `wait_for_tcp_connection` ever kept its listener
+    /// bound, this cell would go on passing, because it drops the listener itself
+    /// either way. The reverie side is pinned where the fact lives, by
+    /// `the_listener_is_closed_once_the_client_is_accepted` in that repository.
+    ///
+    /// ⚠️ THE DISCRIMINATING SHAPE IS NOT WRITABLE GREEN TODAY. It would be a
+    /// listener that stays BOUND and answering after the accept -- the only case
+    /// where the release connect succeeds without our accept having been released.
+    /// MEASURED on hermit#2678's head a826d51a2116: in exactly that scenario the
+    /// flag comes out TRUE (`accepts_after_session=1 total_accepts=3
+    /// flag_reported=true`), so a cell asserting the correct answer would be RED.
+    /// The store at the successful connect precedes the grace loop, and moving it
+    /// after would suppress the flag in the TRUE-positive case too, because a
+    /// released accept also lets the container finish inside the grace window.
+    /// This is the conceded port-collision exposure, tracked as
+    /// `gdb_watcher_release_probe`; it is not reachable in production only because
+    /// reverie drops the listener.
+    #[test]
+    fn a_client_that_connected_and_finished_its_session_is_not_reported_as_early() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind a test listener");
+        let port = listener.local_addr().expect("no local addr").port();
+
+        // A stand-in for `gdb -batch ... quit`: connect, wait for the server to
+        // finish the session, then exit. Waiting on the accepted connection makes
+        // the ordering a fact rather than a delay: the client cannot exit before
+        // the accept and listener drop have happened.
+        let client = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "exec 3<>/dev/tcp/127.0.0.1/{port} || exit 1; IFS= read -r -n 1 <&3; exec 3>&-"
+            ))
+            .spawn()
+            .expect("failed to spawn the stand-in client");
+
+        let mut watch = GdbClientWatch::spawn(client, port);
+
+        // The gdbserver accepts. Bounded, because a hanging test is worse than a
+        // red one: it names itself in a line, a wedged one eats the whole run.
+        listener
+            .set_nonblocking(true)
+            .expect("failed to set the test listener non-blocking");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let accepted = loop {
+            match listener.accept() {
+                Ok(pair) => break Some(pair),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        break None;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("accept failed: {e}"),
+            }
+        };
+        let (mut accepted, _) = accepted.expect("the stand-in client never connected within 30s");
+
+        // ⚠️ THE REVERIE CONTRACT, REPRODUCED. `wait_for_tcp_connection` returns
+        // the stream and drops the listener; from here on the port answers
+        // nothing, while the session itself stays open.
+        drop(listener);
+
+        // End the accepted session, then wait for the peer to close it. EOF is
+        // direct evidence that the client completed the session; no elapsed time
+        // is used as a substitute for that fact.
+        accepted
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("failed to bound the wait for the stand-in client to close");
+        accepted
+            .write_all(b"q")
+            .expect("failed to finish the stand-in client's session");
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            accepted
+                .read(&mut byte)
+                .expect("the stand-in client did not close its session within 30s"),
+            0,
+            "the stand-in client sent unexpected data instead of closing its session"
+        );
+
+        // `finish()` publishes container completion. Wait until the watcher has
+        // reaped the client and confirmed that the container is still running,
+        // so this cell cannot silently take the container-finished-first branch
+        // and pass without exercising its case.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !watch
+            .client_exited_before_container_finished
+            .load(Ordering::SeqCst)
+            && Instant::now() < deadline
+        {
+            thread::sleep(CLIENT_POLL_INTERVAL);
+        }
+        assert!(
+            watch
+                .client_exited_before_container_finished
+                .load(Ordering::SeqCst),
+            "the watcher did not observe the stand-in client exit while the container was still running"
+        );
+
+        assert!(
+            !watch.finish(),
+            "a client that connected, finished its session and exited was reported as having \
+             exited before connecting -- the flag's own documented meaning, inverted"
+        );
+        drop(accepted);
     }
 }
