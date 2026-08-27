@@ -4396,19 +4396,28 @@ fn retained_coordinate_decision(
         .cloned()
         .unwrap_or_default();
     let mut current_by_run: BTreeMap<
-        (String, String, Option<u64>),
+        (String, String, Option<u64>, String),
         BTreeMap<(ObservedResult, DivergenceCoordinates), CurrentPressureResult>,
     > = BTreeMap::new();
     for result in offered_current_results {
         let row = &result.summary.rows[0];
-        let run_id = row
+        let invocation = row
             .invocation
             .as_ref()
-            .expect("trusted pressure row has an invocation")
-            .run_id
-            .clone();
+            .expect("trusted pressure row has an invocation");
+        // The pressure producer's run_id identifies the cell, not a campaign:
+        // separate retained campaigns can therefore carry the same run_id and
+        // repetition. Their literal commands still name distinct working
+        // directories. Include that command in the key so three independently
+        // executed summaries count as three samples, while a copied summary
+        // with the identical invocation is still deduplicated.
         current_by_run
-            .entry((result.summary.hermit_sha.clone(), run_id, row.repetition))
+            .entry((
+                result.summary.hermit_sha.clone(),
+                invocation.run_id.clone(),
+                row.repetition,
+                invocation.shell_command.clone(),
+            ))
             .or_default()
             .entry((result.result, result.coordinates))
             .or_insert(result);
@@ -5721,6 +5730,18 @@ fn self_test() -> Result<(), String> {
             .run_id = run_id.into();
         current_result(row)
     };
+    let current_run_at = |run_id: &str, cwd: &str, mut row: PressureSummaryRow| {
+        let invocation = row
+            .invocation
+            .as_mut()
+            .expect("fixture current row has invocation");
+        invocation.run_id = run_id.into();
+        invocation.cwd = cwd.into();
+        invocation.shell_command = format!("cd {cwd} && env LC_ALL=C hermit run");
+        invocation.attempts[0].cwd = cwd.into();
+        invocation.attempts[0].shell_command = invocation.shell_command.clone();
+        current_result(row)
+    };
     let retained_cell = |candidates: Vec<ResultCandidate>| RetainedCellResults {
         id: validate_id.clone(),
         hermit_sha: "sha-1".into(),
@@ -5883,8 +5904,8 @@ fn self_test() -> Result<(), String> {
             results: BTreeMap::from([(
                 validate_id.clone(),
                 vec![
-                    current_run("match-one", pass_row.clone()),
-                    current_run("match-two", pass_row),
+                    current_run_at("same-cell-run-id", "/repo/match-one", pass_row.clone()),
+                    current_run_at("same-cell-run-id", "/repo/match-two", pass_row),
                 ],
             )]),
             uncheckable: BTreeMap::new(),
