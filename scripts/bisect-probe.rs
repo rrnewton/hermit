@@ -268,7 +268,11 @@ impl Repro {
 /// product. An `Absent` produced by two failed measurements would read as "nothing to
 /// bisect" and quietly retire a real failing test.
 fn classify_repro(alone: Verdict, in_category: Verdict) -> Repro {
-    if !alone.measured() || !in_category.measured() {
+    // A reproduction observation must have actually run and concluded PASS or
+    // FAIL. HOST-INAPPLICABLE is useful scheduling information, but it did not run
+    // the cell and therefore cannot establish that a failure is absent.
+    let observed = |verdict| matches!(verdict, Verdict::Pass | Verdict::Fail);
+    if !observed(alone) || !observed(in_category) {
         return Repro::Unmeasured;
     }
     match (alone == Verdict::Fail, in_category == Verdict::Fail) {
@@ -277,6 +281,29 @@ fn classify_repro(alone: Verdict, in_category: Verdict) -> Repro {
         (true, false) => Repro::AloneOnly,
         (false, false) => Repro::Absent,
     }
+}
+
+/// Select the ids that a `--test` bisect can safely search.
+///
+/// A measured non-standalone result may be left out with its reason printed by
+/// the caller. An unmeasured result is different: it makes the requested set
+/// incomplete, so the whole bisect must refuse rather than silently drop that id.
+fn standalone_ids(
+    reproductions: &BTreeMap<String, Repro>,
+) -> Result<BTreeSet<String>, Vec<String>> {
+    let unmeasured: Vec<String> = reproductions
+        .iter()
+        .filter(|(_, repro)| **repro == Repro::Unmeasured)
+        .map(|(id, _)| id.clone())
+        .collect();
+    if !unmeasured.is_empty() {
+        return Err(unmeasured);
+    }
+    Ok(reproductions
+        .iter()
+        .filter(|(_, repro)| **repro == Repro::Standalone)
+        .map(|(id, _)| id.clone())
+        .collect())
 }
 
 /// One round of the batched bisection: which ids are now localised, and which
@@ -325,6 +352,30 @@ fn probe_rc(verdicts: &[Verdict]) -> i32 {
         return RC_FAIL;
     }
     RC_OK
+}
+
+/// Decide which half a bisection probe permits us to keep.
+///
+/// Only PASS and FAIL provide a direction. Any pending id that was skipped,
+/// missing, unselected, errored, or absent from the result map makes the whole
+/// midpoint unusable: treating one of those states like PASS would silently throw
+/// away the lower half of the search range.
+fn midpoint_any_fail(
+    pending: &BTreeSet<String>,
+    verdicts: &BTreeMap<String, Verdict>,
+) -> Result<bool, Vec<String>> {
+    let unmeasured: Vec<String> = pending
+        .iter()
+        .filter_map(|id| match verdicts.get(id).copied() {
+            Some(Verdict::Pass | Verdict::Fail) => None,
+            Some(verdict) => Some(format!("{id}={}", verdict.label())),
+            None => Some(format!("{id}=NO-VERDICT")),
+        })
+        .collect();
+    if !unmeasured.is_empty() {
+        return Err(unmeasured);
+    }
+    Ok(pending.iter().any(|id| verdicts.get(id) == Some(&Verdict::Fail)))
 }
 
 fn fail(message: &str) -> ! {
@@ -559,9 +610,16 @@ fn is_primary_checkout(root: &Path) -> bool {
     let dir = git(root, &["rev-parse", "--absolute-git-dir"]);
     let common = git(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"]);
     match (dir, common) {
-        (Ok(dir), Ok(common)) => dir == common,
+        (Ok(dir), Ok(common)) => git_dirs_are_primary(&dir, &common),
         _ => true,
     }
+}
+
+/// Git identifies the primary checkout by giving it the same repository-local
+/// directory for `--git-dir` and `--git-common-dir`. A linked worktree has its own
+/// git directory below the common one, so the two paths differ.
+fn git_dirs_are_primary(dir: &str, common: &str) -> bool {
+    dir == common
 }
 
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
@@ -606,7 +664,6 @@ fn probe_at(
     build: &str,
     commit: &str,
     pending: &BTreeSet<String>,
-    counts: &BTreeMap<String, usize>,
 ) -> BTreeMap<String, Verdict> {
     let mut verdicts: BTreeMap<String, Verdict> = BTreeMap::new();
     if let Err(e) = git(root, &["checkout", "--detach", "--force", commit]) {
@@ -633,6 +690,10 @@ fn probe_at(
         }
         return verdicts;
     }
+    // The plan belongs to the commit that was just checked out. Reusing counts
+    // from the starting checkout makes a cell added, removed, or reclassified in
+    // the searched range look MISSING or PASS against the wrong revision.
+    let plan = enumerate(root, harness, lane, pending);
     for id in pending {
         let out = run_selection(
             root,
@@ -644,7 +705,7 @@ fn probe_at(
             &BTreeSet::from([id.clone()]),
             "bisect",
         );
-        let (_, v, _, _) = report_row(id, counts, &out);
+        let (_, v, _, _) = report_row(id, &plan.counts, &out);
         verdicts.insert(id.clone(), v);
     }
     verdicts
@@ -668,8 +729,6 @@ fn bisect(
     good: &str,
     bad: &str,
     ids: &BTreeSet<String>,
-    counts: &BTreeMap<String, usize>,
-    categories: &BTreeMap<String, String>,
 ) -> i32 {
     use std::io::Write;
 
@@ -687,21 +746,35 @@ fn bisect(
         eprintln!("bisect-probe: build FAILED at bad={bad}; nothing can be established");
         return RC_UNUSABLE;
     }
-    let mut pending: BTreeSet<String> = BTreeSet::new();
+    // Enumerate only after checking out and building `bad`: this plan describes
+    // the revision whose reproduction is about to be tested, not whichever
+    // revision happened to be checked out when the driver started.
+    let bad_plan = enumerate(root, harness, lane, ids);
+    let mut reproductions: BTreeMap<String, Repro> = BTreeMap::new();
     for id in ids {
         let unknown = String::from("<unknown>");
-        let cat = categories.get(id).unwrap_or(&unknown);
+        let cat = bad_plan.category_of.get(id).unwrap_or(&unknown);
         let alone = run_selection(root, harness, lane, jobs, "--test", id, &BTreeSet::from([id.clone()]), "alone");
-        let (_, a, _, _) = report_row(id, counts, &alone);
+        let (_, a, _, _) = report_row(id, &bad_plan.counts, &alone);
         let incat = run_selection(root, harness, lane, jobs, "--category", cat, &BTreeSet::from([id.clone()]), "incat");
-        let (_, c, _, _) = report_row(id, counts, &incat);
+        let (_, c, _, _) = report_row(id, &bad_plan.counts, &incat);
         let repro = classify_repro(a, c);
         println!("{}\t{id}\tat bad={bad}: {}", repro.label(), repro.guidance(cat));
         let _ = std::io::stdout().flush();
-        if repro == Repro::Standalone {
-            pending.insert(id.clone());
-        }
+        reproductions.insert(id.clone(), repro);
     }
+    let mut pending = match standalone_ids(&reproductions) {
+        Ok(pending) => pending,
+        Err(unmeasured) => {
+            eprintln!(
+                "bisect-probe: REFUSED: {} requested id(s) were NOT MEASURED at bad={bad}: {}. \
+                 A bisect cannot discard them or choose a direction from them. Nothing was bisected.",
+                unmeasured.len(),
+                unmeasured.join(", ")
+            );
+            return RC_NOT_MEASURED;
+        }
+    };
     if pending.is_empty() {
         eprintln!(
             "bisect-probe: REFUSED: none of the {} requested id(s) reproduces STANDALONE at \
@@ -754,9 +827,22 @@ fn bisect(
                     mid + 1,
                     candidates.len()
                 );
-                probe_at(root, harness, lane, jobs, build, &commit, &pending, counts)
+                probe_at(root, harness, lane, jobs, build, &commit, &pending)
             });
-            let any_fail = pending.iter().any(|id| verdicts.get(id) == Some(&Verdict::Fail));
+            let any_fail = match midpoint_any_fail(&pending, verdicts) {
+                Ok(any_fail) => any_fail,
+                Err(unmeasured) => {
+                    eprintln!(
+                        "bisect-probe: REFUSED at {commit}: the midpoint left pending id(s) \
+                         unmeasured, so choosing either half would be unsupported: {}",
+                        unmeasured.join(", ")
+                    );
+                    for id in &pending {
+                        println!("UNRESOLVED\t{id}\tunmeasured midpoint at {commit}");
+                    }
+                    return RC_NOT_MEASURED;
+                }
+            };
             if any_fail {
                 found = Some(mid);
                 right = mid;
@@ -901,34 +987,9 @@ fn main() {
 
     let root = repo_root();
     let harness = root.join("target/debug/test-harness");
-    if !harness.exists() {
-        fail(&format!(
-            "{} is missing; build it with `cargo build -p hermit-manifest-plan --bin test-harness`",
-            harness.display()
-        ));
+    if good.is_some() != bad.is_some() {
+        fail("--good and --bad must be given together; one alone names no range");
     }
-
-    // ⚠️ ENUMERATE AND REFUSE BEFORE RUNNING ANYTHING. An unmatched id is a defect in
-    // the probe's INPUT, and discovering it after 40 seconds of cells is strictly
-    // worse than discovering it now. This is also the check `plan` itself will not do.
-    let plan = enumerate(&root, &harness, &lane, &ids);
-    let counts = plan.counts.clone();
-    let unselected: Vec<&String> = counts.iter().filter(|(_, n)| **n == 0).map(|(k, _)| k).collect();
-    if !unselected.is_empty() {
-        for id in &unselected {
-            println!("UNSELECTED\t{id}\t0 cells -- matched nothing in lane {lane}");
-        }
-        eprintln!(
-            "bisect-probe: REFUSED: {} of {} requested id(s) matched no cell: {}. \
-             An unmatched id is NOT a pass -- `test-harness plan` exits 0 for one, which is \
-             why this driver checks. Nothing was run; fix the list and re-probe.",
-            unselected.len(),
-            ids.len(),
-            unselected.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
-        );
-        std::process::exit(RC_NOT_MEASURED);
-    }
-
     if let (Some(good), Some(bad)) = (&good, &bad) {
         // ⚠️ THIS MODE CHECKS OUT COMMITS, so it must never run where someone else's
         // work or the shared primary would be clobbered. Both guards are refusals,
@@ -949,11 +1010,38 @@ fn main() {
             );
         }
         std::process::exit(bisect(
-            &root, &harness, &lane, &jobs, &build, good, bad, &ids, &counts, &plan.category_of,
+            &root, &harness, &lane, &jobs, &build, good, bad, &ids,
         ));
     }
-    if good.is_some() != bad.is_some() {
-        fail("--good and --bad must be given together; one alone names no range");
+
+    if !harness.exists() {
+        fail(&format!(
+            "{} is missing; build it with `cargo build -p hermit-manifest-plan --bin test-harness`",
+            harness.display()
+        ));
+    }
+
+    // ⚠️ ENUMERATE AND REFUSE BEFORE RUNNING ANYTHING. An unmatched id is a defect in
+    // the probe's INPUT, and discovering it after 40 seconds of cells is strictly
+    // worse than discovering it now. This is also the check `plan` itself will not do.
+    // Bisect mode enumerates after each checkout instead, because a plan from this
+    // starting revision cannot describe a historical commit.
+    let plan = enumerate(&root, &harness, &lane, &ids);
+    let counts = plan.counts.clone();
+    let unselected: Vec<&String> = counts.iter().filter(|(_, n)| **n == 0).map(|(k, _)| k).collect();
+    if !unselected.is_empty() {
+        for id in &unselected {
+            println!("UNSELECTED\t{id}\t0 cells -- matched nothing in lane {lane}");
+        }
+        eprintln!(
+            "bisect-probe: REFUSED: {} of {} requested id(s) matched no cell: {}. \
+             An unmatched id is NOT a pass -- `test-harness plan` exits 0 for one, which is \
+             why this driver checks. Nothing was run; fix the list and re-probe.",
+            unselected.len(),
+            ids.len(),
+            unselected.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        );
+        std::process::exit(RC_NOT_MEASURED);
     }
 
     if repro_only {
@@ -1097,6 +1185,16 @@ fn self_test() -> i32 {
     // wrong; the message beside it is asserted so a reword cannot silently retarget
     // the guard.
     {
+        // Pure two-sided bracket: this runs in every checkout. The live checks
+        // below prove git supplies the expected paths on this machine, while this
+        // pair ensures the comparison itself cannot become always-true or inverted.
+        if !git_dirs_are_primary("/repo/.git", "/repo/.git") {
+            bad.push("the shared-primary guard must RECOGNISE equal git directories".into());
+        }
+        if git_dirs_are_primary("/repo/.git/worktrees/review", "/repo/.git") {
+            bad.push("the shared-primary guard must NOT reject unequal worktree directories".into());
+        }
+
         // The primary of this repository, whatever machine this is running on.
         let here = repo_root();
         let common = std::process::Command::new("git")
@@ -1183,13 +1281,35 @@ fn self_test() -> i32 {
     if classify_repro(Verdict::Fail, Verdict::Missing) != Repro::Unmeasured {
         bad.push("an unmeasured in-category observation must dominate".into());
     }
+    if classify_repro(Verdict::Skipped, Verdict::Fail) != Repro::Unmeasured {
+        bad.push("a host-inapplicable standalone observation must stay UNMEASURED".into());
+    }
+    if classify_repro(Verdict::Fail, Verdict::Skipped) != Repro::Unmeasured {
+        bad.push("a host-inapplicable category observation must stay UNMEASURED".into());
+    }
     // ⚠️ THE CONTROL. Without it, a classifier returning SuiteOnly for everything
     // would satisfy the case that matters most and look correct.
-    if classify_repro(Verdict::Pass, Verdict::Pass) == Repro::SuiteOnly {
-        bad.push("control: a clean id must NOT be classified SUITE-ONLY".into());
+    if classify_repro(Verdict::Pass, Verdict::Pass) != Repro::Absent {
+        bad.push("control: two real passing observations must be NO-REPRO".into());
     }
     if Repro::SuiteOnly.guidance("c-programs") == Repro::Standalone.guidance("c-programs") {
         bad.push("control: SUITE-ONLY and STANDALONE must not give the same guidance".into());
+    }
+    let mixed_reproductions = BTreeMap::from([
+        ("A".to_string(), Repro::Standalone),
+        ("B".to_string(), Repro::Unmeasured),
+    ]);
+    if standalone_ids(&mixed_reproductions) != Err(vec!["B".to_string()]) {
+        bad.push("one unmeasured id must refuse the whole requested bisect".into());
+    }
+    let measured_reproductions = BTreeMap::from([
+        ("A".to_string(), Repro::Standalone),
+        ("B".to_string(), Repro::SuiteOnly),
+    ]);
+    if standalone_ids(&measured_reproductions)
+        != Ok(BTreeSet::from(["A".to_string()]))
+    {
+        bad.push("a measured STANDALONE id must remain eligible for bisection".into());
     }
 
     // ── The batched-bisection round planner ─────────────────────────────────────
@@ -1256,6 +1376,56 @@ fn self_test() -> i32 {
         bad.push("a round that resolves anything must shrink the pending set".into());
     }
 
+    // ── The midpoint decision used by the binary search ─────────────────────────
+    // PASS and FAIL are the only values that can choose a half. Anything else
+    // means the midpoint did not answer the question, even when another id failed.
+    let two = pend(&["A", "B"]);
+    if midpoint_any_fail(&two, &at(&[("A", Verdict::Pass), ("B", Verdict::Pass)]))
+        != Ok(false)
+    {
+        bad.push("an all-pass midpoint must choose the later half".into());
+    }
+    if midpoint_any_fail(&two, &at(&[("A", Verdict::Pass), ("B", Verdict::Fail)]))
+        != Ok(true)
+    {
+        bad.push("a fully measured midpoint with a failure must choose the earlier half".into());
+    }
+    let mixed = midpoint_any_fail(&two, &at(&[("A", Verdict::Fail), ("B", Verdict::Error)]));
+    if !matches!(mixed, Err(ref rows) if rows == &["B=ERROR".to_string()]) {
+        bad.push(format!(
+            "an ERROR must refuse the midpoint even beside a FAIL, got {mixed:?}"
+        ));
+    }
+    let missing = midpoint_any_fail(&two, &at(&[("A", Verdict::Pass)]));
+    if !matches!(missing, Err(ref rows) if rows == &["B=NO-VERDICT".to_string()]) {
+        bad.push(format!(
+            "a missing pending verdict must refuse the midpoint, got {missing:?}"
+        ));
+    }
+    let skipped = midpoint_any_fail(&two, &at(&[("A", Verdict::Pass), ("B", Verdict::Skipped)]));
+    if !matches!(skipped, Err(ref rows) if rows == &["B=SKIPPED".to_string()]) {
+        bad.push(format!(
+            "a host-inapplicable midpoint must refuse rather than choose a half, got {skipped:?}"
+        ));
+    }
+
+    // A checked-out commit's plan can change the verdict for identical rows. This
+    // is why `probe_at` no longer accepts counts from its caller and enumerates only
+    // after checkout/build: one row is PASS against the current one-cell plan, but
+    // MISSING against a stale two-cell plan.
+    let one = pend(&["A"]);
+    let one_pass = BTreeMap::from([("A".to_string(), vec!["PASS".to_string()])]);
+    let current_counts = BTreeMap::from([("A".to_string(), 1usize)]);
+    let stale_counts = BTreeMap::from([("A".to_string(), 2usize)]);
+    let current = report_rows(&one, &current_counts, &one_pass);
+    let stale = report_rows(&one, &stale_counts, &one_pass);
+    if current[0].1 != Verdict::Pass || stale[0].1 != Verdict::Missing {
+        bad.push(
+            "the checked-out commit's plan must determine its verdict; stale counts changed nothing"
+                .into(),
+        );
+    }
+
     for b in &bad {
         eprintln!("bisect-probe self-test: FAIL -- {b}");
     }
@@ -1266,7 +1436,8 @@ fn self_test() -> i32 {
         "PASS: bisect-probe folds per-cell outcomes into one verdict per REQUESTED id, \
          reports an unmatched id as UNSELECTED rather than a pass, keeps \
          not-measured (rc=3) distinct from failed (rc=1), separates a standalone \
-         reproduction from a suite-only one, and localises exactly the ids that fail \
+         reproduction from a suite-only one, refuses unmeasured bisection midpoints, \
+         uses each checked-out commit's plan, and localises exactly the ids that fail \
          at a bisection boundary"
     );
     0
@@ -1275,6 +1446,126 @@ fn self_test() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct GitFixture {
+        root: PathBuf,
+        harness: PathBuf,
+    }
+
+    impl GitFixture {
+        fn new(label: &str) -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before Unix epoch")
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "bisect-probe-{label}-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&root).expect("create fixture repository");
+            let fixture = Self {
+                harness: root.join("target/debug/test-harness"),
+                root,
+            };
+            fixture.git(&["init", "-q"]);
+            fixture.git(&["config", "user.email", "bisect-probe@example.invalid"]);
+            fixture.git(&["config", "user.name", "bisect-probe test"]);
+            fixture.git(&["config", "core.hooksPath", "/dev/null"]);
+            fixture
+        }
+
+        fn git(&self, args: &[&str]) -> String {
+            let output = Command::new("git")
+                .current_dir(&self.root)
+                .args(args)
+                .output()
+                .expect("run git in fixture repository");
+            assert!(
+                output.status.success(),
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+
+        fn commit_state(
+            &self,
+            plan_count: usize,
+            build_ok: bool,
+            outcome: &str,
+            message: &str,
+        ) -> String {
+            fs::write(self.root.join("plan-count"), format!("{plan_count}\n"))
+                .expect("write plan count");
+            fs::write(
+                self.root.join("build-ok"),
+                if build_ok { "yes\n" } else { "no\n" },
+            )
+            .expect("write build state");
+            fs::write(self.root.join("outcome"), format!("{outcome}\n"))
+                .expect("write outcome");
+            self.git(&["add", "plan-count", "build-ok", "outcome"]);
+            self.git(&["commit", "-q", "-m", message]);
+            self.git(&["rev-parse", "HEAD"])
+        }
+
+        fn install_harness(&self) {
+            fs::create_dir_all(
+                self.harness
+                    .parent()
+                    .expect("fixture harness has a parent"),
+            )
+            .expect("create fixture target directory");
+            fs::write(
+                &self.harness,
+                r#"#!/bin/sh
+set -eu
+case "$1" in
+  plan)
+    count=$(cat plan-count)
+    if [ "$count" = 1 ]; then
+      printf '%s\n' '[{"category":"cat","id":{"test":"a"}}]'
+    else
+      printf '%s\n' '[{"category":"cat","id":{"test":"a"}},{"category":"cat","id":{"test":"a"}}]'
+    fi
+    ;;
+  run)
+    results=
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "--results" ]; then
+        shift
+        results=$1
+        break
+      fi
+      shift
+    done
+    test -n "$results"
+    outcome=$(cat outcome)
+    printf '{"test":"a","outcome":"%s"}\n' "$outcome" > "$results"
+    ;;
+  *) exit 2 ;;
+esac
+"#,
+            )
+            .expect("write fixture harness");
+            let mut permissions = fs::metadata(&self.harness)
+                .expect("read fixture harness metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&self.harness, permissions)
+                .expect("make fixture harness executable");
+        }
+    }
+
+    impl Drop for GitFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
 
     fn ids(list: &[&str]) -> BTreeSet<String> {
         list.iter().map(|s| s.to_string()).collect()
@@ -1360,5 +1651,139 @@ mod tests {
         assert_eq!(fold(2, &["ERROR".into(), "FAIL".into()]), Verdict::Error);
         assert_eq!(fold(2, &["PASS".into()]), Verdict::Missing);
         assert_ne!(RC_FAIL, RC_NOT_MEASURED);
+    }
+
+    #[test]
+    fn reproduction_requires_a_real_observation_in_both_positions() {
+        assert_eq!(
+            classify_repro(Verdict::Skipped, Verdict::Fail),
+            Repro::Unmeasured
+        );
+        assert_eq!(
+            classify_repro(Verdict::Fail, Verdict::Skipped),
+            Repro::Unmeasured
+        );
+        assert_eq!(classify_repro(Verdict::Pass, Verdict::Pass), Repro::Absent);
+    }
+
+    #[test]
+    fn an_unmeasured_reproduction_refuses_the_whole_requested_bisect() {
+        assert_eq!(
+            standalone_ids(&BTreeMap::from([
+                ("a".to_string(), Repro::Standalone),
+                ("b".to_string(), Repro::Unmeasured),
+            ])),
+            Err(vec!["b".to_string()])
+        );
+        assert_eq!(
+            standalone_ids(&BTreeMap::from([
+                ("a".to_string(), Repro::Standalone),
+                ("b".to_string(), Repro::SuiteOnly),
+            ])),
+            Ok(ids(&["a"]))
+        );
+    }
+
+    #[test]
+    fn an_unmeasured_midpoint_cannot_choose_a_half() {
+        let pending = ids(&["a", "b"]);
+        assert_eq!(
+            midpoint_any_fail(
+                &pending,
+                &BTreeMap::from([
+                    ("a".to_string(), Verdict::Pass),
+                    ("b".to_string(), Verdict::Fail),
+                ]),
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            midpoint_any_fail(
+                &pending,
+                &BTreeMap::from([
+                    ("a".to_string(), Verdict::Fail),
+                    ("b".to_string(), Verdict::Error),
+                ]),
+            ),
+            Err(vec!["b=ERROR".to_string()])
+        );
+        assert_eq!(
+            midpoint_any_fail(
+                &pending,
+                &BTreeMap::from([("a".to_string(), Verdict::Pass)]),
+            ),
+            Err(vec!["b=NO-VERDICT".to_string()])
+        );
+    }
+
+    #[test]
+    fn the_checked_out_plan_changes_the_verdict() {
+        let requested = ids(&["a"]);
+        let outcomes = BTreeMap::from([("a".to_string(), vec!["PASS".to_string()])]);
+        let current_counts = BTreeMap::from([("a".to_string(), 1usize)]);
+        let stale_counts = BTreeMap::from([("a".to_string(), 2usize)]);
+        assert_eq!(report_rows(&requested, &current_counts, &outcomes)[0].1, Verdict::Pass);
+        assert_eq!(report_rows(&requested, &stale_counts, &outcomes)[0].1, Verdict::Missing);
+    }
+
+    #[test]
+    fn primary_checkout_comparison_has_both_directions() {
+        assert!(git_dirs_are_primary("/repo/.git", "/repo/.git"));
+        assert!(!git_dirs_are_primary(
+            "/repo/.git/worktrees/review",
+            "/repo/.git"
+        ));
+    }
+
+    #[test]
+    fn probe_uses_the_plan_from_the_commit_it_checked_out() {
+        let fixture = GitFixture::new("checked-out-plan");
+        let stale = fixture.commit_state(2, true, "PASS", "two cells");
+        let current = fixture.commit_state(1, true, "PASS", "one cell");
+        fixture.install_harness();
+        fixture.git(&["checkout", "--detach", "--force", &stale]);
+
+        let pending = ids(&["a"]);
+        let verdicts = probe_at(
+            &fixture.root,
+            &fixture.harness,
+            "portable",
+            "1",
+            "test \"$(cat build-ok)\" = yes",
+            &current,
+            &pending,
+        );
+        assert_eq!(
+            verdicts.get("a"),
+            Some(&Verdict::Pass),
+            "one returned row must be PASS under the checked-out commit's one-cell plan; \
+             reusing the starting checkout's two-cell plan would make it MISSING"
+        );
+    }
+
+    #[test]
+    fn an_unmeasured_midpoint_stops_the_search() {
+        let fixture = GitFixture::new("unmeasured-midpoint");
+        let good = fixture.commit_state(1, true, "PASS", "good");
+        let _first_bad = fixture.commit_state(1, true, "FAIL", "first bad");
+        let _unmeasured = fixture.commit_state(1, false, "FAIL", "cannot build");
+        let bad = fixture.commit_state(1, true, "FAIL", "bad endpoint");
+        fixture.install_harness();
+
+        let rc = bisect(
+            &fixture.root,
+            &fixture.harness,
+            "portable",
+            "1",
+            "test \"$(cat build-ok)\" = yes",
+            &good,
+            &bad,
+            &ids(&["a"]),
+        );
+        assert_eq!(
+            rc, RC_NOT_MEASURED,
+            "a build error at the first midpoint must refuse the search rather than \
+             discard the earlier failing commit and report the later endpoint"
+        );
     }
 }
