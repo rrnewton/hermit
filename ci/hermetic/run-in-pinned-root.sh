@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# Run a command inside the nix-pinned validate root. OPT-IN: nothing calls this
-# by default, and the ordinary validate path is unchanged.
+# Run a command inside the nix-pinned validate root. The canonical host-side
+# validate plan uses this wrapper for each build and test DAG node.
 #
-# SHAPE, unchanged from the stage-1 recommendation. The existing outer
-# systemd-run, validate-lock and cgroup policy stay exactly as they are; this is
-# only the filesystem mechanism, and it deliberately adds no second resource or
-# cgroup layer. The payload is one privileged podman container pinned BY DIGEST,
-# with /dev/kvm passed through, no runtime network, source at /src
-# (read-only by default, explicitly writable for the combined build-and-test phase),
-# and separate writable output and target volumes.
+# The existing outer systemd-run, validate-lock, DAG scheduler, and cgroup
+# policy stay on the host; this wrapper adds the pinned filesystem and network
+# boundary without creating a second resource or cgroup layer. Each invocation
+# is one privileged podman container pinned BY DIGEST, with /dev/kvm passed
+# through, no runtime network, source at /src (read-only by default, explicitly
+# writable for validation nodes), and separate writable output and target
+# volumes.
 #
 # WHY BY DIGEST AND NOT BY TAG. A tag is mutable; a digest is the artifact that
 # actually ran. The digest belongs in the receipt next to the flake.lock: the
 # digest says what ran, the lock says how to rebuild it. See README.md.
 #
 #   usage: run-in-pinned-root.sh --src DIR --out DIR [--digest NAME@SHA]
-#                                [--src-rw] [--cargo-home DIR] -- CMD...
+#                                [--src-rw] [--cargo-home DIR] [--env NAME]... -- CMD...
 #
 # --src-rw mounts the source WRITABLE. The default is read-only and stays that
 # way, but a test phase legitimately writes into its own tree (target/ci,
@@ -35,6 +35,7 @@ HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 DIGEST_FILE="$HERE/image.digest"
 
 src=""; out=""; digest=""; src_mode="ro=true"; cargo_home=""
+pass_env=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --src) src=$2; shift 2 ;;
@@ -42,6 +43,7 @@ while [[ $# -gt 0 ]]; do
         --digest) digest=$2; shift 2 ;;
         --src-rw) src_mode="ro=false"; shift ;;
         --cargo-home) cargo_home=$2; shift 2 ;;
+        --env) pass_env+=("$2"); shift 2 ;;
         --) shift; break ;;
         *) echo "run-in-pinned-root: unexpected argument '$1'" >&2; exit 2 ;;
     esac
@@ -112,23 +114,51 @@ if [[ -n "$cargo_home" ]]; then
     cargo_home_in=/cargo
 fi
 
+env_args=()
+extra_mounts=()
+device_args=()
+if [[ -e /dev/kvm ]]; then
+    device_args+=(--device /dev/kvm)
+fi
+for name in "${pass_env[@]}"; do
+    [[ $name =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
+        echo "run-in-pinned-root: invalid environment name '$name'." >&2
+        exit 2
+    }
+    [[ -v $name ]] || continue
+    case "$name" in
+        E2E_RESULT_ROOT)
+            mkdir -p "${!name}"
+            extra_mounts+=(--mount "type=bind,source=${!name},destination=/results")
+            env_args+=(-e E2E_RESULT_ROOT=/results)
+            ;;
+        E2E_BUILD_ROOT)
+            env_args+=(-e E2E_BUILD_ROOT=/src/target/e2e-build)
+            ;;
+        *) env_args+=(--env "$name") ;;
+    esac
+done
+
 # `--network=none` is the point, not a precaution: if the run can reach the
 # network it can pick up something the lock does not describe, and the rebuild
 # guarantee is void. CARGO_NET_OFFLINE in the image makes that fail loudly.
 exec podman run --rm \
     --privileged \
-    --device /dev/kvm \
+    --hostname=hermetic-container.local \
+    "${device_args[@]}" \
     --network=none \
     --http-proxy=false \
     --tmpfs /test:rw,nosuid,nodev,mode=1777 \
     --mount "type=bind,source=$src,destination=/src,$src_mode" \
-    --mount "type=bind,source=$out/target,destination=/out/target" \
+    --mount "type=bind,source=$out/target,destination=/src/target" \
     --mount "type=bind,source=$out/home,destination=/build" \
     "${cargo_mount[@]}" \
     "${git_mounts[@]}" \
+    "${extra_mounts[@]}" \
+    "${env_args[@]}" \
     -e HOME=/build \
     -e CARGO_HOME="$cargo_home_in" \
-    -e CARGO_TARGET_DIR=/out/target \
+    -e CARGO_TARGET_DIR=/src/target \
     -w /src \
     "$digest" \
     "$@"

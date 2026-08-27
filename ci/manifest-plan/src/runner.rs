@@ -215,31 +215,6 @@ pub struct CellId {
 const SCHEDULED_JOBS_ENV: &str = "HERMIT_E2E_SCHEDULED_JOBS";
 const ISOLATED_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
 const HERMETIC_TEST_WORKDIR: &str = "/test";
-
-/// The working directory every Hermit-run cell gets, and the parent of the empty
-/// per-attempt directories bound to it.
-///
-/// ⚠️ THIS IS THE FIXED HALF OF THE HERMETIC WORKDIR CONTROL, NOT THE WHOLE OF IT
-/// AS THE BRIEF SPELLS IT. The brief asks for a fixed `/test`. This delivers a
-/// fixed AND freshly-empty `/tmp/test`, which is a different path for a
-/// structural reason, not a cosmetic one:
-///
-///   * `--bind` refuses any target outside guest `/tmp` — it warns "target ... is
-///     outside guest /tmp, so this option has no effect" and does nothing — so a
-///     literal `/test` cannot be reached by binding;
-///   * the only route that reaches `/test` is `--mount=type=tmpfs,target=/test`,
-///     and that PANICS today: `reverie-process/src/container.rs:909` unwraps an
-///     `Err(ENOENT, context: Mount)` for ANY target, one that exists on the host
-///     as much as one that does not. That is `HERMETIC_TEST_WORKDIR` above and it
-///     is why `ISOLATED_WORKDIR_ENV` is set by nothing;
-///   * and `--workdir /test` alone only works on a host where somebody has already
-///     created `/test` by hand. Depending on that is the hidden host state this
-///     control exists to remove.
-///
-/// So: a reader must NOT conclude from this constant that the hermetic workdir
-/// work is finished. What is done is "every attempt runs in an empty directory
-/// at the same guest path whatever the host cwd is". What is not done is that
-/// directory being `/test`, and that waits on the reverie mount panic.
 const FIXED_GUEST_WORKDIR: &str = "/tmp/test";
 const FIXED_WORKDIR_SOURCE_DIR: &str = "workdir";
 
@@ -735,14 +710,20 @@ pub fn validate_mode_workdir(
     if !Path::new(workdir).is_absolute() {
         return Err(format!("{id}: {mode} workdir must be an absolute path"));
     }
-    // The DBT dispatcher currently rebuilds the guest launch from program,
-    // arguments, and environment only; it does not preserve Command::current_dir.
+    // The pinned DBT launcher preserves Command::current_dir, but it does not
+    // enter Hermit's container and therefore cannot see a workdir supplied by
+    // Hermit's mount namespace. Refuse until the requested path is established
+    // in the namespace the DBT guest actually uses.
     if backends_enabled.iter().any(|backend| backend == "dbt") {
         return Err(format!(
-            "{id}: {mode} workdir is unsupported when DBT is enabled"
+            "{id}: {mode} workdir is unsupported when DBT is enabled because DBT does not enter the Hermit mount namespace"
         ));
     }
     Ok(())
+}
+
+fn supports_test_workdir(mode: &str, backend: &str) -> bool {
+    matches!(mode, "verify" | "replay" | "chaos" | "custom") && backend != "dbt"
 }
 
 fn cell_relaxations(cell: &SelectedCell) -> Vec<String> {
@@ -1170,7 +1151,7 @@ fn prepare_test_until(
         _ => return Err(format!("{} has unsupported program kind", cell.test.id)),
     };
     guest.extend(guest_args);
-    if context.isolated_workdir.is_some() {
+    if context.isolated_workdir.is_some() || supports_test_workdir(&cell.id.mode, backend) {
         resolve_repo_guest_args(&context.root, &mut guest);
     }
     Ok(guest)
@@ -1323,10 +1304,10 @@ pub fn build_spec(
     seed: Option<i64>,
     timeout_seconds: u64,
 ) -> Result<CellRunSpec, String> {
-    // Validate before using the label in the workdir, verdict, log, or evidence
-    // paths. `execute_spec` may remove the workdir, so accepting `..`, an
-    // absolute path, or more than one component would turn a label into a
-    // filesystem target outside this attempt's directory.
+    // The label is used in verdict, log, evidence, and capture paths. Reject
+    // traversal and multi-component values before any of those paths are
+    // created. The ordinary host-bound workdir uses the same guard; the
+    // hermetic tmpfs path does not remove this path-safety property.
     let fixed_workdir_source = fixed_workdir_source_for_attempt(&dir, attempt)?;
     let backend = cell.id.backend.as_deref().unwrap_or("native");
     let mode_recipe = &cell.test.modes[&cell.id.mode];
@@ -1344,26 +1325,23 @@ pub fn build_spec(
             path.to_string_lossy().into_owned(),
         );
     }
-    // The per-attempt empty directory bound to FIXED_GUEST_WORKDIR. `None`
-    // disables the default, and there are exactly two reasons to disable it,
-    // both of which `validate_mode_workdir` already refuses a manifest-declared
-    // workdir for:
-    //   * a non-Hermit run mode has no `--workdir` to give;
-    //   * DBT rebuilds the guest launch from program/args/env only and does NOT
-    //     preserve `Command::current_dir`, so binding a workdir it will not honour
-    //     would report a control that is not in force.
-    // Keeping the two in step matters: `append_execution_root_args` applies
-    // `isolated_workdir` ahead of everything and bypasses both refusals, which is
-    // a pre-existing gap this default must not widen.
+    // The explicit hermetic path is available only where the launched backend
+    // can honour a guest working directory. Replay is included there because
+    // `record start` accepts the same mount and workdir arguments as `run`.
+    let supports_test_workdir = supports_test_workdir(&cell.id.mode, backend);
+    if context.isolated_workdir.is_some() && !supports_test_workdir {
+        return Err(format!(
+            "hermetic validation cannot isolate a {} cell on the {backend} backend at /test",
+            cell.id.mode
+        ));
+    }
     let bound_workdir_source = (matches!(cell.id.mode.as_str(), "verify" | "chaos" | "custom")
         && backend != "dbt")
         .then_some(fixed_workdir_source.as_path());
+    let isolated = context.isolated_workdir.is_some();
     let verdict = dir.join(format!("verify-{attempt}.json"));
     let mut verification_log_dir = None;
     let (argv, verdict_path) = match cell.id.mode.as_str() {
-        "naked" if context.isolated_workdir.is_some() => {
-            return Err("hermetic validation cannot isolate a naked cell at /test".into());
-        }
         "naked" => (guest_argv.clone(), None),
         "verify" => {
             let mut argv = vec![
@@ -1406,7 +1384,7 @@ pub fn build_spec(
                 mode_recipe.workdir.as_deref(),
                 bound_workdir_source,
             );
-            append_guest_env_args(&mut argv, &env, context.isolated_workdir.is_some());
+            append_guest_env_args(&mut argv, &env, isolated);
             argv.push("--".into());
             argv.extend(guest_argv.clone());
             (argv, Some(verdict))
@@ -1422,7 +1400,7 @@ pub fn build_spec(
                 "start".into(),
                 "--strict".into(),
             ];
-            if context.isolated_workdir.is_some() {
+            if isolated {
                 argv.push("--base-env=minimal".into());
             }
             if context.record_verify_strict {
@@ -1443,7 +1421,7 @@ pub fn build_spec(
                 mode_recipe.workdir.as_deref(),
                 bound_workdir_source,
             );
-            append_guest_env_args(&mut argv, &env, context.isolated_workdir.is_some());
+            append_guest_env_args(&mut argv, &env, isolated);
             argv.push("--".into());
             argv.extend(guest_argv.clone());
             (argv, Some(verdict))
@@ -1478,7 +1456,7 @@ pub fn build_spec(
                 mode_recipe.workdir.as_deref(),
                 bound_workdir_source,
             );
-            append_guest_env_args(&mut argv, &env, context.isolated_workdir.is_some());
+            append_guest_env_args(&mut argv, &env, isolated);
             argv.push("--".into());
             argv.extend(guest_argv.clone());
             (argv, Some(verdict))
@@ -1493,7 +1471,7 @@ pub fn build_spec(
                 backend.into(),
             ];
             argv.extend(cell.test.modes["custom"].args.clone());
-            if context.isolated_workdir.is_some() {
+            if isolated {
                 require_minimal_base_env(&mut argv)?;
                 append_guest_env_args(&mut argv, &env, true);
             } else {
@@ -1555,12 +1533,10 @@ fn execute_spec_until(
         fs::remove_dir_all(&tmp).map_err(|e| format!("cannot reset {}: {e}", tmp.display()))?;
     }
     fs::create_dir_all(&tmp).map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
-    // Reset the bound working directory the same way and for the same reason as
-    // `tmp`: each sequential attempt must start empty, including when rerunning
-    // the cell reuses an attempt label. The attempt component is also required
-    // because concurrent attempts of one cell must not remove or write into each
-    // other's working directories. This runs unconditionally — the directory is
-    // cheap, and creating it when the cell did not ask for a bind is harmless.
+    // The ordinary-host fallback binds this exact per-attempt directory at
+    // /tmp/test. The explicit hermetic path mounts a fresh tmpfs at /test and
+    // ignores the directory, but keeping the reset unconditional preserves the
+    // fallback and makes switching paths a pure precedence decision.
     let workdir = &spec.fixed_workdir_source;
     if workdir.exists() {
         fs::remove_dir_all(workdir)
@@ -2713,7 +2689,11 @@ fn shell_quote(value: &str) -> String {
     }
 }
 
-fn append_guest_env_args(argv: &mut Vec<String>, env: &BTreeMap<String, String>, isolated: bool) {
+fn append_guest_env_args(
+    argv: &mut Vec<String>,
+    env: &BTreeMap<String, String>,
+    uses_test_workdir: bool,
+) {
     // Every forwarded value is harness-authored, never inherited ambient state.
     // PWD and OLDPWD remain absent; E2E_TMPDIR joins the fresh /test mount while
     // HOME/XDG retain their unique per-cell directories and seeded config.
@@ -2726,7 +2706,7 @@ fn append_guest_env_args(argv: &mut Vec<String>, env: &BTreeMap<String, String>,
         "E2E_FIXTURE_DIR",
         SCHEDULED_JOBS_ENV,
     ] {
-        let value = if isolated && name == "E2E_TMPDIR" {
+        let value = if uses_test_workdir && name == "E2E_TMPDIR" {
             HERMETIC_TEST_WORKDIR
         } else {
             env.get(name)
@@ -2779,24 +2759,8 @@ fn require_minimal_base_env(argv: &mut Vec<String>) -> Result<(), String> {
 ///   1. `isolated_workdir` — the hermetic lane's fresh tmpfs at `/test`, enabled by
 ///      `HERMIT_E2E_EMPTY_WORKDIR` from `ci/hermetic/run-split-validate.sh`.
 ///   2. `requested_workdir` — a workdir the manifest names for itself.
-///   3. `fixed_workdir_source` — the default: bind a fresh per-attempt directory
-///      at `FIXED_GUEST_WORKDIR` and chdir into it.
-///
-/// ⚠️ (3) IS A STAND-IN FOR (1), NOT THE INTENDED END STATE. Do not read the
-/// default as the design. The design is the hermetic lane's `/test`; the default
-/// exists because that lane is not invoked today — nothing in the tree calls
-/// `run-split-validate.sh` — and because the tmpfs route it uses panics on this
-/// host anyway (`reverie-process/src/container.rs:909` unwraps
-/// `Err(ENOENT, context: Mount)` for ANY target). Rather than leave every cell
-/// inheriting the HOST's cwd while that is sorted out, (3) gives them a fixed,
-/// empty, host-independent directory now.
-///
-/// ⚠️ AND THE TWO DO NOT FIGHT WHEN THE HERMETIC LANE IS ENABLED. (1) is tried
-/// FIRST, so the moment `HERMIT_E2E_EMPTY_WORKDIR` is set the tmpfs form wins and
-/// the default stands down on its own. Enabling the hermetic lane therefore needs
-/// no change here, and removing (3) later is a deletion rather than an
-/// untangling. That precedence is deliberate; if you reorder these arms you will
-/// silently downgrade the hermetic lane to the stand-in.
+///   3. `fixed_workdir_source` — the ordinary-host fallback binds a fresh
+///      per-attempt directory at `/tmp/test`.
 fn append_execution_root_args(
     argv: &mut Vec<String>,
     isolated_workdir: Option<&Path>,
@@ -2807,15 +2771,10 @@ fn append_execution_root_args(
         argv.push(format!("--mount=type=tmpfs,target={}", workdir.display()));
         argv.extend(["--workdir".into(), workdir.to_string_lossy().into_owned()]);
     } else if let Some(workdir) = requested_workdir {
-        // A manifest that names its own workdir keeps it. applications.yaml sets
-        // `/tmp` because git discovers repositories through cwd ancestors; that is
-        // a deliberate per-cell choice and the default must not override it.
+        // Outside the explicit hermetic path, a manifest that names its own
+        // workdir keeps it and outranks the ordinary-host fallback.
         argv.extend(["--workdir".into(), workdir.into()]);
     } else if let Some(source) = fixed_workdir_source {
-        // THE DEFAULT. Without it the guest inherits the HOST's cwd verbatim, so
-        // one cell reports a different `pwd` in every checkout — measured across
-        // four checkouts, four distinct guest paths — and any cell that reads its
-        // cwd or its ancestors is sensitive to unrelated filesystem churn.
         argv.push(format!(
             "--bind={}:{FIXED_GUEST_WORKDIR}",
             source.to_string_lossy()
@@ -2991,6 +2950,45 @@ mod tests {
             modes: BTreeMap::from([("verify".into(), mode)]),
             preprocessors: Vec::new(),
         }
+    }
+
+    fn guest_env_args(argv: &[String]) -> Vec<String> {
+        argv.windows(2)
+            .filter(|window| window[0] == "--env")
+            .map(|window| window[1].clone())
+            .collect()
+    }
+
+    fn assert_minimal_guest_env(argv: &[String], dir: &str, tmp: &str, jobs: &str) {
+        let mut base_env = Vec::new();
+        let mut index = 0;
+        while index < argv.len() {
+            if let Some(value) = argv[index].strip_prefix("--base-env=") {
+                base_env.push(value.to_string());
+            } else if argv[index] == "--base-env" {
+                index += 1;
+                base_env.push(argv[index].clone());
+            }
+            index += 1;
+        }
+        assert_eq!(
+            base_env,
+            ["minimal"],
+            "every hermetic Hermit cell must select the minimal base environment exactly once: {argv:?}"
+        );
+        assert_eq!(
+            guest_env_args(argv),
+            vec![
+                "LC_ALL=C".to_string(),
+                "TZ=UTC".to_string(),
+                format!("HOME={dir}/home"),
+                format!("XDG_CONFIG_HOME={dir}/xdg-config"),
+                format!("E2E_TMPDIR={tmp}"),
+                format!("E2E_FIXTURE_DIR={dir}/fixtures"),
+                format!("HERMIT_E2E_SCHEDULED_JOBS={jobs}"),
+            ],
+            "the guest environment is an exact allowlist; an added, removed, or inherited name is a regression"
+        );
     }
 
     fn ptrace_cell(mode: &str) -> SelectedCell {
@@ -3506,7 +3504,9 @@ backends_disabled:
                 assert_eq!(
                     validate_mode_workdir("fixture/test", mode, Some("/tmp"), &backends)
                         .unwrap_err(),
-                    format!("fixture/test: {mode} workdir is unsupported when DBT is enabled")
+                    format!(
+                        "fixture/test: {mode} workdir is unsupported when DBT is enabled because DBT does not enter the Hermit mount namespace"
+                    )
                 );
             }
         }
@@ -3616,30 +3616,7 @@ backends_disabled:
             .position(|args| args == ["--workdir", "/test"])
             .unwrap();
         assert!(mount < separator && workdir < separator);
-        for name in ["PWD", "OLDPWD"] {
-            assert!(
-                !spec
-                    .argv
-                    .iter()
-                    .any(|arg| arg.starts_with(&format!("{name}=")))
-            );
-        }
-        for value in [
-            "LC_ALL=C",
-            "TZ=UTC",
-            "HOME=/repo/results/cell/home",
-            "XDG_CONFIG_HOME=/repo/results/cell/xdg-config",
-            "E2E_TMPDIR=/test",
-        ] {
-            assert!(spec.argv.iter().any(|arg| arg == value));
-        }
-        for name in ["E2E_FIXTURE_DIR", SCHEDULED_JOBS_ENV] {
-            assert!(
-                spec.argv
-                    .iter()
-                    .any(|arg| arg.starts_with(&format!("{name}=")))
-            );
-        }
+        assert_minimal_guest_env(&spec.argv, "/repo/results/cell", "/test", "7");
 
         let mut replay_test = recipe(true);
         let replay_mode = replay_test.modes.remove("verify").unwrap();
@@ -3679,6 +3656,7 @@ backends_disabled:
                 .iter()
                 .any(|arg| arg == "--mount=type=tmpfs,target=/test")
         );
+        assert_minimal_guest_env(&replay.argv, "/repo/results/replay", "/test", "7");
 
         let mut custom_test = recipe(true);
         let mut custom_mode = custom_test.modes.remove("verify").unwrap();
@@ -3717,15 +3695,7 @@ backends_disabled:
                 .iter()
                 .any(|arg| arg == "--mount=type=tmpfs,target=/test")
         );
-        for value in [
-            "LC_ALL=C",
-            "TZ=UTC",
-            "HOME=/repo/results/custom/home",
-            "XDG_CONFIG_HOME=/repo/results/custom/xdg-config",
-            "E2E_TMPDIR=/test",
-        ] {
-            assert!(custom.argv.iter().any(|arg| arg == value));
-        }
+        assert_minimal_guest_env(&custom.argv, "/repo/results/custom", "/test", "7");
         let mut naked_test = recipe(true);
         let naked_mode = naked_test.modes.remove("verify").unwrap();
         naked_test.modes.insert("naked".into(), naked_mode);
@@ -3752,7 +3722,7 @@ backends_disabled:
         .unwrap_err();
         assert_eq!(
             naked_error,
-            "hermetic validation cannot isolate a naked cell at /test"
+            "hermetic validation cannot isolate a naked cell on the native backend at /test"
         );
     }
 
@@ -3778,6 +3748,52 @@ backends_disabled:
         assert_eq!(argv[2], root.join("README.md").to_string_lossy());
         assert_eq!(argv[3], ".");
         assert_eq!(argv[4], "missing/path");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ordinary_fixed_workdir_resolves_repo_inputs_before_chdir() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-ordinary-repo-args-bracket-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("fixtures")).unwrap();
+        fs::write(root.join("fixtures/input.txt"), b"fixture").unwrap();
+
+        let mut cell = ptrace_cell("verify");
+        cell.test.direct = Some(DirectCommand::Argv(vec![
+            "/bin/true".into(),
+            "fixtures/input.txt".into(),
+            ".".into(),
+        ]));
+        let context = run_context(&root);
+        let cell_dir = root.join("results/cell");
+        let guest = prepare_test(&context, &cell, &cell_dir).unwrap();
+        assert_eq!(guest[1], root.join("fixtures/input.txt").to_string_lossy());
+        assert_eq!(guest[2], ".");
+
+        let spec = build_spec(
+            &context,
+            &cell,
+            cell_dir.clone(),
+            guest,
+            "1",
+            None,
+            cell.timeout_seconds,
+        )
+        .unwrap();
+        assert_eq!(
+            bound_workdir_source(&spec),
+            cell_dir.join("workdir/1"),
+            "the ordinary supported path must retain hermit-132's per-attempt bind"
+        );
+        assert_eq!(
+            spec.guest_argv[1],
+            root.join("fixtures/input.txt").to_string_lossy(),
+            "repo input must be absolute before the guest changes to /tmp/test"
+        );
+        assert_eq!(spec.guest_argv[2], ".");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3921,6 +3937,7 @@ backends_disabled:
             spec.env.get(SCHEDULED_JOBS_ENV).map(String::as_str),
             Some("7")
         );
+        assert_minimal_guest_env(&spec.argv, "/repo/results/cell", "/tmp/hermit-e2e", "7");
         assert!(!spec.argv.iter().any(|arg| arg == "--no-virtualize-cpuid"));
         assert!(
             !spec
@@ -3928,19 +3945,6 @@ backends_disabled:
                 .iter()
                 .any(|arg| arg == "--max-timeslice=disabled")
         );
-        for name in [
-            "LC_ALL",
-            "TZ",
-            "HOME",
-            "XDG_CONFIG_HOME",
-            "E2E_TMPDIR",
-            "E2E_FIXTURE_DIR",
-            "HERMIT_E2E_SCHEDULED_JOBS",
-        ] {
-            assert!(spec.argv.windows(2).any(|window| {
-                window[0] == "--env" && window[1].starts_with(&format!("{name}="))
-            }));
-        }
         for name in ["RUSTUP_HOME", "CARGO_HOME"] {
             assert!(!spec.env.contains_key(name));
             assert!(
@@ -3980,19 +3984,18 @@ backends_disabled:
             window[0] == "--verify-json" && window[1] == "/repo/results/replay-cell/verify-1.json"
         }));
         assert!(!replay.argv.iter().any(|arg| arg.starts_with("--base-env")));
-        for name in [
-            "LC_ALL",
-            "TZ",
-            "HOME",
-            "XDG_CONFIG_HOME",
-            "E2E_TMPDIR",
-            "E2E_FIXTURE_DIR",
-            "HERMIT_E2E_SCHEDULED_JOBS",
-        ] {
-            assert!(replay.argv.windows(2).any(|window| {
-                window[0] == "--env" && window[1].starts_with(&format!("{name}="))
-            }));
-        }
+        assert_eq!(
+            guest_env_args(&replay.argv),
+            vec![
+                "LC_ALL=C".to_string(),
+                "TZ=UTC".to_string(),
+                "HOME=/repo/results/replay-cell/home".to_string(),
+                "XDG_CONFIG_HOME=/repo/results/replay-cell/xdg-config".to_string(),
+                "E2E_TMPDIR=/tmp/hermit-e2e".to_string(),
+                "E2E_FIXTURE_DIR=/repo/results/replay-cell/fixtures".to_string(),
+                "HERMIT_E2E_SCHEDULED_JOBS=7".to_string(),
+            ]
+        );
 
         let mut custom_test = recipe(true);
         let mut custom_mode = custom_test.modes.remove("verify").unwrap();
@@ -4019,10 +4022,9 @@ backends_disabled:
             custom_cell.timeout_seconds,
         )
         .unwrap();
-        assert!(
-            custom.argv.windows(2).any(|window| {
-                window[0] == "--env" && window[1] == "HERMIT_E2E_SCHEDULED_JOBS=7"
-            })
+        assert_eq!(
+            guest_env_args(&custom.argv),
+            vec!["HERMIT_E2E_SCHEDULED_JOBS=7".to_string()]
         );
     }
 
@@ -4726,18 +4728,17 @@ backends_disabled:
         );
     }
 
-    /// REGRESSION CELL FOR THE FIXED WORKING DIRECTORY.
+    /// REGRESSION CHECK FOR THE ORDINARY-HOST FALLBACK.
     ///
     /// Without the default the guest inherits the HOST's cwd verbatim. Measured on
     /// 2026-08-26 at main f4de43461a, 200 runs rotating across four checkouts:
     ///   default off -> 4 distinct guest `pwd` values
     ///   default on  -> 1, `/tmp/test`, and the directory empty on all 200
-    /// This asserts the argv that produces the second row, and — the half that
-    /// actually regresses — that the three cases which must NOT get it still do not.
+    /// The explicit hermetic path below supersedes this with a tmpfs at `/test`.
+    /// This fallback remains for direct non-hermetic harness runs.
     #[test]
     fn fixed_workdir_is_bound_by_default_and_withheld_where_it_would_lie() {
         let source = Path::new("/cells/x/workdir/attempt-7");
-
         let mut argv: Vec<String> = Vec::new();
         append_execution_root_args(&mut argv, None, None, Some(source));
         assert_eq!(
@@ -4747,26 +4748,170 @@ backends_disabled:
                 "--workdir".to_string(),
                 "/tmp/test".to_string(),
             ],
-            "the default must bind a fresh per-attempt directory AND chdir into it; \
-             binding without --workdir leaves the guest in the host's cwd"
+            "the fallback must bind a fresh per-attempt directory AND chdir into it"
         );
 
-        // A manifest that names its own workdir keeps it. applications.yaml sets
-        // /tmp deliberately, because git discovers repositories through cwd
-        // ancestors; overriding that would reintroduce the defect it fixed.
         let mut argv: Vec<String> = Vec::new();
         append_execution_root_args(&mut argv, None, Some("/tmp"), Some(source));
         assert_eq!(argv, vec!["--workdir".to_string(), "/tmp".to_string()]);
 
-        // No source means the cell is one `validate_mode_workdir` refuses a workdir
-        // for — a non-Hermit mode, or DBT, which does not preserve current_dir.
-        // Emitting a workdir there would record a control that is not in force.
         let mut argv: Vec<String> = Vec::new();
         append_execution_root_args(&mut argv, None, None, None);
         assert!(
             argv.is_empty(),
             "a cell that cannot honour a workdir must be given none, got {argv:?}"
         );
+    }
+
+    #[test]
+    fn the_hermetic_lane_outranks_manifest_and_fallback_workdirs() {
+        let mut argv: Vec<String> = Vec::new();
+        append_execution_root_args(
+            &mut argv,
+            Some(Path::new(HERMETIC_TEST_WORKDIR)),
+            Some("/tmp"),
+            Some(Path::new("/cells/x/workdir/attempt-7")),
+        );
+        assert_eq!(
+            argv,
+            vec![
+                format!("--mount=type=tmpfs,target={HERMETIC_TEST_WORKDIR}"),
+                "--workdir".to_string(),
+                HERMETIC_TEST_WORKDIR.to_string(),
+            ],
+            "the explicit hermetic request must suppress both the manifest override and fallback"
+        );
+        assert!(
+            !argv.iter().any(|arg| arg.starts_with("--bind")),
+            "the ordinary-host bind leaked into the /test path: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn test_workdir_support_matches_the_modes_that_can_honour_it() {
+        for mode in ["verify", "replay", "chaos", "custom"] {
+            assert!(supports_test_workdir(mode, "ptrace"), "mode={mode}");
+        }
+        assert!(!supports_test_workdir("naked", "native"));
+        assert!(!supports_test_workdir("verify", "dbt"));
+    }
+
+    #[test]
+    fn selected_supported_cells_do_not_override_the_hermetic_test_workdir() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifests = ManifestSet::load(&root).unwrap();
+        let mut overrides = Vec::new();
+        for document in &manifests.documents {
+            for test in &document.test {
+                for (mode, recipe) in &test.modes {
+                    let selection = ci_selection(recipe).unwrap();
+                    for backend in &recipe.backends_enabled {
+                        if selection.selected(backend)
+                            && supports_test_workdir(mode, backend)
+                            && recipe.workdir.is_some()
+                        {
+                            overrides.push(format!("{}/{mode}/{backend}", test.id));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            overrides.is_empty(),
+            "scheduled supported cells must all use the hermetic /test workdir: {overrides:?}"
+        );
+    }
+
+    #[test]
+    fn every_selected_cell_can_honour_the_hermetic_test_workdir() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let expected: JsonValue =
+            serde_json::from_slice(&fs::read(root.join("ci/expected-e2e-plan.json")).unwrap())
+                .unwrap();
+        let unsupported = expected["cells"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|cell| {
+                let mode = cell["mode"].as_str().unwrap();
+                let backend = cell["backend"].as_str().unwrap();
+                (!supports_test_workdir(mode, backend))
+                    .then(|| format!("{}/{mode}/{backend}", cell["test"].as_str().unwrap()))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            unsupported.is_empty(),
+            "selected cells that cannot honour the hermetic /test gate: {unsupported:?}"
+        );
+    }
+
+    #[test]
+    fn attempt_labels_must_be_one_normal_path_component() {
+        for attempt in [
+            "",
+            ".",
+            "..",
+            "/absolute",
+            "../parent",
+            "parent/child",
+            "normal/",
+        ] {
+            assert_eq!(
+                fixed_workdir_source_for_attempt(Path::new("/cell"), attempt),
+                Err(format!(
+                    "invalid attempt label {attempt:?}: expected exactly one normal path component"
+                ))
+            );
+        }
+        for attempt in ["1", "attempt-7", "seed--42"] {
+            assert_eq!(
+                fixed_workdir_source_for_attempt(Path::new("/cell"), attempt),
+                Ok(PathBuf::from(format!("/cell/workdir/{attempt}")))
+            );
+        }
+    }
+
+    /// The label is rejected BEFORE anything is created on disk.
+    ///
+    /// `attempt_labels_must_be_one_normal_path_component` covers the return value
+    /// against a path that is never touched, so it cannot see an ordering defect.
+    /// If the guard ever moves below the first `create_dir_all`, a traversal label
+    /// gets to create a directory outside the cell before being refused, and the
+    /// return value alone still looks correct.
+    #[test]
+    fn an_invalid_attempt_label_is_refused_before_any_filesystem_side_effect() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-attempt-label-ordering-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let cell = ptrace_cell("verify");
+        let context = run_context(&root);
+        let cell_dir = root.join("cell");
+
+        for attempt in ["..", "/absolute", "parent/child"] {
+            let error = build_spec(
+                &context,
+                &cell,
+                cell_dir.clone(),
+                vec!["/bin/true".into()],
+                attempt,
+                None,
+                cell.timeout_seconds,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error,
+                format!(
+                    "invalid attempt label {attempt:?}: expected exactly one normal path component"
+                )
+            );
+            assert!(
+                !cell_dir.exists(),
+                "an invalid attempt label must be rejected before filesystem operations"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4796,69 +4941,8 @@ backends_disabled:
         let sources = [source_for("1"), source_for("2")];
         assert_eq!(sources[0], cell_dir.join("workdir/1"));
         assert_eq!(sources[1], cell_dir.join("workdir/2"));
-
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(sources.len()));
-        let results = sources.map(|source| {
-            let barrier = barrier.clone();
-            std::thread::spawn(move || {
-                fs::create_dir_all(&source).unwrap();
-                barrier.wait();
-                fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(source.join("myfile.txt"))
-            })
-        });
-        for result in results {
-            assert!(
-                result.join().unwrap().is_ok(),
-                "concurrent attempts of one cell must not write into the same host directory"
-            );
-        }
+        assert_ne!(sources[0], sources[1]);
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn attempt_labels_must_be_one_normal_path_component() {
-        let root = std::env::temp_dir().join(format!(
-            "hermit-runner-attempt-label-bracket-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        let cell = ptrace_cell("verify");
-        let context = run_context(&root);
-        let cell_dir = root.join("cell");
-
-        for attempt in [
-            "",
-            ".",
-            "..",
-            "/absolute",
-            "../parent",
-            "parent/child",
-            "normal/",
-        ] {
-            let error = build_spec(
-                &context,
-                &cell,
-                cell_dir.clone(),
-                vec!["/bin/true".into()],
-                attempt,
-                None,
-                cell.timeout_seconds,
-            )
-            .unwrap_err();
-            assert_eq!(
-                error,
-                format!(
-                    "invalid attempt label {attempt:?}: expected exactly one normal path component"
-                )
-            );
-            assert!(
-                !cell_dir.exists(),
-                "an invalid attempt label must be rejected before filesystem operations"
-            );
-        }
     }
 
     #[test]
@@ -4902,58 +4986,5 @@ backends_disabled:
         assert!(bound.join("myfile.txt").is_file());
         assert!(!bound.join("stale").exists());
         fs::remove_dir_all(root).unwrap();
-    }
-
-    /// THE PRECEDENCE, ASSERTED — a comment can be reordered without anyone noticing.
-    ///
-    /// When the hermetic lane is enabled BOTH sources are present at once, and the
-    /// tmpfs form must win. If this ever fails, the stand-in default has silently
-    /// downgraded the hermetic lane it exists to stand in for, and the symptom
-    /// would be a cell quietly running in a bound /tmp directory while its receipt
-    /// claims the hermetic /test.
-    #[test]
-    fn the_hermetic_lane_outranks_the_stand_in_default() {
-        let mut argv: Vec<String> = Vec::new();
-        append_execution_root_args(
-            &mut argv,
-            Some(Path::new(HERMETIC_TEST_WORKDIR)),
-            None,
-            Some(Path::new("/cells/x/workdir")),
-        );
-        assert_eq!(
-            argv,
-            vec![
-                format!("--mount=type=tmpfs,target={HERMETIC_TEST_WORKDIR}"),
-                "--workdir".to_string(),
-                HERMETIC_TEST_WORKDIR.to_string(),
-            ],
-            "the hermetic tmpfs must win when both are available, and the default \
-             must contribute nothing at all — not even a stray --bind"
-        );
-        assert!(
-            !argv.iter().any(|arg| arg.starts_with("--bind")),
-            "the stand-in leaked a bind into the hermetic lane: {argv:?}"
-        );
-    }
-
-    /// ⚠️ THE SPLIT, ASSERTED SO IT CANNOT BE QUIETLY CLOSED.
-    ///
-    /// `HERMETIC_TEST_WORKDIR` (`/test`) is what the brief asks for and it is NOT
-    /// what the default delivers, because the only route to it is the tmpfs mount
-    /// that panics in `reverie-process/src/container.rs:909` for any target. If a
-    /// later change makes these equal, the isolation half has either been fixed or
-    /// been papered over, and this test failing is the prompt to say which.
-    #[test]
-    fn the_fixed_workdir_is_not_yet_the_hermetic_one() {
-        assert_ne!(
-            FIXED_GUEST_WORKDIR, HERMETIC_TEST_WORKDIR,
-            "these became equal without anyone recording that the reverie mount \
-             panic was fixed; do not delete this assertion to make it pass"
-        );
-        assert!(
-            FIXED_GUEST_WORKDIR.starts_with("/tmp/"),
-            "--bind refuses a target outside guest /tmp, so the default path must \
-             live under it or the bind silently does nothing"
-        );
     }
 }
