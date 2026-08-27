@@ -122,6 +122,7 @@ merged:
 
 | provenance | what it runs | what its bounds mean |
 |---|---|---|
+| `hermit-repeat` | a cell repeatedly at one tree | the runs requested directly through `hermit-repeat` |
 | `pressure-test` | a cell repeatedly at one tree | the flake distribution — what a yellow-cell floor should be derived from |
 | `validate` | a cell once per commit | a point; the regression signal a floor is checked against |
 
@@ -136,12 +137,14 @@ six COMMIT records, every divergence between two of them reports the same turn.
 
 ### Writing observations
 
-Two commands write these arrays, both explicit and opt-in. **Ordinary validation
+Three commands write these arrays, all explicit and opt-in. **Ordinary validation
 still changes no tracked scorecard file.**
 
 ```console
 ./ci/compat-envelope/scorecard.rs update-observations --summary FILE   # pressure test
 ./ci/compat-envelope/scorecard.rs observe-results --results DIR        # validate
+./ci/compat-envelope/scorecard.rs project-observations \
+  --series-root ../series --refreshed-at STAMP                         # series
 ```
 
 `observe-results` walks every `results.jsonl` under `DIR`, so several runs fold
@@ -149,6 +152,18 @@ in one invocation — which is how a validate-side range widens beyond a point.
 Both refuse a dirty tracked tree and refuse rows that are not clean at `HEAD`.
 `ERROR` rows are refused rather than recorded: an infrastructure fault is not
 product behaviour. Neither command can change which cells are green.
+
+The series cell name is the exact `test/mode/backend` identity. Passing and
+diverging comparisons create observations and update `last_tested`; compressed
+`num_runs` rows contribute their full sample count to any recorded divergence
+position. `no_result`, `timeout`, `errored`, and `skipped` rows are named but do
+not become evidence. Historical rows that predate the `detcore_tree` field use
+the recorded Hermit tree's `detcore` entry when that commit is available; a row
+whose tree cannot be resolved is named and skipped rather than guessed.
+
+This projection does not import retained validate result directories. That is
+a separate input path even though both ultimately update the same observation
+fields.
 
 During investigation, probe one exact red cell with a tight wall-clock cap:
 

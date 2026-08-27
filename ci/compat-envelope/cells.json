@@ -1,5 +1,11 @@
 {
   "schema": 6,
+  "projection": {
+    "source": "../series",
+    "refreshed_at": "2026-08-27T07:02:24Z",
+    "rows_read": 11,
+    "pre_series_corpus": true
+  },
   "cells": [
     {
       "lane": "portable",
@@ -707,8 +713,71 @@
       "backend": "ptrace",
       "enabled": true,
       "status": "green",
-      "observations": [],
-      "measurement": "never-measured"
+      "last_tested": {
+        "hermit_sha": "0b2772a74fc70a1eb4b24ef3385cc1a51f9cc028",
+        "detcore_tree": "1d32424c7adbe336a2be73b47787f0fc066bd725",
+        "depth": {
+          "hermit": {
+            "commits": 2345,
+            "first_parent": 2270
+          }
+        }
+      },
+      "observations": [
+        {
+          "detcore_tree": "1d32424c7adbe336a2be73b47787f0fc066bd725",
+          "provenance": "validate",
+          "depth": {
+            "hermit": {
+              "commits": 2345,
+              "first_parent": 2270
+            }
+          },
+          "hermit_shas": [
+            "0b2772a74fc70a1eb4b24ef3385cc1a51f9cc028"
+          ],
+          "results": [
+            "pass"
+          ],
+          "invocations": []
+        },
+        {
+          "detcore_tree": "6d76d421eae7970531581959ed7fbb12200e419d",
+          "provenance": "pressure-test",
+          "depth": {
+            "hermit": {
+              "commits": 2338,
+              "first_parent": 2263
+            }
+          },
+          "hermit_shas": [
+            "0b2d6e8c96f37e1e2a28a706e0e97c5891d08109"
+          ],
+          "results": [
+            "pass"
+          ],
+          "invocations": []
+        },
+        {
+          "detcore_tree": "d65d0a7468fa74989ffe4cf7b468074cc9936c58",
+          "provenance": "pressure-test",
+          "depth": {
+            "hermit": {
+              "commits": 1926,
+              "first_parent": 1851
+            }
+          },
+          "hermit_shas": [
+            "dee8cf49ce6a7e3e9e2c87c930f3aa55ae83da18"
+          ],
+          "results": [
+            "pass",
+            "determinism-failure"
+          ],
+          "invocations": []
+        }
+      ],
+      "measurement": "diverged-unlocated"
     },
     {
       "lane": "portable",
