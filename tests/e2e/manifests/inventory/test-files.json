@@ -469,6 +469,12 @@
       "why": "tests/backend-parity/fixtures/openat_flags.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "suite-helper",
+      "path": "tests/backend-parity/fixtures/parity_probe.h",
+      "runner": "tests/backend-parity/parity_mutation.py",
+      "why": "tests/backend-parity/fixtures/parity_probe.h is owned by tests/backend-parity/parity_mutation.py: This header gives every identity fixture in the family one contract -- check accumulation, a single canonical stdout line, nonzero exit on any failed check, and the parity_mutate_*() seam the harness perturbs. It is compiled into each fixture rather than run, so it is build input to the harness and never an executable guest in its own right."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/path_file_ops.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false)",
@@ -577,10 +583,22 @@
       "why": "tests/backend-parity/fixtures/renameat2_flags.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "suite-helper",
+      "path": "tests/backend-parity/fixtures/rlimit_identity.c",
+      "runner": "tests/backend-parity/parity_mutation.py",
+      "why": "tests/backend-parity/fixtures/rlimit_identity.c is owned by tests/backend-parity/parity_mutation.py: This is a family member guest exercised only through the shared mutation harness, which compiles it with the family flags and supplies its declared mutation field. It carries no bespoke verification logic of its own and is not a manifest test, so the generic manifest must not schedule it independently of the harness that gives it meaning."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/robust_list.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/robust_list.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/backend-parity/fixtures/sched_getaffinity_identity.c",
+      "runner": "tests/backend-parity/parity_mutation.py",
+      "why": "tests/backend-parity/fixtures/sched_getaffinity_identity.c is owned by tests/backend-parity/parity_mutation.py: This is the second family member guest, registered to demonstrate that a new member inherits the shared verification with zero bespoke code. Like its sibling it is compiled and driven exclusively by the mutation harness and is not an independently scheduled manifest test, so the generic manifest must not claim it."
     },
     {
       "disposition": "manifest-test",
@@ -637,16 +655,16 @@
       "why": "tests/backend-parity/fixtures/signalfd_create.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
-      "disposition": "manifest-test",
-      "path": "tests/backend-parity/fixtures/socket_epoll_ordering.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false)",
-      "why": "tests/backend-parity/fixtures/socket_epoll_ordering.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI because no backend has ever been measured for this cell -- the registration it was ported from disabled the non-ptrace backends with a host-toolchain excuse rather than a measurement"
-    },
-    {
       "disposition": "guest-fixture",
       "path": "tests/backend-parity/fixtures/sigprocmask_state.c",
       "runner": "tests/backend-parity/run_matrix.py",
       "why": "tests/backend-parity/fixtures/sigprocmask_state.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic sigprocmask(2) signal-mask block/unblock/query round-tripping as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBT/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/socket_epoll_ordering.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false)",
+      "why": "tests/backend-parity/fixtures/socket_epoll_ordering.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI because no backend has ever been measured for this cell -- the registration it was ported from disabled the non-ptrace backends with a host-toolchain excuse rather than a measurement"
     },
     {
       "disposition": "manifest-test",
@@ -745,6 +763,24 @@
       "why": "tests/backend-parity/fixtures/vectored_io.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "support-data",
+      "path": "tests/backend-parity/measurements/README.md",
+      "runner": "maintainers of tests/e2e/manifests/backend-parity-c.yaml",
+      "why": "tests/backend-parity/measurements/README.md is owned by maintainers of tests/e2e/manifests/backend-parity-c.yaml: This note records the method and the traps behind the measured verify sweeps that justify each ci flag in the backend-parity-c manifest, so a later flip cites recorded evidence instead of re-deriving it. It is documentation consumed by humans; no runner reads it and the generic manifest must not treat it as guest input."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/backend-parity/measurements/verify-sweep-6e1b59af0.tsv",
+      "runner": "maintainers of tests/e2e/manifests/backend-parity-c.yaml",
+      "why": "tests/backend-parity/measurements/verify-sweep-6e1b59af0.tsv is owned by maintainers of tests/e2e/manifests/backend-parity-c.yaml: This table is the recorded per-cell verify evidence, one row per declared test and backend pair with both sweep verdicts, that every ci = true flag in the backend-parity-c manifest rests on. It is inert recorded data read by reviewers rather than by any runner, and the generic manifest must not schedule it as an executable guest."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/backend-parity/parity_mutation.py",
+      "runner": "ci/dag/portable.json e2e.parity_mutation",
+      "why": "tests/backend-parity/parity_mutation.py is owned by ci/dag/portable.json e2e.parity_mutation: This is the shared mutation harness for the backend-parity identity family: it proves each declared field is load-bearing and compares every candidate backend against the golden ptrace reference at a recorded strictness tier. It is a driver invoked directly by CI, not a guest, and the generic manifest must not schedule it as one."
+    },
+    {
       "disposition": "special-driver",
       "path": "tests/backend-parity/retarget_to_manifest.py",
       "runner": "backend-parity matrix.tsv -> schema-v3 manifest migration tool (manual)",
@@ -803,12 +839,6 @@
       "path": "tests/c/acct_refusal_probe.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/acct_refusal_probe.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/c/procfs_identity_agreement.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace; ci=true)",
-      "why": "tests/c/procfs_identity_agreement.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace; ci=true): regression guest for the /proc/<pid>/maps identity class, asserting that stat, maps and fdinfo report ONE inode for the same mapped file so a second determinization route cannot present a second stable-but-wrong identity"
     },
     {
       "disposition": "manifest-test",
@@ -949,6 +979,12 @@
       "why": "tests/c/errno_path_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: exercises syscall failure cases chosen to fail for argument-intrinsic reasons and prints each errno, so verify's double run asserts that failure is as deterministic as success"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/exec_clock_continuity.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/exec_clock_continuity.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this self-re-execing guest and asserts that guest virtual time is strictly monotonic ACROSS the execve boundary, comparing pre-exec and post-exec CLOCK_REALTIME samples handed through argv; it remains a guest fixture because a generic manifest cannot express the exec-boundary hand-off contract or the cross-image ordering assertion."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/file_timestamp_identity.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/system-utils.yaml",
@@ -959,6 +995,12 @@
       "path": "tests/c/flock_exclusion.c",
       "runner": "cargo test -p hermit --test flock_exclusion",
       "why": "tests/c/flock_exclusion.c is compiled and exercised by hermit-cli/tests/flock_exclusion.rs: it proves flock exclusion between distinct open file descriptions in one process and across processes, release and reacquire, safe refusal for blocking upgrades of known and SCM_RIGHTS-received lock state, safe cross-process inherited-lock state, replayed lock side effects for materialized files, and fail-closed replay for non-materialized files"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/fork_child_getrandom.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/fork_child_getrandom.c is owned by hermit-cli/tests/cli.rs: The no-namespace integration test forks two sequential child processes, requires their getrandom streams to be distinct, and verifies the complete invocation twice so changing host TIDs cannot change either child's bytes. It remains a fixture because the generic manifest has no no-namespace execution mode."
     },
     {
       "disposition": "manifest-test",
@@ -1424,6 +1466,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/procfs_identity_agreement.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace; ci=true)",
+      "why": "tests/c/procfs_identity_agreement.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace; ci=true): regression guest for the /proc/<pid>/maps identity class, asserting that stat, maps and fdinfo report ONE inode for the same mapped file so a second determinization route cannot present a second stable-but-wrong identity"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/procfs_positioned_probe.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/procfs_positioned_probe.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
@@ -1610,15 +1658,15 @@
     },
     {
       "disposition": "manifest-test",
-      "path": "tests/c/setitimer_determinism.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
-      "why": "tests/c/setitimer_determinism.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "disposition": "manifest-test",
       "path": "tests/c/session_identity.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
       "why": "tests/c/session_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: pins the container's observed session and process-group identity under ptrace verification"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/setitimer_determinism.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
+      "why": "tests/c/setitimer_determinism.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "disposition": "manifest-test",
@@ -1778,15 +1826,15 @@
     },
     {
       "disposition": "manifest-test",
-      "path": "tests/c/startup_tls_guards.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/system-utils.yaml (explicit mode selection; ci=false)",
-      "why": "tests/c/startup_tls_guards.c is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml (explicit mode selection; ci=false): prints the x86-64 glibc TLS stack canary, pointer guard, and AT_RANDOM bytes so canonical verification detects a backend that replaces startup randomness only after glibc has consumed it"
-    },
-    {
-      "disposition": "manifest-test",
       "path": "tests/c/startup_surface_identity.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/system-utils.yaml",
       "why": "tests/c/startup_surface_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: prints argv, environ in order, the full auxv vector including the AT_RANDOM bytes and the raw vDSO base, and the initial stack layout, and branches on those values so verify's double run asserts identity of both the inputs and the decisions made from them"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/startup_tls_guards.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/system-utils.yaml (explicit mode selection; ci=false)",
+      "why": "tests/c/startup_tls_guards.c is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml (explicit mode selection; ci=false): prints the x86-64 glibc TLS stack canary, pointer guard, and AT_RANDOM bytes so canonical verification detects a backend that replaces startup randomness only after glibc has consumed it"
     },
     {
       "disposition": "manifest-test",
@@ -2003,6 +2051,12 @@
       "path": "tests/chaos/order_violation.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/*.yaml",
       "why": "tests/chaos/order_violation.c is owned by target/debug/test-harness via tests/e2e/manifests/*.yaml: Direct schema-v2 program; all modes and backend policy are centralized in the YAML bucket manifests"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/chaos/thread_interleaving.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/*.yaml",
+      "why": "tests/chaos/thread_interleaving.c is owned by target/debug/test-harness via tests/e2e/manifests/*.yaml: Direct schema-v2 program; all modes and backend policy are centralized in the YAML bucket manifests"
     },
     {
       "disposition": "special-driver",
@@ -2773,16 +2827,16 @@
       "why": "tests/e2e/system-utils/proc-uptime.sh is owned by target/debug/test-harness via tests/e2e/manifests/*.yaml: Direct schema-v2 program; all modes and backend policy are centralized in the YAML bucket manifests"
     },
     {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/system-utils/procfs_sanitized_paths.c",
-      "runner": "tests/e2e/system-utils/procfs-sanitized-paths.sh",
-      "why": "tests/e2e/system-utils/procfs_sanitized_paths.c is owned by tests/e2e/system-utils/procfs-sanitized-paths.sh: The C guest reads all eighteen procfs paths in one process and asserts sanitizer-specific invariants; the manifest-compatible shell wrapper compiles and owns its lifecycle."
-    },
-    {
       "disposition": "manifest-test",
       "path": "tests/e2e/system-utils/procfs-sanitized-paths.sh",
       "runner": "target/debug/test-harness via tests/e2e/manifests/*.yaml",
       "why": "tests/e2e/system-utils/procfs-sanitized-paths.sh is owned by target/debug/test-harness via tests/e2e/manifests/*.yaml: Direct schema-v2 program; all modes and backend policy are centralized in the YAML bucket manifests"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/system-utils/procfs_sanitized_paths.c",
+      "runner": "tests/e2e/system-utils/procfs-sanitized-paths.sh",
+      "why": "tests/e2e/system-utils/procfs_sanitized_paths.c is owned by tests/e2e/system-utils/procfs-sanitized-paths.sh: The C guest reads all eighteen procfs paths in one process and asserts sanitizer-specific invariants; the manifest-compatible shell wrapper compiles and owns its lifecycle."
     },
     {
       "disposition": "manifest-test",
@@ -3401,60 +3455,6 @@
       "path": "tests/util/ssl_server.py",
       "runner": "scripts/validate.rs or Hermit integration targets",
       "why": "tests/util/ssl_server.py is owned by scripts/validate.rs or Hermit integration targets: The `ssl_server` utility provides a caller-facing probe or server helper; its caller owns process coordination, hardware preflight, arguments, and assertions. Running this helper as an independent manifest cell would test setup machinery without the behavior it supports."
-    },
-    {
-      "disposition": "support-data",
-      "path": "tests/backend-parity/measurements/README.md",
-      "runner": "maintainers of tests/e2e/manifests/backend-parity-c.yaml",
-      "why": "tests/backend-parity/measurements/README.md is owned by maintainers of tests/e2e/manifests/backend-parity-c.yaml: This note records the method and the traps behind the measured verify sweeps that justify each ci flag in the backend-parity-c manifest, so a later flip cites recorded evidence instead of re-deriving it. It is documentation consumed by humans; no runner reads it and the generic manifest must not treat it as guest input."
-    },
-    {
-      "disposition": "support-data",
-      "path": "tests/backend-parity/measurements/verify-sweep-6e1b59af0.tsv",
-      "runner": "maintainers of tests/e2e/manifests/backend-parity-c.yaml",
-      "why": "tests/backend-parity/measurements/verify-sweep-6e1b59af0.tsv is owned by maintainers of tests/e2e/manifests/backend-parity-c.yaml: This table is the recorded per-cell verify evidence, one row per declared test and backend pair with both sweep verdicts, that every ci = true flag in the backend-parity-c manifest rests on. It is inert recorded data read by reviewers rather than by any runner, and the generic manifest must not schedule it as an executable guest."
-    },
-    {
-      "disposition": "suite-helper",
-      "path": "tests/backend-parity/fixtures/parity_probe.h",
-      "runner": "tests/backend-parity/parity_mutation.py",
-      "why": "tests/backend-parity/fixtures/parity_probe.h is owned by tests/backend-parity/parity_mutation.py: This header gives every identity fixture in the family one contract -- check accumulation, a single canonical stdout line, nonzero exit on any failed check, and the parity_mutate_*() seam the harness perturbs. It is compiled into each fixture rather than run, so it is build input to the harness and never an executable guest in its own right."
-    },
-    {
-      "disposition": "suite-helper",
-      "path": "tests/backend-parity/fixtures/rlimit_identity.c",
-      "runner": "tests/backend-parity/parity_mutation.py",
-      "why": "tests/backend-parity/fixtures/rlimit_identity.c is owned by tests/backend-parity/parity_mutation.py: This is a family member guest exercised only through the shared mutation harness, which compiles it with the family flags and supplies its declared mutation field. It carries no bespoke verification logic of its own and is not a manifest test, so the generic manifest must not schedule it independently of the harness that gives it meaning."
-    },
-    {
-      "disposition": "suite-helper",
-      "path": "tests/backend-parity/fixtures/sched_getaffinity_identity.c",
-      "runner": "tests/backend-parity/parity_mutation.py",
-      "why": "tests/backend-parity/fixtures/sched_getaffinity_identity.c is owned by tests/backend-parity/parity_mutation.py: This is the second family member guest, registered to demonstrate that a new member inherits the shared verification with zero bespoke code. Like its sibling it is compiled and driven exclusively by the mutation harness and is not an independently scheduled manifest test, so the generic manifest must not claim it."
-    },
-    {
-      "disposition": "suite-helper",
-      "path": "tests/backend-parity/parity_mutation.py",
-      "runner": "ci/dag/portable.json e2e.parity_mutation",
-      "why": "tests/backend-parity/parity_mutation.py is owned by ci/dag/portable.json e2e.parity_mutation: This is the shared mutation harness for the backend-parity identity family: it proves each declared field is load-bearing and compares every candidate backend against the golden ptrace reference at a recorded strictness tier. It is a driver invoked directly by CI, not a guest, and the generic manifest must not schedule it as one."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/c/exec_clock_continuity.c",
-      "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/exec_clock_continuity.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this self-re-execing guest and asserts that guest virtual time is strictly monotonic ACROSS the execve boundary, comparing pre-exec and post-exec CLOCK_REALTIME samples handed through argv; it remains a guest fixture because a generic manifest cannot express the exec-boundary hand-off contract or the cross-image ordering assertion."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/c/fork_child_getrandom.c",
-      "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/fork_child_getrandom.c is owned by hermit-cli/tests/cli.rs: The no-namespace integration test forks two sequential child processes, requires their getrandom streams to be distinct, and verifies the complete invocation twice so changing host TIDs cannot change either child's bytes. It remains a fixture because the generic manifest has no no-namespace execution mode."
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/chaos/thread_interleaving.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/*.yaml",
-      "why": "tests/chaos/thread_interleaving.c is owned by target/debug/test-harness via tests/e2e/manifests/*.yaml: Direct schema-v2 program; all modes and backend policy are centralized in the YAML bucket manifests"
     }
   ],
   "schema": 2

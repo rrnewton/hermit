@@ -1,3 +1,11 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 #define _GNU_SOURCE
 #include <errno.h>
 #include <linux/futex.h>
@@ -132,8 +140,13 @@ static pid_t spawn_group_owner(const char *mode) {
   }
 
   if (strcmp(mode, "signal") == 0) {
-    lock_as_owner();
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, owner_thread, NULL) != 0) {
+      die("pthread_create owner");
+    }
+    wait_until(&state->owner_ready, 1);
     wait_until(&state->trigger, 1);
+    /* The signal recipient is deliberately not the robust-mutex owner. */
     raise(SIGTERM);
     _exit(9);
   }

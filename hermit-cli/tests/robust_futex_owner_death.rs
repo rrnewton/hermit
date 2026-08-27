@@ -35,8 +35,8 @@
 //! The assertions below therefore also require Detcore's own log records that
 //! its wake reached exactly one modeled waiter, the ptrace path deferred the
 //! transition, and it did not execute the production store. The unit tests
-//! separately prove that the fake exposes the same non-atomic window as the
-//! remaining DBT, SaBRe, and KVM path.
+//! separately expose why a backend without atomic or post-exit support must not
+//! run the separate read/write path.
 
 use std::fs;
 use std::fs::File;
@@ -204,6 +204,7 @@ fn robust_futex_owner_death_wakes_the_waiter_at_l2() {
             "run",
             "--backend=ptrace",
             "--strict",
+            "--tmp=/tmp",
             "--verify",
             "--verify-strict",
             "--verify-json",
@@ -254,6 +255,7 @@ fn detcore_wakes_the_modeled_waiter_before_linux_finishes_exit() {
             "run",
             "--backend=ptrace",
             "--strict",
+            "--tmp=/tmp",
             "--base-env=minimal",
             "--",
         ])
@@ -323,6 +325,41 @@ fn ptrace_wakes_after_guest_observed_fatal_signal_and_exit_group_cleanup() {
     let guest = build_lifecycle_guest(&build_root);
 
     for mode in ["signal", "exit-group"] {
+        let verify_json = build_root.join(format!("ptrace-{mode}.verify.json"));
+        let _ = fs::remove_file(&verify_json);
+        let mut verify = Command::new("timeout");
+        verify
+            .args(["--kill-after", "5s", "120s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args([
+                "--log=info",
+                "run",
+                "--backend=ptrace",
+                "--strict",
+                "--tmp=/tmp",
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+            ])
+            .arg(&verify_json)
+            .args(["--base-env=minimal", "--"])
+            .arg(&guest)
+            .arg(mode);
+        let verified = run_captured(
+            verify,
+            &format!("ptrace robust-futex {mode} strict verification"),
+            &build_root.join(format!("ptrace-{mode}-verify.out")),
+            &build_root.join(format!("ptrace-{mode}-verify.err")),
+            true,
+        );
+        assert!(
+            verified.stdout.contains("PASS: waiter received EOWNERDEAD"),
+            "ptrace {mode} verification did not make progress after owner death\nstdout:\n{}\nstderr:\n{}",
+            verified.stdout,
+            verified.stderr,
+        );
+        assert_nonempty_canonical_l2(&verify_json, &verified.stdout, &verified.stderr);
+
         let mut run = Command::new("timeout");
         run.args(["--kill-after", "5s", "120s"])
             .arg(env!("CARGO_BIN_EXE_hermit"))
@@ -331,6 +368,7 @@ fn ptrace_wakes_after_guest_observed_fatal_signal_and_exit_group_cleanup() {
                 "run",
                 "--backend=ptrace",
                 "--strict",
+                "--tmp=/tmp",
                 "--base-env=minimal",
                 "--",
             ])
