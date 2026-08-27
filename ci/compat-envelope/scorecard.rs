@@ -5566,6 +5566,8 @@ fn self_test() -> Result<(), String> {
                     first_divergent_virtual_nanoseconds: None,
                     first_divergent_record: None,
                     first_divergent_syscall: None,
+                    first_divergent_left_message: None,
+                    first_divergent_right_message: None,
                 })
                 .unwrap();
                 serde_json::json!({
@@ -5921,6 +5923,8 @@ red/`measured-and-passed` count is **0**.",
                 first_divergent_virtual_nanoseconds: virtual_nanoseconds,
                 first_divergent_record: record,
                 first_divergent_syscall: syscall,
+                first_divergent_left_message: None,
+                first_divergent_right_message: None,
                 runtime: None,
             }
         };

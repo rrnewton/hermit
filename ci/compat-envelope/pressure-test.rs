@@ -826,7 +826,7 @@ struct ResultRow {
     ///
     /// ⚠️ `#[serde(default)]`, SO ABSENCE STAYS "WRITTEN BEFORE THE FIELD
     /// EXISTED" rather than "this attempt located nothing", which is an explicit
-    /// null. The producer emits all four on every row and a test in
+    /// null. The producer emits every field on every row and a test in
     /// `ci/manifest-plan/src/runner.rs` holds it to that.
     #[serde(default)]
     first_divergent_record: Option<u64>,
@@ -836,6 +836,10 @@ struct ResultRow {
     first_divergent_scheduler_turn: Option<u64>,
     #[serde(default)]
     first_divergent_virtual_nanoseconds: Option<u64>,
+    #[serde(default)]
+    first_divergent_left_message: Option<String>,
+    #[serde(default)]
+    first_divergent_right_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     run_index: Option<u64>,
     hermit_sha: String,
@@ -993,6 +997,9 @@ struct InvocationAttempt {
 struct RequiredNullableU64(Option<u64>);
 
 #[derive(Debug, Deserialize)]
+struct RequiredNullableString(Option<String>);
+
+#[derive(Debug, Deserialize)]
 struct VerificationEvidence {
     verified: bool,
     bitwise_parity: bool,
@@ -1040,6 +1047,12 @@ struct VerificationEvidence {
     /// DESERIALIZATION.
     #[allow(dead_code)]
     first_divergent_syscall: RequiredNullableU64,
+    /// Required-nullable for the same reason as the four numeric fields: this
+    /// reader sees reports produced by the current invocation, so a missing key
+    /// means the producer stopped writing evidence rather than that the report
+    /// predates the field.
+    first_divergent_left_message: RequiredNullableString,
+    first_divergent_right_message: RequiredNullableString,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -3653,6 +3666,8 @@ fn earlier_attempts_that_located(rows: &[ResultRow], terminal: u64) -> Vec<&Resu
                 || row.first_divergent_syscall.is_some()
                 || row.first_divergent_scheduler_turn.is_some()
                 || row.first_divergent_virtual_nanoseconds.is_some()
+                || row.first_divergent_left_message.is_some()
+                || row.first_divergent_right_message.is_some()
         })
         .collect();
     earlier.sort_by_key(|row| row.attempt);
@@ -4075,10 +4090,12 @@ fn read_verification_report(
     }
     if evidence.verdict != "diverged"
         && (evidence.first_divergent_scheduler_turn.0.is_some()
-            || evidence.first_divergent_virtual_nanoseconds.0.is_some())
+            || evidence.first_divergent_virtual_nanoseconds.0.is_some()
+            || evidence.first_divergent_left_message.0.is_some()
+            || evidence.first_divergent_right_message.0.is_some())
     {
         return Err(format!(
-            "verification report {} records a divergence position without a divergent verdict",
+            "verification report {} records divergence evidence without a divergent verdict",
             path.display()
         ));
     }
@@ -4216,6 +4233,8 @@ fn summarize(
                                     "first_divergent_syscall": row.first_divergent_syscall,
                                     "first_divergent_scheduler_turn": row.first_divergent_scheduler_turn,
                                     "first_divergent_virtual_nanoseconds": row.first_divergent_virtual_nanoseconds,
+                                    "first_divergent_left_message": row.first_divergent_left_message,
+                                    "first_divergent_right_message": row.first_divergent_right_message,
                                 })
                             })
                             .collect();
@@ -4448,6 +4467,10 @@ fn summarize(
                                             earlier_row.first_divergent_scheduler_turn,
                                         "first_divergent_virtual_nanoseconds":
                                             earlier_row.first_divergent_virtual_nanoseconds,
+                                        "first_divergent_left_message":
+                                            earlier_row.first_divergent_left_message,
+                                        "first_divergent_right_message":
+                                            earlier_row.first_divergent_right_message,
                                     },
                                     "verification_logs": verification_logs,
                                     "normalized_ptrace_golden": normalized_ptrace_golden,
@@ -4956,8 +4979,8 @@ fn self_test(root: &Path) -> Result<(), String> {
             "pressure-divergence-history-{}",
             std::process::id()
         ));
-        let diverged = r#"{"schema":4,"attempt":1,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"FAIL","first_divergent_record":93,"first_divergent_syscall":37,"first_divergent_scheduler_turn":68,"first_divergent_virtual_nanoseconds":7,"timeout_seconds":15,"duration_ms":100,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null,"artifact_dir":"/retained/runs/r/t-verify-ptrace"}"#;
-        let passed = r#"{"schema":4,"attempt":2,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"PASS","first_divergent_record":null,"first_divergent_syscall":null,"first_divergent_scheduler_turn":null,"first_divergent_virtual_nanoseconds":null,"timeout_seconds":15,"duration_ms":200,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null,"artifact_dir":"/retained/runs/r/t-verify-ptrace-attempt-2"}"#;
+        let diverged = r#"{"schema":4,"attempt":1,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"FAIL","first_divergent_record":93,"first_divergent_syscall":37,"first_divergent_scheduler_turn":68,"first_divergent_virtual_nanoseconds":7,"first_divergent_left_message":"INFO detcore: left event","first_divergent_right_message":"INFO detcore: right event","timeout_seconds":15,"duration_ms":100,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null,"artifact_dir":"/retained/runs/r/t-verify-ptrace"}"#;
+        let passed = r#"{"schema":4,"attempt":2,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"PASS","first_divergent_record":null,"first_divergent_syscall":null,"first_divergent_scheduler_turn":null,"first_divergent_virtual_nanoseconds":null,"first_divergent_left_message":null,"first_divergent_right_message":null,"timeout_seconds":15,"duration_ms":200,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null,"artifact_dir":"/retained/runs/r/t-verify-ptrace-attempt-2"}"#;
         fs::write(&path, format!("{diverged}\n{passed}\n"))
             .map_err(|e| format!("cannot write divergence history fixture: {e}"))?;
         let all = read_result_rows(&path)?;
@@ -4965,6 +4988,10 @@ fn self_test(root: &Path) -> Result<(), String> {
         if earlier.len() != 1
             || earlier[0].attempt != 1
             || earlier[0].first_divergent_record != Some(93)
+            || earlier[0].first_divergent_left_message.as_deref()
+                != Some("INFO detcore: left event")
+            || earlier[0].first_divergent_right_message.as_deref()
+                != Some("INFO detcore: right event")
         {
             return Err(format!(
                 "the diverging first attempt must remain an earlier observation; got {} row(s)",
@@ -4993,6 +5020,14 @@ fn self_test(root: &Path) -> Result<(), String> {
                 .replace(
                     "\"first_divergent_virtual_nanoseconds\":7",
                     "\"first_divergent_virtual_nanoseconds\":null",
+                )
+                .replace(
+                    "\"first_divergent_left_message\":\"INFO detcore: left event\"",
+                    "\"first_divergent_left_message\":null",
+                )
+                .replace(
+                    "\"first_divergent_right_message\":\"INFO detcore: right event\"",
+                    "\"first_divergent_right_message\":null",
                 ),
             passed
         );
@@ -6833,6 +6868,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         first_divergent_syscall: None,
         first_divergent_scheduler_turn: None,
         first_divergent_virtual_nanoseconds: None,
+        first_divergent_left_message: None,
+        first_divergent_right_message: None,
         attempt: 1,
         schema: CELL_RESULT_SCHEMA,
         run_id: sample_slug.clone(),
@@ -6882,7 +6919,13 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err("matching retained result-row identity was refused".into());
     }
     let appended_results = scratch.join("appended-results.jsonl");
-    let first_row = result_row.clone();
+    let mut first_row = result_row.clone();
+    first_row.first_divergent_record = Some(93);
+    first_row.first_divergent_syscall = Some(37);
+    first_row.first_divergent_scheduler_turn = Some(68);
+    first_row.first_divergent_virtual_nanoseconds = Some(7);
+    first_row.first_divergent_left_message = Some("INFO detcore: left event".into());
+    first_row.first_divergent_right_message = Some("INFO detcore: right event".into());
     let mut second_row = result_row.clone();
     second_row.attempt = 2;
     second_row.outcome = "PASS".into();
@@ -6907,9 +6950,16 @@ fn self_test(root: &Path) -> Result<(), String> {
         || appended[0].attempt != 1
         || appended[0].duration_ms != Some(19_000)
         || appended[0].timeout_seconds != Some(20)
+        || appended[0].first_divergent_syscall != Some(37)
+        || appended[0].first_divergent_left_message.as_deref()
+            != Some("INFO detcore: left event")
+        || appended[0].first_divergent_right_message.as_deref()
+            != Some("INFO detcore: right event")
         || appended[1].attempt != 2
         || appended[1].duration_ms != Some(19_500)
         || appended[1].timeout_seconds != Some(20)
+        || appended[1].first_divergent_left_message.is_some()
+        || appended[1].first_divergent_right_message.is_some()
         || !appended.iter().all(|row| {
             result_row_identity_and_invocation_match(
                 row,
@@ -6954,6 +7004,10 @@ fn self_test(root: &Path) -> Result<(), String> {
     if nested_rows.len() != 2
         || nested_rows[0].1.run_index != Some(4)
         || nested_rows[0].1.attempt != 1
+        || nested_rows[0].1.first_divergent_left_message.as_deref()
+            != Some("INFO detcore: left event")
+        || nested_rows[0].1.first_divergent_right_message.as_deref()
+            != Some("INFO detcore: right event")
         || nested_rows[1].1.run_index != Some(4)
         || nested_rows[1].1.attempt != 2
     {
@@ -7041,6 +7095,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         first_divergent_syscall: None,
         first_divergent_scheduler_turn: None,
         first_divergent_virtual_nanoseconds: None,
+        first_divergent_left_message: None,
+        first_divergent_right_message: None,
         attempt: 1,
         schema: CELL_RESULT_SCHEMA,
         run_id: first_repetition_slug.clone(),

@@ -829,6 +829,12 @@ pub struct AttemptResult {
     /// Syscalls the guest completed before diverging. A different keyspace from
     /// every other coordinate here; see the note in canonical_verdict.
     pub first_divergent_syscall: Option<u64>,
+    /// First differing compared message from the left execution, with only the
+    /// separately recorded syscall number, scheduler turn, and committed time
+    /// removed.
+    pub first_divergent_left_message: Option<String>,
+    /// Corresponding first differing compared message from the right execution.
+    pub first_divergent_right_message: Option<String>,
     pub sabre_path_evidence: Option<String>,
     pub sabre_path_evidence_sha256: Option<String>,
     pub reason: Option<String>,
@@ -922,6 +928,11 @@ pub struct CellResult {
     pub first_divergent_record: Option<u64>,
     /// Syscalls completed before diverging. Same first-attempt rule.
     pub first_divergent_syscall: Option<u64>,
+    /// First differing compared message from the first attempt that recorded
+    /// message content.
+    pub first_divergent_left_message: Option<String>,
+    /// Corresponding first differing compared message from that same attempt.
+    pub first_divergent_right_message: Option<String>,
     pub reason: Option<String>,
     /// Where this cell's retained evidence lives.
     ///
@@ -1663,6 +1674,8 @@ fn execute_spec_until(
     let mut first_divergent_virtual_nanoseconds = None;
     let mut first_divergent_record = None;
     let mut first_divergent_syscall = None;
+    let mut first_divergent_left_message = None;
+    let mut first_divergent_right_message = None;
     let (sabre_path_evidence, sabre_path_evidence_sha256) = spec
         .sabre_path_evidence
         .as_ref()
@@ -1698,6 +1711,10 @@ fn execute_spec_until(
                                 report.first_divergent_virtual_nanoseconds;
                             first_divergent_record = report.first_divergent_record;
                             first_divergent_syscall = report.first_divergent_syscall;
+                            first_divergent_left_message =
+                                report.first_divergent_left_message.clone();
+                            first_divergent_right_message =
+                                report.first_divergent_right_message.clone();
                         }
                         if launch_refusal || backend_unavailable {
                             // The process never created a guest.  A report at
@@ -1782,6 +1799,8 @@ fn execute_spec_until(
         first_divergent_virtual_nanoseconds,
         first_divergent_record,
         first_divergent_syscall,
+        first_divergent_left_message,
+        first_divergent_right_message,
         sabre_path_evidence,
         sabre_path_evidence_sha256,
         reason,
@@ -1922,6 +1941,8 @@ fn cell_timeout_attempt(
         first_divergent_virtual_nanoseconds: None,
         first_divergent_record: None,
         first_divergent_syscall: None,
+        first_divergent_left_message: None,
+        first_divergent_right_message: None,
         sabre_path_evidence: None,
         sabre_path_evidence_sha256: None,
         reason: Some(format!(
@@ -2085,6 +2106,8 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
     let first_divergent_virtual_nanoseconds = position.virtual_nanoseconds;
     let first_divergent_record = position.record;
     let first_divergent_syscall = position.syscall;
+    let first_divergent_left_message = position.left_message;
+    let first_divergent_right_message = position.right_message;
     let mut error_kind = attempts
         .iter()
         .find_map(|attempt| attempt.error_kind.clone());
@@ -2232,6 +2255,8 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         first_divergent_virtual_nanoseconds,
         first_divergent_record,
         first_divergent_syscall,
+        first_divergent_left_message,
+        first_divergent_right_message,
         reason,
     })
 }
@@ -2292,6 +2317,8 @@ pub fn infrastructure_error_result(
         first_divergent_virtual_nanoseconds: None,
         first_divergent_record: None,
         first_divergent_syscall: None,
+        first_divergent_left_message: None,
+        first_divergent_right_message: None,
         reason: Some(reason),
     }
 }
@@ -2344,11 +2371,13 @@ pub fn host_inapplicable_result(
         first_divergent_virtual_nanoseconds: None,
         first_divergent_record: None,
         first_divergent_syscall: None,
+        first_divergent_left_message: None,
+        first_divergent_right_message: None,
         reason: Some(reason),
     }
 }
 
-/// Reduce per-attempt divergence positions to the cell-level pair.
+/// Reduce per-attempt divergence evidence to the cell-level fields.
 ///
 /// Same first-attempt rule as `reason`, and resolved PER COORDINATE rather than
 /// per attempt: a report that located a turn but no virtual nanosecond still
@@ -2360,22 +2389,29 @@ pub fn host_inapplicable_result(
 /// earliest/latest in ci/compat-envelope/scorecard.rs without having a sample
 /// behind it, and this project has repeatedly been bitten by numbers that look
 /// like a measurement and are not.
-/// The four divergence coordinates of one cell.
+/// The divergence coordinates and compared messages of one cell.
 ///
-/// A NAMED STRUCT rather than a tuple, deliberately: four `Option<u64>` in
-/// positional order is four indistinguishable integers, and this project has
-/// already had a bare ordinal read against the wrong axis. Each field is a
-/// DIFFERENT KEYSPACE -- measured on one real divergence, the same event was
-/// record 98, syscall 37 and scheduler turn 4.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// A named struct rather than a tuple, deliberately: the four numeric values
+/// are otherwise indistinguishable, and this project has already had a bare
+/// ordinal read against the wrong axis. Each numeric field is a different
+/// keyspace -- measured on one real divergence, the same event was record 98,
+/// syscall 37 and scheduler turn 4. The messages retain the compared event
+/// content without treating record position as identity.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DivergencePosition {
     pub scheduler_turn: Option<u64>,
     pub virtual_nanoseconds: Option<u64>,
     pub record: Option<u64>,
     pub syscall: Option<u64>,
+    pub left_message: Option<String>,
+    pub right_message: Option<String>,
 }
 
 fn cell_divergence_position(attempts: &[AttemptResult]) -> DivergencePosition {
+    let messages = attempts.iter().find(|attempt| {
+        attempt.first_divergent_left_message.is_some()
+            || attempt.first_divergent_right_message.is_some()
+    });
     DivergencePosition {
         scheduler_turn: attempts
             .iter()
@@ -2389,6 +2425,8 @@ fn cell_divergence_position(attempts: &[AttemptResult]) -> DivergencePosition {
         syscall: attempts
             .iter()
             .find_map(|attempt| attempt.first_divergent_syscall),
+        left_message: messages.and_then(|attempt| attempt.first_divergent_left_message.clone()),
+        right_message: messages.and_then(|attempt| attempt.first_divergent_right_message.clone()),
     }
 }
 
@@ -3350,7 +3388,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_preserves_both_failed_rows_with_elapsed_bound_and_attempt() {
+    fn retry_preserves_a_divergence_when_the_later_row_passes() {
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-durable-row-bracket-{}",
             std::process::id()
@@ -3393,6 +3431,12 @@ mod tests {
         first.error_kind = None;
         assert_eq!(first.duration_ms, None);
         first.duration_ms = Some(111);
+        first.first_divergent_record = Some(93);
+        first.first_divergent_syscall = Some(37);
+        first.first_divergent_scheduler_turn = Some(68);
+        first.first_divergent_virtual_nanoseconds = Some(7);
+        first.first_divergent_left_message = Some("INFO detcore: left event".into());
+        first.first_divergent_right_message = Some("INFO detcore: right event".into());
         append_result(&path, &first).unwrap();
 
         // A validate retry starts a fresh harness process and prepares the same
@@ -3401,7 +3445,7 @@ mod tests {
         prepare_result_path(&path).unwrap();
         context.attempt = 2;
         let mut second = infrastructure_error_result(&context, &cell, "forced retry".into());
-        second.outcome = "FAIL".into();
+        second.outcome = "PASS".into();
         second.error_kind = None;
         second.duration_ms = Some(222);
         append_result(&path, &second).unwrap();
@@ -3415,9 +3459,25 @@ mod tests {
         assert_eq!(rows[0]["attempt"], 1);
         assert_eq!(rows[0]["duration_ms"], 111);
         assert_eq!(rows[0]["timeout_seconds"], 15);
+        assert_eq!(rows[0]["outcome"], "FAIL");
+        assert_eq!(rows[0]["first_divergent_record"], 93);
+        assert_eq!(rows[0]["first_divergent_syscall"], 37);
+        assert_eq!(rows[0]["first_divergent_scheduler_turn"], 68);
+        assert_eq!(rows[0]["first_divergent_virtual_nanoseconds"], 7);
+        assert_eq!(
+            rows[0]["first_divergent_left_message"],
+            "INFO detcore: left event"
+        );
+        assert_eq!(
+            rows[0]["first_divergent_right_message"],
+            "INFO detcore: right event"
+        );
         assert_eq!(rows[1]["attempt"], 2);
         assert_eq!(rows[1]["duration_ms"], 222);
         assert_eq!(rows[1]["timeout_seconds"], 15);
+        assert_eq!(rows[1]["outcome"], "PASS");
+        assert!(rows[1]["first_divergent_left_message"].is_null());
+        assert!(rows[1]["first_divergent_right_message"].is_null());
         assert_ne!(rows[0]["artifact_dir"], rows[1]["artifact_dir"]);
         assert!(
             rows[1]["artifact_dir"]
@@ -4129,11 +4189,15 @@ backends_disabled:
     /// would erase the position the failing attempt found.
     #[test]
     fn cell_divergence_takes_the_first_attempt_that_located_one() {
-        let attempts = vec![
+        let mut attempts = vec![
             attempt_with_divergence(None, None, None, None),
             attempt_with_divergence(Some(4), Some(400), Some(40), Some(14)),
             attempt_with_divergence(Some(1), Some(100), Some(10), Some(2)),
         ];
+        attempts[1].first_divergent_left_message = Some("left event A".into());
+        attempts[1].first_divergent_right_message = Some("right event A".into());
+        attempts[2].first_divergent_left_message = Some("left event B".into());
+        attempts[2].first_divergent_right_message = Some("right event B".into());
         assert_eq!(
             cell_divergence_position(&attempts),
             DivergencePosition {
@@ -4141,6 +4205,8 @@ backends_disabled:
                 virtual_nanoseconds: Some(400),
                 record: Some(40),
                 syscall: Some(14),
+                left_message: Some("left event A".into()),
+                right_message: Some("right event A".into()),
             },
             "the first located position wins; a later, earlier-diverging attempt \
              must not silently replace it, and this is NOT a min across attempts"
@@ -4165,6 +4231,8 @@ backends_disabled:
                 virtual_nanoseconds: Some(900),
                 record: Some(3),
                 syscall: Some(5),
+                left_message: None,
+                right_message: None,
             }
         );
     }
@@ -4214,7 +4282,7 @@ backends_disabled:
     /// treat these numbers as a baseline to compare against.
     ///
     /// That distinction currently holds only because no
-    /// `skip_serializing_if = "Option::is_none"` is attached to these four
+    /// `skip_serializing_if = "Option::is_none"` is attached to these
     /// fields -- an entirely natural tidy-up for a field that is null on the
     /// large majority of rows. Adding one would silently convert every future
     /// "ran and found nothing" row into a row indistinguishable from a
@@ -4266,13 +4334,15 @@ backends_disabled:
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            first_divergent_left_message: None,
+            first_divergent_right_message: None,
             reason: None,
             artifact_dir: "/repo/artifacts".into(),
         }
     }
 
     #[test]
-    fn a_located_nothing_row_still_carries_all_four_coordinate_keys() {
+    fn a_located_nothing_row_still_carries_all_divergence_fields() {
         let attempt = attempt_with_sabre_evidence("evidence");
         let rendered = serde_json::to_value(&attempt).expect("attempt serializes");
         let object = rendered.as_object().expect("attempt is a JSON object");
@@ -4281,6 +4351,8 @@ backends_disabled:
             "first_divergent_syscall",
             "first_divergent_scheduler_turn",
             "first_divergent_virtual_nanoseconds",
+            "first_divergent_left_message",
+            "first_divergent_right_message",
         ] {
             let found = object.get(key).unwrap_or_else(|| {
                 panic!(
@@ -4306,6 +4378,8 @@ backends_disabled:
             "first_divergent_syscall",
             "first_divergent_scheduler_turn",
             "first_divergent_virtual_nanoseconds",
+            "first_divergent_left_message",
+            "first_divergent_right_message",
         ] {
             let found = object.get(key).unwrap_or_else(|| {
                 panic!(
@@ -4328,6 +4402,8 @@ backends_disabled:
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            first_divergent_left_message: None,
+            first_divergent_right_message: None,
             index: "1".into(),
             outcome: "PASS".into(),
             error_kind: None,
@@ -4418,6 +4494,8 @@ backends_disabled:
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            first_divergent_left_message: None,
+            first_divergent_right_message: None,
             runtime: None,
             compared_log_messages: Some(crate::canonical_verdict::ComparedLogMessages {
                 left: 1,
@@ -4638,6 +4716,8 @@ backends_disabled:
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            first_divergent_left_message: None,
+            first_divergent_right_message: None,
             runtime: None,
         })
         .unwrap();
