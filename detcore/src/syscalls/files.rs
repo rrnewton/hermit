@@ -1784,12 +1784,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         let in_type = guest
             .thread_state()
             .with_detfd(call.in_fd(), |detfd| detfd.ty())?;
-        let (out_type, out_resource, out_inode) =
+        let (out_type, out_resource, out_inode, out_is_inherited_append) =
             guest.thread_state().with_detfd(call.out_fd(), |detfd| {
                 (
                     detfd.ty(),
                     detfd.resource(),
                     detfd.stat().map(|stat| stat.inode),
+                    is_inherited_container_stdio(detfd.resource())
+                        && detfd.status_flags() & libc::O_APPEND != 0,
                 )
             })?;
 
@@ -1806,6 +1808,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_detfd(call.in_fd(), |detfd| detfd.procfs_position().is_some())?;
         if in_is_procfs {
             return Err(Errno::ENOSYS.into());
+        }
+
+        // Linux refuses sendfile when the output open file description has
+        // O_APPEND. The inherited stdio bit is logical so it cannot reach the
+        // kernel; reproduce the same EINVAL before forwarding rather than
+        // reporting append while overwriting at the physical file offset.
+        if out_is_inherited_append {
+            return Err(Errno::EINVAL.into());
         }
 
         if !matches!(in_type, FdType::Regular | FdType::Memfd)
@@ -1856,10 +1866,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         fd: RawFd,
     ) -> Result<(), Error> {
-        let append = guest.thread_state().with_detfd(fd, |detfd| {
-            is_inherited_container_stdio(detfd.resource())
-                && detfd.status_flags() & libc::O_APPEND != 0
-        })?;
+        let append = self.inherited_container_stdio_has_append(guest, fd)?;
         if append {
             match guest
                 .inject_with_retry(Syscall::Lseek(
@@ -1875,6 +1882,34 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         }
         Ok(())
+    }
+
+    fn inherited_container_stdio_has_append<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        fd: RawFd,
+    ) -> Result<bool, Error> {
+        guest.thread_state().with_detfd(fd, |detfd| {
+            is_inherited_container_stdio(detfd.resource())
+                && detfd.status_flags() & libc::O_APPEND != 0
+        })
+    }
+
+    /// Linux applies O_APPEND to pwrite/pwritev/pwritev2 despite their explicit
+    /// offsets, but those calls still leave the open file description's current
+    /// offset unchanged. The inherited bit is logical, so replace the syscall's
+    /// explicit offset with the current file size instead of seeking the shared
+    /// supervisor description.
+    async fn inherited_append_offset_for_positioned_write<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        requested_offset: i64,
+    ) -> Result<Option<i64>, Error> {
+        if requested_offset < 0 || !self.inherited_container_stdio_has_append(guest, fd)? {
+            return Ok(None);
+        }
+        Ok(Some(self.inject_fstat(guest, fd).await?.st_size))
     }
 
     /// SYS_write system call.
@@ -1994,6 +2029,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             } else {
                 Errno::ESPIPE.into()
             });
+        }
+
+        if let Some(append_offset) = self
+            .inherited_append_offset_for_positioned_write(guest, call.fd(), call.offset())
+            .await?
+        {
+            call = call.with_offset(append_offset);
         }
 
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
@@ -2317,7 +2359,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     pub async fn handle_pwritev<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        call: syscalls::Pwritev,
+        mut call: syscalls::Pwritev,
     ) -> Result<i64, Error> {
         if self.timer_slack_binding(guest, call.fd())?.is_some() {
             let offset = vectored_offset(call.pos_l(), call.pos_h());
@@ -2326,6 +2368,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             } else {
                 Err(Errno::ESPIPE.into())
             };
+        }
+
+        let requested_offset = vectored_offset(call.pos_l(), call.pos_h());
+        if let Some(append_offset) = self
+            .inherited_append_offset_for_positioned_write(guest, call.fd(), requested_offset)
+            .await?
+        {
+            call = call.with_pos_l(append_offset as u64).with_pos_h(0);
         }
 
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
@@ -2370,7 +2420,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     pub async fn handle_pwritev2<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        call: syscalls::Pwritev2,
+        mut call: syscalls::Pwritev2,
     ) -> Result<i64, Error> {
         if self.timer_slack_binding(guest, call.fd())?.is_some() {
             let offset = vectored_offset(call.pos_l(), call.pos_h());
@@ -2386,6 +2436,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             return self
                 .writev_timer_slack(guest, call.fd(), iovecs, call.flags())
                 .await;
+        }
+
+        let requested_offset = vectored_offset(call.pos_l(), call.pos_h());
+        if requested_offset == -1 && self.inherited_container_stdio_has_append(guest, call.fd())? {
+            // An offset of -1 uses and advances the open file description's
+            // current offset. Put that offset at EOF exactly as writev does.
+            self.position_inherited_append(guest, call.fd()).await?;
+        } else if let Some(append_offset) = self
+            .inherited_append_offset_for_positioned_write(guest, call.fd(), requested_offset)
+            .await?
+        {
+            call = call.with_pos_l(append_offset as u64).with_pos_h(0);
         }
 
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {

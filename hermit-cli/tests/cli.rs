@@ -55,6 +55,7 @@ static EXEC_CLOCK_CONTINUITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FORK_CHILD_GETRANDOM_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_STATUS_FLAG_CONTAINMENT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static STDIO_APPEND_WRITE_FAMILY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static NONBLOCKING_STDIN_RECV_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_NONBLOCK_THEN_APPEND_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_INITIAL_NONBLOCKING_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -625,6 +626,117 @@ fn assert_guest_cannot_mutate_hermits_stdout_flags(backend: &str) {
     assert_eq!(append_after, append_before);
 }
 
+fn stdio_append_write_family_guest() -> &'static Path {
+    STDIO_APPEND_WRITE_FAMILY_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("stdio-append-write-family");
+        fs::create_dir_all(&build_root).expect("failed to create append-write guest directory");
+        let guest = build_root.join("stdio_append_write_family");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/stdio_append_write_family.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the append-write guest");
+        assert!(
+            output.status.success(),
+            "append-write guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// An inherited stdout that logically carries O_APPEND must match Linux for
+/// every mediated write path without changing the supervisor's physical flag.
+///
+/// Native Linux refuses sendfile with EINVAL when the output description has
+/// O_APPEND. Its pwrite family instead appends despite the explicit offset, and
+/// preserves the current file offset unless pwritev2 receives offset -1. The
+/// modeled flag must reproduce those results; reflecting O_APPEND through
+/// F_GETFL while forwarding at the physical offset would make the model lie.
+fn assert_inherited_append_write_family_matches_linux(backend: &str) {
+    let _guard = hermit_run_guard();
+    let guest = stdio_append_write_family_guest();
+
+    for (mode, expected_bytes, expected_position) in [
+        ("sendfile", b"prefix\n".as_slice(), 0_u64),
+        ("pwrite", b"prefix\nguest\n".as_slice(), 0),
+        ("pwritev", b"prefix\nguest\n".as_slice(), 0),
+        ("pwritev2", b"prefix\nguest\n".as_slice(), 0),
+        ("pwritev2-current", b"prefix\nguest\n".as_slice(), 13),
+    ] {
+        let directory = tempfile::tempdir().expect("failed to create a temporary directory");
+        let output_path = directory.path().join(format!("{mode}.out"));
+        let mut supervisor_stdout = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&output_path)
+            .expect("failed to open the stdout stand-in");
+        supervisor_stdout
+            .write_all(b"prefix\n")
+            .expect("failed to seed the stdout stand-in");
+        supervisor_stdout
+            .seek(SeekFrom::Start(0))
+            .expect("failed to position the stdout stand-in before EOF");
+
+        // SAFETY: the descriptor is live and F_GETFL takes no third argument.
+        let flags_before = unsafe { libc::fcntl(supervisor_stdout.as_raw_fd(), libc::F_GETFL) };
+        assert!(
+            flags_before >= 0,
+            "F_GETFL on the supervisor descriptor failed"
+        );
+        assert_eq!(flags_before & libc::O_APPEND, 0);
+
+        let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+            .args(["run", "--backend", backend, "--"])
+            .arg(guest)
+            .arg(mode)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(
+                supervisor_stdout
+                    .try_clone()
+                    .expect("failed to duplicate the stdout stand-in"),
+            ))
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("failed to run the {backend} {mode} append guest: {error}")
+            });
+        let diagnostics = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{backend} {mode} did not match Linux O_APPEND behavior: {:?}\nstderr:\n{diagnostics}",
+            output.status,
+        );
+        assert_eq!(
+            fs::read(&output_path).expect("failed to read the stdout stand-in"),
+            expected_bytes,
+            "{backend} {mode} wrote at the physical offset instead of applying logical O_APPEND\nstderr:\n{diagnostics}",
+        );
+        assert_eq!(
+            supervisor_stdout
+                .stream_position()
+                .expect("failed to read the supervisor's current offset"),
+            expected_position,
+            "{backend} {mode} changed the shared file offset contrary to Linux\nstderr:\n{diagnostics}",
+        );
+
+        // SAFETY: the descriptor is still live and F_GETFL takes no third argument.
+        let flags_after = unsafe { libc::fcntl(supervisor_stdout.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(
+            flags_after, flags_before,
+            "{backend} {mode} leaked O_APPEND to the supervisor: 0x{flags_before:x} -> 0x{flags_after:x}",
+        );
+    }
+}
+
 fn stdio_initial_nonblocking_guest() -> &'static Path {
     STDIO_INITIAL_NONBLOCKING_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1047,6 +1159,19 @@ fn run_kvm_guest_cannot_mutate_hermits_stdout_flags() {
         return;
     }
     assert_guest_cannot_mutate_hermits_stdout_flags("kvm");
+}
+
+#[test]
+fn run_ptrace_inherited_append_matches_linux_for_write_family() {
+    assert_inherited_append_write_family_matches_linux("ptrace");
+}
+
+#[test]
+fn run_kvm_inherited_append_matches_linux_for_write_family() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+    assert_inherited_append_write_family_matches_linux("kvm");
 }
 
 #[test]
