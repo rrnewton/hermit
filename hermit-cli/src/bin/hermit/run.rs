@@ -81,6 +81,17 @@ const TMP_DIR: &str = "/tmp";
 const FAIL_CLOSED_ENV: &str = "HERMIT_FAIL_CLOSED";
 const NORMALIZED_SABRE_DETLOG_TIMESTAMP: &str = "1970-01-01T00:00:00.000000Z";
 
+fn take_skid_overshoot_warning() -> Option<String> {
+    let count = reverie::take_skid_overshoot_count();
+    (count > 0).then(|| {
+        format!(
+            "WARNING: observed {count} {} event(s); a successful exit does not establish \
+             deterministic execution because precise PMU timer delivery passed its target.",
+            reverie::SKID_OVERSHOOT_MARKER
+        )
+    })
+}
+
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
@@ -2745,14 +2756,19 @@ impl RunOpts {
             );
         }
 
-        if self.namespace_only {
+        // A previous invocation in this process must not qualify this one.
+        let _ = reverie::take_skid_overshoot_count();
+        let result = if self.namespace_only {
             self.run_with_namespace_only(global)
         } else if self.verify {
             self.verify(global)
         } else {
-            let (status, _) = self.run(global, false)?;
-            Ok(status)
+            self.run(global, false).map(|(status, _)| status)
+        };
+        if let Some(warning) = take_skid_overshoot_warning() {
+            eprintln!("{warning}");
         }
+        result
     }
 
     /// Some arguments imply others. This is the place where that validation occurs.
@@ -4314,6 +4330,19 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    #[test]
+    fn skid_overshoot_warning_consumes_only_recorded_events() {
+        let _ = reverie::take_skid_overshoot_count();
+        assert_eq!(take_skid_overshoot_warning(), None);
+
+        reverie::record_skid_overshoot();
+        reverie::record_skid_overshoot();
+        let warning = take_skid_overshoot_warning().expect("recorded overshoots must be reported");
+        assert!(warning.contains("observed 2 HERMIT_SKID_OVERSHOOT event(s)"));
+        assert!(warning.contains("successful exit does not establish deterministic execution"));
+        assert_eq!(take_skid_overshoot_warning(), None);
+    }
 
     #[test]
     fn run_one_summary_is_empty_again_before_run_two() -> Result<(), Error> {
