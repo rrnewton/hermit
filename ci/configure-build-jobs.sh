@@ -140,11 +140,18 @@ fi
 # while this layer declines with 2 reports the SAME condition as two different
 # things depending on which guard fired first. Both are "could not determine",
 # which is what EX_TEMPFAIL means to scripts/validate.rs.
-# 86d9003a..7137c5dd leaves reverie-dbt/vendor/dynamorio,
-# reverie-dbt/build.rs, and third-party byte-identical by git object ID, so the
-# measured budget carries unchanged with the Reverie pin.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 7137c5ddba398728f8fc8e7068a198ce4223f9c3 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to calibrated Reverie 7137c5ddba398728f8fc8e7068a198ce4223f9c3 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# BOUND TO 49ae9401 (2026-08-27): this revision changes the vendored
+# DynamoRIO source, so the earlier recipe identity does not carry. A cold
+# `cargo check -p reverie-dbt --locked --offline` reported cache MISS then
+# PUBLISHED for
+#     key=sha256:c9c1ee55257cbb0635b56f494a75ee1dc6af839ca8e289231f533b0208340463
+# and the native source build took 33.38s at jobs=16, or 534.08 effective
+# job-seconds. The existing 1050 effective-job-second threshold remains above
+# that one cold local measurement. It is retained conservatively; this sample
+# does not replace the original n=3 hosted measurement or satisfy the >=5-sample
+# replacement rule.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 49ae940130919dbadffbdcf933a354ee746a8440 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to calibrated Reverie 49ae940130919dbadffbdcf933a354ee746a8440 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
