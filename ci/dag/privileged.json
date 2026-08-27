@@ -79,7 +79,7 @@
     {
       "group": "e2e", "job": "manifest_applications",
       "desc": "Privileged manifest bucket: applications",
-      "description": "The selected KVM application cell has a 120 s individual timeout and 10 s TERM/KILL grace. A 180 s node leaves another 50 s for fixture/reporting work and is 2x the measured 90 s whole-node estimate, so the named inner timeout wins without tightening a load-sensitive test.",
+      "description": "The selected KVM application cell has a measured 60 s individual timeout and 10 s TERM/KILL grace. A 180 s node leaves 110 s for fixture/reporting work, so the named inner timeout wins without tightening a load-sensitive test.",
       "manifest": {"lane": "privileged", "category": "applications"},
       "cmd": "./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category applications --ci-only --allow-empty --prebuilt",
       "deps": ["build.privileged_tests", "build.manifest_guests", "e2e.metadata"],

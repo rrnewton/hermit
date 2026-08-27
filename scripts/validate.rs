@@ -7671,6 +7671,7 @@ fn retry_steps_with_satisfied_prerequisites(
 fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
     const DEFAULT_TEST_CAP_S: i64 = 15;
     const NEXTEST_TERMINATION_GRACE_S: i64 = 2;
+    const MANIFEST_TERMINATION_GRACE_S: i64 = 10;
 
     fn quoted_seconds(line: &str, field: &str) -> Result<i64, String> {
         let prefix = format!("{field} = \"");
@@ -7781,12 +7782,16 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         })
         .collect::<Result<Vec<_>, String>>()?;
     let manifest_caps = declared_manifest_caps(root)?;
-    let largest_test_cap_s = nextest_caps
+    let largest_nextest_cap_s = nextest_caps
         .iter()
-        .chain(&manifest_caps)
         .copied()
         .max()
-        .ok_or("retry bounds: no declared per-test cap")?;
+        .ok_or("retry bounds: no declared nextest cap")?;
+    let largest_manifest_cap_s = manifest_caps
+        .iter()
+        .copied()
+        .max()
+        .ok_or("retry bounds: no declared manifest cap")?;
 
     let smallest_enclosing_deadline_s = ["portable", "privileged"]
         .into_iter()
@@ -7796,29 +7801,33 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .min()
         .ok_or("retry bounds: no enclosing lane deadline")?;
     let attempts = validate_runtime::MAX_ATTEMPTS_PER_CELL as i64;
-    let default_execution_s = attempts * DEFAULT_TEST_CAP_S;
-    let default_with_grace_s = attempts * (DEFAULT_TEST_CAP_S + NEXTEST_TERMINATION_GRACE_S);
-    let largest_with_grace_s =
-        attempts * (largest_test_cap_s + NEXTEST_TERMINATION_GRACE_S);
+    let default_with_grace_s = DEFAULT_TEST_CAP_S + NEXTEST_TERMINATION_GRACE_S;
+    let largest_nextest_with_grace_s = largest_nextest_cap_s + NEXTEST_TERMINATION_GRACE_S;
+    let largest_manifest_with_grace_s = largest_manifest_cap_s + MANIFEST_TERMINATION_GRACE_S;
+    // A retry is a new DAG execution of the node and receives a fresh node timeout.
+    // Multiplying an inner test timeout by the attempt count and comparing that
+    // product with one node attempt's deadline compares different scopes. Each
+    // inner timeout plus its own termination grace must fit one node attempt.
     if attempts != 2
-        || default_execution_s != 30
         || nextest_caps.first().copied() != Some(DEFAULT_TEST_CAP_S)
         || default_with_grace_s >= smallest_enclosing_deadline_s
-        || largest_with_grace_s >= smallest_enclosing_deadline_s
+        || largest_nextest_with_grace_s >= smallest_enclosing_deadline_s
+        || largest_manifest_with_grace_s >= smallest_enclosing_deadline_s
     {
         return Err(format!(
-            "retry bounds: attempts={attempts}; default={default_execution_s}s execution / \
-             {default_with_grace_s}s including termination grace; largest declared override \
-             including grace={largest_with_grace_s}s; smallest enclosing lane deadline=\
+            "retry bounds: attempts={attempts}; default nextest cap including grace=\
+             {default_with_grace_s}s; largest nextest cap including grace=\
+             {largest_nextest_with_grace_s}s; largest manifest cap including grace=\
+             {largest_manifest_with_grace_s}s; smallest enclosing lane deadline=\
              {smallest_enclosing_deadline_s}s"
         ));
     }
     Ok(format!(
-        "retry bounds: {attempts} attempts x {DEFAULT_TEST_CAP_S}s = {default_execution_s}s; \
-         with {NEXTEST_TERMINATION_GRACE_S}s termination grace per attempt = \
-         {default_with_grace_s}s < {smallest_enclosing_deadline_s}s; largest declared \
-         {largest_test_cap_s}s override including grace = {largest_with_grace_s}s < \
-         {smallest_enclosing_deadline_s}s"
+        "retry bounds: {attempts} attempts receive separate node deadlines; default nextest \
+         cap including grace={default_with_grace_s}s; largest nextest cap including grace=\
+         {largest_nextest_with_grace_s}s; largest manifest cap including grace=\
+         {largest_manifest_with_grace_s}s; each is below the smallest enclosing lane deadline \
+         of {smallest_enclosing_deadline_s}s"
     ))
 }
 
