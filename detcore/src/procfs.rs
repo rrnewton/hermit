@@ -3170,16 +3170,37 @@ fn sanitize_schedstat(contents: &[u8]) -> Vec<u8> {
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-873): Review private mount-root normalization.
 fn sanitize_mountinfo(contents: &[u8]) -> Vec<u8> {
-    const TEMP_ROOT_PREFIXES: &[&[u8]] = &[b"/tmpvol/.tmp", b"/tmp/.tmp"];
-
     fn is_private_temp_root(root: &[u8]) -> bool {
-        let Some(suffix) = TEMP_ROOT_PREFIXES
-            .iter()
-            .find_map(|prefix| root.strip_prefix(*prefix))
-        else {
+        fn is_tempfile_name(name: &[u8]) -> bool {
+            let Some(suffix) = name.strip_prefix(b".tmp") else {
+                return false;
+            };
+            suffix.len() == 6 && suffix.iter().all(u8::is_ascii_alphanumeric)
+        }
+
+        let Some(separator) = root.iter().rposition(|byte| *byte == b'/') else {
             return false;
         };
-        suffix.len() == 6 && suffix.iter().all(u8::is_ascii_alphanumeric)
+        let (parent, name) = root.split_at(separator);
+        if !is_tempfile_name(&name[1..]) {
+            return false;
+        }
+
+        if parent == b"/tmp" || parent == b"/tmpvol" {
+            return true;
+        }
+
+        // Validation gives each run a Python `tempfile.mkdtemp(prefix="v")`
+        // directory under host /tmp. Hermit's own `.tmpXXXXXX` directory is
+        // therefore one level below the `/tmpvol` mount root seen by guests.
+        let Some(validate_root) = parent.strip_prefix(b"/tmpvol/") else {
+            return false;
+        };
+        validate_root.len() == 9
+            && validate_root[0] == b'v'
+            && validate_root[1..]
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
     }
 
     let mut normalized = Vec::with_capacity(contents.len());
@@ -4228,11 +4249,26 @@ Rss:                   4 kB\n" as &[u8];
 
     #[test]
     fn private_mount_roots_are_guest_stable() {
-        let input = b"37 29 0:31 /tmpvol/.tmpAb12Z9 /tmp rw - btrfs /dev/md0 rw\n38 29 0:31 /host/data /data ro - btrfs /dev/md0 ro\n39 29 0:31 /tmp/.tmp654321 /etc/group ro - btrfs /dev/md0 ro\n";
+        let input = b"37 29 0:31 /tmpvol/.tmpAb12Z9 /tmp rw - btrfs /dev/md0 rw\n38 29 0:31 /host/data /data ro - btrfs /dev/md0 ro\n39 29 0:31 /tmp/.tmp654321 /etc/group ro - btrfs /dev/md0 ro\n40 29 0:31 /tmpvol/v_45e4xci/.tmpxZruR5 /run/nscd ro - btrfs /dev/md0 rw\n41 29 0:31 /tmpvol/vabcdefgh/.tmp123abc /etc/group ro - btrfs /dev/md0 rw\n";
         assert_eq!(
             sanitize_mountinfo(input),
-            b"37 29 0:31 /tmpvol/.hermit/tmp /tmp rw - btrfs /dev/md0 rw\n38 29 0:31 /host/data /data ro - btrfs /dev/md0 ro\n39 29 0:31 /tmpvol/.hermit/etc/group /etc/group ro - btrfs /dev/md0 ro\n"
+            b"37 29 0:31 /tmpvol/.hermit/tmp /tmp rw - btrfs /dev/md0 rw\n38 29 0:31 /host/data /data ro - btrfs /dev/md0 ro\n39 29 0:31 /tmpvol/.hermit/etc/group /etc/group ro - btrfs /dev/md0 ro\n40 29 0:31 /tmpvol/.hermit/run/nscd /run/nscd ro - btrfs /dev/md0 rw\n41 29 0:31 /tmpvol/.hermit/etc/group /etc/group ro - btrfs /dev/md0 rw\n"
         );
+    }
+
+    #[test]
+    fn unrelated_mount_roots_are_preserved() {
+        for root in [
+            "/tmpvol/build/.tmpAb12Z9",
+            "/tmpvol/v_short/.tmpAb12Z9",
+            "/tmpvol/v-45e4xci/.tmpAb12Z9",
+            "/tmpvol/v_45e4xci/work/.tmpAb12Z9",
+            "/tmpvol/v_45e4xci/.tmpAb12Z9/child",
+            "/tmpvol/v_45e4xci/.tmpAb12Z!",
+        ] {
+            let input = format!("37 29 0:31 {root} /tmp rw - btrfs /dev/md0 rw\n");
+            assert_eq!(sanitize_mountinfo(input.as_bytes()), input.as_bytes());
+        }
     }
 
     #[test]
