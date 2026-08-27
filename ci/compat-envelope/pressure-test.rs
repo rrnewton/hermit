@@ -809,8 +809,10 @@ struct ManifestBudgetRow {
 struct ResultRow {
     schema: u64,
     run_id: String,
-    #[serde(default)]
-    run_index: u64,
+    #[serde(default = "first_attempt")]
+    attempt: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_index: Option<u64>,
     hermit_sha: String,
     source_tree_dirty: bool,
     test: String,
@@ -836,6 +838,10 @@ struct ResultRow {
     error_kind: Option<String>,
     #[serde(flatten)]
     extra: BTreeMap<String, JsonValue>,
+}
+
+fn first_attempt() -> u64 {
+    1
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1351,9 +1357,7 @@ fn run() -> Result<(), String> {
                 )?;
                 Ok(())
             })();
-            let series_result = if std::env::var_os("DEV_HERMIT_PARENT").is_some()
-                && results.join("series-results.jsonl").is_file()
-            {
+            let series_result = if std::env::var_os("DEV_HERMIT_PARENT").is_some() {
                 emit_series(&results)
             } else {
                 Ok(())
@@ -1843,63 +1847,34 @@ fn emit_series(results: &Path) -> Result<(), String> {
     // campaign from a checkout that has since moved is the normal case, and the
     // tree being attributed is recorded in the campaign, not read from git.
     let mut collected: Vec<(String, ResultRow)> = Vec::new();
-    let completed_rows = results.join("series-results.jsonl");
-    if completed_rows.is_file() {
-        let text = fs::read_to_string(&completed_rows)
-            .map_err(|e| format!("cannot read {}: {e}", completed_rows.display()))?;
-        for (line_number, line) in text.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let mut row: ResultRow = serde_json::from_str(line).map_err(|e| {
-                format!(
-                    "invalid {} line {}: {e}",
-                    completed_rows.display(),
-                    line_number + 1
-                )
-            })?;
-            if row.runtime.is_none() && row.mode == "verify" {
-                row.runtime = retained_verification_runtime(&row.attempts)?;
-            }
-            let key = format!(
-                "{}/{}/{}/{:020}",
-                row.test,
-                row.mode,
-                row.backend.as_deref().unwrap_or("native"),
-                row.run_index
-            );
-            collected.push((key, row));
+    let entries = fs::read_dir(results)
+        .map_err(|e| format!("cannot read {}: {e}", results.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("cannot walk {}: {e}", results.display()))?;
+        if !entry.path().is_dir() {
+            continue;
         }
-    } else {
-        let entries = fs::read_dir(results)
-            .map_err(|e| format!("cannot read {}: {e}", results.display()))?;
-        for entry in entries {
-            let entry = entry.map_err(|e| format!("cannot walk {}: {e}", results.display()))?;
-            if !entry.path().is_dir() {
-                continue;
-            }
-            let result_file = entry.path().join("results.jsonl");
-            if !result_file.is_file() {
-                continue;
-            }
-            let text = fs::read_to_string(&result_file)
-                .map_err(|e| format!("cannot read {}: {e}", result_file.display()))?;
-            let lines: Vec<_> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-            if lines.len() != 1 {
-                return Err(format!(
-                    "{} contains {} nonempty rows; expected exactly one",
-                    result_file.display(),
-                    lines.len()
-                ));
-            }
-            let mut row: ResultRow = serde_json::from_str(lines[0])
-                .map_err(|e| format!("invalid {}: {e}", result_file.display()))?;
-            row.run_index = series_run_index(&entry.file_name().to_string_lossy());
-            if row.runtime.is_none() && row.mode == "verify" {
-                row.runtime = retained_verification_runtime(&row.attempts)?;
-            }
-            collected.push((entry.file_name().to_string_lossy().into_owned(), row));
+        let result_file = entry.path().join("results.jsonl");
+        if !result_file.is_file() {
+            continue;
         }
+        let text = fs::read_to_string(&result_file)
+            .map_err(|e| format!("cannot read {}: {e}", result_file.display()))?;
+        let lines: Vec<_> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        if lines.len() != 1 {
+            return Err(format!(
+                "{} contains {} nonempty rows; expected exactly one",
+                result_file.display(),
+                lines.len()
+            ));
+        }
+        let mut row: ResultRow = serde_json::from_str(lines[0])
+            .map_err(|e| format!("invalid {}: {e}", result_file.display()))?;
+        row.run_index = Some(series_run_index(&entry.file_name().to_string_lossy()));
+        if row.runtime.is_none() && row.mode == "verify" {
+            row.runtime = retained_verification_runtime(&row.attempts)?;
+        }
+        collected.push((entry.file_name().to_string_lossy().into_owned(), row));
     }
     if collected.is_empty() {
         return Err(format!(
@@ -2851,7 +2826,6 @@ fn write_plan_after_scorecard_check(
                 "mkdir -p {cell_dir}; if test -f {status_file}; then exit 0; fi; \
              printf '{incomplete}\\n' > {status_file}; {preparation_guard}status=0; \
              env E2E_RESULT_ROOT={results} E2E_BUILD_ROOT={build_root} E2E_RUN_ID={run_id} \
-             E2E_RUN_INDEX={run_index} \
              E2E_KEEP_VERIFY_LOGS=1 \
              {harness} \
              || status=$?; \
@@ -2862,7 +2836,6 @@ fn write_plan_after_scorecard_check(
                 results = shell_quote(&results.to_string_lossy()),
                 build_root = shell_quote(&build_root.to_string_lossy()),
                 run_id = shell_quote(&evidence_run_id),
-                run_index = repetition.unwrap_or(0),
                 harness = harness,
                 result_in_progress = shell_quote(&result_in_progress.to_string_lossy()),
                 result_file = shell_quote(&result_file.to_string_lossy()),
@@ -6463,7 +6436,8 @@ fn self_test(root: &Path) -> Result<(), String> {
     let mut result_row = ResultRow {
         schema: CELL_RESULT_SCHEMA,
         run_id: sample_slug.clone(),
-        run_index: 0,
+        attempt: 1,
+        run_index: Some(0),
         hermit_sha: sample_metadata.hermit_sha.clone(),
         source_tree_dirty: false,
         test: sample_a.test.clone(),
@@ -6549,7 +6523,8 @@ fn self_test(root: &Path) -> Result<(), String> {
     let repeated_result_row = ResultRow {
         schema: CELL_RESULT_SCHEMA,
         run_id: first_repetition_slug.clone(),
-        run_index: 1,
+        attempt: 1,
+        run_index: Some(1),
         hermit_sha: repeated_metadata.hermit_sha.clone(),
         source_tree_dirty: false,
         test: green_id.test.clone(),
