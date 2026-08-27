@@ -3860,68 +3860,61 @@ fn hermit_dap_rejects_replay_options_without_replay() {
     );
 }
 
-/// A tracer panic and a guest that exited 1 must be distinguishable from `$?`
-/// ALONE, with no stderr parsing.
+/// A forced PMU skid overshoot must fail without a tracer panic.
 ///
-/// ⚠️ THIS IS THE WHOLE POINT AND IT IS EASY TO SATISFY BY ACCIDENT. Asserting
-/// only that the panic arm is 125 would still pass if hermit returned 125 for
-/// everything, so both arms are asserted together and the test is named for the
-/// DIFFERENCE rather than for either value.
+/// ⚠️ BOTH HALVES ARE REQUIRED. A nonzero exit alone would pass if every guest
+/// failure were relabelled as an overshoot, so the canonical marker and exact
+/// Hermit failure status prove the detected condition refused the result. The
+/// ordinary guest-failure arm remains the guest's own status.
 ///
-/// Measured before the fix: both arms returned 1, with the `HERMIT_TASK_PANIC`
-/// marker present on stderr in the panic arm. The information existed and only
-/// `$?` could not carry it -- every harness and gate on this project decides
-/// pass/fail from exactly that value.
+/// Measured before the recovery: the injected arm emitted `HERMIT_TASK_PANIC`
+/// and returned Hermit's reserved internal-failure status before a comparison
+/// could complete.
 ///
-/// The panic is induced with reverie's own fault injector rather than a mock, so
-/// this exercises the real task-boundary path: the guest thread panics, reverie
-/// emits the marker and exits 101 inside the sandbox container, and hermit's CLI
-/// error arm is what turns that into a status.
+/// The overshoot is induced with reverie's own fault injector rather than a mock,
+/// so this exercises the real timer-delivery and Hermit reporting paths.
 #[test]
-fn tracer_panic_and_guest_failure_have_different_exit_codes() {
+fn skid_overshoot_refuses_a_successful_result() {
     let _guard = hermit_run_guard();
 
     // A guest with enough retired conditional branches to reach the timer path;
     // a trivial guest exits before the injected zero skid margin can bite.
     let busy = "awk 'BEGIN{s=0;for(i=0;i<300000;i++)s+=i;print s}'";
-    let panicked = Command::new(env!("CARGO_BIN_EXE_hermit"))
+    let overshot = Command::new(env!("CARGO_BIN_EXE_hermit"))
         .args(["run", "--", "/bin/sh", "-c", busy])
         .env("REVERIE_SKID_MARGIN_OVERRIDE", "0")
         .output()
         .expect("failed to run hermit under the skid injector");
 
-    let stderr = String::from_utf8_lossy(&panicked.stderr);
-    // If the injector stopped inducing a panic this test would silently become a
-    // comparison of two ordinary runs, so require the panic actually happened.
+    let stderr = String::from_utf8_lossy(&overshot.stderr);
+    assert!(!overshot.status.success(), "{stderr}");
+    assert!(stderr.contains("HERMIT_SKID_OVERSHOOT"), "{stderr}");
     assert!(
-        stderr.contains("HERMIT_TASK_PANIC") || stderr.contains("panicked at"),
-        "the skid injector did not induce a tracer panic; this test is measuring nothing:\n{stderr}"
+        stderr.contains("deterministic execution was not established"),
+        "{stderr}"
     );
+    assert!(!stderr.contains("HERMIT_TASK_PANIC"), "{stderr}");
+    assert!(!stderr.contains("panicked at"), "{stderr}");
 
     let guest_failed = hermit(&["run", "--", "/bin/sh", "-c", "exit 1"]);
 
-    let panic_code = panicked.status.code();
+    let overshoot_code = overshot.status.code();
     let guest_code = guest_failed.status.code();
     assert_ne!(
-        panic_code, guest_code,
-        "a tracer panic and a guest exiting 1 are indistinguishable from $? alone \
-         (both {panic_code:?}); every gate reading the exit code cannot tell a crash \
-         from a failure"
+        overshoot_code, guest_code,
+        "a PMU skid overshoot and a guest exiting 1 must remain distinguishable"
+    );
+    assert_eq!(
+        overshoot_code,
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        "a detected PMU skid overshoot must refuse the run"
     );
     // Deliberately a literal `1`: this is the GUEST's own chosen status passing
-    // through, not hermit's reserved code, so it must NOT track
-    // `HERMIT_INTERNAL_FAILURE_EXIT`. If that constant ever became 1 this
-    // assertion pair should start failing, and substituting the constant here
-    // would hide exactly that.
+    // through, not hermit's reserved code.
     assert_eq!(
         guest_code,
         Some(1),
         "the guest's own exit status must pass through unchanged"
-    );
-    assert_eq!(
-        panic_code,
-        Some(HERMIT_INTERNAL_FAILURE_EXIT),
-        "hermit-internal failure should use the reserved wrapper code"
     );
 }
 

@@ -156,8 +156,14 @@ fi
 #     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
 #     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
 # so the measured key and conservative threshold carry unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 1393db6279331feb4af2533220e4786ab104a1b9 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 1393db6279331feb4af2533220e4786ab104a1b9 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO e3ccb715 (2026-08-27): the three source_recipe_key repository
+# inputs are byte-identical to 1393db62:
+#     reverie-dbt/vendor/dynamorio  a3c41e5d3630 -> a3c41e5d3630
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+#     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
+# so the measured key and conservative threshold carry unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != e3ccb71500f5cd13d45eba849100f2aae4265bc0 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie e3ccb71500f5cd13d45eba849100f2aae4265bc0 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
