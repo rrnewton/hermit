@@ -67,7 +67,7 @@ def refusal_output(
 CASES: tuple[tuple[str, int, bool], ...] = (
     ("thread 'main' panicked at src/x.rs:9: connection refused by: peer", 1, False),
     ("guest: server said 'refused by: firewall'\nerror: compilation failed", 1, False),
-    ("error[E0433]: file /home/x/validate: REFUSED_cases/t.rs not found", 1, False),
+    ("error[E0433]: file fixtures/validate: REFUSED_cases/t.rs not found", 1, False),
     ("refused by: guest firewall policy", 1, False),
     ("   refused by: guest firewall policy", 1, False),
     ("validate: REFUSED_cases is a guest label", 1, False),
