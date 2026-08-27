@@ -1719,6 +1719,7 @@ fn self_test() -> Result<(), String> {
     typed_libtest_count_bracket()?;
     ledger_gate_origin_bracket()?;
     requalification_plan_bracket(&root)?;
+    validate_series_writer_bracket()?;
     no_result_propagation_bracket()?;
     possible_missing_artifact_bracket()?;
     selective_subset_bracket(&root)?;
@@ -11400,6 +11401,100 @@ fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
         }
     }
     println!("  requalification plan: one exact selected cell, schema-6 eligible, never full authority");
+    Ok(())
+}
+
+fn validate_series_writer_bracket() -> Result<(), String> {
+    let root = std::env::temp_dir().join(format!(
+        "validate-series-writer-{}-{}",
+        std::process::id(),
+        epoch_now()
+    ));
+    let parent = root.join("parent");
+    let checkout = root.join("checkout");
+    let results = root.join("results/bucket");
+    std::fs::create_dir_all(parent.join("ci-hub/series"))
+        .and_then(|_| std::fs::create_dir_all(&checkout))
+        .and_then(|_| std::fs::create_dir_all(&results))
+        .map_err(|error| format!("validate series writer: cannot create fixture: {error}"))?;
+    std::fs::write(
+        parent.join("ci-hub/series/series.py"),
+        r#"import json
+import pathlib
+import sys
+parent = pathlib.Path(sys.argv[sys.argv.index("--parent") + 1])
+parent.joinpath("captured.json").write_text(json.dumps({"argv": sys.argv[1:], "stdin": sys.stdin.read()}))
+print("fixture append accepted")
+"#,
+    )
+    .map_err(|error| format!("validate series writer: cannot write fixture script: {error}"))?;
+    let row = |attempt| {
+        serde_json::json!({
+            "schema": 4,
+            "attempt": attempt,
+            "hermit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "source_tree_dirty": false,
+            "test": "applications/fixture",
+            "category": "applications",
+            "lane": "portable",
+            "mode": "verify",
+            "backend": "ptrace",
+            "outcome": if attempt == 1 { "FAIL" } else { "PASS" },
+        })
+    };
+    std::fs::write(
+        results.join("results.jsonl"),
+        format!("{}\n{}\n", row(1), row(2)),
+    )
+    .map_err(|error| format!("validate series writer: cannot write result fixture: {error}"))?;
+    let saved = std::env::var_os("E2E_RUN_ID");
+    // SAFETY: the validate self-test is single-threaded here and restores the
+    // process environment before returning.
+    unsafe { std::env::set_var("E2E_RUN_ID", "validate-series-fixture") };
+    let appended = append_validate_series(
+        Some(&parent),
+        &checkout,
+        &root.join("results"),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    match saved {
+        Some(value) => unsafe { std::env::set_var("E2E_RUN_ID", value) },
+        None => unsafe { std::env::remove_var("E2E_RUN_ID") },
+    }
+    appended?;
+    let captured: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(parent.join("captured.json"))
+            .map_err(|error| format!("validate series writer: cannot read captured call: {error}"))?,
+    )
+    .map_err(|error| format!("validate series writer: malformed captured call: {error}"))?;
+    let argv = captured["argv"]
+        .as_array()
+        .ok_or("validate series writer: captured argv is not an array")?;
+    let arguments = argv.iter().filter_map(serde_json::Value::as_str).collect::<Vec<_>>();
+    for pair in [
+        ["--checkout", checkout.to_str().ok_or("fixture checkout is not UTF-8")?],
+        ["--producer", "validate"],
+        ["--run-id", "validate-series-fixture"],
+        ["--tree", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+    ] {
+        if !arguments.windows(2).any(|window| window == pair) {
+            return Err(format!("validate series writer: omitted argument pair {pair:?}"));
+        }
+    }
+    let rows = captured["stdin"]
+        .as_str()
+        .ok_or("validate series writer: captured stdin is not a string")?
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("validate series writer: malformed captured row: {error}"))?;
+    if rows.len() != 2 || rows[0]["attempt"] != 1 || rows[1]["attempt"] != 2 {
+        return Err(format!(
+            "validate series writer: ordinary appended attempts were not both sent: {rows:?}"
+        ));
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    println!("  validate series writer: checkout identity and both appended attempts carried");
     Ok(())
 }
 
