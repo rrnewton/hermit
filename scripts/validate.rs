@@ -9127,6 +9127,98 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
                 observations
             ));
         }
+        let dbt_log = "[test.dbt_parity] ▶ START DynamoRIO DBT strict backend parity matrix\n\
+[test.dbt_parity] PASS dbt/file_metadata: matched\n\
+[test.dbt_parity] FAIL dbt/random_sources: output differed\n\
+[test.dbt_parity] PASS dbt/: empty case\n\
+[test.dbt_parity] PASS ptrace/wrong_backend: matched\n\
+[test.dbt_parity] PASS dbt/missing_colon\n\
+[test.dbt_parity] XPASS dbt/known_gap: candidate\n\
+[test.other] FAIL dbt/other_node: ignored\n";
+        let dbt = dbt_parity_test_observations(dbt_log);
+        let expected_dbt = vec![
+            TestAttemptObservation {
+                node: DBT_PARITY_NODE.into(),
+                attempt: 1,
+                id: "backend-parity/file_metadata [dbt/strict]".into(),
+                passed: true,
+            },
+            TestAttemptObservation {
+                node: DBT_PARITY_NODE.into(),
+                attempt: 1,
+                id: "backend-parity/random_sources [dbt/strict]".into(),
+                passed: false,
+            },
+        ];
+        if dbt != expected_dbt {
+            return Err(format!(
+                "end-of-run summary: DBT parity PASS/FAIL rows or malformed-line refusal were \
+                 parsed incorrectly: {dbt:?}"
+            ));
+        }
+        let dbt_failed = test_id_summary(
+            dbt,
+            &[],
+            &BTreeSet::from([DBT_PARITY_NODE.to_string()]),
+        );
+        if dbt_failed.failed.len() != 1
+            || dbt_failed.failed[0].id != "backend-parity/random_sources [dbt/strict]"
+            || !dbt_failed.failed_nodes_without_test_ids.is_empty()
+        {
+            return Err(format!(
+                "end-of-run summary: a DBT parity case failure did not replace its node-only \
+                 fallback with the stable test id: {dbt_failed:?}"
+            ));
+        }
+
+        let dbt_retry_log = "[test.dbt_parity] ▶ START first attempt\n\
+[test.dbt_parity] FAIL dbt/virtual_clock: first attempt failed\n\
+[test.dbt_parity] ▶ START second attempt\n\
+[test.dbt_parity] PASS dbt/virtual_clock: retry passed\n";
+        let dbt_retry = dbt_parity_test_observations(dbt_retry_log);
+        if dbt_retry.len() != 2
+            || dbt_retry[0].attempt != 1
+            || dbt_retry[0].passed
+            || dbt_retry[1].attempt != 2
+            || !dbt_retry[1].passed
+            || dbt_retry[0].id != dbt_retry[1].id
+        {
+            return Err(format!(
+                "end-of-run summary: DBT parity retry lost its per-attempt result: {dbt_retry:?}"
+            ));
+        }
+        let mut dbt_attempts = vec![
+            unreported_attempt(DBT_PARITY_NODE.into(), 1),
+            unreported_attempt(DBT_PARITY_NODE.into(), 2),
+        ];
+        dbt_attempts[0].retry_class = Some("self-test retry".into());
+        let dbt_retry_summary = test_id_summary(dbt_retry, &dbt_attempts, &BTreeSet::new());
+        if dbt_retry_summary.recovered.len() != 1
+            || dbt_retry_summary.recovered[0].id
+                != "backend-parity/virtual_clock [dbt/strict]"
+            || dbt_retry_summary.recovered[0].retry_classes != ["self-test retry"]
+        {
+            return Err(format!(
+                "end-of-run summary: DBT parity fail-then-pass was not retained as recovered: \
+                 {dbt_retry_summary:?}"
+            ));
+        }
+
+        let dbt_pre_case_death = dbt_parity_test_observations(
+            "[test.dbt_parity] ▶ START DynamoRIO DBT strict backend parity matrix\n\
+[test.dbt_parity] ERROR: process died before the first case result\n",
+        );
+        let dbt_pre_case_summary = test_id_summary(
+            dbt_pre_case_death,
+            &[],
+            &BTreeSet::from([DBT_PARITY_NODE.to_string()]),
+        );
+        if dbt_pre_case_summary.failed_nodes_without_test_ids != [DBT_PARITY_NODE] {
+            return Err(format!(
+                "end-of-run summary: a DBT parity node that died before its first case gained an \
+                 invented test id: {dbt_pre_case_summary:?}"
+            ));
+        }
         let e2e_root = tmp.join("summary-e2e");
         std::fs::create_dir_all(&e2e_root)
             .map_err(|e| format!("end-of-run summary: cannot create E2E fixture: {e}"))?;
@@ -13434,6 +13526,68 @@ fn nextest_test_observations(log: &str) -> Vec<TestAttemptObservation> {
     observations
 }
 
+const DBT_PARITY_NODE: &str = "test.dbt_parity";
+
+/// Parse one result emitted by the standalone DBT parity matrix.
+///
+/// `run_matrix.py` owns the stable case name `backend-parity/<case>`; the
+/// suffix records the backend and mode selected by the DAG node. Diagnostic,
+/// gap, blocked, and malformed lines are not individual test outcomes.
+fn dbt_parity_test_observation(rest: &str) -> Option<(bool, String)> {
+    let rest = rest.trim_start();
+    let (passed, result) = if let Some(result) = rest.strip_prefix("PASS ") {
+        (true, result)
+    } else if let Some(result) = rest.strip_prefix("FAIL ") {
+        (false, result)
+    } else {
+        return None;
+    };
+    let (identity, _detail) = result.split_once(':')?;
+    let case = identity.strip_prefix("dbt/")?;
+    if case.is_empty()
+        || !case
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+    {
+        return None;
+    }
+    Some((passed, format!("backend-parity/{case} [dbt/strict]")))
+}
+
+/// Recover DBT parity case results from the durable scheduler log.
+///
+/// Each scheduler START begins a new attempt. Keeping that boundary means a
+/// failed case that passes on retry remains visible as a recovered test id,
+/// while a node that dies before emitting any case result still has no invented
+/// id and remains in `failed_nodes_without_test_ids`.
+fn dbt_parity_test_observations(log: &str) -> Vec<TestAttemptObservation> {
+    let mut attempt = 0;
+    let mut seen: BTreeSet<(usize, String)> = BTreeSet::new();
+    let mut observations = Vec::new();
+    for line in log.lines() {
+        let Some(after_open) = line.strip_prefix('[') else { continue };
+        let Some((node, rest)) = after_open.split_once(']') else { continue };
+        if node != DBT_PARITY_NODE {
+            continue;
+        }
+        if rest.trim_start().starts_with("▶ START") {
+            attempt += 1;
+            continue;
+        }
+        let Some((passed, id)) = dbt_parity_test_observation(rest) else { continue };
+        let attempt = attempt.max(1);
+        if seen.insert((attempt, id.clone())) {
+            observations.push(TestAttemptObservation {
+                node: DBT_PARITY_NODE.to_string(),
+                attempt,
+                id,
+                passed,
+            });
+        }
+    }
+    observations
+}
+
 fn collect_e2e_result_files(path: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
     for entry in std::fs::read_dir(path)
         .map_err(|error| format!("cannot read per-cell result root {}: {error}", path.display()))?
@@ -15213,7 +15367,11 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         .collect();
     let mut test_summary_errors = Vec::new();
     let mut test_observations = match read_log_since_settled(&log_path, 0) {
-        Some(log) => nextest_test_observations(&log),
+        Some(log) => {
+            let mut observations = nextest_test_observations(&log);
+            observations.extend(dbt_parity_test_observations(&log));
+            observations
+        }
         None => {
             test_summary_errors.push(
                 "individual nextest test ids could not be read from the durable log; failed DAG \
