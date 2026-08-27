@@ -4082,6 +4082,53 @@ backends_disabled:
         assert_eq!(cell_divergence_position(&[]), DivergencePosition::default());
     }
 
+    /// ⚠️ ABSENCE OF THIS KEY IS RESERVED FOR "WRITTEN BEFORE THE FIELD
+    /// EXISTED", AND NOTHING ELSE. A row that ran, compared, and located no
+    /// divergence must carry the key with an explicit null.
+    ///
+    /// WHY IT NEEDS A TEST RATHER THAN BEING OBVIOUS. `CELL_RESULT_SCHEMA` was
+    /// NOT bumped when these coordinates were added, so the schema number
+    /// cannot separate the two meanings. Measured over the 6215 retained
+    /// `results.jsonl` files on this host, 54734 rows: schema 4 contains BOTH
+    /// 28899 rows without the key and 17540 with it. Within schema 4 the only
+    /// thing that distinguishes "this predates the field" from "this ran and
+    /// found nothing" is whether the key is present at all.
+    ///
+    /// That distinction currently holds only because no
+    /// `skip_serializing_if = "Option::is_none"` is attached to these four
+    /// fields -- an entirely natural tidy-up for a field that is null on the
+    /// large majority of rows. Adding one would silently convert every future
+    /// "ran and found nothing" row into a row indistinguishable from a
+    /// pre-field one, and no existing test would notice. This is that test.
+    ///
+    /// It asserts PRESENCE and NULLNESS separately from any value, so it fails
+    /// on the skip attribute rather than on a changed position.
+    #[test]
+    fn a_located_nothing_row_still_carries_all_four_coordinate_keys() {
+        let attempt = attempt_with_sabre_evidence("evidence");
+        let rendered = serde_json::to_value(&attempt).expect("attempt serializes");
+        let object = rendered.as_object().expect("attempt is a JSON object");
+        for key in [
+            "first_divergent_record",
+            "first_divergent_syscall",
+            "first_divergent_scheduler_turn",
+            "first_divergent_virtual_nanoseconds",
+        ] {
+            let found = object.get(key).unwrap_or_else(|| {
+                panic!(
+                    "{key} is absent from a serialized attempt that located nothing. \
+                     Absence is how a consumer recognises a row written before this \
+                     field existed; emitting it for a row that simply found nothing \
+                     merges two different facts that no later reader can separate."
+                )
+            });
+            assert!(
+                found.is_null(),
+                "{key} must be an explicit null when nothing was located, got {found}"
+            );
+        }
+    }
+
     fn attempt_with_sabre_evidence(evidence: &str) -> AttemptResult {
         AttemptResult {
             first_divergent_scheduler_turn: None,
