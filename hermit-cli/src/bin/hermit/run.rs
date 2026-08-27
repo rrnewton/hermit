@@ -2670,10 +2670,7 @@ impl RunOpts {
         if self.verify {
             validate_log_level(global)?;
         }
-        let dbt_verification_stdin = if self.selected_backend() == Backend::Kvm {
-            hermit::reserve_kvm_stdin(super::startup_stdin()?)?;
-            None
-        } else if self.verify && self.selected_backend() == Backend::Dbt {
+        let dbt_verification_stdin = if self.verify && self.selected_backend() == Backend::Dbt {
             // DBT owns its two-run adapter and replays this descriptor there.
             // The common output-capturing backends reserve the same input in
             // `hermit` because their execution path lives in the library.
@@ -2685,6 +2682,9 @@ impl RunOpts {
             // this, piped input (e.g. `echo prog | hermit run --verify -- gcc
             // -x c -`) is dropped and hermit reports a false deterministic pass.
             hermit::reserve_output_stdin_snapshot(super::startup_stdin()?)?;
+            None
+        } else if self.selected_backend() == Backend::Kvm {
+            hermit::reserve_kvm_stdin(super::startup_stdin()?)?;
             None
         } else {
             None

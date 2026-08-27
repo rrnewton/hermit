@@ -499,9 +499,10 @@ fn reserved_kvm_stdin() -> Result<Option<fs::File>, Error> {
 /// data piped into hermit (`echo prog | hermit run --strict --verify -- ...`)
 /// was silently dropped. Both runs then saw identical *empty* input and hermit
 /// reported a false "deterministic" success even though the guest never received
-/// its input. `Seekable` holds a rewindable file so both runs receive the exact
-/// same bytes; `None` means stdin should be `/dev/null` (nothing to replay, or a
-/// terminal that cannot be replayed identically to two runs).
+/// its input. `Seekable` holds a read-only, rewindable file so both runs receive
+/// the exact same bytes without being able to modify the caller's input; `None`
+/// means stdin should be `/dev/null` (nothing to replay, or a terminal that
+/// cannot be replayed identically to two runs).
 enum StdinSnapshot {
     Seekable(fs::File),
     None,
@@ -513,11 +514,11 @@ static OUTPUT_STDIN_SNAPSHOT: Mutex<Option<StdinSnapshot>> = Mutex::new(None);
 /// backends can replay identical input to each run of `hermit run --verify`.
 ///
 /// `stdin` is the descriptor captured before Rust startup could reuse a closed
-/// fd 0 (see the binary's `startup_stdin`). A regular-file redirect is already
-/// seekable and is kept as-is; a pipe/fifo/socket is drained once into a
-/// seekable temporary file so it can be re-read; a terminal (or absent stdin)
-/// is treated as `/dev/null` because a live terminal cannot be replayed
-/// identically to two runs.
+/// fd 0 (see the binary's `startup_stdin`). A regular-file redirect is reopened
+/// read-only; a pipe/fifo/socket is drained once into a seekable temporary file
+/// and that file is reopened read-only. A terminal (or absent stdin) is treated
+/// as `/dev/null` because a live terminal cannot be replayed identically to two
+/// runs.
 pub fn reserve_output_stdin_snapshot(stdin: Option<fs::File>) -> io::Result<()> {
     let snapshot = match stdin {
         None => StdinSnapshot::None,
@@ -526,40 +527,50 @@ pub fn reserve_output_stdin_snapshot(stdin: Option<fs::File>) -> io::Result<()> 
             let is_tty = unsafe { libc::isatty(file.as_raw_fd()) } == 1;
             if is_tty {
                 StdinSnapshot::None
-            } else if file.stream_position().is_ok() {
-                // Already seekable (e.g. `< file`): rewind before each run.
-                StdinSnapshot::Seekable(file)
             } else {
-                // Non-seekable (pipe/fifo/socket): buffer once into a seekable
-                // temporary file so both --verify runs receive identical input.
-                //
-                // NAME THE WAIT BEFORE ENTERING IT. This `io::copy` reads to
-                // EOF, so a stdin that never reaches EOF -- an inherited socket,
-                // a fifo whose writer stays open -- blocks here FOREVER, before
-                // the guest has started. Measured: the process wedges with ZERO
-                // bytes on stdout and stderr and is only cleared by killing it,
-                // which is indistinguishable from a slow run. That
-                // indistinguishability is the whole harm; an unbounded wait that
-                // says what it is waiting for is merely slow, and a reader can
-                // act on it.
-                //
-                // Deliberately UNCONDITIONAL rather than emitted after a delay:
-                // a message that appears only once N seconds have passed makes
-                // hermit's own stderr depend on timing, and this project does
-                // not accept timing-dependent output. Deliberately NOT a
-                // deadline either -- a 12s slow producer is legitimate and
-                // delivers, and nothing can separate "slow" from "never" except
-                // by waiting. This changes no control flow: every input that
-                // worked before still works, byte for byte, on stdout.
-                eprintln!(
-                    "hermit: --verify is buffering stdin from a non-seekable stream so both \
-                     runs receive identical input. If this appears to hang, stdin has not \
-                     reached end-of-file; pass `< /dev/null` when the guest needs no input."
-                );
-                let mut buffered = tempfile::tempfile()?;
-                io::copy(&mut file, &mut buffered)?;
-                buffered.seek(SeekFrom::Start(0))?;
-                StdinSnapshot::Seekable(buffered)
+                let replay = if file.stream_position().is_ok() {
+                    // Already seekable (e.g. `< file`): retain it below through
+                    // a read-only descriptor with an independent file offset.
+                    file
+                } else {
+                    // Non-seekable (pipe/fifo/socket): buffer once into a
+                    // seekable temporary file so both --verify runs receive
+                    // identical input.
+                    //
+                    // NAME THE WAIT BEFORE ENTERING IT. This `io::copy` reads to
+                    // EOF, so a stdin that never reaches EOF -- an inherited socket,
+                    // a fifo whose writer stays open -- blocks here FOREVER, before
+                    // the guest has started. Measured: the process wedges with ZERO
+                    // bytes on stdout and stderr and is only cleared by killing it,
+                    // which is indistinguishable from a slow run. That
+                    // indistinguishability is the whole harm; an unbounded wait that
+                    // says what it is waiting for is merely slow, and a reader can
+                    // act on it.
+                    //
+                    // Deliberately UNCONDITIONAL rather than emitted after a delay:
+                    // a message that appears only once N seconds have passed makes
+                    // hermit's own stderr depend on timing, and this project does
+                    // not accept timing-dependent output. Deliberately NOT a
+                    // deadline either -- a 12s slow producer is legitimate and
+                    // delivers, and nothing can separate "slow" from "never" except
+                    // by waiting. This changes no control flow: every input that
+                    // worked before still works, byte for byte, on stdout.
+                    eprintln!(
+                        "hermit: --verify is buffering stdin from a non-seekable stream so both \
+                         runs receive identical input. If this appears to hang, stdin has not \
+                         reached end-of-file; pass `< /dev/null` when the guest needs no input."
+                    );
+                    let mut buffered = tempfile::tempfile()?;
+                    io::copy(&mut file, &mut buffered)?;
+                    buffered.seek(SeekFrom::Start(0))?;
+                    buffered
+                };
+
+                // A duplicate would keep the original access mode. Reopen the
+                // reserved descriptor read-only so neither verification run
+                // can modify the caller's stdin or the next run's input.
+                let replay_path = format!("/proc/self/fd/{}", replay.as_raw_fd());
+                StdinSnapshot::Seekable(fs::File::open(replay_path)?)
             }
         }
     };
@@ -584,17 +595,22 @@ pub fn reserve_output_stdin_snapshot(stdin: Option<fs::File>) -> io::Result<()> 
 /// (nothing to replay). Runs are sequential (each executes in its own forked
 /// container child), so resetting the shared open file description's offset here
 /// is safe.
-fn output_backend_stdin_file() -> Result<Option<fs::File>, Error> {
+fn output_backend_stdin_reservation() -> Result<(bool, Option<fs::File>), Error> {
     let mut reservation = OUTPUT_STDIN_SNAPSHOT
         .lock()
         .map_err(|_| io::Error::other("output stdin snapshot lock is poisoned"))?;
     match reservation.as_mut() {
         Some(StdinSnapshot::Seekable(file)) => {
             file.seek(SeekFrom::Start(0))?;
-            Ok(Some(file.try_clone()?))
+            Ok((true, Some(file.try_clone()?)))
         }
-        Some(StdinSnapshot::None) | None => Ok(None),
+        Some(StdinSnapshot::None) => Ok((true, None)),
+        None => Ok((false, None)),
     }
+}
+
+fn output_backend_stdin_file() -> Result<Option<fs::File>, Error> {
+    Ok(output_backend_stdin_reservation()?.1)
 }
 
 /// Returns the stdin to hand a guest run in an output-capturing backend.
@@ -1926,7 +1942,20 @@ async fn run_kvm(
     capture_output: bool,
 ) -> Result<Output, Error> {
     let dispatch_started = Instant::now();
-    let stdin = reserved_kvm_stdin()?;
+    let stdin = if capture_output {
+        let (snapshot_reserved, snapshot) = output_backend_stdin_reservation()?;
+        if snapshot_reserved {
+            snapshot
+        } else {
+            // Public KVM output-capture callers do not pass through the CLI's
+            // verify setup. Preserve their existing stdin behavior instead of
+            // silently replacing it with /dev/null merely because output is
+            // captured.
+            reserved_kvm_stdin()?
+        }
+    } else {
+        reserved_kvm_stdin()?
+    };
     let requested_cwd = command
         .get_current_dir()
         .map(Path::to_owned)
@@ -2718,6 +2747,9 @@ pub fn run_with_output_backend_timeout_and_skid_overshoots(
 ) -> Result<(Output, u64), Error> {
     let skid_overshoot_report = SkidOvershootReport::begin(backend.uses_ptrace_pmu_timers());
     if backend == Backend::Kvm {
+        // Reserve before the Tokio runtime can reuse a closed fd 0. KVM
+        // verification consumes the explicit output snapshot in `run_kvm`;
+        // public output-capture callers without one retain this reservation.
         ensure_kvm_stdin_reserved()?;
     }
     let config = prepare_backend_config(config, backend);
@@ -3649,6 +3681,12 @@ mod tests {
             file.read_to_end(&mut got).unwrap();
             assert_eq!(got, payload, "run {run} stdin replay mismatch");
         }
+
+        let mut file = output_backend_stdin_file().unwrap().unwrap();
+        let error = file
+            .write_all(b"guest-must-not-change-the-snapshot")
+            .expect_err("the replayed stdin must be read-only");
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
     }
 
     #[test]
