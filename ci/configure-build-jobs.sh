@@ -156,8 +156,8 @@ fi
 #     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
 #     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
 # so the measured key and conservative threshold carry unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != b5a7c03230d107cab1533a50ee88d2635fb66b83 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie b5a7c03230d107cab1533a50ee88d2635fb66b83 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != b4e01a4ecbb2694db25c545d9df8d661cc4f5308 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie b4e01a4ecbb2694db25c545d9df8d661cc4f5308 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

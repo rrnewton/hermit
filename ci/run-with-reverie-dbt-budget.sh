@@ -140,7 +140,7 @@ fi
 #     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
 #     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
 # so the measured key and conservative threshold carry unchanged.
-expected_pin=b5a7c03230d107cab1533a50ee88d2635fb66b83
+expected_pin=b4e01a4ecbb2694db25c545d9df8d661cc4f5308
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
