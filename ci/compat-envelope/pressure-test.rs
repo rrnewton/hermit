@@ -864,12 +864,14 @@ fn read_result_rows(path: &Path) -> Result<Vec<ResultRow>, String> {
                 index + 1
             ));
         }
-        if previous_attempt.is_some_and(|previous| row.attempt <= previous) {
+        let expected_attempt = previous_attempt.map_or(1, |previous| previous + 1);
+        if row.attempt != expected_attempt {
             return Err(format!(
-                "{}:{} result attempt {} does not follow the preceding attempt",
+                "{}:{} result attempt {} does not follow the preceding attempts; expected {}",
                 path.display(),
                 index + 1,
-                row.attempt
+                row.attempt,
+                expected_attempt
             ));
         }
         if !attempts.insert(row.attempt) {
@@ -926,6 +928,12 @@ fn read_result_rows(path: &Path) -> Result<Vec<ResultRow>, String> {
     }
     if rows.is_empty() {
         return Err(format!("{} contains no result rows", path.display()));
+    }
+    if rows.len() > 1 && rows[0].timeout_seconds.is_none() {
+        return Err(format!(
+            "{}:1 retry history attempt 1 has no wall-clock bound",
+            path.display()
+        ));
     }
     Ok(rows)
 }
@@ -2108,10 +2116,12 @@ fn series_self_test() -> Result<(), String> {
             "pressure-series-result-rows-{}",
             std::process::id()
         ));
-        let one = r#"{"schema":4,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"FAIL","duration_ms":100,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null,"artifact_dir":"/retained/runs/r/t-verify-ptrace"}"#;
+        let legacy_one = r#"{"schema":4,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"FAIL","duration_ms":100,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null,"artifact_dir":"/retained/runs/r/t-verify-ptrace"}"#;
+        let one = r#"{"schema":4,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"FAIL","timeout_seconds":15,"duration_ms":100,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null,"artifact_dir":"/retained/runs/r/t-verify-ptrace"}"#;
         let two = r#"{"schema":4,"attempt":2,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"PASS","timeout_seconds":15,"duration_ms":200,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null,"artifact_dir":"/retained/runs/r/t-verify-ptrace-attempt-2"}"#;
-        // A row with no ordinal is attempt 1, not a missing value.
-        fs::write(&path, format!("{one}\n"))
+        // A pre-retry row with no ordinal or bound remains readable as attempt
+        // 1; once a retry exists, every observation must carry its own bound.
+        fs::write(&path, format!("{legacy_one}\n"))
             .map_err(|e| format!("cannot write one-row series fixture: {e}"))?;
         let single = read_result_rows(&path)?;
         if single.len() != 1 || single[0].attempt != 1 || single[0].outcome != "FAIL" {
@@ -2142,6 +2152,21 @@ fn series_self_test() -> Result<(), String> {
             .map_err(|e| format!("cannot write duplicate series fixture: {e}"))?;
         if read_result_rows(&path).is_ok() {
             return Err("a repeated attempt ordinal must be refused".into());
+        }
+        // A retained retry history must include every attempt in order. A gap
+        // would make the missing observation look as though it never ran.
+        let three = two.replace("\"attempt\":2", "\"attempt\":3");
+        fs::write(&path, format!("{one}\n{three}\n"))
+            .map_err(|e| format!("cannot write skipped-attempt series fixture: {e}"))?;
+        if read_result_rows(&path).is_ok() {
+            return Err("a retry history with a missing attempt must be refused".into());
+        }
+        // elapsed without the bound it ran against is not a usable retry
+        // observation. The old single-row shape above remains readable.
+        fs::write(&path, format!("{legacy_one}\n{two}\n"))
+            .map_err(|e| format!("cannot write missing-bound series fixture: {e}"))?;
+        if read_result_rows(&path).is_ok() {
+            return Err("a retry history missing attempt 1's bound must be refused".into());
         }
         // Rows from different cells are not one cell's log.
         let other = one.replace("\"test\":\"t\"", "\"test\":\"other\"");
