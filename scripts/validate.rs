@@ -4789,6 +4789,10 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // declared worker width is eight. Giving the wrapper only the default
         // one CPU makes dagrun refuse before the selected cell can start.
         requalification.hint.preferred_inner_jobs = Some(8);
+        // pressure-test owns the nested scheduler width through its explicit
+        // `--jobs 1`. An ordinary `-j` jobs flag would make the outer runner
+        // append `-j 8` to this command, which pressure-test does not accept.
+        requalification.jobs_flag = Some(String::new());
         steps.push(requalification);
         let cfg = validate_plan::config_from(steps, "targeted cell requalification");
         return Ok(Plan {
@@ -11370,6 +11374,11 @@ fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
         return Err(
             "requalification plan: wrapper cannot admit the nested release build's eight workers"
                 .into(),
+        );
+    }
+    if step.jobs_flag.as_deref() != Some("") {
+        return Err(
+            "requalification plan: outer scheduler can append an unsupported -j flag".into(),
         );
     }
     for token in [
