@@ -1444,11 +1444,18 @@ fn e9patch_rejects_mounts_that_change_a_symlink_target() {
 fn detects_symlink_resolution_through_implicit_mounts() {
     use std::os::fd::AsRawFd;
 
+    // ⚠️ THE PREFIX MUST BE THE TEMP DIRECTORY IN USE, NOT THE LITERAL `/tmp`.
+    // `NamedTempFile` honours `TMPDIR`, and validate runs this suite with
+    // `TMPDIR` pointed inside its own runtime directory. Hardcoding `/tmp`
+    // therefore asserted a property of the developer's default environment
+    // rather than of `path_resolution_visits_prefix`, and the test passed
+    // locally while failing in every validate run.
+    let temp_root = std::env::temp_dir();
     let file = tempfile::NamedTempFile::new().unwrap();
     let proc_fd = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
-    assert!(path_resolution_visits_prefix(&proc_fd, Path::new("/tmp")).unwrap());
+    assert!(path_resolution_visits_prefix(&proc_fd, &temp_root).unwrap());
     assert!(path_resolution_visits_prefix(&proc_fd, Path::new("/proc")).unwrap());
-    assert!(!path_resolution_visits_prefix(Path::new("/bin/echo"), Path::new("/tmp")).unwrap());
+    assert!(!path_resolution_visits_prefix(Path::new("/bin/echo"), &temp_root).unwrap());
 }
 
 #[test]
