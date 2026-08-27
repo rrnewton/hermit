@@ -119,8 +119,34 @@ pub struct HistoryRow {
     pub cell_results: Option<CellResultsValue>,
     #[serde(default)]
     pub gates: Vec<GateHistoryRow>,
+    /// `tree` deliberately remains in this map even though it has a shared
+    /// accessor below. Receipt identity uses
+    /// `serde_json::to_vec(HistoryRow)-v1`, whose bytes depend on struct-field
+    /// order followed by this `BTreeMap`'s key order. Moving `tree` into an
+    /// ordinary struct field would change existing receipt digests without
+    /// changing their meaning.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+impl HistoryRow {
+    /// Return the Git tree recorded for this validation row.
+    ///
+    /// Absence is valid for historical rows. A present value is either one
+    /// forty-hex Git object ID or a malformed row; callers must not turn the
+    /// malformed case into absence.
+    pub fn tree(&self) -> Result<Option<&str>, &'static str> {
+        let Some(value) = self.extra.get("tree") else {
+            return Ok(None);
+        };
+        let Some(tree) = value.as_str() else {
+            return Err("malformed HistoryRow tree: expected a string");
+        };
+        if tree.len() != 40 || !tree.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("malformed HistoryRow tree: expected exactly 40 hexadecimal characters");
+        }
+        Ok(Some(tree))
+    }
 }
 
 /// Per-DAG-node test-coverage obligation outcome. Current producers compute this
@@ -379,6 +405,9 @@ impl CellResultsValue {
 
 #[cfg(test)]
 mod tests {
+    use sha2::Digest;
+    use sha2::Sha256;
+
     use super::*;
 
     #[test]
@@ -398,6 +427,62 @@ mod tests {
         assert_eq!(row.checks, Some(36));
         assert_eq!(row.real_seconds, Some(123.0));
         assert_eq!(row.user_seconds, None);
+    }
+
+    #[test]
+    fn history_tree_distinguishes_absent_valid_and_malformed() {
+        let absent: HistoryRow = serde_json::from_str(r#"{"schema_version":1}"#).unwrap();
+        assert_eq!(absent.tree(), Ok(None));
+
+        let valid: HistoryRow = serde_json::from_str(
+            r#"{"schema_version":1,"tree":"0123456789abcdef0123456789ABCDEF01234567"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            valid.tree(),
+            Ok(Some("0123456789abcdef0123456789ABCDEF01234567"))
+        );
+
+        let malformed_string: HistoryRow =
+            serde_json::from_str(r#"{"schema_version":1,"tree":"unknown"}"#).unwrap();
+        assert_eq!(
+            malformed_string.tree(),
+            Err("malformed HistoryRow tree: expected exactly 40 hexadecimal characters")
+        );
+
+        let malformed_type: HistoryRow =
+            serde_json::from_str(r#"{"schema_version":1,"tree":7}"#).unwrap();
+        assert_eq!(
+            malformed_type.tree(),
+            Err("malformed HistoryRow tree: expected a string")
+        );
+    }
+
+    #[test]
+    fn history_tree_accessor_preserves_receipt_canonicalization_v1() {
+        let row: HistoryRow = serde_json::from_str(
+            r#"{
+                "schema_version":5,
+                "commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "tree":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "tree_dirty":false,
+                "result":"pass",
+                "z_extension":2,
+                "a_extension":1
+            }"#,
+        )
+        .unwrap();
+
+        let canonical = serde_json::to_vec(&row).unwrap();
+        assert_eq!(
+            canonical,
+            br#"{"schema_version":5,"run_id":null,"started_at":null,"finished_at":null,"host":null,"slot":null,"repo":null,"cwd":null,"profile":null,"selection_mode":null,"commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","commit_anchored":null,"tree_dirty":false,"result":"pass","exit_code":null,"executed_tests":null,"filtered_tests":null,"coverage":null,"full_coverage":null,"checks":null,"gates_run":null,"gates_expected":null,"failures":null,"dag_jobs":null,"concurrent_validates":null,"known_flaky_failure":null,"solo_rerun_confirmation":null,"real_seconds":null,"user_seconds":null,"sys_seconds":null,"log_file":null,"source":null,"cell_results":null,"gates":[],"a_extension":1,"tree":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","z_extension":2}"#.as_slice()
+        );
+        let digest = format!("{:x}", Sha256::digest(&canonical));
+        assert_eq!(
+            digest,
+            "e909dc57a7de484727d13d556895ad1afd547c956700987ab1945d2d5fb7bb5d"
+        );
     }
 
     #[test]
