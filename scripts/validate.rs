@@ -8286,6 +8286,43 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
                 rendered.contains("❌ FAILURE"),
             ));
         }
+        // ⚠️ THE THIRD STATE, WHICH THE TWO CHECKS AROUND IT DO NOT COVER: a run
+        // with nothing to report must SAY nothing was found, not render nothing.
+        // Both blocks above are conditional with no else, so before this a clean
+        // run and a run whose retry accounting produced nothing were the same
+        // bytes -- absence readable as a result, on the one section the owner
+        // reads specifically to spot a flaky pass.
+        let mut clean = RunSummary::new(Verdict::Pass, 0, "self-test", Vec::new());
+        clean.wall_s = Some(0.0);
+        clean.nodes_executed = 3;
+        let clean_rendered = run_summary_lines(&clean, std::time::Instant::now()).join("\n");
+        if !clean_rendered.contains("no retries and no flaky tests")
+            || clean_rendered.contains(SUMMARY_FLAKY_HEADING)
+            || clean_rendered.contains("\u{274c} FAILURE")
+        {
+            return Err(format!(
+                "end-of-run summary: a CLEAN run must state that it found no retries and no \
+                 flaky tests, so silence cannot be confused with the accounting having \
+                 produced nothing: stated={} flaky_heading={} failure_banner={}",
+                clean_rendered.contains("no retries and no flaky tests"),
+                clean_rendered.contains(SUMMARY_FLAKY_HEADING),
+                clean_rendered.contains("\u{274c} FAILURE"),
+            ));
+        }
+        // And it must NOT claim cleanliness before a DAG ran, which would be the
+        // same error inverted: nothing was counted, so nothing can be reported.
+        let mut nothing_ran = RunSummary::new(Verdict::Refused, 2, "self-test", Vec::new());
+        nothing_ran.wall_s = None;
+        let nothing_rendered =
+            run_summary_lines(&nothing_ran, std::time::Instant::now()).join("\n");
+        if nothing_rendered.contains("no retries and no flaky tests") {
+            return Err(
+                "end-of-run summary: a run that stopped before the DAG claimed it found no \
+                 flaky tests; it counted nothing and must claim nothing"
+                    .to_string(),
+            );
+        }
+
         // A node that exhausted its retries and STILL failed is a failure, not a
         // flake. Feed the same attempts with that node marked failed-finally and
         // the flake list must empty out, or a red would read as a flaky green.
@@ -12194,6 +12231,22 @@ fn run_summary_lines(s: &RunSummary, started: std::time::Instant) -> Vec<String>
             s.failed_ids.len()
         ));
         lines.extend(summary_id_list(&s.failed_ids));
+    }
+    // ⚠️ A CLEAN RUN SAYS SO, RATHER THAN SAYING NOTHING. With both blocks above
+    // conditional and no else, a run with nothing to report rendered IDENTICALLY
+    // to a run whose retry accounting produced nothing — the two are the same
+    // bytes, so absence was readable as a result. That is the defect shape this
+    // project keeps paying for, and it lands specifically on the reader the
+    // trailing section exists for: someone scanning for a flaky warning cannot
+    // tell "there were none" from "the question was never asked".
+    //
+    // Only when a DAG actually ran. Before that there is genuinely nothing to
+    // have counted, and claiming otherwise would be the same error inverted.
+    if s.flaky.is_empty() && s.failed_ids.is_empty() && s.wall_s.is_some() && s.nodes_executed > 0
+    {
+        lines.push(String::new());
+        lines.push("   no retries and no flaky tests: every executed node passed first time"
+            .to_string());
     }
     // Node accounting is printed whenever a DAG ran, and deliberately printed as
     // an explicit zero when one did not, so "no nodes ran" is a stated fact
