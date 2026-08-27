@@ -571,6 +571,12 @@ pub struct Scheduler {
     /// Child-TID futexes whose kernel clear may still be racing a guest join.
     cleared_child_tids: HashMap<FutexID, DetTid>,
 
+    // TODO-HUMAN-REVIEW(PR-2747): Review the SaBRe physical thread-exit scheduling barrier.
+    /// Threads that have committed an ordinary exit turn but whose final kernel exit status has
+    /// not yet been reported by the backend. The recorded futex is released only after that
+    /// report, when the kernel has cleared its `CLONE_CHILD_CLEARTID` word.
+    pending_physical_thread_exits: BTreeMap<DetTid, FutexID>,
+
     /// The rendered report for a terminal deadlock, once one has been detected.
     ///
     /// Set instead of panicking, and consumed by `sched_loop_inner`, which
@@ -1148,6 +1154,7 @@ async fn sched_loop_inner(
             let sched = sched.lock().unwrap();
             if sched.run_queue.is_empty()
                 && sched.blocked.is_empty()
+                && sched.pending_physical_thread_exits.is_empty()
                 && sched.pending_physical_process_exits.is_empty()
                 && sched.pending_run_queue_admissions.is_empty()
                 && sched.pending_run_queue_removals.is_empty()
@@ -1413,6 +1420,7 @@ impl Scheduler {
             pending_run_queue_removals: Default::default(),
             pending_waitid_signals: Default::default(),
             cleared_child_tids: Default::default(),
+            pending_physical_thread_exits: Default::default(),
             terminal_deadlock: None,
             cancel_killed_thread_rpcs: cfg.cancel_killed_thread_rpcs,
             backend_requires_thread_directed_process_signals: cfg
@@ -1842,10 +1850,10 @@ impl Scheduler {
                     // TODO-HUMAN-REVIEW(PR-845): Review killed-thread RPC cancellation.
                     nextturn.resp.try_put(SchedResponse::Signaled(None));
                 }
-                self.wake_futex_child_cleartid(
-                    FutexID::private(mm, nextturn.child_tid_addr),
-                    *dtid,
-                );
+                let child_tid_futex = FutexID::private(mm, nextturn.child_tid_addr);
+                if !self.pending_physical_thread_exits.contains_key(dtid) {
+                    self.wake_futex_child_cleartid(child_tid_futex, *dtid);
+                }
             }
         }
 
@@ -2041,6 +2049,17 @@ impl Scheduler {
         removed
     }
 
+    /// Release the child-TID futex after the backend observes the thread's final kernel exit
+    /// status. At this point the kernel has cleared the word, so a resumed `pthread_join` cannot
+    /// race that write.
+    pub(crate) fn complete_physical_thread_exit(&mut self, dettid: DetTid) -> bool {
+        let Some(futexid) = self.pending_physical_thread_exits.remove(&dettid) else {
+            return false;
+        };
+        self.wake_futex_child_cleartid(futexid, dettid);
+        true
+    }
+
     /// Release every physical-exit barrier after the backend supervisor has drained all tracees.
     pub(crate) fn release_all_physical_process_exits(&mut self) -> usize {
         let children = std::mem::take(&mut self.pending_physical_process_exits);
@@ -2048,6 +2067,16 @@ impl Scheduler {
         for child in children {
             self.completed_physical_process_exits.insert(child);
             self.wake_physical_child_waiters(child);
+        }
+        released
+    }
+
+    /// Release every child-TID futex after the backend supervisor has drained all tracees.
+    pub(crate) fn release_all_physical_thread_exits(&mut self) -> usize {
+        let threads = std::mem::take(&mut self.pending_physical_thread_exits);
+        let released = threads.len();
+        for (dettid, futexid) in threads {
+            self.wake_futex_child_cleartid(futexid, dettid);
         }
         released
     }
@@ -2253,6 +2282,13 @@ impl Scheduler {
         self.drain_pending_run_queue_removals();
         self.drain_pending_waitid_signals();
         self.drain_pending_run_queue_admissions();
+        if !self.pending_physical_thread_exits.is_empty() {
+            // The ordinary exit turn installed this barrier before the exiting
+            // thread resumed. Keep every sibling parked until the backend has
+            // observed the final kernel exit and the child-TID word is clear.
+            std::thread::yield_now();
+            return Err(SkipTurn);
+        }
         if self
             .blocked
             .physical_child_waiters
@@ -4067,6 +4103,7 @@ impl Scheduler {
         rsrcs: &Resources,
         resp: &Ivar<SchedResponse>,
     ) -> Result<(), SkipTurn> {
+        self.begin_physical_thread_exit(next_dtid, rsrcs);
         match self.next_turns.get(&next_dtid) {
             None => {
                 info!(
@@ -4098,6 +4135,30 @@ impl Scheduler {
                 Ok(())
             }
         }
+    }
+
+    fn begin_physical_thread_exit(&mut self, dettid: DetTid, rsrcs: &Resources) {
+        if !self.backend_reports_physical_process_exits {
+            return;
+        }
+        let Some((false, _process, mm)) = rsrcs.exit_identity() else {
+            return;
+        };
+        let child_tid_addr = self
+            .next_turns
+            .get(&dettid)
+            .map_or(0, |nextturn| nextturn.child_tid_addr);
+        if child_tid_addr == 0 {
+            return;
+        }
+        let previous = self
+            .pending_physical_thread_exits
+            .insert(dettid, FutexID::private(mm, child_tid_addr));
+        assert!(previous.is_none(), "thread exit barrier already pending");
+        trace!(
+            "[detcore, dtid {}] waiting for final physical thread exit before child-TID futex wake",
+            dettid
+        );
     }
 
     /// Unblock the guest to run, clear its ivars for the next turn, and increment the turn counter.
@@ -6600,6 +6661,91 @@ mod test {
         assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
         assert!(scheduler.blocked.timed_waiters.is_empty());
         assert_eq!(global_time.lock().unwrap().as_nanos(), exit_deadline);
+    }
+
+    #[test]
+    fn physical_thread_exit_precedes_sibling_progress_and_child_tid_wake() {
+        let config = Config {
+            backend_reports_physical_process_exits: true,
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let leader = DetPid::from_raw(100);
+        let child = DetTid::from_raw(101);
+        let sibling = DetTid::from_raw(102);
+        let child_tid_addr = 0x1234;
+        let child_tid_futex = FutexID::private(MmId::initial(leader), child_tid_addr);
+        scheduler.thread_tree.add_child(leader, leader, true);
+        scheduler.thread_tree.add_child(leader, child, false);
+        scheduler.thread_tree.add_child(leader, sibling, false);
+        register_known_thread(&mut scheduler, leader);
+        register_known_thread(&mut scheduler, child);
+        register_known_thread(&mut scheduler, sibling);
+        scheduler.next_turns.get_mut(&child).unwrap().child_tid_addr = child_tid_addr;
+        scheduler.sleep_futex_waiter(&leader, child_tid_futex, None, u32::MAX);
+        scheduler.runqueue_push_back(sibling);
+        let mut exit = Resources::new(child);
+        exit.insert(
+            ResourceID::Exit {
+                group: false,
+                process: leader,
+                mm: MmId::initial(leader),
+            },
+            Permission::RW,
+        );
+        let response = scheduler.next_turns.get(&child).unwrap().resp.clone();
+
+        assert!(
+            scheduler
+                .step5_guest_unblock(child, &exit, &response)
+                .is_ok()
+        );
+        assert!(matches!(response.try_read(), Some(SchedResponse::Go(None))));
+        scheduler.logically_kill_thread(&child, &leader, MmId::initial(leader));
+
+        assert!(scheduler.pending_physical_thread_exits.contains_key(&child));
+        assert!(!scheduler.child_tid_was_cleared(child_tid_futex, child.as_raw()));
+        assert!(!scheduler.run_queue.contains_tid(leader));
+        assert!(scheduler.step2_process_blocked(&global_time).is_err());
+        assert!(scheduler.run_queue.contains_tid(sibling));
+
+        assert!(scheduler.complete_physical_thread_exit(child));
+        assert!(scheduler.pending_physical_thread_exits.is_empty());
+        assert!(scheduler.child_tid_was_cleared(child_tid_futex, child.as_raw()));
+        assert!(scheduler.run_queue.contains_tid(leader));
+        assert!(scheduler.step2_process_blocked(&global_time).is_ok());
+    }
+
+    #[test]
+    fn backend_without_physical_exit_reporting_keeps_immediate_child_tid_wake() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let leader = DetPid::from_raw(100);
+        let child = DetTid::from_raw(101);
+        let child_tid_addr = 0x1234;
+        let child_tid_futex = FutexID::private(MmId::initial(leader), child_tid_addr);
+        scheduler.thread_tree.add_child(leader, leader, true);
+        scheduler.thread_tree.add_child(leader, child, false);
+        register_known_thread(&mut scheduler, leader);
+        register_known_thread(&mut scheduler, child);
+        scheduler.next_turns.get_mut(&child).unwrap().child_tid_addr = child_tid_addr;
+        scheduler.sleep_futex_waiter(&leader, child_tid_futex, None, u32::MAX);
+        let mut exit = Resources::new(child);
+        exit.insert(
+            ResourceID::Exit {
+                group: false,
+                process: leader,
+                mm: MmId::initial(leader),
+            },
+            Permission::RW,
+        );
+
+        scheduler.begin_physical_thread_exit(child, &exit);
+        scheduler.logically_kill_thread(&child, &leader, MmId::initial(leader));
+
+        assert!(scheduler.pending_physical_thread_exits.is_empty());
+        assert!(scheduler.child_tid_was_cleared(child_tid_futex, child.as_raw()));
+        assert!(scheduler.run_queue.contains_tid(leader));
     }
 
     fn physical_wait_handoff_queue(completion_before_wait: bool) -> Vec<DetTid> {
