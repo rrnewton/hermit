@@ -7039,8 +7039,43 @@ fn propagate_verbosity(plan: &mut Plan, verbosity: i64) {
 /// A deny-list also has to be complete to be safe, and nothing enumerates which
 /// steps depend on a host facility. An allow-list is wrong in the safe direction: a
 /// step nobody classified keeps running exactly where it runs today.
+/// The build steps whose OUTPUT IS EXECUTED inside the pinned root, and which must
+/// therefore be BUILT there.
+///
+/// ⚠️ THE RULE IS "AN OUTPUT THAT EXECUTES IN THE CONTAINER MUST BE BUILT IN THE
+/// CONTAINER", AND IT IS NOT A PREFERENCE. Measured 2026-08-27, same container, same
+/// mount, two binaries:
+///     host-built hermit     -> rc=127, "error while loading shared libraries:
+///                              libunwind-x86_64.so.8: cannot open shared object file"
+///     container-built hermit -> hermit 0.2.0, runs
+/// The nix image does not carry the host's libunwind. Publishing a host-built binary
+/// into the container's target directory relocates something it still cannot execute;
+/// the cells would move from "artifact pointer missing" to "cannot load shared
+/// libraries". The blocker is the toolchain, not the file location.
+///
+/// ⚠️ THIS LIST WAS DERIVED BY FOLLOWING THE RULE, NOT BY LISTING WHAT LOOKED RIGHT,
+/// AND FOLLOWING IT ADDED ONE I HAD NOT EXPECTED. `build.runtime_release` is here
+/// because it stages `target/install_pkg` (the SaBRe binary among others) and
+/// `ci/publish-hermit-e2e-artifact.sh` copies that whole tree into the artifact the
+/// cells unpack and run. A list assembled from memory would have stopped at five.
+const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
+    // builds target/debug/test-harness, which the cell command invokes directly
+    "setup.manifest_plan",
+    // runs test-harness
+    "e2e.metadata",
+    // builds target/debug/hermit, which the cells run as the guest tracer
+    "build.workspace",
+    // stages target/install_pkg, bundled into the artifact and executed by the cells
+    "build.runtime_release",
+    // packages the above into the artifact the cell command requires
+    "build.e2e_artifact",
+    // compiles the guest programs the cells execute under hermit
+    "build.manifest_guests",
+];
+
 fn pinned_root_step(step: &Step) -> bool {
-    step.tag().starts_with("e2e.manifest_")
+    let tag = step.tag();
+    tag.starts_with("e2e.manifest_") || PINNED_ROOT_PRODUCER_STEPS.contains(&tag.as_str())
 }
 
 fn pinned_root_command(root: &Path, out: &Path, step: &Step) -> String {
@@ -7148,6 +7183,8 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
                 step("test", "strict_compat", "./scripts/validate.rs --portable-strict-compat-only", vec![]),
                 step("lint", "clippy", "cargo clippy --workspace", vec![]),
                 step("test", "hermit_integration", "./ci/run-nextest-counted.sh -p hermit", vec![]),
+                // A producer whose output the cells execute: wrapped by the rule.
+                step("build", "workspace", "cargo build --workspace", vec![]),
             ],
             "pinned-root bracket",
         ),
@@ -7193,6 +7230,22 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
                 host.cmd, host.env, host.deps
             ));
         }
+    }
+
+    // A producer step is wrapped for the same reason a cell is: its output executes
+    // inside the image. If this stops holding, the cells get a host-built binary the
+    // image cannot load -- rc=127 on libunwind, measured -- and every cell fails with
+    // a message about the artifact rather than about the toolchain.
+    let producer = by_tag
+        .get("build.workspace")
+        .ok_or("pinned-root bracket: the producer node disappeared")?;
+    if !producer.cmd.contains("run-in-pinned-root.sh")
+        || producer.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
+    {
+        return Err(format!(
+            "pinned-root bracket: build.workspace produces binaries the cells execute and must be built in the image, but it was left on the host: cmd={:?} env={:?}",
+            producer.cmd, producer.env
+        ));
     }
 
     let wrapped = by_tag
@@ -7272,7 +7325,7 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
             "pinned-root bracket: sequential lanes must fetch once then reuse the cache: first_fetches={first_fetches} second_fetches={second_fetches} second={second_step:?}"
         ));
     }
-    Ok("pinned root: scheduled manifest cells wrapped with the /test gate; 6 non-cell steps verified still on the host; 1 locked fetch added".into())
+    Ok("pinned root: scheduled manifest cells and the producers they execute wrapped with the /test gate; 6 non-producer steps verified still on the host; 1 locked fetch added".into())
 }
 
 // --------------------------------------------------------------------------- interruption
