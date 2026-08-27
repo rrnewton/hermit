@@ -160,6 +160,9 @@ pressure summary classifies it: FRESH imports the matching retained position;
 DRIFTED replaces it with the current position; WRONG discards it because the
 current comparison matches; UNCHECKABLE withholds it because the current row
 did not establish a trustworthy result. Each outcome is printed per cell.
+One matching run is UNCHECKABLE rather than WRONG because these cells can match
+once and diverge on another run. WRONG requires at least two distinct current
+runs and no divergence; every classification prints the run count it used.
 
 The writers refuse unrelated tracked changes. `import-results` may replace its
 own two generated outputs so the same retained corpus can be imported again.

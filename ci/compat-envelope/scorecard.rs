@@ -1298,7 +1298,6 @@ struct RetainedDecision {
 
 enum ImportEvidence {
     Retained(RetainedCellResults),
-    Current(Vec<CurrentPressureResult>),
     None,
 }
 
@@ -3353,6 +3352,27 @@ fn import_results(
     let mut outcome_rows = Vec::new();
     let mut retained_rows_imported = 0usize;
     let mut current_rows_imported = 0usize;
+    for current_results in current.results.values() {
+        for current_result in current_results {
+            let depth = BTreeMap::from([(
+                "hermit".to_string(),
+                repo_depth_at(root, &current_result.summary.hermit_sha).ok_or_else(|| {
+                    format!(
+                        "cannot read Hermit source depth at current SHA {}",
+                        current_result.summary.hermit_sha
+                    )
+                })?,
+            )]);
+            apply_pressure_summary(
+                &mut tracked,
+                &current_result.summary,
+                &current_result.summary.hermit_sha,
+                &current_result.summary.detcore_tree,
+                &depth,
+            )?;
+            current_rows_imported += 1;
+        }
+    }
     for retained in retained_cells {
         let retained_id = retained.id.clone();
         let has_coordinate = retained.candidates.iter().any(|candidate| {
@@ -3397,29 +3417,6 @@ fn import_results(
                 fold.located += one.located;
                 fold.unlocated += one.unlocated;
                 fold.errored.extend(one.errored);
-            }
-            ImportEvidence::Current(current_results) => {
-                for current_result in current_results {
-                    let depth = BTreeMap::from([(
-                        "hermit".to_string(),
-                        repo_depth_at(root, &current_result.summary.hermit_sha).ok_or_else(
-                            || {
-                                format!(
-                                    "cannot read Hermit source depth at current SHA {}",
-                                    current_result.summary.hermit_sha
-                                )
-                            },
-                        )?,
-                    )]);
-                    apply_pressure_summary(
-                        &mut tracked,
-                        &current_result.summary,
-                        &current_result.summary.hermit_sha,
-                        &current_result.summary.detcore_tree,
-                        &depth,
-                    )?;
-                    current_rows_imported += 1;
-                }
             }
             ImportEvidence::None => {}
         }
@@ -4316,11 +4313,42 @@ fn retained_coordinate_decision(
         .map(|candidate| DivergenceCoordinates::from_row(&candidate.row))
         .filter(|coordinates| !coordinates.is_empty())
         .collect::<BTreeSet<_>>();
-    let current_results = current
+    let offered_current_results = current
         .results
         .get(&retained.id)
         .cloned()
         .unwrap_or_default();
+    let mut current_by_run: BTreeMap<
+        (String, String, Option<u64>),
+        BTreeMap<(ObservedResult, DivergenceCoordinates), CurrentPressureResult>,
+    > = BTreeMap::new();
+    for result in offered_current_results {
+        let row = &result.summary.rows[0];
+        let run_id = row
+            .invocation
+            .as_ref()
+            .expect("trusted pressure row has an invocation")
+            .run_id
+            .clone();
+        current_by_run
+            .entry((result.summary.hermit_sha.clone(), run_id, row.repetition))
+            .or_default()
+            .entry((result.result, result.coordinates))
+            .or_insert(result);
+    }
+    if current_by_run.values().any(|values| values.len() != 1) {
+        return RetainedDecision {
+            state: RetainedComparisonState::Uncheckable,
+            import: ImportEvidence::None,
+            retained_coordinates,
+            current_coordinates: BTreeSet::new(),
+            reason: "one current run identity carries conflicting results".into(),
+        };
+    }
+    let current_results = current_by_run
+        .into_values()
+        .map(|values| values.into_values().next().expect("one result per run"))
+        .collect::<Vec<_>>();
     let current_coordinates = current_results
         .iter()
         .filter(|result| result.result.carries_divergence_position())
@@ -4347,36 +4375,59 @@ fn retained_coordinate_decision(
         };
     }
 
-    let result_kinds = current_results
+    let matched = current_results
         .iter()
-        .map(|result| {
-            if result.result == ObservedResult::Pass {
-                "pass"
-            } else if result.result.carries_divergence_position() {
-                "diverged"
-            } else {
-                "no-verdict"
-            }
-        })
-        .collect::<BTreeSet<_>>();
-    if result_kinds == BTreeSet::from(["pass"]) {
-        return RetainedDecision {
-            state: RetainedComparisonState::Wrong,
-            import: ImportEvidence::Current(current_results),
-            retained_coordinates,
-            current_coordinates,
-            reason: "the current canonical comparison matches".into(),
-        };
-    }
-    if result_kinds != BTreeSet::from(["diverged"]) || current_coordinates.is_empty() {
+        .filter(|result| result.result == ObservedResult::Pass)
+        .count();
+    let diverged = current_results
+        .iter()
+        .filter(|result| result.result.carries_divergence_position())
+        .count();
+    let no_verdict = current_results.len() - matched - diverged;
+    let sample_count = current_results.len();
+    if no_verdict > 0 {
         return RetainedDecision {
             state: RetainedComparisonState::Uncheckable,
             import: ImportEvidence::None,
             retained_coordinates,
             current_coordinates,
             reason: format!(
-                "current pressure summaries do not establish one located divergence result: {}",
-                result_kinds.into_iter().collect::<Vec<_>>().join(", ")
+                "{sample_count} current run(s): {matched} matched, {diverged} diverged, {no_verdict} produced no verdict"
+            ),
+        };
+    }
+    if diverged == 0 {
+        if matched < 2 {
+            return RetainedDecision {
+                state: RetainedComparisonState::Uncheckable,
+                import: ImportEvidence::None,
+                retained_coordinates,
+                current_coordinates,
+                reason: format!(
+                    "{sample_count} current run matched; one matching run cannot establish that an intermittent divergence is gone"
+                ),
+            };
+        }
+        return RetainedDecision {
+            state: RetainedComparisonState::Wrong,
+            import: ImportEvidence::None,
+            retained_coordinates,
+            current_coordinates,
+            reason: format!("{sample_count} current runs all matched"),
+        };
+    }
+    if current_coordinates.is_empty()
+        || current_results.iter().any(|result| {
+            result.result.carries_divergence_position() && result.coordinates.is_empty()
+        })
+    {
+        return RetainedDecision {
+            state: RetainedComparisonState::Uncheckable,
+            import: ImportEvidence::None,
+            retained_coordinates,
+            current_coordinates,
+            reason: format!(
+                "{sample_count} current run(s): {matched} matched and {diverged} diverged, but at least one divergence has no coordinate"
             ),
         };
     }
@@ -4386,16 +4437,19 @@ fn retained_coordinate_decision(
             import: ImportEvidence::Retained(retained),
             retained_coordinates,
             current_coordinates,
-            reason: "the current divergence coordinates equal the retained coordinates".into(),
+            reason: format!(
+                "{sample_count} current run(s): {matched} matched and {diverged} diverged; every current divergence coordinate equals the retained set"
+            ),
         }
     } else {
         RetainedDecision {
             state: RetainedComparisonState::Drifted,
-            import: ImportEvidence::Current(current_results),
+            import: ImportEvidence::None,
             retained_coordinates,
             current_coordinates,
-            reason: "the current divergence coordinates differ from the retained coordinates"
-                .into(),
+            reason: format!(
+                "{sample_count} current run(s): {matched} matched and {diverged} diverged; the current divergence coordinate set differs from the retained set"
+            ),
         }
     }
 }
@@ -5534,6 +5588,13 @@ fn self_test() -> Result<(), String> {
             coordinates,
         }
     };
+    let current_run = |run_id: &str, mut row: PressureSummaryRow| {
+        row.invocation
+            .as_mut()
+            .expect("fixture current row has invocation")
+            .run_id = run_id.into();
+        current_result(row)
+    };
     let retained_cell = |candidates: Vec<ResultCandidate>| RetainedCellResults {
         id: validate_id.clone(),
         hermit_sha: "sha-1".into(),
@@ -5561,8 +5622,9 @@ fn self_test() -> Result<(), String> {
     }
 
     // FOUR RETAINED-COMPARISON OUTCOMES. These use the measured shapes that
-    // forced the distinction: 16 stayed 16; 111/119 moved to 117; 407 now
-    // matches; and 330 cannot be checked because the current row is rejected.
+    // forced the distinction: 16 stayed 16; 111/119 moved to 117; a single
+    // match cannot establish that 407 is gone; and 330 cannot be checked
+    // because the current row is rejected.
     let fresh_coordinates = coordinates(Some(3), Some(30), Some(16), Some(7));
     let fresh = retained_coordinate_decision(
         retained_cell(vec![validate_candidate(
@@ -5572,10 +5634,10 @@ fn self_test() -> Result<(), String> {
         &CurrentPressureEvidence {
             results: BTreeMap::from([(
                 validate_id.clone(),
-                vec![current_result(pressure_at(
-                    "determinism-failure",
-                    fresh_coordinates,
-                ))],
+                vec![current_run(
+                    "fresh-current",
+                    pressure_at("determinism-failure", fresh_coordinates),
+                )],
             )]),
             uncheckable: BTreeMap::new(),
         },
@@ -5606,7 +5668,10 @@ fn self_test() -> Result<(), String> {
             &CurrentPressureEvidence {
                 results: BTreeMap::from([(
                     validate_id.clone(),
-                    vec![current_result(pressure_at("determinism-failure", changed))],
+                    vec![current_run(
+                        "changed-current",
+                        pressure_at("determinism-failure", changed),
+                    )],
                 )]),
                 uncheckable: BTreeMap::new(),
             },
@@ -5632,36 +5697,94 @@ fn self_test() -> Result<(), String> {
         &CurrentPressureEvidence {
             results: BTreeMap::from([(
                 validate_id.clone(),
-                vec![current_result(pressure_at(
-                    "determinism-failure",
-                    coordinates(Some(3), Some(30), Some(117), Some(7)),
-                ))],
+                vec![current_run(
+                    "drifted-current",
+                    pressure_at(
+                        "determinism-failure",
+                        coordinates(Some(3), Some(30), Some(117), Some(7)),
+                    ),
+                )],
             )]),
             uncheckable: BTreeMap::new(),
         },
     );
     if drifted.state != RetainedComparisonState::Drifted
-        || !matches!(drifted.import, ImportEvidence::Current(_))
+        || !matches!(drifted.import, ImportEvidence::None)
     {
         return Err("changed retained coordinates were not replaced as DRIFTED".into());
     }
 
     let mut pass_row = pressure_at("pass", coordinates(None, None, None, None));
     pass_row.verification = None;
+    let one_match = retained_coordinate_decision(
+        retained_cell(vec![validate_candidate(
+            "wrong-retained",
+            coordinates(Some(3), Some(30), Some(407), Some(7)),
+        )]),
+        &CurrentPressureEvidence {
+            results: BTreeMap::from([(
+                validate_id.clone(),
+                vec![current_run("one-match", pass_row.clone())],
+            )]),
+            uncheckable: BTreeMap::new(),
+        },
+    );
+    if one_match.state != RetainedComparisonState::Uncheckable
+        || !matches!(one_match.import, ImportEvidence::None)
+    {
+        return Err(
+            "one matching run was treated as proof that a retained coordinate is WRONG".into(),
+        );
+    }
     let wrong = retained_coordinate_decision(
         retained_cell(vec![validate_candidate(
             "wrong-retained",
             coordinates(Some(3), Some(30), Some(407), Some(7)),
         )]),
         &CurrentPressureEvidence {
-            results: BTreeMap::from([(validate_id.clone(), vec![current_result(pass_row)])]),
+            results: BTreeMap::from([(
+                validate_id.clone(),
+                vec![
+                    current_run("match-one", pass_row.clone()),
+                    current_run("match-two", pass_row),
+                ],
+            )]),
             uncheckable: BTreeMap::new(),
         },
     );
     if wrong.state != RetainedComparisonState::Wrong
-        || !matches!(wrong.import, ImportEvidence::Current(_))
+        || !matches!(wrong.import, ImportEvidence::None)
     {
-        return Err("a retained divergence whose current comparison matches was not WRONG".into());
+        return Err(
+            "two distinct matching runs did not classify a retained divergence as WRONG".into(),
+        );
+    }
+
+    let mut intermittent_pass = pressure_at("pass", coordinates(None, None, None, None));
+    intermittent_pass.verification = None;
+    let intermittent = retained_coordinate_decision(
+        retained_cell(vec![validate_candidate(
+            "intermittent-retained",
+            fresh_coordinates,
+        )]),
+        &CurrentPressureEvidence {
+            results: BTreeMap::from([(
+                validate_id.clone(),
+                vec![
+                    current_run("intermittent-match", intermittent_pass),
+                    current_run(
+                        "intermittent-divergence",
+                        pressure_at("determinism-failure", fresh_coordinates),
+                    ),
+                ],
+            )]),
+            uncheckable: BTreeMap::new(),
+        },
+    );
+    if intermittent.state != RetainedComparisonState::Fresh {
+        return Err(
+            "a matching run hid a later current divergence at the retained coordinate".into(),
+        );
     }
 
     let mut uncheckable_row = pressure_at(
