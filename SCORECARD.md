@@ -66,3 +66,23 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | `util-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |
 
 Ordinary full validation executes 306 selected regression cells: the 304 green compatibility cells above (including 5 chaos-mode race-exposure checks), and 2 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
+
+## Status and measurement
+
+The table above reports status. This table reports the separate `measurement` field derived from observations stored in `ci/compat-envelope/cells.json`; it does not change status or which cells ordinary validation selects. Retained history that has not been imported is not counted here. A stored measurement does not establish that it describes current code; `show` reports whether the recorded last test still matches `HEAD:detcore`.
+
+The count table includes all **5728** tracked cells; no row is omitted.
+
+| Status | `never-measured` | `measured-and-passed` | `measured-no-verdict` | `diverged-unlocated` | `diverged` | Total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `green` | 304 | 0 | 0 | 0 | 0 | 304 |
+| `red` | 370 | 1 | 0 | 0 | 0 | 371 |
+| `not-applicable` | 5052 | 0 | 0 | 0 | 1 | 5053 |
+| **Total** | **5726** | **1** | **0** | **0** | **1** | **5728** |
+
+Cells whose stored `measurement` is not `never-measured` are shown individually so status and measurement remain visible together.
+
+| Test | Mode | Backend | Status | Measurement |
+| --- | --- | --- | --- | --- |
+| `applications/example-timed-progress-bar` | `verify` | `ptrace` | `red` | `measured-and-passed` |
+| `data-handling/sqlite-query-determinism` | `verify` | `sabre` | `not-applicable` | `diverged` |
