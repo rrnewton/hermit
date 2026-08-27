@@ -122,6 +122,7 @@ use tool_global::create_child_thread;
 use tool_global::create_vfork_child_thread;
 use tool_global::deregister_thread;
 pub use tool_global::format_unsupported_syscall_warning;
+pub use tool_global::prepare_exec;
 use tool_global::report_unsupported_syscall;
 
 fn select_thread_exit_detpid(
@@ -320,15 +321,38 @@ impl<T: RecordOrReplay> Detcore<T> {
         child_tid: Tid,
         child_tid_addr: usize,
         flags: CloneFlags,
+        exit_signal: libc::c_int,
+        physical_ids: Option<(i32, i32)>,
     ) {
+        let child_dettid = DetTid::from_raw(child_tid.into());
+        guest.thread_state_mut().clone_flags = Some(flags);
+        if !flags.contains(CloneFlags::CLONE_THREAD) {
+            guest
+                .thread_state()
+                .prepare_child_process_cpu_time(child_dettid);
+        }
+        let parent_dettid = guest.thread_state().dettid;
+        let parent_pedigree = &mut guest.thread_state_mut().pedigree;
+        let child_pedigree = parent_pedigree.fork_mut();
+        debug!(
+            "[dtid {}] after registering external child (tid {}, pedigree {}) parent's pedigree becomes {}",
+            parent_dettid, child_dettid, child_pedigree, parent_pedigree,
+        );
+        // The kernel clone has already succeeded before an external backend
+        // calls this method, so these parent updates are not speculative. If
+        // registration observes a retired parent, create_child_thread exits
+        // that parent by tail injection; no continuing caller can retry or
+        // roll the successful clone back.
         tool_global::create_child_thread(
             guest,
-            DetTid::from_raw(child_tid.into()),
+            child_dettid,
             child_tid_addr,
             Some(flags),
-            (flags.bits() & 0xff) as libc::c_int,
+            exit_signal,
+            physical_ids,
         )
         .await;
+        guest.thread_state_mut().clone_flags = None;
     }
     async fn passthrough<G: Guest<Self>>(
         &self,
@@ -1436,6 +1460,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 ThreadState {
                     dettid,
                     detpid: None, // Initialized later.
+                    physical_tid: None,
+                    restarted_child_wait: None,
                     open_file_creator: None,
                     mm_id: MmId::for_clone(
                         pts.1.mm_id,
@@ -1592,8 +1618,22 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 &new_dettid,
                 guest.config()
             );
+            let physical_ids = if guest
+                .config()
+                .backend_requires_thread_directed_process_signals
+            {
+                Some((
+                    guest.pid().as_raw(),
+                    guest
+                        .thread_state()
+                        .physical_tid
+                        .expect("backend requires a host thread ID before registration"),
+                ))
+            } else {
+                None
+            };
             if let Some(post_exec_mm) =
-                create_child_thread(guest, new_dettid, 0, None, libc::SIGCHLD).await
+                create_child_thread(guest, new_dettid, 0, None, libc::SIGCHLD, physical_ids).await
             {
                 guest.thread_state_mut().mm_id = post_exec_mm;
             }

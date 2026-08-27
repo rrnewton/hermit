@@ -478,7 +478,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .with_sig(call.sig());
             self.record_or_replay(guest, targeted).await?
         };
-        self.notify_cross_task_signal(guest, tid, call.sig()).await;
+        self.notify_cross_task_signal(guest, tid, call.sig(), Some(DetPid::from_raw(tgid)))
+            .await;
         Ok(value)
     }
 
@@ -496,7 +497,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // guest THREAD signals a sibling. Like `kill`, a successful cross-task
         // send must tell the scheduler, or a target parked in a child wait is
         // never woken and the wait hangs.
-        self.notify_cross_task_signal(guest, DetTid::from_raw(call.tid()), call.sig())
+        self.notify_cross_task_signal(guest, DetTid::from_raw(call.tid()), call.sig(), None)
             .await;
         Ok(value)
     }
@@ -515,7 +516,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let value = self.record_or_replay(guest, call).await?;
         // Same wakeup obligation as `tgkill`; `tkill` is the older two-argument
         // spelling of the same thread-directed send.
-        self.notify_cross_task_signal(guest, DetTid::from_raw(call.tid()), call.sig())
+        self.notify_cross_task_signal(guest, DetTid::from_raw(call.tid()), call.sig(), None)
             .await;
         Ok(value)
     }
@@ -544,6 +545,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         target: DetTid,
         raw_signal: i32,
+        target_process: Option<DetPid>,
     ) {
         // ⚠️ NO `Signal::try_from` GATE. It used to stand here, and because
         // `nix`'s `Signal` models only 1..=31 it rejected EVERY realtime signal:
@@ -553,7 +555,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // `SigWrapper` now carries the raw number, so every deliverable signal
         // can be represented and none is dropped for being unnameable.
         if target != guest.thread_state().dettid {
-            notify_signal_pending(guest, target, SigWrapper(raw_signal)).await;
+            notify_signal_pending(guest, target, SigWrapper(raw_signal), target_process).await;
         }
     }
 
@@ -572,7 +574,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Thread-directed like `tgkill`, so it carries the same wakeup
         // obligation. `sigqueue`/`pthread_sigqueue` reach a parked sibling
         // through here.
-        self.notify_cross_task_signal(guest, DetTid::from_raw(call.tid()), call.sig())
+        self.notify_cross_task_signal(guest, DetTid::from_raw(call.tid()), call.sig(), None)
             .await;
         Ok(value)
     }
@@ -616,7 +618,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .with_siginfo(call.siginfo());
             self.record_or_replay(guest, targeted).await?
         };
-        self.notify_cross_task_signal(guest, tid, call.sig()).await;
+        self.notify_cross_task_signal(guest, tid, call.sig(), Some(DetPid::from_raw(tgid)))
+            .await;
         Ok(value)
     }
 

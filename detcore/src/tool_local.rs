@@ -1608,6 +1608,17 @@ pub struct ThreadState<T> {
     /// The deterministic process ID of the this thread.
     pub detpid: Option<DetTid>,
 
+    /// Host thread ID supplied by a backend whose scheduler identity is
+    /// virtual. `None` keeps the existing direct-ID behavior for other
+    /// backends.
+    #[serde(default)]
+    pub physical_tid: Option<i32>,
+
+    /// Scheduler child wait that Linux will restart after the current DBT
+    /// signal handler returns through `rt_sigreturn`.
+    #[serde(default)]
+    pub(crate) restarted_child_wait: Option<ChildWaitSpec>,
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1063): Review backend-supplied open-file creator identity.
     /// Stable identity used when allocating deterministic open-file descriptions.
@@ -1781,6 +1792,8 @@ impl<T> std::fmt::Debug for ThreadState<T> {
         f.debug_struct("ThreadState")
             .field("dettid", &self.dettid)
             .field("detpid", &self.detpid)
+            .field("physical_tid", &self.physical_tid)
+            .field("restarted_child_wait", &self.restarted_child_wait)
             .field("mm_id", &self.mm_id)
             .field("memory_metadata", &self.memory_metadata)
             .field("stats", &self.stats)
@@ -2025,6 +2038,8 @@ impl<T> ThreadState<T> {
         ThreadState {
             dettid: pid,
             detpid: None, // Initialized later.
+            physical_tid: None,
+            restarted_child_wait: None,
             open_file_creator: None,
             mm_id: MmId::initial(pid),
             memory_metadata: Arc::new(Mutex::new(MemoryMetadata::new())),
