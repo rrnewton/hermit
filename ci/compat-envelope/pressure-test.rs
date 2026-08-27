@@ -847,6 +847,10 @@ struct ResultRow {
     extra: BTreeMap<String, JsonValue>,
 }
 
+fn first_attempt() -> u64 {
+    1
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct InvocationAttempt {
     index: String,
@@ -1360,9 +1364,7 @@ fn run() -> Result<(), String> {
                 )?;
                 Ok(())
             })();
-            let series_result = if std::env::var_os("DEV_HERMIT_PARENT").is_some()
-                && results.join("series-results.jsonl").is_file()
-            {
+            let series_result = if std::env::var_os("DEV_HERMIT_PARENT").is_some() {
                 emit_series(&results)
             } else {
                 Ok(())
@@ -3003,7 +3005,6 @@ fn write_plan_after_scorecard_check(
                 "mkdir -p {cell_dir}; if test -f {status_file}; then exit 0; fi; \
              printf '{incomplete}\\n' > {status_file}; {preparation_guard}status=0; \
              env E2E_RESULT_ROOT={results} E2E_BUILD_ROOT={build_root} E2E_RUN_ID={run_id} \
-             E2E_RUN_INDEX={run_index} \
              E2E_KEEP_VERIFY_LOGS=1 \
              {harness} \
              || status=$?; \
@@ -3014,7 +3015,6 @@ fn write_plan_after_scorecard_check(
                 results = shell_quote(&results.to_string_lossy()),
                 build_root = shell_quote(&build_root.to_string_lossy()),
                 run_id = shell_quote(&evidence_run_id),
-                run_index = repetition.unwrap_or(0),
                 harness = harness,
                 result_in_progress = shell_quote(&result_in_progress.to_string_lossy()),
                 result_file = shell_quote(&result_file.to_string_lossy()),
@@ -6688,7 +6688,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         attempt: 1,
         schema: CELL_RESULT_SCHEMA,
         run_id: sample_slug.clone(),
-        run_index: 0,
+        attempt: 1,
+        run_index: Some(0),
         hermit_sha: sample_metadata.hermit_sha.clone(),
         source_tree_dirty: false,
         test: sample_a.test.clone(),
@@ -6775,7 +6776,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         attempt: 1,
         schema: CELL_RESULT_SCHEMA,
         run_id: first_repetition_slug.clone(),
-        run_index: 1,
+        attempt: 1,
+        run_index: Some(1),
         hermit_sha: repeated_metadata.hermit_sha.clone(),
         source_tree_dirty: false,
         test: green_id.test.clone(),
