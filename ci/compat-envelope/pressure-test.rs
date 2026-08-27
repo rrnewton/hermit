@@ -815,6 +815,20 @@ struct ResultRow {
     /// "this is the first attempt" from being the same thing anywhere downstream.
     #[serde(default = "first_attempt")]
     attempt: u64,
+    /// This attempt's own first-divergence coordinates.
+    ///
+    /// ⚠️ `#[serde(default)]`, SO ABSENCE STAYS "WRITTEN BEFORE THE FIELD
+    /// EXISTED" rather than "this attempt located nothing", which is an explicit
+    /// null. The producer emits all four on every row and a test in
+    /// `ci/manifest-plan/src/runner.rs` holds it to that.
+    #[serde(default)]
+    first_divergent_record: Option<u64>,
+    #[serde(default)]
+    first_divergent_syscall: Option<u64>,
+    #[serde(default)]
+    first_divergent_scheduler_turn: Option<u64>,
+    #[serde(default)]
+    first_divergent_virtual_nanoseconds: Option<u64>,
     hermit_sha: String,
     source_tree_dirty: bool,
     test: String,
@@ -2008,6 +2022,57 @@ fn series_self_test() -> Result<(), String> {
         }
     }
 
+    // ⚠️ A DIVERGENCE ON AN EARLIER ATTEMPT MUST SURVIVE A PASSING RETRY.
+    // Without this the flake case is silently dropped: attempt 1 diverges,
+    // attempt 2 passes, the terminal row reports the pass and the coordinate the
+    // first attempt located is never seen by any cell.
+    {
+        let path = Path::new("results.jsonl");
+        let diverged = r#"{"schema":4,"attempt":1,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"FAIL","first_divergent_record":93,"first_divergent_syscall":37,"first_divergent_scheduler_turn":68,"first_divergent_virtual_nanoseconds":7,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null}"#;
+        let passed = r#"{"schema":4,"attempt":2,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"PASS","first_divergent_record":null,"first_divergent_syscall":null,"first_divergent_scheduler_turn":null,"first_divergent_virtual_nanoseconds":null,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null}"#;
+        let all = all_attempt_rows(path, &format!("{diverged}\n{passed}\n"))?;
+        if all.len() != 2 {
+            return Err("both attempts must parse".into());
+        }
+        let earlier = earlier_attempts_that_located(&all, 2);
+        if earlier.len() != 1 || earlier[0].attempt != 1 {
+            return Err(format!(
+                "the diverging first attempt must be reported as an earlier observation; got {} row(s)",
+                earlier.len()
+            ));
+        }
+        if earlier[0].first_divergent_record != Some(93) {
+            return Err("the earlier attempt must carry its own coordinate".into());
+        }
+        // The terminal attempt is still the one the cell's own row reports.
+        let terminal = terminal_attempt_row(path, &format!("{diverged}\n{passed}\n"))?
+            .ok_or("a terminal row must still be selected")?;
+        if terminal.attempt != 2 || terminal.outcome != "PASS" {
+            return Err("the terminal attempt must still be the cell's reported row".into());
+        }
+        // ⚠️ AND AN ATTEMPT THAT LOCATED NOTHING IS NOT AN OBSERVATION OF A
+        // DIVERGENCE. Absence and null both mean "did not locate", so neither may
+        // manufacture a row; only a located coordinate does.
+        if !earlier_attempts_that_located(&all, 1).is_empty() {
+            return Err("nothing precedes the first attempt, so nothing may be reported".into());
+        }
+        let both_clean = format!(
+            "{}\n{}\n",
+            diverged.replace("\"first_divergent_record\":93", "\"first_divergent_record\":null")
+                .replace("\"first_divergent_syscall\":37", "\"first_divergent_syscall\":null")
+                .replace("\"first_divergent_scheduler_turn\":68", "\"first_divergent_scheduler_turn\":null")
+                .replace("\"first_divergent_virtual_nanoseconds\":7", "\"first_divergent_virtual_nanoseconds\":null"),
+            passed
+        );
+        let clean = all_attempt_rows(path, &both_clean)?;
+        if !earlier_attempts_that_located(&clean, 2).is_empty() {
+            return Err(
+                "an earlier attempt that located NOTHING must not be reported as a divergence"
+                    .into(),
+            );
+        }
+    }
+
     if series_run_index("a-cell-with-no-suffix") != 0 {
         return Err("a single-run campaign is a series of length one, ordinal 0".into());
     }
@@ -2054,6 +2119,10 @@ fn series_self_test() -> Result<(), String> {
         cells: Vec::new(),
     };
     let row = ResultRow {
+        first_divergent_record: None,
+        first_divergent_syscall: None,
+        first_divergent_scheduler_turn: None,
+        first_divergent_virtual_nanoseconds: None,
         attempt: 1,
         schema: 4,
         run_id: "campaign".into(),
@@ -3712,6 +3781,50 @@ fn terminal_attempt_row(
     Ok(rows.into_iter().max_by_key(|row| row.attempt))
 }
 
+/// Attempts BEFORE the terminal one that located a divergence, earliest first.
+///
+/// ⚠️ A CELL THAT DIVERGED AND THEN PASSED ON RETRY STILL DIVERGED. The terminal
+/// attempt is what the harness exit describes, so it is what the cell's result
+/// reports, but reading only that attempt throws away a real observation -- and a
+/// flake is precisely "diverged, then passed", which is the population the
+/// standing retries-must-record-the-flake work exists to stop hiding.
+///
+/// These are emitted as ADDITIONAL summary rows carrying the repeat ordinal, which
+/// is the mechanism the scorecard already has for several observations of one
+/// cell: it keys its duplicate guard on (cell, repetition) precisely so repeats
+/// merge rather than collide. Nothing new is introduced to express this.
+///
+/// ⚠️ RED CELLS ONLY. The caller applies this on the red-cell path alone. Doing it
+/// for green cells would change what the scorecard reports about cells nobody
+/// currently considers suspect, which is a decision about what green means rather
+/// than an accuracy improvement, and it is not taken here.
+fn earlier_attempts_that_located(rows: &[ResultRow], terminal: u64) -> Vec<&ResultRow> {
+    let mut earlier: Vec<&ResultRow> = rows
+        .iter()
+        .filter(|row| row.attempt < terminal)
+        .filter(|row| {
+            row.first_divergent_record.is_some()
+                || row.first_divergent_syscall.is_some()
+                || row.first_divergent_scheduler_turn.is_some()
+                || row.first_divergent_virtual_nanoseconds.is_some()
+        })
+        .collect();
+    earlier.sort_by_key(|row| row.attempt);
+    earlier
+}
+
+/// Every parsed row of one cell's appended log, in file order.
+fn all_attempt_rows(result_file: &Path, text: &str) -> Result<Vec<ResultRow>, String> {
+    let mut rows = Vec::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        rows.push(
+            serde_json::from_str(line)
+                .map_err(|e| format!("invalid {}: {e}", result_file.display()))?,
+        );
+    }
+    Ok(rows)
+}
+
 fn result_row_matches_cell(
     row: &ResultRow,
     slug: &str,
@@ -4386,6 +4499,77 @@ fn summarize(
                 .or_default() += 1;
             if result == "pass" && metadata.repetitions.is_none() {
                 passing.push(display_id(cell));
+            }
+            // ⚠️ AN EARLIER ATTEMPT THAT DIVERGED IS STILL AN OBSERVATION.
+            // The row above reports the TERMINAL attempt, which is what the
+            // harness exit describes. On the red-cell path, an attempt before it
+            // that located a divergence is emitted as its own row carrying the
+            // repeat ordinal, so the observation is recorded instead of being
+            // dropped when a retry happens to pass. A flake is exactly
+            // "diverged, then passed".
+            //
+            // ⚠️ RED CELLS ONLY, and `metadata.repetitions.is_none()` is what
+            // makes that so: it is the existing discriminator for the red-cell
+            // campaign, the same one that decides whether a pass is recorded as a
+            // promotion candidate. Doing this for green cells would change what
+            // the scorecard reports about cells nobody currently considers
+            // suspect. That is a decision about what green means and it is
+            // deliberately not taken here.
+            //
+            // ⚠️ THIS CANNOT MOVE A STATUS. These rows only add observations, and
+            // observations feed `measurement`; `status` is owned by a different
+            // writer and the scorecard enforces that boundary.
+            if metadata.repetitions.is_none() && row_valid {
+                let earlier: Vec<JsonValue> = match fs::read_to_string(&result_file)
+                    .ok()
+                    .and_then(|text| all_attempt_rows(&result_file, &text).ok())
+                {
+                    Some(all) => {
+                        let terminal = all.iter().map(|row| row.attempt).max().unwrap_or(1);
+                        earlier_attempts_that_located(&all, terminal)
+                            .into_iter()
+                            .map(|earlier_row| {
+                                json!({
+                                    "cell": cell,
+                                    "repetition": earlier_row.attempt,
+                                    "harness_exit": harness_status,
+                                    "outcome": earlier_row.outcome,
+                                    "reason": earlier_row.reason,
+                                    "error_kind": earlier_row.error_kind,
+                                    "invocation": invocation,
+                                    "result_row_valid": true,
+                                    // The attempt located a divergence, so the
+                                    // result that describes it is the one that
+                                    // carries a divergence position.
+                                    "result": "determinism-failure",
+                                    "verification": {
+                                        "first_divergent_record":
+                                            earlier_row.first_divergent_record,
+                                        "first_divergent_syscall":
+                                            earlier_row.first_divergent_syscall,
+                                        "first_divergent_scheduler_turn":
+                                            earlier_row.first_divergent_scheduler_turn,
+                                        "first_divergent_virtual_nanoseconds":
+                                            earlier_row.first_divergent_virtual_nanoseconds,
+                                    },
+                                    "verification_logs": verification_logs,
+                                    "normalized_ptrace_golden": normalized_ptrace_golden,
+                                    "evidence_errors": Vec::<String>::new(),
+                                    "runner_seen": runner.seen,
+                                    "runner_ok": runner.ok,
+                                    "runner_timed_out": runner.timed_out,
+                                    "runner_oom": runner.oom,
+                                    "oom_proven_by_runner_and_attempt_marker": false,
+                                    "timeout_proven_by_runner_and_attempt_marker": false,
+                                })
+                            })
+                            .collect()
+                    }
+                    None => Vec::new(),
+                };
+                for earlier_row in earlier {
+                    rows.push(earlier_row);
+                }
             }
             rows.push(json!({
                 "cell": cell,
@@ -6651,6 +6835,10 @@ fn self_test(root: &Path) -> Result<(), String> {
         cells: vec![sample_a.clone()],
     };
     let mut result_row = ResultRow {
+        first_divergent_record: None,
+        first_divergent_syscall: None,
+        first_divergent_scheduler_turn: None,
+        first_divergent_virtual_nanoseconds: None,
         attempt: 1,
         schema: CELL_RESULT_SCHEMA,
         run_id: sample_slug.clone(),
@@ -6734,6 +6922,10 @@ fn self_test(root: &Path) -> Result<(), String> {
     let first_repetition_slug = cell_run_slug(&green_id, Some(1));
     let second_repetition_slug = cell_run_slug(&green_id, Some(2));
     let repeated_result_row = ResultRow {
+        first_divergent_record: None,
+        first_divergent_syscall: None,
+        first_divergent_scheduler_turn: None,
+        first_divergent_virtual_nanoseconds: None,
         attempt: 1,
         schema: CELL_RESULT_SCHEMA,
         run_id: first_repetition_slug.clone(),
