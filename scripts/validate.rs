@@ -6771,10 +6771,24 @@ fn propagate_verbosity(plan: &mut Plan, verbosity: i64) {
     }
 }
 
-fn pinned_root_host_step(step: &Step) -> bool {
-    step.tag() == "pre.submodules"
-        || step.tag() == PINNED_ROOT_FETCH_TAG
-        || step.tag() == PIN_GATE_TAG
+/// The steps that run inside the pinned root: the scheduled E2E manifest cells,
+/// and nothing else.
+///
+/// ⚠️ THIS IS AN ALLOW-LIST BY DELIBERATE CHOICE, AND THE EARLIER DENY-LIST IS WHY.
+/// The first version wrapped everything except three preflight steps, which moved
+/// FORTY-FOUR steps that are not scheduled cells into the container as a side
+/// effect. That is not a smaller blast radius argued down; it was measured:
+/// `gate.manifest` passed 4 of 4 on the ordinary host lane on 2026-08-26 and FAILED
+/// twice inside the container, because its self-test needs `systemd-run --user
+/// --scope` and the container has no systemd user session. It fails closed, which is
+/// correct, but it is not a Hermit guest run and nothing about goal 2 required
+/// moving it.
+///
+/// A deny-list also has to be complete to be safe, and nothing enumerates which
+/// steps depend on a host facility. An allow-list is wrong in the safe direction: a
+/// step nobody classified keeps running exactly where it runs today.
+fn pinned_root_step(step: &Step) -> bool {
+    step.tag().starts_with("e2e.manifest_")
 }
 
 fn pinned_root_command(root: &Path, out: &Path, step: &Step) -> String {
@@ -6844,7 +6858,7 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
         }
 
         for step in &mut cfg.steps {
-            if pinned_root_host_step(step) {
+            if !pinned_root_step(step) {
                 continue;
             }
             // The selected E2E population has no naked or DBT cells. Every
@@ -6853,12 +6867,6 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
             // silently running it outside /test.
             step.env
                 .insert("HERMIT_E2E_EMPTY_WORKDIR".into(), "/test".into());
-            // The only nested validate command is already written to opt out of
-            // a second cgroup layer in CI. The outer DAG step remains boxed and
-            // owns the resource limits around this container.
-            if step.tag() == "test.strict_compat" {
-                step.env.insert("CI".into(), "1".into());
-            }
             step.cmd = pinned_root_command(root, &out, step);
             if index == 0 && !step.deps.iter().any(|dep| dep == PINNED_ROOT_FETCH_TAG) {
                 step.deps.push(PINNED_ROOT_FETCH_TAG.into());
@@ -6873,22 +6881,21 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
     let step = |group: &str, job: &str, cmd: &str, deps: Vec<String>| {
         step_with_caps(group, job, "fixture", cmd.into(), deps, 30, 30, 1024 * 1024)
     };
-    let mut ordinary = step("test", "ordinary", "echo pinned", vec![]);
-    ordinary.env.insert("FIXTURE_VALUE".into(), "literal".into());
-    let strict = step("test", "strict_compat", "./scripts/validate.rs --portable-strict-compat-only", vec![]);
+    let mut cell = step("e2e", "manifest_fixture", "echo cells", vec![]);
+    cell.env.insert("FIXTURE_VALUE".into(), "literal".into());
     let mut plan = Plan {
         cfg: validate_plan::config_from(
             vec![
                 step("pre", "submodules", "host-submodules", vec![]),
                 step("pre", "reverie_pin", "./ci/run-reverie-pin-check.sh", vec!["pre.submodules".into()]),
-                ordinary,
-                strict,
-                step(
-                    "test",
-                    "mentions_pin_script",
-                    "echo ./ci/run-reverie-pin-check.sh",
-                    vec![],
-                ),
+                cell,
+                // The four below are the shape of the forty-four that must STAY on
+                // the host. gate.manifest is named explicitly because it is the one
+                // measured to fail in the container.
+                step("gate", "manifest", "target/debug/test-harness validate", vec![]),
+                step("test", "strict_compat", "./scripts/validate.rs --portable-strict-compat-only", vec![]),
+                step("lint", "clippy", "cargo clippy --workspace", vec![]),
+                step("test", "hermit_integration", "./ci/run-nextest-counted.sh -p hermit", vec![]),
             ],
             "pinned-root bracket",
         ),
@@ -6900,72 +6907,67 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
     let fetch = by_tag
         .get(PINNED_ROOT_FETCH_TAG)
         .ok_or("pinned-root bracket: locked fetch node was not added")?;
-    if fetch.cmd != PINNED_ROOT_FETCH_COMMAND
-        || fetch.deps != [PIN_GATE_TAG.to_string()]
-    {
+    if fetch.cmd != PINNED_ROOT_FETCH_COMMAND || fetch.deps != [PIN_GATE_TAG.to_string()] {
         return Err(format!(
             "pinned-root bracket: fetch command/dependency drifted: cmd={:?} deps={:?}",
             fetch.cmd, fetch.deps
         ));
     }
-    for tag in ["pre.submodules", PIN_GATE_TAG] {
+
+    // ⚠️ THE NEGATIVE HALF, AND IT IS THE POINT OF THIS BRACKET.
+    // Everything that is not a scheduled manifest cell must be left exactly as it
+    // was: no image wrapper, no /test gate, and no edge to the fetch node. Measured
+    // 2026-08-26: gate.manifest passes 4 of 4 on the host lane and fails twice in
+    // the container, because its self-test needs a systemd user session the
+    // container does not have. If this loop ever stops failing, the wrapper has
+    // grown back past the scheduled cells and that failure returns with it.
+    for tag in [
+        "gate.manifest",
+        "test.strict_compat",
+        "lint.clippy",
+        "test.hermit_integration",
+        "pre.submodules",
+        PIN_GATE_TAG,
+    ] {
         let host = by_tag
             .get(tag)
-            .ok_or_else(|| format!("pinned-root bracket: host preflight {tag} disappeared"))?;
-        if host.cmd.contains("run-in-pinned-root.sh") {
-            return Err(format!(
-                "pinned-root bracket: network/repository preflight {tag} was moved into the network-disabled image"
-            ));
-        }
-    }
-    for tag in [
-        "test.ordinary",
-        "test.strict_compat",
-        "test.mentions_pin_script",
-    ] {
-        let wrapped = by_tag
-            .get(tag)
-            .ok_or_else(|| format!("pinned-root bracket: wrapped node {tag} disappeared"))?;
-        if !wrapped.cmd.starts_with("/repo/ci/hermetic/run-in-pinned-root.sh ")
-            || !wrapped.cmd.contains("--src /repo")
-            || !wrapped.cmd.contains("--out /repo/ignored/hermetic/split")
-            || !wrapped
-                .cmd
-                .contains(&format!("--env {STEP_STARTED_MONOTONIC_NS_ENV}"))
-            || !wrapped.cmd.contains("--env HERMIT_E2E_EMPTY_WORKDIR")
-            || !wrapped
-                .cmd
-                .contains("/src/ci/hermetic/assert-no-network.sh")
-            || wrapped.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
-            || !wrapped.deps.iter().any(|dep| dep == PINNED_ROOT_FETCH_TAG)
+            .ok_or_else(|| format!("pinned-root bracket: host step {tag} disappeared"))?;
+        if host.cmd.contains("run-in-pinned-root.sh")
+            || host.env.contains_key("HERMIT_E2E_EMPTY_WORKDIR")
+            || host.deps.iter().any(|dep| dep == PINNED_ROOT_FETCH_TAG)
         {
             return Err(format!(
-                "pinned-root bracket: {tag} lost its image wrapper, /test gate, or fetch edge: cmd={:?} env={:?} deps={:?}",
-                wrapped.cmd, wrapped.env, wrapped.deps
+                "pinned-root bracket: {tag} is not a scheduled manifest cell and must stay on the host, but it was wrapped: cmd={:?} env={:?} deps={:?}",
+                host.cmd, host.env, host.deps
             ));
         }
     }
-    let ordinary = by_tag["test.ordinary"];
-    if !ordinary.cmd.contains("--env FIXTURE_VALUE")
-        || !ordinary.cmd.ends_with(" bash 'echo pinned'")
+
+    let wrapped = by_tag
+        .get("e2e.manifest_fixture")
+        .ok_or("pinned-root bracket: the scheduled cell node disappeared")?;
+    if !wrapped.cmd.starts_with("/repo/ci/hermetic/run-in-pinned-root.sh ")
+        || !wrapped.cmd.contains("--src /repo")
+        || !wrapped.cmd.contains("--out /repo/ignored/hermetic/split")
+        || !wrapped
+            .cmd
+            .contains(&format!("--env {STEP_STARTED_MONOTONIC_NS_ENV}"))
+        || !wrapped.cmd.contains("--env HERMIT_E2E_EMPTY_WORKDIR")
+        || !wrapped.cmd.contains("/src/ci/hermetic/assert-no-network.sh")
+        || wrapped.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
+        || !wrapped.deps.iter().any(|dep| dep == PINNED_ROOT_FETCH_TAG)
+        || !wrapped.cmd.contains("--env FIXTURE_VALUE")
+        || !wrapped.cmd.ends_with(" bash 'echo cells'")
     {
         return Err(format!(
-            "pinned-root bracket: per-step environment or literal command changed: {:?}",
-            ordinary.cmd
+            "pinned-root bracket: the scheduled cell lost its image wrapper, /test gate, per-step environment or fetch edge: cmd={:?} env={:?} deps={:?}",
+            wrapped.cmd, wrapped.env, wrapped.deps
         ));
     }
-    let strict = by_tag["test.strict_compat"];
-    if strict.env.get("CI").map(String::as_str) != Some("1")
-        || !strict.cmd.contains("--env CI")
-    {
-        return Err(
-            "pinned-root bracket: nested strict compatibility did not select its existing explicit inner-cgroup opt-out"
-                .into(),
-        );
-    }
+
     let mut nested = Plan {
         cfg: validate_plan::config_from(
-            vec![step("test", "nested", "echo already-inside", vec![])],
+            vec![step("e2e", "manifest_nested", "echo already-inside", vec![])],
             "already inside pinned root",
         ),
         ..Default::default()
@@ -6982,11 +6984,11 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
     }
     let mut sequential = Plan {
         cfg: validate_plan::config_from(
-            vec![step("test", "first", "true", vec![])],
+            vec![step("e2e", "manifest_first", "true", vec![])],
             "first lane",
         ),
         second: Some(validate_plan::config_from(
-            vec![step("test", "second", "true", vec![])],
+            vec![step("e2e", "manifest_second", "true", vec![])],
             "second lane",
         )),
         ..Default::default()
@@ -7007,7 +7009,7 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
     let second_step = second
         .steps
         .iter()
-        .find(|step| step.tag() == "test.second")
+        .find(|step| step.tag() == "e2e.manifest_second")
         .expect("second-lane step remains present");
     if first_fetches != 1
         || second_fetches != 0
@@ -7018,7 +7020,7 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
             "pinned-root bracket: sequential lanes must fetch once then reuse the cache: first_fetches={first_fetches} second_fetches={second_fetches} second={second_step:?}"
         ));
     }
-    Ok("pinned root: 2 host preflights retained, 1 locked fetch added, 3 test commands wrapped with the /test gate".into())
+    Ok("pinned root: scheduled manifest cells wrapped with the /test gate; 6 non-cell steps verified still on the host; 1 locked fetch added".into())
 }
 
 // --------------------------------------------------------------------------- interruption
