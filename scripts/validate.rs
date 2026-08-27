@@ -7331,6 +7331,106 @@ mod scheduler_explanation_tests {
 }
 
 #[cfg(test)]
+mod declared_width_channel_tests {
+    use super::*;
+
+    /// A step's DECLARED parallelism width must be one its own command can honour.
+    ///
+    /// ⚠️ THE FAILURE THIS EXISTS TO CATCH LEAVES NO TRACE IN THE RESULT. `dagrun
+    /// sweep` varies a step's inner width through `jobs_flag` or `jobs_env`. If the
+    /// command ALSO fixes that width itself -- an inline `VAR=8 cmd`, or a literal
+    /// `--jobs 8` argument -- the baked value wins, the declared channel does
+    /// nothing, and THE SWEEP STILL PRINTS A SPEEDUP TABLE. Measured 2026-08-27
+    /// with a step whose command was `XW=8 sh -c 'echo $XW'` while declaring
+    /// `jobs_env = "XW"`: it reported the width as 8 at every swept value and the
+    /// table showed a 1.17x speedup. A clean curve for a knob that cannot move, and
+    /// nothing in the curve says so.
+    ///
+    /// ⚠️ AND `jobs_env` ALONE IS NOT ENOUGH. The default flag template is still
+    /// appended alongside it, so an env-channel step also needs `jobs_flag = ""`.
+    /// Measured the same day: a step declaring only `jobs_env` received `-j 1` and
+    /// died with `sleep: invalid option -- 'j'`.
+    ///
+    /// Today every step declares NOTHING and this passes over all of them, which is
+    /// the point: it is here so the FIRST declaration has to be true. Deleting it
+    /// because it currently finds nothing would remove the check exactly when the
+    /// declarations start arriving.
+    #[test]
+    fn a_declared_width_channel_is_not_contradicted_by_its_own_command() {
+        // ⚠️ COUNTED AND ASSERTED, BECAUSE THE FIRST VERSION OF THIS TEST SKIPPED
+        // SILENTLY. It read the lane files with `let Ok(..) else { continue }`, so
+        // when the working directory was not the repository root both lanes were
+        // skipped and the test PASSED having inspected nothing. Caught by planting
+        // a violation and watching it stay green -- the same absence-readable-as-a-
+        // result shape this file warns about elsewhere, authored here by accident.
+        // Embedded at COMPILE time, like the nextest-policy gate in this file. A
+        // `#[cfg(test)]` test runs from rust-script's project cache, not the
+        // repository, so reading these by relative path silently found nothing.
+        let mut inspected = 0usize;
+        for (path, raw) in [
+            ("ci/dag/portable.json", include_str!("../ci/dag/portable.json")),
+            ("ci/dag/privileged.json", include_str!("../ci/dag/privileged.json")),
+        ] {
+            let cfg: serde_json::Value =
+                serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{path}: {e}"));
+            let steps = cfg["steps"].as_array().cloned().unwrap_or_default();
+            for step in steps {
+                let tag = format!(
+                    "{}.{}",
+                    step["group"].as_str().unwrap_or("?"),
+                    step["job"].as_str().unwrap_or("?")
+                );
+                inspected += 1;
+                let cmd = step["cmd"].as_str().unwrap_or("");
+                let jobs_flag = step.get("jobs_flag").and_then(|v| v.as_str());
+                let jobs_env = step.get("jobs_env").and_then(|v| v.as_str());
+
+                if let Some(var) = jobs_env.filter(|v| !v.trim().is_empty()) {
+                    assert!(
+                        !cmd.contains(&format!("{var}=")),
+                        "{path} {tag}: declares the width channel `jobs_env = \"{var}\"` while \
+                         its own command sets `{var}=` inline. The inline assignment wins, so \
+                         the declared channel cannot move the width -- and a sweep would still \
+                         print a speedup table for it. Remove the inline assignment or drop \
+                         the declaration."
+                    );
+                    assert_eq!(
+                        jobs_flag.map(str::trim),
+                        Some(""),
+                        "{path} {tag}: declares `jobs_env` but does not set `jobs_flag = \"\"`. \
+                         The default flag template is appended as well, so the command receives \
+                         a `-j N` it did not ask for on top of the environment variable."
+                    );
+                }
+
+                if let Some(template) = jobs_flag.filter(|t| !t.trim().is_empty()) {
+                    // The literal option the template renders, before any number.
+                    let opt = template
+                        .split(|c: char| c == '%' || c == '=' || c.is_whitespace())
+                        .find(|piece| piece.starts_with('-'))
+                        .unwrap_or(template.trim());
+                    let baked = cmd
+                        .split_whitespace()
+                        .any(|word| word == opt || word.starts_with(&format!("{opt}=")));
+                    assert!(
+                        !baked,
+                        "{path} {tag}: declares the width channel `jobs_flag = \"{template}\"` \
+                         while its own command already passes `{opt}`. The sweep appends a \
+                         second one, so the width measured is not the width reported. Remove \
+                         the literal argument or drop the declaration."
+                    );
+                }
+            }
+        }
+        assert!(
+            inspected >= 60,
+            "expected to inspect every step in both lanes (68 at the time of writing); \
+             only {inspected} were seen, so this gate is not covering what it claims"
+        );
+    }
+}
+
+#[cfg(test)]
 mod nextest_timeout_tests {
     /// The per-test cap stays at 15s, and every exemption from it is named,
     /// measured, and justified IN PLACE.
