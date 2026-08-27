@@ -22,6 +22,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use hermit::HERMIT_VERIFICATION_DIVERGENCE_EXIT;
+use hermit::Verdict;
 
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 static WORKLOADS: OnceLock<Workloads> = OnceLock::new();
@@ -349,7 +350,12 @@ fn hermit_command(base_env: &str) -> Command {
     command
 }
 
-fn verify_guest_command(tmp: &Path, script: &str, extra_options: &[&str]) -> Command {
+fn verify_guest_command(
+    tmp: &Path,
+    report: &Path,
+    script: &str,
+    extra_options: &[&str],
+) -> Command {
     let guest = tmp.join("guest");
     fs::write(&guest, script).expect("failed to write verify guest");
     let mut permissions = fs::metadata(&guest)
@@ -361,6 +367,8 @@ fn verify_guest_command(tmp: &Path, script: &str, extra_options: &[&str]) -> Com
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command
         .args(["run", "--verify"])
+        .arg("--verify-json")
+        .arg(report)
         .args(extra_options)
         .args([
             "--base-env=minimal",
@@ -370,6 +378,26 @@ fn verify_guest_command(tmp: &Path, script: &str, extra_options: &[&str]) -> Com
         .arg(format!("--tmp={}", tmp.display()))
         .arg("/tmp/guest");
     command
+}
+
+fn read_verification_report(path: &Path) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(path).unwrap_or_else(|error| {
+        panic!(
+            "verification did not publish report {}: {error}",
+            path.display()
+        )
+    }))
+    .unwrap_or_else(|error| panic!("verification report was not valid JSON: {error}"))
+}
+
+fn verification_verdict(report: &serde_json::Value) -> Verdict {
+    serde_json::from_value(
+        report
+            .get("verdict")
+            .cloned()
+            .expect("verification report has no verdict field"),
+    )
+    .expect("verification report verdict is not a known Verdict")
 }
 
 fn remove_retained_verify_logs(stderr: &str) {
@@ -1006,28 +1034,33 @@ fn verify_rejects_explicit_log_levels_below_info() {
 fn verify_reports_stdout_divergence() {
     let _guard = hermit_run_lock();
     let tmp = tempfile::tempdir().expect("failed to create verify tmp directory");
+    let report = tempfile::NamedTempFile::new().expect("failed to create verification report");
     let mut command = verify_guest_command(
         tmp.path(),
+        report.path(),
         "#!/bin/sh\nif [ -e /tmp/state ]; then printf second; else printf first; fi\n: > /tmp/state\n",
         &[],
     );
 
     let output = command.output().expect("failed to run stdout verification");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "divergent verification unexpectedly exited successfully:\n{stderr}"
+    );
+    let report = read_verification_report(report.path());
+    assert_eq!(
+        verification_verdict(&report),
+        Verdict::Diverged,
+        "unexpected verification report: {report}"
+    );
     assert_eq!(
         output.status.code(),
         Some(HERMIT_VERIFICATION_DIVERGENCE_EXIT),
         "unexpected status:\n{stderr}"
     );
     assert!(!stderr.contains("HERMIT_INTERNAL_FAILURE"), "{stderr}");
-    assert!(
-        stderr.contains("Mismatch in stdout between run 1 and run 2"),
-        "missing stdout diagnostic:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("Failure: nondeterministic."),
-        "missing verification failure:\n{stderr}"
-    );
+    assert_eq!(report["guest_exit_code"], serde_json::json!(0));
     remove_retained_verify_logs(&stderr);
 }
 
@@ -1035,8 +1068,10 @@ fn verify_reports_stdout_divergence() {
 fn verify_reports_exit_status_divergence() {
     let _guard = hermit_run_lock();
     let tmp = tempfile::tempdir().expect("failed to create verify tmp directory");
+    let report = tempfile::NamedTempFile::new().expect("failed to create verification report");
     let mut command = verify_guest_command(
         tmp.path(),
+        report.path(),
         "#!/bin/sh\nif [ -e /tmp/state ]; then exit 17; fi\n: > /tmp/state\nexit 0\n",
         &["--verify-allow=both"],
     );
@@ -1045,41 +1080,61 @@ fn verify_reports_exit_status_divergence() {
         .output()
         .expect("failed to run exit-status verification");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "divergent verification unexpectedly exited successfully:\n{stderr}"
+    );
+    let report = read_verification_report(report.path());
+    assert_eq!(
+        verification_verdict(&report),
+        Verdict::Diverged,
+        "unexpected verification report: {report}"
+    );
     assert_eq!(
         output.status.code(),
         Some(HERMIT_VERIFICATION_DIVERGENCE_EXIT),
         "unexpected status:\n{stderr}"
     );
-    assert!(
-        stderr.contains("Mismatch in exit status between run 1 and run 2"),
-        "missing exit-status diagnostic:\n{stderr}"
-    );
+    assert_eq!(report["guest_exit_code"], serde_json::json!(17));
     remove_retained_verify_logs(&stderr);
 }
 
 #[test]
 fn verify_verbose_compares_the_full_trace() {
     let _guard = hermit_run_lock();
+    let report = tempfile::NamedTempFile::new().expect("failed to create verification report");
     let mut command = hermit_command("minimal");
-    command.args(["--verify", "--verify-verbose", "--", "/bin/true"]);
+    command
+        .args(["--verify", "--verify-verbose"])
+        .arg("--verify-json")
+        .arg(report.path())
+        .args(["--", "/bin/true"]);
 
     let output = command
         .output()
         .expect("failed to run verbose verification");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "divergent verification unexpectedly exited successfully:\n{stderr}"
+    );
+    let report = read_verification_report(report.path());
+    assert_eq!(
+        verification_verdict(&report),
+        Verdict::Diverged,
+        "unexpected verification report: {report}"
+    );
     assert_eq!(
         output.status.code(),
         Some(HERMIT_VERIFICATION_DIVERGENCE_EXIT),
         "unexpected status:\n{stderr}"
     );
-    assert!(
-        stderr.contains("Comparing full trace messages"),
-        "missing full-trace comparison:\n{stderr}"
+    assert_eq!(
+        report["comparison"]["log_scope"],
+        serde_json::json!("full_trace"),
+        "verbose verification did not report a full-trace comparison: {report}"
     );
-    assert!(
-        stderr.contains("Failure: nondeterministic."),
-        "missing verification failure:\n{stderr}"
-    );
+    assert_eq!(report["guest_exit_code"], serde_json::json!(0));
     remove_retained_verify_logs(&stderr);
 }
 
