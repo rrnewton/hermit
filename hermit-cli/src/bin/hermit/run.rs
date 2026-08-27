@@ -111,6 +111,17 @@ fn private_verify_summary() -> Result<tempfile::NamedTempFile, Error> {
         .context("creating private verification run summary")
 }
 
+fn take_verify_summary_before_next_run(path: &Path) -> Result<Option<RunSummary>, Error> {
+    let summary = read_verify_summary(path);
+    fs::write(path, b"").with_context(|| {
+        format!(
+            "resetting private verification run summary {} before run 2",
+            path.display()
+        )
+    })?;
+    Ok(summary)
+}
+
 fn extract_sabre_detlogs(path: &Path, stderr: &mut Vec<u8>) -> Result<usize, Error> {
     let mut log = OpenOptions::new().append(true).open(path)?;
     let mut guest_stderr = Vec::with_capacity(stderr.len());
@@ -3626,19 +3637,19 @@ impl RunOpts {
 
         // Verification historically sent both executions to one --summary-json
         // path, so run 2 overwrote run 1. Keep the public path's run-2 meaning,
-        // while capturing run 1 privately and capturing run 2 privately when no
-        // public summary was requested.
+        // while capturing run 1 privately. When no public path was requested,
+        // the same private file is emptied before run 2 and reused.
+        //
+        // The private file lives in the checkout because Hermit's isolated /tmp
+        // is not the host /tmp. It is consequently guest-visible. Leaving run
+        // 1's JSON in it while run 2 executes changes the guest's input: a guest
+        // that reads the file sees zero bytes in run 1 and a completed summary
+        // in run 2. Emptying it before run 2 preserves the initial contents.
         let summary1_file = private_verify_summary()?;
-        let summary2_file = self
-            .summary_json
-            .is_none()
-            .then(private_verify_summary)
-            .transpose()?;
         let summary2_path = self
             .summary_json
             .as_deref()
-            .or_else(|| summary2_file.as_ref().map(|file| file.path()))
-            .expect("a public or private second-run summary path");
+            .unwrap_or(summary1_file.path());
         let mut run1_options = self.clone();
         run1_options.summary_json = Some(summary1_file.path().to_owned());
         let mut run2_options = self.clone();
@@ -3729,6 +3740,8 @@ impl RunOpts {
             }
             return Err(Error::msg(format!("First run during --verify {status}")));
         }
+
+        let summary1 = take_verify_summary_before_next_run(summary1_file.path())?;
 
         // ⚠️ THE TWO RUNS MUST START FROM IDENTICAL fd STATE, AND WITHOUT THIS
         // THEY DO NOT. Both runs inherit hermit's OWN stderr, so a guest that
@@ -3830,7 +3843,6 @@ impl RunOpts {
             "Success: deterministic. Determinism verified."
         };
         let failure_message = "Failure: nondeterministic.";
-        let summary1 = read_verify_summary(summary1_file.path());
         let summary2 = read_verify_summary(summary2_path);
         let mut outcome = compare_two_runs(
             ComparedRun {
@@ -4298,6 +4310,31 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    #[test]
+    fn run_one_summary_is_empty_again_before_run_two() -> Result<(), Error> {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let summary = RunSummary {
+            sched_turns: 12,
+            virttime_elapsed: 34,
+            syscalls: Some(5),
+            ..Default::default()
+        };
+        fs::write(
+            file.path(),
+            serde_json::to_vec(&summary).expect("summary fixture serializes"),
+        )
+        .unwrap();
+
+        let captured = take_verify_summary_before_next_run(file.path())?
+            .expect("run one summary remains readable");
+        assert_eq!(captured.sched_turns, 12);
+        assert_eq!(captured.virttime_elapsed, 34);
+        assert_eq!(captured.syscalls, Some(5));
+        assert_eq!(fs::read(file.path()).unwrap(), b"");
+
+        Ok::<(), Error>(())
+    }
 
     #[test]
     fn exit_status_diagnostic_reports_guest_exit_code_and_signal() {
