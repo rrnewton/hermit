@@ -274,6 +274,12 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
   exhaustion, if it ever occurred, fails **loudly** (`perf_event_open` error or
   a `set_pinned(1)` panic), never as silent miscounting, so leaving PMU uncapped
   cannot corrupt results invisibly.
+  The canonical `ci-hub validate-run` launcher supplies one shared
+  `DAGRUN_RESOURCE_CAPS_PATH`, so these same counts cover overlapping top-level
+  validates rather than restarting at full capacity in each scheduler process.
+  A queued gate has not started: its wall and CPU bounds begin only after its
+  resource demand is granted. Direct developer invocations that do not supply
+  that path retain the process-local behavior.
 - `--max-mem SPEC` (or `-j N`) bounds total concurrency. With `--max-mem`, the
   runner picks the largest `-j` whose modeled worst-case footprint (summed
   `rss_baseline_bytes` of a schedulable set) fits the budget.
