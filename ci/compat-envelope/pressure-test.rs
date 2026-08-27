@@ -806,6 +806,15 @@ struct ManifestBudgetRow {
 struct ResultRow {
     schema: u64,
     run_id: String,
+    /// Which attempt of this cell the row describes.
+    ///
+    /// ⚠️ DEFAULTED, BECAUSE ABSENCE MEANS "WRITTEN BEFORE RETRIES APPENDED".
+    /// Rows produced before https://github.com/rrnewton/hermit/pull/2708 have no
+    /// ordinal and are single-attempt by construction, so they read as attempt 1
+    /// rather than as a missing value. That keeps "this predates the field" and
+    /// "this is the first attempt" from being the same thing anywhere downstream.
+    #[serde(default = "first_attempt")]
+    attempt: u64,
     hermit_sha: String,
     source_tree_dirty: bool,
     test: String,
@@ -1855,16 +1864,12 @@ fn emit_series(results: &Path) -> Result<(), String> {
         }
         let text = fs::read_to_string(&result_file)
             .map_err(|e| format!("cannot read {}: {e}", result_file.display()))?;
-        let lines: Vec<_> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-        if lines.len() != 1 {
+        let Some(row) = terminal_attempt_row(&result_file, &text)? else {
             return Err(format!(
-                "{} contains {} nonempty rows; expected exactly one",
-                result_file.display(),
-                lines.len()
+                "{} contains no nonempty rows",
+                result_file.display()
             ));
-        }
-        let row: ResultRow = serde_json::from_str(lines[0])
-            .map_err(|e| format!("invalid {}: {e}", result_file.display()))?;
+        };
         collected.push((entry.file_name().to_string_lossy().into_owned(), row));
     }
     if collected.is_empty() {
@@ -1962,6 +1967,47 @@ fn series_self_test() -> Result<(), String> {
     if series_run_index("a-cell-repetition-0004") != 4 {
         return Err("the repetition ordinal must come from the retained directory".into());
     }
+    // ⚠️ AN APPENDED RETRY MUST NOT VOID THE CELL. #2708 made the runner append a
+    // row per attempt; both readers here required exactly one and so discarded a
+    // retried cell entirely -- outcome, invocation and the divergence coordinates
+    // its verification report had already located. These brackets pin the three
+    // behaviours that replaced that refusal.
+    {
+        let path = Path::new("results.jsonl");
+        let one = r#"{"schema":4,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"FAIL","argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null}"#;
+        let two = r#"{"schema":4,"attempt":2,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"PASS","argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null}"#;
+        // A row with no ordinal is attempt 1, not a missing value.
+        let single = terminal_attempt_row(path, one)?.ok_or("one row must select")?;
+        if single.attempt != 1 || single.outcome != "FAIL" {
+            return Err("a row without an ordinal must read as attempt 1".into());
+        }
+        // Two attempts select the TERMINAL one, which is what the harness exit
+        // reports; taking the first would compare an earlier outcome to a later exit.
+        let retried = terminal_attempt_row(path, &format!("{one}\n{two}\n"))?
+            .ok_or("a retried cell must still select a row")?;
+        if retried.attempt != 2 || retried.outcome != "PASS" {
+            return Err("a retried cell must select the terminal attempt".into());
+        }
+        // Order in the file must not decide it.
+        let reversed = terminal_attempt_row(path, &format!("{two}\n{one}\n"))?
+            .ok_or("a retried cell must still select a row")?;
+        if reversed.attempt != 2 {
+            return Err("selection must be by ordinal, not by position in the file".into());
+        }
+        // A repeated ordinal is a malformed file, not a retry.
+        if terminal_attempt_row(path, &format!("{one}\n{one}\n")).is_ok() {
+            return Err("a repeated attempt ordinal must be refused".into());
+        }
+        // Rows from different cells are not one cell's log.
+        let other = one.replace("\"test\":\"t\"", "\"test\":\"other\"");
+        if terminal_attempt_row(path, &format!("{one}\n{other}\n")).is_ok() {
+            return Err("rows from more than one cell must be refused".into());
+        }
+        if terminal_attempt_row(path, "\n  \n")?.is_some() {
+            return Err("an empty file must select nothing".into());
+        }
+    }
+
     if series_run_index("a-cell-with-no-suffix") != 0 {
         return Err("a single-run campaign is a series of length one, ordinal 0".into());
     }
@@ -2008,6 +2054,7 @@ fn series_self_test() -> Result<(), String> {
         cells: Vec::new(),
     };
     let row = ResultRow {
+        attempt: 1,
         schema: 4,
         run_id: "campaign".into(),
         hermit_sha: metadata.hermit_sha.clone(),
@@ -3586,6 +3633,85 @@ fn runner_observed_terminal_attempt(runner: RunnerEvidence, harness_status: Opti
         })
 }
 
+fn first_attempt() -> u64 {
+    1
+}
+
+/// The TERMINAL attempt's row out of an appended per-cell `results.jsonl`.
+///
+/// ⚠️ THIS FILE STOPPED HAVING EXACTLY ONE ROW, AND BOTH READERS STILL REQUIRED
+/// ONE. https://github.com/rrnewton/hermit/pull/2708 made the runner APPEND a row
+/// per attempt -- "a retry is a second observation, so it receives the next
+/// positive ordinal instead of replacing the earlier row"
+/// (`ci/manifest-plan/src/runner.rs`). Both readers here refused any such file
+/// with "contains N nonempty rows; expected exactly one", so a cell that retried
+/// contributed NO evidence at all: not its outcome, not its invocation, and not
+/// the divergence coordinates its verification report had already located.
+/// Retries happen on flaky and failing cells, which is exactly the red population
+/// a first-divergence point has to come from.
+///
+/// WHY THE TERMINAL ATTEMPT AND NOT THE FIRST. The row has to agree with the
+/// harness exit status -- `result_row_matches_cell` checks `outcome` against it --
+/// and the harness exits once, on the last attempt. Picking the first attempt
+/// would compare an earlier outcome against a later exit and refuse every
+/// retried cell for a second, more confusing reason. This is also the attempt
+/// `runner_observed_terminal_attempt` reasons about, so the two agree.
+///
+/// ⚠️ WHAT THIS DOES NOT DO, said plainly because it is a real limit. The
+/// divergence coordinates reaching the scorecard come from the verification
+/// REPORT, not from these rows, and a cell whose first attempt diverged and whose
+/// retry passed still reports the terminal pass. Recording the earlier
+/// divergence is a separate change about what a flake is worth, and it is not
+/// made here.
+fn terminal_attempt_row(
+    result_file: &Path,
+    text: &str,
+) -> Result<Option<ResultRow>, String> {
+    let lines: Vec<&str> = text.lines().filter(|line| !line.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return Ok(None);
+    }
+    let mut rows: Vec<ResultRow> = Vec::with_capacity(lines.len());
+    for line in &lines {
+        rows.push(
+            serde_json::from_str(line)
+                .map_err(|e| format!("invalid {}: {e}", result_file.display()))?,
+        );
+    }
+    // Two rows claiming the same attempt are a malformed file, not a retry, and
+    // silently taking one of them would pick an arbitrary observation.
+    let mut ordinals: Vec<u64> = rows.iter().map(|row| row.attempt).collect();
+    ordinals.sort_unstable();
+    let distinct = {
+        let mut seen = ordinals.clone();
+        seen.dedup();
+        seen.len()
+    };
+    if distinct != ordinals.len() {
+        return Err(format!(
+            "{} contains {} rows but only {} distinct attempt ordinal(s); a retry must \
+             take the next ordinal rather than repeating one",
+            result_file.display(),
+            rows.len(),
+            distinct
+        ));
+    }
+    // Every row must describe the same cell, or the file is not one cell's log.
+    if let Some(first) = rows.first() {
+        for row in &rows {
+            if (&row.test, &row.mode, &row.backend, &row.run_id)
+                != (&first.test, &first.mode, &first.backend, &first.run_id)
+            {
+                return Err(format!(
+                    "{} mixes rows from more than one cell or run",
+                    result_file.display()
+                ));
+            }
+        }
+    }
+    Ok(rows.into_iter().max_by_key(|row| row.attempt))
+}
+
 fn result_row_matches_cell(
     row: &ResultRow,
     slug: &str,
@@ -4106,20 +4232,20 @@ fn summarize(
             let (outcome, row_valid, reason, error_kind, invocation) = if result_file.is_file() {
                 match fs::read_to_string(&result_file) {
                     Ok(text) => {
-                        let lines: Vec<_> = text
-                            .lines()
-                            .filter(|line| !line.trim().is_empty())
-                            .collect();
-                        if lines.len() != 1 {
-                            evidence_errors.push(format!(
-                                "{} contains {} nonempty rows; expected exactly one",
-                                result_file.display(),
-                                lines.len()
-                            ));
-                            ("NO_RESULT".to_string(), false, None, None, None)
-                        } else {
-                            match serde_json::from_str::<ResultRow>(lines[0]) {
-                                Ok(row) => {
+                        match terminal_attempt_row(&result_file, &text) {
+                            Err(error) => {
+                                evidence_errors.push(error);
+                                ("NO_RESULT".to_string(), false, None, None, None)
+                            }
+                            Ok(None) => {
+                                evidence_errors.push(format!(
+                                    "{} contains no nonempty rows",
+                                    result_file.display()
+                                ));
+                                ("NO_RESULT".to_string(), false, None, None, None)
+                            }
+                            Ok(Some(row)) => {
+                                {
                                     let row_matches = result_row_matches_cell(
                                         &row,
                                         &evidence_run_id,
@@ -4159,13 +4285,6 @@ fn summarize(
                                     ));
                                         ("NO_RESULT".to_string(), false, None, None, None)
                                     }
-                                }
-                                Err(error) => {
-                                    evidence_errors.push(format!(
-                                        "invalid result row {}: {error}",
-                                        result_file.display()
-                                    ));
-                                    ("NO_RESULT".to_string(), false, None, None, None)
                                 }
                             }
                         }
@@ -6532,6 +6651,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         cells: vec![sample_a.clone()],
     };
     let mut result_row = ResultRow {
+        attempt: 1,
         schema: CELL_RESULT_SCHEMA,
         run_id: sample_slug.clone(),
         hermit_sha: sample_metadata.hermit_sha.clone(),
@@ -6614,6 +6734,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     let first_repetition_slug = cell_run_slug(&green_id, Some(1));
     let second_repetition_slug = cell_run_slug(&green_id, Some(2));
     let repeated_result_row = ResultRow {
+        attempt: 1,
         schema: CELL_RESULT_SCHEMA,
         run_id: first_repetition_slug.clone(),
         hermit_sha: repeated_metadata.hermit_sha.clone(),
