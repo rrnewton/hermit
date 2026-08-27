@@ -49,6 +49,7 @@ use reverie::syscalls::Sysno;
 use serde::Deserialize;
 use serde::Serialize;
 use tracing::debug;
+use tracing::error;
 use tracing::info;
 use tracing::trace;
 use tracing::warn;
@@ -704,7 +705,7 @@ impl GlobalTool for GlobalState {
 
             let is_thread_reconnect = matches!(
                 &request,
-                GlobalRequest::StartNewThread(child_dettid, _) if *child_dettid == dtid
+                GlobalRequest::StartNewThread(child_dettid, ..) if *child_dettid == dtid
             ) && self.global_time.lock().unwrap().contains_thread(dtid);
 
             // This portion of the time updates "asynchronously", and we can tick it on every rpc:
@@ -907,9 +908,9 @@ impl GlobalTool for GlobalState {
                 SchedulerRpcResult::ThreadExited => R::ThreadExited,
             },
             // Requested by the child thread itself:
-            GlobalRequest::StartNewThread(dettid, detpid) => {
+            GlobalRequest::StartNewThread(dettid, detpid, physical_ids) => {
                 match self
-                    .recv_start_new_thread(from, dettid, detpid, request_mm)
+                    .recv_start_new_thread(from, dettid, detpid, request_mm, physical_ids)
                     .await
                 {
                     SchedulerRpcResult::Continue(history) => R::StartNewThread(history),
@@ -1437,6 +1438,7 @@ impl GlobalState {
         dettid: DetTid,
         detpid: DetPid,
         request_mm: MmId,
+        physical_ids: Option<(i32, i32)>,
     ) -> SchedulerRpcResult<Option<ThreadHistory>> {
         let mut tries: u64 = 0;
         // TODO: eliminate this loop. Could instead signal with an ivar.
@@ -1446,6 +1448,14 @@ impl GlobalState {
             if sched.thread_is_logically_killed(dettid)
                 || !sched.rpc_incarnation_matches(dettid, request_mm)
             {
+                return SchedulerRpcResult::ThreadExited;
+            }
+            if self.cfg.backend_requires_thread_directed_process_signals && physical_ids.is_none() {
+                error!(
+                    "[detcore, dtid {}] backend requires a host thread ID at StartNewThread",
+                    dettid,
+                );
+                sched.logically_kill_thread(&dettid, &detpid, request_mm);
                 return SchedulerRpcResult::ThreadExited;
             }
             // The resources that must be held for the fresh thread to run:
@@ -1483,6 +1493,17 @@ impl GlobalState {
                     entry.get().clone()
                 }
             };
+            if let Some((physical_pid, physical_tid)) = physical_ids
+                && let Err(open_error) =
+                    sched.register_physical_thread(dettid, request_mm, physical_pid, physical_tid)
+            {
+                error!(
+                    "[detcore, dtid {}] cannot bind host process {} thread {} for exact signal delivery: {}",
+                    dettid, physical_pid, physical_tid, open_error,
+                );
+                sched.logically_kill_thread(&dettid, &detpid, request_mm);
+                return SchedulerRpcResult::ThreadExited;
+            }
             sched.request_put(&nextturn.req, rsrcs, &self.global_time);
             break nextturn.resp;
         };
@@ -2012,7 +2033,7 @@ pub enum GlobalRequest {
 
     /// New thread is alive and waiting to run its first instruction.  Contains the dettid
     /// and detpid of the new child.
-    StartNewThread(DetTid, DetPid),
+    StartNewThread(DetTid, DetPid, Option<(i32, i32)>),
 
     /// Remove a thread from scheduler data structures, guaranteeing that it will
     /// consume no further turns. Carries its final timeslice distribution and any
@@ -2176,6 +2197,11 @@ pub fn format_unsupported_syscall_warning(syscalls: &BTreeSet<String>) -> Option
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe exec descriptor-status handoff.
+/// Notifies the coordinator that `guest` is about to `execve`, recording the
+/// pre-exec address space `mm` and any file-descriptor blocking overrides. A
+/// backend that handles `execve` outside Detcore's syscall handler must call
+/// this before the native syscall so the next image reconnects to the existing
+/// scheduler identity and logical clock.
 pub async fn prepare_exec<G, T>(guest: &mut G, mm: MmId, fd_blocking: ExecFdBlockingOverrides)
 where
     G: Guest<Detcore<T>>,
@@ -2349,7 +2375,15 @@ where
     let dettid = guest.thread_state().dettid;
     if cfg.sequentialize_threads {
         trace!("[detcore, dtid {}] new thread BLOCKING on rpc...", &dettid);
-        let resp = send_and_update_time(guest, GlobalRequest::StartNewThread(dettid, detpid)).await;
+        let physical_ids = guest
+            .thread_state()
+            .physical_tid
+            .map(|tid| (guest.pid().as_raw(), tid));
+        let resp = send_and_update_time(
+            guest,
+            GlobalRequest::StartNewThread(dettid, detpid, physical_ids),
+        )
+        .await;
         match resp.1 {
             GlobalResponse::StartNewThread(preempts) => {
                 trace!("[detcore, dtid {}] new thread UNBLOCKED (post-rpc)", dettid);
@@ -3255,7 +3289,7 @@ mod tests {
                 (
                     fresh_local_time,
                     old_mm.for_exec(detpid),
-                    GlobalRequest::StartNewThread(dettid, detpid),
+                    GlobalRequest::StartNewThread(dettid, detpid, None),
                 ),
             )
             .await;
@@ -3460,7 +3494,7 @@ mod tests {
                 (
                     fresh_local_time,
                     old_mm.for_exec(detpid),
-                    GlobalRequest::StartNewThread(leader, detpid),
+                    GlobalRequest::StartNewThread(leader, detpid, None),
                 ),
             )
             .await;
@@ -4061,7 +4095,7 @@ mod tests {
             (
                 DetTime::new(&config),
                 MmId::initial(dettid),
-                GlobalRequest::StartNewThread(dettid, detpid),
+                GlobalRequest::StartNewThread(dettid, detpid, None),
             ),
         );
         let kill_after_request = async {
@@ -4078,6 +4112,41 @@ mod tests {
         let (response, ()) = tokio::join!(request, kill_after_request);
         assert_eq!(response, (None, GlobalResponse::ThreadExited));
         assert!(!state.sched.lock().unwrap().priorities.contains_key(&dettid));
+    }
+
+    #[tokio::test]
+    async fn required_physical_thread_id_missing_is_terminal() {
+        let config = Config {
+            sequentialize_threads: true,
+            cancel_killed_thread_rpcs: true,
+            backend_requires_thread_directed_process_signals: true,
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let dettid = DetTid::from_raw(17);
+        let detpid = DetPid::from_raw(17);
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .add_child(dettid, dettid, true);
+        install_test_registration(&state, dettid, Ivar::new());
+
+        let response = state
+            .receive_rpc(
+                reverie::Tid::from_raw(dettid.as_raw()),
+                (
+                    DetTime::new(&config),
+                    MmId::initial(detpid),
+                    GlobalRequest::StartNewThread(dettid, detpid, None),
+                ),
+            )
+            .await;
+
+        assert_eq!(response, (None, GlobalResponse::ThreadExited));
+        let scheduler = state.sched.lock().unwrap();
+        assert!(!scheduler.next_turns.contains_key(&dettid));
     }
 
     #[tokio::test]

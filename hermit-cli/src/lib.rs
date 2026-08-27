@@ -1920,8 +1920,8 @@ async fn run_kvm(
 
 // TODO-HUMAN-REVIEW(PR-743): Review bounded relaunch before DBT guest execution.
 #[cfg(feature = "dbt")]
-fn dbt_client_thread_start_failed(status: &std::process::ExitStatus) -> bool {
-    status.code() == Some(reverie_dbt::CLIENT_THREAD_START_FAILURE_EXIT_CODE)
+fn dbt_coordinator_connect_failed(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::ConnectionAborted
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1972,44 +1972,70 @@ async fn run_dbt(
         "launching guest through reverie-dbt with Detcore<DbtGuest>",
     );
 
-    if capture_output {
+    let (status, stdout, stderr, global) = if capture_output {
         let launch = || {
-            runner
-                .output_with_environment(&guest, &environment)
-                .map_err(|error| anyhow!("failed to launch drrun ({}): {error}", drrun.display()))
+            runner.output_with_environment_and_global::<detcore::GlobalState>(
+                &guest,
+                &environment,
+                config.clone(),
+            )
         };
-        let mut output = launch()?;
-        if dbt_client_thread_start_failed(&output.status) {
-            tracing::warn!(
-                target: "hermit::dbt",
-                "DynamoRIO client thread failed before guest start; retrying once",
-            );
-            output = launch()?;
-        }
-        return Ok(Output {
-            status: output.status.into(),
-            stdout: output.stdout,
-            stderr: output.stderr,
-        });
-    }
-
-    let launch = || {
-        runner
-            .status_with_environment(&guest, &environment)
-            .map_err(|error| anyhow!("failed to launch drrun ({}): {error}", drrun.display()))
+        let (output, global) = match launch().await {
+            Ok(output) => output,
+            Err(error) if dbt_coordinator_connect_failed(&error) => {
+                tracing::warn!(
+                    target: "hermit::dbt",
+                    "DynamoRIO client exited before connecting to the coordinator; retrying once",
+                );
+                launch().await.map_err(|error| {
+                    anyhow!("failed to launch drrun ({}): {error}", drrun.display())
+                })?
+            }
+            Err(error) => {
+                return Err(anyhow!(
+                    "failed to launch drrun ({}): {error}",
+                    drrun.display()
+                ));
+            }
+        };
+        (output.status, output.stdout, output.stderr, global)
+    } else {
+        let launch = || {
+            runner.status_with_environment_and_global::<detcore::GlobalState>(
+                &guest,
+                &environment,
+                config.clone(),
+            )
+        };
+        let (status, global) = match launch().await {
+            Ok(output) => output,
+            Err(error) if dbt_coordinator_connect_failed(&error) => {
+                tracing::warn!(
+                    target: "hermit::dbt",
+                    "DynamoRIO client exited before connecting to the coordinator; retrying once",
+                );
+                launch().await.map_err(|error| {
+                    anyhow!("failed to launch drrun ({}): {error}", drrun.display())
+                })?
+            }
+            Err(error) => {
+                return Err(anyhow!(
+                    "failed to launch drrun ({}): {error}",
+                    drrun.display()
+                ));
+            }
+        };
+        (status, Vec::new(), Vec::new(), global)
     };
-    let mut status = launch()?;
-    if dbt_client_thread_start_failed(&status) {
-        tracing::warn!(
-            target: "hermit::dbt",
-            "DynamoRIO client thread failed before guest start; retrying once",
-        );
-        status = launch()?;
+
+    if !status.success() {
+        global.force_shutdown_with_error();
     }
+    global.clean_up(print_summary, &None).await;
     Ok(Output {
         status: status.into(),
-        stdout: Vec::new(),
-        stderr: Vec::new(),
+        stdout,
+        stderr,
     })
 }
 
@@ -3761,16 +3787,11 @@ mod tests {
 
     #[test]
     #[cfg(feature = "dbt")]
-    fn dbt_retries_only_the_pre_guest_bootstrap_failure() {
-        use std::os::unix::process::ExitStatusExt as _;
-
-        let failure = std::process::ExitStatus::from_raw(
-            reverie_dbt::CLIENT_THREAD_START_FAILURE_EXIT_CODE << 8,
-        );
-        assert!(super::dbt_client_thread_start_failed(&failure));
-        assert!(!super::dbt_client_thread_start_failed(
-            &std::process::ExitStatus::from_raw(1 << 8)
-        ));
+    fn dbt_retries_only_a_pre_guest_coordinator_failure() {
+        let failure = std::io::Error::from(std::io::ErrorKind::ConnectionAborted);
+        assert!(super::dbt_coordinator_connect_failed(&failure));
+        let guest_error = std::io::Error::from(std::io::ErrorKind::InvalidData);
+        assert!(!super::dbt_coordinator_connect_failed(&guest_error));
     }
 
     #[test]
