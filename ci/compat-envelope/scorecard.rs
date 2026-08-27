@@ -452,8 +452,8 @@ struct CanonicalComparison {
     run_id: String,
     evidence_sha256: String,
     result: ObservedResult,
-    left_info_messages: u64,
-    right_info_messages: u64,
+    left_info_messages: BTreeSet<u64>,
+    right_info_messages: BTreeSet<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -1080,7 +1080,7 @@ impl ResultRow {
     /// whether it matched or diverged. A FAIL is useful evidence only when the
     /// strict comparison actually ran; a red produced by a weaker comparison
     /// would lower the standard just as surely as admitting its green.
-    fn bitwise_info_comparison(&self) -> Result<(u64, u64), String> {
+    fn bitwise_info_comparison(&self) -> Result<(BTreeSet<u64>, BTreeSet<u64>), String> {
         self.require_provenance()?;
         if !matches!(self.mode.as_str(), "verify" | "replay" | "chaos") {
             return Err(format!(
@@ -1094,13 +1094,8 @@ impl ResultRow {
                 self.outcome
             ));
         }
-        if self.attempts.len() != 1 {
-            return Err(format!(
-                "result row contains {} attempt receipts; expected exactly one",
-                self.attempts.len()
-            ));
-        }
-        let mut compared = None;
+        let mut left_counts = BTreeSet::new();
+        let mut right_counts = BTreeSet::new();
         for (index, attempt) in self.attempts.iter().enumerate() {
             let report_text = attempt
                 .get("verification_report")
@@ -1200,9 +1195,14 @@ impl ResultRow {
                 }
                 _ => unreachable!("outcome checked above"),
             }
-            compared = Some((left, right));
+            left_counts.insert(left);
+            right_counts.insert(right);
         }
-        compared.ok_or_else(|| "result row contains no comparison attempt".into())
+        if left_counts.is_empty() {
+            Err("result row contains no comparison attempt".into())
+        } else {
+            Ok((left_counts, right_counts))
+        }
     }
 }
 
