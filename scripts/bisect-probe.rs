@@ -139,10 +139,15 @@ impl Verdict {
 /// reported PASS while one of its cells went unobserved is the exact failure this
 /// driver exists to prevent. `Error` outranks `Fail` for the same reason: an
 /// infrastructure error is "I could not measure", not "the product is broken", and
-/// a bisect that reads it as a reproduction converges on the wrong commit.
+/// a bisect that reads it as a reproduction converges on the wrong commit. More
+/// rows than the plan promised are also `Error`: an append-mode results file can
+/// otherwise carry an old PASS into the current probe.
 fn fold(expected: usize, outcomes: &[String]) -> Verdict {
     if expected == 0 {
         return Verdict::Unselected;
+    }
+    if outcomes.len() > expected {
+        return Verdict::Error;
     }
     if outcomes.len() < expected {
         return Verdict::Missing;
@@ -485,6 +490,22 @@ fn enumerate(root: &Path, harness: &Path, lane: &str, ids: &BTreeSet<String>) ->
     Plan { counts, category_of, category_size }
 }
 
+/// Remove the previous result before asking `test-harness` to append new rows.
+///
+/// An absent file is the expected first-run case. Every other error must refuse
+/// the run: continuing would let an append-mode harness leave old rows in place,
+/// and those rows could be reported as the result of the current selection.
+fn clear_results_file(results: &Path) -> Result<(), String> {
+    match std::fs::remove_file(results) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "cannot clear previous results file {}: {error}",
+            results.display()
+        )),
+    }
+}
+
 /// Run ONE `test-harness` selection and return per-id cell outcomes, attributed by
 /// each row's own `test` field.
 ///
@@ -512,7 +533,15 @@ fn run_selection(
         tag,
         select_value.replace('/', "-")
     ));
-    let _ = std::fs::remove_file(&results);
+    if let Err(error) = clear_results_file(&results) {
+        eprintln!("bisect-probe: REFUSED: {error}; test-harness was not run");
+        for id in interested {
+            if let Some(v) = outcomes.get_mut(id) {
+                v.push("ERROR".to_string());
+            }
+        }
+        return outcomes;
+    }
     let status = Command::new(harness)
         .current_dir(root)
         .args(["run", "--lane", lane, select_flag, select_value, "--prebuilt", "--jobs", jobs])
@@ -1129,34 +1158,46 @@ fn main() {
     let mut outcomes: BTreeMap<String, Vec<String>> = ids.iter().map(|i| (i.clone(), vec![])).collect();
     for id in &ids {
         let results = root.join(format!("target/bisect-probe-{}.jsonl", id.replace('/', "-")));
-        let _ = std::fs::remove_file(&results);
-        let status = Command::new(&harness)
-            .current_dir(&root)
-            .args(["run", "--lane", &lane, "--test", id, "--prebuilt", "--jobs", &jobs])
-            .arg("--results")
-            .arg(&results)
-            // The child's own PASS/FAIL chatter would interleave with this driver's
-            // one-line-per-id report and make the probe harder to read, not easier.
-            // The rows are the record; they are read back from --results below.
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        if status.is_err() {
+        let cleared = match clear_results_file(&results) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("bisect-probe: REFUSED: {error}; test-harness was not run");
+                false
+            }
+        };
+        if !cleared {
             if let Some(v) = outcomes.get_mut(id) {
                 v.push("ERROR".to_string());
             }
-            continue;
-        }
-        // ⚠️ READ THE ROWS, NOT THE EXIT CODE. `run` exits non-zero for a failed cell
-        // AND for a harness error, and the per-row `outcome` is the only thing that
-        // separates them. An unreadable results file leaves the vector short, which
-        // folds to MISSING rather than to PASS.
-        if let Ok(text) = std::fs::read_to_string(&results) {
-            for line in text.lines().filter(|l| !l.trim().is_empty()) {
-                if let Ok(row) = serde_json::from_str::<serde_json::Value>(line) {
-                    if let Some(o) = row.get("outcome").and_then(|o| o.as_str()) {
-                        if let Some(v) = outcomes.get_mut(id) {
-                            v.push(o.to_string());
+        } else {
+            let status = Command::new(&harness)
+                .current_dir(&root)
+                .args(["run", "--lane", &lane, "--test", id, "--prebuilt", "--jobs", &jobs])
+                .arg("--results")
+                .arg(&results)
+                // The child's own PASS/FAIL chatter would interleave with this driver's
+                // one-line-per-id report and make the probe harder to read, not easier.
+                // The rows are the record; they are read back from --results below.
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            if status.is_err() {
+                if let Some(v) = outcomes.get_mut(id) {
+                    v.push("ERROR".to_string());
+                }
+            } else {
+                // ⚠️ READ THE ROWS, NOT THE EXIT CODE. `run` exits non-zero for a failed cell
+                // AND for a harness error, and the per-row `outcome` is the only thing that
+                // separates them. An unreadable results file leaves the vector short, which
+                // folds to MISSING rather than to PASS.
+                if let Ok(text) = std::fs::read_to_string(&results) {
+                    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                        if let Ok(row) = serde_json::from_str::<serde_json::Value>(line) {
+                            if let Some(o) = row.get("outcome").and_then(|o| o.as_str()) {
+                                if let Some(v) = outcomes.get_mut(id) {
+                                    v.push(o.to_string());
+                                }
+                            }
                         }
                     }
                 }
@@ -1214,6 +1255,11 @@ fn self_test() -> i32 {
     // A cell that plan promised and the run never reported is MISSING, not PASS.
     if fold(2, &pass()) != Verdict::Missing {
         bad.push("a short row set must be MISSING, not a pass".into());
+    }
+    // More rows than the plan promised can be old append-mode results. They do
+    // not establish what the current run did and must not become PASS.
+    if fold(1, &["PASS".into(), "PASS".into()]) != Verdict::Error {
+        bad.push("more result rows than planned must be ERROR, not a pass".into());
     }
     // Precedence: cannot-measure outranks measured-and-broken.
     if fold(2, &["ERROR".into(), "FAIL".into()]) != Verdict::Error {
@@ -1479,7 +1525,8 @@ fn self_test() -> i32 {
     println!(
         "PASS: bisect-probe folds per-cell outcomes into one verdict per REQUESTED id, \
          reports an unmatched id as UNSELECTED rather than a pass, keeps \
-         not-measured (rc=3) distinct from failed (rc=1), separates a standalone \
+         stale result rows from becoming a pass, keeps not-measured (rc=3) \
+         distinct from failed (rc=1), separates a standalone \
          reproduction from a suite-only one, refuses unmeasured bisection midpoints, \
          uses each checked-out commit's plan, and localises exactly the ids that fail \
          at a bisection boundary"
@@ -1842,6 +1889,87 @@ esac
             "/repo/.git/worktrees/review",
             "/repo/.git"
         ));
+    }
+
+    #[test]
+    fn an_uncleared_prior_result_cannot_produce_a_verdict() {
+        let fixture = GitFixture::new("uncleared-result");
+        let target = fixture.root.join("target");
+        fs::create_dir_all(fixture.harness.parent().expect("harness parent"))
+            .expect("create fixture target directory");
+        fs::write(
+            &fixture.harness,
+            r#"#!/bin/sh
+set -eu
+results=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--results" ]; then
+    shift
+    results=$1
+    break
+  fi
+  shift
+done
+test -n "$results"
+printf '%s\n' ran > harness-ran
+printf '%s\n' '{"test":"a","outcome":"PASS"}' >> "$results"
+"#,
+        )
+        .expect("write append-only fixture harness");
+        let mut harness_permissions = fs::metadata(&fixture.harness)
+            .expect("read fixture harness metadata")
+            .permissions();
+        harness_permissions.set_mode(0o755);
+        fs::set_permissions(&fixture.harness, harness_permissions)
+            .expect("make fixture harness executable");
+
+        let results = target.join("bisect-probe-stale-a.jsonl");
+        let prior = "{\"test\":\"a\",\"outcome\":\"PASS\"}\n";
+        fs::write(&results, prior).expect("write prior PASS result");
+        let mut target_permissions = fs::metadata(&target)
+            .expect("read target directory metadata")
+            .permissions();
+        target_permissions.set_mode(0o555);
+        fs::set_permissions(&target, target_permissions)
+            .expect("make prior result impossible to remove");
+
+        let outcomes = run_selection(
+            &fixture.root,
+            &fixture.harness,
+            "portable",
+            "1",
+            "--test",
+            "a",
+            &ids(&["a"]),
+            "stale",
+        );
+
+        let mut target_permissions = fs::metadata(&target)
+            .expect("read protected target directory metadata")
+            .permissions();
+        target_permissions.set_mode(0o755);
+        fs::set_permissions(&target, target_permissions)
+            .expect("restore target directory permissions");
+
+        let (_, verdict, _, _) = report_row(
+            "a",
+            &BTreeMap::from([("a".to_string(), 1usize)]),
+            &outcomes,
+        );
+        assert_eq!(
+            verdict,
+            Verdict::Error,
+            "an uncleared prior PASS must not become the current selection's verdict"
+        );
+        assert!(
+            !fixture.root.join("harness-ran").exists(),
+            "test-harness must not run while an old result file remains"
+        );
+        assert_eq!(
+            fs::read_to_string(&results).expect("read unchanged prior result"),
+            prior,
+            "the append-only harness must not run after cleanup fails"
+        );
     }
 
     #[test]
