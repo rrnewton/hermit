@@ -1,25 +1,22 @@
 #!/usr/bin/env bash
-# Enforce the post-facto-human-review core-change review protocol on one PR.
+# Enforce the core-change review protocol on one pull request.
 #
 # Background: after PR #1095 landed a core change without the required dual
 # adversarial review, the review protocol lived only in agent skills that a
 # forgetful actor could bypass. This script is the "code that never forgets"
 # version: a preland/merge-gate lint that BLOCKS landing when a PR carries the
-# `post-facto-human-review` label but has not actually been reviewed and
-# approved, or is missing a required PR-body section.
+# contract's post-facto label but has not actually been reviewed and approved,
+# or is missing a required PR-body section.
 #
-# A PR labeled `post-facto-human-review` may only land when ALL hold:
-#   (a) adversarial review happened for BOTH reviewers: at least one
-#       `adversarial-review-codex<N>` AND at least one
-#       `adversarial-review-claude<N>` label, for a round N in 1..4;
-#   (b) the LATEST reviews approved: `passed-review-codex` AND
-#       `passed-review-claude` (these are invalidated on every new push, so
-#       their presence means the current revision is approved);
+# A PR carrying that label may only land when ALL hold:
+#   (a) every review family in the shared contract has a numbered activity label;
+#   (b) every family has its approval label (these are invalidated on every new
+#       push, so their presence means the current revision is approved);
 #   (c) the PR body contains the required sections: Summary, Determinism,
 #       Linux Semantics, Validation, Human Review Required, and — when the PR
 #       touches KVM — Relationship to gVisor.
 #
-# A PR WITHOUT the `post-facto-human-review` label passes unconditionally; this
+# A PR without the contract's post-facto label passes unconditionally; this
 # lint never second-guesses whether the label should have been applied.
 #
 # Inputs (environment variables):
@@ -29,11 +26,47 @@
 #   PR_NUMBER  PR number, used only in diagnostics (default: "unknown")
 #
 # Exit status:
-#   0  protocol satisfied, or the PR is not labeled post-facto-human-review
+#   0  protocol satisfied, or the PR does not carry the post-facto label
 #   1  the PR is labeled but violates the protocol (landing must be blocked)
 #   2  usage / internal error
 
 set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+readonly REVIEW_CONTRACT_ADAPTER="$SCRIPT_DIR/review_contract_adapter.py"
+
+if ! contract_output=$(python3 "$REVIEW_CONTRACT_ADAPTER" --format lint-records); then
+    echo "::error::PR #${PR_NUMBER:-unknown}: cannot load the accepted review labels; refusing to guess." >&2
+    exit 2
+fi
+
+post_facto_label=
+declare -a review_families=()
+declare -A approval_labels=()
+declare -A round_labels_csv=()
+while IFS=$'\t' read -r first second third extra; do
+    if [ "$first" = post-facto ]; then
+        if [ -n "$post_facto_label" ] || [ -z "$second" ] || [ -n "$third" ] || [ -n "$extra" ]; then
+            echo "::error::PR #${PR_NUMBER:-unknown}: malformed post-facto review-label contract record." >&2
+            exit 2
+        fi
+        post_facto_label=$second
+    else
+        if [ -z "$first" ] || [ -z "$second" ] || [ -z "$third" ] || [ -n "$extra" ] \
+            || [ -n "${approval_labels[$first]+set}" ]; then
+            echo "::error::PR #${PR_NUMBER:-unknown}: malformed review-family contract record." >&2
+            exit 2
+        fi
+        review_families+=("$first")
+        approval_labels[$first]=$second
+        round_labels_csv[$first]=$third
+    fi
+done <<<"$contract_output"
+
+if [ -z "$post_facto_label" ] || [ "${#review_families[@]}" -eq 0 ]; then
+    echo "::error::PR #${PR_NUMBER:-unknown}: review-label contract is incomplete." >&2
+    exit 2
+fi
 
 pr="${PR_NUMBER:-unknown}"
 is_kvm="${PR_IS_KVM:-false}"
@@ -59,17 +92,26 @@ if [ -z "${PR_LABELS+set}" ]; then
 fi
 labels="$PR_LABELS"
 
-# The valid adversarial-review round labels, per reviewer (rounds 1..4).
-readonly REVIEW_ROUND_RANGE='[1-4]'
-
 # True when an exact label name is present (full-line match).
 has_label() {
     printf '%s\n' "$labels" | grep -Fxq -- "$1"
 }
 
-# True when any label matches the given extended regex, anchored to a full line.
-has_label_matching() {
-    printf '%s\n' "$labels" | grep -Eq -- "^($1)\$"
+# True when one of the contract's exact numbered labels is present.
+has_round_label() {
+    local family=$1 round_label
+    local -a accepted=()
+    IFS=, read -r -a accepted <<<"${round_labels_csv[$family]}"
+    for round_label in "${accepted[@]}"; do
+        has_label "$round_label" && return 0
+    done
+    return 1
+}
+
+# Spell the exact accepted alternatives from the shared contract.
+round_label_alternatives() {
+    local family=$1
+    printf '%s' "${round_labels_csv[$family]//,/, }"
 }
 
 # True when the body contains SECTION as a heading. Accepts a Markdown ATX
@@ -83,7 +125,7 @@ has_section() {
         "^[[:space:]]*(#{1,6}[[:space:]]*${section}|\*\*[[:space:]]*${section}|${section}[[:space:]]*:)"
 }
 
-if ! has_label post-facto-human-review; then
+if ! has_label "$post_facto_label"; then
     # Report the genuinely-empty case distinctly from "has labels, but not this
     # one". Both are correct passes, and a reader who cannot tell them apart
     # cannot tell a real not-applicable from a lost label set.
@@ -91,7 +133,7 @@ if ! has_label post-facto-human-review; then
         echo "PR #${pr}: the PR has NO labels at all (empty set, supplied); \
 core-review protocol not applicable."
     else
-        echo "PR #${pr}: no post-facto-human-review label; core-review protocol not applicable."
+        echo "PR #${pr}: no ${post_facto_label} label; core-review protocol not applicable."
     fi
     exit 0
 fi
@@ -102,14 +144,14 @@ fi
 # empty is a PR with no description (which then legitimately fails (c) below).
 if [ -z "${PR_BODY+set}" ]; then
     echo "::error::PR #${pr}: PR_BODY is not set, and this PR is labeled" >&2
-    echo "  post-facto-human-review, so the required-section checks below cannot run." >&2
+    echo "  ${post_facto_label}, so the required-section checks below cannot run." >&2
     echo "  Refusing rather than reporting five phantom 'missing section' errors for a" >&2
     echo "  body that was never supplied. Pass an EMPTY string for a PR with no body." >&2
     exit 2
 fi
 body="$PR_BODY"
 
-echo "PR #${pr}: post-facto-human-review present; enforcing the core-change review protocol."
+echo "PR #${pr}: ${post_facto_label} present; enforcing the core-change review protocol."
 
 errors=0
 fail() {
@@ -117,7 +159,7 @@ fail() {
     errors=$((errors + 1))
 }
 
-# (a) Adversarial review happened for both reviewers (any round 1..4).
+# (a) Adversarial review happened for every family (any accepted round).
 #
 # STATE THE OBSERVATION, NOT A CAUSE THIS GATE CANNOT SEE. A label is a cache,
 # not the event: this script reads label names and has no view of reviews,
@@ -126,8 +168,8 @@ fail() {
 # supplied set" is the OBSERVATION, and only the second is established here.
 #
 # The distinction is not pedantry. An absent approval label has more than one
-# cause, and the routine one is not misconduct: the invalidator strips
-# passed-review-* when a new commit lands, so "approved, then the PR moved" and
+# cause, and the routine one is not misconduct: the invalidator strips approval
+# labels when a new commit lands, so "approved, then the PR moved" and
 # "never approved" look identical from here. Naming only the second sends the
 # author to argue with a reviewer instead of re-requesting review after a push.
 #
@@ -136,30 +178,32 @@ fail() {
 # unconditional list of candidates would be the same defect wearing humility.
 missing_approval() {
     local reviewer=$1
-    if has_label_matching "adversarial-review-${reviewer}${REVIEW_ROUND_RANGE}"; then
-        fail "passed-review-${reviewer} is absent from the supplied labels, but \
-adversarial-review-${reviewer}[1-4] is present. Review ran; the approval label is not here. \
+    local approval_label=${approval_labels[$reviewer]}
+    local alternatives
+    alternatives=$(round_label_alternatives "$reviewer")
+    if has_round_label "$reviewer"; then
+        fail "${approval_label} is absent from the supplied labels, but one of \
+${alternatives} is present. Review ran; the approval label is not here. \
 Either ${reviewer} has not approved, or it approved an earlier revision and a later push \
 invalidated the label -- re-request review at the current head."
     else
-        fail "passed-review-${reviewer} is absent from the supplied labels, and so is \
-adversarial-review-${reviewer}[1-4]: no round label for ${reviewer} is present at all. \
+        fail "${approval_label} is absent from the supplied labels, and none of \
+${alternatives} is present: no round label for ${reviewer} is present at all. \
 No ${reviewer} review is recorded on this PR."
     fi
 }
 
-if ! has_label_matching "adversarial-review-codex${REVIEW_ROUND_RANGE}"; then
-    fail "no adversarial-review-codex[1-4] label is present in the supplied labels \
-(need one of adversarial-review-codex1..4)."
-fi
-if ! has_label_matching "adversarial-review-claude${REVIEW_ROUND_RANGE}"; then
-    fail "no adversarial-review-claude[1-4] label is present in the supplied labels \
-(need one of adversarial-review-claude1..4)."
-fi
+for reviewer in "${review_families[@]}"; do
+    if ! has_round_label "$reviewer"; then
+        fail "no accepted ${reviewer} round label is present in the supplied labels \
+(need one of $(round_label_alternatives "$reviewer"))."
+    fi
+done
 
 # (b) The latest reviews approved.
-has_label passed-review-codex || missing_approval codex
-has_label passed-review-claude || missing_approval claude
+for reviewer in "${review_families[@]}"; do
+    has_label "${approval_labels[$reviewer]}" || missing_approval "$reviewer"
+done
 
 # (c) Required PR-body sections.
 for section in "Summary" "Determinism" "Linux Semantics" "Validation" "Human Review Required"; do
