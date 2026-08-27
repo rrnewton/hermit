@@ -5336,7 +5336,6 @@ fn self_test() -> Result<(), String> {
                 first_divergent_virtual_nanoseconds: virtual_nanoseconds,
                 first_divergent_record: record,
                 first_divergent_syscall: syscall,
-                runtime: None,
             }
         };
     let pressure_row = |result: &str, turn: Option<u64>, virtual_nanoseconds| PressureSummaryRow {
