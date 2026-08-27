@@ -2834,18 +2834,28 @@ impl<T: RecordOrReplay> Detcore<T> {
                         // on the supervisor's setting unless Detcore learns their behavior.
                         return Err(Errno::EOPNOTSUPP.into());
                     }
+                    // The supervisor may itself have supplied an append-mode
+                    // redirect. Detcore can add append behavior without setting
+                    // the shared kernel bit, but cannot make ordinary writes
+                    // non-appending while that physical bit remains set. Refuse
+                    // that one transition instead of reporting a state whose
+                    // writes would contradict F_GETFL.
+                    let physical_now = self
+                        .record_or_replay(
+                            guest,
+                            syscalls::Fcntl::new().with_fd(fd).with_cmd(F_GETFL),
+                        )
+                        .await? as i32;
+                    if physical_now & libc::O_APPEND != 0 && flags & libc::O_APPEND == 0 {
+                        return Err(Errno::EOPNOTSUPP.into());
+                    }
                     let requested_nonblocking = flags & libc::O_NONBLOCK;
-                    let model_nonblocking = current & libc::O_NONBLOCK;
-                    if requested_nonblocking != model_nonblocking {
-                        // Re-read rather than reuse the model: the model's other settable
-                        // bits are the GUEST's, and pushing those to the kernel is the
-                        // escape. Only the supervisor's own physical word may be echoed back.
-                        let physical_now = self
-                            .record_or_replay(
-                                guest,
-                                syscalls::Fcntl::new().with_fd(fd).with_cmd(F_GETFL),
-                            )
-                            .await? as i32;
+                    let physical_nonblocking = physical_now & libc::O_NONBLOCK;
+                    if requested_nonblocking != physical_nonblocking {
+                        // Use the physical word read above rather than the model: the model's
+                        // other settable bits are the GUEST's, and pushing those to the kernel
+                        // is the escape. Only the supervisor's own physical word may be echoed
+                        // back.
                         let physical_next =
                             (physical_now & !libc::O_NONBLOCK) | requested_nonblocking;
                         self.record_or_replay(

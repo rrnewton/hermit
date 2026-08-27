@@ -611,6 +611,50 @@ fn assert_guest_cannot_mutate_hermits_stdout_flags(backend: &str) {
          SUPERVISOR's file description ({backend} backend): 0x{before:x} -> \
          0x{after:x}\nhermit stderr:\n{diagnostics}",
     );
+
+    // A caller may already have opened stdout with O_APPEND. Detcore can add
+    // append behavior without changing the shared kernel description, but it
+    // cannot remove behavior supplied by a physical bit it must leave alone.
+    // Refuse that transition instead of claiming a flag state that writes do
+    // not honor.
+    let already_append_path = directory.path().join("already-append.out");
+    let already_append = fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(&already_append_path)
+        .expect("failed to open append-mode stdout stand-in");
+    let append_before = unsafe { libc::fcntl(already_append.as_raw_fd(), libc::F_GETFL) };
+    assert_ne!(append_before & libc::O_APPEND, 0);
+    let clear = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["run", "--backend", backend, "--"])
+        .arg(guest)
+        .arg("clear")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(
+            already_append
+                .try_clone()
+                .expect("failed to duplicate append-mode stdout"),
+        ))
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run the {backend} append-clear guest: {error}"));
+    let clear_diagnostics = String::from_utf8_lossy(&clear.stderr);
+    assert!(
+        clear.status.success(),
+        "{backend} append-clear guest did not receive the explicit refusal: {:?}\nstderr:\n{clear_diagnostics}",
+        clear.status,
+    );
+    let expected_clear = format!(
+        "clear_result=-1 clear_errno={} append_after=1",
+        libc::EOPNOTSUPP
+    );
+    assert!(
+        clear_diagnostics.contains(&expected_clear),
+        "{backend} append-clear result did not report EOPNOTSUPP with O_APPEND preserved:\n{clear_diagnostics}",
+    );
+    let append_after = unsafe { libc::fcntl(already_append.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(append_after, append_before);
 }
 
 fn stdio_initial_nonblocking_guest() -> &'static Path {
