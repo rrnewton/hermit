@@ -1475,9 +1475,7 @@ fn run() -> Result<(), String> {
                 )?;
                 Ok(())
             })();
-            let series_result = if std::env::var_os("DEV_HERMIT_PARENT").is_some()
-                && results.join("series-results.jsonl").is_file()
-            {
+            let series_result = if std::env::var_os("DEV_HERMIT_PARENT").is_some() {
                 emit_series(&results)
             } else {
                 Ok(())
@@ -3376,7 +3374,6 @@ fn write_plan_after_scorecard_check(
                 "mkdir -p {cell_dir}; if test -f {status_file}; then exit 0; fi; \
              printf '{incomplete}\\n' > {status_file}; {preparation_guard}status=0; \
              env E2E_RESULT_ROOT={results} E2E_BUILD_ROOT={build_root} E2E_RUN_ID={run_id} \
-             E2E_RUN_INDEX={run_index} \
              E2E_KEEP_VERIFY_LOGS=1 \
              {harness} \
              || status=$?; \
@@ -3387,7 +3384,6 @@ fn write_plan_after_scorecard_check(
                 results = shell_quote(&results.to_string_lossy()),
                 build_root = shell_quote(&build_root.to_string_lossy()),
                 run_id = shell_quote(&evidence_run_id),
-                run_index = repetition.unwrap_or(0),
                 harness = harness,
                 result_in_progress = shell_quote(&result_in_progress.to_string_lossy()),
                 result_file = shell_quote(&result_file.to_string_lossy()),
