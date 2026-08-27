@@ -164,6 +164,17 @@ check(
     repr(missing),
 )
 
+catalog_fixtures = run_matrix.CatalogFixtures()
+catalog_tmp_a = catalog_fixtures.host_tmp("ptrace", "reference")
+catalog_tmp_b = catalog_fixtures.host_tmp("dbt", "candidate")
+check(
+    "catalog fixture supplies a distinct host temporary directory per command",
+    catalog_tmp_a != catalog_tmp_b
+    and catalog_tmp_a.parent == Path("/backend-parity-catalog/host-tmp")
+    and catalog_tmp_b.parent == catalog_tmp_a.parent,
+    repr((catalog_tmp_a, catalog_tmp_b)),
+)
+
 
 print("case PRODUCER-PATH — live run results drive both sides of the mutation")
 
@@ -306,6 +317,25 @@ check(
     and len(backend_local_commands) == run_matrix.RUNS
     and all("--backend" in command for command in backend_local_commands),
     repr((result, backend_local_commands)),
+)
+backend_local_tmp_args = [
+    argument
+    for command in backend_local_commands
+    for argument in command
+    if argument.startswith("--tmp=")
+]
+check(
+    "backend-local commands use distinct catalog host temporary directories",
+    len(backend_local_tmp_args) == run_matrix.RUNS
+    and len(set(backend_local_tmp_args)) == run_matrix.RUNS
+    and all(
+        argument.startswith(
+            "--tmp=/backend-parity-catalog/host-tmp/"
+            "dbt-anonymous_mmap_layout-run-"
+        )
+        for argument in backend_local_tmp_args
+    ),
+    repr(backend_local_tmp_args),
 )
 check(
     "backend-local layout does not invent cross-backend operands",

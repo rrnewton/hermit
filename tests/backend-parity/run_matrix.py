@@ -375,6 +375,17 @@ class Fixtures:
 
 
 class CatalogFixtures:
+    def __init__(self) -> None:
+        self._host_tmp_sequence = 0
+
+    def host_tmp(self, backend: str, name: str) -> Path:
+        self._host_tmp_sequence += 1
+        return (
+            Path("/backend-parity-catalog")
+            / "host-tmp"
+            / f"{backend}-{name}-{self._host_tmp_sequence}"
+        )
+
     def binary(self, name: str) -> Path:
         return Path("/backend-parity-catalog") / name
 
