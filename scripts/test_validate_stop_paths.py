@@ -36,6 +36,27 @@ NO_RESULT_MARKER = "NO-RESULT-CASE:"
 # reaction -- nothing was evaluated, fix the environment, re-run -- and differ only in
 # which fix, which the message carries. The full argument is in ci/lint-checks-node.sh.
 NO_RESULT_EXIT_CODE = 75
+FINAL_VALIDATE_STATUS_PREFIX = "FINAL_VALIDATE_STATUS: "
+FINAL_VALIDATE_STATUSES = frozenset(("PASSED", "FAILED", "COULD_NOT_RUN"))
+
+
+class ValidateChildRefused(RuntimeError):
+    """The child reported that validation could not run."""
+
+
+def final_validate_status(output: str) -> str | None:
+    """Return the last complete status line; absence remains unknown."""
+    matches = [
+        line.removeprefix(FINAL_VALIDATE_STATUS_PREFIX)
+        for line in output.splitlines()
+        if line.startswith(FINAL_VALIDATE_STATUS_PREFIX)
+    ]
+    if not matches:
+        return None
+    status = matches[-1]
+    if status not in FINAL_VALIDATE_STATUSES:
+        raise AssertionError(f"validate emitted unknown final status {status!r}")
+    return status
 
 
 class NoParentAdapter(RuntimeError):
@@ -245,7 +266,27 @@ def wait_for_text(log: Path, text: str, process: subprocess.Popen[bytes]) -> Non
         if log.exists() and text in log.read_text(errors="replace"):
             return
         if process.poll() is not None:
-            raise AssertionError(f"validate exited before ready: rc={process.returncode}")
+            seen = log.read_text(errors="replace") if log.exists() else ""
+            status = final_validate_status(seen)
+            if status == "COULD_NOT_RUN" and process.returncode == NO_RESULT_EXIT_CODE:
+                raise ValidateChildRefused(
+                    f"validate could not run before ready: rc={process.returncode}"
+                )
+            if status is not None:
+                expected = {
+                    "PASSED": 0,
+                    "FAILED": 1,
+                    "COULD_NOT_RUN": NO_RESULT_EXIT_CODE,
+                }[status]
+                if process.returncode != expected:
+                    raise AssertionError(
+                        f"validate final status {status} disagrees with "
+                        f"rc={process.returncode}; expected {expected}"
+                    )
+            raise AssertionError(
+                f"validate exited before ready: rc={process.returncode}; "
+                f"final_status={status or 'absent'}"
+            )
         time.sleep(0.05)
     # SHOW WHAT IT ACTUALLY SAW. The bare form of this message cost real time:
     # it names readiness, so it was read as a slow start, when the log underneath
@@ -258,6 +299,52 @@ def wait_for_text(log: Path, text: str, process: subprocess.Popen[bytes]) -> Non
         f"opens, so a cold cache is NOT the explanation.\n"
         f"--- validate output ({len(seen)} bytes) ---\n{seen[-2000:]}"
     )
+
+
+def run_final_validate_status_contract() -> None:
+    """Pin genuine refusal, quoted-earlier, and absent-status behavior."""
+
+    class Exited:
+        def __init__(self, returncode: int):
+            self.returncode = returncode
+
+        def poll(self) -> int:
+            return self.returncode
+
+    with tempfile.TemporaryDirectory(prefix="validate-final-status-") as tmp:
+        log = Path(tmp) / "validate.log"
+        log.write_text("FINAL_VALIDATE_STATUS: COULD_NOT_RUN\n", encoding="utf-8")
+        try:
+            wait_for_text(log, "never-written", Exited(NO_RESULT_EXIT_CODE))
+        except ValidateChildRefused:
+            pass
+        else:
+            raise AssertionError("a genuine could-not-run status was not classified by name")
+
+        log.write_text(
+            "FINAL_VALIDATE_STATUS: COULD_NOT_RUN\n"
+            "quoted documentation above must not win\n"
+            "FINAL_VALIDATE_STATUS: FAILED\n",
+            encoding="utf-8",
+        )
+        try:
+            wait_for_text(log, "never-written", Exited(1))
+        except ValidateChildRefused as exc:
+            raise AssertionError("an earlier quoted status overrode the real final status") from exc
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("a failed child unexpectedly reached readiness")
+
+        log.write_text("ordinary output with no status\n", encoding="utf-8")
+        try:
+            wait_for_text(log, "never-written", Exited(NO_RESULT_EXIT_CODE))
+        except ValidateChildRefused as exc:
+            raise AssertionError("absence was misclassified as could-not-run") from exc
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("status absence unexpectedly reached readiness")
 
 
 def assert_schema5_contract(row: dict, *, admitted: bool = False) -> None:
@@ -333,7 +420,7 @@ def run_signal(
             assert rc == -sig.value, (sig.name, rc)
             return
 
-        assert rc == 130, (sig.name, rc, log.read_text(errors="replace"))
+        assert rc == NO_RESULT_EXIT_CODE, (sig.name, rc, log.read_text(errors="replace"))
         assert len(rows) == 1, (sig.name, rows)
         row = rows[0]
         assert_schema5_contract(row, admitted=lock_proven)
@@ -522,6 +609,7 @@ def run_cleanup_signal_race() -> None:
 
 
 def main() -> None:
+    run_final_validate_status_contract()
     warm_validate_binary()
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         run_signal(sig, expect_record=True)
