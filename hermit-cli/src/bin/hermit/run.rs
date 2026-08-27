@@ -4347,6 +4347,28 @@ mod tests {
     }
 
     #[test]
+    fn run_reports_skid_overshoots_after_the_backend_returns() {
+        let source = include_str!("run.rs");
+        let main = source
+            .split_once("pub fn main(&mut self, global: &GlobalOpts)")
+            .expect("RunOpts::main remains present")
+            .1
+            .split_once("pub fn validate_args(&mut self)")
+            .expect("RunOpts::main remains before validate_args")
+            .0;
+        let reset = main
+            .find("let _ = reverie::take_skid_overshoot_count();")
+            .expect("RunOpts::main clears overshoot evidence before execution");
+        let run = main
+            .find("let result = if self.namespace_only")
+            .expect("RunOpts::main retains the backend result");
+        let report = main
+            .find("if let Some(warning) = take_skid_overshoot_warning()")
+            .expect("RunOpts::main consumes overshoot evidence after execution");
+        assert!(reset < run && run < report);
+    }
+
+    #[test]
     fn run_one_summary_is_empty_again_before_run_two() -> Result<(), Error> {
         let file = tempfile::NamedTempFile::new().unwrap();
         let summary = RunSummary {
