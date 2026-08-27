@@ -2,9 +2,9 @@
 
 This table is derived from the manifest, not from a separately maintained parent-workspace CSV. `./ci/compat-envelope/scorecard.rs check` verifies it.
 
-**Green** means the cell is SELECTED: it is listed in `ci/expected-e2e-plan.json` and is therefore required to pass by ordinary validation. **Red** is every other test/mode/backend cell: measured failure, unavailable, or not yet run all remain red until the cell is promoted into the regression plan and passes. Manifest-disabled combinations are red, not omitted: a cell that cannot run is not green.
+**Green** means the cell is SELECTED: it is listed in `ci/expected-e2e-plan.json` and is therefore required to pass by ordinary validation. **Red** means an enabled cell is not selected: measured failure, unavailable, or not yet run all remain red until the cell is promoted into the regression plan and passes. The summary table below classifies the current **5053** manifest-disabled combinations as **Not applicable**, not red or omitted: a cell that cannot run cannot pass or fail.
 
-**Green does not mean measured, and it does not mean passing.** Selection, measurement, and result are three separate facts, and the Green column below reports only the first of them. A green cell that has never been executed once is the ordinary case, not an anomaly: green is a statement about what the plan REQUIRES, not about what has been OBSERVED. Whether a result was ever seen is a per-cell `measurement` field in `ci/compat-envelope/cells.json`, independent of colour and reading `never-measured`, `measured-and-passed`, or `diverged`; a cell can be green and `never-measured`, or red and `measured-and-passed`, and both combinations are present in the tracked file today. To count what has actually run, count that field -- do not count this table. Conflating the three has repeatedly produced project-status reports that quoted the Green total as a number of passing tests, which it has never been.
+**Green does not mean measured, and it does not mean passing.** Selection, measurement, and result are three separate facts, and the Green column below reports only the first of them. Green is a statement about what the plan REQUIRES, not about what has been OBSERVED. Whether a result was ever seen is a per-cell `measurement` field in `ci/compat-envelope/cells.json`, independent of colour and reading `never-measured`, `measured-and-passed`, or `diverged`; a cell can be green and `never-measured`, or red and `measured-and-passed`. The generated Status and measurement section below states whether those combinations are present today and quotes their exact current counts. To count what has actually run, count that field -- do not count this table. Conflating the three has repeatedly produced project-status reports that quoted the Green total as a number of passing tests, which it has never been.
 
 Every selected `verify` cell, and every seed in a selected `chaos` cell, runs the same backend twice. The manifest runner adds `--verify-strict` when the selected Hermit binary supports it, and accepts a result only when the typed report says `verified=true`, `verdict=matched`, `bitwise_parity=true`, `strictness=canonical`, `compare_logs=true`, a named canonical `record_envelope`, and both INFO-message counts are nonzero. Bare `--verify` remains a Stripped comparison when invoked directly and does not satisfy this regression plan. These same-backend results do not establish cross-backend parity.
 
@@ -31,15 +31,15 @@ Green is **304 of 5728**, which is **5.31%** — over THIS population and no oth
 
 ⚠️ **Adding or removing a backend or mode changes this denominator and therefore the percentage, without anything about the product changing.** Removing a backend whose cells are mostly red RAISES the reported figure; adding honest red cells LOWERS it. Neither is progress. Before comparing this percentage against an earlier one, diff the two lists above: if they differ, the numbers are not comparable and the difference is not a result.
 
-The mode view makes the current order of work explicit: expand `verify` first, then `replay`, then `chaos`. Each backend cell is `green / total`; an em dash means that mode does not exist for that backend.
+The mode view makes the current order of work explicit: expand `verify` first, then `replay`, then `chaos`. Each backend cell is `green / total`; an em dash means that mode does not exist for that backend. The summary columns use the same Green, Red, and Not applicable statuses as the table above.
 
-| Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `native` | Green | Red | Total |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `verify` | 235 / 358 | 0 / 358 | 1 / 358 | 57 / 358 | 5 / 358 | — | 298 | 1492 | 1790 |
-| `replay` | 1 / 358 | 0 / 358 | 0 / 358 | 0 / 358 | 0 / 358 | — | 1 | 1789 | 1790 |
-| `chaos` | 5 / 358 | 0 / 358 | 0 / 358 | 0 / 358 | 0 / 358 | — | 5 | 1785 | 1790 |
-| `naked` | — | — | — | — | — | 0 / 358 | 0 | 358 | 358 |
-| **Total** | | | | | | | **304** | **5424** | **5728** |
+| Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `native` | Green | Red | Not applicable | Total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `verify` | 235 / 358 | 0 / 358 | 1 / 358 | 57 / 358 | 5 / 358 | — | 298 | 336 | 1156 | 1790 |
+| `replay` | 1 / 358 | 0 / 358 | 0 / 358 | 0 / 358 | 0 / 358 | — | 1 | 0 | 1789 | 1790 |
+| `chaos` | 5 / 358 | 0 / 358 | 0 / 358 | 0 / 358 | 0 / 358 | — | 5 | 2 | 1783 | 1790 |
+| `naked` | — | — | — | — | — | 0 / 358 | 0 | 33 | 325 | 358 |
+| **Total** | | | | | | | **304** | **371** | **5053** | **5728** |
 
 ## Cross-backend parity
 
@@ -71,7 +71,7 @@ Ordinary full validation executes 306 selected regression cells: the 304 green c
 
 The table above reports status. This table reports the separate `measurement` field derived from observations stored in `ci/compat-envelope/cells.json`; it does not change status or which cells ordinary validation selects. Retained history that has not been imported is not counted here. A stored measurement does not establish that it describes current code; `show` reports whether the recorded last test still matches `HEAD:detcore`.
 
-The count table includes all **5728** tracked cells; no row is omitted.
+The count table includes all **5728** tracked cells; no row is omitted. The current green/`never-measured` count is **0**, and the current red/`measured-and-passed` count is **1**. These values use the same counts printed in the table below.
 
 | Status | `never-measured` | `measured-and-passed` | `measured-no-verdict` | `diverged-unlocated` | `diverged` | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
