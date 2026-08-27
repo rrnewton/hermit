@@ -56,10 +56,11 @@ Commands:
       into the cells' checked-in observations, under the `validate` provenance
       so they never mix with pressure-test bounds. Explicit and opt-in: ordinary
       validation does not run this and changes no tracked file.
-  import-results --results DIR
-      Import the latest clean canonical comparison retained on HEAD's history
-      for every selected compatibility cell. This reads existing results; it
-      does not execute a guest. Refuses unless every selected cell has evidence.
+  import-results --results DIR --current-summary FILE [--current-summary FILE ...]
+      Import clean canonical comparisons retained on HEAD's history. A retained
+      divergence position is imported only after current results classify it as
+      FRESH, DRIFTED, WRONG, or UNCHECKABLE. This reads existing results; it does
+      not execute a guest and it never changes scorecard colour.
   project-observations --series-root DIR --refreshed-at STAMP
       Re-derive the divergence-position projection from the series store, which
       is the authority for it. REFUSES to drop measured evidence when the source
@@ -1168,6 +1169,19 @@ impl ResultRow {
                     index + 1
                 )
             })?;
+            let recorded_coordinates = DivergenceCoordinates::from_row(self);
+            let report_coordinates = DivergenceCoordinates {
+                scheduler_turn: report.first_divergent_scheduler_turn,
+                virtual_nanoseconds: report.first_divergent_virtual_nanoseconds,
+                record: report.first_divergent_record,
+                syscall: report.first_divergent_syscall,
+            };
+            if recorded_coordinates != report_coordinates {
+                return Err(format!(
+                    "attempt {} top-level divergence coordinates do not match the embedded verification report",
+                    index + 1
+                ));
+            }
             match self.outcome.as_str() {
                 "PASS" => report.require_canonical_match().map_err(|error| {
                     format!(
@@ -1210,57 +1224,8 @@ struct Derived {
     green: BTreeSet<CellId>,
 }
 
-/// A selected cell is green only when its latest imported VALIDATE result set
-/// contains at least one pass and no refusal. Selection remains a separate
-/// fact: a selected red cell is still required by ordinary validation.
-///
-/// Compare the recorded Hermit first-parent depth, not merely the detcore tree.
-/// Several Hermit commits can carry one unchanged detcore tree, and folding all
-/// of them together would let an older result decide the current colour.
-fn selected_validate_pass(cell: &TrackedCell) -> bool {
-    let comparisons = cell
-        .observations
-        .iter()
-        .filter(|observation| observation.provenance == ObservationProvenance::Validate)
-        .flat_map(|observation| observation.canonical_comparisons.iter())
-        .collect::<Vec<_>>();
-    let Some(latest_depth) = comparisons
-        .iter()
-        .map(|comparison| comparison.hermit_first_parent)
-        .max()
-    else {
-        return false;
-    };
-    let results = comparisons
-        .iter()
-        .filter(|comparison| comparison.hermit_first_parent == latest_depth)
-        .map(|comparison| comparison.result)
-        .collect::<BTreeSet<_>>();
-    !results.is_empty() && results == BTreeSet::from([ObservedResult::Pass])
-}
-
-fn score_cell(derived: &Derived, cell: &TrackedCell) -> CellStatus {
-    if !cell.enabled {
-        CellStatus::NotApplicable
-    } else if derived.selected.contains(&cell.id) && selected_validate_pass(cell) {
-        CellStatus::Green
-    } else {
-        CellStatus::Red
-    }
-}
-
-fn retained_comparison_state(comparison_sha: Option<&str>, head: &str) -> &'static str {
-    match comparison_sha {
-        Some(sha) if sha == head => "fresh",
-        Some(_) => "stale",
-        None => "NO_RESULT",
-    }
-}
-
-fn refresh_score(derived: &Derived, tracked: &mut TrackedCells) {
-    for cell in &mut tracked.cells {
-        cell.status = score_cell(derived, cell);
-    }
+fn retained_import_cells(derived: &Derived) -> BTreeSet<CellId> {
+    derived.enabled.clone()
 }
 
 #[derive(Clone)]
@@ -1276,6 +1241,77 @@ struct RetainedCellResults {
     detcore_tree: String,
     depth: BTreeMap<String, SourceDepth>,
     candidates: Vec<ResultCandidate>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DivergenceCoordinates {
+    scheduler_turn: Option<u64>,
+    virtual_nanoseconds: Option<u64>,
+    record: Option<u64>,
+    syscall: Option<u64>,
+}
+
+impl DivergenceCoordinates {
+    fn from_row(row: &ResultRow) -> Self {
+        Self {
+            scheduler_turn: row.first_divergent_scheduler_turn,
+            virtual_nanoseconds: row.first_divergent_virtual_nanoseconds,
+            record: row.first_divergent_record,
+            syscall: row.first_divergent_syscall,
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        self.scheduler_turn.is_none()
+            && self.virtual_nanoseconds.is_none()
+            && self.record.is_none()
+            && self.syscall.is_none()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum RetainedComparisonState {
+    Fresh,
+    Drifted,
+    Wrong,
+    Uncheckable,
+}
+
+impl RetainedComparisonState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "FRESH",
+            Self::Drifted => "DRIFTED",
+            Self::Wrong => "WRONG",
+            Self::Uncheckable => "UNCHECKABLE",
+        }
+    }
+}
+
+struct RetainedDecision {
+    state: RetainedComparisonState,
+    import: ImportEvidence,
+    retained_coordinates: BTreeSet<DivergenceCoordinates>,
+    current_coordinates: BTreeSet<DivergenceCoordinates>,
+    reason: String,
+}
+
+enum ImportEvidence {
+    Retained(RetainedCellResults),
+    Current(Vec<CurrentPressureResult>),
+    None,
+}
+
+#[derive(Clone)]
+struct CurrentPressureResult {
+    summary: PressureSummary,
+    result: ObservedResult,
+    coordinates: DivergenceCoordinates,
+}
+
+struct CurrentPressureEvidence {
+    results: BTreeMap<CellId, Vec<CurrentPressureResult>>,
+    uncheckable: BTreeMap<CellId, Vec<String>>,
 }
 
 fn main() -> ExitCode {
@@ -1448,6 +1484,7 @@ fn run() -> Result<(), String> {
         }
         "import-results" => {
             let mut result_root = None;
+            let mut current_summaries = Vec::new();
             while let Some(arg) = args.next() {
                 match arg.as_str() {
                     "--results" => {
@@ -1455,11 +1492,19 @@ fn run() -> Result<(), String> {
                             args.next().ok_or("--results requires a directory")?,
                         ));
                     }
+                    "--current-summary" => {
+                        current_summaries.push(PathBuf::from(
+                            args.next().ok_or("--current-summary requires a file")?,
+                        ));
+                    }
                     _ => return Err(format!("unknown import-results option `{arg}`\n\n{USAGE}")),
                 }
             }
             let result_root = result_root.ok_or("import-results requires --results DIR")?;
-            import_results(&root, &result_root)?;
+            if current_summaries.is_empty() {
+                return Err("import-results requires at least one --current-summary FILE".into());
+            }
+            import_results(&root, &result_root, &current_summaries)?;
         }
         "self-test" => {
             no_more(&mut args)?;
@@ -1637,12 +1682,7 @@ fn read_json<T: for<'a> Deserialize<'a>>(path: &Path) -> Result<T, String> {
     serde_json::from_slice(&bytes).map_err(|e| format!("invalid JSON in {}: {e}", path.display()))
 }
 
-fn render_scorecard(derived: &Derived, tracked: &TrackedCells) -> String {
-    let status: BTreeMap<_, _> = tracked
-        .cells
-        .iter()
-        .map(|cell| (cell.id.clone(), cell.status))
-        .collect();
+fn render_scorecard(derived: &Derived, _tracked: &TrackedCells) -> String {
     let mut backends: BTreeSet<&str> = derived
         .population
         .iter()
@@ -1661,15 +1701,21 @@ fn render_scorecard(derived: &Derived, tracked: &TrackedCells) -> String {
         "# Compatibility scorecard\n\n\
 This table is derived from the manifest, not from a separately maintained parent-workspace CSV. \
 `./ci/compat-envelope/scorecard.rs check` verifies it.\n\n\
-**Green** means the cell is selected in `ci/expected-e2e-plan.json` AND its latest imported \
-`validate` comparison passed the canonical INFO standard. **Red** includes every other enabled \
-test/mode/backend cell: an imported divergence, no imported comparison, or absence from the \
-selected plan all remain red. Manifest-disabled combinations are not applicable.\n\n\
-Selection and result remain separate facts. A selected red cell is STILL REQUIRED by ordinary \
-validation; turning it red does not delete or skip the check. The per-cell `measurement` field in \
-`ci/compat-envelope/cells.json` summarizes imported observations. Its historical value \
-`never-measured` means no observation has been imported, not proof that no retained run exists. \
-Use the recorded SHA and invocation to identify what was compared.\n\n\
+**Green** means the cell is SELECTED: it is listed in `ci/expected-e2e-plan.json` and is therefore \
+required to pass by ordinary validation. **Red** is every \
+other test/mode/backend cell: measured failure, unavailable, or not yet run all remain red until \
+the cell is promoted into the regression plan and passes. Manifest-disabled combinations are red, \
+not omitted: a cell that cannot run is not green.\n\n\
+**Green does not mean measured, and it does not mean passing.** Selection, measurement, and result \
+are three separate facts, and the Green column below reports only the first of them. A green cell \
+that has never been executed once is the ordinary case, not an anomaly: green is a statement about \
+what the plan REQUIRES, not about what has been OBSERVED. Whether a result was ever seen is a \
+per-cell `measurement` field in `ci/compat-envelope/cells.json`, independent of colour and reading \
+`never-measured`, `measured-and-passed`, or `diverged`; a cell can be green and `never-measured`, \
+or red and `measured-and-passed`, and both combinations are present in the tracked file today. To \
+count what has actually run, count that field -- do not count this table. Conflating the three has \
+repeatedly produced project-status reports that quoted the Green total as a number of passing \
+tests, which it has never been.\n\n\
 Every selected `verify` cell, and every seed in a selected `chaos` cell, runs the same backend \
 twice. The manifest runner adds `--verify-strict` when the selected Hermit binary supports it, and \
 accepts a result only when the typed report says `verified=true`, `verdict=matched`, \
@@ -1690,9 +1736,9 @@ this regression plan. These same-backend results do not establish cross-backend 
             .filter(|id| id.backend == *backend)
             .count();
         let backend_green = derived
-            .population
+            .green
             .iter()
-            .filter(|id| id.backend == *backend && status.get(*id) == Some(&CellStatus::Green))
+            .filter(|id| id.backend == *backend)
             .count();
         // NOT APPLICABLE IS SUBTRACTED FROM RED, NOT ADDED TO THE TOTAL. The
         // population is unchanged; what changes is that a cell whose backend is
@@ -1700,9 +1746,7 @@ this regression plan. These same-backend results do not establish cross-backend 
         let backend_na = derived
             .population
             .iter()
-            .filter(|id| {
-                id.backend == *backend && status.get(*id) == Some(&CellStatus::NotApplicable)
-            })
+            .filter(|id| id.backend == *backend && !derived.enabled.contains(*id))
             .count();
         green_total += backend_green;
         na_total += backend_na;
@@ -1853,14 +1897,14 @@ denominator.\n\n\
             .collect();
         let category_green = category_cells
             .iter()
-            .filter(|id| status.get(**id) == Some(&CellStatus::Green))
+            .filter(|id| derived.green.contains(**id))
             .count();
         out.push_str(&format!("| `{category}`"));
         for mode in ["verify", "replay", "chaos"] {
             let mode_total = category_cells.iter().filter(|id| id.mode == mode).count();
             let mode_green = category_cells
                 .iter()
-                .filter(|id| id.mode == mode && status.get(**id) == Some(&CellStatus::Green))
+                .filter(|id| id.mode == mode && derived.green.contains(**id))
                 .count();
             out.push_str(&format!(" | {mode_green} / {mode_total}"));
         }
@@ -1880,14 +1924,11 @@ denominator.\n\n\
         .iter()
         .filter(|id| id.mode == "custom")
         .count();
-    let selected_compatibility = derived.green.len();
-    let selected_red = selected_compatibility.saturating_sub(green_total);
     out.push_str(&format!(
-        "Ordinary full validation executes {} selected regression cells: {selected_compatibility} \
-comparable cells (including {chaos} chaos-mode race-exposure checks), and {custom} explicit custom \
-commands outside the comparable denominator. Of the selected comparable cells, {green_total} have \
-a latest imported canonical pass and {selected_red} are red. All remain required; a red selected cell \
-is a regression or an evidence gap, not permission to remove the check.\n",
+        "Ordinary full validation executes {} selected regression cells: the {green_total} green \
+compatibility cells above (including {chaos} chaos-mode race-exposure checks), and {custom} \
+explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for \
+all of them; a failing green cell is a regression, not permission to move it to red.\n",
         derived.selected.len()
     ));
     out
@@ -1967,6 +2008,13 @@ fn tracked_from(
             // must not discard measured evidence while doing so.
             let last_tested = previous.get(&id).and_then(|cell| cell.last_tested.clone());
             let enabled = derived.enabled.contains(&id);
+            let status = if !enabled {
+                CellStatus::NotApplicable
+            } else if derived.green.contains(&id) {
+                CellStatus::Green
+            } else {
+                CellStatus::Red
+            };
             let ci_disabled_reason = derived.ci_disabled_reasons.get(&id).cloned();
             let not_applicable_reason = derived.not_applicable_reasons.get(&id).cloned();
             // Set when THIS update overrode the ratchet for this cell; otherwise
@@ -1985,7 +2033,7 @@ fn tracked_from(
             let mut cell = TrackedCell {
                 id,
                 enabled,
-                status: CellStatus::Red,
+                status,
                 ci_disabled_reason,
                 not_applicable_reason,
                 last_tested,
@@ -1994,10 +2042,6 @@ fn tracked_from(
                 green_removal_reason,
             };
             cell.measurement = derive_measurement(&cell);
-            // Applicability is decided before pass/fail. Among applicable
-            // cells, selection is necessary but no longer sufficient: the
-            // latest imported validate evidence must also be a canonical pass.
-            cell.status = score_cell(derived, &cell);
             cell
         })
         .collect();
@@ -2023,10 +2067,6 @@ enum Writer {
     /// `update-observations`: owns observations but cannot alter scorecard
     /// colour because pressure evidence is not the ordinary validation result.
     Observations,
-    /// `observe-results` and `import-results`: own observations and may update
-    /// scorecard colour from validate evidence. They still cannot change the
-    /// selected plan or any manifest-derived field.
-    ValidateObservations,
 }
 
 /// REFUSE A WRITE THAT CROSSED THE WRITER BOUNDARY.
@@ -2121,7 +2161,7 @@ fn enforce_writer_boundary(
                 }
             }
         }
-        Writer::Observations | Writer::ValidateObservations => {
+        Writer::Observations => {
             // An observation writer merges evidence into cells that already
             // exist. It may not change the population, and it may not touch a
             // single ratchet field.
@@ -2148,7 +2188,7 @@ fn enforce_writer_boundary(
                 if old_cell.enabled != new_cell.enabled {
                     return Err(changed("enabled"));
                 }
-                if writer == Writer::Observations && old_cell.status != new_cell.status {
+                if old_cell.status != new_cell.status {
                     return Err(changed("status"));
                 }
                 if old_cell.ci_disabled_reason != new_cell.ci_disabled_reason {
@@ -2157,7 +2197,7 @@ fn enforce_writer_boundary(
             }
         }
     }
-    if before.schema != after.schema && writer != Writer::Update {
+    if before.schema != after.schema && writer == Writer::Observations {
         return Err(
             "writer boundary violated: an observation writer changed the schema version".into(),
         );
@@ -2815,14 +2855,14 @@ fn apply_pressure_summary(
         let observation = match position {
             Some(position) => &mut observations[position],
             None => {
-                    observations.push(Observation {
-                        detcore_tree: summary.detcore_tree.clone(),
-                        provenance: ObservationProvenance::PressureTest,
-                        depth: depth.clone(),
-                        hermit_shas: BTreeSet::new(),
-                        results: BTreeSet::new(),
-                        canonical_comparisons: BTreeSet::new(),
-                        invocations: BTreeSet::new(),
+                observations.push(Observation {
+                    detcore_tree: summary.detcore_tree.clone(),
+                    provenance: ObservationProvenance::PressureTest,
+                    depth: depth.clone(),
+                    hermit_shas: BTreeSet::new(),
+                    results: BTreeSet::new(),
+                    canonical_comparisons: BTreeSet::new(),
+                    invocations: BTreeSet::new(),
                     first_divergent_scheduler_turn: ObservedPositions::default(),
                     first_divergent_virtual_nanoseconds: ObservedPositions::default(),
                     first_divergent_record: ObservedPositions::default(),
@@ -2833,7 +2873,7 @@ fn apply_pressure_summary(
         };
         observation.hermit_shas.insert(summary.hermit_sha.clone());
         observation.results.insert(result);
-        observation.invocations.insert(ObservedInvocation {
+        let inserted = observation.invocations.insert(ObservedInvocation {
             hermit_sha: summary.hermit_sha.clone(),
             run_id: invocation.run_id,
             result,
@@ -2844,14 +2884,16 @@ fn apply_pressure_summary(
             shell_command: invocation.shell_command,
             attempts: invocation.attempts,
         });
-        observation.first_divergent_scheduler_turn.record(turn);
-        observation
-            .first_divergent_virtual_nanoseconds
-            .record(virtual_nanoseconds);
-        observation.first_divergent_record.record(divergent_record);
-        observation
-            .first_divergent_syscall
-            .record(divergent_syscall);
+        if inserted {
+            observation.first_divergent_scheduler_turn.record(turn);
+            observation
+                .first_divergent_virtual_nanoseconds
+                .record(virtual_nanoseconds);
+            observation.first_divergent_record.record(divergent_record);
+            observation
+                .first_divergent_syscall
+                .record(divergent_syscall);
+        }
         // Sort by the full key, so a tree carrying both a pressure-test and a
         // validate observation still has a stable tracked-file order.
         observations.sort_by(|left, right| {
@@ -3103,16 +3145,18 @@ fn apply_validate_results(
             let hermit_depth = depth.get("hermit").ok_or_else(|| {
                 format!("{} observation has no Hermit source depth", display_id(id))
             })?;
-            observation.canonical_comparisons.insert(CanonicalComparison {
-                hermit_sha: row.hermit_sha.clone(),
-                hermit_commits: hermit_depth.commits,
-                hermit_first_parent: hermit_depth.first_parent,
-                run_id: row.run_id.clone(),
-                evidence_sha256: candidate.evidence_identity.clone(),
-                result,
-                left_info_messages,
-                right_info_messages,
-            });
+            observation
+                .canonical_comparisons
+                .insert(CanonicalComparison {
+                    hermit_sha: row.hermit_sha.clone(),
+                    hermit_commits: hermit_depth.commits,
+                    hermit_first_parent: hermit_depth.first_parent,
+                    run_id: row.run_id.clone(),
+                    evidence_sha256: candidate.evidence_identity.clone(),
+                    result,
+                    left_info_messages,
+                    right_info_messages,
+                });
             // Record the invocation, exactly as the pressure path does. Without
             // it a validate-sourced bound would have strictly WORSE provenance
             // than a pressure-sourced one: no per-run record, no run_id, and no
@@ -3193,8 +3237,7 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
     let before = tracked.clone();
     let fold = apply_validate_results(&mut tracked, &rows, &head, &detcore_tree, &depth, true)?;
     refresh_measurement(&mut tracked);
-    refresh_score(&derived, &mut tracked);
-    enforce_writer_boundary(&before, &tracked, Writer::ValidateObservations)?;
+    enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
     fs::write(root.join(SCORECARD), render_scorecard(&derived, &tracked))
         .map_err(|e| format!("cannot write {SCORECARD}: {e}"))?;
     fs::write(root.join(CELLS), encoded_cells(&tracked)?)
@@ -3248,7 +3291,11 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn import_results(root: &Path, results: &Path) -> Result<(), String> {
+fn import_results(
+    root: &Path,
+    results: &Path,
+    current_summaries: &[PathBuf],
+) -> Result<(), String> {
     let status = Command::new("git")
         .args(["status", "--porcelain", "--untracked-files=no"])
         .current_dir(root)
@@ -3279,44 +3326,110 @@ fn import_results(root: &Path, results: &Path) -> Result<(), String> {
             derived.population.len()
         ));
     }
+    let import_cells = retained_import_cells(&derived);
     let RetainedImport {
-        cells: imported_cells,
+        cells: retained_cells,
         files_scanned,
         rows_scanned,
         terminal_comparisons,
         stale_coordinate_rows,
         stale_coordinates,
         stale_coordinate_cells,
-        fresh_cells,
-        stale_cells,
         no_result_cells,
-    } = read_retained_selected_results(root, results, &derived.enabled, &derived.green)?;
+    } = read_retained_results(root, results, &import_cells)?;
+    let retained_cell_count = retained_cells.len();
+    let current = read_current_pressure_evidence(root, current_summaries, &before)?;
     let mut tracked = tracked_from(&derived, Some(before.clone()), None, false)?;
-    // This command is a projection of the latest retained validate evidence,
-    // not an append-only history store. Replace its prior validate projection
-    // for the selected cells so rerunning with the same retained corpus is
-    // byte-identical and a newer comparison can supersede an older one.
+    // This command is a projection, not an append-only history store. Remove
+    // only observations carrying this command's canonical-comparison receipt;
+    // series and pressure observations are separate evidence and survive.
     for cell in &mut tracked.cells {
-        if derived.green.contains(&cell.id) {
-            cell.observations
-                .retain(|observation| observation.provenance != ObservationProvenance::Validate);
-        }
+        remove_imported_validate_projection(cell);
     }
+
     let mut fold = ValidateFold::default();
-    for retained in imported_cells {
-        let rows = BTreeMap::from([(retained.id, retained.candidates)]);
-        let one = apply_validate_results(
-            &mut tracked,
-            &rows,
-            &retained.hermit_sha,
-            &retained.detcore_tree,
-            &retained.depth,
-            false,
-        )?;
-        fold.passed += one.passed;
-        fold.located += one.located;
-        fold.unlocated += one.unlocated;
-        fold.errored.extend(one.errored);
+    let mut historical_without_coordinates = 0usize;
+    let mut outcome_counts: BTreeMap<RetainedComparisonState, usize> = BTreeMap::new();
+    let mut outcome_rows = Vec::new();
+    let mut retained_rows_imported = 0usize;
+    let mut current_rows_imported = 0usize;
+    for retained in retained_cells {
+        let retained_id = retained.id.clone();
+        let has_coordinate = retained.candidates.iter().any(|candidate| {
+            candidate.row.outcome == "FAIL"
+                && !DivergenceCoordinates::from_row(&candidate.row).is_empty()
+        });
+        let decision = if has_coordinate {
+            Some(retained_coordinate_decision(retained, &current))
+        } else {
+            historical_without_coordinates += 1;
+            let rows = BTreeMap::from([(retained.id.clone(), retained.candidates.clone())]);
+            let one = apply_validate_results(
+                &mut tracked,
+                &rows,
+                &retained.hermit_sha,
+                &retained.detcore_tree,
+                &retained.depth,
+                false,
+            )?;
+            retained_rows_imported += retained.candidates.len();
+            fold.passed += one.passed;
+            fold.located += one.located;
+            fold.unlocated += one.unlocated;
+            fold.errored.extend(one.errored);
+            None
+        };
+        let Some(decision) = decision else { continue };
+        *outcome_counts.entry(decision.state).or_default() += 1;
+        match decision.import {
+            ImportEvidence::Retained(retained) => {
+                let rows = BTreeMap::from([(retained.id.clone(), retained.candidates.clone())]);
+                let one = apply_validate_results(
+                    &mut tracked,
+                    &rows,
+                    &retained.hermit_sha,
+                    &retained.detcore_tree,
+                    &retained.depth,
+                    false,
+                )?;
+                retained_rows_imported += retained.candidates.len();
+                fold.passed += one.passed;
+                fold.located += one.located;
+                fold.unlocated += one.unlocated;
+                fold.errored.extend(one.errored);
+            }
+            ImportEvidence::Current(current_results) => {
+                for current_result in current_results {
+                    let depth = BTreeMap::from([(
+                        "hermit".to_string(),
+                        repo_depth_at(root, &current_result.summary.hermit_sha).ok_or_else(
+                            || {
+                                format!(
+                                    "cannot read Hermit source depth at current SHA {}",
+                                    current_result.summary.hermit_sha
+                                )
+                            },
+                        )?,
+                    )]);
+                    apply_pressure_summary(
+                        &mut tracked,
+                        &current_result.summary,
+                        &current_result.summary.hermit_sha,
+                        &current_result.summary.detcore_tree,
+                        &depth,
+                    )?;
+                    current_rows_imported += 1;
+                }
+            }
+            ImportEvidence::None => {}
+        }
+        outcome_rows.push((
+            retained_id,
+            decision.state,
+            decision.retained_coordinates,
+            decision.current_coordinates,
+            decision.reason,
+        ));
     }
     if !fold.errored.is_empty() {
         return Err(format!(
@@ -3326,67 +3439,23 @@ fn import_results(root: &Path, results: &Path) -> Result<(), String> {
         ));
     }
     refresh_measurement(&mut tracked);
-    refresh_score(&derived, &mut tracked);
+    enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
 
-    let missing_after = derived
-        .green
-        .iter()
-        .filter(|id| {
-            tracked
-                .cells
-                .iter()
-                .find(|cell| &cell.id == *id)
-                .is_none_or(|cell| {
-                    let Some(last) = &cell.last_tested else {
-                        return true;
-                    };
-                    !cell.observations.iter().any(|observation| {
-                        observation.provenance == ObservationProvenance::Validate
-                            && observation
-                                .canonical_comparisons
-                                .iter()
-                                .any(|comparison| comparison.hermit_sha == last.hermit_sha)
-                    })
-                })
-        })
-        .map(display_id)
-        .collect::<Vec<_>>();
-    let missing_after = missing_after.into_iter().collect::<BTreeSet<_>>();
-    if missing_after != no_result_cells {
-        return Err(format!(
-            "imported comparison coverage disagrees with its NO_RESULT classification: {} cell(s) lacked a stored comparison but {} were classified NO_RESULT",
-            missing_after.len(),
-            no_result_cells.len()
-        ));
-    }
-    enforce_writer_boundary(&before, &tracked, Writer::ValidateObservations)?;
-
-    let counts = |cells: &TrackedCells| {
-        let green = cells
-            .cells
-            .iter()
-            .filter(|cell| cell.status == CellStatus::Green)
-            .count();
-        let red = cells
-            .cells
-            .iter()
-            .filter(|cell| cell.status == CellStatus::Red)
-            .count();
-        let not_applicable = cells
-            .cells
-            .iter()
-            .filter(|cell| cell.status == CellStatus::NotApplicable)
-            .count();
-        (green, red, not_applicable, cells.cells.len())
+    let measurement_counts = |cells: &TrackedCells| {
+        let mut counts = BTreeMap::new();
+        for cell in &cells.cells {
+            *counts.entry(cell.measurement.as_str()).or_insert(0usize) += 1;
+        }
+        counts
     };
-    let before_counts = counts(&before);
-    let after_counts = counts(&tracked);
+    let before_counts = measurement_counts(&before);
+    let after_counts = measurement_counts(&tracked);
     let changed = before
         .cells
         .iter()
         .filter_map(|old| {
             let new = tracked.cells.iter().find(|cell| cell.id == old.id)?;
-            (old.status != new.status).then_some((old, new))
+            (old.measurement != new.measurement).then_some((old, new))
         })
         .collect::<Vec<_>>();
 
@@ -3396,11 +3465,13 @@ fn import_results(root: &Path, results: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot write {CELLS}: {e}"))?;
 
     println!(
-        "compatibility scorecard: imported {} terminal BitwiseInfoV1 comparison(s) for {} selected compatibility cells from {} retained results.jsonl file(s) containing {} row(s); no guest was executed",
+        "compatibility scorecard: found {} enabled cell(s) with {} terminal BitwiseInfoV1 comparison(s) in {} retained results.jsonl file(s) containing {} row(s); imported {} retained row(s) and {} current pressure row(s); no guest was executed",
+        retained_cell_count,
         terminal_comparisons,
-        derived.green.len(),
         files_scanned,
-        rows_scanned
+        rows_scanned,
+        retained_rows_imported,
+        current_rows_imported,
     );
     println!(
         "  excluded as stale: {stale_coordinate_rows} older diverging comparison row(s), carrying {stale_coordinates} coordinate value(s), across {} enabled cell(s) whose newest retained canonical result is a pass",
@@ -3410,34 +3481,58 @@ fn import_results(root: &Path, results: &Path) -> Result<(), String> {
         println!("    stale coordinate: {cell}");
     }
     println!(
-        "  retained comparison state for the {} selected compatibility cells: fresh={} stale={} NO_RESULT={}",
-        derived.green.len(),
-        fresh_cells.len(),
-        stale_cells.len(),
+        "  retained comparisons without a divergence coordinate: {historical_without_coordinates}; enabled cells with no retained canonical comparison: {}",
         no_result_cells.len()
     );
-    for cell in &no_result_cells {
-        println!("    cannot currently be checked from retained results: {cell}");
+    println!(
+        "  retained coordinate freshness: FRESH={} DRIFTED={} WRONG={} UNCHECKABLE={}",
+        outcome_counts
+            .get(&RetainedComparisonState::Fresh)
+            .copied()
+            .unwrap_or(0),
+        outcome_counts
+            .get(&RetainedComparisonState::Drifted)
+            .copied()
+            .unwrap_or(0),
+        outcome_counts
+            .get(&RetainedComparisonState::Wrong)
+            .copied()
+            .unwrap_or(0),
+        outcome_counts
+            .get(&RetainedComparisonState::Uncheckable)
+            .copied()
+            .unwrap_or(0),
+    );
+    for (id, state, retained_coordinates, current_coordinates, reason) in &outcome_rows {
+        println!(
+            "    {}: {} retained={:?} current={:?} — {}",
+            display_id(id),
+            state.as_str(),
+            retained_coordinates,
+            current_coordinates,
+            reason
+        );
     }
     println!(
-        "  before: {} green / {} red / {} not-applicable / {} total",
-        before_counts.0, before_counts.1, before_counts.2, before_counts.3
+        "  population before: {} cells; measurement {:?}",
+        before.cells.len(),
+        before_counts
     );
     println!(
-        "  after : {} green / {} red / {} not-applicable / {} total",
-        after_counts.0, after_counts.1, after_counts.2, after_counts.3
+        "  population after : {} cells; measurement {:?}",
+        tracked.cells.len(),
+        after_counts
     );
     for (old, new) in changed {
         println!(
-            "  {}: {:?} -> {:?} at {} ({})",
+            "  {}: {} -> {} at {}",
             display_id(&new.id),
-            old.status,
-            new.status,
+            old.measurement.as_str(),
+            new.measurement.as_str(),
             new.last_tested
                 .as_ref()
                 .map(|last| last.hermit_sha.as_str())
-                .unwrap_or("no recorded SHA"),
-            new.measurement.as_str()
+                .unwrap_or("no recorded SHA")
         );
     }
     Ok(())
@@ -3856,21 +3951,18 @@ struct RetainedImport {
     stale_coordinate_rows: usize,
     stale_coordinates: usize,
     stale_coordinate_cells: BTreeSet<String>,
-    fresh_cells: BTreeSet<String>,
-    stale_cells: BTreeSet<String>,
     no_result_cells: BTreeSet<String>,
 }
 
 /// Read retained validate rows without pretending they belong to the current
 /// checkout. Each row keeps its own Hermit SHA, and only clean canonical
-/// comparisons on HEAD's history are eligible. For each selected cell, import
+/// comparisons on HEAD's history are eligible. For each enabled cell, import
 /// every terminal comparison at the newest eligible SHA so disagreement at one
 /// revision remains visible instead of being resolved by file ordering.
-fn read_retained_selected_results(
+fn read_retained_results(
     root: &Path,
     result_root: &Path,
     eligible: &BTreeSet<CellId>,
-    selected: &BTreeSet<CellId>,
 ) -> Result<RetainedImport, String> {
     if !result_root.is_dir() {
         return Err(format!(
@@ -3888,7 +3980,6 @@ fn read_retained_selected_results(
         ));
     }
 
-    let head = git_head(root)?;
     let history = git_history_ranks(root)?;
     let retained_workspace = result_root
         .ancestors()
@@ -3996,7 +4087,7 @@ fn read_retained_selected_results(
             .push(candidate);
     }
 
-    let no_result_cells = selected
+    let no_result_cells = eligible
         .iter()
         .filter(|id| !by_cell_and_rank.contains_key(*id))
         .map(display_id)
@@ -4008,8 +4099,6 @@ fn read_retained_selected_results(
     let mut stale_coordinate_rows = 0usize;
     let mut stale_coordinates = 0usize;
     let mut stale_coordinate_cells = BTreeSet::new();
-    let mut fresh_cells = BTreeSet::new();
-    let mut stale_cells = BTreeSet::new();
     for (id, mut ranks) in by_cell_and_rank {
         let latest_rank = *ranks.keys().next().expect("cell has retained evidence");
         let latest_candidates = ranks.get(&latest_rank).expect("latest rank exists");
@@ -4039,12 +4128,9 @@ fn read_retained_selected_results(
                 }
             }
         }
-        if !selected.contains(&id) {
-            continue;
-        }
         let candidates = ranks
             .remove(&latest_rank)
-            .expect("latest selected evidence exists");
+            .expect("latest retained evidence exists");
         let sha = candidates[0].row.hermit_sha.clone();
         if candidates
             .iter()
@@ -4072,15 +4158,6 @@ fn read_retained_selected_results(
             }
         };
         terminal_comparisons += candidates.len();
-        match retained_comparison_state(Some(&sha), &head) {
-            "fresh" => {
-                fresh_cells.insert(display_id(&id));
-            }
-            "stale" => {
-                stale_cells.insert(display_id(&id));
-            }
-            _ => unreachable!("a present comparison is fresh or stale"),
-        }
         cells.push(RetainedCellResults {
             id,
             hermit_sha: sha,
@@ -4097,10 +4174,254 @@ fn read_retained_selected_results(
         stale_coordinate_rows,
         stale_coordinates,
         stale_coordinate_cells,
-        fresh_cells,
-        stale_cells,
         no_result_cells,
     })
+}
+
+fn checked_current_pressure_result(
+    tracked: &TrackedCells,
+    summary: PressureSummary,
+    current_tree: &str,
+) -> Result<CurrentPressureResult, String> {
+    let row = summary
+        .rows
+        .first()
+        .ok_or("current pressure summary contains no row")?;
+    if summary.rows.len() != 1 {
+        return Err("current pressure check requires exactly one row".into());
+    }
+    let mut checked = tracked.clone();
+    for cell in &mut checked.cells {
+        cell.last_tested = None;
+        cell.observations.clear();
+        cell.measurement = MeasurementState::NeverMeasured;
+    }
+    apply_pressure_summary(
+        &mut checked,
+        &summary,
+        &summary.hermit_sha,
+        current_tree,
+        &BTreeMap::new(),
+    )?;
+    let result = ObservedResult::parse(&row.result)?;
+    let coordinates = row
+        .verification
+        .as_ref()
+        .map(|report| DivergenceCoordinates {
+            scheduler_turn: report.first_divergent_scheduler_turn,
+            virtual_nanoseconds: report.first_divergent_virtual_nanoseconds,
+            record: report.first_divergent_record,
+            syscall: report.first_divergent_syscall,
+        })
+        .unwrap_or(DivergenceCoordinates {
+            scheduler_turn: None,
+            virtual_nanoseconds: None,
+            record: None,
+            syscall: None,
+        });
+    Ok(CurrentPressureResult {
+        summary,
+        result,
+        coordinates,
+    })
+}
+
+fn read_current_pressure_evidence(
+    root: &Path,
+    summaries: &[PathBuf],
+    tracked: &TrackedCells,
+) -> Result<CurrentPressureEvidence, String> {
+    let history = git_history_ranks(root)?;
+    let current_tree = git_rev_parse(root, "HEAD:detcore")?;
+    let mut results: BTreeMap<CellId, Vec<CurrentPressureResult>> = BTreeMap::new();
+    let mut uncheckable: BTreeMap<CellId, Vec<String>> = BTreeMap::new();
+    let mut offered_rows = 0usize;
+
+    for path in summaries {
+        let summary: PressureSummary = read_json(path)?;
+        offered_rows += summary.rows.len();
+        let summary_problem = if !history.contains_key(&summary.hermit_sha) {
+            Some(format!(
+                "{} belongs to {}, which is not on HEAD's history",
+                path.display(),
+                summary.hermit_sha
+            ))
+        } else {
+            let recorded_tree = git_rev_parse(root, &format!("{}:detcore", summary.hermit_sha))?;
+            if summary.detcore_tree != recorded_tree {
+                Some(format!(
+                    "{} names detcore tree {}, but {} contains {}",
+                    path.display(),
+                    summary.detcore_tree,
+                    summary.hermit_sha,
+                    recorded_tree
+                ))
+            } else if summary.detcore_tree != current_tree {
+                Some(format!(
+                    "{} measured detcore tree {}, but HEAD contains {}",
+                    path.display(),
+                    summary.detcore_tree,
+                    current_tree
+                ))
+            } else {
+                None
+            }
+        };
+
+        for row in &summary.rows {
+            if let Some(problem) = &summary_problem {
+                uncheckable
+                    .entry(row.cell.clone())
+                    .or_default()
+                    .push(problem.clone());
+                continue;
+            }
+            let one = PressureSummary {
+                schema: summary.schema,
+                hermit_sha: summary.hermit_sha.clone(),
+                detcore_tree: summary.detcore_tree.clone(),
+                source_tree_dirty: summary.source_tree_dirty,
+                rows: vec![row.clone()],
+            };
+            match checked_current_pressure_result(tracked, one, &current_tree) {
+                Ok(result) => {
+                    results.entry(row.cell.clone()).or_default().push(result);
+                }
+                Err(error) => {
+                    uncheckable
+                        .entry(row.cell.clone())
+                        .or_default()
+                        .push(format!("{}: {error}", path.display()));
+                }
+            }
+        }
+    }
+    if offered_rows == 0 {
+        return Err("current pressure summaries contain no rows".into());
+    }
+    Ok(CurrentPressureEvidence {
+        results,
+        uncheckable,
+    })
+}
+
+fn retained_coordinate_decision(
+    retained: RetainedCellResults,
+    current: &CurrentPressureEvidence,
+) -> RetainedDecision {
+    let retained_coordinates = retained
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.row.outcome == "FAIL")
+        .map(|candidate| DivergenceCoordinates::from_row(&candidate.row))
+        .filter(|coordinates| !coordinates.is_empty())
+        .collect::<BTreeSet<_>>();
+    let current_results = current
+        .results
+        .get(&retained.id)
+        .cloned()
+        .unwrap_or_default();
+    let current_coordinates = current_results
+        .iter()
+        .filter(|result| result.result.carries_divergence_position())
+        .map(|result| result.coordinates)
+        .filter(|coordinates| !coordinates.is_empty())
+        .collect::<BTreeSet<_>>();
+
+    if let Some(reasons) = current.uncheckable.get(&retained.id) {
+        return RetainedDecision {
+            state: RetainedComparisonState::Uncheckable,
+            import: ImportEvidence::None,
+            retained_coordinates,
+            current_coordinates,
+            reason: reasons.join("; "),
+        };
+    }
+    if current_results.is_empty() {
+        return RetainedDecision {
+            state: RetainedComparisonState::Uncheckable,
+            import: ImportEvidence::None,
+            retained_coordinates,
+            current_coordinates,
+            reason: "no current pressure summary row was supplied".into(),
+        };
+    }
+
+    let result_kinds = current_results
+        .iter()
+        .map(|result| {
+            if result.result == ObservedResult::Pass {
+                "pass"
+            } else if result.result.carries_divergence_position() {
+                "diverged"
+            } else {
+                "no-verdict"
+            }
+        })
+        .collect::<BTreeSet<_>>();
+    if result_kinds == BTreeSet::from(["pass"]) {
+        return RetainedDecision {
+            state: RetainedComparisonState::Wrong,
+            import: ImportEvidence::Current(current_results),
+            retained_coordinates,
+            current_coordinates,
+            reason: "the current canonical comparison matches".into(),
+        };
+    }
+    if result_kinds != BTreeSet::from(["diverged"]) || current_coordinates.is_empty() {
+        return RetainedDecision {
+            state: RetainedComparisonState::Uncheckable,
+            import: ImportEvidence::None,
+            retained_coordinates,
+            current_coordinates,
+            reason: format!(
+                "current pressure summaries do not establish one located divergence result: {}",
+                result_kinds.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        };
+    }
+    if current_coordinates == retained_coordinates {
+        RetainedDecision {
+            state: RetainedComparisonState::Fresh,
+            import: ImportEvidence::Retained(retained),
+            retained_coordinates,
+            current_coordinates,
+            reason: "the current divergence coordinates equal the retained coordinates".into(),
+        }
+    } else {
+        RetainedDecision {
+            state: RetainedComparisonState::Drifted,
+            import: ImportEvidence::Current(current_results),
+            retained_coordinates,
+            current_coordinates,
+            reason: "the current divergence coordinates differ from the retained coordinates"
+                .into(),
+        }
+    }
+}
+
+fn remove_imported_validate_projection(cell: &mut TrackedCell) {
+    let removed_shas = cell
+        .observations
+        .iter()
+        .filter(|observation| {
+            observation.provenance == ObservationProvenance::Validate
+                && !observation.canonical_comparisons.is_empty()
+        })
+        .flat_map(|observation| observation.canonical_comparisons.iter())
+        .map(|comparison| comparison.hermit_sha.clone())
+        .collect::<BTreeSet<_>>();
+    cell.observations.retain(|observation| {
+        observation.provenance != ObservationProvenance::Validate
+            || observation.canonical_comparisons.is_empty()
+    });
+    if cell
+        .last_tested
+        .as_ref()
+        .is_some_and(|last| removed_shas.contains(&last.hermit_sha))
+    {
+        cell.last_tested = None;
+    }
 }
 
 fn git_history_ranks(root: &Path) -> Result<BTreeMap<String, usize>, String> {
@@ -4495,17 +4816,6 @@ fn recorded_shell_quote(value: &str) -> String {
 }
 
 fn self_test() -> Result<(), String> {
-    let retained_states = [
-        retained_comparison_state(Some("head"), "head"),
-        retained_comparison_state(Some("ancestor"), "head"),
-        retained_comparison_state(None, "head"),
-    ];
-    if retained_states != ["fresh", "stale", "NO_RESULT"] {
-        return Err(format!(
-            "retained comparison state collapsed fresh, stale, and NO_RESULT: {:?}",
-            retained_states
-        ));
-    }
     let summary = fresh_result_summary(172, "fixture-sha", 170, 2, 2);
     let expected_summary = "Fresh result check: 172/172 selected cells passed at fixture-sha \
 (170 compatibility green, including 2 chaos; 2 custom outside the comparable denominator).";
@@ -4947,6 +5257,25 @@ fn self_test() -> Result<(), String> {
     );
     apply_pressure_summary(&mut observed, &campaign, "sha-1", "tree-1", &depth_fixture)
         .map_err(|e| format!("pressure-observation campaign bracket failed: {e}"))?;
+    let once = encoded_cells(&observed)?;
+    let mut repeated = observed.clone();
+    apply_pressure_summary(&mut repeated, &campaign, "sha-1", "tree-1", &depth_fixture)
+        .map_err(|e| format!("repeated pressure-observation bracket failed: {e}"))?;
+    let twice = encoded_cells(&repeated)?;
+    if twice != once {
+        let first_difference = once
+            .lines()
+            .zip(twice.lines())
+            .enumerate()
+            .find(|(_, (left, right))| left != right)
+            .map(|(index, (left, right))| {
+                format!("line {}: once={left:?} twice={right:?}", index + 1)
+            })
+            .unwrap_or_else(|| format!("byte lengths differ: {} vs {}", once.len(), twice.len()));
+        return Err(format!(
+            "reapplying one pressure summary changed the stored observation: {first_difference}"
+        ));
+    }
     let same_engine = pressure_summary("sha-doc", "tree-1", vec![pressure_row("pass", None, None)]);
     apply_pressure_summary(
         &mut observed,
@@ -5138,6 +5467,284 @@ fn self_test() -> Result<(), String> {
         first_divergent_syscall: Some(9),
         attempts: vec![validate_attempt("FAIL")],
     };
+
+    let validate_candidate = |run_id: &str, coordinates: DivergenceCoordinates| {
+        let mut row = validate_row.clone();
+        row.run_id = run_id.into();
+        row.first_divergent_scheduler_turn = coordinates.scheduler_turn;
+        row.first_divergent_virtual_nanoseconds = coordinates.virtual_nanoseconds;
+        row.first_divergent_record = coordinates.record;
+        row.first_divergent_syscall = coordinates.syscall;
+        let mut report: JsonValue = serde_json::from_str(
+            row.attempts[0]["verification_report"]
+                .as_str()
+                .expect("fixture report is a string"),
+        )
+        .expect("fixture report is JSON");
+        report["first_divergent_scheduler_turn"] = serde_json::json!(coordinates.scheduler_turn);
+        report["first_divergent_virtual_nanoseconds"] =
+            serde_json::json!(coordinates.virtual_nanoseconds);
+        report["first_divergent_record"] = serde_json::json!(coordinates.record);
+        report["first_divergent_syscall"] = serde_json::json!(coordinates.syscall);
+        let report = serde_json::to_string(&report).expect("fixture report serializes");
+        row.attempts[0]["verification_report_sha256"] =
+            JsonValue::String(format!("{:x}", Sha256::digest(report.as_bytes())));
+        row.attempts[0]["verification_report"] = JsonValue::String(report);
+        let evidence_identity = row.evidence_identity().expect("fixture has identity");
+        ResultCandidate {
+            evidence_identity,
+            path: PathBuf::from("fixture/results.jsonl"),
+            row,
+        }
+    };
+    let pressure_at = |result: &str, coordinates: DivergenceCoordinates| {
+        let mut row = pressure_row(
+            result,
+            coordinates.scheduler_turn,
+            coordinates.virtual_nanoseconds,
+        );
+        row.verification = Some(PressureVerification {
+            first_divergent_scheduler_turn: coordinates.scheduler_turn,
+            first_divergent_virtual_nanoseconds: coordinates.virtual_nanoseconds,
+            first_divergent_record: coordinates.record,
+            first_divergent_syscall: coordinates.syscall,
+        });
+        row
+    };
+    let current_result = |row: PressureSummaryRow| {
+        let result = ObservedResult::parse(&row.result).expect("fixture result parses");
+        let coordinates = row
+            .verification
+            .as_ref()
+            .map(|report| DivergenceCoordinates {
+                scheduler_turn: report.first_divergent_scheduler_turn,
+                virtual_nanoseconds: report.first_divergent_virtual_nanoseconds,
+                record: report.first_divergent_record,
+                syscall: report.first_divergent_syscall,
+            })
+            .unwrap_or(DivergenceCoordinates {
+                scheduler_turn: None,
+                virtual_nanoseconds: None,
+                record: None,
+                syscall: None,
+            });
+        CurrentPressureResult {
+            summary: pressure_summary("sha-1", "tree-1", vec![row]),
+            result,
+            coordinates,
+        }
+    };
+    let retained_cell = |candidates: Vec<ResultCandidate>| RetainedCellResults {
+        id: validate_id.clone(),
+        hermit_sha: "sha-1".into(),
+        detcore_tree: "tree-1".into(),
+        depth: depth_fixture.clone(),
+        candidates,
+    };
+    let coordinates = |turn, virtual_nanoseconds, record, syscall| DivergenceCoordinates {
+        scheduler_turn: turn,
+        virtual_nanoseconds,
+        record,
+        syscall,
+    };
+
+    let mut mismatched_coordinates = validate_candidate(
+        "mismatched-coordinate",
+        coordinates(Some(3), Some(30), Some(16), Some(7)),
+    );
+    mismatched_coordinates.row.first_divergent_record = Some(17);
+    if mismatched_coordinates.row.bitwise_info_comparison().is_ok() {
+        return Err(
+            "a top-level divergence coordinate that disagreed with its embedded report was accepted"
+                .into(),
+        );
+    }
+
+    // FOUR RETAINED-COMPARISON OUTCOMES. These use the measured shapes that
+    // forced the distinction: 16 stayed 16; 111/119 moved to 117; 407 now
+    // matches; and 330 cannot be checked because the current row is rejected.
+    let fresh_coordinates = coordinates(Some(3), Some(30), Some(16), Some(7));
+    let fresh = retained_coordinate_decision(
+        retained_cell(vec![validate_candidate(
+            "fresh-retained",
+            fresh_coordinates,
+        )]),
+        &CurrentPressureEvidence {
+            results: BTreeMap::from([(
+                validate_id.clone(),
+                vec![current_result(pressure_at(
+                    "determinism-failure",
+                    fresh_coordinates,
+                ))],
+            )]),
+            uncheckable: BTreeMap::new(),
+        },
+    );
+    if fresh.state != RetainedComparisonState::Fresh
+        || !matches!(fresh.import, ImportEvidence::Retained(_))
+    {
+        return Err("equal retained and current coordinates were not FRESH".into());
+    }
+
+    for (label, changed) in [
+        (
+            "scheduler turn",
+            coordinates(Some(4), Some(30), Some(16), Some(7)),
+        ),
+        (
+            "virtual nanoseconds",
+            coordinates(Some(3), Some(31), Some(16), Some(7)),
+        ),
+        ("record", coordinates(Some(3), Some(30), Some(17), Some(7))),
+        ("syscall", coordinates(Some(3), Some(30), Some(16), Some(8))),
+    ] {
+        let changed_decision = retained_coordinate_decision(
+            retained_cell(vec![validate_candidate(
+                "field-retained",
+                fresh_coordinates,
+            )]),
+            &CurrentPressureEvidence {
+                results: BTreeMap::from([(
+                    validate_id.clone(),
+                    vec![current_result(pressure_at("determinism-failure", changed))],
+                )]),
+                uncheckable: BTreeMap::new(),
+            },
+        );
+        if changed_decision.state != RetainedComparisonState::Drifted {
+            return Err(format!(
+                "changing only the {label} coordinate did not produce DRIFTED"
+            ));
+        }
+    }
+
+    let drifted = retained_coordinate_decision(
+        retained_cell(vec![
+            validate_candidate(
+                "drifted-retained-a",
+                coordinates(Some(3), Some(30), Some(111), Some(7)),
+            ),
+            validate_candidate(
+                "drifted-retained-b",
+                coordinates(Some(3), Some(30), Some(119), Some(7)),
+            ),
+        ]),
+        &CurrentPressureEvidence {
+            results: BTreeMap::from([(
+                validate_id.clone(),
+                vec![current_result(pressure_at(
+                    "determinism-failure",
+                    coordinates(Some(3), Some(30), Some(117), Some(7)),
+                ))],
+            )]),
+            uncheckable: BTreeMap::new(),
+        },
+    );
+    if drifted.state != RetainedComparisonState::Drifted
+        || !matches!(drifted.import, ImportEvidence::Current(_))
+    {
+        return Err("changed retained coordinates were not replaced as DRIFTED".into());
+    }
+
+    let mut pass_row = pressure_at("pass", coordinates(None, None, None, None));
+    pass_row.verification = None;
+    let wrong = retained_coordinate_decision(
+        retained_cell(vec![validate_candidate(
+            "wrong-retained",
+            coordinates(Some(3), Some(30), Some(407), Some(7)),
+        )]),
+        &CurrentPressureEvidence {
+            results: BTreeMap::from([(validate_id.clone(), vec![current_result(pass_row)])]),
+            uncheckable: BTreeMap::new(),
+        },
+    );
+    if wrong.state != RetainedComparisonState::Wrong
+        || !matches!(wrong.import, ImportEvidence::Current(_))
+    {
+        return Err("a retained divergence whose current comparison matches was not WRONG".into());
+    }
+
+    let mut uncheckable_row = pressure_at(
+        "infrastructure-error",
+        coordinates(Some(3), Some(30), Some(330), Some(7)),
+    );
+    uncheckable_row.evidence_errors = vec![
+        "terminal verify result must retain exactly one nonempty run1 log and one nonempty run2 log"
+            .into(),
+    ];
+    let uncheckable_summary = pressure_summary("sha-1", "tree-1", vec![uncheckable_row]);
+    let uncheckable_error = checked_current_pressure_result(
+        &TrackedCells {
+            schema: SCHEMA,
+            projection: None,
+            cells: vec![TrackedCell {
+                id: validate_id.clone(),
+                enabled: true,
+                status: CellStatus::Red,
+                ci_disabled_reason: None,
+                not_applicable_reason: None,
+                last_tested: None,
+                observations: Vec::new(),
+                measurement: MeasurementState::NeverMeasured,
+                green_removal_reason: None,
+            }],
+        },
+        uncheckable_summary,
+        "tree-1",
+    )
+    .err()
+    .ok_or("a current row with missing retained logs was accepted")?;
+    let uncheckable = retained_coordinate_decision(
+        retained_cell(vec![validate_candidate(
+            "uncheckable-retained",
+            coordinates(Some(3), Some(30), Some(330), Some(7)),
+        )]),
+        &CurrentPressureEvidence {
+            results: BTreeMap::new(),
+            uncheckable: BTreeMap::from([(validate_id.clone(), vec![uncheckable_error])]),
+        },
+    );
+    if uncheckable.state != RetainedComparisonState::Uncheckable
+        || !matches!(uncheckable.import, ImportEvidence::None)
+    {
+        return Err("an untrustworthy current comparison was not UNCHECKABLE".into());
+    }
+    if checked_current_pressure_result(
+        &TrackedCells {
+            schema: SCHEMA,
+            projection: None,
+            cells: vec![TrackedCell {
+                id: validate_id.clone(),
+                enabled: true,
+                status: CellStatus::Red,
+                ci_disabled_reason: None,
+                not_applicable_reason: None,
+                last_tested: None,
+                observations: Vec::new(),
+                measurement: MeasurementState::NeverMeasured,
+                green_removal_reason: None,
+            }],
+        },
+        pressure_summary("sha-1", "tree-1", Vec::new()),
+        "tree-1",
+    )
+    .is_ok()
+    {
+        return Err("an empty current pressure summary was accepted".into());
+    }
+
+    let red_import_fixture = Derived {
+        population: BTreeSet::from([validate_id.clone()]),
+        enabled: BTreeSet::from([validate_id.clone()]),
+        ci_disabled_reasons: BTreeMap::new(),
+        not_applicable_reasons: BTreeMap::new(),
+        selected: BTreeSet::new(),
+        green: BTreeSet::new(),
+    };
+    if retained_import_cells(&red_import_fixture) != BTreeSet::from([validate_id.clone()]) {
+        return Err("an enabled red cell was excluded from retained import".into());
+    }
+
     let rows = BTreeMap::from([(
         validate_id.clone(),
         vec![ResultCandidate {
@@ -5154,7 +5761,7 @@ fn self_test() -> Result<(), String> {
         &depth_fixture,
         true,
     )
-        .map_err(|e| format!("validate-observation bracket failed: {e}"))?;
+    .map_err(|e| format!("validate-observation bracket failed: {e}"))?;
     let pressure = observed.cells[0]
         .observations
         .iter()
@@ -5337,6 +5944,17 @@ fn self_test() -> Result<(), String> {
         row.first_divergent_record = None;
         row.first_divergent_syscall = None;
         row.attempts = vec![validate_attempt(outcome)];
+        if let Some(report_text) = row.attempts[0]["verification_report"].as_str() {
+            let mut report: JsonValue = serde_json::from_str(report_text).unwrap();
+            report["first_divergent_scheduler_turn"] = JsonValue::Null;
+            report["first_divergent_virtual_nanoseconds"] = JsonValue::Null;
+            report["first_divergent_record"] = JsonValue::Null;
+            report["first_divergent_syscall"] = JsonValue::Null;
+            let report = serde_json::to_string(&report).unwrap();
+            row.attempts[0]["verification_report_sha256"] =
+                JsonValue::String(format!("{:x}", Sha256::digest(report.as_bytes())));
+            row.attempts[0]["verification_report"] = JsonValue::String(report);
+        }
         BTreeMap::from([(
             id.clone(),
             vec![ResultCandidate {
@@ -5412,70 +6030,6 @@ fn self_test() -> Result<(), String> {
              measurement"
                 .into(),
         );
-    }
-
-    // SCORECARD COLOUR BRACKET. Selection is necessary but cannot manufacture
-    // a green by itself. A latest imported pass makes the selected cell green;
-    // a same-SHA divergence makes it red; and a later pass can recover without
-    // deleting the older observation. The selected set never changes across
-    // these transitions, so the bracket cannot pass by moving the plan.
-    let selected_fixture = Derived {
-        population: BTreeSet::from([unlocated_id.clone()]),
-        enabled: BTreeSet::from([unlocated_id.clone()]),
-        ci_disabled_reasons: BTreeMap::new(),
-        not_applicable_reasons: BTreeMap::new(),
-        selected: BTreeSet::from([unlocated_id.clone()]),
-        green: BTreeSet::from([unlocated_id.clone()]),
-    };
-    refresh_score(&selected_fixture, &mut passed);
-    if passed.cells[0].status != CellStatus::Green {
-        return Err("a selected cell with a latest canonical pass did not become green".into());
-    }
-    apply_validate_results(
-        &mut passed,
-        &coordinate_less_row(&unlocated_id, "FAIL"),
-        "sha-1",
-        "tree-1",
-        &depth_fixture,
-        true,
-    )
-    .map_err(|e| format!("same-SHA divergence score bracket failed: {e}"))?;
-    refresh_measurement(&mut passed);
-    refresh_score(&selected_fixture, &mut passed);
-    if passed.cells[0].status != CellStatus::Red {
-        return Err("a selected cell with a same-SHA canonical divergence stayed green".into());
-    }
-    let mut later_pass_rows = coordinate_less_row(&unlocated_id, "PASS");
-    later_pass_rows.get_mut(&unlocated_id).unwrap()[0]
-        .row
-        .hermit_sha = "sha-2".into();
-    let mut later_depth = depth_fixture.clone();
-    later_depth.get_mut("hermit").unwrap().commits += 1;
-    later_depth.get_mut("hermit").unwrap().first_parent += 1;
-    apply_validate_results(
-        &mut passed,
-        &later_pass_rows,
-        "sha-2",
-        "tree-2",
-        &later_depth,
-        true,
-    )
-    .map_err(|e| format!("later-pass score bracket failed: {e}"))?;
-    refresh_measurement(&mut passed);
-    refresh_score(&selected_fixture, &mut passed);
-    if passed.cells[0].status != CellStatus::Green {
-        return Err(
-            "a later canonical pass did not supersede an older divergence for colour".into(),
-        );
-    }
-    let unselected_fixture = Derived {
-        selected: BTreeSet::new(),
-        green: BTreeSet::new(),
-        ..selected_fixture
-    };
-    refresh_score(&unselected_fixture, &mut passed);
-    if passed.cells[0].status != CellStatus::Red {
-        return Err("an unselected canonical pass was promoted to green".into());
     }
 
     let mut weak_rows = coordinate_less_row(&unlocated_id, "PASS");
@@ -6519,7 +7073,7 @@ fn self_test() -> Result<(), String> {
     }
 
     println!(
-        "compatibility scorecard self-test: retained-comparison-state, provenance, distinct-evidence, result, selected-chaos, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, source-identity, writer-boundary, projection, path-independence, infrastructure-refusal, and divergence-without-a-comparison brackets pass"
+        "compatibility scorecard self-test: retained-comparison FRESH/DRIFTED/WRONG/UNCHECKABLE, provenance, distinct-evidence, result, selected-chaos, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, source-identity, writer-boundary, projection, path-independence, infrastructure-refusal, and divergence-without-a-comparison brackets pass"
     );
     Ok(())
 }
