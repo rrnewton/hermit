@@ -148,7 +148,7 @@ const EXEMPT_FILES: [(&str, &str); 1] = [(
 /// ⚠️ This is a RATCHET, not a target. It may only go down. Lowering it is the
 /// migration: give each site an `EXIT-CLASS:` or a typed `ExpectedExit`, and for a
 /// hermit-chosen value use `HERMIT_INTERNAL_FAILURE_EXIT` rather than `125`.
-const BASELINE: usize = 17;
+const BASELINE: usize = 13;
 
 const REQUIRED_SCAN_ROOTS: [&str; 3] = ["hermit-cli/tests", "detcore/tests", "tests"];
 
