@@ -1109,8 +1109,8 @@ impl GlobalTool for GlobalState {
                 )
                 .await,
             ),
-            GlobalRequest::RobustListWakes(owner, wakes) => {
-                R::RobustListWakes(self.recv_robust_list_wakes(owner, wakes))
+            GlobalRequest::RobustListWakes(wakes) => {
+                R::RobustListWakes(self.recv_robust_list_wakes(wakes))
             }
             GlobalRequest::DeterminizeInode(ino) => {
                 R::DeterminizeInode(self.recv_determinize_inode(from, ino).await)
@@ -1902,12 +1902,9 @@ impl GlobalState {
         }
     }
 
-    fn recv_robust_list_wakes(&self, owner: DetTid, wakes: Vec<FutexID>) -> Vec<u64> {
+    fn recv_robust_list_wakes(&self, wakes: Vec<(DetTid, FutexID)>) -> Vec<u64> {
         let mut sched = self.sched.lock().unwrap();
-        wakes
-            .into_iter()
-            .map(|futex| sched.wake_futex_waiters(owner, futex, 1, u32::MAX))
-            .collect()
+        sched.wake_futex_waiters_after_exit(&wakes)
     }
 
     async fn recv_determinize_inode(&self, from: Tid, ino: RawInode) -> (DetInode, LogicalTime) {
@@ -2396,7 +2393,7 @@ pub enum GlobalRequest {
 
     /// Deliver robust-futex wakes collected before exit after the backend has
     /// confirmed that Linux's physical task cleanup completed.
-    RobustListWakes(DetTid, Vec<FutexID>),
+    RobustListWakes(Vec<(DetTid, FutexID)>),
 }
 
 /// Responses from the global object
@@ -2837,8 +2834,7 @@ pub(crate) async fn robust_list_wakes_after_exit<R>(
     threads_time: DetTime,
     reverie: &R,
     mm: MmId,
-    owner: DetTid,
-    wakes: Vec<RobustListWake>,
+    wakes: Vec<(DetTid, RobustListWake)>,
 ) -> Vec<u64>
 where
     R: GlobalRPC<GlobalState>,
@@ -2851,8 +2847,10 @@ where
             threads_time,
             mm,
             GlobalRequest::RobustListWakes(
-                owner,
-                wakes.into_iter().map(|wake| wake.futex).collect(),
+                wakes
+                    .into_iter()
+                    .map(|(owner, wake)| (owner, wake.futex))
+                    .collect(),
             ),
         ))
         .await;

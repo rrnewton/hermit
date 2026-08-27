@@ -1612,6 +1612,7 @@ pub(crate) struct PendingRobustListWakes {
 pub(crate) struct RobustListProcessState {
     heads: BTreeMap<DetTid, usize>,
     pending: BTreeMap<DetTid, PendingRobustListWakes>,
+    matched_physical_exits: BTreeMap<DetTid, DetTime>,
 }
 
 impl GuestClock {
@@ -2153,24 +2154,66 @@ impl<T> ThreadState<T> {
 
     pub(crate) fn stage_robust_list_wakes(
         &self,
-        owner: DetTid,
         reason: RobustListExit,
-        wakes: Vec<RobustListWake>,
+        wakes: Vec<(DetTid, Vec<RobustListWake>)>,
     ) {
-        self.robust_list_process
+        let mut process = self
+            .robust_list_process
             .lock()
-            .expect("robust-list process state mutex poisoned")
-            .pending
-            .insert(owner, PendingRobustListWakes { reason, wakes });
+            .expect("robust-list process state mutex poisoned");
+        process.pending = wakes
+            .into_iter()
+            .map(|(owner, wakes)| (owner, PendingRobustListWakes { reason, wakes }))
+            .collect();
+        process.matched_physical_exits.clear();
     }
 
-    pub(crate) fn take_robust_list_wakes(&self) -> Option<PendingRobustListWakes> {
+    pub(crate) fn take_robust_list_wakes_after_exit(
+        &self,
+        exit_signal: Option<i32>,
+        exit_time: DetTime,
+    ) -> Option<(DetTime, Vec<(DetTid, RobustListWake)>)> {
         let mut process = self
             .robust_list_process
             .lock()
             .expect("robust-list process state mutex poisoned");
         process.heads.remove(&self.dettid);
-        process.pending.remove(&self.dettid)
+        let pending = process.pending.get(&self.dettid)?;
+        let matches = match pending.reason {
+            RobustListExit::ExitGroup => true,
+            RobustListExit::Signal(expected) => exit_signal == Some(expected),
+        };
+        if !matches {
+            return None;
+        }
+
+        process
+            .matched_physical_exits
+            .insert(self.dettid, exit_time);
+        if process
+            .pending
+            .keys()
+            .any(|owner| !process.matched_physical_exits.contains_key(owner))
+        {
+            return None;
+        }
+
+        let request_time = process
+            .matched_physical_exits
+            .values()
+            .max()
+            .expect("a completed robust-list exit group has a physical-exit time")
+            .clone();
+        process.matched_physical_exits.clear();
+        let pending = std::mem::take(&mut process.pending);
+        let mut ready = Vec::new();
+        for (owner, mut pending) in pending {
+            pending
+                .wakes
+                .sort_by_key(|wake| format!("{:?}", wake.futex));
+            ready.extend(pending.wakes.into_iter().map(|wake| (owner, wake)));
+        }
+        Some((request_time, ready))
     }
 
     /// Clear the robust-list head for a candidate `execve` image, returning the
@@ -2804,28 +2847,118 @@ mod timeslice_tests {
         );
     }
 
-    #[test]
-    fn physical_exit_takes_only_its_own_staged_robust_list_wakes() {
-        let mut state = ThreadState::<()>::new(DetTid::from_raw(3), &Config::default(), ());
-        state.record_robust_list_head(Some(0x404100));
-        let wake = RobustListWake {
-            futex: FutexID::private(MmId::initial(DetTid::from_raw(3)), 0x4040),
+    fn two_owner_robust_list_state() -> (
+        ThreadState<()>,
+        ThreadState<()>,
+        RobustListWake,
+        RobustListWake,
+        RobustListWake,
+    ) {
+        let first_owner = DetTid::from_raw(3);
+        let second_owner = DetTid::from_raw(4);
+        let mm = MmId::initial(first_owner);
+        let lower = RobustListWake {
+            futex: FutexID::private(mm, 0x4040),
         };
-        state.stage_robust_list_wakes(
-            DetTid::from_raw(3),
+        let middle = RobustListWake {
+            futex: FutexID::private(mm, 0x5050),
+        };
+        let higher = RobustListWake {
+            futex: FutexID::private(mm, 0x6060),
+        };
+        let mut first = ThreadState::<()>::new(first_owner, &Config::default(), ());
+        let mut second = first.clone();
+        second.dettid = second_owner;
+        first.record_robust_list_head(Some(0x404100));
+        second.record_robust_list_head(Some(0x404200));
+        first.stage_robust_list_wakes(
             RobustListExit::Signal(libc::SIGTERM),
-            vec![wake],
+            vec![
+                (second_owner, vec![higher]),
+                (first_owner, vec![middle, lower]),
+            ],
         );
+        (first, second, lower, middle, higher)
+    }
+
+    #[test]
+    fn group_robust_list_wakes_wait_for_every_owner_and_sort_the_request() {
+        let (first, second, lower, middle, higher) = two_owner_robust_list_state();
+        let mut first_time = DetTime::default();
+        first_time.add_syscall();
+        let mut second_time = first_time.clone();
+        second_time.add_syscall();
 
         assert_eq!(
-            state.take_robust_list_wakes(),
-            Some(PendingRobustListWakes {
-                reason: RobustListExit::Signal(libc::SIGTERM),
-                wakes: vec![wake],
-            })
+            second.take_robust_list_wakes_after_exit(Some(libc::SIGTERM), second_time.clone()),
+            None,
+            "the first physical exit must not release part of the group"
         );
-        assert!(state.robust_list_heads().is_empty());
-        assert_eq!(state.take_robust_list_wakes(), None);
+        assert_eq!(
+            first.take_robust_list_wakes_after_exit(Some(libc::SIGTERM), first_time),
+            Some((
+                second_time,
+                vec![
+                    (DetTid::from_raw(3), lower),
+                    (DetTid::from_raw(3), middle),
+                    (DetTid::from_raw(4), higher),
+                ],
+            )),
+            "the final matching exit releases one owner/futex-sorted request"
+        );
+    }
+
+    #[test]
+    fn group_robust_list_wake_request_is_independent_of_exit_arrival_order() {
+        let release = |reverse: bool| {
+            let (first, second, _, _, _) = two_owner_robust_list_state();
+            let first_time = DetTime::default();
+            let mut second_time = first_time.clone();
+            second_time.add_syscall();
+            if reverse {
+                assert_eq!(
+                    second.take_robust_list_wakes_after_exit(
+                        Some(libc::SIGTERM),
+                        second_time.clone(),
+                    ),
+                    None
+                );
+                first.take_robust_list_wakes_after_exit(Some(libc::SIGTERM), first_time)
+            } else {
+                assert_eq!(
+                    first.take_robust_list_wakes_after_exit(Some(libc::SIGTERM), first_time),
+                    None
+                );
+                second.take_robust_list_wakes_after_exit(Some(libc::SIGTERM), second_time)
+            }
+        };
+
+        assert_eq!(release(false), release(true));
+    }
+
+    #[test]
+    fn mismatched_or_nonfatal_exit_does_not_release_group_robust_list_wakes() {
+        let (first, second, _, _, _) = two_owner_robust_list_state();
+        assert_eq!(
+            first.take_robust_list_wakes_after_exit(Some(libc::SIGKILL), DetTime::default()),
+            None
+        );
+        assert_eq!(
+            second.take_robust_list_wakes_after_exit(Some(libc::SIGTERM), DetTime::default()),
+            None,
+            "one matching owner cannot release a group whose peer exited for another reason"
+        );
+
+        let (first, second, _, _, _) = two_owner_robust_list_state();
+        assert_eq!(
+            first.take_robust_list_wakes_after_exit(None, DetTime::default()),
+            None
+        );
+        assert_eq!(
+            second.take_robust_list_wakes_after_exit(Some(libc::SIGTERM), DetTime::default()),
+            None,
+            "a normal exit must not satisfy a staged fatal-signal exit"
+        );
     }
 
     #[test]
