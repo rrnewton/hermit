@@ -2,6 +2,23 @@
 
 set -uo pipefail
 
+function write_structured_test_counts {
+    local executed=$1 filtered=$2 path=${DAGRUN_TEST_COUNTS_PATH:-} tmp
+    [[ -n $path ]] || return 0
+    tmp="${path}.tmp.$$"
+    umask 077
+    if ! printf '{"schema":1,"executed_tests":%s,"filtered_tests":%s}\n' \
+        "$executed" "$filtered" >"$tmp"; then
+        printf 'run-nextest-counted: cannot write structured test counts to %s\n' "$tmp" >&2
+        return 2
+    fi
+    if ! mv -f -- "$tmp" "$path"; then
+        rm -f -- "$tmp"
+        printf 'run-nextest-counted: cannot publish structured test counts to %s\n' "$path" >&2
+        return 2
+    fi
+}
+
 function emit_libtest_count {
     local log=$1 status=${2:-0} line finished='' initial='' passed=0 failed=0
     local exec_failed=0 timed_out=0 skipped=0 summary='' categories='' completed=0 executed=0
@@ -62,9 +79,14 @@ function emit_libtest_count {
         return 2
     fi
 
-    # dagrun consumes canonical libtest counts from complete step
-    # output. Nextest's human summary is equally authoritative but has a
-    # different spelling, so restate that one parsed summary without guessing.
+    # The human lines below remain useful in logs, but receipt-bearing dagrun
+    # clients consume this exact file instead. A command that merely prints a
+    # libtest-looking banner therefore cannot manufacture an executed-test
+    # count.
+    write_structured_test_counts "$executed" "$skipped" || return $?
+
+    # Preserve the canonical libtest spelling for human-facing logs and older
+    # dagrun clients that have not required the structured count file.
     if ((status == 0)); then
         printf 'running %s tests\n' "$executed"
         printf 'test result: ok. %s passed; 0 failed; 0 ignored; %s filtered out\n' \
@@ -106,6 +128,13 @@ function self_test {
     got=$(emit_libtest_count "$scratch/with-skips" 0)
     expected=$'running 8 tests\ntest result: ok. 8 passed; 0 failed; 0 ignored; 7 filtered out'
     [[ $got == "$expected" ]] || return 1
+
+    rm -f "$scratch/counts.json"
+    got=$(DAGRUN_TEST_COUNTS_PATH="$scratch/counts.json" \
+        emit_libtest_count "$scratch/with-skips" 0)
+    [[ $got == "$expected" ]] || return 1
+    [[ $(<"$scratch/counts.json") == \
+        '{"schema":1,"executed_tests":8,"filtered_tests":7}' ]] || return 1
 
     printf 'Summary [   0.003s] 1 test run: 1 passed\n' >"$scratch/no-skips"
     got=$(emit_libtest_count "$scratch/no-skips" 0)

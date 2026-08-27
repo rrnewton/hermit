@@ -36,6 +36,8 @@ Exit 0 = all assertions pass, 1 = a real failure.
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -206,6 +208,29 @@ def main() -> int:
         check(
             "evidence" in non_columns and "tier_evidence" not in non_columns,
             "allowlist admits `evidence` and does NOT admit the planted key",
+        )
+
+        # The scheduler must consume a producer-owned file, not a line that a
+        # test can counterfeit on stdout. The file is exact, atomic and absent
+        # when no scheduler-owned destination was provided.
+        counts = workdir / "counts.json"
+        prior = os.environ.get("DAGRUN_TEST_COUNTS_PATH")
+        os.environ["DAGRUN_TEST_COUNTS_PATH"] = str(counts)
+        try:
+            rm.write_structured_test_counts(27, 0)
+        finally:
+            if prior is None:
+                os.environ.pop("DAGRUN_TEST_COUNTS_PATH", None)
+            else:
+                os.environ["DAGRUN_TEST_COUNTS_PATH"] = prior
+        check(
+            json.loads(counts.read_text(encoding="utf-8"))
+            == {"schema": 1, "executed_tests": 27, "filtered_tests": 0},
+            "structured DBT count records 27 executed cases",
+        )
+        check(
+            not list(workdir.glob("counts.json.tmp.*")),
+            "structured DBT count leaves no temporary file",
         )
 
     print()

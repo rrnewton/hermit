@@ -52,6 +52,11 @@ pub struct RetainedCellResults {
     pub evidence: Value,
 }
 
+#[derive(Debug)]
+pub struct RetainedCoverageEvidence {
+    pub evidence: Value,
+}
+
 fn hex_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -299,6 +304,259 @@ pub fn expected_plan(repo_root: &Path) -> Result<Vec<Value>, String> {
         .collect()
 }
 
+fn string_set(value: &Value, key: &str) -> Result<BTreeSet<String>, String> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("test-binary registration has no {key} array"))?
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .filter(|name| !name.trim().is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| format!("test-binary registration {key} contains a non-name"))
+        })
+        .collect()
+}
+
+fn enabled_cell_scope(cell: &Value) -> Result<Value, String> {
+    let mut scoped = identity(cell)?
+        .as_object()
+        .cloned()
+        .ok_or("cell identity was not an object")?;
+    for key in ["status", "measurement", "reason", "last_tested", "observations"] {
+        if let Some(value) = cell.get(key) {
+            scoped.insert(key.into(), value.clone());
+        }
+    }
+    let mut passes = 0u64;
+    let mut failures = 0u64;
+    let mut other = BTreeMap::<String, u64>::new();
+    for result in cell
+        .get("observations")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|observation| observation.get("results").and_then(Value::as_array))
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        match result {
+            "pass" => passes += 1,
+            "fail" => failures += 1,
+            value => *other.entry(value.to_string()).or_default() += 1,
+        }
+    }
+    scoped.insert("observed_pass_count".into(), serde_json::json!(passes));
+    scoped.insert("observed_fail_count".into(), serde_json::json!(failures));
+    scoped.insert("observed_other_results".into(), serde_json::json!(other));
+    Ok(Value::Object(scoped))
+}
+
+fn coverage_document(
+    plan_name: &str,
+    selection_mode: &str,
+    planned_nodes: &BTreeSet<String>,
+    planned_test_nodes: &BTreeSet<String>,
+    test_node_coverage: &Value,
+    selected: &[Value],
+    cells_document: &Value,
+    registration: &Value,
+) -> Result<Value, String> {
+    let selected: BTreeMap<_, _> = selected
+        .iter()
+        .map(|cell| Ok((sort_key(cell)?, cell.clone())))
+        .collect::<Result<_, String>>()?;
+    let enabled: BTreeMap<_, _> = cells_document
+        .get("cells")
+        .and_then(Value::as_array)
+        .ok_or("ci/compat-envelope/cells.json has no cells array")?
+        .iter()
+        .filter(|cell| cell.get("enabled").and_then(Value::as_bool) == Some(true))
+        .map(|cell| {
+            let id = identity(cell)?;
+            Ok((sort_key(&id)?, enabled_cell_scope(cell)?))
+        })
+        .collect::<Result<_, String>>()?;
+    let selected_and_enabled = selected.keys().filter(|key| enabled.contains_key(*key)).count();
+    let enabled_not_selected: Vec<Value> = enabled
+        .iter()
+        .filter(|(key, _)| !selected.contains_key(*key))
+        .map(|(_, value)| value.clone())
+        .collect();
+    let selected_not_enabled: Vec<Value> = selected
+        .iter()
+        .filter(|(key, _)| !enabled.contains_key(*key))
+        .map(|(_, value)| value.clone())
+        .collect();
+
+    if registration.get("schema").and_then(Value::as_u64) != Some(1) {
+        return Err("test-binary registration has unsupported schema".into());
+    }
+    let present = string_set(registration, "present")?;
+    let ci_registered = string_set(registration, "ci_registered")?;
+    let none_recorded = string_set(registration, "none_recorded")?;
+    let undeclared = string_set(registration, "undeclared")?;
+    let reason_rows = registration
+        .get("reason_recorded")
+        .and_then(Value::as_array)
+        .ok_or("test-binary registration has no reason_recorded array")?;
+    let reason_recorded: BTreeSet<String> = reason_rows
+        .iter()
+        .map(|row| string(row, "binary").map(str::to_string))
+        .collect::<Result<_, _>>()?;
+    let accounted: BTreeSet<String> = ci_registered
+        .iter()
+        .chain(reason_recorded.iter())
+        .chain(none_recorded.iter())
+        .chain(undeclared.iter())
+        .cloned()
+        .collect();
+    if accounted != present
+        || !ci_registered.is_disjoint(&reason_recorded)
+        || !ci_registered.is_disjoint(&none_recorded)
+        || !ci_registered.is_disjoint(&undeclared)
+        || !reason_recorded.is_disjoint(&none_recorded)
+        || !reason_recorded.is_disjoint(&undeclared)
+        || !none_recorded.is_disjoint(&undeclared)
+    {
+        return Err("test-binary registration does not form an exact partition".into());
+    }
+
+    Ok(serde_json::json!({
+        "schema": 1,
+        "plan": {
+            "name": plan_name,
+            "selection_mode": selection_mode,
+            "outer_node_count": planned_nodes.len(),
+            "outer_nodes": planned_nodes,
+        },
+        "test_nodes": {
+            "planned": planned_test_nodes,
+            "coverage": test_node_coverage,
+        },
+        "e2e": {
+            "selected_count": selected.len(),
+            "enabled_count": enabled.len(),
+            "selected_and_enabled_count": selected_and_enabled,
+            "enabled_not_selected_count": enabled_not_selected.len(),
+            "selected_not_enabled_count": selected_not_enabled.len(),
+            "selected": selected.into_values().collect::<Vec<_>>(),
+            "enabled_not_selected": enabled_not_selected,
+            "selected_not_enabled": selected_not_enabled,
+        },
+        "integration_test_binaries": registration,
+    }))
+}
+
+/// Retain the exact test population around a full run, including work outside
+/// the selected set. This is reporting, not an exemption: a reader can tell a
+/// selected cell from an enabled cell that ordinary validation never selected,
+/// and can see every integration-test binary outside the CI DAG.
+pub fn retain_coverage_evidence(
+    parent: &Path,
+    repo_root: &Path,
+    run_id: &str,
+    commit: &str,
+    plan_name: &str,
+    selection_mode: &str,
+    planned_nodes: &BTreeSet<String>,
+    planned_test_nodes: &BTreeSet<String>,
+    test_node_coverage: &Value,
+    selected: &[Value],
+) -> Result<RetainedCoverageEvidence, String> {
+    let cells_path = repo_root.join("ci/compat-envelope/cells.json");
+    let cells_document: Value = serde_json::from_slice(
+        &fs::read(&cells_path)
+            .map_err(|error| format!("cannot read {}: {error}", cells_path.display()))?,
+    )
+    .map_err(|error| format!("{} is malformed: {error}", cells_path.display()))?;
+    let audit = repo_root.join("ci/audit-test-binary-registration.py");
+    let output = std::process::Command::new("python3")
+        .arg(&audit)
+        .arg("--root")
+        .arg(repo_root)
+        .arg("--json")
+        .output()
+        .map_err(|error| format!("cannot execute {}: {error}", audit.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} --json exited {}; {}",
+            audit.display(),
+            output.status.code().map_or_else(|| "by signal".into(), |code| code.to_string()),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let registration: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("test-binary registration JSON is malformed: {error}"))?;
+    let document = coverage_document(
+        plan_name,
+        selection_mode,
+        planned_nodes,
+        planned_test_nodes,
+        test_node_coverage,
+        selected,
+        &cells_document,
+        &registration,
+    )?;
+    let artifact_dir = parent.join("ignored").join("validate").join("artifacts").join(run_id);
+    fs::create_dir_all(&artifact_dir).map_err(|error| {
+        format!("cannot create retained coverage directory {}: {error}", artifact_dir.display())
+    })?;
+    let artifact = artifact_dir.join("coverage.json");
+    let mut bytes = serde_json::to_vec_pretty(&document)
+        .map_err(|error| format!("cannot encode coverage evidence: {error}"))?;
+    bytes.push(b'\n');
+    fs::write(&artifact, &bytes)
+        .map_err(|error| format!("cannot publish {}: {error}", artifact.display()))?;
+    let relative = artifact
+        .strip_prefix(parent)
+        .map_err(|_| "retained coverage artifact is outside parent root")?
+        .to_string_lossy()
+        .into_owned();
+    let e2e = document.get("e2e").expect("constructed e2e scope");
+    let binaries = document
+        .get("integration_test_binaries")
+        .expect("constructed integration-test scope");
+    let mut evidence = test_node_coverage
+        .as_object()
+        .cloned()
+        .ok_or("test-node coverage was not an object")?;
+    evidence.insert("schema".into(), serde_json::json!(1));
+    evidence.insert("run_id".into(), serde_json::json!(run_id));
+    evidence.insert("hermit_sha".into(), serde_json::json!(commit));
+    evidence.insert("plan".into(), document["plan"].clone());
+    evidence.insert("test_nodes".into(), document["test_nodes"].clone());
+    evidence.insert(
+        "e2e".into(),
+        serde_json::json!({
+            "selected_count": e2e["selected_count"],
+            "enabled_count": e2e["enabled_count"],
+            "selected_and_enabled_count": e2e["selected_and_enabled_count"],
+            "enabled_not_selected_count": e2e["enabled_not_selected_count"],
+            "selected_not_enabled_count": e2e["selected_not_enabled_count"],
+        }),
+    );
+    evidence.insert(
+        "integration_test_binaries".into(),
+        serde_json::json!({
+            "present_count": binaries["present"].as_array().map_or(0, Vec::len),
+            "ci_registered_count": binaries["ci_registered"].as_array().map_or(0, Vec::len),
+            "reason_recorded_count": binaries["reason_recorded"].as_array().map_or(0, Vec::len),
+            "none_recorded_count": binaries["none_recorded"].as_array().map_or(0, Vec::len),
+            "undeclared_count": binaries["undeclared"].as_array().map_or(0, Vec::len),
+        }),
+    );
+    evidence.insert(
+        "artifact".into(),
+        serde_json::json!({
+            "path": relative,
+            "sha256": hex_digest(&bytes),
+        }),
+    );
+    Ok(RetainedCoverageEvidence { evidence: Value::Object(evidence) })
+}
+
 /// Transform all result rows for one validate invocation into the closed
 /// schema-7 cell-verdict artifact and summary used by ci-hub.
 pub fn retain(
@@ -525,6 +783,87 @@ mod tests {
             format!("{}\n", serde_json::to_string(row).unwrap()),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn coverage_separates_selected_from_enabled_but_not_selected() {
+        let selected = vec![
+            serde_json::json!({
+                "lane":"portable", "category":"c-programs", "test":"c-programs/a",
+                "mode":"verify", "backend":"ptrace"
+            }),
+            serde_json::json!({
+                "lane":"portable", "category":"c-programs", "test":"c-programs/custom",
+                "mode":"custom", "backend":"ptrace"
+            }),
+        ];
+        let cells = serde_json::json!({"cells":[
+            {
+                "lane":"portable", "category":"c-programs", "test":"c-programs/a",
+                "mode":"verify", "backend":"ptrace", "enabled":true
+            },
+            {
+                "lane":"portable", "category":"c-programs", "test":"c-programs/b",
+                "mode":"verify", "backend":"ptrace", "enabled":true,
+                "status":"red", "measurement":"measured-and-failed",
+                "reason":"excluded after the recorded observations",
+                "observations":[{"results":["pass", "fail", "fail"]}]
+            },
+            {
+                "lane":"portable", "category":"c-programs", "test":"c-programs/custom",
+                "mode":"custom", "backend":"ptrace", "enabled":false
+            }
+        ]});
+        let registration = serde_json::json!({
+            "schema":1,
+            "present":["covered", "unknown"],
+            "ci_registered":["covered"],
+            "reason_recorded":[],
+            "none_recorded":["unknown"],
+            "undeclared":[]
+        });
+        let planned_nodes = BTreeSet::from([
+            "check.example".to_string(),
+            "test.example".to_string(),
+        ]);
+        let planned_test_nodes = BTreeSet::from(["test.example".to_string()]);
+        let test_node_coverage = serde_json::json!({
+            "planned_test_nodes": 1,
+            "executed_test_nodes": 1,
+            "zero_executed_nodes": [],
+            "absent_nodes": [],
+        });
+        let scope = coverage_document(
+            "full",
+            "full",
+            &planned_nodes,
+            &planned_test_nodes,
+            &test_node_coverage,
+            &selected,
+            &cells,
+            &registration,
+        )
+        .unwrap();
+        assert_eq!(scope["plan"]["name"], "full");
+        assert_eq!(scope["plan"]["selection_mode"], "full");
+        assert_eq!(scope["plan"]["outer_node_count"], 2);
+        assert_eq!(scope["plan"]["outer_nodes"][0], "check.example");
+        assert_eq!(scope["plan"]["outer_nodes"][1], "test.example");
+        assert_eq!(scope["test_nodes"]["planned"][0], "test.example");
+        assert_eq!(scope["test_nodes"]["coverage"], test_node_coverage);
+        assert_eq!(scope["e2e"]["selected_count"], 2);
+        assert_eq!(scope["e2e"]["enabled_count"], 2);
+        assert_eq!(scope["e2e"]["selected_and_enabled_count"], 1);
+        assert_eq!(scope["e2e"]["enabled_not_selected_count"], 1);
+        assert_eq!(scope["e2e"]["selected_not_enabled_count"], 1);
+        assert_eq!(scope["e2e"]["enabled_not_selected"][0]["observed_pass_count"], 1);
+        assert_eq!(scope["e2e"]["enabled_not_selected"][0]["observed_fail_count"], 2);
+        assert_eq!(
+            scope["e2e"]["enabled_not_selected"][0]["reason"],
+            "excluded after the recorded observations"
+        );
+        assert_eq!(scope["integration_test_binaries"]["ci_registered"][0], "covered");
+        assert_eq!(scope["integration_test_binaries"]["none_recorded"][0], "unknown");
     }
 
     fn append_result_row(root: &Path, row: &Value) {

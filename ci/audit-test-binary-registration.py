@@ -171,7 +171,7 @@ def declarations(root: Path) -> dict[str, Declaration]:
     return rows
 
 
-def audit(root: Path) -> int:
+def audit(root: Path, *, json_output: bool = False) -> int:
     try:
         present = present_targets(root)
         registered = registered_targets(root)
@@ -198,6 +198,30 @@ def audit(root: Path) -> int:
             file=sys.stderr,
         )
         return 2
+
+    if json_output:
+        print(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "present": sorted(present),
+                    "ci_registered": sorted(ci_registered),
+                    "reason_recorded": [
+                        {
+                            "binary": name,
+                            "disposition": rows[name].disposition,
+                            "reason": rows[name].reason,
+                        }
+                        for name in sorted(reason_recorded)
+                    ],
+                    "none_recorded": sorted(none_recorded),
+                    "undeclared": sorted(undeclared),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        return 2 if undeclared else 0
 
     print(
         "test-binary registration: "
@@ -254,8 +278,14 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_ROOT,
         help="repository root (used by isolated mutation tests)",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the complete registration partition as one JSON object",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
-    raise SystemExit(audit(parse_args().root.resolve()))
+    arguments = parse_args()
+    raise SystemExit(audit(arguments.root.resolve(), json_output=arguments.json))

@@ -1508,6 +1508,30 @@ def write_results(path: Path, results: list[dict[str, str]]) -> None:
     print(f"TRACKING: wrote {len(results)} result row(s) to {path}")
 
 
+def write_structured_test_counts(executed: int, filtered: int) -> None:
+    """Publish the scheduler-owned count record without trusting stdout."""
+    configured = os.environ.get("DAGRUN_TEST_COUNTS_PATH")
+    if not configured:
+        return
+    path = Path(configured)
+    temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    payload = {
+        "schema": 1,
+        "executed_tests": executed,
+        "filtered_tests": filtered,
+    }
+    try:
+        temporary.write_text(
+            json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8"
+        )
+        temporary.replace(path)
+    except OSError as error:
+        temporary.unlink(missing_ok=True)
+        raise MatrixError(
+            f"cannot publish structured test counts to {path}: {error}"
+        ) from error
+
+
 DEFAULT_OBSERVATION_SUBDIR = Path("ignored") / "backend-parity"
 
 
@@ -1890,6 +1914,8 @@ def main() -> int:
         )
     results: list[dict[str, str]] = []
     failures = 0
+    executed_cases = 0
+    filtered_cases = 0
     with tempfile.TemporaryDirectory(prefix="hermit-backend-parity-") as tempdir:
         fixtures = Fixtures(Path(tempdir))
         for backend in backends:
@@ -1915,9 +1941,11 @@ def main() -> int:
                             "detail": gap_reason,
                         }
                     )
+                    filtered_cases += 1
                     continue
 
                 evidence: dict[str, str] = {}
+                executed_cases += 1
                 status, detail, duration = run_case(
                     hermit,
                     backend,
@@ -1956,6 +1984,7 @@ def main() -> int:
         verify=args.verify,
         probe_gaps=args.probe_gaps,
     )
+    write_structured_test_counts(executed_cases, filtered_cases)
     return 1 if failures else 0
 
 
