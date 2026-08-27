@@ -1801,7 +1801,7 @@ cleared-caps refusal names {} starved step(s)",
         let tmp = std::env::temp_dir().join(format!("validate-plan-selftest-{}", std::process::id()));
         let full_args = parse_argv(&["full".into(), "--no-label-pr".into()])
             .map_err(|rc| format!("full-plan bracket: parser refused positive form rc={rc}"))?;
-        let full = build_plan(&root, &full_args, &tmp)?;
+        let mut full = build_plan(&root, &full_args, &tmp)?;
         if full.second.is_some() {
             return Err("full-plan bracket: default full plan is still sequential".into());
         }
@@ -1902,6 +1902,61 @@ cleared-caps refusal names {} starved step(s)",
             if !full.cfg.steps.iter().any(|s| s.tag() == required) {
                 return Err(format!("full-plan bracket: fused plan lost {required}"));
             }
+        }
+        let strict_before = full
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "test.strict_compat")
+            .expect("strict compatibility node exists")
+            .clone();
+        let executable = Path::new("/tmp/exact validate driver");
+        if !reuse_validate_executable(&mut full, executable)? {
+            return Err(
+                "full-plan bracket: strict compatibility did not reuse the current validate executable"
+                    .into(),
+            );
+        }
+        let strict_after = full
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "test.strict_compat")
+            .expect("strict compatibility node remains after executable replacement");
+        let mut strict_expected = strict_before.clone();
+        strict_expected.cmd = strict_expected.cmd.replacen(
+            " ./scripts/validate.rs --portable-strict-compat-only",
+            " '/tmp/exact validate driver' --portable-strict-compat-only",
+            1,
+        );
+        if format!("{strict_after:?}") != format!("{strict_expected:?}") {
+            return Err(format!(
+                "full-plan bracket: reusing the validate executable changed more than its command token:\n  before={strict_before:?}\n  after={strict_after:?}"
+            ));
+        }
+        for argument in [
+            "--portable-strict-compat-only",
+            "--reuse-parent-manifest-gate",
+            "--no-label-pr",
+            "--verbose",
+        ] {
+            if strict_after.cmd.matches(argument).count() != 1 {
+                return Err(format!(
+                    "full-plan bracket: strict compatibility lost or duplicated {argument}: {}",
+                    strict_after.cmd
+                ));
+            }
+        }
+        let mut corrupt = Plan::default();
+        corrupt.cfg.steps.push(strict_before.clone());
+        corrupt.cfg.steps[0].cmd = corrupt.cfg.steps[0]
+            .cmd
+            .replace(" ./scripts/validate.rs ", " ./changed-validate-driver ");
+        if reuse_validate_executable(&mut corrupt, executable).is_ok() {
+            return Err(
+                "full-plan bracket: strict compatibility accepted an unaudited validate invocation"
+                    .into(),
+            );
         }
         let canonical_test_tags = test_nodes_of(&validate_plan::lane_config(&root, "portable")?);
         let fused_test_tags = test_nodes_of(&full.cfg);
@@ -2103,7 +2158,16 @@ cleared-caps refusal names {} starved step(s)",
             "--no-label-pr".into(),
         ])
         .map_err(|rc| format!("full-plan bracket: nested positive form refused rc={rc}"))?;
-        let nested = build_plan(&root, &nested_args, &tmp)?;
+        let mut nested = build_plan(&root, &nested_args, &tmp)?;
+        let nested_before = format!("{:?}", nested.cfg.steps);
+        if reuse_validate_executable(&mut nested, executable)?
+            || format!("{:?}", nested.cfg.steps) != nested_before
+        {
+            return Err(
+                "full-plan bracket: a plan without test.strict_compat was modified by executable reuse"
+                    .into(),
+            );
+        }
         if nested.cfg.steps.iter().any(|s| s.tag() == "gate.manifest")
             || !nested.cfg.steps.iter().any(|s| s.tag() == PIN_GATE_TAG)
         {
@@ -6933,6 +6997,63 @@ fn propagate_verbosity(plan: &mut Plan, verbosity: i64) {
             step.env.insert("VALIDATE_VERBOSITY".into(), value.clone());
         }
     }
+}
+
+/// Run the nested strict-compatibility payload with this already-compiled
+/// validation executable.
+///
+/// The shipped lane remains independently runnable through
+/// `./scripts/validate.rs`.  In a full validation, however, that spelling
+/// enters rust-script a second time from the fresh checkout and recompiles this
+/// same driver inside the one-core `test.strict_compat` step before any of its
+/// 193 nodes can start.  Replacing only the executable token preserves every
+/// argument, environment assignment, dependency, resource, timeout, and nested
+/// check.
+fn reuse_validate_executable(
+    plan: &mut Plan,
+    executable: &Path,
+) -> Result<bool, String> {
+    const INVOCATION: &str = " ./scripts/validate.rs --portable-strict-compat-only";
+    let replacement = format!(
+        " {} --portable-strict-compat-only",
+        validate_plan::shell_quote(&executable.to_string_lossy())
+    );
+    let mut found = false;
+    for cfg in std::iter::once(&mut plan.cfg).chain(plan.second.iter_mut()) {
+        for step in &mut cfg.steps {
+            if step.tag() != "test.strict_compat" {
+                continue;
+            }
+            if found {
+                return Err("more than one test.strict_compat node was planned".into());
+            }
+            if step.cmd.matches(INVOCATION).count() != 1 {
+                return Err(format!(
+                    "test.strict_compat no longer has the audited nested validate invocation: {}",
+                    step.cmd
+                ));
+            }
+            step.cmd = step.cmd.replacen(INVOCATION, &replacement, 1);
+            found = true;
+        }
+    }
+    Ok(found)
+}
+
+fn reuse_current_validate_executable(plan: &mut Plan) -> Result<bool, String> {
+    let has_strict_compat = std::iter::once(&plan.cfg)
+        .chain(plan.second.iter())
+        .flat_map(|cfg| cfg.steps.iter())
+        .any(|step| step.tag() == "test.strict_compat");
+    if !has_strict_compat {
+        return Ok(false);
+    }
+    let executable = std::env::current_exe().map_err(|error| {
+        format!(
+            "cannot resolve this validate executable for test.strict_compat: {error}"
+        )
+    })?;
+    reuse_validate_executable(plan, &executable)
 }
 
 // --------------------------------------------------------------------------- interruption
@@ -13359,6 +13480,19 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // level through the plan so `--verbosity 5` does not become level 1 at the
     // nested strict-compat boundary (and default level 1 stays bounded there).
     propagate_verbosity(&mut plan, args.verbosity);
+
+    if let Err(error) = reuse_current_validate_executable(&mut plan) {
+        eprintln!("validate: cannot bind the nested strict-compatibility payload: {error}");
+        return RunSummary::refused(
+            2,
+            &profile_name,
+            "nested strict-compatibility validate executable",
+            vec![
+                error,
+                "test.strict_compat was not run with an unverified or changed invocation".into(),
+            ],
+        );
+    }
 
     // A node this machine provably cannot run is withheld here, BEFORE anything
     // spawns, and recorded as host-inapplicable. Nothing a node DOES can reach
