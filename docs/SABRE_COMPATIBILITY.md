@@ -224,6 +224,99 @@ Separately, the same full scorecard found that the already-enabled
 and requires independent requalification; it is not counted as progress here.
 The result is not L2.
 
+### `startup-tls-guards`: the first divergent record is stdout content
+
+The imported canonical measurements for
+`system-utils/startup-tls-guards/verify@sabre` diverged three times out of
+three at scheduler turn 3, virtual time `1767225600002223000`, record 117, and
+syscall 48. This establishes reproduction at a stable coordinate, not a rate.
+The raw log pairs for those three measurements are no longer present, so their
+two exact output-buffer hashes cannot be recovered from the imported summary.
+
+A later focused canonical run at Hermit
+`1540f91a0539e0cec8923d33220cdc316c910a0b` retained both logs. The comparison
+surface had shifted by two records and one syscall, but the differing record
+was the same operation: the output-buffer record for the guest's final
+114-byte stdout write. The adjacent records were identical in both runs:
+
+```text
+finish syscall #48: madvise(0x5c3d4780000, 196608, 4) = Ok(0)
+inbound syscall: write(1, 0x5555555712a0, 114) = ?
+finish syscall #49: write(1, 0x5555555712a0, 114) = Ok(114)
+```
+
+The following output-buffer records differed:
+
+```text
+run 1: DETLOG [iobuf][dtid 2] write out fd=1 0x5555555712a0+114->2b2f1cc110e6ff75af9c76ddfc1e578b93da28501a387973732482106042011a
+run 2: DETLOG [iobuf][dtid 2] write out fd=1 0x5555555712a0+114->3df75cedc1078091f736c9bb24bbe671456f3705c60737bc72172d63db4a0c82
+```
+
+Those hashes are the SHA-256 values of these exact guest outputs:
+
+```text
+run 1:
+STACK_CANARY 0x6df6042a2bc69b00
+POINTER_GUARD 0xf659c12325d8b3af
+AT_RANDOM_BYTES a2cd18d300537a5cb083dc48dbfa0ef2
+
+run 2:
+STACK_CANARY 0xc692cfb823819a00
+POINTER_GUARD 0xb1159e693df08f44
+AT_RANDOM_BYTES a2cd18d300537a5cb083dc48dbfa0ef2
+```
+
+The next record is the identical `exit_group(0)` entry. Both executions also
+have the same four scheduler turns, 50 completed syscalls, final virtual time
+`2733000`, and complete SaBRe path evidence: guest RPC observed, zero ptrace
+fallback sites, and zero trusted shared-object sites. The differing fact is the
+stdout content alone: both glibc TLS guards vary while the later read of
+`AT_RANDOM` matches.
+
+This is not the pthread exit/join mechanism behind
+`backend-parity-c/pthread-lifecycle/verify@sabre` and
+`chaos-c/lock-granularity/verify@sabre`. Those cells first differ in a scheduler
+COMMIT's virtual time by exact multiples of the 5,000 ns futex charge, around
+different `pthread_join` futex sequences. This cell has one guest thread, no
+such futex sequence, identical scheduler/runtime totals, and first differs in
+the final stdout bytes.
+
+The source ordering explains the output. `tests/c/startup_tls_guards.c` reads
+the x86-64 glibc stack canary at `%fs:0x28`, the pointer guard at `%fs:0x30`,
+and the 16 bytes addressed by `AT_RANDOM`. Detcore's `handle_post_exec` replaces
+those auxiliary-vector bytes with deterministic bytes. At the pinned Reverie
+commit `86d9003a7a2a8d5399ef94a251e4d991d6c504a5`, however, SaBRe records a
+pending post-load event and does not deliver it to Detcore until the first
+rewritten syscall. Glibc has initialized the guards before that callback. The
+SaBRe loader also handles `ARCH_SET_FS` before the plugin exists and copies its
+stack guard at offset `0x28` into the client TLS; it has no corresponding
+pointer-guard handling. By the time Detcore writes deterministic `AT_RANDOM`
+bytes, both printed guards have already been initialized from the earlier
+startup state.
+
+An exhaustive source search finds no other test reading `%fs:0x28` or
+`%fs:0x30`; `system-utils/startup-surface-identity` reads `AT_RANDOM` itself but
+not the guards. No other confirmed divergent cell currently demonstrates this
+mechanism. Repair belongs before glibc consumes the initial auxiliary vector,
+not in the later Detcore callback and not by rewriting live guards after
+protected frames may exist.
+
+The retained focused artifacts had these hashes before their relevant records
+were copied here:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| run 1 log | `17f413cb344daa4faee2b67ac4d78c58f34f19a4ce1c000bdbe23dafc4c82c75` |
+| run 2 log | `95b3df52b686185bf73b73779de62d0813ffa7b7cccd2380654862e0c313e184` |
+| comparison stderr | `d4086e0d8fc134358e96c05fb0a9878f24e2cedbbae179f25eb24ed8e29b91a1` |
+| verification report | `d039974bb3dc0df037adfcf7845c4ebb7c642f91404c220d16dacd3249b7660d` |
+| result row | `096db88e9e74548e736a32466b07e74089303bb0ce6083bc4ac1fb268d31c867` |
+
+The fixture, Detcore post-exec code, SaBRe adapter, pinned Reverie revision, and
+manifest row are byte-identical between that focused run and Hermit main
+`538ddb26bb2ce92d9cc9bf4303d4e0f9602517a5`. No fresh guest run was taken for
+this documentation update while another full validate owned the machine.
+
 The following 27 candidates fail SaBRe's `Stripped` comparison or its timeout
 and remain disabled:
 
