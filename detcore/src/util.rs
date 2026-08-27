@@ -172,11 +172,51 @@ pub const STDERR_DIAGNOSTIC_DEADLINE: std::time::Duration = std::time::Duration:
 /// blocks again has still spent that earlier time on its exit path.
 static STDERR_BLOCKED_SINCE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
+/// Test-only observability: append one byte each time THIS process gives up on a
+/// diagnostic write AFTER HAVING WAITED for the reader.
+///
+/// ⚠️ "GAVE UP AFTER WAITING" IS THE COUNTABLE QUANTITY, AND PLAIN "GAVE UP" IS NOT.
+/// Once the shared budget is spent, every later write also gives up -- instantly,
+/// via the `checked_sub` miss below. Counting those would produce the same number
+/// under both designs and prove nothing. What separates them is how many times a
+/// process actually SPENDS the budget: a shared clock can be spent once, a
+/// per-`write()` clock is spent again on every blocked call.
+///
+/// ⚠️ IT CANNOT BE REPORTED ON STDERR, WHICH IS THE OBVIOUS PLACE AND IS WRONG.
+/// The whole condition is that stderr is undeliverable, so a give-up notice written
+/// there is the one message guaranteed not to arrive. It goes to a file the caller
+/// names instead. Env-var-gated and inert when unset, like
+/// `HERMIT_INTERNAL_LITEINST_ACTIVATION_PROBE`.
+///
+/// ⚠️ THE PATH MUST NOT BE UNDER `/tmp`. The container replaces `/tmp` with a
+/// private empty tmpfs, so the forked init would write into a different file from
+/// the parent -- or fail -- and the count would silently be wrong rather than
+/// absent. `O_APPEND` is what makes the two processes' records add up instead of
+/// overwriting each other.
+fn record_give_up_after_waiting() {
+    const RECORD_ENV: &str = "HERMIT_INTERNAL_STDERR_GIVE_UP_RECORD";
+    let Some(path) = std::env::var_os(RECORD_ENV) else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write as _;
+        let _ = file.write_all(b"gave-up-after-waiting\n");
+    }
+}
+
 impl std::io::Write for RetryingStderr {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
+        // Whether THIS call has already waited on the reader. Only a call that
+        // waited and then ran out of budget is a spend of the deadline; see
+        // `record_give_up_after_waiting`.
+        let mut waited = false;
         loop {
             // SAFETY: `write(2)` on fd 2 reads `buf.len()` bytes from `buf`,
             // which is valid for that length, and writes no memory.
@@ -197,6 +237,9 @@ impl std::io::Write for RetryingStderr {
                     let blocked_since = *STDERR_BLOCKED_SINCE.get_or_init(std::time::Instant::now);
                     let spent = blocked_since.elapsed();
                     let Some(remaining) = STDERR_DIAGNOSTIC_DEADLINE.checked_sub(spent) else {
+                        if waited {
+                            record_give_up_after_waiting();
+                        }
                         return Err(err);
                     };
                     // Block until the reader makes room. A failed or timed-out
@@ -219,6 +262,7 @@ impl std::io::Write for RetryingStderr {
                     unsafe {
                         libc::poll(&mut pfd, 1, timeout_ms);
                     }
+                    waited = true;
                     continue;
                 }
                 _ => return Err(err),

@@ -5986,3 +5986,129 @@ fn the_stderr_deadline_is_spent_once_across_writes_not_restarted_by_each() {
         "giving up on undeliverable diagnostics must not change the exit status"
     );
 }
+
+/// The deadline is spent ONCE PER PROCESS, counted rather than timed.
+///
+/// ⚠️ THIS REPLACES A TIMING ASSERTION THAT COULD NOT BE MADE TO WORK, AND THE
+/// MEASUREMENTS ARE WHY. The quantity that separates a shared clock from a
+/// per-`write()` clock is `writes / writing processes`. On the two-process path
+/// that is 3 writes over 2 processes, so a timed assertion has only a 1.5x gap
+/// to aim at. Twelve fixtures were tried to widen it -- child count, `--log`
+/// info/debug/trace, longer guest loops, nested `sh -c`, guest-written stderr --
+/// and every one measured flat at ~1.50x, because the write count is
+/// self-limiting: hermit aborts once diagnostic writes start failing, so more
+/// diagnostic lines do not produce more blocked writes. `--summary` and
+/// `--strict` made it WORSE, inflating the per-exit side to 5.93-5.98s.
+///
+/// Measured 2026-08-26, and this is the argument for counting:
+///
+/// ```text
+///                    elapsed                     give-ups after waiting
+///   per-exit    5.03s 5.05s 7.37s                      2  2  2
+///   per-write   7.53s 7.53s 8.88s                      3  3  3
+/// ```
+///
+/// The elapsed columns very nearly TOUCH -- 7.37s against 7.53s is a 2% margin,
+/// and that 7.37s run would have false-failed any ceiling placed to catch the
+/// mutation. The counts do not overlap at all and did not vary once. Counting
+/// removes the flakiness class instead of making it improbable.
+///
+/// ⚠️ "GAVE UP AFTER WAITING" IS THE COUNTABLE THING; PLAIN "GAVE UP" IS NOT.
+/// Once the shared budget is spent every later write also gives up, instantly,
+/// so counting those yields the same number under both designs. See
+/// `record_give_up_after_waiting` in detcore/src/util.rs.
+///
+/// The count equals the number of PROCESSES that reported, not the number of
+/// lines they tried to write -- which is the whole guarantee, and is why the two
+/// fixtures below expect 1 and 2 rather than any measure of their output.
+#[test]
+fn the_stderr_deadline_is_spent_once_per_process_counted_not_timed() {
+    use std::os::unix::io::FromRawFd;
+    const F_SETPIPE_SZ: i32 = 1031;
+    const PIPE_BYTES: usize = 4096;
+    const RECORD_ENV: &str = "HERMIT_INTERNAL_STDERR_GIVE_UP_RECORD";
+
+    // ⚠️ NOT UNDER /tmp. The container replaces /tmp with a private empty tmpfs,
+    // so the forked init would append to a different file from its parent and the
+    // count would be quietly wrong rather than absent. CARGO_TARGET_TMPDIR is
+    // inside the build directory.
+    let record_dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
+    fs::create_dir_all(record_dir).expect("record dir");
+
+    // (label, guest argv, processes expected to report)
+    let cases: [(&str, Vec<&str>, usize); 2] = [
+        (
+            "a guest that runs: hermit and the forked container init both report",
+            vec!["/bin/echo", "hi"],
+            2,
+        ),
+        (
+            "a guest that is missing: it fails before the init is forked, so one reports",
+            vec!["/nonexistent-guest-for-the-counted-give-up-cell"],
+            1,
+        ),
+    ];
+
+    for (label, guest, expected_processes) in cases {
+        let record = record_dir.join(format!("give-ups-{}.txt", guest.len()));
+        let _ = fs::remove_file(&record);
+
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        unsafe { libc::fcntl(write_fd, F_SETPIPE_SZ, PIPE_BYTES as i32) };
+        let filler = vec![b'x'; PIPE_BYTES];
+        assert_eq!(
+            unsafe { libc::write(write_fd, filler.as_ptr().cast(), filler.len()) },
+            PIPE_BYTES as isize,
+            "the pipe must start completely full so every diagnostic write blocks"
+        );
+        let flags = unsafe { libc::fcntl(write_fd, libc::F_GETFL) };
+        unsafe { libc::fcntl(write_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+
+        let mut args = vec!["run", "--"];
+        args.extend_from_slice(&guest);
+        let mut child = Command::new(env!("CARGO_BIN_EXE_hermit"))
+            .args(&args)
+            .env(RECORD_ENV, &record)
+            .stdout(Stdio::null())
+            .stderr(unsafe { Stdio::from_raw_fd(write_fd) })
+            .spawn()
+            .expect("spawn hermit");
+        let held = unsafe { std::fs::File::from_raw_fd(read_fd) };
+
+        // Bounded only so a genuine hang is a red rather than a wedged runner.
+        // NOTHING IS ASSERTED ABOUT THIS DURATION; the verdict is the count.
+        let deadline = Duration::from_secs(30);
+        let started = Instant::now();
+        let status = loop {
+            match child.try_wait().expect("try_wait") {
+                Some(status) => break Some(status),
+                None if started.elapsed() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                None => thread::sleep(Duration::from_millis(50)),
+            }
+        };
+        drop(held);
+        assert!(
+            status.is_some(),
+            "{label}: hermit never exited; the retry loop is unbounded"
+        );
+
+        let recorded = fs::read_to_string(&record).unwrap_or_default();
+        let give_ups = recorded.lines().count();
+        assert_eq!(
+            give_ups, expected_processes,
+            "{label}\n  expected {expected_processes} give-up(s) after waiting, one per \
+             reporting process, and got {give_ups}.\n  MORE than expected means the \
+             deadline is being spent per `write()` again: each blocked write pays it \
+             afresh, so the count tracks LINES instead of PROCESSES. Measured under that \
+             regression: 3 here where 2 is correct, and 4 where 1 is correct.\n  FEWER \
+             means the diagnostics were delivered after all and the fixture stopped \
+             exercising a stopped reader."
+        );
+    }
+}
