@@ -31,6 +31,9 @@ use std::process::Command;
 /// privileged lane, so a lane-mismatched query for it is legitimately empty.
 const REAL_ID: &str = "applications/c-toolchain-workflow";
 const UNKNOWN_ID: &str = "no-such-test-xyz";
+/// A second real id, so a repeated `--test` can be built from two values that are
+/// both accepted and therefore isolates the duplicate check.
+const SECOND_REAL_ID: &str = "applications/git-repository-workflow";
 
 fn repo_root() -> PathBuf {
     // CARGO_MANIFEST_DIR is <root>/ci/manifest-plan.
@@ -47,6 +50,34 @@ fn repo_root() -> PathBuf {
 /// and Cargo builds both bins of this package for an integration test, so the pair
 /// is coherent. A `None` code means a signal, which is a harness failure rather than
 /// a verdict and is asserted against explicitly.
+/// Run `test-harness` and return `(exit code, stdout, stderr)`.
+///
+/// ⚠️ THE EXIT CODE ALONE IS NOT ENOUGH FOR MOST OF THESE CASES, which is why this
+/// exists alongside [`harness`]. `agent(hermit-126)` found that four of the five
+/// repeated-selector cases below were satisfied by validation this change did not
+/// add -- an invalid `--lane`/`--mode`/`--backend` value, or the unknown-id guard for
+/// `--test`. All of those also exit 2, so an exit-code assertion cannot tell the new
+/// duplicate check from the old value check. Requiring the duplicate-specific
+/// diagnostic is what separates them.
+fn harness_output(args: &[&str]) -> (i32, String, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_test-harness"))
+        .current_dir(repo_root())
+        .args(args)
+        .output()
+        .expect("failed to run test-harness");
+    let code = out.status.code().unwrap_or_else(|| {
+        panic!(
+            "test-harness died on a signal for args {args:?}; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    (
+        code,
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
 fn harness(args: &[&str]) -> i32 {
     let out = Command::new(env!("CARGO_BIN_EXE_test-harness"))
         .current_dir(repo_root())
@@ -73,25 +104,57 @@ fn plan_refuses_an_unknown_test_id() {
     );
 }
 
+///
+/// ⚠️ IT ASSERTS THE EMPTY RESULT, NOT ONLY rc=0. An earlier version discarded the
+/// output, so it could not distinguish "correctly returned nothing" from "returned
+/// something it should not have" -- and the whole point of this case is WHICH empty
+/// answer is legitimate. Found by `agent(hermit-126)`.
 #[test]
 fn plan_still_accepts_a_real_id_that_selects_nothing_in_this_lane() {
+    let (code, stdout, stderr) =
+        harness_output(&["plan", "--lane", "privileged", "--test", REAL_ID]);
     assert_eq!(
-        harness(&["plan", "--lane", "privileged", "--test", REAL_ID]),
-        0,
+        code, 0,
         "a REAL id with no cells in the requested lane is a correct, well-formed query \
          and must stay rc=0. This is the case a `cells.is_empty()` guard would have \
-         refused, which is why the check is 'unknown id' instead."
+         refused, which is why the check is 'unknown id' instead. stderr: {stderr:?}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "and it must be EMPTY -- an empty plan is the answer, so printing cells here \
+         would mean the lane filter was ignored: {stdout:?}"
     );
 }
 
 #[test]
 fn audit_gaps_still_reports_no_gaps_as_success() {
+    let (code, stdout, stderr) =
+        harness_output(&["audit-gaps", "--lane", "privileged", "--test", REAL_ID]);
     assert_eq!(
-        harness(&["audit-gaps", "--lane", "privileged", "--test", REAL_ID]),
-        0,
+        code, 0,
         "`print_plan` also serves `audit-gaps`, where an empty answer legitimately \
          means NO GAPS. Turning that into a failure would trade a silent false pass \
-         for a loud false failure."
+         for a loud false failure. stderr: {stderr:?}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "no gaps means NO OUTPUT; anything here is a gap this control would hide: \
+         {stdout:?}"
+    );
+}
+
+/// ⚠️ THE SECOND CHANGED COMMAND PATH. `plan` had an unknown-id case from the start;
+/// `audit-gaps` shares `print_plan` and the same guard, and had none -- so half the
+/// surface this change touches was unpinned. Found by `agent(hermit-126)`.
+#[test]
+fn audit_gaps_refuses_an_unknown_test_id() {
+    let (code, _, stderr) =
+        harness_output(&["audit-gaps", "--lane", "portable", "--test", UNKNOWN_ID]);
+    assert_eq!(code, 2, "audit-gaps must refuse an id in no manifest too");
+    assert!(
+        stderr.contains("unknown test id"),
+        "and it must refuse with the unknown-id diagnostic rather than some other \
+         check that also exits 2: {stderr:?}"
     );
 }
 
@@ -121,12 +184,24 @@ fn an_unfiltered_plan_still_produces_cells() {
         Some(0),
         "an unfiltered plan must succeed"
     );
+    // ⚠️ PARSED, NOT SNIFFED. Checking `starts_with('[')` and a length over 2 accepts
+    // `[{}]`, `[ ]]` and any malformed string that happens to open with a bracket.
+    // The control exists to prove real cells came back, so it has to decode them.
+    // Found by `agent(hermit-126)`.
     let text = String::from_utf8_lossy(&out.stdout);
+    let cells: serde_json::Value = serde_json::from_str(text.trim()).unwrap_or_else(|error| {
+        panic!(
+            "an unfiltered plan must print valid JSON: {error}; stdout was {:?}",
+            text.chars().take(200).collect::<String>()
+        )
+    });
+    let array = cells
+        .as_array()
+        .unwrap_or_else(|| panic!("an unfiltered plan must print a JSON ARRAY, got {cells}"));
     assert!(
-        text.trim().starts_with('[') && text.trim().len() > 2,
-        "an unfiltered plan must print a non-empty cell array, or the exit codes above \
-         prove nothing about the guard: stdout was {:?}",
-        text.chars().take(120).collect::<String>()
+        !array.is_empty(),
+        "an unfiltered plan must print a NON-EMPTY cell array, or the exit codes above \
+         prove nothing about the guard"
     );
 }
 
@@ -166,13 +241,58 @@ fn a_repeated_test_flag_is_refused_in_either_order() {
 /// Every single-valued selector, not just the one the defect was found through.
 /// `--jobs` already refused a repeat; these did not, and there is no reason for the
 /// rule to differ per flag.
+///
+/// ⚠️ EVERY VALUE HERE IS VALID ON PURPOSE, AND AN EARLIER VERSION USED `"a"`/`"b"`.
+/// With those, four of the five cases passed WITHOUT the duplicate check: `"a"` is an
+/// invalid `--lane`, `--mode` and `--backend` value, so existing value validation
+/// already exits 2, and it is an unknown `--test` id, so this change's own unknown-id
+/// guard exits 2. Only `--category` isolated the duplicate. The loop went red under a
+/// mutation of `set_once` and therefore looked discriminating, because that one good
+/// case carried the other four. Found by `agent(hermit-126)`; a whole-function
+/// mutation cannot see it, because the test does fail -- just for one fifth of the
+/// reasons it claims.
 #[test]
 fn every_single_valued_selector_refuses_a_repeat() {
-    for flag in ["--lane", "--category", "--test", "--mode", "--backend"] {
+    // Two ACCEPTED values per selector, so nothing but the repeat can refuse them.
+    for (flag, first, second) in [
+        ("--lane", "portable", "privileged"),
+        ("--category", "applications", "detcore"),
+        ("--test", REAL_ID, SECOND_REAL_ID),
+        ("--mode", "verify", "chaos"),
+        ("--backend", "ptrace", "sabre"),
+    ] {
+        for (a, b) in [(first, second), (second, first)] {
+            let (code, _, stderr) = harness_output(&["plan", flag, a, flag, b]);
+            assert_eq!(
+                code, 2,
+                "{flag} must be refused when repeated ({a} then {b})"
+            );
+            assert!(
+                stderr.contains(&format!("{flag} may be specified only once")),
+                "{flag} repeated as {a} then {b} must fail with the DUPLICATE \
+                 diagnostic, not with some other check that also exits 2; got: {stderr:?}"
+            );
+        }
+    }
+}
+
+/// The single-occurrence control, over every selector rather than two of them.
+///
+/// Without this the loop above proves nothing: a `test-harness` that refused every
+/// invocation would satisfy all ten assertions.
+#[test]
+fn a_single_occurrence_of_every_selector_is_still_accepted() {
+    for (flag, value) in [
+        ("--lane", "portable"),
+        ("--category", "applications"),
+        ("--test", REAL_ID),
+        ("--mode", "verify"),
+        ("--backend", "ptrace"),
+    ] {
+        let (code, _, stderr) = harness_output(&["plan", flag, value]);
         assert_eq!(
-            harness(&["plan", "--lane", "portable", flag, "a", flag, "b"]),
-            2,
-            "{flag} must be refused when repeated"
+            code, 0,
+            "a single {flag} {value} must still be accepted; stderr: {stderr:?}"
         );
     }
 }
