@@ -4088,11 +4088,20 @@ backends_disabled:
     ///
     /// WHY IT NEEDS A TEST RATHER THAN BEING OBVIOUS. `CELL_RESULT_SCHEMA` was
     /// NOT bumped when these coordinates were added, so the schema number
-    /// cannot separate the two meanings. Measured over the 6215 retained
-    /// `results.jsonl` files on this host, 54734 rows: schema 4 contains BOTH
-    /// 28899 rows without the key and 17540 with it. Within schema 4 the only
-    /// thing that distinguishes "this predates the field" from "this ran and
-    /// found nothing" is whether the key is present at all.
+    /// cannot separate the two meanings. Within schema 4 the only thing that
+    /// distinguishes "this predates the field" from "this ran and found nothing"
+    /// is whether the key is present at all.
+    ///
+    /// ⚠️ THE STRUCTURAL CLAIM IS THE DURABLE ONE; THE COUNTS ARE NOT. Schema 4
+    /// contains BOTH rows with the key and rows without it, while schemas 1, 2
+    /// and 3 never carry it -- that is what makes the schema number useless as a
+    /// discriminator, and agent(hermit-106) reproduced it independently across
+    /// 1478 rows. The row COUNTS behind it move: this file measured 28899 without
+    /// and 17540 with over 6215 retained `results.jsonl`, and a sample of 1200 of
+    /// those files gave a different ratio. Both are honest. The corpus lives in
+    /// gitignored run directories that agents create and delete, so it is not a
+    /// fixed population and a count taken from it is true of one moment. Do not
+    /// treat these numbers as a baseline to compare against.
     ///
     /// That distinction currently holds only because no
     /// `skip_serializing_if = "Option::is_none"` is attached to these four
@@ -4103,6 +4112,54 @@ backends_disabled:
     ///
     /// It asserts PRESENCE and NULLNESS separately from any value, so it fails
     /// on the skip attribute rather than on a changed position.
+    /// ⚠️ THE ROW, NOT ONLY THE ATTEMPT. The measurement in the docstring above is
+    /// about `results.jsonl` ROWS, and a row is a `CellResult` with its attempts
+    /// nested inside it. An earlier version of this test guarded `AttemptResult`
+    /// alone, which left the level the evidence actually describes uncovered:
+    /// agent(hermit-106) put `skip_serializing_if = "Option::is_none"` on all four
+    /// `CellResult` coordinates and the whole package stayed GREEN, 126 tests, 0
+    /// failures, INCLUDING this test. A check that stays green while the hazard it
+    /// names is open is the failure this file is full of warnings about.
+    fn cell_result_that_located_nothing() -> CellResult {
+        CellResult {
+            schema: CELL_RESULT_SCHEMA,
+            run_id: "fixture".into(),
+            attempt: 1,
+            hermit_sha: "sha".into(),
+            binary_build_sha: None,
+            source_tree_dirty: false,
+            binary_sha256: None,
+            test_sha256: "digest".into(),
+            test: "fixture/test".into(),
+            category: "fixture".into(),
+            lane: "portable".into(),
+            mode: "verify".into(),
+            backend: Some("ptrace".into()),
+            classification: "required".into(),
+            outcome: "PASS".into(),
+            error_kind: None,
+            timeout_seconds: 1,
+            duration_ms: 1,
+            log_level: None,
+            effective_args: Vec::new(),
+            argv: vec!["hermit".into()],
+            guest_argv: vec!["guest".into()],
+            env: BTreeMap::new(),
+            cwd: "/repo".into(),
+            shell_command: "cd /repo && hermit".into(),
+            relaxations: Vec::new(),
+            execution_path: None,
+            diversity: None,
+            attempts: vec![attempt_with_sabre_evidence("evidence")],
+            first_divergent_scheduler_turn: None,
+            first_divergent_virtual_nanoseconds: None,
+            first_divergent_record: None,
+            first_divergent_syscall: None,
+            reason: None,
+            artifact_dir: "/repo/artifacts".into(),
+        }
+    }
+
     #[test]
     fn a_located_nothing_row_still_carries_all_four_coordinate_keys() {
         let attempt = attempt_with_sabre_evidence("evidence");
@@ -4125,6 +4182,31 @@ backends_disabled:
             assert!(
                 found.is_null(),
                 "{key} must be an explicit null when nothing was located, got {found}"
+            );
+        }
+
+        // THE ROW LEVEL, which is what a `results.jsonl` line actually is and what
+        // every count in the docstring above was measured over.
+        let row = cell_result_that_located_nothing();
+        let rendered = serde_json::to_value(&row).expect("row serializes");
+        let object = rendered.as_object().expect("row is a JSON object");
+        for key in [
+            "first_divergent_record",
+            "first_divergent_syscall",
+            "first_divergent_scheduler_turn",
+            "first_divergent_virtual_nanoseconds",
+        ] {
+            let found = object.get(key).unwrap_or_else(|| {
+                panic!(
+                    "{key} is absent from a serialized RESULT ROW that located nothing. \
+                     A results.jsonl line is a CellResult, so this is the level every \
+                     count in this test's docstring was measured over; absence here is \
+                     how a reader recognises a row written before the field existed."
+                )
+            });
+            assert!(
+                found.is_null(),
+                "{key} must be an explicit null on the row when nothing was located, got {found}"
             );
         }
     }
