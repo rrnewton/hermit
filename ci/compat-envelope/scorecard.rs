@@ -420,6 +420,12 @@ struct Observation {
     depth: BTreeMap<String, SourceDepth>,
     hermit_shas: BTreeSet<String>,
     results: BTreeSet<ObservedResult>,
+    /// The compact receipt for canonical validate evidence. Raw result files
+    /// remain in retained history; this keeps the comparison identity and INFO
+    /// population needed to score the cell without copying every argv and
+    /// environment value into the tracked scorecard.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    canonical_comparisons: BTreeSet<CanonicalComparison>,
     invocations: BTreeSet<ObservedInvocation>,
     #[serde(default, skip_serializing_if = "ObservedPositions::is_empty")]
     first_divergent_scheduler_turn: ObservedPositions,
@@ -436,6 +442,18 @@ struct Observation {
     /// coordinate's axis.
     #[serde(default, skip_serializing_if = "ObservedPositions::is_empty")]
     first_divergent_syscall: ObservedPositions,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct CanonicalComparison {
+    hermit_sha: String,
+    hermit_commits: u64,
+    hermit_first_parent: u64,
+    run_id: String,
+    evidence_sha256: String,
+    result: ObservedResult,
+    left_info_messages: u64,
+    right_info_messages: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -1062,7 +1080,7 @@ impl ResultRow {
     /// whether it matched or diverged. A FAIL is useful evidence only when the
     /// strict comparison actually ran; a red produced by a weaker comparison
     /// would lower the standard just as surely as admitting its green.
-    fn require_bitwise_info_comparison_evidence(&self) -> Result<(), String> {
+    fn bitwise_info_comparison(&self) -> Result<(u64, u64), String> {
         self.require_provenance()?;
         if !matches!(self.mode.as_str(), "verify" | "replay" | "chaos") {
             return Err(format!(
@@ -1076,6 +1094,13 @@ impl ResultRow {
                 self.outcome
             ));
         }
+        if self.attempts.len() != 1 {
+            return Err(format!(
+                "result row contains {} attempt receipts; expected exactly one",
+                self.attempts.len()
+            ));
+        }
+        let mut compared = None;
         for (index, attempt) in self.attempts.iter().enumerate() {
             let report_text = attempt
                 .get("verification_report")
@@ -1105,6 +1130,17 @@ impl ResultRow {
             let comparison = raw
                 .get("comparison")
                 .ok_or_else(|| format!("attempt {} has no comparison", index + 1))?;
+            let counts = raw
+                .get("compared_log_messages")
+                .ok_or_else(|| format!("attempt {} has no INFO-message counts", index + 1))?;
+            let left = counts
+                .get("left")
+                .and_then(JsonValue::as_u64)
+                .ok_or_else(|| format!("attempt {} has no left INFO-message count", index + 1))?;
+            let right = counts
+                .get("right")
+                .and_then(JsonValue::as_u64)
+                .ok_or_else(|| format!("attempt {} has no right INFO-message count", index + 1))?;
             let exact_bitwise_info = comparison.get("display_name").and_then(JsonValue::as_str)
                 == Some("BitwiseInfoV1")
                 && comparison.get("strictness").and_then(JsonValue::as_str) == Some("canonical")
@@ -1164,8 +1200,9 @@ impl ResultRow {
                 }
                 _ => unreachable!("outcome checked above"),
             }
+            compared = Some((left, right));
         }
-        Ok(())
+        compared.ok_or_else(|| "result row contains no comparison attempt".into())
     }
 }
 
@@ -1182,20 +1219,27 @@ struct Derived {
 /// contains at least one pass and no refusal. Selection remains a separate
 /// fact: a selected red cell is still required by ordinary validation.
 ///
-/// Match invocations by the SHA in `last_tested`, not merely by detcore tree.
+/// Compare the recorded Hermit first-parent depth, not merely the detcore tree.
 /// Several Hermit commits can carry one unchanged detcore tree, and folding all
 /// of them together would let an older result decide the current colour.
 fn selected_validate_pass(cell: &TrackedCell) -> bool {
-    let Some(last_tested) = &cell.last_tested else {
-        return false;
-    };
-    let results = cell
+    let comparisons = cell
         .observations
         .iter()
         .filter(|observation| observation.provenance == ObservationProvenance::Validate)
-        .flat_map(|observation| observation.invocations.iter())
-        .filter(|invocation| invocation.hermit_sha == last_tested.hermit_sha)
-        .map(|invocation| invocation.result)
+        .flat_map(|observation| observation.canonical_comparisons.iter())
+        .collect::<Vec<_>>();
+    let Some(latest_depth) = comparisons
+        .iter()
+        .map(|comparison| comparison.hermit_first_parent)
+        .max()
+    else {
+        return false;
+    };
+    let results = comparisons
+        .iter()
+        .filter(|comparison| comparison.hermit_first_parent == latest_depth)
+        .map(|comparison| comparison.result)
         .collect::<BTreeSet<_>>();
     !results.is_empty() && results == BTreeSet::from([ObservedResult::Pass])
 }
@@ -2768,13 +2812,14 @@ fn apply_pressure_summary(
         let observation = match position {
             Some(position) => &mut observations[position],
             None => {
-                observations.push(Observation {
-                    detcore_tree: summary.detcore_tree.clone(),
-                    provenance: ObservationProvenance::PressureTest,
-                    depth: depth.clone(),
-                    hermit_shas: BTreeSet::new(),
-                    results: BTreeSet::new(),
-                    invocations: BTreeSet::new(),
+                    observations.push(Observation {
+                        detcore_tree: summary.detcore_tree.clone(),
+                        provenance: ObservationProvenance::PressureTest,
+                        depth: depth.clone(),
+                        hermit_shas: BTreeSet::new(),
+                        results: BTreeSet::new(),
+                        canonical_comparisons: BTreeSet::new(),
+                        invocations: BTreeSet::new(),
                     first_divergent_scheduler_turn: ObservedPositions::default(),
                     first_divergent_virtual_nanoseconds: ObservedPositions::default(),
                     first_divergent_record: ObservedPositions::default(),
@@ -2916,6 +2961,7 @@ fn apply_validate_results(
     hermit_sha: &str,
     detcore_tree: &str,
     depth: &BTreeMap<String, SourceDepth>,
+    store_invocation: bool,
 ) -> Result<ValidateFold, String> {
     let mut fold = ValidateFold::default();
     for (id, candidates) in rows {
@@ -2988,7 +3034,8 @@ fn apply_validate_results(
             let result = validate_row_result(row)?;
             row.require_provenance()
                 .map_err(|error| format!("{} {error}", display_id(id)))?;
-            row.require_bitwise_info_comparison_evidence()
+            let (left_info_messages, right_info_messages) = row
+                .bitwise_info_comparison()
                 .map_err(|error| format!("{} {error}", display_id(id)))?;
             // Same integrity check the pressure path applies to its
             // invocations. A shell_command that does not reconstruct from cwd,
@@ -3038,6 +3085,7 @@ fn apply_validate_results(
                         depth: depth.clone(),
                         hermit_shas: BTreeSet::new(),
                         results: BTreeSet::new(),
+                        canonical_comparisons: BTreeSet::new(),
                         invocations: BTreeSet::new(),
                         first_divergent_scheduler_turn: ObservedPositions::default(),
                         first_divergent_virtual_nanoseconds: ObservedPositions::default(),
@@ -3049,21 +3097,38 @@ fn apply_validate_results(
             };
             observation.hermit_shas.insert(hermit_sha.to_string());
             observation.results.insert(result);
+            let hermit_depth = depth.get("hermit").ok_or_else(|| {
+                format!("{} observation has no Hermit source depth", display_id(id))
+            })?;
+            observation.canonical_comparisons.insert(CanonicalComparison {
+                hermit_sha: row.hermit_sha.clone(),
+                hermit_commits: hermit_depth.commits,
+                hermit_first_parent: hermit_depth.first_parent,
+                run_id: row.run_id.clone(),
+                evidence_sha256: candidate.evidence_identity.clone(),
+                result,
+                left_info_messages,
+                right_info_messages,
+            });
             // Record the invocation, exactly as the pressure path does. Without
             // it a validate-sourced bound would have strictly WORSE provenance
             // than a pressure-sourced one: no per-run record, no run_id, and no
             // pasteable command to reproduce the divergence it reports.
-            let inserted = observation.invocations.insert(ObservedInvocation {
-                hermit_sha: row.hermit_sha.clone(),
-                run_id: row.run_id.clone(),
-                result,
-                argv: row.argv.clone(),
-                guest_argv: row.guest_argv.clone(),
-                env: row.env.clone(),
-                cwd: row.cwd.clone(),
-                shell_command: row.shell_command.clone(),
-                attempts: attempt_invocations,
-            });
+            let inserted = if store_invocation {
+                observation.invocations.insert(ObservedInvocation {
+                    hermit_sha: row.hermit_sha.clone(),
+                    run_id: row.run_id.clone(),
+                    result,
+                    argv: row.argv.clone(),
+                    guest_argv: row.guest_argv.clone(),
+                    env: row.env.clone(),
+                    cwd: row.cwd.clone(),
+                    shell_command: row.shell_command.clone(),
+                    attempts: attempt_invocations,
+                })
+            } else {
+                true
+            };
             // Re-importing the same retained evidence must be byte-idempotent.
             // Positions are vectors, so appending them when the invocation set
             // rejected a duplicate would silently inflate the sample count.
@@ -3123,7 +3188,7 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
     }
     let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
     let before = tracked.clone();
-    let fold = apply_validate_results(&mut tracked, &rows, &head, &detcore_tree, &depth)?;
+    let fold = apply_validate_results(&mut tracked, &rows, &head, &detcore_tree, &depth, true)?;
     refresh_measurement(&mut tracked);
     refresh_score(&derived, &mut tracked);
     enforce_writer_boundary(&before, &tracked, Writer::ValidateObservations)?;
@@ -3216,7 +3281,10 @@ fn import_results(root: &Path, results: &Path) -> Result<(), String> {
         files_scanned,
         rows_scanned,
         terminal_comparisons,
-    } = read_retained_selected_results(root, results, &derived.green)?;
+        stale_coordinate_rows,
+        stale_coordinates,
+        stale_coordinate_cells,
+    } = read_retained_selected_results(root, results, &derived.enabled, &derived.green)?;
     let mut tracked = tracked_from(&derived, Some(before.clone()), None, false)?;
     // This command is a projection of the latest retained validate evidence,
     // not an append-only history store. Replace its prior validate projection
@@ -3237,6 +3305,7 @@ fn import_results(root: &Path, results: &Path) -> Result<(), String> {
             &retained.hermit_sha,
             &retained.detcore_tree,
             &retained.depth,
+            false,
         )?;
         fold.passed += one.passed;
         fold.located += one.located;
@@ -3268,9 +3337,9 @@ fn import_results(root: &Path, results: &Path) -> Result<(), String> {
                     !cell.observations.iter().any(|observation| {
                         observation.provenance == ObservationProvenance::Validate
                             && observation
-                                .invocations
+                                .canonical_comparisons
                                 .iter()
-                                .any(|invocation| invocation.hermit_sha == last.hermit_sha)
+                                .any(|comparison| comparison.hermit_sha == last.hermit_sha)
                     })
                 })
         })
@@ -3326,6 +3395,13 @@ fn import_results(root: &Path, results: &Path) -> Result<(), String> {
         files_scanned,
         rows_scanned
     );
+    println!(
+        "  excluded as stale: {stale_coordinate_rows} older diverging comparison row(s), carrying {stale_coordinates} coordinate value(s), across {} enabled cell(s) whose newest retained canonical result is a pass",
+        stale_coordinate_cells.len()
+    );
+    for cell in &stale_coordinate_cells {
+        println!("    stale coordinate: {cell}");
+    }
     println!(
         "  before: {} green / {} red / {} not-applicable / {} total",
         before_counts.0, before_counts.1, before_counts.2, before_counts.3
@@ -3760,6 +3836,9 @@ struct RetainedImport {
     files_scanned: usize,
     rows_scanned: usize,
     terminal_comparisons: usize,
+    stale_coordinate_rows: usize,
+    stale_coordinates: usize,
+    stale_coordinate_cells: BTreeSet<String>,
 }
 
 /// Read retained validate rows without pretending they belong to the current
@@ -3770,6 +3849,7 @@ struct RetainedImport {
 fn read_retained_selected_results(
     root: &Path,
     result_root: &Path,
+    eligible: &BTreeSet<CellId>,
     selected: &BTreeSet<CellId>,
 ) -> Result<RetainedImport, String> {
     if !result_root.is_dir() {
@@ -3828,7 +3908,7 @@ fn read_retained_selected_results(
                 continue;
             }
             let Some(id) = row.id() else { continue };
-            if !selected.contains(&id) || !history.contains_key(&row.hermit_sha) {
+            if !eligible.contains(&id) || !history.contains_key(&row.hermit_sha) {
                 continue;
             }
             let evidence_identity = row
@@ -3881,11 +3961,7 @@ fn read_retained_selected_results(
         if !matches!(candidate.row.outcome.as_str(), "PASS" | "FAIL") {
             continue;
         }
-        if candidate
-            .row
-            .require_bitwise_info_comparison_evidence()
-            .is_err()
-        {
+        if candidate.row.bitwise_info_comparison().is_err() {
             continue;
         }
         let rank = *history
@@ -3921,14 +3997,44 @@ fn read_retained_selected_results(
     let mut metadata: BTreeMap<String, (String, BTreeMap<String, SourceDepth>)> = BTreeMap::new();
     let mut cells = Vec::new();
     let mut terminal_comparisons = 0usize;
-    for id in selected {
-        let ranks = by_cell_and_rank
-            .remove(id)
-            .expect("missing selected cells refused above");
-        let (_rank, candidates) = ranks
-            .into_iter()
-            .next()
-            .expect("selected cell has retained evidence");
+    let mut stale_coordinate_rows = 0usize;
+    let mut stale_coordinates = 0usize;
+    let mut stale_coordinate_cells = BTreeSet::new();
+    for (id, mut ranks) in by_cell_and_rank {
+        let latest_rank = *ranks.keys().next().expect("cell has retained evidence");
+        let latest_candidates = ranks.get(&latest_rank).expect("latest rank exists");
+        let latest_is_pass = latest_candidates
+            .iter()
+            .all(|candidate| candidate.row.outcome == "PASS");
+        if latest_is_pass {
+            for candidates in ranks.range((latest_rank + 1)..).map(|(_, rows)| rows) {
+                for candidate in candidates {
+                    if candidate.row.outcome != "FAIL" {
+                        continue;
+                    }
+                    let coordinate_count = [
+                        candidate.row.first_divergent_scheduler_turn,
+                        candidate.row.first_divergent_virtual_nanoseconds,
+                        candidate.row.first_divergent_record,
+                        candidate.row.first_divergent_syscall,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .count();
+                    if coordinate_count > 0 {
+                        stale_coordinate_rows += 1;
+                        stale_coordinates += coordinate_count;
+                        stale_coordinate_cells.insert(display_id(&id));
+                    }
+                }
+            }
+        }
+        if !selected.contains(&id) {
+            continue;
+        }
+        let candidates = ranks
+            .remove(&latest_rank)
+            .expect("latest selected evidence exists");
         let sha = candidates[0].row.hermit_sha.clone();
         if candidates
             .iter()
@@ -3936,7 +4042,7 @@ fn read_retained_selected_results(
         {
             return Err(format!(
                 "latest retained rank mixed Hermit SHAs for {}",
-                display_id(id)
+                display_id(&id)
             ));
         }
         let (detcore_tree, depth) = match metadata.get(&sha) {
@@ -3957,7 +4063,7 @@ fn read_retained_selected_results(
         };
         terminal_comparisons += candidates.len();
         cells.push(RetainedCellResults {
-            id: id.clone(),
+            id,
             hermit_sha: sha,
             detcore_tree,
             depth,
@@ -3969,6 +4075,9 @@ fn read_retained_selected_results(
         files_scanned: files.len(),
         rows_scanned,
         terminal_comparisons,
+        stale_coordinate_rows,
+        stale_coordinates,
+        stale_coordinate_cells,
     })
 }
 
@@ -5004,7 +5113,14 @@ fn self_test() -> Result<(), String> {
             row: validate_row.clone(),
         }],
     )]);
-    apply_validate_results(&mut observed, &rows, "sha-1", "tree-1", &depth_fixture)
+    apply_validate_results(
+        &mut observed,
+        &rows,
+        "sha-1",
+        "tree-1",
+        &depth_fixture,
+        true,
+    )
         .map_err(|e| format!("validate-observation bracket failed: {e}"))?;
     let pressure = observed.cells[0]
         .observations
@@ -5208,6 +5324,7 @@ fn self_test() -> Result<(), String> {
         "sha-1",
         "tree-1",
         &depth_fixture,
+        true,
     )
     .map_err(|e| format!("diverged-unlocated bracket failed: {e}"))?;
     refresh_measurement(&mut unlocated);
@@ -5239,6 +5356,7 @@ fn self_test() -> Result<(), String> {
         "sha-1",
         "tree-1",
         &depth_fixture,
+        true,
     )
     .map_err(|e| format!("coordinate-less PASS bracket failed: {e}"))?;
     refresh_measurement(&mut passed);
@@ -5286,6 +5404,7 @@ fn self_test() -> Result<(), String> {
         "sha-1",
         "tree-1",
         &depth_fixture,
+        true,
     )
     .map_err(|e| format!("same-SHA divergence score bracket failed: {e}"))?;
     refresh_measurement(&mut passed);
@@ -5297,12 +5416,16 @@ fn self_test() -> Result<(), String> {
     later_pass_rows.get_mut(&unlocated_id).unwrap()[0]
         .row
         .hermit_sha = "sha-2".into();
+    let mut later_depth = depth_fixture.clone();
+    later_depth.get_mut("hermit").unwrap().commits += 1;
+    later_depth.get_mut("hermit").unwrap().first_parent += 1;
     apply_validate_results(
         &mut passed,
         &later_pass_rows,
         "sha-2",
         "tree-2",
-        &depth_fixture,
+        &later_depth,
+        true,
     )
     .map_err(|e| format!("later-pass score bracket failed: {e}"))?;
     refresh_measurement(&mut passed);
@@ -5341,6 +5464,7 @@ fn self_test() -> Result<(), String> {
         "sha-1",
         "tree-1",
         &depth_fixture,
+        true,
     )
     .is_ok()
     {
@@ -5366,6 +5490,7 @@ fn self_test() -> Result<(), String> {
         "sha-1",
         "tree-1",
         &depth_fixture,
+        true,
     )
     .map_err(|e| {
         format!(
@@ -5452,6 +5577,7 @@ fn self_test() -> Result<(), String> {
             "sha-1",
             "tree-1",
             &depth_fixture,
+            true,
         )
         .map_err(|e| format!("a coordinate-less {outcome} failed the fold outright: {e}"))?;
         if other_fold.reads_all_green() {
@@ -5775,6 +5901,7 @@ fn self_test() -> Result<(), String> {
         depth: BTreeMap::new(),
         hermit_shas: BTreeSet::new(),
         results: BTreeSet::new(),
+        canonical_comparisons: BTreeSet::new(),
         invocations: BTreeSet::new(),
         first_divergent_scheduler_turn: ObservedPositions::default(),
         first_divergent_virtual_nanoseconds: ObservedPositions::default(),
