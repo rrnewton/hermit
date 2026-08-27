@@ -10573,14 +10573,17 @@ fn product_front_door_process_bracket() -> Result<(), String> {
             let output = command.output().map_err(|error| {
                 format!("front-door process bracket: cannot launch {label}: {error}")
             })?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
             let rendered = format!(
                 "{}{}",
-                String::from_utf8_lossy(&output.stdout),
+                stdout,
                 String::from_utf8_lossy(&output.stderr)
             );
-            if output.status.code() != Some(4)
+            if output.status.code() != Some(i32::from(COULD_NOT_RUN_EXIT_CODE))
                 || !rendered.contains("product validation inside dev-hermit")
                 || !rendered.contains(expected_remediation)
+                || stdout.lines().last()
+                    != Some("FINAL_VALIDATE_STATUS: COULD_NOT_RUN")
             {
                 return Err(format!(
                     "front-door process bracket: {label} escaped/refused incorrectly: status={:?} \
