@@ -645,7 +645,7 @@ impl GlobalTool for GlobalState {
         let (exec_reconnect, is_exec_caller_after_local_mm_swap) = {
             let pending = self.pending_exec_states.lock().unwrap();
             let reconnect = match &request {
-                GlobalRequest::CreateChildThread(child, process, _, None, _, None, _)
+                GlobalRequest::CreateChildThread(child, process, _, None, _, _, _)
                     if *child == dtid && *child == *process =>
                 {
                     pending.get(process).cloned()
@@ -3287,6 +3287,9 @@ mod tests {
             (global_time.as_nanos(), global_time.threads_time(dettid))
         };
         let fresh_local_time = DetTime::new(&config);
+        let physical_ids = Some((std::process::id() as i32, unsafe {
+            libc::syscall(libc::SYS_gettid) as i32
+        }));
         state.pending_exec_states.lock().unwrap().insert(
             detpid,
             PendingExecState {
@@ -3328,7 +3331,7 @@ mod tests {
                         0,
                         None,
                         libc::SIGCHLD,
-                        None,
+                        physical_ids,
                         Some(DEFAULT_PRIORITY),
                     ),
                 ),
@@ -3341,6 +3344,15 @@ mod tests {
                 GlobalResponse::CreateChildThread(Some(old_mm.for_exec(detpid)))
             )
         );
+        assert_eq!(
+            state.sched.lock().unwrap().physical_thread_identity(dettid),
+            Some((
+                old_mm.for_exec(detpid),
+                physical_ids.unwrap().0,
+                physical_ids.unwrap().1,
+            )),
+            "post-exec host identity must be installed by CreateChildThread before admission"
+        );
 
         let start_response = state
             .receive_rpc(
@@ -3348,7 +3360,7 @@ mod tests {
                 (
                     fresh_local_time,
                     old_mm.for_exec(detpid),
-                    GlobalRequest::StartNewThread(dettid, detpid, None),
+                    GlobalRequest::StartNewThread(dettid, detpid, physical_ids),
                 ),
             )
             .await;

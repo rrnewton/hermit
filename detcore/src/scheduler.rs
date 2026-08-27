@@ -5363,6 +5363,7 @@ mod test {
     fn nonleader_exec_removal_preserves_replacement_admission() {
         let config = Config {
             cancel_killed_thread_rpcs: true,
+            backend_requires_thread_directed_process_signals: true,
             ..Config::default()
         };
         let mut sched = Scheduler::new(&config);
@@ -5379,12 +5380,21 @@ mod test {
         sched.runqueue_push_back(caller);
 
         let old_leader_request = sched.next_turns.get(&leader).unwrap().req.clone();
+        let post_exec_mm = pre_exec_mm.for_exec(detpid);
+        let physical_pid = std::process::id() as i32;
+        let physical_tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+        sched
+            .register_physical_thread(leader, pre_exec_mm, physical_pid, physical_tid)
+            .expect("old leader PIDFD_THREAD registration must succeed");
+        sched
+            .register_physical_thread(leader, post_exec_mm, physical_pid, physical_tid)
+            .expect("post-exec PIDFD_THREAD registration must replace the old address space");
         let retired = sched.reconnect_after_exec(ExecReconnect {
             caller,
             new_leader: leader,
             detpid,
             pre_exec_mm,
-            post_exec_mm: pre_exec_mm.for_exec(detpid),
+            post_exec_mm,
             child_tid_addr: 0,
             reconnect_priority: Some(DEFAULT_PRIORITY),
         });
@@ -5393,6 +5403,11 @@ mod test {
         assert!(matches!(old_leader_request.try_read(), Some(Err(_))));
         assert!(sched.pending_run_queue_removals.contains_key(&leader));
         assert!(sched.pending_run_queue_admissions.contains_key(&leader));
+        assert_eq!(
+            sched.physical_thread_identity(leader),
+            Some((post_exec_mm, physical_pid, physical_tid)),
+            "old-leader cleanup must not remove the replacement leader's PIDFD_THREAD"
+        );
 
         sched.drain_pending_run_queue_removals();
         sched.drain_pending_run_queue_admissions();
