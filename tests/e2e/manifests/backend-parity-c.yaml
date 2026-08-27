@@ -6682,3 +6682,77 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
         ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+  - id: backend-parity-c/timer-family-identity
+    description: "Cross-family timer ordering: timerfd, POSIX timers, interval timers, alarm, epoll timeout, and futex timeout across two threads"
+    lane: portable
+    requires:
+    - linux
+    - x86_64
+    - userns
+    - ptrace
+    - cc
+    timeout_seconds: 120
+    occasional: false
+    program: tests/backend-parity/fixtures/timer_family_identity.c
+    build:
+      cflags:
+      - -pthread
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci:
+          ptrace: false
+        ci_disabled_reason:
+          ptrace:
+            result: determinism-failure
+            evidence: "hermit 34cee61879de471e10f155960063a5bf59d594b7; task drain_hermit_draft_pr_6"
+            reason: "The exact manifest cell failed canonical ptrace verification at scheduler turn 270 (virtual ns 1767225600072319480, record 421, syscall 6). In 30 additional strict ptrace runs the guest produced three outcomes: 24 futex-first successes, 4 timerfd-first successes, and 2 nonzero exits from PMU skid overshoot. Keep this measured red available for manual pressure and mechanism work; do not promote it into blocking CI until the cross-family ordering is deterministic."
+        backends_enabled:
+        - ptrace
+        assert:
+          bitwise_parity: true
+        backends_disabled:
+          dbt: DBT canonical verification never measured for this cell
+          kvm: KVM canonical verification never measured for this cell
+          sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
+          liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
