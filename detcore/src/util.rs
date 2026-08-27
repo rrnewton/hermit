@@ -83,7 +83,9 @@ pub fn truncated(width: usize, mut s: String) -> String {
 /// would busy-spin against a full pipe, so it blocks in `poll(POLLOUT)`.
 pub struct RetryingStderr;
 
-/// Total wall-clock a single diagnostic write may spend waiting for a reader.
+/// Total wall-clock ALL diagnostic writes in ONE PROCESS may spend waiting for a
+/// reader that is not draining. Hermit forks, so read the fork note below before
+/// treating this as the whole exit path's budget.
 ///
 /// ⚠️ WITHOUT A CEILING THIS LOOP NEVER ENDS, AND IT RUNS WHILE HERMIT IS ALREADY
 /// FAILING. `EAGAIN` -> `poll(POLLOUT, 1s)` -> retry is correct for a reader that
@@ -99,18 +101,82 @@ pub struct RetryingStderr;
 /// reports why hermit is stopping. A supervisor that hangs while reporting an
 /// error is harder to diagnose than one that dies reporting it badly.
 ///
-/// Five seconds is far above any real drain and far below "never". On expiry the
-/// write returns `WouldBlock`, `writeln!` gives up, the caller's `let _ =` drops
-/// that line, and hermit exits — which is the pre-existing contract for a
+/// ⚠️ THIS IS A TOTAL FOR THE WHOLE PROCESS, NOT A BUDGET PER `write()` CALL, AND
+/// THE DIFFERENCE IS THE ENTIRE GUARANTEE. An earlier version started the clock
+/// inside `fn write`, so every call got the full allowance. Nothing writes to
+/// stderr exactly once on the exit path:
+///
+/// ```text
+///   hermit-cli/src/bin/hermit/main.rs      the failure class, the head of the
+///                                          error chain, then ONE PER CAUSE in
+///                                          `for cause in chain` -- 2 + chain length
+///   hermit-cli/src/bin/hermit/tracing.rs   .with_writer(|| RetryingStderr) is the
+///                                          writer for the WHOLE subscriber: one
+///                                          write per log event
+///   detcore/src/tool_global.rs             a multi-part `write!`, which `write_fmt`
+///                                          splits into several `write` calls
+/// ```
+///
+/// With a per-call budget the process-level cost was N times this number, N is
+/// bounded by the error chain rather than by anything here, and every caller's
+/// `let _ =` swallowed the overrun silently. A `--log info` run measured at 138
+/// lines would have been minutes, not seconds.
+///
+/// ⚠️ THE VALUE IS DERIVED FROM THE BOUND THAT ENCLOSES IT, NOT CHOSEN. Diagnostics
+/// on the exit path run inside `RUN_TIMEOUT_UNWIND_GRACE` (10s,
+/// `hermit-cli/src/lib.rs`): the window between a `--timeout` expiring and the
+/// SIGALRM fallback calling `_exit`. Overrun there does not merely delay the
+/// report, it loses it -- the fallback fires mid-sentence and additionally emits
+/// `HERMIT_RUN_TIMEOUT_FALLBACK`, which is supposed to mean the teardown wedged.
+/// So the arithmetic is:
+///
+/// ⚠️ AND IT APPLIES TWICE, BECAUSE HERMIT FORKS. `Container::run` forks the
+/// container init, so the init gets its own COPY of the process-wide clock below
+/// and spends its own full deadline. Both processes write diagnostics to the same
+/// fd 2 on the way out. "Process total" is therefore NOT "exit total", and a
+/// derivation that forgets the fork is out by exactly a factor of two. Measured
+/// 2026-08-26 against a stopped reader on a real guest, which is the case where
+/// both processes report:
+///
+/// ```text
+///   deadline 5000ms   ->  10.03s observed   two processes, one deadline each
+///   deadline 2500ms   ->   5.02s observed   the same two, halved
+///   deadline 2500ms   ->   2.52s observed   missing guest: only ONE process reports
+/// ```
+///
+/// So the arithmetic is:
+///
+/// ```text
+///   RUN_TIMEOUT_UNWIND_GRACE                    10s     the enclosing bound
+///   diagnostics may have half of it              5s     leaving 5s for the unwind
+///   processes that write diagnostics              2     hermit + the forked init
+///   this deadline, per process                2500ms    = 5s / 2
+/// ```
+///
+/// Half is a split, not a measurement, and is stated as one; the factor of two is
+/// a fact about the process tree and is measured above. What is ALSO measured is
+/// that the previous arrangement could not fit: at 5s per CALL, the same real-guest
+/// fixture took 15.04s -- three blocked writes -- against a 10s grace, so the inner
+/// bound exceeded its outer bound before any unwind work happened at all.
+/// `hermit-cli` asserts this relationship in a test, so raising either side without
+/// the other fails by name.
+///
+/// On expiry the write returns `WouldBlock`, `writeln!` gives up, the caller's
+/// `let _ =` drops that line, and hermit exits — the pre-existing contract for a
 /// diagnostic that cannot be delivered.
-const STDERR_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+pub const STDERR_DIAGNOSTIC_DEADLINE: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// When this process first found stderr unwritable, shared by every
+/// `RetryingStderr`, which is what makes the deadline above a process total.
+/// Set on the first `EAGAIN` and never reset: a run that recovers and later
+/// blocks again has still spent that earlier time on its exit path.
+static STDERR_BLOCKED_SINCE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 impl std::io::Write for RetryingStderr {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
-        let started = std::time::Instant::now();
         loop {
             // SAFETY: `write(2)` on fd 2 reads `buf.len()` bytes from `buf`,
             // which is valid for that length, and writes no memory.
@@ -122,12 +188,17 @@ impl std::io::Write for RetryingStderr {
             match err.kind() {
                 std::io::ErrorKind::Interrupted => continue,
                 std::io::ErrorKind::WouldBlock => {
-                    // ⚠️ BOUNDED. Waiting for a slow reader is the point; waiting
-                    // for a stopped one is a hang on hermit's exit path. Give up
-                    // and let the caller drop the line rather than never return.
-                    if started.elapsed() >= STDERR_WRITE_DEADLINE {
+                    // ⚠️ BOUNDED, AND THE CLOCK IS PROCESS-WIDE. Waiting for a slow
+                    // reader is the point; waiting for a stopped one is a hang on
+                    // hermit's exit path. Starting the clock here rather than at the
+                    // top of `write` is what makes the deadline a total: the first
+                    // blocked write sets it and every later one inherits it, so N
+                    // writes cost the deadline once instead of N times.
+                    let blocked_since = *STDERR_BLOCKED_SINCE.get_or_init(std::time::Instant::now);
+                    let spent = blocked_since.elapsed();
+                    let Some(remaining) = STDERR_DIAGNOSTIC_DEADLINE.checked_sub(spent) else {
                         return Err(err);
-                    }
+                    };
                     // Block until the reader makes room. A failed or timed-out
                     // poll falls through to another write attempt rather than
                     // dropping the bytes.
@@ -136,9 +207,17 @@ impl std::io::Write for RetryingStderr {
                         events: libc::POLLOUT,
                         revents: 0,
                     };
+                    // ⚠️ CLAMPED TO WHAT IS LEFT, NOT A FLAT SECOND. The check above
+                    // happens BEFORE the poll, so a flat 1000ms let a call that
+                    // started at 4.9s sleep a further second and overshoot to ~6s --
+                    // the deadline documented one number and delivered another.
+                    // Clamping makes the elapsed total the stated total.
+                    let timeout_ms = i32::try_from(remaining.as_millis())
+                        .unwrap_or(i32::MAX)
+                        .min(1000);
                     // SAFETY: one initialised `pollfd`, count 1, timeout in ms.
                     unsafe {
-                        libc::poll(&mut pfd, 1, 1000);
+                        libc::poll(&mut pfd, 1, timeout_ms);
                     }
                     continue;
                 }
