@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
-"""Check the refusal predicate used by the validate stop-path test.
+"""Check refusal handling in the validate stop-path test.
 
 This check is deliberately about behavior, not Python spelling.  The defect in
-https://github.com/rrnewton/hermit/pull/2637 was that `_looks_refused()` searched
-the complete captured channel for refusal-shaped text.  That turned ordinary
-failures which merely mentioned that text into `ValidateChildRefused`.
+https://github.com/rrnewton/hermit/pull/2637 was that the consumer searched the
+complete captured channel for refusal-shaped text.  That turned ordinary failures
+which merely mentioned that text into `ValidateChildRefused`.
 
 The stop-path test cannot run inside `make lint-checks`: it starts a full
 validate, and a validate started from inside validation is refused.  Importing
 the file is safe, however, because its process-spawning work is guarded by
 `if __name__ == "__main__"`.  This check therefore drives the real
-`wait_for_text()` path with both genuine refusal summaries and ordinary failure
-output.
+`wait_for_text()` path with genuine re-entrancy refusals, other could-not-run
+outcomes, status mismatches, quoted text, and ordinary failure output.
 
 The check refuses when the refusal-classification path is absent.  Pull request
-2637 must therefore be underneath this change before it can land: once the gate
-is scheduled, deleting or renaming both observed names cannot turn it green.
-`ValidateChildRefused` and `wait_for_text` must exist, and the consumer must
-classify every case correctly.  A source-only check cannot decide whether
-arbitrary rewritten Python has the same behavior; executing the real consumer
-on the required inputs can.
+2637 must therefore be underneath this change before it can land. The
+`ValidateChildRefused` and `wait_for_text` consumer path must exist and classify
+every case correctly. A source-only check cannot decide whether arbitrary
+rewritten Python has the same behavior; executing the real consumer on the
+required inputs can.
 
 Exit status:
     0  wait_for_text classifies every case correctly
@@ -39,36 +38,92 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TARGET = ROOT / "scripts" / "test_validate_stop_paths.py"
 SAMPLE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
+FINAL_COULD_NOT_RUN = "FINAL_VALIDATE_STATUS: COULD_NOT_RUN"
+FINAL_FAILED = "FINAL_VALIDATE_STATUS: FAILED"
+REENTRANCY_REASON = "   refused by: the re-entrancy guard"
 
-# These are channel contents, not fragments of an implementation.  The nine
-# False cases are ordinary failures; seven contain one of the old predicate's
-# substrings, while two complete-looking lines check the required line context.
-# The two True cases are final refusal summaries emitted by validate,
-# including a channel shared with other writers.  Against this exact corpus the
-# original predicate produces seven false refusals and misses the standalone
-# genuine refusal.
-CASES: tuple[tuple[str, bool], ...] = (
-    ("thread 'main' panicked at src/x.rs:9: connection refused by: peer", False),
-    ("guest: server said 'refused by: firewall'\nerror: compilation failed", False),
-    ("error[E0433]: file /home/x/validate: REFUSED_cases/t.rs not found", False),
-    ("refused by: guest firewall policy", False),
-    ("   refused by: guest firewall policy", False),
-    ("validate: REFUSED_cases is a guest label", False),
-    ("another validate is already running in this documentation", False),
+
+def refusal_output(
+    *,
+    reason: str,
+    commit: str = SAMPLE_COMMIT,
+    profile: str = "full",
+    lead_in: str = "",
+) -> str:
+    return (
+        lead_in
+        + f"🚫 validate REFUSED (exit 75) — profile {profile} @ {commit}\n"
+        + f"{reason}\n"
+        + "   nodes: none executed (stopped before the DAG ran)\n"
+        + f"{FINAL_COULD_NOT_RUN}\n"
+    )
+
+# These are complete channel contents plus the observed child status, not source
+# fragments. The thirteen False cases include ordinary failures, other refusal
+# reasons, incomplete status output, and a status/code disagreement. The three
+# True cases are the specific re-entrancy refusal that prevents the stop-test seam
+# from running, including the documented unknown-commit fallback and a channel
+# containing earlier text from another writer.
+CASES: tuple[tuple[str, int, bool], ...] = (
+    ("thread 'main' panicked at src/x.rs:9: connection refused by: peer", 1, False),
+    ("guest: server said 'refused by: firewall'\nerror: compilation failed", 1, False),
+    ("error[E0433]: file /home/x/validate: REFUSED_cases/t.rs not found", 1, False),
+    ("refused by: guest firewall policy", 1, False),
+    ("   refused by: guest firewall policy", 1, False),
+    ("validate: REFUSED_cases is a guest label", 1, False),
+    ("another validate is already running in this documentation", 1, False),
     (
-        f"wrapper: 🚫 validate REFUSED (exit 3) — profile full @ {SAMPLE_COMMIT}",
+        "wrapper: "
+        + refusal_output(reason=REENTRANCY_REASON),
+        75,
         False,
     ),
-    ("🚫 validate REFUSED is quoted documentation, not a final summary", False),
     (
-        "refused by: guest firewall policy\n"
-        f"🚫 validate REFUSED (exit 3) — profile full @ {SAMPLE_COMMIT}\n"
-        "   refused by: the per-checkout invocation lock\n"
-        "   another validate is already running",
+        "🚫 validate REFUSED is quoted documentation, not a final summary\n"
+        f"{REENTRANCY_REASON}\n"
+        f"{FINAL_COULD_NOT_RUN}\n",
+        75,
+        False,
+    ),
+    (
+        refusal_output(reason="   refused by: argument parsing"),
+        75,
+        False,
+    ),
+    (
+        refusal_output(reason=REENTRANCY_REASON),
+        1,
+        False,
+    ),
+    (
+        f"{FINAL_COULD_NOT_RUN}\n",
+        75,
+        False,
+    ),
+    (
+        f"{FINAL_COULD_NOT_RUN}\nquoted earlier\n{FINAL_FAILED}\n",
+        1,
+        False,
+    ),
+    (
+        refusal_output(reason=REENTRANCY_REASON),
+        75,
         True,
     ),
     (
-        f"🚫 validate REFUSED (exit 2) — profile strict @ {SAMPLE_COMMIT}",
+        refusal_output(reason=REENTRANCY_REASON, commit="unknown", profile="strict"),
+        75,
+        True,
+    ),
+    (
+        refusal_output(
+            reason=REENTRANCY_REASON,
+            lead_in=(
+                "wrapper mentioned validate: REFUSED and "
+                "FINAL_VALIDATE_STATUS: FAILED\n"
+            ),
+        ),
+        75,
         True,
     ),
 )
@@ -81,7 +136,8 @@ class CheckFailed(RuntimeError):
 class ExitedProcess:
     """The part of subprocess.Popen that wait_for_text observes after exit."""
 
-    returncode = 1
+    def __init__(self, returncode: int) -> None:
+        self.returncode = returncode
 
     def poll(self) -> int:
         return self.returncode
@@ -90,11 +146,11 @@ class ExitedProcess:
 def check_wait_for_text(
     wait_for_text: Callable[[Path, str, object], object],
     refusal_type: type[BaseException],
-    cases: Sequence[tuple[str, bool]],
+    cases: Sequence[tuple[str, int, bool]],
     *,
     subject: str,
 ) -> None:
-    expected = {want for _, want in cases}
+    expected = {want for _, _, want in cases}
     if expected != {False, True}:
         raise CheckFailed(
             f"{subject}: refusal predicate corpus must contain refusing and "
@@ -102,12 +158,16 @@ def check_wait_for_text(
         )
 
     wrong: list[str] = []
-    for sample, want in cases:
+    for sample, returncode, want in cases:
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "validate.log"
             log.write_text(sample, encoding="utf-8")
             try:
-                wait_for_text(log, "REFUSAL-CHECK-READY-MARKER", ExitedProcess())
+                wait_for_text(
+                    log,
+                    "REFUSAL-CHECK-READY-MARKER",
+                    ExitedProcess(returncode),
+                )
             except BaseException as exc:  # target exit 0 must not bypass the gate
                 if isinstance(exc, refusal_type):
                     got = True
@@ -144,8 +204,7 @@ def check_target(path: Path) -> None:
         ) from exc
 
     has_exception = "ValidateChildRefused" in namespace
-    has_predicate = "_looks_refused" in namespace
-    if not has_exception and not has_predicate:
+    if not has_exception:
         raise CheckFailed(
             f"{path}: refusal-classification path is absent; this gate cannot "
             "pass without observing it"
@@ -176,25 +235,55 @@ def self_test() -> None:
     import re
 
     summary = re.compile(
-        r"🚫 validate REFUSED \(exit [1-9][0-9]*\) — profile .+ @ [0-9a-f]{40}"
+        r"🚫 validate REFUSED \(exit 75\) — profile .+ @ (?:[0-9a-f]{40}|unknown)"
     )
 
-    def correct(output: str) -> bool:
-        return any(summary.fullmatch(line) for line in output.splitlines())
+    def correct(output: str, returncode: int) -> bool:
+        if returncode != 75:
+            return False
+        lines = output.splitlines()
+        statuses = [
+            (index, line.removeprefix("FINAL_VALIDATE_STATUS: "))
+            for index, line in enumerate(lines)
+            if line.startswith("FINAL_VALIDATE_STATUS: ")
+        ]
+        if not statuses or statuses[-1][1] != "COULD_NOT_RUN":
+            return False
+        final_index = statuses[-1][0]
+        summaries = [
+            index
+            for index, line in enumerate(lines[:final_index])
+            if summary.fullmatch(line)
+        ]
+        return bool(
+            summaries
+            and lines[summaries[-1] + 1 : summaries[-1] + 2]
+            == [REENTRANCY_REASON]
+        )
 
     shapes = ("refused by:", "validate: REFUSED", "another validate is already running")
 
-    def original_defect(output: str) -> bool:
+    def original_defect(output: str, _returncode: int) -> bool:
         return any(shape in output for shape in shapes)
+
+    def final_status_only(output: str, returncode: int) -> bool:
+        statuses = [
+            line.removeprefix("FINAL_VALIDATE_STATUS: ")
+            for line in output.splitlines()
+            if line.startswith("FINAL_VALIDATE_STATUS: ")
+        ]
+        return bool(statuses and statuses[-1] == "COULD_NOT_RUN" and returncode == 75)
 
     class Refused(RuntimeError):
         pass
 
     def wait_with(
-        predicate: Callable[[str], bool],
+        predicate: Callable[[str, int], bool],
     ) -> Callable[[Path, str, object], None]:
-        def wait(log: Path, _text: str, _process: object) -> None:
-            if predicate(log.read_text(encoding="utf-8")):
+        def wait(log: Path, _text: str, process: object) -> None:
+            if predicate(
+                log.read_text(encoding="utf-8"), int(getattr(process, "returncode"))
+            ):
                 raise Refused("refused")
             raise AssertionError("ordinary failure")
 
@@ -209,26 +298,50 @@ def self_test() -> None:
     )
 
     expected_failures = (
-        ("original whole-channel predicate", wait_with(original_defect), CASES),
+        (
+            "original whole-channel predicate",
+            wait_with(original_defect),
+            CASES,
+            "misclassified",
+        ),
         (
             "predicate that misses every refusal",
-            wait_with(lambda _output: False),
+            wait_with(lambda _output, _returncode: False),
             CASES,
+            "misclassified",
         ),
-        ("empty corpus", correct_wait, ()),
+        (
+            "final-status-only predicate",
+            wait_with(final_status_only),
+            CASES,
+            "misclassified",
+        ),
+        (
+            "empty corpus",
+            correct_wait,
+            (),
+            "must contain refusing and non-refusing cases",
+        ),
         (
             "non-refusing-only corpus",
             correct_wait,
-            tuple(case for case in CASES if not case[1]),
+            tuple(case for case in CASES if not case[2]),
+            "must contain refusing and non-refusing cases",
         ),
         (
             "refusing-only corpus",
             correct_wait,
-            tuple(case for case in CASES if case[1]),
+            tuple(case for case in CASES if case[2]),
+            "must contain refusing and non-refusing cases",
         ),
-        ("consumer exits zero", lambda _log, _text, _process: sys.exit(0), CASES),
+        (
+            "consumer exits zero",
+            lambda _log, _text, _process: sys.exit(0),
+            CASES,
+            "raised SystemExit: 0",
+        ),
     )
-    for name, wait_for_text, cases in expected_failures:
+    for name, wait_for_text, cases, required_message in expected_failures:
         try:
             check_wait_for_text(
                 wait_for_text,
@@ -236,8 +349,11 @@ def self_test() -> None:
                 cases,
                 subject=f"self-test {name}",
             )
-        except CheckFailed:
-            pass
+        except CheckFailed as exc:
+            if required_message not in str(exc):
+                raise AssertionError(
+                    f"self-test refused {name} for the wrong reason: {exc}"
+                ) from exc
         else:
             raise AssertionError(f"self-test did not refuse {name}")
 
