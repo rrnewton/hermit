@@ -2681,15 +2681,40 @@ else
   is_kvm=false
 fi
 
+lint_status=0
 PR_NUMBER="$pr" PR_LABELS="$labels" PR_BODY="$body" PR_IS_KVM="$is_kvm" \
-  bash scripts/core-review-protocol-lint.sh
+  bash scripts/core-review-protocol-lint.sh || lint_status=$?
+
+case "$lint_status" in
+  0) ;;
+  1) exit 1 ;;
+  2) exit 2 ;;
+  126)
+    echo "review-protocol lint FAILED to execute (exit 126) -- this is not a pass" >&2
+    exit 126
+    ;;
+  127)
+    echo "review-protocol lint was not found (exit 127) -- this is not a pass" >&2
+    exit 127
+    ;;
+  *)
+    echo "review-protocol lint returned undocumented exit $lint_status -- this is not a pass" >&2
+    exit "$lint_status"
+    ;;
+esac
 ```
 
-Exit 0 means the partial lint passed or did not apply; exit 1 means it found a
-label/body violation; exit 2 means the invocation could not decide. Record the
-exact-head adversarial-review evidence separately before binding a lane or
-landing. In particular, do not present this command's exit 0 as proof of an
-approval at the current head.
+The lint itself emits only three statuses: 0 means the partial lint passed or did
+not apply; 1 means it found a label/body violation; 2 means it could not decide
+because of a usage or internal error. Those three are not the shell's complete
+status range. Status 126 means the command was found but could not be executed;
+127 means it was not found. Statuses 3..125 and 128..255 are also outside the
+lint's contract (128 plus a signal number commonly reports signal termination).
+Every status other than 0 is a failure; an undocumented status is never a pass.
+
+Record the exact-head adversarial-review evidence separately before binding a
+lane or landing. In particular, do not present this command's exit 0 as proof of
+an approval at the current head.
 
 ⚠️ **CAPTURE EACH FETCH AND CHECK IT.** A failing command substitution can still
 leave a variable set and empty. The linter deliberately treats an explicitly

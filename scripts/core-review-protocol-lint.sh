@@ -29,6 +29,12 @@
 #   0  protocol satisfied, or the PR does not carry the post-facto label
 #   1  the PR is labeled but violates the protocol (landing must be blocked)
 #   2  usage / internal error
+#
+# Those are the only statuses this script emits deliberately.  In particular,
+# a command used by a match predicate may return 2 for its own error, 126 when
+# it cannot be executed, 127 when it cannot be found, or another nonzero status.
+# None of those means "no match": every predicate accepts only 0 (match) and 1
+# (no match), and converts every other status to this script's internal-error 2.
 
 set -euo pipefail
 
@@ -71,6 +77,24 @@ fi
 pr="${PR_NUMBER:-unknown}"
 is_kvm="${PR_IS_KVM:-false}"
 
+# A grep predicate has three possible outcomes even though a shell condition is
+# only true or false: 0 is a match, 1 is a clean no-match, and every other status
+# means the comparison did not complete.  Keep that third outcome distinct;
+# otherwise a missing or unexecutable grep (127/126) is read as "label absent",
+# and the first label check below reports a not-applicable pass.
+match_status_or_refuse() {
+    local operation=$1 status=$2
+    case "$status" in
+        0 | 1)
+            return "$status"
+            ;;
+        *)
+            echo "::error::PR #${pr}: ${operation} could not decide (exit ${status}); refusing rather than treating it as no match." >&2
+            exit 2
+            ;;
+    esac
+}
+
 # UNSET IS NOT THE SAME STATE AS EMPTY, AND ONLY ONE OF THEM IS AN ANSWER.
 #
 # This previously read `labels="${PR_LABELS-}"`, which collapses "the caller
@@ -94,7 +118,9 @@ labels="$PR_LABELS"
 
 # True when an exact label name is present (full-line match).
 has_label() {
-    printf '%s\n' "$labels" | grep -Fxq -- "$1"
+    local status=0
+    grep -Fxq -- "$1" <<<"$labels" || status=$?
+    match_status_or_refuse "label lookup" "$status"
 }
 
 # True when one of the contract's exact numbered labels is present.
@@ -121,8 +147,12 @@ round_label_alternatives() {
 # counting as the section.
 has_section() {
     local section=$1
-    printf '%s\n' "$body" | grep -Eiq \
-        "^[[:space:]]*(#{1,6}[[:space:]]*${section}|\*\*[[:space:]]*${section}|${section}[[:space:]]*:)"
+    local status=0
+    grep -Eiq \
+        "^[[:space:]]*(#{1,6}[[:space:]]*${section}|\*\*[[:space:]]*${section}|${section}[[:space:]]*:)" \
+        <<<"$body" \
+        || status=$?
+    match_status_or_refuse "PR-body section lookup" "$status"
 }
 
 if ! has_label "$post_facto_label"; then
