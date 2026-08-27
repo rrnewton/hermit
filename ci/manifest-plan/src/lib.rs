@@ -1,6 +1,8 @@
 pub mod canonical_verdict;
 pub mod ci_selection;
+pub mod host_capability;
 pub mod ledger;
 pub mod manifest_value;
 pub mod runner;
+pub mod stress_series;
 pub mod timeouts;
