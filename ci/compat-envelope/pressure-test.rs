@@ -1825,6 +1825,27 @@ fn series_run_index(dir_name: &str) -> u64 {
         .unwrap_or(0)
 }
 
+fn logical_time_nanoseconds(text: &str) -> Option<u64> {
+    let value = text.trim().replace('_', "");
+    if let Some(nanoseconds) = value.strip_suffix("ns") {
+        return nanoseconds.parse().ok();
+    }
+    let seconds = value.strip_suffix('s')?;
+    let (whole, fraction) = seconds.split_once('.').unwrap_or((seconds, ""));
+    if fraction.len() > 9
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let whole = whole.parse::<u64>().ok()?;
+    let mut fraction = fraction.to_string();
+    fraction.extend(std::iter::repeat_n('0', 9 - fraction.len()));
+    whole
+        .checked_mul(1_000_000_000)?
+        .checked_add(fraction.parse::<u64>().ok()?)
+}
+
 fn runtime_from_log(path: &Path) -> Result<JsonValue, String> {
     let text = fs::read_to_string(path)
         .map_err(|error| format!("cannot read retained verification log {}: {error}", path.display()))?;
@@ -6755,6 +6776,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         first_divergent_syscall: None,
         first_divergent_scheduler_turn: None,
         first_divergent_virtual_nanoseconds: None,
+        attempt: 1,
         schema: CELL_RESULT_SCHEMA,
         run_id: sample_slug.clone(),
         run_index: Some(0),
@@ -6943,6 +6965,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         first_divergent_syscall: None,
         first_divergent_scheduler_turn: None,
         first_divergent_virtual_nanoseconds: None,
+        attempt: 1,
         schema: CELL_RESULT_SCHEMA,
         run_id: first_repetition_slug.clone(),
         run_index: Some(1),
