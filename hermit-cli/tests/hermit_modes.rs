@@ -21,6 +21,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::Instant;
 
+use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
+
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 static WORKLOADS: OnceLock<Workloads> = OnceLock::new();
 
@@ -1014,7 +1016,7 @@ fn verify_reports_stdout_divergence() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         output.status.code(),
-        Some(1),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
         "unexpected status:\n{stderr}"
     );
     assert!(
@@ -1044,7 +1046,7 @@ fn verify_reports_exit_status_divergence() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         output.status.code(),
-        Some(1),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
         "unexpected status:\n{stderr}"
     );
     assert!(
@@ -1066,7 +1068,7 @@ fn verify_verbose_compares_the_full_trace() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         output.status.code(),
-        Some(1),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
         "unexpected status:\n{stderr}"
     );
     assert!(
