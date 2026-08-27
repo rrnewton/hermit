@@ -122,6 +122,7 @@ merged:
 
 | provenance | what it runs | what its bounds mean |
 |---|---|---|
+| `hermit-repeat` | a cell repeatedly at one tree | the runs requested directly through `hermit-repeat` |
 | `pressure-test` | a cell repeatedly at one tree | the flake distribution — what a yellow-cell floor should be derived from |
 | `validate` | a cell once per commit | a point; the regression signal a floor is checked against |
 
@@ -139,11 +140,18 @@ six COMMIT records, every divergence between two of them reports the same turn.
 Three commands write these arrays, all explicit and opt-in. **Ordinary validation
 still changes no tracked scorecard file.**
 
+Run these commands from the Hermit repository root. In the standard
+`dev-hermit/hermit` checkout, the parent series directory is `../series`.
+Because `--series-root` is resolved from the current directory, a checkout under
+`dev-hermit/worktrees/NAME` uses `../../series` instead.
+
 ```console
 ./ci/compat-envelope/scorecard.rs update-observations --summary FILE   # pressure test
 ./ci/compat-envelope/scorecard.rs observe-results --results DIR        # validate
 ./ci/compat-envelope/scorecard.rs import-results \
   --results DIR --current-summary FILE [--current-summary FILE ...]
+./ci/compat-envelope/scorecard.rs project-observations \
+  --series-root ../series --refreshed-at STAMP                         # series
 ```
 
 `observe-results` walks every `results.jsonl` under `DIR`, so several runs fold
@@ -185,6 +193,18 @@ comparison.
 The historical `never-measured` value in `cells.json` means no observation was
 imported. It is not proof that the cell was never run; retained results can
 exist before this projection is refreshed.
+
+The series cell name is the exact `test/mode/backend` identity. Passing and
+diverging comparisons create observations and update `last_tested`; compressed
+`num_runs` rows contribute their full sample count to any recorded divergence
+position. `no_result`, `timeout`, `errored`, and `skipped` rows are named but do
+not become evidence. Historical rows that predate the `detcore_tree` field use
+the recorded Hermit tree's `detcore` entry when that commit is available; a row
+whose tree cannot be resolved is named and skipped rather than guessed.
+
+This projection does not import retained validate result directories. That is
+a separate input path even though both ultimately update the same observation
+fields.
 
 During investigation, probe one exact red cell with a tight wall-clock cap:
 
