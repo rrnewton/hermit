@@ -60,6 +60,7 @@ static STDIO_NONBLOCK_THEN_APPEND_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_INITIAL_NONBLOCKING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_STATUS_ALIAS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_UNSUPPORTED_STATUS_FLAGS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static STDIO_APPEND_WRITE_PATHS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 const DBT_IO_BUFFER_MUTATOR_SOURCE: &str = r#"
@@ -796,6 +797,163 @@ fn assert_inherited_stdio_aliases_share_status_flags(backend: &str) {
     );
 }
 
+fn stdio_append_write_paths_guest() -> &'static Path {
+    STDIO_APPEND_WRITE_PATHS_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("stdio-append-write-paths");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create stdio append write-path guest directory");
+        let guest = build_root.join("stdio_append_write_paths");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/stdio_append_write_paths.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile stdio append write-path guest");
+        assert!(
+            output.status.success(),
+            "stdio append write-path guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// Every accepted write-like syscall must agree with the guest-visible
+/// `O_APPEND` returned by `F_GETFL` without changing the supervisor's open file
+/// description.
+///
+/// Linux refuses `sendfile` with `EINVAL` when its output is an append-mode
+/// regular file. Its positional-write calls instead append while preserving
+/// the open file description's offset. The inherited-stdio containment cannot
+/// report `O_APPEND` and then bypass those semantics merely because the
+/// physical bit was deliberately withheld from the supervisor's descriptor.
+fn assert_inherited_stdio_append_write_paths(backend: &str, operations: &[&str]) {
+    let _guard = hermit_run_guard();
+    let guest = stdio_append_write_paths_guest();
+
+    for operation in operations {
+        let directory = tempfile::tempdir().expect("failed to create a temporary directory");
+        let output_path = directory.path().join(format!("{operation}.out"));
+        let mut supervisor_stdout = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&output_path)
+            .expect("failed to open the file standing in for hermit's stdout");
+        supervisor_stdout
+            .write_all(b"prefix\n")
+            .expect("failed to seed the stdout stand-in");
+        supervisor_stdout
+            .seek(SeekFrom::Start(0))
+            .expect("failed to put the stdout stand-in before EOF");
+
+        // SAFETY: the descriptor is live and F_GETFL takes no third argument.
+        let flags_before = unsafe { libc::fcntl(supervisor_stdout.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags_before >= 0, "F_GETFL on supervisor stdout failed");
+        assert_eq!(
+            flags_before & libc::O_APPEND,
+            0,
+            "the supervisor's descriptor must start without O_APPEND",
+        );
+
+        let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+            .args(["run", "--backend", backend, "--"])
+            .arg(guest)
+            .arg(operation)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(
+                supervisor_stdout
+                    .try_clone()
+                    .expect("failed to duplicate the stdout stand-in"),
+            ))
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("failed to run the {backend} {operation} guest: {error}")
+            });
+        let diagnostics = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{backend} {operation} guest did not observe Linux O_APPEND semantics: {:?}\nstderr:\n{diagnostics}",
+            output.status,
+        );
+        assert!(
+            diagnostics.contains(&format!("op={operation} append=1")),
+            "{backend} {operation} guest did not observe O_APPEND:\n{diagnostics}",
+        );
+
+        let expected = if *operation == "sendfile" {
+            assert!(
+                diagnostics.contains("result=-1 errno=22 input_offset=0"),
+                "{backend} sendfile did not return EINVAL without consuming input:\n{diagnostics}",
+            );
+            b"prefix\n".as_slice()
+        } else if *operation == "pwritev2-noappend" {
+            assert!(
+                diagnostics.contains("result=6 errno=0"),
+                "{backend} {operation} did not complete the positional write:\n{diagnostics}",
+            );
+            b"guest\n\n".as_slice()
+        } else {
+            assert!(
+                diagnostics.contains("result=6 errno=0"),
+                "{backend} {operation} did not complete the positional write:\n{diagnostics}",
+            );
+            b"prefix\nguest\n".as_slice()
+        };
+        assert_eq!(
+            fs::read(&output_path).expect("failed to read stdout stand-in"),
+            expected,
+            "{backend} {operation} contradicted its guest-visible O_APPEND flag\nstderr:\n{diagnostics}",
+        );
+        assert_eq!(
+            supervisor_stdout
+                .stream_position()
+                .expect("failed to read supervisor stdout offset"),
+            0,
+            "{backend} {operation} changed the inherited open file description's offset",
+        );
+        // SAFETY: the descriptor is still live and F_GETFL takes no third argument.
+        let flags_after = unsafe { libc::fcntl(supervisor_stdout.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(
+            flags_after, flags_before,
+            "{backend} {operation} changed the supervisor's status flags: \
+             0x{flags_before:x} -> 0x{flags_after:x}",
+        );
+    }
+
+    // O_APPEND has no effect on a pipe. The sendfile refusal is therefore
+    // restricted to regular-file output rather than all inherited stdout.
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["run", "--backend", backend, "--"])
+        .arg(guest)
+        .arg("sendfile-pipe")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap_or_else(|error| {
+            panic!("failed to run the {backend} pipe-backed sendfile guest: {error}")
+        });
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{backend} pipe-backed sendfile guest failed: {:?}\nstderr:\n{diagnostics}",
+        output.status,
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "guest\n");
+    assert!(
+        diagnostics.contains("op=sendfile-pipe append=1 result=6 errno=0 input_offset=6"),
+        "{backend} sendfile treated pipe output as an append-mode regular file:\n{diagnostics}",
+    );
+}
+
 fn nonblocking_stdin_recv_guest() -> &'static Path {
     NONBLOCKING_STDIN_RECV_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1086,6 +1244,32 @@ fn run_kvm_inherited_stdio_aliases_share_status_flags() {
         return;
     }
     assert_inherited_stdio_aliases_share_status_flags("kvm");
+}
+
+#[test]
+fn run_ptrace_inherited_stdio_append_covers_write_like_syscalls() {
+    assert_inherited_stdio_append_write_paths(
+        "ptrace",
+        &[
+            "sendfile",
+            "pwrite",
+            "pwritev",
+            "pwritev2",
+            "pwritev2-noappend",
+        ],
+    );
+}
+
+#[test]
+fn run_kvm_inherited_stdio_append_covers_write_like_syscalls() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+    // The KVM ElfExecutor accepts sendfile on captured standard output, but
+    // rejects positioned writes to standard descriptors (pwrite64 with EBADF;
+    // pwritev/pwritev2 with ENOSYS). Cover the accepted write-like path here;
+    // the ptrace half covers every syscall Detcore can forward to the host.
+    assert_inherited_stdio_append_write_paths("kvm", &["sendfile"]);
 }
 
 // TODO-HUMAN-REVIEW(PR-723): Review the DBT PID fixture build.
