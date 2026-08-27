@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
 import re
 import signal
@@ -40,14 +41,15 @@ NO_RESULT_EXIT_CODE = 75
 
 
 class ValidateChildRefused(RuntimeError):
-    """The spawned validate REFUSED to start, so the stop path was never exercised.
+    """The spawned validate hit the re-entrancy guard before the test seam.
 
     This is a could-not-evaluate, not a failure, and the distinction is the whole
     point of the class. The fixture spawns `scripts/validate.rs full`; when that
-    child refuses -- because another validate holds the per-checkout invocation
-    lock, or because admission declines -- nothing about the signal traps has been
-    observed. Reporting it as an assertion says the stop paths are broken when
-    what actually happened is that they were never reached.
+    child inherits the outer validate marker, the re-entrancy guard runs before
+    the stop-test seam and nothing about the signal traps has been observed.
+    Reporting that specific refusal as an assertion says the stop paths are broken
+    when they were never reached. Other refusals remain failures: bad arguments or
+    broken setup are defects in this fixture, not reasons to skip it.
 
     Measured on main at 4e168f2aa5b9: `AssertionError: validate exited before
     ready: rc=2` was the whole of check.lint_checks' failure, and the node was red
@@ -261,45 +263,71 @@ def warm_validate_binary() -> None:
 # Reason text is not enough: the captured output also contains text written by
 # wrappers and child programs.
 _REFUSAL_SUMMARY = re.compile(
-    r"🚫 validate REFUSED \(exit [1-9][0-9]*\) — profile .+ @ [0-9a-f]{40}"
+    r"🚫 validate REFUSED \(exit (?P<exit>[1-9][0-9]*)\) — profile .+ @ [0-9a-f]{40}"
 )
+_REENTRANCY_REFUSAL = "   refused by: the re-entrancy guard"
 
 
-def _looks_refused(output: str) -> bool:
-    """Did the child DECLINE, as opposed to failing at something?
+def _looks_refused(output: str, returncode: int) -> bool:
+    """Did the child hit the specific refusal that makes this test unevaluable?
 
-    Match the complete status line, not refusal-shaped prose anywhere else on the
-    captured channel. Anything else stays an AssertionError because reporting a
-    crash as could-not-evaluate would hide the failure.
+    Match the complete status line, its exit status, and the immediately following
+    re-entrancy reason. `Verdict::Refused` also covers bad arguments and broken
+    setup; those are fixture failures, not reasons to report could-not-evaluate.
+    Anything else stays an AssertionError because reporting a crash or invalid
+    invocation as could-not-evaluate would hide the failure.
     """
-    return any(_REFUSAL_SUMMARY.fullmatch(line) for line in output.splitlines())
+    lines = output.splitlines()
+    for index, line in enumerate(lines):
+        match = _REFUSAL_SUMMARY.fullmatch(line)
+        if match is None or int(match.group("exit")) != returncode:
+            continue
+        if lines[index + 1 : index + 2] == [_REENTRANCY_REFUSAL]:
+            return True
+    return False
 
 
 _SAMPLE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
-_REFUSAL_SELF_CHECK: tuple[tuple[str, bool], ...] = (
+_REFUSAL_SELF_CHECK: tuple[tuple[str, int, bool], ...] = (
     # Text from another writer must not decide the result, including at line start.
-    ("thread 'main' panicked at src/x.rs:9: connection refused by: peer", False),
-    ("guest: server said 'refused by: firewall'\nerror: compilation failed", False),
-    ("error[E0433]: file /home/x/validate: REFUSED_cases/t.rs not found", False),
-    ("refused by: guest firewall policy", False),
-    ("   refused by: guest firewall policy", False),
-    ("validate: REFUSED_cases is a guest label", False),
-    ("another validate is already running in this documentation", False),
+    ("thread 'main' panicked at src/x.rs:9: connection refused by: peer", 1, False),
+    ("guest: server said 'refused by: firewall'\nerror: compilation failed", 1, False),
+    ("error[E0433]: file /home/x/validate: REFUSED_cases/t.rs not found", 1, False),
+    ("refused by: guest firewall policy", 1, False),
+    ("   refused by: guest firewall policy", 1, False),
+    ("validate: REFUSED_cases is a guest label", 1, False),
+    ("another validate is already running in this documentation", 1, False),
     (
         f"wrapper: 🚫 validate REFUSED (exit 3) — profile full @ {_SAMPLE_COMMIT}",
+        3,
         False,
     ),
-    ("🚫 validate REFUSED is quoted documentation, not a final summary", False),
+    ("🚫 validate REFUSED is quoted documentation, not a final summary", 2, False),
+    (
+        f"🚫 validate REFUSED (exit 2) — profile full @ {_SAMPLE_COMMIT}\n"
+        "   refused by: argument parsing",
+        2,
+        False,
+    ),
+    (
+        f"🚫 validate REFUSED (exit 2) — profile full @ {_SAMPLE_COMMIT}\n"
+        f"{_REENTRANCY_REFUSAL}",
+        101,
+        False,
+    ),
     # A real final status line still counts when other writers used the channel.
     (
         "refused by: guest firewall policy\n"
-        f"🚫 validate REFUSED (exit 3) — profile full @ {_SAMPLE_COMMIT}\n"
-        "   refused by: the per-checkout invocation lock\n"
+        f"🚫 validate REFUSED (exit 2) — profile full @ {_SAMPLE_COMMIT}\n"
+        f"{_REENTRANCY_REFUSAL}\n"
         "   another validate is already running",
+        2,
         True,
     ),
     (
-        f"🚫 validate REFUSED (exit 2) — profile strict @ {_SAMPLE_COMMIT}",
+        f"🚫 validate REFUSED (exit 2) — profile strict @ {_SAMPLE_COMMIT}\n"
+        f"{_REENTRANCY_REFUSAL}",
+        2,
         True,
     ),
 )
@@ -312,7 +340,7 @@ def check_refusal_predicate() -> None:
     sits at the top of `main()` so a regression here cannot hide behind a run whose
     children all happened to start.
     """
-    expected_results = {want for _, want in _REFUSAL_SELF_CHECK}
+    expected_results = {want for _, _, want in _REFUSAL_SELF_CHECK}
     if expected_results != {False, True}:
         raise AssertionError(
             "the refusal predicate self-check must contain refusing and "
@@ -320,8 +348,8 @@ def check_refusal_predicate() -> None:
         )
     wrong = [
         f"{'must' if want else 'must NOT'} classify as refused: {sample!r}"
-        for sample, want in _REFUSAL_SELF_CHECK
-        if _looks_refused(sample) is not want
+        for sample, returncode, want in _REFUSAL_SELF_CHECK
+        if _looks_refused(sample, returncode) is not want
     ]
     if wrong:
         raise AssertionError(
@@ -334,21 +362,22 @@ def wait_for_text(log: Path, text: str, process: subprocess.Popen[bytes]) -> Non
     while time.monotonic() < deadline:
         if log.exists() and text in log.read_text(errors="replace"):
             return
-        if process.poll() is not None:
+        returncode = process.poll()
+        if returncode is not None:
             # ⚠️ SHOW THE OUTPUT HERE TOO. The timeout branch below prints what it
             # saw; this branch did not, so the ONE case that needs a reason -- the
             # child died and only the child knows why -- arrived as a bare rc with
             # its log already deleted with the TemporaryDirectory. That cost the
             # first diagnosis of this exact failure.
             seen = log.read_text(errors="replace") if log.exists() else "<log never created>"
-            if _looks_refused(seen):
+            if _looks_refused(seen, returncode):
                 raise ValidateChildRefused(
-                    f"the spawned validate refused to start (rc={process.returncode}); "
+                    f"the spawned validate refused to start (rc={returncode}); "
                     f"the stop path was never exercised.\n"
                     f"--- validate output ({len(seen)} bytes) ---\n{seen[-2000:]}"
                 )
             raise AssertionError(
-                f"validate exited before ready: rc={process.returncode}\n"
+                f"validate exited before ready: rc={returncode}\n"
                 f"--- validate output ({len(seen)} bytes) ---\n{seen[-2000:]}"
             )
         time.sleep(0.05)
@@ -626,6 +655,54 @@ def run_cleanup_signal_race() -> None:
         assert rows[0]["interruption_signal"] is None, rows[0]
 
 
+def run_signal_cases() -> None:
+    warm_validate_binary()
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        run_signal(sig, expect_record=True)
+    run_signal(signal.SIGKILL, expect_record=False)
+    run_signal(signal.SIGTERM, expect_record=True, prior_failure=True)
+    run_signal(signal.SIGTERM, expect_record=True, lock_proven=True)
+    # The retired shell contract trusted these caller-selected values. Rust must
+    # ignore them: only the canonical authority query can establish admission.
+    run_signal(signal.SIGTERM, expect_record=True, forged_owner=True)
+
+
+def run_signal_cases_then_incomplete_exit(
+    signal_cases: Callable[[], None], incomplete_exit: Callable[[], None]
+) -> str | None:
+    """Keep the incomplete-exit check independent of a refused signal child."""
+    unevaluated: str | None = None
+    try:
+        signal_cases()
+    except ValidateChildRefused as exc:
+        unevaluated = f"signal stop paths (validate declined to start): {exc}"
+    # This starts its own child and asserts an ordinary incomplete exit remains a
+    # failure. It must not disappear merely because an earlier signal child was
+    # refused, and a refusal here must fail its return-code assertion rather than
+    # inherit the signal cases' no-result classification.
+    incomplete_exit()
+    return unevaluated
+
+
+def check_signal_refusal_does_not_skip_incomplete_exit() -> None:
+    calls: list[str] = []
+
+    def refused_signal_cases() -> None:
+        calls.append("signal cases")
+        raise ValidateChildRefused("fixture refusal")
+
+    def incomplete_exit() -> None:
+        calls.append("incomplete exit")
+
+    unevaluated = run_signal_cases_then_incomplete_exit(
+        refused_signal_cases, incomplete_exit
+    )
+    assert calls == ["signal cases", "incomplete exit"], calls
+    assert unevaluated is not None and unevaluated.startswith("signal stop paths"), (
+        unevaluated
+    )
+
+
 def main() -> None:
     # ⚠️ EVERY CHILD THIS FILE SPAWNS IS A FIXTURE, NOT A NESTED VALIDATION, so the
     # outer run's active marker is cleared ONCE HERE rather than in each env
@@ -633,12 +710,12 @@ def main() -> None:
     # to run_canonical_adapter_contract, which builds its own environment — the
     # marker has to be gone from the process, not from one dictionary.
     #
-    # scripts/validate.rs exports HERMIT_VALIDATE_ACTIVE=<pid> to every gate child
-    # (validate.rs:9509); detect_nesting() reads it at :11022 and the guard fires
-    # at :11042 — BEFORE the stop-test seam at :11073. So under `make lint-checks`
-    # inside a validate, each child is refused as a nested invocation and exits
-    # before emitting VALIDATE_STOP_TEST_READY, having run none of the stop-path
-    # code:
+    # scripts/validate.rs exports HERMIT_VALIDATE_ACTIVE=<pid> to every gate child;
+    # scripts/lib/validate_runtime.rs exposes it as ACTIVE_ENV and reads it in
+    # detect_nesting(). The re-entrancy guard runs BEFORE stop_test_requested()
+    # enters the stop-test seam. So under `make lint-checks` inside a validate,
+    # each child is refused as a nested invocation and exits before emitting
+    # VALIDATE_STOP_TEST_READY, having run none of the stop-path code:
     #
     #     validate: refusing to re-enter a full validation level from inside
     #     validate (outer pid ...); nested invocations may only ...
@@ -657,30 +734,21 @@ def main() -> None:
     # Before anything spawns: a misclassifying predicate turns this run's reds into
     # no-results, so it is checked first rather than trusted.
     check_refusal_predicate()
+    check_signal_refusal_does_not_skip_incomplete_exit()
 
     unevaluated: list[str] = []
     # ⚠️ A REFUSED CHILD MAKES EVERY SIGNAL CASE UNEVALUABLE, NOT FAILED, so the
-    # whole block is bracketed rather than each call. If validate declines to
+    # signal cases are bracketed rather than each call. If validate declines to
     # start, no signal was delivered to anything and nothing about the stop paths
-    # was observed; carrying on to the next case would spawn another child that
-    # will be refused for the same reason. The four steps AFTER this block do not
-    # spawn a validate and are left to run, which is the same judgement the
-    # NoParentAdapter bracket below already makes: skip only what cannot be
-    # evaluated, and keep going.
-    try:
-        warm_validate_binary()
-        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-            run_signal(sig, expect_record=True)
-        run_signal(signal.SIGKILL, expect_record=False)
-        run_signal(signal.SIGTERM, expect_record=True, prior_failure=True)
-        run_signal(signal.SIGTERM, expect_record=True, lock_proven=True)
-        # The retired shell contract trusted these caller-selected values. Rust
-        # must ignore them: only the canonical authority query can establish
-        # admission.
-        run_signal(signal.SIGTERM, expect_record=True, forged_owner=True)
-        run_incomplete_exit()
-    except ValidateChildRefused as exc:
-        unevaluated.append(f"signal stop paths (validate declined to start): {exc}")
+    # was observed; carrying on to the next signal case would spawn another child
+    # that will be refused for the same reason. Checks after this block have their
+    # own contracts and remain independent, so skip only the signal cases and keep
+    # going.
+    signal_unevaluated = run_signal_cases_then_incomplete_exit(
+        run_signal_cases, run_incomplete_exit
+    )
+    if signal_unevaluated is not None:
+        unevaluated.append(signal_unevaluated)
     # ⚠️ SKIP ONLY WHAT CANNOT BE EVALUATED, AND KEEP GOING.
     # An earlier version let NoParentAdapter propagate out of main(), which
     # abandoned the four steps below it -- refuse=True, the cleanup race and the
