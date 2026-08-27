@@ -118,6 +118,8 @@ use hermit_manifest_plan::ledger::HistoryRow;
 use hermit_manifest_plan::runner::ManifestSet;
 use hermit_manifest_plan::runner::Population;
 use hermit_manifest_plan::runner::Selection;
+use hermit_manifest_plan::runner::E2E_KERNEL_VERSION_ENV;
+use hermit_manifest_plan::runner::E2E_MACHINE_SHORTNAME_ENV;
 
 use validate_plan::CompatMode;
 use validate_plan::CompatDisposition;
@@ -144,6 +146,8 @@ const PINNED_ROOT_FORWARDED_ENV: &[&str] = &[
     "CARGO_BUILD_JOBS",
     STEP_STARTED_MONOTONIC_NS_ENV,
     "E2E_BUILD_ROOT",
+    E2E_KERNEL_VERSION_ENV,
+    E2E_MACHINE_SHORTNAME_ENV,
     "E2E_RESULT_ROOT",
     "E2E_RUN_ID",
     "HERMIT_E2E_EMPTY_WORKDIR",
@@ -4516,7 +4520,7 @@ fn withhold_host_inapplicable(root: &Path, plan: &mut Plan) -> Result<(), String
         // question was asked and how it was answered, not just its consequences.
         println!(
             "Host capability {}: {} — {}",
-            verdict.capability.value(),
+            capability.value(),
             if verdict.present { "PRESENT" } else { "ABSENT" },
             verdict.evidence
         );
@@ -7772,6 +7776,12 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
             .contains(&format!("--env {STEP_STARTED_MONOTONIC_NS_ENV}"))
         || !wrapped.cmd.contains("--env DAGRUN_TEST_COUNTS_PATH")
         || !wrapped.cmd.contains("--env HERMIT_E2E_EMPTY_WORKDIR")
+        || !wrapped
+            .cmd
+            .contains(&format!("--env {E2E_MACHINE_SHORTNAME_ENV}"))
+        || !wrapped
+            .cmd
+            .contains(&format!("--env {E2E_KERNEL_VERSION_ENV}"))
         || !wrapped.cmd.contains("/src/ci/hermetic/assert-no-network.sh")
         || !wrapped
             .cmd
@@ -13349,6 +13359,39 @@ fn short_hostname() -> String {
     raw.split('.').next().unwrap_or("unknown").to_string()
 }
 
+fn establish_cell_host_facts(nested: bool) -> Result<(), String> {
+    if nested {
+        for name in [E2E_MACHINE_SHORTNAME_ENV, E2E_KERNEL_VERSION_ENV] {
+            if std::env::var(name)
+                .ok()
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                return Err(format!(
+                    "{name} was not forwarded into the pinned root; refusing to record the container hostname as the measurement machine"
+                ));
+            }
+        }
+        return Ok(());
+    }
+
+    let machine_shortname = short_hostname();
+    if machine_shortname == "unknown" || machine_shortname.contains('/') {
+        return Err(format!(
+            "cannot establish a short machine name for cell results: {machine_shortname:?}"
+        ));
+    }
+    let kernel_version = sh("uname", &["-r"])
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("cannot establish kernel_version for cell results")?;
+    // SAFETY: validation owns these process-wide values before the DAG starts;
+    // worker threads are created only after plan construction completes.
+    unsafe {
+        std::env::set_var(E2E_MACHINE_SHORTNAME_ENV, machine_shortname);
+        std::env::set_var(E2E_KERNEL_VERSION_ENV, kernel_version);
+    }
+    Ok(())
+}
+
 /// Resolve the logical ledger authority. Precedence:
 ///   1. `$HERMIT_VALIDATE_LEDGER` — explicit fixture/standalone file.
 ///   2. `$DEV_HERMIT_PARENT/ledger` — the canonical adapter-backed union.
@@ -14250,7 +14293,7 @@ fn probe_host_capability_query() -> Option<u8> {
     let Some(capability) = validate_plan::HostCapability::from_value(&name) else {
         eprintln!(
             "validate: unknown host capability '{name}'; the vocabulary is closed \
-             (scripts/lib/validate_plan.rs::HostCapability) and an unrecognized name is refused \
+             (hermit_manifest_plan::host_capability::HostCapability) and an unrecognized name is refused \
              rather than answered"
         );
         return Some(2);
@@ -14811,6 +14854,15 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                 detail,
             );
         }
+    }
+
+    if let Err(error) = establish_cell_host_facts(nesting.nested) {
+        return RunSummary::refused(
+            2,
+            &profile_name,
+            "cell-result host facts",
+            vec![error],
+        );
     }
 
     // Anchor the logical run before locks, freshness checks, plan construction, cgroup re-exec,
