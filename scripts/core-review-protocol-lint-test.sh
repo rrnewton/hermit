@@ -210,6 +210,86 @@ run_unset_case "PR_BODY unset is IGNORED when the protocol does not apply" 0 PR_
 # refusal above cannot be mistaken for "any missing label now blocks".
 run_case "empty labels + empty body still passes (not applicable)" 0 "" ""
 
+# --- A failed predicate is not a clean no-match -------------------------------
+#
+# The linter's grep predicates accept only grep's 0 (match) and 1 (no match).
+# Every other observable shell status must become the linter's internal-error 2.
+# The fake python3 supplies the already-validated contract records so these
+# checks isolate the predicate status rather than depending on network access.
+run_predicate_status_case() { # NAME MODE RAW_STATUS OPERATION
+    local name=$1 mode=$2 raw_status=$3 operation=$4
+    local actual=0 output
+
+    # These functions are exported and invoked by the child Bash, which the
+    # static check cannot see from this process.
+    # shellcheck disable=SC2317
+    python3() {
+        printf '%s\n' \
+            $'post-facto\tpost-facto-human-review' \
+            $'codex\tpassed-review-codex\tadversarial-review-codex1,adversarial-review-codex2,adversarial-review-codex3,adversarial-review-codex4' \
+            $'claude\tpassed-review-claude\tadversarial-review-claude1,adversarial-review-claude2,adversarial-review-claude3,adversarial-review-claude4'
+    }
+    # shellcheck disable=SC2317
+    grep() {
+        while IFS= read -r _; do :; done
+        case "$PREDICATE_FAILURE_MODE" in
+            status) return "$PREDICATE_FAILURE_STATUS" ;;
+            section-status)
+                if [ "$1" = -Eiq ]; then
+                    return "$PREDICATE_FAILURE_STATUS"
+                fi
+                return 0
+                ;;
+            not-executable) command / "$@" ;;
+            not-found) command /tmp/core-review-protocol-lint-no-such-command "$@" ;;
+        esac
+    }
+    export -f python3 grep
+
+    output=$(PREDICATE_FAILURE_MODE="$mode" PREDICATE_FAILURE_STATUS="$raw_status" \
+        PR_LABELS=post-facto-human-review PR_BODY='' PR_IS_KVM=false PR_NUMBER=test \
+        bash "$LINT" 2>&1) || actual=$?
+    unset -f python3 grep
+
+    if [ "$actual" -eq 2 ] \
+        && [[ $output == *"${operation} could not decide (exit ${raw_status})"* ]]; then
+        echo "ok   - ${name} (predicate exit ${raw_status} -> linter exit 2)"
+        pass=$((pass + 1))
+    else
+        echo "FAIL - ${name}: predicate exit ${raw_status}, linter exit ${actual}"
+        printf '%s\n' "$output"
+        fail=$((fail + 1))
+    fi
+}
+
+run_predicate_status_case \
+    "command found but not executable refuses" not-executable 126 "label lookup"
+run_predicate_status_case \
+    "command not found refuses" not-found 127 "label lookup"
+
+predicate_status_failures=0
+for predicate_mode in status section-status; do
+    if [ "$predicate_mode" = status ]; then
+        operation="label lookup"
+    else
+        operation="PR-body section lookup"
+    fi
+    for ((predicate_status = 2; predicate_status <= 255; predicate_status++)); do
+        before_fail=$fail
+        run_predicate_status_case \
+            "${operation} status ${predicate_status} is not a clean no-match" \
+            "$predicate_mode" "$predicate_status" "$operation" >/dev/null
+        if [ "$fail" -ne "$before_fail" ]; then
+            predicate_status_failures=$((predicate_status_failures + 1))
+        fi
+    done
+done
+if [ "$predicate_status_failures" -eq 0 ]; then
+    echo "ok   - label and section statuses 2..255 refuse as linter exit 2"
+else
+    echo "FAIL - ${predicate_status_failures} label/section statuses in 2..255 did not refuse"
+fi
+
 # Prove that an unreviewed local or fetched parent contract cannot become the
 # authority silently. A changed local file falls back to the reviewed bytes;
 # changed fetched bytes are refused by the content pin.
