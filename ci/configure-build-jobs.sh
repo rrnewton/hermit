@@ -165,8 +165,14 @@ fi
 # measured key and conservative threshold carry unchanged. The Rust source
 # change remains build-relevant and requires fresh validation; this carry does
 # not reuse a receipt.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 4f3fbd50bf922a8f589f1e985733d515868d1251 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 4f3fbd50bf922a8f589f1e985733d515868d1251 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 1f226acd (2026-08-27): all three source_recipe_key repository
+# inputs are byte-identical to 4f3fbd50:
+#     reverie-dbt/vendor/dynamorio  a3c41e5d3630 -> a3c41e5d3630
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+#     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
+# so the measured key and conservative threshold carry unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 1f226acd5bd0a942279e2acbf22c7e75c6527af7 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 1f226acd5bd0a942279e2acbf22c7e75c6527af7 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
