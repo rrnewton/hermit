@@ -70,7 +70,14 @@ function fetch_localhost_payload {
         local server_pid=
         local server_status=0
         local status=0
-        local -a nc_args=(--send-only -l 127.0.0.1 18765)
+        # PORT 0 IS AN ALLOCATION; A LITERAL IS NOT. The kernel hands back a free
+        # port and holds it bound, so two concurrent runs of this same program
+        # cannot land on the same one. The literal 18765 collided with itself:
+        # nothing checked it was free, so a second run either failed to bind or,
+        # worse, talked to the first run's server. The compared value is a sha256
+        # of the downloaded payload, so the port never reaches it and varying it
+        # cannot manufacture a divergence.
+        local -a nc_args=(--send-only -l 127.0.0.1 0)
 
         trap 'if [[ -n $server_pid ]]; then kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; fi' EXIT
         prepare_archive_fixture
@@ -105,14 +112,26 @@ function fetch_localhost_payload {
         # Yield one deterministic logical interval so Ncat reaches listen(2)
         # before the client connects, without a second readiness process.
         sleep 0.1
+        # Read the port the kernel actually assigned. This also CONFIRMS the bind,
+        # which the sleep alone only assumes.
+        local server_port=''
+        server_port=$(ss -ltnpH 2>/dev/null \
+            | grep -F "pid=${server_pid}," \
+            | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2)
+        if [[ ! $server_port =~ ^[1-9][0-9]*$ ]]; then
+            printf 'could not read the kernel-assigned port for ncat pid %s\\n' "$server_pid" >&2
+            kill "$server_pid" 2>/dev/null || true
+            wait "$server_pid" 2>/dev/null || true
+            return 1
+        fi
         if [[ $client == wget ]]; then
             /usr/bin/wget --quiet \
                 --output-document="$WORK_DIR/output/payload.txt" \
-                http://127.0.0.1:18765/payload.txt || status=$?
+                http://127.0.0.1:$server_port/payload.txt || status=$?
         else
             /usr/bin/curl --fail --silent --show-error \
                 --output "$WORK_DIR/output/payload.txt" \
-                http://127.0.0.1:18765/payload.txt || status=$?
+                http://127.0.0.1:$server_port/payload.txt || status=$?
         fi
 
         if ((status != 0)); then
