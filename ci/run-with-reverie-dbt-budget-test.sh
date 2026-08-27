@@ -18,11 +18,19 @@
 # them exits 2 in about a second, having never invoked Cargo, and a truncated
 # node reads a great deal like a fast one.
 #
-# Nothing else covers this. `check-reverie-pin.rs` reads the calibration site,
-# but only on the pin-UPDATE path, and it deliberately refuses to rewrite it
+# `check-reverie-pin.rs` reads the calibration site, but historically only on the
+# pin-UPDATE path, and it deliberately refuses to rewrite it
 # (`BUDGET_CALIBRATION_SITE`) because doing so would assert that a measurement
-# still applies, which that tool cannot establish. So the drift between the
-# recorded pin and the calibrated pin has no gate at all -- this is it.
+# still applies, which that tool cannot establish. That reasoning is unchanged.
+#
+# ⚠️ "SO THE DRIFT HAS NO GATE AT ALL -- THIS IS IT" WAS TRUE AND IS NO LONGER.
+# `check_dbt_budget_bindings` in check-reverie-pin.rs now REFUSES on the ordinary
+# path -- the one the pre-commit hook and scripts/validate.rs run -- when either
+# binding disagrees with the recorded pin, and it covers
+# ci/configure-build-jobs.sh too, which nothing checked before. It refuses; it
+# still does not rewrite, for exactly the reason above. This file remains the
+# END-TO-END check: it asserts the wrapped command actually RAN, which no
+# string comparison can establish.
 #
 # This has failed for two DIFFERENT reasons already, which is why the assertion
 # is "the wrapped command ran" rather than "expected_pin looks right":
