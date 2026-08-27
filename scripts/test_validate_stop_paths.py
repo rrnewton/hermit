@@ -321,6 +321,10 @@ def run_final_validate_status_contract() -> None:
             wait_for_text(log, "never-written", Exited(NO_RESULT_EXIT_CODE))
         except ValidateChildRefused:
             pass
+        except AssertionError as exc:
+            raise AssertionError(
+                f"a genuine could-not-run status was not classified by name: {exc}"
+            ) from exc
         else:
             raise AssertionError("a genuine could-not-run status was not classified by name")
 
@@ -334,8 +338,13 @@ def run_final_validate_status_contract() -> None:
             wait_for_text(log, "never-written", Exited(1))
         except ValidateChildRefused as exc:
             raise AssertionError("an earlier quoted status overrode the real final status") from exc
-        except AssertionError:
-            pass
+        except AssertionError as exc:
+            expected = "validate exited before ready: rc=1; final_status=FAILED"
+            if str(exc) != expected:
+                raise AssertionError(
+                    "the final FAILED status was not the value the reader classified: "
+                    f"{exc}"
+                ) from exc
         else:
             raise AssertionError("a failed child unexpectedly reached readiness")
 
@@ -344,8 +353,14 @@ def run_final_validate_status_contract() -> None:
             wait_for_text(log, "never-written", Exited(NO_RESULT_EXIT_CODE))
         except ValidateChildRefused as exc:
             raise AssertionError("absence was misclassified as could-not-run") from exc
-        except AssertionError:
-            pass
+        except AssertionError as exc:
+            expected = (
+                "validate exited before ready: rc=75; final_status=absent"
+            )
+            if str(exc) != expected:
+                raise AssertionError(
+                    f"status absence was not preserved by the reader: {exc}"
+                ) from exc
         else:
             raise AssertionError("status absence unexpectedly reached readiness")
 
@@ -611,7 +626,19 @@ def run_cleanup_signal_race() -> None:
         assert rows[0]["interruption_signal"] is None, rows[0]
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    args = sys.argv[1:] if argv is None else argv
+    if args == ["--final-status-self-test"]:
+        run_final_validate_status_contract()
+        print(
+            "PASS: final validate status uses the last occurrence, recognizes a "
+            "genuine could-not-run result, and preserves absence"
+        )
+        return
+    if args:
+        raise SystemExit(
+            "usage: test_validate_stop_paths.py [--final-status-self-test]"
+        )
     run_final_validate_status_contract()
     warm_validate_binary()
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):

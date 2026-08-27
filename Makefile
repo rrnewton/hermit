@@ -129,14 +129,12 @@ check-skill-discovery: ## Verify Claude and stock Codex discover the same produc
 # checkers in this target had no such node (measured 2026-08-25 at a5fef7ff7623).
 lint: lint-checks lint-cargo ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, Reverie pin policy, nested lockfiles, record-version floor)
 
-# ⚠️ scripts/test_validate_stop_paths.py is deliberately NOT in this recipe and must
-# not be added back. It SPAWNS A VALIDATE -- `Popen([scripts/validate.rs, "full"])` in
-# its run_signal -- so as a DAG node it runs a validate from inside a validate. The
-# child is refused and exits 2 before emitting VALIDATE_STOP_TEST_READY, which is what
-# turned check.lint_checks red on main at 7406b4dd2efc: `AssertionError: validate
-# exited before ready: rc=2`, deterministic, after the other checkers had passed.
-# It passes STANDALONE, which is exactly why wiring it looked safe. Its absence is kept
-# honest by the ALLOWLIST entry in scripts/check-checker-scheduling.rs.
+# ⚠️ The FULL scripts/test_validate_stop_paths.py run is deliberately NOT in this
+# recipe. It SPAWNS A VALIDATE -- `Popen([scripts/validate.rs, "full"])` in its
+# run_signal -- so as a DAG node it runs a validate from inside a validate. The child
+# is refused before emitting VALIDATE_STOP_TEST_READY. Its
+# `--final-status-self-test` mode below is pure string/file classification and does
+# not launch validate, so the output-channel contract is gated without nesting.
 #
 # ⚠️ Comments INSIDE the recipe below must be TAB-indented. A comment at column 0 ends
 # the recipe, silently dropping every line after it.
@@ -144,6 +142,7 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 	./scripts/check-skill-discovery.rs
 	./scripts/test-required-check-outcomes.sh
 	./scripts/test-check-status-outcome.sh
+	python3 ./scripts/test_validate_stop_paths.py --final-status-self-test
 	./scripts/check-merge-gate-policy.sh
 	./scripts/test-configure-merge-gate-ruleset.sh
 	python3 ./scripts/test_pr_status.py

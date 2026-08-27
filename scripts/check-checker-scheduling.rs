@@ -73,17 +73,6 @@ const ALLOWLIST: &[(&str, &str)] = &[
          checker, not to this list.",
     ),
     (
-        "scripts/test_validate_stop_paths.py",
-        "CANNOT be scheduled: it SPAWNS A VALIDATE. Its run_signal does \
-         Popen([scripts/validate.rs, 'full']), so as a DAG node it runs a validate from \
-         inside a validate; the child is refused and exits 2 before emitting \
-         VALIDATE_STOP_TEST_READY. Measured on main at 7406b4dd2efc, deterministically, \
-         after the other ten checkers passed. It passes STANDALONE, which is why wiring \
-         it looked safe -- a checker that spawns the harness it runs under is not merely \
-         unscheduled, it is unschedulable in this shape. Run it by hand, or give it a \
-         mode that does not launch a real validate.",
-    ),
-    (
         "ci/check-shard-coverage.sh",
         "Unscheduled, and a WORKING guard: it caught a real error in the change \
          that added check.lint_checks (a node assigned to no shard). Its only \
