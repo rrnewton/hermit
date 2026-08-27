@@ -108,7 +108,10 @@ fn is_checker_path(path: &str) -> bool {
 /// Keep this exact rather than treating every `*-probe.rs` as a checker: most probes
 /// are tools, while `bisect-probe.rs --self-test` is the assertion-bearing entrypoint
 /// that `lint-checks` must run.
-const CHECKER_PATHS: &[&str] = &["scripts/bisect-probe.rs"];
+const CHECKER_PATHS: &[&str] = &[
+    "ci/compat-envelope/scorecard.rs",
+    "scripts/bisect-probe.rs",
+];
 
 /// Directory/prefix pairs that identify a checker entrypoint by convention.
 const CHECKER_PREFIXES: &[&str] = &[

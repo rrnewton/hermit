@@ -140,6 +140,7 @@ lint: lint-checks lint-cargo ## Run the full lint suite matching CI (rustfmt, sh
 # the recipe, silently dropping every line after it.
 lint-checks: ## The lint checkers CI schedules as one node (everything in `lint` except the two cargo passes)
 	./scripts/check-skill-discovery.rs
+	./ci/compat-envelope/scorecard.rs check
 	./scripts/test-required-check-outcomes.sh
 	./scripts/test-check-status-outcome.sh
 	python3 ./scripts/test_validate_stop_paths.py --final-status-self-test
