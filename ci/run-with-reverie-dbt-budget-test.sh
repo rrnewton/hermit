@@ -233,6 +233,131 @@ else
     echo "PASS: the usage error still exits 2"
 fi
 
+# The wrapper above reaches run-reverie-pin-check.sh repeatedly.  Reusing a
+# compiled checker is valid only while every input that can change its code is
+# unchanged.  Count compiler executions with a fake rustc: a second identical
+# call must reuse, while source, included support, and compiler changes must
+# each compile again.  With the reuse removed, the first assertion observes two
+# compilations and fails, so this is also the removed-fix control.
+reuse_tree="$work/compiled-checker-reuse"
+fake_bin="$work/fake-bin"
+mkdir -p "$reuse_tree/ci" "$reuse_tree/scripts/lib" "$fake_bin"
+cp -p ci/run-reverie-pin-check.sh "$reuse_tree/ci/"
+cp -p scripts/check-reverie-pin.rs "$reuse_tree/scripts/"
+cp -p scripts/check-git-pin-uniformity.rs "$reuse_tree/scripts/"
+cp -p scripts/lib/rust_script_prelude.rs "$reuse_tree/scripts/lib/"
+compile_count="$work/fake-rustc-count"
+: >"$compile_count"
+cat >"$fake_bin/rustc" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${1:-} == -vV ]]; then
+    printf 'rustc 1.99.0-fake (%s)\nhost: x86_64-unknown-linux-gnu\n' \
+        "${FAKE_RUSTC_VERSION:-one}"
+    exit 0
+fi
+output=
+while (($#)); do
+    if [[ $1 == -o ]]; then
+        output=$2
+        shift 2
+    else
+        shift
+    fi
+done
+if [[ -z $output ]]; then
+    echo 'fake rustc: no -o output' >&2
+    exit 2
+fi
+printf 'compile\n' >>"$FAKE_RUSTC_COUNT"
+if [[ ${FAKE_RUSTC_FAIL:-0} == 1 ]]; then
+    exit 17
+fi
+printf '#!/usr/bin/env bash\nexit 0\n' >"$output"
+chmod +x "$output"
+EOF
+chmod +x "$fake_bin/rustc"
+
+run_reuse_fixture() {
+    local compiler_version=${1:-one}
+    local compiler_fail=${2:-0}
+    (
+        cd "$reuse_tree"
+        PATH="$fake_bin:$PATH" \
+        FAKE_RUSTC_COUNT="$compile_count" \
+        FAKE_RUSTC_VERSION="$compiler_version" \
+        FAKE_RUSTC_FAIL="$compiler_fail" \
+            ./ci/run-reverie-pin-check.sh --self-test
+    ) >/dev/null 2>&1
+}
+
+run_reuse_fixture
+run_reuse_fixture
+count=$(wc -l <"$compile_count")
+if ((count != 1)); then
+    echo "FAIL: identical pin-checker source compiled $count times, expected 1" >&2
+    failures=$((failures + 1))
+else
+    echo "PASS: identical pin-checker source shares one compiled executable"
+fi
+
+printf '\n// force source-content invalidation\n' >>"$reuse_tree/scripts/check-reverie-pin.rs"
+run_reuse_fixture
+count=$(wc -l <"$compile_count")
+if ((count != 2)); then
+    echo "FAIL: changed pin-checker source left compile count at $count, expected 2" >&2
+    failures=$((failures + 1))
+else
+    echo "PASS: changed pin-checker source compiles again"
+fi
+
+printf '\n// force included-support invalidation\n' >>"$reuse_tree/scripts/lib/rust_script_prelude.rs"
+run_reuse_fixture
+count=$(wc -l <"$compile_count")
+if ((count != 3)); then
+    echo "FAIL: changed included support left compile count at $count, expected 3" >&2
+    failures=$((failures + 1))
+else
+    echo "PASS: changed included support compiles again"
+fi
+
+run_reuse_fixture two
+count=$(wc -l <"$compile_count")
+if ((count != 4)); then
+    echo "FAIL: changed compiler identity left compile count at $count, expected 4" >&2
+    failures=$((failures + 1))
+else
+    echo "PASS: changed compiler identity compiles again"
+fi
+
+sed -i '0,/--edition=2021/s//--edition=2024/' \
+    "$reuse_tree/ci/run-reverie-pin-check.sh"
+run_reuse_fixture two
+count=$(wc -l <"$compile_count")
+if ((count != 5)); then
+    echo "FAIL: changed compiler arguments left compile count at $count, expected 5" >&2
+    failures=$((failures + 1))
+else
+    echo "PASS: changed compiler arguments compile again"
+fi
+
+rc=0
+run_reuse_fixture three 1 || rc=$?
+if ((rc != 17)); then
+    echo "FAIL: failed checker compilation exited $rc, expected compiler status 17" >&2
+    failures=$((failures + 1))
+else
+    echo "PASS: failed checker compilation remains a failure"
+fi
+run_reuse_fixture three
+count=$(wc -l <"$compile_count")
+if ((count != 7)); then
+    echo "FAIL: failed checker compilation was reused; compile count is $count, expected 7" >&2
+    failures=$((failures + 1))
+else
+    echo "PASS: failed checker compilation is not reused"
+fi
+
 if ((failures != 0)); then
     echo "run-with-reverie-dbt-budget-test.sh: $failures check(s) failed" >&2
     exit 1
