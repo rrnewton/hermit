@@ -133,13 +133,22 @@ impl CompatMode {
     pub fn run_args(self, label: &str, nsswitch: &str) -> Vec<String> {
         let s = |v: &str| v.to_string();
         match self {
-            CompatMode::Strict => vec![s("run"), s("--strict"), s("--verify"), s("--")],
+            CompatMode::Strict => vec![
+                s("run"),
+                s("--strict"),
+                s("--verify"),
+                s("--env"),
+                s("TMPDIR=/tmp"),
+                s("--"),
+            ],
             CompatMode::PortableStrict => vec![
                 s("run"),
                 s("--strict"),
                 s("--verify"),
                 s("--no-virtualize-cpuid"),
                 s("--max-timeslice=disabled"),
+                s("--env"),
+                s("TMPDIR=/tmp"),
                 s("--"),
             ],
             CompatMode::Sabre => {

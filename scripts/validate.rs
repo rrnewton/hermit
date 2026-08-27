@@ -1170,6 +1170,16 @@ fn self_test() -> Result<(), String> {
                  legacy below-L2 run would not use strict execution: {rendered:?}"
             ));
         }
+        if matches!(mode, CompatMode::Strict | CompatMode::PortableStrict)
+            && !rendered[..guest_separator]
+                .windows(2)
+                .any(|pair| pair == ["--env", "TMPDIR=/tmp"])
+        {
+            return Err(format!(
+                "{mode:?} did not override the inherited host TMPDIR with the guest-visible \
+                 /tmp before the guest argv separator: {rendered:?}"
+            ));
+        }
         if rendered[..guest_separator]
             .iter()
             .any(|arg| arg == "--verify-strict")

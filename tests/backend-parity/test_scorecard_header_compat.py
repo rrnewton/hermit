@@ -284,6 +284,7 @@ check(
 def run_backend_local_dynamic(name: str, candidate_stdout: bytes):
     """Exercise a dynamic row whose raw output is not a parity contract."""
     commands: list[list[str]] = []
+    fixtures = run_matrix.CatalogFixtures()
     original = run_matrix.run_with_timeout
 
     def planted_run(command):
@@ -299,16 +300,16 @@ def run_backend_local_dynamic(name: str, candidate_stdout: bytes):
             Path("/planted/hermit"),
             "dbt",
             name,
-            run_matrix.CatalogFixtures(),
+            fixtures,
             strict=True,
             evidence=evidence,
         )
     finally:
         run_matrix.run_with_timeout = original
-    return result, evidence, commands
+    return result, evidence, commands, fixtures.exposed_tmp_paths
 
 
-result, backend_local, backend_local_commands = run_backend_local_dynamic(
+result, backend_local, backend_local_commands, exposed_tmp_paths = run_backend_local_dynamic(
     "anonymous_mmap_layout", b"multiple 0x1000 0x2000 0x3000\n"
 )
 check(
@@ -322,20 +323,26 @@ backend_local_tmp_args = [
     argument
     for command in backend_local_commands
     for argument in command
-    if argument.startswith("--tmp=")
+    if argument == "--env=TMPDIR=/tmp"
 ]
 check(
-    "backend-local commands use distinct catalog host temporary directories",
+    "backend-local commands give DBT a guest-visible TMPDIR",
     len(backend_local_tmp_args) == run_matrix.RUNS
-    and len(set(backend_local_tmp_args)) == run_matrix.RUNS
-    and all(
-        argument.startswith(
-            "--tmp=/backend-parity-catalog/host-tmp/"
-            "dbt-anonymous_mmap_layout-run-"
-        )
-        for argument in backend_local_tmp_args
-    ),
+    and set(backend_local_tmp_args) == {"--env=TMPDIR=/tmp"},
     repr(backend_local_tmp_args),
+)
+check(
+    "backend-local fixture exposure is considered for every command",
+    len(exposed_tmp_paths) == run_matrix.RUNS
+    and all(
+        backend == "dbt"
+        and guest[0] == "/backend-parity-catalog/mmap_determinism"
+        and str(host_tmp) in command
+        for (backend, guest, host_tmp), command in zip(
+            exposed_tmp_paths, backend_local_commands, strict=True
+        )
+    ),
+    repr((exposed_tmp_paths, backend_local_commands)),
 )
 check(
     "backend-local layout does not invent cross-backend operands",
@@ -353,7 +360,7 @@ check(
     ),
 )
 
-clock_result, clock_local, clock_commands = run_backend_local_dynamic(
+clock_result, clock_local, clock_commands, _ = run_backend_local_dynamic(
     "virtual_clock", b"clock matrix success\n"
 )
 check(

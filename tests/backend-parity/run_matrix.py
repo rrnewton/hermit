@@ -24,6 +24,22 @@ REPOSITORY = SCRIPT_DIR.parent.parent
 BACKENDS = ("ptrace", "dbt", "kvm")
 RUNS = 3
 
+DBT_PRIVATE_TMP_SCRIPT = """\
+private_tmp=$1
+mount_count=$2
+shift 2
+mount --make-rprivate /
+while [ "$mount_count" -gt 0 ]; do
+    mount --bind "$1" "$2"
+    shift 2
+    mount_count=$((mount_count - 1))
+done
+mount --rbind "$private_tmp" /tmp
+cd /tmp
+export TMPDIR=/tmp
+exec "$@"
+"""
+
 # The compatibility scorecard is measurement state, not Hermit source.  When
 # this checkout is nested in dev-hermit, live observations are written to one
 # ignored per-run file under compat-envelope/ignored/backend-parity/.  The
@@ -252,6 +268,71 @@ class MatrixError(Exception):
     """An invalid case catalog or failed regression contract."""
 
 
+def tmp_destination(path: Path, host_tmp: Path) -> tuple[Path, Path] | None:
+    """Map one normalized host /tmp path beneath a command-local /tmp root."""
+    normalized = Path(os.path.normpath(path))
+    if not normalized.is_absolute():
+        return None
+    try:
+        relative = normalized.relative_to("/tmp")
+    except ValueError:
+        return None
+    host_tmp = host_tmp.resolve(strict=True)
+    destination = host_tmp / relative
+    resolved_destination = destination.resolve(strict=False)
+    try:
+        resolved_destination.relative_to(host_tmp)
+    except ValueError as error:
+        raise MatrixError(
+            f"refusing to stage {normalized} outside {host_tmp}: "
+            f"destination resolves to {resolved_destination}"
+        ) from error
+    return normalized, destination
+
+
+def command_in_private_tmp(
+    command: list[str], host_tmp: Path, preserve: tuple[Path, ...] = ()
+) -> list[str]:
+    """Run one command with its host directory mounted over /tmp."""
+    mounts: list[str] = []
+    host_tmp = Path(os.path.abspath(host_tmp))
+    for requested in preserve:
+        mapping = tmp_destination(requested, host_tmp)
+        if mapping is None:
+            continue
+        source, destination = mapping
+        if not source.exists():
+            raise MatrixError(f"cannot preserve missing path beneath /tmp: {source}")
+        resolved_source = source.resolve(strict=True)
+        if source.is_dir() and host_tmp.is_relative_to(resolved_source):
+            raise MatrixError(
+                f"cannot replace /tmp while preserving {source}: "
+                f"it contains the command directory {host_tmp}"
+            )
+        if source.is_dir():
+            destination.mkdir(parents=True, exist_ok=True)
+        elif source.is_file():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.touch()
+        else:
+            raise MatrixError(f"cannot preserve unsupported path beneath /tmp: {source}")
+        mounts.extend((str(resolved_source), str(destination)))
+    return [
+        "unshare",
+        "--user",
+        "--map-root-user",
+        "--mount",
+        "sh",
+        "-ceu",
+        DBT_PRIVATE_TMP_SCRIPT,
+        "hermit-dbt-private-tmp",
+        str(host_tmp),
+        str(len(mounts) // 2),
+        *mounts,
+        *command,
+    ]
+
+
 def compile_fixture(source: Path, output: Path, *flags: str) -> Path:
     compiler = shutil.which(os.environ.get("CC", "cc"))
     if compiler is None:
@@ -292,6 +373,21 @@ class Fixtures:
         )
         path.mkdir(parents=True)
         return path
+
+    def expose_tmp_paths(
+        self, backend: str, guest: list[str], host_tmp: Path
+    ) -> list[str]:
+        """Keep absolute /tmp file arguments visible to the selected backend."""
+        for argument in guest:
+            mapping = tmp_destination(Path(argument), host_tmp)
+            if mapping is None:
+                continue
+            source, destination = mapping
+            if not source.is_file():
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+        return [*guest]
 
     def binary(self, name: str) -> Path:
         if name in self._binaries:
@@ -377,6 +473,7 @@ class Fixtures:
 class CatalogFixtures:
     def __init__(self) -> None:
         self._host_tmp_sequence = 0
+        self.exposed_tmp_paths: list[tuple[str, tuple[str, ...], Path]] = []
 
     def host_tmp(self, backend: str, name: str) -> Path:
         self._host_tmp_sequence += 1
@@ -385,6 +482,12 @@ class CatalogFixtures:
             / "host-tmp"
             / f"{backend}-{name}-{self._host_tmp_sequence}"
         )
+
+    def expose_tmp_paths(
+        self, backend: str, guest: list[str], host_tmp: Path
+    ) -> list[str]:
+        self.exposed_tmp_paths.append((backend, tuple(guest), host_tmp))
+        return [*guest]
 
     def binary(self, name: str) -> Path:
         return Path("/backend-parity-catalog") / name
@@ -667,16 +770,28 @@ def hermit_command(
         command.extend(DEFAULT_VERIFY_POLICY.hermit_flags)
         if verify_json is not None:
             command.append(f"--verify-json={verify_json}")
-    command.extend(
-        [
-            "--base-env=minimal",
-            "--max-timeslice=disabled",
-            f"--tmp={host_tmp}",
-        ]
-    )
+    command.extend(["--base-env=minimal", "--max-timeslice=disabled"])
+    if backend == "dbt":
+        # DBT does not enter Hermit's mount namespace. Put the whole launcher in
+        # a rootless mount namespace whose /tmp is this command's directory, so
+        # fixed /tmp names are isolated even when the guest ignores TMPDIR.
+        command.append("--tmp=/tmp")
+        command.append("--env=TMPDIR=/tmp")
+    else:
+        command.append(f"--tmp={host_tmp}")
     if backend == "ptrace" and name != "cpuid_policy":
         command.append("--no-virtualize-cpuid")
     command.extend(["--", *guest])
+    if backend == "dbt":
+        preserve = [hermit.parent]
+        built_install = hermit.parent.parent / "install_pkg"
+        if (built_install / "rsrcs").is_dir():
+            preserve.append(built_install)
+        if verify_json is not None:
+            preserve.append(verify_json.parent)
+        if install_dir := os.environ.get("HERMIT_INSTALL_DIR"):
+            preserve.append(Path(install_dir))
+        return command_in_private_tmp(command, host_tmp, tuple(preserve))
     return command
 
 
@@ -1163,14 +1278,15 @@ def run_case(
         # reference must retain the portable invocation captured above.
         guest = [*guest, "--kvm"]
     if verify:
+        host_tmp = fixtures.host_tmp(backend, f"{name}-verify")
         return run_case_verify(
             hermit,
             backend,
             name,
-            guest,
+            fixtures.expose_tmp_paths(backend, guest, host_tmp),
             expected_status,
             expected_l2,
-            fixtures.host_tmp(backend, f"{name}-verify"),
+            host_tmp,
             evidence,
         )
     baseline: bytes | None = None
@@ -1183,18 +1299,19 @@ def run_case(
         backend, name, expected_stdout
     )
     if requires_exact_stdout_parity or requires_ptrace_reference:
+        reference_tmp = fixtures.host_tmp("ptrace", f"{name}-reference")
         (
             reference_stdout,
             reference_problem,
             reference_blocked,
         ) = capture_ptrace_reference(
             hermit,
-            reference_guest,
+            fixtures.expose_tmp_paths("ptrace", reference_guest, reference_tmp),
             name,
             strict,
             expected_status,
             expected_stdout,
-            fixtures.host_tmp("ptrace", f"{name}-reference"),
+            reference_tmp,
         )
         if evidence is not None:
             evidence.update(stdout_parity_evidence(None, reference_stdout))
@@ -1217,13 +1334,14 @@ def run_case(
         else None
     )
     for iteration in range(RUNS):
+        host_tmp = fixtures.host_tmp(backend, f"{name}-run-{iteration + 1}")
         command = hermit_command(
             hermit,
             backend,
-            guest,
+            fixtures.expose_tmp_paths(backend, guest, host_tmp),
             name,
             strict,
-            fixtures.host_tmp(backend, f"{name}-run-{iteration + 1}"),
+            host_tmp,
         )
         result = run_with_timeout(command)
         if result is None:
