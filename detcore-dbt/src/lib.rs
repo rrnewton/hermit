@@ -431,55 +431,6 @@ fn translate_self_identity_targets(
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-fn restarted_exact_child_wait_target(
-    signal_context: &libc::ucontext_t,
-    opcode: [u8; 2],
-) -> Option<(usize, i32)> {
-    if opcode != [0x0f, 0x05] {
-        return None;
-    }
-    let gregs = &signal_context.uc_mcontext.gregs;
-    let sysnum = gregs[libc::REG_RAX as usize];
-    let (target_register, physical_pid, terminal_events_only) =
-        if sysnum == libc::SYS_wait4 as libc::greg_t {
-            let options = gregs[libc::REG_RDX as usize] as libc::c_int;
-            (
-                libc::REG_RDI as usize,
-                gregs[libc::REG_RDI as usize],
-                options
-                    & (libc::WNOHANG
-                        | libc::WUNTRACED
-                        | libc::WCONTINUED
-                        | libc::__WCLONE
-                        | libc::__WALL)
-                    == 0,
-            )
-        } else if sysnum == libc::SYS_waitid as libc::greg_t
-            && gregs[libc::REG_RDI as usize] == libc::P_PID as libc::greg_t
-        {
-            let options = gregs[libc::REG_R10 as usize] as libc::c_int;
-            (
-                libc::REG_RSI as usize,
-                gregs[libc::REG_RSI as usize],
-                options & libc::WEXITED != 0
-                    && options
-                        & (libc::WNOHANG
-                            | libc::WSTOPPED
-                            | libc::WCONTINUED
-                            | libc::__WCLONE
-                            | libc::__WALL)
-                        == 0,
-            )
-        } else {
-            return None;
-        };
-    if !terminal_events_only || physical_pid <= 0 || physical_pid > i32::MAX as libc::greg_t {
-        return None;
-    }
-    Some((target_register, physical_pid as i32))
-}
-
 fn run_cooperative<F: Future<Output = ()>>(future: F, idle: Idler) {
     let mut future = pin!(future);
     let waker = Waker::noop();
@@ -2155,67 +2106,6 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         thread.post_exec_pending = false;
     }
 
-    #[cfg(target_arch = "x86_64")]
-    if sysnum == libc::SYS_rt_sigreturn {
-        let mut current: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-        let read_current = unsafe { read_registers(context as usize, &mut current) };
-        let mut signal_context: libc::ucontext_t = unsafe { std::mem::zeroed() };
-        let read_context = unsafe {
-            read_memory(
-                current.rsp as usize,
-                (&mut signal_context as *mut libc::ucontext_t).cast(),
-                std::mem::size_of::<libc::ucontext_t>(),
-            )
-        };
-        if read_current != 0 && read_context != 0 {
-            let mut opcode = [0_u8; 2];
-            let restart_rip = signal_context.uc_mcontext.gregs[libc::REG_RIP as usize];
-            let read_opcode =
-                unsafe { read_memory(restart_rip as usize, opcode.as_mut_ptr(), opcode.len()) };
-            if read_opcode != 0
-                && let Some((target_register, physical_pid)) =
-                    restarted_exact_child_wait_target(&signal_context, opcode)
-            {
-                let mut guest = DbtGuest::<Detcore>::new(
-                    context as usize,
-                    det_tid,
-                    host_pid,
-                    None,
-                    branches,
-                    &mut thread.state,
-                    &runtime.global,
-                    &runtime.config,
-                    invoke_syscall,
-                    read_registers,
-                    write_registers,
-                );
-                if let Some(process) =
-                    run_ready(tool.registered_process_for_physical_pid(&mut guest, physical_pid))
-                {
-                    let target_value = process.as_raw() as libc::greg_t;
-                    let target_offset =
-                        std::ptr::addr_of!(signal_context.uc_mcontext.gregs[target_register])
-                            as usize
-                            - std::ptr::addr_of!(signal_context) as usize;
-                    let wrote = unsafe {
-                        write_memory(
-                            current.rsp as usize + target_offset,
-                            (&target_value as *const libc::greg_t).cast(),
-                            std::mem::size_of::<libc::greg_t>(),
-                        )
-                    };
-                    if wrote != std::mem::size_of::<libc::greg_t>() {
-                        emit_lifecycle_marker(
-                            emit,
-                            b"detcore-dbt: failed to rewrite a restarted child wait target\n",
-                        );
-                        return -1;
-                    }
-                }
-            }
-        }
-    }
-
     if sysnum == libc::SYS_execveat {
         unsafe { result.write(-(Errno::ENOSYS.into_raw() as i64)) };
         TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
@@ -3473,59 +3363,6 @@ mod tests {
         ] {
             assert!(!requires_native_lifecycle(sysnum));
         }
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn restarted_exact_child_wait_target_requires_kernel_restart_context() {
-        let mut context: libc::ucontext_t = unsafe { std::mem::zeroed() };
-        context.uc_mcontext.gregs[libc::REG_RAX as usize] = libc::SYS_wait4 as libc::greg_t;
-        context.uc_mcontext.gregs[libc::REG_RDI as usize] = 42;
-        assert_eq!(
-            restarted_exact_child_wait_target(&context, [0x0f, 0x05]),
-            Some((libc::REG_RDI as usize, 42))
-        );
-
-        context.uc_mcontext.gregs[libc::REG_RAX as usize] = -(libc::EINTR as libc::greg_t);
-        assert_eq!(
-            restarted_exact_child_wait_target(&context, [0x0f, 0x05]),
-            None,
-            "a non-restarting signal frame must retain its EINTR result"
-        );
-
-        context.uc_mcontext.gregs[libc::REG_RAX as usize] = libc::SYS_wait4 as libc::greg_t;
-        assert_eq!(
-            restarted_exact_child_wait_target(&context, [0x48, 0x3d]),
-            None,
-            "a ucontext redirected past the syscall must not be rewritten"
-        );
-        context.uc_mcontext.gregs[libc::REG_RDX as usize] = libc::WNOHANG as libc::greg_t;
-        assert_eq!(
-            restarted_exact_child_wait_target(&context, [0x0f, 0x05]),
-            None,
-            "a nonblocking wait must not enter the blocking restart path"
-        );
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn restarted_exact_waitid_target_uses_the_saved_pid_argument() {
-        let mut context: libc::ucontext_t = unsafe { std::mem::zeroed() };
-        context.uc_mcontext.gregs[libc::REG_RAX as usize] = libc::SYS_waitid as libc::greg_t;
-        context.uc_mcontext.gregs[libc::REG_RDI as usize] = libc::P_PID as libc::greg_t;
-        context.uc_mcontext.gregs[libc::REG_RSI as usize] = 43;
-        context.uc_mcontext.gregs[libc::REG_R10 as usize] = libc::WEXITED as libc::greg_t;
-        assert_eq!(
-            restarted_exact_child_wait_target(&context, [0x0f, 0x05]),
-            Some((libc::REG_RSI as usize, 43))
-        );
-
-        context.uc_mcontext.gregs[libc::REG_RDI as usize] = libc::P_ALL as libc::greg_t;
-        assert_eq!(
-            restarted_exact_child_wait_target(&context, [0x0f, 0x05]),
-            None,
-            "only an exact P_PID wait belongs to this translation"
-        );
     }
 
     /// Every `Determinized` syscall that this gate currently lets run natively
