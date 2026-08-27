@@ -1613,6 +1613,7 @@ fn execute_spec_until(
         .then(|| format!("cell exceeded {cell_timeout_seconds} s"));
     let mut error_kind = None;
     let launch_refusal = spec.id.mode != "naked"
+        && !output.timed_out
         && !output.status.success()
         && stdout.is_empty()
         && stderr.lines().next().is_some_and(|line| {
