@@ -24,7 +24,18 @@ ci/hermetic/build-image.sh                     # build from the lock, load, reco
 ci/hermetic/run-in-pinned-root.sh --src DIR --out DIR -- CMD...
 ci/hermetic/run-split-validate.sh              # fetch (network) then build+test (no network)
 ci/hermetic/assert-no-network.sh               # the boundary check, with a negative control
+ci/hermetic/assert-build-dependencies.sh       # the executable build-dependency check
 ```
+
+Before the offline phase starts a DAG node, it checks three different
+populations rather than folding them into one tool list: 18 executable build
+dependencies, four native library packages with their development headers, 24
+commands selected portable cells run as hermit guests, and 11 literal FHS paths
+those cells name. Some commands occur in both executable sets because they are
+used in both roles. `xxd` occurs only in the build set: e9patch runs `xxd -i`
+while generating two C sources, but no selected portable cell runs it as a
+guest. The assertion also checks the exact headers and libraries consumed from
+`nativeLibs`, so their absence is named before compilation begins.
 
 ## V3 per-cell execution contract
 

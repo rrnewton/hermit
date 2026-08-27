@@ -221,7 +221,7 @@ if [[ $dry -eq 1 ]]; then
     echo "   CARGO_HOME=$cargo_home cargo fetch --locked"
     echo "-- offline phase would run, inside the pinned root, --network=none:"
     echo "   ci/hermetic/assert-no-network.sh"
-    echo "   verify pinned developer tools and required guest commands"
+    echo "   verify pinned developer tools, build dependencies and required guest commands"
     echo "   ci/run-node.sh $lane $build_nodes"
     echo "   ci/run-node.sh $lane $test_nodes"
     exit 0
@@ -283,17 +283,11 @@ if [[ $do_offline -eq 1 ]]; then
             export HERMIT_E2E_EMPTY_WORKDIR=/test
 
             # Fail before a DAG node can report a misleading product failure.
-            # The image owns these pins; the runner verifies what it was given
-            # and names every executable required by the selected portable
-            # population, including commands reached inside shell fixtures.
-            command -v rust-script >/dev/null || {
-                echo "run-split-validate: pinned root is missing rust-script" >&2
-                exit 2
-            }
-            command -v cargo-nextest >/dev/null || {
-                echo "run-split-validate: pinned root is missing cargo-nextest" >&2
-                exit 2
-            }
+            # Build dependencies and guest tools are different populations. The
+            # first assertion names the 18 executables and four native libraries
+            # used to compile and stage Hermit and its backend resources; the loop
+            # below remains the audit of commands selected cells run as guests.
+            /src/ci/hermetic/assert-build-dependencies.sh
             rust_script_actual=$(rust-script --version)
             [[ "$rust_script_actual" == *" ${HERMIT_RUST_SCRIPT_VERSION}"* ]] || {
                 echo "run-split-validate: rust-script version mismatch: $rust_script_actual" >&2

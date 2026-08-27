@@ -150,6 +150,7 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 	./scripts/bisect-probe.rs --self-test
 	./ci/lint-checks-node.sh --self-test
 	./ci/liteinst-strict-node.sh --self-test
+	./ci/hermetic/assert-build-dependencies.sh --self-test
 	./scripts/check-checker-scheduling.rs --self-test
 	./scripts/check-checker-scheduling.rs
 	python3 ./scripts/check-validate-refusal-predicate.py --self-test
