@@ -1496,6 +1496,8 @@ mod tests {
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            first_divergent_left_message: None,
+            first_divergent_right_message: None,
         }
     }
 

@@ -600,6 +600,12 @@ pub struct VerificationOutcome {
     /// had completed before the divergence -- which is a real state, not a
     /// missing value: a run can diverge during startup.
     pub first_divergent_syscall: Option<u64>,
+    /// First differing compared message from the left execution, with only the
+    /// separately recorded syscall number, scheduler turn, and committed time
+    /// removed.
+    pub first_divergent_left_message: Option<String>,
+    /// Corresponding first differing compared message from the right execution.
+    pub first_divergent_right_message: Option<String>,
 }
 
 impl VerificationOutcome {
@@ -701,6 +707,12 @@ pub struct VerificationReport {
     /// from detcore's own `finish syscall #N` counter. See the identically
     /// named field on [`VerificationOutcome`].
     pub first_divergent_syscall: Option<u64>,
+    /// First differing compared message from the left execution, with only the
+    /// separately recorded syscall number, scheduler turn, and committed time
+    /// removed.
+    pub first_divergent_left_message: Option<String>,
+    /// Corresponding first differing compared message from the right execution.
+    pub first_divergent_right_message: Option<String>,
 }
 
 /// WHY a `no_result` record is a `no_result`.
@@ -759,6 +771,8 @@ impl VerificationReport {
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            first_divergent_left_message: None,
+            first_divergent_right_message: None,
         }
     }
 }
@@ -801,6 +815,8 @@ impl From<&VerificationOutcome> for VerificationReport {
             first_divergent_virtual_nanoseconds: outcome.first_divergent_virtual_nanoseconds,
             first_divergent_record: outcome.first_divergent_record,
             first_divergent_syscall: outcome.first_divergent_syscall,
+            first_divergent_left_message: outcome.first_divergent_left_message.clone(),
+            first_divergent_right_message: outcome.first_divergent_right_message.clone(),
         }
     }
 }
@@ -1028,6 +1044,8 @@ fn compare_two_runs_with_unsupported_scan(
     let mut first_divergent_virtual_nanoseconds = None;
     let mut first_divergent_record = None;
     let mut first_divergent_syscall = None;
+    let mut first_divergent_left_message = None;
+    let mut first_divergent_right_message = None;
 
     // Resolve the strictness label to concrete diff flags once, and carry the
     // resulting spec through to the verdict so the returned outcome records
@@ -1140,6 +1158,8 @@ fn compare_two_runs_with_unsupported_scan(
                 // on a match.
                 first_divergent_record = summary.first_divergent_record;
                 first_divergent_syscall = summary.first_divergent_syscall;
+                first_divergent_left_message = summary.first_divergent_left_message.clone();
+                first_divergent_right_message = summary.first_divergent_right_message.clone();
                 if !summary.refused {
                     eprintln!(
                         ":: {}",
@@ -1212,6 +1232,8 @@ fn compare_two_runs_with_unsupported_scan(
             first_divergent_virtual_nanoseconds,
             first_divergent_record,
             first_divergent_syscall,
+            first_divergent_left_message,
+            first_divergent_right_message,
         })
     } else {
         Ok(VerificationOutcome {
@@ -1226,6 +1248,8 @@ fn compare_two_runs_with_unsupported_scan(
             first_divergent_virtual_nanoseconds,
             first_divergent_record,
             first_divergent_syscall,
+            first_divergent_left_message,
+            first_divergent_right_message,
         })
     }
 }
@@ -2279,6 +2303,14 @@ mod tests {
             report.first_divergent_virtual_nanoseconds,
             Some(4_567_890_123)
         );
+        assert_eq!(
+            report.first_divergent_left_message.as_deref(),
+            Some("INFO detcore: DETLOG value=1")
+        );
+        assert_eq!(
+            report.first_divergent_right_message.as_deref(),
+            Some("INFO detcore: DETLOG value=2")
+        );
 
         let _ = fs::remove_file(left_path);
         let _ = fs::remove_file(right_path);
@@ -2318,6 +2350,18 @@ mod tests {
         assert_eq!(
             report.first_divergent_virtual_nanoseconds,
             Some(4_567_890_123)
+        );
+        assert_eq!(
+            report.first_divergent_left_message.as_deref(),
+            Some(
+                "INFO detcore::scheduler: COMMIT turn <NUM> at time <NANOSECONDS>\nINFO detcore: DETLOG value=1"
+            )
+        );
+        assert_eq!(
+            report.first_divergent_right_message.as_deref(),
+            Some(
+                "INFO detcore::scheduler: COMMIT turn <NUM> at time <NANOSECONDS>\nINFO detcore: DETLOG value=2"
+            )
         );
 
         let _ = fs::remove_file(left_path);
@@ -2751,6 +2795,8 @@ mod tests {
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            first_divergent_left_message: None,
+            first_divergent_right_message: None,
         };
         assert!(!VerificationReport::from(&diverged).bitwise_parity);
     }

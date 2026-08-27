@@ -75,6 +75,14 @@ pub struct VerificationReport {
     /// syscall completed.
     #[serde(default)]
     pub first_divergent_syscall: Option<u64>,
+    /// First differing compared message from the left execution, with the
+    /// separately recorded syscall number, scheduler turn, and committed time
+    /// removed. Older reports omit it and remain readable.
+    #[serde(default)]
+    pub first_divergent_left_message: Option<String>,
+    /// Corresponding first differing compared message from the right execution.
+    #[serde(default)]
+    pub first_divergent_right_message: Option<String>,
     /// Runtime totals for the two compared executions when the producer could
     /// read both run summaries.
     #[serde(default)]
@@ -255,7 +263,9 @@ mod tests {
             "first_divergent_scheduler_turn":4,
             "first_divergent_virtual_nanoseconds":1767225600002825515,
             "first_divergent_record":108,
-            "first_divergent_syscall":37}"#;
+            "first_divergent_syscall":37,
+            "first_divergent_left_message":"INFO detcore: left event",
+            "first_divergent_right_message":"INFO detcore: right event"}"#;
         let report = VerificationReport::from_json_slice(json).expect("diverged report parses");
         assert_eq!(report.first_divergent_scheduler_turn, Some(4));
         assert_eq!(
@@ -269,6 +279,14 @@ mod tests {
         // all 11 tests in this module GREEN. A struct field nothing asserts is
         // indistinguishable from one nothing populates.
         assert_eq!(report.first_divergent_syscall, Some(37));
+        assert_eq!(
+            report.first_divergent_left_message.as_deref(),
+            Some("INFO detcore: left event")
+        );
+        assert_eq!(
+            report.first_divergent_right_message.as_deref(),
+            Some("INFO detcore: right event")
+        );
     }
 
     /// The record index is the only coordinate that LOCATES the divergence;
@@ -285,6 +303,8 @@ mod tests {
         assert_eq!(report.first_divergent_record, Some(3));
         assert_eq!(report.first_divergent_scheduler_turn, None);
         assert_eq!(report.first_divergent_virtual_nanoseconds, None);
+        assert_eq!(report.first_divergent_left_message, None);
+        assert_eq!(report.first_divergent_right_message, None);
         assert_eq!(report.first_divergent_syscall, None);
     }
 
@@ -357,6 +377,8 @@ mod tests {
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            first_divergent_left_message: None,
+            first_divergent_right_message: None,
             runtime: None,
         }
     }

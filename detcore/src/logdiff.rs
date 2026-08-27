@@ -835,6 +835,62 @@ fn first_different_message_indices(
     }
 }
 
+/// Keep the content that identifies a differing event while removing only
+/// values already carried in separate fields beside it.
+///
+/// This is deliberately narrower than [`strip_log_entry`]. Syscall arguments,
+/// resource names, thread identities, payload bytes, and all other numbers stay
+/// exact. Record position is not part of the message and remains a separate
+/// observation.
+fn first_divergent_message(message: &str) -> String {
+    static FINISHED_SYSCALL: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(finish syscall #)[0-9][0-9_]*").unwrap());
+    static COMMIT_TURN: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(\bCOMMIT turn )[0-9][0-9_]*\b").unwrap());
+    static COMMITTED_TIME: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(\b(?:at time|on previously committed) )[0-9][0-9_]*(?:\.[0-9_]+)?(?:ns|s)?\b")
+            .unwrap()
+    });
+
+    let (first_line, continuation) = match message.split_once('\n') {
+        Some((first_line, continuation)) => (first_line, Some(continuation)),
+        None => (message, None),
+    };
+    let first_line =
+        if is_detlog_syscall_result(first_line) && finished_syscall_number(first_line).is_some() {
+            FINISHED_SYSCALL
+                .replace_all(first_line, "${1}<NUM>")
+                .into_owned()
+        } else {
+            first_line.to_string()
+        };
+    let first_line = if is_commit(&first_line) && commit_position(&first_line).is_some() {
+        let first_line = COMMIT_TURN.replace_all(&first_line, "${1}<NUM>");
+        COMMITTED_TIME
+            .replace_all(&first_line, "${1}<NANOSECONDS>")
+            .into_owned()
+    } else {
+        first_line
+    };
+    match continuation {
+        Some(continuation) => format!("{first_line}\n{continuation}"),
+        None => first_line,
+    }
+}
+
+fn compared_message_at_record(
+    records: &[(usize, &str)],
+    compared: &[String],
+    record: Option<usize>,
+) -> Option<String> {
+    let record = record?;
+    records
+        .iter()
+        .position(|(index, _)| *index == record)
+        .and_then(|position| compared.get(position))
+        .map(|message| first_divergent_message(message))
+}
+
 fn parse_underscored_u64(value: &str) -> Option<u64> {
     value.replace('_', "").parse().ok()
 }
@@ -1217,7 +1273,7 @@ fn git_diff(
 /// compare"*. Both selected lists being empty is a NO-RESULT, not a match, so
 /// the counts travel with the verdict and a parity consumer can require nonzero
 /// execution before believing a green.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogDiffSummary {
     /// True if a substantive difference was found between the two runs.
     pub diff_found: bool,
@@ -1240,6 +1296,13 @@ pub struct LogDiffSummary {
     /// divergence located at record 108 is easier to act on when you also know
     /// the guest was 37 syscalls in.
     pub first_divergent_syscall: Option<u64>,
+    /// The first differing compared message from the left execution, after
+    /// removing only the syscall number, scheduler turn, and committed virtual
+    /// time that are already recorded in separate fields.
+    pub first_divergent_left_message: Option<String>,
+    /// The corresponding first differing compared message from the right
+    /// execution, with the same narrowly scoped removals.
+    pub first_divergent_right_message: Option<String>,
     /// True when the comparison was REFUSED rather than performed, so there is
     /// no verdict about whether the runs agree.
     ///
@@ -1371,7 +1434,7 @@ pub fn try_log_diff_with_records_and_filter(
 /// far as anyone has looked" are different claims, and a caller who cannot tell
 /// them apart will stop early and conclude the wrong thing. The record counts
 /// are therefore part of the result, not optional detail alongside it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrefixComparison {
     /// The verdict over the compared prefix only.
     pub summary: LogDiffSummary,
@@ -1504,6 +1567,8 @@ pub fn log_diff_summary_from_strs_with_filter(
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            first_divergent_left_message: None,
+            first_divergent_right_message: None,
             refused: true,
         });
     }
@@ -1600,6 +1665,10 @@ pub fn log_diff_summary_from_strs_with_filter(
         left.and_then(|index| finished_syscall_at_or_before(&all_a, index))
             .or_else(|| right.and_then(|index| finished_syscall_at_or_before(&all_b, index)))
     });
+    let first_divergent_left_message = first_different
+        .and_then(|(left, _)| compared_message_at_record(compared_a, &prepared_a, left));
+    let first_divergent_right_message = first_different
+        .and_then(|(_, right)| compared_message_at_record(compared_b, &prepared_b, right));
 
     let diff_found = if opts.git_diff {
         git_diff(
@@ -1641,6 +1710,10 @@ pub fn log_diff_summary_from_strs_with_filter(
             .and_then(|(left_index, right_index)| left_index.or(right_index)),
         first_divergent_syscall: diff_found
             .then_some(first_divergent_syscall_candidate)
+            .flatten(),
+        first_divergent_left_message: diff_found.then_some(first_divergent_left_message).flatten(),
+        first_divergent_right_message: diff_found
+            .then_some(first_divergent_right_message)
             .flatten(),
         // This path compared the logs; only the refusal above declines to.
         refused: false,
@@ -3095,11 +3168,92 @@ Jun 09 06:49:17.742  INFO detcore: [t] use 0x1111";
             diverged.first_divergent_virtual_nanoseconds,
             Some(12_345_678_901)
         );
+        assert_eq!(
+            diverged.first_divergent_left_message.as_deref(),
+            Some("INFO detcore: DETLOG count=42")
+        );
+        assert_eq!(
+            diverged.first_divergent_right_message.as_deref(),
+            Some("INFO detcore: DETLOG count=43")
+        );
 
         let matched = super::log_diff_summary_from_strs(left, left, &opts, &mut Vec::new())?;
         assert!(matched.matched_with_evidence());
         assert_eq!(matched.first_divergent_scheduler_turn, None);
         assert_eq!(matched.first_divergent_virtual_nanoseconds, None);
+        assert_eq!(matched.first_divergent_left_message, None);
+        assert_eq!(matched.first_divergent_right_message, None);
+        Ok(())
+    }
+
+    #[test]
+    fn first_divergent_messages_keep_event_content_not_separate_positions() -> std::io::Result<()> {
+        let left = "2026-08-13T01:02:03.000000Z INFO detcore::scheduler: COMMIT turn 110, dettid 2 using resources {Device(ContainerStdout): W}, on previously committed 1_767_225_600.031_999_250s";
+        let right = "2026-08-13T01:02:04.000000Z INFO detcore::scheduler: COMMIT turn 111, dettid 2 using resources {Device(ContainerStdout): W}, on previously committed 1_767_225_600.031_994_250s";
+        let opts = super::LogDiffOpts {
+            comparison: super::LogComparisonMode::Info,
+            canonicalize_addresses: true,
+            no_color: true,
+            ..Default::default()
+        };
+
+        let same_event = super::log_diff_summary_from_strs(left, right, &opts, &mut Vec::new())?;
+        assert!(same_event.diff_found);
+        assert_eq!(
+            same_event.first_divergent_left_message, same_event.first_divergent_right_message,
+            "turn and committed-time values are recorded separately, so they must not split one event into two"
+        );
+        assert_eq!(
+            same_event.first_divergent_left_message.as_deref(),
+            Some(
+                "INFO detcore::scheduler: COMMIT turn <NUM>, dettid 2 using resources {Device(ContainerStdout): W}, on previously committed <NANOSECONDS>"
+            )
+        );
+        assert_eq!(
+            super::first_divergent_message(
+                "INFO detcore::scheduler: COMMIT turn 110 at time 123\npayload at time 456"
+            ),
+            "INFO detcore::scheduler: COMMIT turn <NUM> at time <NANOSECONDS>\npayload at time 456",
+            "only the structured first line carries the separately recorded position"
+        );
+
+        let after_longer_shared_prefix = super::log_diff_summary_from_strs(
+            format!("2026-08-13T01:02:02.000000Z INFO detcore: shared event\n{left}"),
+            format!("2026-08-13T01:02:02.000000Z INFO detcore: shared event\n{right}"),
+            &opts,
+            &mut Vec::new(),
+        )?;
+        assert_ne!(
+            same_event.first_divergent_record, after_longer_shared_prefix.first_divergent_record,
+            "a longer shared trace must move the record observation in this fixture"
+        );
+        assert_eq!(
+            (
+                same_event.first_divergent_left_message.as_deref(),
+                same_event.first_divergent_right_message.as_deref(),
+            ),
+            (
+                after_longer_shared_prefix
+                    .first_divergent_left_message
+                    .as_deref(),
+                after_longer_shared_prefix
+                    .first_divergent_right_message
+                    .as_deref(),
+            ),
+            "the same event after a longer trace must keep the same compared messages"
+        );
+
+        let different_event = super::log_diff_summary_from_strs(
+            left,
+            "2026-08-13T01:02:04.000000Z INFO detcore::scheduler: COMMIT turn 111, dettid 2 using resources {Device(ContainerStderr): W}, on previously committed 1_767_225_600.031_994_250s",
+            &opts,
+            &mut Vec::new(),
+        )?;
+        assert_ne!(
+            different_event.first_divergent_left_message,
+            different_event.first_divergent_right_message,
+            "different event content must remain distinguishable"
+        );
         Ok(())
     }
 
