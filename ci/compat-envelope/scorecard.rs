@@ -1142,6 +1142,10 @@ impl ResultRow {
                     .get("canonicalize_addresses")
                     .and_then(JsonValue::as_bool)
                     == Some(true)
+                && comparison.get("canonicalizations")
+                    == Some(&serde_json::json!([
+                        "host-address-to-first-appearance-ordinal/v1"
+                    ]))
                 && comparison.get("full_trace").and_then(JsonValue::as_bool) == Some(true)
                 && comparison
                     .get("exact_remainder")
@@ -1149,7 +1153,13 @@ impl ResultRow {
                     == Some(true)
                 && comparison.get("ignore_lines").and_then(JsonValue::as_bool) == Some(false)
                 && comparison.get("skip_commit").and_then(JsonValue::as_bool) == Some(false)
-                && comparison.get("skip_detlog").and_then(JsonValue::as_bool) == Some(false);
+                && comparison.get("skip_detlog").and_then(JsonValue::as_bool) == Some(false)
+                && comparison.get("stripped_prefixes")
+                    == Some(&serde_json::json!(["real-wall-clock-prefix/v1"]))
+                && comparison
+                    .get("virtualize_time")
+                    .and_then(JsonValue::as_bool)
+                    == Some(true);
             if !exact_bitwise_info {
                 return Err(format!(
                     "attempt {} did not use the exact BitwiseInfoV1 INFO comparison",
@@ -6613,31 +6623,41 @@ fn self_test() -> Result<(), String> {
         );
     }
 
-    let mut weak_rows = coordinate_less_row(&unlocated_id, "PASS");
-    let weak = &mut weak_rows.get_mut(&unlocated_id).unwrap()[0].row;
-    let mut report: JsonValue =
-        serde_json::from_str(weak.attempts[0]["verification_report"].as_str().unwrap()).unwrap();
-    report["comparison"]["display_name"] = JsonValue::String("Stripped".into());
-    let report = serde_json::to_string(&report).unwrap();
-    weak.attempts[0]["verification_report_sha256"] =
-        JsonValue::String(format!("{:x}", Sha256::digest(report.as_bytes())));
-    weak.attempts[0]["verification_report"] = JsonValue::String(report);
-    if apply_validate_results(
-        &mut TrackedCells {
-            schema: SCHEMA,
-            projection: None,
-            cells: vec![bare_cell(&unlocated_id)],
-        },
-        &weak_rows,
-        "sha-1",
-        "tree-1",
-        &depth_fixture,
-        true,
-        true,
-    )
-    .is_ok()
-    {
-        return Err("a Stripped comparison was imported as BitwiseInfoV1 evidence".into());
+    for (field, weaker_value) in [
+        ("display_name", serde_json::json!("Stripped")),
+        ("virtualize_time", serde_json::json!(false)),
+        ("canonicalizations", serde_json::json!([])),
+        ("stripped_prefixes", serde_json::json!([])),
+    ] {
+        let mut weak_rows = coordinate_less_row(&unlocated_id, "PASS");
+        let weak = &mut weak_rows.get_mut(&unlocated_id).unwrap()[0].row;
+        let mut report: JsonValue =
+            serde_json::from_str(weak.attempts[0]["verification_report"].as_str().unwrap())
+                .unwrap();
+        report["comparison"][field] = weaker_value;
+        let report = serde_json::to_string(&report).unwrap();
+        weak.attempts[0]["verification_report_sha256"] =
+            JsonValue::String(format!("{:x}", Sha256::digest(report.as_bytes())));
+        weak.attempts[0]["verification_report"] = JsonValue::String(report);
+        if apply_validate_results(
+            &mut TrackedCells {
+                schema: SCHEMA,
+                projection: None,
+                cells: vec![bare_cell(&unlocated_id)],
+            },
+            &weak_rows,
+            "sha-1",
+            "tree-1",
+            &depth_fixture,
+            true,
+            true,
+        )
+        .is_ok()
+        {
+            return Err(format!(
+                "a comparison with weakened {field} was imported as BitwiseInfoV1 evidence"
+            ));
+        }
     }
 
     // ⚠️ THE THIRD STATE: AN `ERROR` THAT LOCATED NOTHING. Three brackets, because
