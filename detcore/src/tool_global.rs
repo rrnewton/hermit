@@ -3346,7 +3346,7 @@ mod tests {
         );
         assert_eq!(
             state.sched.lock().unwrap().physical_thread_identity(dettid),
-            Some((old_mm.for_exec(detpid), physical_pid, physical_tid,)),
+            Some((old_mm.for_exec(detpid), physical_pid, physical_tid)),
             "post-exec host identity must be installed by CreateChildThread before admission"
         );
 
