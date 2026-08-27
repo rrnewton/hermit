@@ -25,6 +25,11 @@ use hermit_manifest_plan::runner::prepare_result_path;
 use hermit_manifest_plan::runner::requires_capability;
 use hermit_manifest_plan::runner::run_cell;
 use hermit_manifest_plan::runner::write_junit;
+use hermit_manifest_plan::stress_series::HostCapabilities;
+#[cfg(test)]
+use hermit_manifest_plan::stress_series::HostCapability;
+#[cfg(test)]
+use hermit_manifest_plan::stress_series::HostCapabilityVerdict;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
@@ -133,37 +138,6 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
     args
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct HostCapabilityVerdict {
-    present: bool,
-    evidence: String,
-}
-
-fn parse_host_capability_verdict(stdout: &[u8]) -> Result<HostCapabilityVerdict, String> {
-    let text = std::str::from_utf8(stdout)
-        .map_err(|error| format!("host capability probe emitted non-UTF-8 output: {error}"))?
-        .trim_end();
-    let (state, evidence) = text
-        .split_once('\t')
-        .ok_or_else(|| format!("host capability probe emitted malformed output: {text:?}"))?;
-    if evidence.trim().is_empty() {
-        return Err("host capability probe emitted empty evidence".into());
-    }
-    let present = match state {
-        "PRESENT" => true,
-        "ABSENT" => false,
-        other => {
-            return Err(format!(
-                "host capability probe emitted unknown state {other:?}"
-            ));
-        }
-    };
-    Ok(HostCapabilityVerdict {
-        present,
-        evidence: evidence.to_string(),
-    })
-}
-
 fn write_structured_test_counts(
     path: &Path,
     executed: usize,
@@ -186,75 +160,18 @@ fn write_structured_test_counts(
     }
     Ok(())
 }
-
-fn probe_host_capability(root: &Path, capability: &str) -> HostCapabilityVerdict {
-    let output = Command::new(root.join("scripts/validate.rs"))
-        .args(["--probe-host-capability", capability])
-        .current_dir(root)
-        .output();
-    match output {
-        Ok(output) if output.status.success() => {
-            match parse_host_capability_verdict(&output.stdout) {
-                Ok(verdict) => verdict,
-                Err(error) => HostCapabilityVerdict {
-                    present: true,
-                    evidence: format!("probe output was unusable ({error}); doubt runs the cell"),
-                },
-            }
-        }
-        Ok(output) => HostCapabilityVerdict {
-            present: true,
-            evidence: format!(
-                "probe exited {}; doubt runs the cell ({})",
-                output
-                    .status
-                    .code()
-                    .map_or_else(|| "by signal".into(), |code| code.to_string()),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-        },
-        Err(error) => HostCapabilityVerdict {
-            present: true,
-            evidence: format!("probe could not start ({error}); doubt runs the cell"),
-        },
-    }
-}
-
-fn resolve_host_capabilities(
-    root: &Path,
-    cells: &[hermit_manifest_plan::runner::SelectedCell],
-) -> BTreeMap<String, HostCapabilityVerdict> {
-    let capabilities = cells
-        .iter()
-        .flat_map(|cell| cell.test.requires.iter())
-        .filter_map(|token| requires_capability(token).ok().flatten())
-        .collect::<BTreeSet<_>>();
-    capabilities
-        .into_iter()
-        .map(|capability| {
-            let verdict = probe_host_capability(root, capability);
-            eprintln!(
-                "Host capability {capability}: {} — {}",
-                if verdict.present { "PRESENT" } else { "ABSENT" },
-                verdict.evidence
-            );
-            (capability.to_string(), verdict)
-        })
-        .collect()
-}
-
 fn host_inapplicable_reason(
     requires: &[String],
-    verdicts: &BTreeMap<String, HostCapabilityVerdict>,
+    verdicts: &HostCapabilities,
 ) -> Option<(Vec<String>, String)> {
     let mut absent = requires
         .iter()
         .filter_map(|token| requires_capability(token).ok().flatten())
         .filter_map(|capability| {
             verdicts
-                .get(capability)
+                .get(&capability)
                 .filter(|verdict| !verdict.present)
-                .map(|verdict| (capability.to_string(), verdict.evidence.clone()))
+                .map(|verdict| (capability.value().to_string(), verdict.evidence.clone()))
         })
         .collect::<Vec<_>>();
     absent.sort();
@@ -1347,7 +1264,6 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         });
     }
     let cells = manifests.select(&selection).unwrap_or_else(|e| fail(e));
-    let host_capabilities = resolve_host_capabilities(root, &cells);
     if cells.is_empty() && !args.allow_empty {
         fail("filters selected no cells");
     }
@@ -1355,6 +1271,14 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     let context = RunContext::from_env(root.to_path_buf(), args.prebuilt)
         .unwrap_or_else(|e| fail(e))
         .with_scheduled_worker_capacity(capacity);
+    for (capability, verdict) in &context.host_capabilities {
+        eprintln!(
+            "Host capability {}: {} — {}",
+            capability.value(),
+            if verdict.present { "PRESENT" } else { "ABSENT" },
+            verdict.evidence
+        );
+    }
     let results_path = args.results.clone().unwrap_or_else(|| {
         context
             .result_root
@@ -1380,7 +1304,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         |index, emit| {
             let cell = &cells[index];
             if let Some((_, reason)) =
-                host_inapplicable_reason(&cell.test.requires, &host_capabilities)
+                host_inapplicable_reason(&cell.test.requires, &context.host_capabilities)
             {
                 let _ = emit(host_inapplicable_result(&context, cell, reason), false);
                 return;
@@ -1563,13 +1487,13 @@ mod tests {
 
     use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 
+    use super::HostCapability;
     use super::HostCapabilityVerdict;
     use super::audit_privileged_unboxed_guard;
     use super::command_jobs;
     use super::for_each_parallel;
     use super::host_inapplicable_reason;
     use super::parse;
-    use super::parse_host_capability_verdict;
     use super::run_with_retry;
     use super::scheduled_worker_capacity;
     use super::write_structured_test_counts;
@@ -1599,34 +1523,9 @@ mod tests {
     }
 
     #[test]
-    fn host_capability_output_is_closed_and_evidence_bearing() {
-        assert_eq!(
-            parse_host_capability_verdict(b"PRESENT\tkernel accepted the probe\n").unwrap(),
-            HostCapabilityVerdict {
-                present: true,
-                evidence: "kernel accepted the probe".into(),
-            }
-        );
-        assert_eq!(
-            parse_host_capability_verdict(b"ABSENT\tENODEV and no cpuinfo flag\n").unwrap(),
-            HostCapabilityVerdict {
-                present: false,
-                evidence: "ENODEV and no cpuinfo flag".into(),
-            }
-        );
-        for malformed in [
-            b"PRESENT\n".as_slice(),
-            b"PRESENT\t\n".as_slice(),
-            b"UNKNOWN\tevidence\n".as_slice(),
-        ] {
-            assert!(parse_host_capability_verdict(malformed).is_err());
-        }
-    }
-
-    #[test]
     fn only_a_declared_absent_capability_withholds_a_cell() {
         let absent = BTreeMap::from([(
-            "cpuid-faulting".to_string(),
+            HostCapability::CpuidFaulting,
             HostCapabilityVerdict {
                 present: false,
                 evidence: "planted absence".into(),
@@ -1642,7 +1541,7 @@ mod tests {
         assert!(host_inapplicable_reason(&undeclared, &absent).is_none());
 
         let present = BTreeMap::from([(
-            "cpuid-faulting".to_string(),
+            HostCapability::CpuidFaulting,
             HostCapabilityVerdict {
                 present: true,
                 evidence: "planted presence".into(),

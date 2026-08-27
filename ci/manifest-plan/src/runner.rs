@@ -31,6 +31,11 @@ pub use crate::canonical_verdict::VerificationRuntime;
 use crate::ci_selection::CiDisabledReasonSpec;
 use crate::ci_selection::CiSelection;
 use crate::ci_selection::CiSelectionSpec;
+use crate::host_capability::probe_host_capabilities;
+use crate::stress_series::HostCapabilities;
+use crate::stress_series::HostCapability;
+#[cfg(test)]
+use crate::stress_series::HostCapabilityVerdict;
 use crate::timeouts::DEFAULTS_FILE;
 use crate::timeouts::MANIFEST_SCHEMA;
 use crate::timeouts::resolve_timeout_seconds;
@@ -39,6 +44,8 @@ use crate::timeouts::validate_timeout_seconds;
 const BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
 const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
 pub const CELL_RESULT_SCHEMA: u64 = 4;
+pub const E2E_MACHINE_SHORTNAME_ENV: &str = "E2E_MACHINE_SHORTNAME";
+pub const E2E_KERNEL_VERSION_ENV: &str = "E2E_KERNEL_VERSION";
 
 /// Closed vocabulary for manifest `requires` tokens.
 ///
@@ -46,11 +53,11 @@ pub const CELL_RESULT_SCHEMA: u64 = 4;
 /// a cell. A token mapped to `None` is still validated, but can never suppress
 /// execution. Keeping the mapping here gives the manifest validator and the
 /// executable harness one authority.
-pub const REQUIRES_VOCABULARY: &[(&str, Option<&str>)] = &[
+pub const REQUIRES_VOCABULARY: &[(&str, Option<HostCapability>)] = &[
     ("ar", None),
     ("bash", None),
     ("cc", None),
-    ("cpuid", Some("cpuid-faulting")),
+    ("cpuid", Some(HostCapability::CpuidFaulting)),
     ("cxx", None),
     ("date", None),
     ("du", None),
@@ -77,7 +84,7 @@ pub const REQUIRES_VOCABULARY: &[(&str, Option<&str>)] = &[
     ("zstd", None),
 ];
 
-pub fn requires_capability(token: &str) -> Result<Option<&'static str>, String> {
+pub fn requires_capability(token: &str) -> Result<Option<HostCapability>, String> {
     REQUIRES_VOCABULARY
         .iter()
         .find(|(name, _)| *name == token)
@@ -854,6 +861,15 @@ struct SabrePathRecord {
 pub struct CellResult {
     pub schema: u64,
     pub run_id: String,
+    /// Short machine name measured with this row. A hostname alone is not a
+    /// stable host class, but it is the existing per-machine key used by the
+    /// parent store.
+    pub machine_shortname: String,
+    /// `uname -r` for the kernel under which this cell ran.
+    pub kernel_version: String,
+    /// The complete closed set of capability verdicts that determined which
+    /// cells could execute on this host.
+    pub host_capabilities: HostCapabilities,
     /// The cell attempt that produced this observation. A retry is a second
     /// observation, so it receives the next positive ordinal instead of
     /// replacing the earlier row.
@@ -971,6 +987,9 @@ pub struct RunContext {
     pub result_root: PathBuf,
     pub build_root: PathBuf,
     pub run_id: String,
+    pub machine_shortname: String,
+    pub kernel_version: String,
+    pub host_capabilities: HostCapabilities,
     pub attempt: u64,
     pub source_sha: String,
     pub source_dirty: bool,
@@ -1028,6 +1047,28 @@ impl RunContext {
             })
             .transpose()?
             .unwrap_or(1);
+        let machine_name = match std::env::var(E2E_MACHINE_SHORTNAME_ENV) {
+            Ok(value) if !value.is_empty() => value,
+            _ => command_text("hostname", &["-s"])
+                .or_else(|_| command_text("hostname", &[]))
+                .map_err(|error| format!("cannot establish machine_shortname: {error}"))?,
+        };
+        let machine_shortname = machine_name
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        if machine_shortname.is_empty() || machine_shortname.contains('/') {
+            return Err(format!(
+                "machine_shortname must be one nonempty path segment, got {machine_shortname:?}"
+            ));
+        }
+        let kernel_version = match std::env::var(E2E_KERNEL_VERSION_ENV) {
+            Ok(value) if !value.trim().is_empty() => value,
+            _ => command_text("uname", &["-r"])
+                .map_err(|error| format!("cannot establish kernel_version: {error}"))?,
+        };
+        let host_capabilities = probe_host_capabilities();
         let build_root = std::env::var_os("E2E_BUILD_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| result_root.join("build").join(&source_sha));
@@ -1068,6 +1109,9 @@ impl RunContext {
             result_root,
             build_root,
             run_id,
+            machine_shortname,
+            kernel_version,
+            host_capabilities,
             attempt,
             source_sha,
             source_dirty,
@@ -1092,6 +1136,24 @@ impl RunContext {
 
 /// One initial execution plus one retry, scoped to one selected cell.
 pub const MAX_ATTEMPTS_PER_CELL: u64 = 2;
+
+fn command_text(program: &str, args: &[&str]) -> Result<String, String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|error| format!("cannot execute {program}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("{program} exited {}", output.status));
+    }
+    let value = String::from_utf8(output.stdout)
+        .map_err(|error| format!("{program} output is not UTF-8: {error}"))?
+        .trim()
+        .to_string();
+    if value.is_empty() {
+        return Err(format!("{program} returned an empty value"));
+    }
+    Ok(value)
+}
 
 pub fn prepare_test(
     context: &RunContext,
@@ -2233,6 +2295,9 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         artifact_dir: dir.display().to_string(),
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
+        machine_shortname: context.machine_shortname.clone(),
+        kernel_version: context.kernel_version.clone(),
+        host_capabilities: context.host_capabilities.clone(),
         attempt: context.attempt,
         hermit_sha: context.source_sha.clone(),
         binary_build_sha: context.binary_build_sha.clone(),
@@ -2303,6 +2368,9 @@ pub fn infrastructure_error_result(
         artifact_dir: dir.display().to_string(),
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
+        machine_shortname: context.machine_shortname.clone(),
+        kernel_version: context.kernel_version.clone(),
+        host_capabilities: context.host_capabilities.clone(),
         attempt: context.attempt,
         hermit_sha: context.source_sha.clone(),
         binary_build_sha: context.binary_build_sha.clone(),
@@ -2365,6 +2433,9 @@ pub fn host_inapplicable_result(
         artifact_dir: dir.display().to_string(),
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
+        machine_shortname: context.machine_shortname.clone(),
+        kernel_version: context.kernel_version.clone(),
+        host_capabilities: context.host_capabilities.clone(),
         attempt: context.attempt,
         hermit_sha: context.source_sha.clone(),
         binary_build_sha: context.binary_build_sha.clone(),
@@ -2576,6 +2647,13 @@ pub fn prepare_result_path(path: &Path) -> Result<(), String> {
 }
 
 pub fn append_result(path: &Path, result: &CellResult) -> Result<(), String> {
+    // A missing prerequisite means the cell did not execute. Keep the typed
+    // value for the harness summary and JUnit skip, but do not publish a cell
+    // row that downstream readers could count as an observation. The validate
+    // record names the withheld node and prerequisite separately.
+    if result.outcome == "HOST-INAPPLICABLE" {
+        return Ok(());
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -3140,6 +3218,25 @@ mod tests {
         }
     }
 
+    fn fixture_host_capabilities() -> HostCapabilities {
+        BTreeMap::from([
+            (
+                HostCapability::CpuidFaulting,
+                HostCapabilityVerdict {
+                    present: true,
+                    evidence: "fixture cpuid probe".into(),
+                },
+            ),
+            (
+                HostCapability::Kvm,
+                HostCapabilityVerdict {
+                    present: false,
+                    evidence: "fixture kvm probe".into(),
+                },
+            ),
+        ])
+    }
+
     fn run_context(root: &Path) -> RunContext {
         RunContext {
             root: root.into(),
@@ -3147,6 +3244,9 @@ mod tests {
             result_root: root.join("results"),
             build_root: root.join("build"),
             run_id: "fixture".into(),
+            machine_shortname: "fixture-host".into(),
+            kernel_version: "7.1.3-fixture".into(),
+            host_capabilities: fixture_host_capabilities(),
             attempt: 1,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
@@ -3232,6 +3332,9 @@ mod tests {
             result_root: root.join("results"),
             build_root: root.join("build"),
             run_id: "fixture".into(),
+            machine_shortname: "fixture-host".into(),
+            kernel_version: "7.1.3-fixture".into(),
+            host_capabilities: fixture_host_capabilities(),
             attempt: 1,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
@@ -3398,6 +3501,9 @@ mod tests {
             result_root: root.join("results"),
             build_root: root.join("build"),
             run_id: "fixture".into(),
+            machine_shortname: "fixture-host".into(),
+            kernel_version: "7.1.3-fixture".into(),
+            host_capabilities: fixture_host_capabilities(),
             attempt: 1,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
@@ -3455,6 +3561,9 @@ mod tests {
             result_root: root.join("results"),
             build_root: root.join("build"),
             run_id: "fixture".into(),
+            machine_shortname: "fixture-host".into(),
+            kernel_version: "7.1.3-fixture".into(),
+            host_capabilities: fixture_host_capabilities(),
             attempt: 1,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
@@ -3476,6 +3585,12 @@ mod tests {
         assert!(result.binary_sha256.is_none());
         assert_eq!(result.error_kind, None);
         assert_eq!(result.duration_ms, None);
+        let results = root.join("results.jsonl");
+        append_result(&results, &result).unwrap();
+        assert!(
+            !results.exists(),
+            "a cell withheld for an unmet prerequisite must not publish a cell row"
+        );
         let row = serde_json::to_value(&result).unwrap();
         assert!(
             row.get("duration_ms").is_none(),
@@ -3528,6 +3643,9 @@ mod tests {
             result_root: root.join("results"),
             build_root: root.join("build"),
             run_id: "fixture".into(),
+            machine_shortname: "fixture-host".into(),
+            kernel_version: "7.1.3-fixture".into(),
+            host_capabilities: fixture_host_capabilities(),
             attempt: 1,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
@@ -3742,6 +3860,9 @@ backends_disabled:
             result_root: PathBuf::from("/repo/results"),
             build_root: PathBuf::from("/repo/build"),
             run_id: "fixture".into(),
+            machine_shortname: "fixture-host".into(),
+            kernel_version: "7.1.3-fixture".into(),
+            host_capabilities: fixture_host_capabilities(),
             attempt: 1,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
@@ -3792,6 +3913,9 @@ backends_disabled:
             result_root: PathBuf::from("/repo/results"),
             build_root: PathBuf::from("/repo/build"),
             run_id: "fixture".into(),
+            machine_shortname: "fixture-host".into(),
+            kernel_version: "7.1.3-fixture".into(),
+            host_capabilities: fixture_host_capabilities(),
             attempt: 1,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
@@ -4036,6 +4160,9 @@ backends_disabled:
             result_root: PathBuf::from("/repo/results"),
             build_root: PathBuf::from("/repo/build"),
             run_id: "fixture".into(),
+            machine_shortname: "fixture-host".into(),
+            kernel_version: "7.1.3-fixture".into(),
+            host_capabilities: fixture_host_capabilities(),
             attempt: 1,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
@@ -4119,6 +4246,9 @@ backends_disabled:
             result_root: PathBuf::from("/repo/results"),
             build_root: PathBuf::from("/repo/build"),
             run_id: "fixture".into(),
+            machine_shortname: "fixture-host".into(),
+            kernel_version: "7.1.3-fixture".into(),
+            host_capabilities: fixture_host_capabilities(),
             attempt: 1,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
@@ -4421,6 +4551,9 @@ backends_disabled:
         CellResult {
             schema: CELL_RESULT_SCHEMA,
             run_id: "fixture".into(),
+            machine_shortname: "fixture-host".into(),
+            kernel_version: "7.1.3-fixture".into(),
+            host_capabilities: fixture_host_capabilities(),
             attempt: 1,
             hermit_sha: "sha".into(),
             binary_build_sha: None,
@@ -4492,6 +4625,13 @@ backends_disabled:
         let row = cell_result_that_located_nothing();
         let rendered = serde_json::to_value(&row).expect("row serializes");
         let object = rendered.as_object().expect("row is a JSON object");
+        assert_eq!(object["machine_shortname"], "fixture-host");
+        assert_eq!(object["kernel_version"], "7.1.3-fixture");
+        assert_eq!(
+            object["host_capabilities"]["cpuid-faulting"]["present"],
+            true
+        );
+        assert_eq!(object["host_capabilities"]["kvm"]["present"], false);
         for key in [
             "first_divergent_record",
             "first_divergent_syscall",
@@ -4941,6 +5081,9 @@ backends_disabled:
             result_root: root.join("results"),
             build_root: root.join("build"),
             run_id: "fixture".into(),
+            machine_shortname: "fixture-host".into(),
+            kernel_version: "7.1.3-fixture".into(),
+            host_capabilities: fixture_host_capabilities(),
             attempt: 1,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
@@ -5009,6 +5152,9 @@ backends_disabled:
             result_root: root.join("results"),
             build_root,
             run_id: "fixture".into(),
+            machine_shortname: "fixture-host".into(),
+            kernel_version: "7.1.3-fixture".into(),
+            host_capabilities: fixture_host_capabilities(),
             attempt: 1,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
