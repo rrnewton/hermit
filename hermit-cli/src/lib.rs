@@ -1024,6 +1024,10 @@ impl Backend {
         }
     }
 
+    fn uses_ptrace_pmu_timers(self) -> bool {
+        matches!(self, Self::Ptrace | Self::Liteinst | Self::E9patch)
+    }
+
     /// Returns backends whose Hermit integration prerequisites are met.
     ///
     /// Some integrations use CLI launch adapters rather than direct
@@ -1063,6 +1067,40 @@ impl Backend {
             Self::Kvm => kvm_device_unavailable_reason(Path::new("/dev/kvm")),
             Self::E9patch => e9patch_unavailable_reason(),
         }
+    }
+}
+
+struct SkidOvershootReport {
+    enabled: bool,
+}
+
+fn take_skid_overshoot_warning() -> Option<String> {
+    let count = reverie::take_skid_overshoot_count();
+    (count > 0).then(|| {
+        format!(
+            "WARNING: observed {count} {} report(s); a successful exit does not establish \
+             deterministic execution because precise PMU timer delivery passed its target.",
+            reverie::SKID_OVERSHOOT_MARKER
+        )
+    })
+}
+
+impl SkidOvershootReport {
+    fn begin(enabled: bool) -> Self {
+        if enabled {
+            // A previous invocation in this process must not qualify this one.
+            let _ = reverie::take_skid_overshoot_count();
+        }
+        Self { enabled }
+    }
+
+    fn finish<T>(self, result: T) -> T {
+        if self.enabled
+            && let Some(warning) = take_skid_overshoot_warning()
+        {
+            eprintln!("{warning}");
+        }
+        result
     }
 }
 
@@ -2094,18 +2132,20 @@ pub fn run_with_backend_timeout(
     backend: Backend,
     timeout: Option<Duration>,
 ) -> Result<ExitStatus, Error> {
+    let skid_overshoot_report = SkidOvershootReport::begin(backend.uses_ptrace_pmu_timers());
     if backend == Backend::Kvm {
         ensure_kvm_stdin_reserved()?;
     }
     let config = prepare_backend_config(config, backend);
-    run_with_backend_inner(
+    let result = run_with_backend_inner(
         command,
         config,
         print_summary,
         print_summary_to_json_file,
         backend,
         timeout,
-    )
+    );
+    skid_overshoot_report.finish(result)
 }
 
 // TODO-HUMAN-REVIEW(PR-749): Review LiteInst backend configuration normalization.
@@ -2543,18 +2583,20 @@ pub fn run_with_output_backend_timeout(
     backend: Backend,
     timeout: Option<Duration>,
 ) -> Result<Output, Error> {
+    let skid_overshoot_report = SkidOvershootReport::begin(backend.uses_ptrace_pmu_timers());
     if backend == Backend::Kvm {
         ensure_kvm_stdin_reserved()?;
     }
     let config = prepare_backend_config(config, backend);
-    run_with_output_backend_inner(
+    let result = run_with_output_backend_inner(
         command,
         config,
         print_summary,
         print_summary_to_json_file,
         backend,
         timeout,
-    )
+    );
+    skid_overshoot_report.finish(result)
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -2910,36 +2952,50 @@ impl<'a> From<Option<&'a PathBuf>> for HermitData {
 /// Records to the specified directory, which must already exist.
 #[tokio::main(flavor = "current_thread")]
 pub async fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
-    Ok(Record::spawn(command, dir).await?.wait().await?)
+    let skid_overshoot_report = SkidOvershootReport::begin(true);
+    let result = async { Ok(Record::spawn(command, dir).await?.wait().await?) }.await;
+    skid_overshoot_report.finish(result)
 }
 
 /// Records to the specified directory, which must already exist. The
 /// stderr/stdout of the recording is captured in `Output`.
 #[tokio::main(flavor = "current_thread")]
 pub async fn record_with_output(mut command: Command, dir: &Path) -> Result<Output, Error> {
+    let skid_overshoot_report = SkidOvershootReport::begin(true);
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
 
-    Ok(Record::spawn(command, dir)
-        .await?
-        .wait_with_output()
-        .await?)
+    let result = async {
+        Ok(Record::spawn(command, dir)
+            .await?
+            .wait_with_output()
+            .await?)
+    }
+    .await;
+    skid_overshoot_report.finish(result)
 }
 
 /// Replays from the specified directory.
 #[tokio::main(flavor = "current_thread")]
 pub async fn replay_from(dir: &Path) -> Result<ExitStatus, Error> {
-    Ok(Replay::spawn(dir, false, None, &[]).await?.wait().await?)
+    let skid_overshoot_report = SkidOvershootReport::begin(true);
+    let result = async { Ok(Replay::spawn(dir, false, None, &[]).await?.wait().await?) }.await;
+    skid_overshoot_report.finish(result)
 }
 
 /// Replays with a gdb server.
 #[tokio::main(flavor = "current_thread")]
 pub async fn replay_with_gdbserver(dir: &Path, port: u16) -> Result<ExitStatus, Error> {
-    Ok(Replay::spawn(dir, false, Some(port), &[])
-        .await?
-        .wait()
-        .await?)
+    let skid_overshoot_report = SkidOvershootReport::begin(true);
+    let result = async {
+        Ok(Replay::spawn(dir, false, Some(port), &[])
+            .await?
+            .wait()
+            .await?)
+    }
+    .await;
+    skid_overshoot_report.finish(result)
 }
 
 /// Replays with a gdb server and applies mounts inside the replay chroot.
@@ -2949,33 +3005,113 @@ pub async fn replay_with_gdbserver_and_mounts(
     port: u16,
     mounts: &[Mount],
 ) -> Result<ExitStatus, Error> {
-    Ok(Replay::spawn(dir, false, Some(port), mounts)
-        .await?
-        .wait()
-        .await?)
+    let skid_overshoot_report = SkidOvershootReport::begin(true);
+    let result = async {
+        Ok(Replay::spawn(dir, false, Some(port), mounts)
+            .await?
+            .wait()
+            .await?)
+    }
+    .await;
+    skid_overshoot_report.finish(result)
 }
 
 /// Replays from the specified directory which must already exist. The
 /// stderr/stdout of the replay is captured in `Output`.
 #[tokio::main(flavor = "current_thread")]
 pub async fn replay_with_output(dir: &Path) -> Result<Output, Error> {
-    Ok(Replay::spawn(dir, true, None, &[])
-        .await?
-        .wait_with_output()
-        .await?)
+    let skid_overshoot_report = SkidOvershootReport::begin(true);
+    let result = async {
+        Ok(Replay::spawn(dir, true, None, &[])
+            .await?
+            .wait_with_output()
+            .await?)
+    }
+    .await;
+    skid_overshoot_report.finish(result)
 }
 
 /// Replays with captured output and applies the requested mounts inside the replay chroot.
 #[tokio::main(flavor = "current_thread")]
 pub async fn replay_with_output_and_mounts(dir: &Path, mounts: &[Mount]) -> Result<Output, Error> {
-    Ok(Replay::spawn(dir, true, None, mounts)
-        .await?
-        .wait_with_output()
-        .await?)
+    let skid_overshoot_report = SkidOvershootReport::begin(true);
+    let result = async {
+        Ok(Replay::spawn(dir, true, None, mounts)
+            .await?
+            .wait_with_output()
+            .await?)
+    }
+    .await;
+    skid_overshoot_report.finish(result)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    static SKID_OVERSHOOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn skid_overshoot_report_covers_success_error_and_disabled_backends() {
+        let _lock = SKID_OVERSHOOT_TEST_LOCK.lock().unwrap();
+        let _ = reverie::take_skid_overshoot_count();
+
+        reverie::record_skid_overshoot();
+        let empty_run = SkidOvershootReport::begin(true);
+        assert_eq!(
+            reverie::take_skid_overshoot_count(),
+            0,
+            "begin must clear evidence from a previous invocation"
+        );
+        empty_run.finish(());
+
+        let success = SkidOvershootReport::begin(true);
+        reverie::record_skid_overshoot();
+        reverie::record_skid_overshoot();
+        assert_eq!(success.finish(Ok::<_, &str>(7)), Ok(7));
+        assert_eq!(reverie::take_skid_overshoot_count(), 0);
+
+        let error = SkidOvershootReport::begin(true);
+        reverie::record_skid_overshoot();
+        assert_eq!(
+            error.finish(Err::<(), _>("guest failed")),
+            Err("guest failed")
+        );
+        assert_eq!(reverie::take_skid_overshoot_count(), 0);
+
+        reverie::record_skid_overshoot();
+        let disabled = SkidOvershootReport::begin(false);
+        disabled.finish(());
+        assert_eq!(
+            reverie::take_skid_overshoot_count(),
+            1,
+            "a backend that cannot produce ptrace PMU overshoots must not consume another run's evidence"
+        );
+    }
+
+    #[test]
+    fn only_ptrace_hosted_backends_consume_skid_overshoot_reports() {
+        for backend in [Backend::Ptrace, Backend::Liteinst, Backend::E9patch] {
+            assert!(backend.uses_ptrace_pmu_timers(), "{backend:?}");
+        }
+        for backend in [Backend::Dbt, Backend::Sabre, Backend::Kvm] {
+            assert!(!backend.uses_ptrace_pmu_timers(), "{backend:?}");
+        }
+    }
+
+    #[test]
+    fn skid_overshoot_warning_names_the_limit_of_a_successful_exit() {
+        let _lock = SKID_OVERSHOOT_TEST_LOCK.lock().unwrap();
+        let _ = reverie::take_skid_overshoot_count();
+        assert_eq!(take_skid_overshoot_warning(), None);
+
+        reverie::record_skid_overshoot();
+        let warning = take_skid_overshoot_warning().expect("recorded overshoot must be reported");
+        assert!(warning.contains("observed 1 HERMIT_SKID_OVERSHOOT report(s)"));
+        assert!(warning.contains("successful exit does not establish deterministic execution"));
+        assert_eq!(reverie::take_skid_overshoot_count(), 0);
+    }
+
     /// ⚠️ THE REGRESSION agent(hermit-007)'s CODEX LANE CAUGHT, PINNED FOR THE
     /// SIGNAL BAND. This test fails if the signal half stops being covered; it
     /// does NOT prove the predicate can never drift again, because the

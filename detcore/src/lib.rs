@@ -282,12 +282,16 @@ fn report_rcb_overshoot(
     last_timer: u64,
 ) {
     let message = format!(
-        "prehook: PMU RCB overshoot! Clock_value: {}. Stepped forward {} RCBs, but should have trapped at {}",
-        clock_value, delta_rcbs, last_timer
+        "{} prehook: PMU RCB overshoot! Clock_value: {}. Stepped forward {} RCBs, but should have trapped at {}",
+        reverie::SKID_OVERSHOOT_MARKER,
+        clock_value,
+        delta_rcbs,
+        last_timer
     );
     if panic_on_rcb_overshoot {
         panic!("{}", message);
     }
+    reverie::record_skid_overshoot();
     error!("{}", message);
 }
 
@@ -3136,16 +3140,23 @@ mod rcb_overshoot_tests {
 
     #[test]
     fn default_overshoot_policy_emits_error_and_returns() {
+        let _ = reverie::take_skid_overshoot_count();
         let error = Arc::new(Mutex::new(None));
         with_default(ErrorSubscriber(error.clone()), || {
             report_rcb_overshoot(false, 16_249, 139, 100);
         });
 
         let error = error.lock().unwrap().take().expect("missing ERROR event");
+        assert!(error.contains(reverie::SKID_OVERSHOOT_MARKER), "{error}");
         assert!(error.contains("PMU RCB overshoot"), "{error}");
         assert!(error.contains("16249"), "{error}");
         assert!(error.contains("139"), "{error}");
         assert!(error.contains("100"), "{error}");
+        assert_eq!(
+            reverie::take_skid_overshoot_count(),
+            1,
+            "the log-and-continue path must feed the supervisor's structural count"
+        );
     }
 
     #[test]
