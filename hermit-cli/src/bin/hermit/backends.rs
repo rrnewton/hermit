@@ -797,7 +797,28 @@ pub(super) fn run_dbt(
         return Ok(output_status(&output));
     }
 
-    let (log1, log2) = temp_log_files_in("dbt-run1", "dbt-run2", verify_log_dir)
+    // The capture names are READ BY THE HARNESS, so they are not a local choice.
+    //
+    // `ci/compat-envelope/pressure-test.rs` and `ci/manifest-plan/src/runner.rs`
+    // both scan a retained verify-log directory with
+    // `name.starts_with("run1_log_")` / `("run2_log_")`. This call used to pass
+    // "dbt-run1"/"dbt-run2", which `temp_log_files_in` turns into the prefixes
+    // `dbt-run1_log_` / `dbt-run2_log_` -- and those do not start with
+    // `run1_log_`. `run.rs` passes "run1"/"run2" for every other backend.
+    //
+    // Measured 2026-08-27 on one guest with one binary, backend the only
+    // variable: DBT wrote both captures, 47,507 bytes each, and the harness
+    // predicate matched 0 of the 2 it requires; the same command without
+    // `--backend dbt` wrote `run1_log_`/`run2_log_` and matched 2 of 2. So every
+    // dbt verify cell was recorded `infrastructure-error` for
+    // "terminal verify result must retain exactly one nonempty run1 log and one
+    // nonempty run2 log" while its logs sat in the directory under a name
+    // nothing looked for. 174 of 174 records under that condition were dbt.
+    //
+    // Fixed HERE rather than by teaching the scanners a second prefix: the
+    // scanners already refuse a missing, duplicated, or empty capture, and
+    // widening what they accept would weaken the check that caught this.
+    let (log1, log2) = temp_log_files_in("run1", "run2", verify_log_dir)
         .map_err(|error| Error::msg(format!("failed to create DBT verification logs: {error}")))?;
     let (log1_file, log1_path) = log1.into_parts();
     let (log2_file, log2_path) = log2.into_parts();

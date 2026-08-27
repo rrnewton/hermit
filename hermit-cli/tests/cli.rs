@@ -915,6 +915,107 @@ fn run_dbt_verifies_simple_env_shebang() {
     );
 }
 
+/// DBT's retained verify captures must carry the names THE HARNESS SCANS FOR.
+///
+/// This is not a style assertion. `ci/compat-envelope/pressure-test.rs` and
+/// `ci/manifest-plan/src/runner.rs` both locate the pair with
+/// `name.starts_with("run1_log_")` / `("run2_log_")`, and a terminal verify
+/// result whose directory does not yield exactly one of each is recorded
+/// `infrastructure-error` regardless of the verdict it actually reached.
+///
+/// DBT used to pass "dbt-run1"/"dbt-run2" to `temp_log_files_in`, producing
+/// `dbt-run1_log_*`, which does not start with `run1_log_`. Measured 2026-08-27
+/// with the backend as the only variable: DBT wrote both captures, 47,507 bytes
+/// each, and the harness predicate matched 0 of the 2 it requires; the same
+/// command without `--backend dbt` matched 2 of 2. Every dbt verify cell was
+/// filed as an infrastructure failure with its logs present but unnamed --
+/// 174 of 174 records under that condition were dbt, and two of them were
+/// concealing a real divergence.
+///
+/// Nothing else in the tree ever referenced the `dbt-` spelling, so it was
+/// undefended: the mismatch could return by editing one string with no test
+/// failing. This asserts BOTH directions -- the scanned names are present, and
+/// the old spelling is absent -- so a revert is visible.
+#[test]
+fn dbt_verify_retains_captures_under_the_names_the_harness_scans_for() {
+    if dbt_unavailable("dbt_verify_retains_captures_under_the_names_the_harness_scans_for") {
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create DBT verify-log naming test directory");
+    let log_dir = root.path().join("verify-logs");
+    fs::create_dir(&log_dir).expect("failed to create DBT verification log directory");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "run",
+            "--backend",
+            "dbt",
+            "--verify",
+            "--keep-logs",
+            "--verify-log-dir",
+        ])
+        .arg(&log_dir)
+        .args(["--", "/bin/echo", "dbt-verify-log-naming"])
+        .output()
+        .expect("failed to run DBT verification");
+
+    // DELIBERATELY NOT asserting the verdict. The subject here is the NAME the
+    // captures are retained under, and `--keep-logs` retains them whether the
+    // two runs matched or not. An earlier version of this test also required
+    // success and was flaky within three runs: DBT verification of /bin/echo
+    // diverged on one of them ("Log differences found between run 1 and run 2"),
+    // which failed the test for a reason that has nothing to do with the naming
+    // it exists to pin. Coupling a property to an unrelated verdict is how a
+    // test starts getting re-run until it passes.
+    let stderr_text = strip_ansi_sgr(&stderr(&output));
+    assert!(
+        stderr_text.contains("Verification logs retained") || output.status.success(),
+        "DBT verification neither succeeded nor reported retained logs, so this test cannot \
+         observe the capture names at all:\n{stderr_text}"
+    );
+
+    let names = |prefix: &str| -> Vec<String> {
+        fs::read_dir(&log_dir)
+            .expect("failed to read the retained verify-log directory")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+            .filter(|name| name.starts_with(prefix))
+            .collect()
+    };
+
+    // The harness predicate, applied verbatim: exactly one of each, both nonempty.
+    for prefix in ["run1_log_", "run2_log_"] {
+        let matched = names(prefix);
+        assert_eq!(
+            matched.len(),
+            1,
+            "DBT verification must retain exactly one {prefix} capture for the harness to find; \
+             directory held {:?}",
+            fs::read_dir(&log_dir)
+                .map(|entries| entries
+                    .filter_map(Result::ok)
+                    .map(|e| e.file_name())
+                    .collect::<Vec<_>>())
+                .unwrap_or_default()
+        );
+        let size = fs::metadata(log_dir.join(&matched[0]))
+            .expect("failed to stat a retained capture")
+            .len();
+        assert!(size > 0, "retained capture {} is empty", matched[0]);
+    }
+
+    // And the spelling that hid them must not come back.
+    for stale in ["dbt-run1_log_", "dbt-run2_log_"] {
+        assert!(
+            names(stale).is_empty(),
+            "DBT retained a {stale} capture; the harness scans for run1_log_/run2_log_ and will \
+             record this cell as an infrastructure failure even when it reached a verdict"
+        );
+    }
+}
+
 #[test]
 fn dbt_verify_without_json_rejects_io_buffer_content_divergence() {
     if dbt_unavailable("dbt_verify_without_json_rejects_io_buffer_content_divergence") {
