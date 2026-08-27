@@ -510,7 +510,8 @@ pub struct DbtCountedBranchComparison {
 pub struct RunRuntime {
     pub scheduler_turns: u64,
     pub virtual_nanoseconds: u64,
-    pub syscalls: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub syscalls: Option<u64>,
 }
 
 impl From<&RunSummary> for RunRuntime {
@@ -2759,19 +2760,19 @@ mod tests {
         let first = RunSummary {
             sched_turns: 12,
             virttime_elapsed: 34,
-            syscalls: 5,
+            syscalls: Some(5),
             ..Default::default()
         };
         let second = RunSummary {
             sched_turns: 13,
             virttime_elapsed: 35,
-            syscalls: 6,
+            syscalls: Some(6),
             ..Default::default()
         };
         let runtime = VerificationRuntime::from_summaries(Some(&first), Some(&second))
             .expect("two summaries produce runtime totals");
         assert_eq!(runtime.run1.unwrap().scheduler_turns, 12);
-        assert_eq!(runtime.run2.unwrap().syscalls, 6);
+        assert_eq!(runtime.run2.unwrap().syscalls, Some(6));
 
         let mut report = VerificationReport::no_result();
         report.runtime = Some(runtime);

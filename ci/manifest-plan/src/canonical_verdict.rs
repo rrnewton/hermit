@@ -5,7 +5,8 @@ use serde::Serialize;
 pub struct RuntimeStats {
     pub scheduler_turns: u64,
     pub virtual_nanoseconds: u64,
-    pub syscalls: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub syscalls: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -337,7 +338,7 @@ mod tests {
                        "run2":{"scheduler_turns":13,"virtual_nanoseconds":35,"syscalls":6}}}"#;
         let report = VerificationReport::from_json_slice(json).expect("runtime report parses");
         let runtime = report.runtime.expect("runtime retained");
-        assert_eq!(runtime.run1.expect("run1").syscalls, 5);
+        assert_eq!(runtime.run1.expect("run1").syscalls, Some(5));
         assert_eq!(runtime.run2.expect("run2").scheduler_turns, 13);
     }
 
