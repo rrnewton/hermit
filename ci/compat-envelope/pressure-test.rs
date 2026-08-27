@@ -6802,9 +6802,12 @@ fn self_test(root: &Path) -> Result<(), String> {
     let first_row = result_row.clone();
     let mut second_row = result_row.clone();
     second_row.attempt = 2;
+    second_row.outcome = "PASS".into();
     second_row.duration_ms = 19_500;
     second_row.timeout_seconds = Some(20);
     second_row.artifact_dir = format!("{}-attempt-2", first_row.artifact_dir);
+    second_row.attempts[0]["outcome"] = json!("PASS");
+    second_row.attempts[0]["status"] = json!(0);
     fs::write(
         &appended_results,
         format!(
@@ -6824,6 +6827,31 @@ fn self_test(root: &Path) -> Result<(), String> {
         || appended[1].attempt != 2
         || appended[1].duration_ms != 19_500
         || appended[1].timeout_seconds != Some(20)
+        || !appended.iter().all(|row| {
+            result_row_identity_and_invocation_match(
+                row,
+                &sample_slug,
+                &sample_metadata,
+                &sample_a,
+                true,
+            )
+        })
+        || result_row_matches_cell(
+            &appended[0],
+            &sample_slug,
+            &sample_metadata,
+            &sample_a,
+            true,
+            Some(0),
+        )
+        || !result_row_matches_cell(
+            &appended[1],
+            &sample_slug,
+            &sample_metadata,
+            &sample_a,
+            true,
+            Some(0),
+        )
         || result_artifact_dir(&scratch, &appended[1])?
             != PathBuf::from(&second_row.artifact_dir)
     {
