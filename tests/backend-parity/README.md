@@ -32,17 +32,17 @@ Stripped verification (`hermit run --strict --verify`):
 | --- | ---: | --- | ---: |
 | ptrace | 28/28 | Stripped DETLOG | 100% |
 | DBT | 26/28 | Stripped DETLOG | 93% |
-| KVM | 22/28 | guest-visible only | 79% |
+| KVM | — | retained-log comparison enabled; this 28-test row is not remeasured | — |
 
-The two verification kinds are not interchangeable. **Stripped DETLOG**
-(ptrace, DBT) means Hermit re-ran the guest and found the two normalized DETLOG
+The verification results must name the comparator that actually ran. **Stripped DETLOG**
+means Hermit re-ran the guest and found the two normalized DETLOG
 streams equal after stripping selected fields; it does not mean the full syscall
 and scheduling traces were bitwise-identical and does not establish L2.
-**guest-visible** verification (KVM) is weaker: reverie-kvm runs concurrently and
-declares outright that its internal syscall trace order is not deterministic, so
-`--verify` compares only guest stdout and exit status across the two runs. KVM's
-column is therefore capped at `guest`, never `detlog`. See the verification
-subsection below for the contract that holds at L1 but not under `--verify`.
+KVM now compares retained logs too. Plain `--verify` uses the Stripped policy on
+every backend; `--verify-strict` selects canonical `BitwiseInfoV1` on every
+backend. Whether a KVM cell matches is a measured property of that workload.
+The historical 22/28 guest-visible count predates retained-log comparison and
+is therefore not reused as a current result.
 
 The task's pre-existing DBT-native baseline is 70/89 tests (78.7%). That number
 measures the backend's own Reverie suite. The 23/24 number above is deliberately
@@ -111,9 +111,12 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 
 ## Cases
 
-Each cell shows the L1 status and, after `/`, the `--verify` status: `detlog`
-for Stripped DETLOG equality, `guest` for KVM guest-visible equality, and `gap`
-where verification does not succeed. Neither successful status is an L2 claim.
+Each cell shows the L1 status and, after `/`, the last recorded `--verify`
+status: `detlog` for Stripped DETLOG equality, `guest` for guest-visible
+equality, and `gap` where verification did not succeed. The KVM `guest` entries
+are the historical 22/28 measurement made before KVM enabled log comparison;
+they are retained as provenance, not reported as current canonical results.
+Neither successful status is an L2 claim.
 
 | Test | ptrace | DBT | KVM |
 | --- | --- | --- | --- |
@@ -181,16 +184,22 @@ three byte-identical runs. The runner disables PMU timeslicing for portability.
 ### Stripped verification (`--verify`)
 
 Passing `--verify` adds a two-run comparison: the runner invokes
-`hermit run --strict --verify --verify-allow both`. For ptrace and DBT, Hermit
-compares DETLOG streams after Stripped normalization; this is not bitwise parity
-and not L2. Because `--verify` diverts the guest's own stdout into per-run
-temporary logs, this path cannot re-check stdout the way the L1 path does;
-instead it enforces that the guest exit status matches and that Hermit's
-double-run comparison succeeded at *at least* the verification kind expected
-for the backend. The runner keys on two stderr witnesses: `Determinism verified`
-(Stripped DETLOG, ptrace and DBT) and `guest output and exit status matched`
-(KVM guest-visible). A DETLOG result satisfies a `guest` contract because it
-compares more observations; the reverse fails.
+`hermit run --strict --verify --verify-allow both`. Plain `--verify` now uses
+the Stripped retained-log comparison for ptrace, DBT, and KVM;
+`--verify-strict` selects canonical `BitwiseInfoV1` for all three. The KVM
+statuses above predate that change and came from the older guest-output and
+exit-status comparison; they must not be reused as current log-comparison
+results. A fresh matrix run must be judged from its typed `--verify-json`
+report. The matrix's KVM tier allowlist still records only `guest` or `gap`, so
+it must be updated before those 28 cells can be remeasured under the current
+comparator.
+
+Because `--verify` diverts the guest's own stdout into per-run temporary logs,
+this path cannot re-check stdout the way the L1 path does; instead it enforces
+that the guest exit status matches and that Hermit's double-run comparison
+succeeded at *at least* the verification kind expected for the backend. A
+DETLOG result satisfies a `guest` contract because it compares more
+observations; the reverse fails.
 
 One contract holds at L1 but not under `--verify` and is recorded as a `gap`
 with its reason in the runner:
