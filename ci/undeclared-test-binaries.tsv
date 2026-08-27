@@ -20,7 +20,6 @@ btrfs_reservation_determinism	none-recorded	No reason was recorded when this bin
 btrfs_reserved_bytes_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 buddyinfo_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 compression	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
-container_init_deadline	measured-green-pending-registration	Measured 2026-08-26 on hermit@a787a547ea: 3 tests, 3 pass, 16.2s. Green and cheap; belongs in the DAG. Not registered here because every portable.json step carries a measured rss_baseline_bytes hint and that memory sample has not been taken.
 copy_file_range_refusal	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 cppc_feedback_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 cpuidle_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.

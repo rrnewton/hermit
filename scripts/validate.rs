@@ -7346,7 +7346,7 @@ mod nextest_timeout_tests {
         for required in [
             "test(/(^|::)every_record_container_site_classifies_a_child_fault_by_name$/)",
             "test(/(^|::)run_timeout_fallback_fires_when_the_unwind_does_not_finish$/)",
-            "binary(=container_init_deadline) & test(/(^|::)bare_timeout_kills_a_hung_hermit_run$/)",
+            "binary(=container_init_deadline)",
         ] {
             assert!(config.contains(required), "nextest config lost {required}");
             assert!(manifest.contains(required), "manifest lost {required}");
@@ -7358,12 +7358,14 @@ mod nextest_timeout_tests {
             assert!(config.contains(required), "nextest config lost {required}");
             assert!(manifest.contains(required), "manifest lost {required}");
         }
-        assert!(config.contains("waits for timeout(1)'s 15s deadline"));
-        assert!(config.contains("16.2s while passing"));
+        assert!(config.contains("exercises a 15s timeout"));
+        assert!(config.contains("20s teardown budget"));
+        assert!(config.contains("15.002s"));
         assert!(config.contains("RUN_TIMEOUT_UNWIND_GRACE"));
         assert!(config.contains("11.2s"));
-        assert!(manifest.contains("15-second external deadline"));
-        assert!(manifest.contains("named teardown check"));
+        assert!(manifest.contains("15-second timeout"));
+        assert!(manifest.contains("20-second teardown budget"));
+        assert!(manifest.contains("15.002 seconds"));
         assert!(manifest.contains("timeout_seconds: 15"));
     }
 }
