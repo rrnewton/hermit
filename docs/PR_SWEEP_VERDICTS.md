@@ -2368,107 +2368,123 @@ moved" — also false; the record shows agents, prompted by the row. Corrected
 because the true story is the stronger one: the printed reason did its job, and
 printing the reason still was not enough.
 
-### 22. Run the merge gate by hand, because nothing else runs it
+## 22. Run the review-protocol label/body lint by hand; no pull-request event runs it
 
-⚠️ **`scripts/core-review-protocol-lint.sh` enforces the `post-facto-human-review`
-protocol and executes in NO job.** Not a workflow, not a Makefile recipe, not a DAG
-node.
+`scripts/core-review-protocol-lint.sh` is called by the `core-review-protocol` job
+in `.github/workflows/merge-gate.yml`. That workflow's only trigger is
+`workflow_dispatch`, so **no automatically triggered pull-request job runs the
+lint against a real pull request**. The Makefile schedules
+`scripts/core-review-protocol-lint-test.sh`, which tests fixtures rather than a
+live pull request.
 
-⚠️ **AND A TREE-WIDE GREP WILL TELL YOU OTHERWISE, BECAUSE THE GATE'S TEST *IS*
-SCHEDULED AND ITS NAME CONTAINS THE GATE'S NAME.** Search for the substring
-`core-review-protocol-lint` and you get hits in the `Makefile` and in
-`scripts/check-checker-scheduling.rs`, which reads as "something runs it". Every one
-of those is `core-review-protocol-lint-**test**.sh` — the fixture-driven self-test,
-which `make lint-checks` does run. Separate the two names before drawing a
-conclusion. Measured 2026-08-26 on `origin/main`, references to the **gate itself**:
+The distinction matters because the script is a **partial label/body lint**, not
+exact-head approval authority. It receives the labels, body, pull-request number,
+and a Boolean saying whether changed paths or labels identify a KVM change. It
+does not receive the head SHA or state, read review comments, or establish the
+reviewers' identities. An exit 0 therefore says only that the supplied snapshot
+passes these checks, or that the `post-facto-human-review` label is absent. It does
+not prove that two named reviewers approved the current open head.
 
-| file | what it is |
-| --- | --- |
-| `.github/workflows/merge-gate.yml` | the only production caller; `on:` is `workflow_dispatch:` alone, so it cannot fire on a pull request |
-| `AGENTS.md` | documentation |
-
-**The test passing proves the gate's logic is correct on fixtures. It never sees a
-real pull request.** A scheduled test for an unscheduled gate is the most convincing
-possible form of this trap, and it is why the earlier revision of this section
-reported the wrong file count.
-
-`AGENTS.md` is the load-bearing one: since `b999b4cb4c` (07-31) it asserted these
-checks are *"enforced by the `core-review-protocol` merge-gate job, which blocks
-landing when any are missing"*. That false-enforcement claim is a large part of why
-nobody ran the gate. `28210d144d` (#2673) corrected it — cite that as the sibling
-fix rather than re-deriving it.
-
-**It is not dead code. It works, and it would have refused most of a night's core
-changes.** Of 240 pull requests merged from 2026-08-25, twelve carried
-`post-facto-human-review`. Driven from their real labels and bodies:
-
-| outcome | count | pull requests |
-| --- | --- | --- |
-| would have been BLOCKED | **9 of 12** | #2568 #2517 #2486 #2434 #2407 #2312 #2236 #2172 #2150 |
-| would have passed | 3 | #2534 #2373 #2370 |
-
-Seven of the nine failed on **missing or incomplete adversarial review**, not on
-prose: five had *no claude round label at all*, four had *no codex round label at
-all*, and two had a review that ran whose approval label was gone — the case the
-gate itself describes as "it approved an earlier revision and a later push
-invalidated the label". Only two of the nine failed on body sections alone.
-
-**So run it yourself, before you bind a lane on a labelled head or land one.** It
-takes about a second and needs no infrastructure:
+**The partial lint is still useful.** Measured from
+`2026-08-27T07:40:16Z` through `2026-08-27T07:42:08Z`, using the checker and
+workflow at fetched `main` SHA
+`63b778646101bb7228a1fc1674c937274b75aab4`. The exact GitHub search window was
+`2026-08-25T00:00:00Z..2026-08-25T23:59:59Z`:
 
 ```console
-PR=<n>
-labels=$(with-proxy gh pr view "$PR" -R rrnewton/hermit --json labels -q '.labels[].name') \
-  || { echo "label fetch FAILED -- this is not a pass" >&2; exit 2; }
-body=$(with-proxy gh pr view "$PR" -R rrnewton/hermit --json body -q .body) \
-  || { echo "body fetch FAILED -- this is not a pass" >&2; exit 2; }
-PR_NUMBER="$PR" PR_LABELS="$labels" PR_BODY="$body" \
-  ./scripts/core-review-protocol-lint.sh
+with-proxy gh api --method GET search/issues \
+  -f q='repo:rrnewton/hermit is:pr is:merged merged:2026-08-25T00:00:00Z..2026-08-25T23:59:59Z' \
+  --jq '{total_count}'
+with-proxy gh api --method GET search/issues \
+  -f q='repo:rrnewton/hermit is:pr is:merged merged:2026-08-25T00:00:00Z..2026-08-25T23:59:59Z label:post-facto-human-review' \
+  --jq '{total_count, numbers:[.items[].number]}'
 ```
 
-Exit 0 means satisfied *or* the head is not labelled; exit 1 means the protocol is
-violated and landing should be blocked; exit 2 is usage or internal error, which is
-**not** a pass.
+The raw results were:
 
-⚠️ **CAPTURE THE FETCH AND CHECK IT. DO NOT INLINE IT AS `PR_LABELS="$(gh ...)"`,
-WHICH IS WHAT AN EARLIER REVISION OF THIS SECTION PRINTED.** Two properties combine
-into a silent green. A failing `gh` still assigns — the variable ends up **set and
-empty**, not unset. And the script guards `unset` while treating set-and-empty as the
-affirmative claim *"this pull request genuinely has no labels"*, so it takes the
-not-applicable fast path. Measured on #2216, same script, same head, the only
-variable being whether `gh` egressed:
+```json
+{"total_count":220}
+{"numbers":[2568,2534,2517,2486,2434,2407,2373,2370,2312,2236,2172,2150],"total_count":12}
+```
 
-| `gh` invocation | result on #2216 |
-| --- | --- |
-| plain `gh` — no proxy, the default on this fleet; exits 1, *"network is unreachable"* | **exit 0**, *"the PR has NO labels at all (empty set, supplied); core-review protocol not applicable"* |
-| `with-proxy gh` | **exit 1**, blocking, naming both absent approval labels |
+Fetching each of those twelve pull requests' live labels, body, and complete
+paginated changed-file list, then supplying `PR_IS_KVM`, produced:
 
-The script's own header names this exact state: *"a hand spot-check that forgot the
-variable took the not-applicable fast path and printed a PASS having checked
-NOTHING."* The inline form reintroduces it at the call site, in the one shape the
-script cannot detect. **That is worse than shipping no recipe at all** — without one
-nobody runs the gate and nobody claims they did, whereas a green line plus this
-section's own instruction to record it converts an absent check into manufactured
-evidence. Any form that makes a failed fetch exit non-zero is fine; `"$(...)"`
-inline is not one of them. The `with-proxy` half matters for the same reason:
-*"network is unreachable"* means the call never left the box, which is an
-environment fault and never a verdict about the pull request.
+| partial label/body lint outcome | count | pull requests |
+| --- | --- | --- |
+| blocked | **9 of 12** | #2568 #2517 #2486 #2434 #2407 #2312 #2236 #2172 #2150 |
+| passed | 3 | #2534 #2373 #2370 |
 
-⚠️ **THIS HOLDS ONLY WHERE AGENTS HOLD IT, AND YOU SHOULD READ IT THAT WAY.** There
-is no workflow behind it, no required status check behind that, and `main` has no
-branch protection — the one ruleset named for check gating has been empty since
-2026-08-09. A raw `gh pr merge` bypasses every word of this section. It is a
-convention, and its failure mode is silent: the first person who skips it merges
-successfully and nothing anywhere reports that a step was missed. Write down that
-you ran it, in the lane, so the next reader can tell "ran and passed" from "nobody
-looked".
+Run the same partial lint before landing a labelled pull request. Every fetch is
+checked, including the file list used to derive `PR_IS_KVM`; a failed fetch is an
+error, never a non-KVM answer:
 
-⚠️ **AND DO NOT ARM IT UNILATERALLY.** Re-adding a `pull_request` trigger would
-contradict the standing directive that CI must not run automatically, and a trigger
-without a `required_status_checks` rule — or a rule without a trigger — gives you
-one of the two failure modes rather than a gate: **a check that gates nothing, or a
-requirement nothing can satisfy.** Both layers or neither, and that pairing is an
-owner ruling. The asymmetry that makes it a ruling rather than a task: this
-convention fails **open, per pull request**, and is recoverable by fix-forward;
-enforcement fails **closed, repo-wide, at once**, and with no bypass actor
-configured it is recoverable only by editing repository settings.
+```console
+set -euo pipefail
+repo=rrnewton/hermit
+pr=<n>
+
+if ! pr_json=$(with-proxy gh api "repos/$repo/pulls/$pr"); then
+  echo "pull-request fetch FAILED -- this is not a pass" >&2
+  exit 2
+fi
+if ! labels=$(jq -r '.labels[].name' <<<"$pr_json"); then
+  echo "label decode FAILED -- this is not a pass" >&2
+  exit 2
+fi
+if ! body=$(jq -r '.body // ""' <<<"$pr_json"); then
+  echo "body decode FAILED -- this is not a pass" >&2
+  exit 2
+fi
+if ! files=$(with-proxy gh api --paginate "repos/$repo/pulls/$pr/files" \
+    --jq '.[].filename'); then
+  echo "changed-file fetch FAILED -- cannot decide whether this is KVM" >&2
+  exit 2
+fi
+
+if grep -qiE 'kvm' <<<"$files" || grep -Fixq kvm <<<"$labels"; then
+  is_kvm=true
+else
+  is_kvm=false
+fi
+
+PR_NUMBER="$pr" PR_LABELS="$labels" PR_BODY="$body" PR_IS_KVM="$is_kvm" \
+  bash scripts/core-review-protocol-lint.sh
+```
+
+Exit 0 means the partial lint passed or did not apply; exit 1 means it found a
+label/body violation; exit 2 means the invocation could not decide. Record the
+exact-head adversarial-review evidence separately before binding a lane or
+landing. In particular, do not present this command's exit 0 as proof of an
+approval at the current head.
+
+⚠️ **CAPTURE EACH FETCH AND CHECK IT.** A failing command substitution can still
+leave a variable set and empty. The linter deliberately treats an explicitly
+empty label set as the affirmative statement "this pull request has no labels",
+so an unchecked fetch can turn a network failure into a not-applicable exit 0.
+The guarded assignments above keep missing evidence distinct from an empty value.
+
+⚠️ **CURRENT ENFORCEMENT IS NARROWER THAN "NO PROTECTION".** The same live
+measurement returned all of these facts:
+
+- `GET /repos/rrnewton/hermit/branches/main` reports `protected: true`, while its
+  legacy `protection` object has `enabled: false` and no required status checks.
+- The active `main history protection` ruleset prevents deletion and
+  non-fast-forward updates and requires linear history.
+- The active `main check gating (admin-bypassable)` ruleset has `rules: []`, so
+  no status check currently requires this lint.
+- Manual `workflow_dispatch` runs of `merge-gate.yml` exist; for example,
+  https://github.com/rrnewton/hermit/actions/runs/32553733143 was created on
+  `2026-08-22T05:12:22Z`.
+
+Thus a merge is not unconstrained, and a required manually dispatched check
+would be satisfiable. What is absent is an automatically triggered pull-request
+run and a required status check for this lint. Skipping the hand-run lint is not
+reported by the current repository settings.
+
+⚠️ **DO NOT CHANGE THAT POLICY UNILATERALLY.** Adding a `pull_request` trigger
+would contradict the standing directive that CI does not run automatically.
+Requiring the existing manually dispatched check instead would make every pull
+request wait for a deliberate dispatch. Either policy changes repository-wide
+landing behavior and therefore needs an owner decision; the present partial
+lint remains a hand-run check until then.
