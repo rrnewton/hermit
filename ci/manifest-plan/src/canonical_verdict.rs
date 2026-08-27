@@ -2,6 +2,22 @@ use serde::Deserialize;
 use serde::Serialize;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RuntimeStats {
+    pub scheduler_turns: u64,
+    pub virtual_nanoseconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub syscalls: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct VerificationRuntime {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run1: Option<RuntimeStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run2: Option<RuntimeStats>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct VerificationReport {
     pub verified: bool,
     pub bitwise_parity: bool,
@@ -59,6 +75,10 @@ pub struct VerificationReport {
     /// syscall completed.
     #[serde(default)]
     pub first_divergent_syscall: Option<u64>,
+    /// Runtime totals for the two compared executions when the producer could
+    /// read both run summaries.
+    #[serde(default)]
+    pub runtime: Option<VerificationRuntime>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -310,6 +330,18 @@ mod tests {
         assert_eq!(report.first_divergent_virtual_nanoseconds, None);
     }
 
+    #[test]
+    fn runtime_totals_survive_the_typed_report_parse() {
+        let json = br#"{"verified":true,"bitwise_parity":true,"verdict":"matched",
+            "comparison":{"strictness":"canonical","compare_logs":true,"record_envelope":"all_records_v1"},"compared_log_messages":{"left":180,"right":180},
+            "runtime":{"run1":{"scheduler_turns":12,"virtual_nanoseconds":34,"syscalls":5},
+                       "run2":{"scheduler_turns":13,"virtual_nanoseconds":35,"syscalls":6}}}"#;
+        let report = VerificationReport::from_json_slice(json).expect("runtime report parses");
+        let runtime = report.runtime.expect("runtime retained");
+        assert_eq!(runtime.run1.expect("run1").syscalls, Some(5));
+        assert_eq!(runtime.run2.expect("run2").scheduler_turns, 13);
+    }
+
     fn report(strictness: &str, compare_logs: bool, left: u64, right: u64) -> VerificationReport {
         VerificationReport {
             verified: true,
@@ -325,6 +357,7 @@ mod tests {
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            runtime: None,
         }
     }
 

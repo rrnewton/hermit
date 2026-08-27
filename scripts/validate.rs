@@ -1719,6 +1719,7 @@ fn self_test() -> Result<(), String> {
     typed_libtest_count_bracket()?;
     ledger_gate_origin_bracket()?;
     requalification_plan_bracket(&root)?;
+    validate_series_writer_bracket()?;
     no_result_propagation_bracket()?;
     possible_missing_artifact_bracket()?;
     selective_subset_bracket(&root)?;
@@ -3304,7 +3305,6 @@ fn configure_e2e_result_root(
     // harness process mint a local timestamp. Schema-6 evidence is one complete
     // selected population, not a pool of unrelated bucket attempts.
     std::env::set_var("E2E_RUN_ID", &run);
-
     // The harness derives its prebuilt-fixture directory from RESULT_ROOT too,
     // but build products are not evidence and must not accumulate beside every
     // retained scorecard. Keep them in validate's ordinary disposable run
@@ -3446,6 +3446,86 @@ mod concurrent_validate_path_tests {
             .any(|line| line.contains("refusing rather than running two validates")));
         let _ = std::fs::remove_dir_all(&root);
     }
+}
+
+/// Send all completed cells from one validate invocation to the parent series
+/// writer as one batch. The harness appends retries to each bucket's existing
+/// `results.jsonl`, so this reads the same durable attempt records used by the
+/// terminal-verdict projection instead of maintaining another result file.
+fn append_validate_series(
+    parent: Option<&Path>,
+    checkout: &Path,
+    result_root: &Path,
+    tree: &str,
+) -> Result<bool, String> {
+    let Some(parent) = parent else {
+        return Ok(false);
+    };
+    let rows = validate_cell_results::all_result_rows(result_root)?;
+    if rows.is_empty() {
+        return Ok(false);
+    }
+    let run_id = std::env::var_os("E2E_RUN_ID")
+        .filter(|value| !value.is_empty())
+        .ok_or("E2E_RUN_ID is missing after completed cell rows were recorded")?;
+    let script = parent.join("ci-hub/series/series.py");
+    if !script.is_file() {
+        return Err(format!(
+            "{} does not exist; DEV_HERMIT_PARENT does not contain the series writer",
+            script.display()
+        ));
+    }
+    let mut child = Command::new("python3")
+        .arg(&script)
+        .arg("append-cells")
+        .arg("--parent")
+        .arg(parent)
+        .arg("--checkout")
+        .arg(checkout)
+        .arg("--producer")
+        .arg("validate")
+        .arg("--run-id")
+        .arg(&run_id)
+        .arg("--tree")
+        .arg(tree)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("cannot run {}: {error}", script.display()))?;
+    {
+        use std::io::Write;
+        let input = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| format!("{} has no writable stdin", script.display()))?;
+        for row in &rows {
+            serde_json::to_writer(&mut *input, row)
+                .map_err(|error| format!("cannot encode retained cell row: {error}"))?;
+            input
+                .write_all(b"\n")
+                .map_err(|error| format!("cannot send retained cell row: {error}"))?;
+        }
+    }
+    drop(child.stdin.take());
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("cannot wait for {}: {error}", script.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "series writer refused {} retained cell row(s) from {}: {}",
+            rows.len(),
+            result_root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    eprintln!(
+        "validate: per-cell series updated from {} retained row(s) under {}: {}",
+        rows.len(),
+        result_root.display(),
+        String::from_utf8_lossy(&output.stdout).trim()
+    );
+    Ok(true)
 }
 
 /// Establish the self-tee. FAIL-CLOSED: any failure exits loudly rather than
@@ -4685,8 +4765,11 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
                 matches.len()
             ));
         };
+        // The outer validate publishes these rows after all attempts finish.
+        // Suppress pressure-test's standalone publisher here so one physical
+        // cell run cannot appear twice under two producer names.
         let command = format!(
-            "./ci/compat-envelope/pressure-test.rs run --results \"$E2E_RESULT_ROOT\" \
+            "env -u DEV_HERMIT_PARENT ./ci/compat-envelope/pressure-test.rs run --results \"$E2E_RESULT_ROOT\" \
              --test {} --mode {} --backend {} --repetitions 1 \
              --run-id-prefix \"$E2E_RUN_ID-pid$$\" --jobs 1",
             validate_plan::shell_quote(test),
@@ -4699,7 +4782,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // binary was already built by a lane node, which this focused path does
         // not have; retaining it would make every cold targeted run exit 127.
         steps.retain(|step| step.tag() != gate);
-        steps.push(step_with_caps(
+        let mut requalification = step_with_caps(
             "requalify",
             "cell",
             "Targeted canonical cell requalification",
@@ -4708,7 +4791,16 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             3600,
             7200,
             16 * 1024 * 1024 * 1024,
-        ));
+        );
+        // The nested pressure plan may need its release-Hermit build, whose
+        // declared worker width is eight. Giving the wrapper only the default
+        // one CPU makes dagrun refuse before the selected cell can start.
+        requalification.hint.preferred_inner_jobs = Some(8);
+        // pressure-test owns the nested scheduler width through its explicit
+        // `--jobs 1`. An ordinary `-j` jobs flag would make the outer runner
+        // append `-j 8` to this command, which pressure-test does not accept.
+        requalification.jobs_flag = Some(String::new());
+        steps.push(requalification);
         let cfg = validate_plan::config_from(steps, "targeted cell requalification");
         return Ok(Plan {
             planned_test_nodes: BTreeSet::new(),
@@ -8212,7 +8304,11 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     let names_its_ground = environmental_attempts
         .iter()
         .any(|a| a.attempt == 1 && a.retry_class.as_deref() == Some("bpfjailer-banner"));
-    if environmental_attempts.len() != 2 || !first_failed || !second_passed || !names_its_ground {
+    if environmental_attempts.len() != 2
+        || !first_failed
+        || !second_passed
+        || !names_its_ground
+    {
         return Err(format!(
             "scheduler accounting: a node that FAILED then PASSED was recorded as if it had \
              passed first time — the retry erased the flake. attempts={:?}",
@@ -11376,7 +11472,19 @@ fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
         .iter()
         .find(|step| step.tag() == "requalify.cell")
         .ok_or("requalification plan: exact cell step is absent")?;
+    if step.hint.preferred_inner_jobs != Some(8) {
+        return Err(
+            "requalification plan: wrapper cannot admit the nested release build's eight workers"
+                .into(),
+        );
+    }
+    if step.jobs_flag.as_deref() != Some("") {
+        return Err(
+            "requalification plan: outer scheduler can append an unsupported -j flag".into(),
+        );
+    }
     for token in [
+        "env -u DEV_HERMIT_PARENT ./ci/compat-envelope/pressure-test.rs run",
         "--test applications/timed-progress-bar",
         "--mode verify",
         "--backend ptrace",
@@ -11388,6 +11496,100 @@ fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
         }
     }
     println!("  requalification plan: one exact selected cell, schema-6 eligible, never full authority");
+    Ok(())
+}
+
+fn validate_series_writer_bracket() -> Result<(), String> {
+    let root = std::env::temp_dir().join(format!(
+        "validate-series-writer-{}-{}",
+        std::process::id(),
+        epoch_now()
+    ));
+    let parent = root.join("parent");
+    let checkout = root.join("checkout");
+    let results = root.join("results/bucket");
+    std::fs::create_dir_all(parent.join("ci-hub/series"))
+        .and_then(|_| std::fs::create_dir_all(&checkout))
+        .and_then(|_| std::fs::create_dir_all(&results))
+        .map_err(|error| format!("validate series writer: cannot create fixture: {error}"))?;
+    std::fs::write(
+        parent.join("ci-hub/series/series.py"),
+        r#"import json
+import pathlib
+import sys
+parent = pathlib.Path(sys.argv[sys.argv.index("--parent") + 1])
+parent.joinpath("captured.json").write_text(json.dumps({"argv": sys.argv[1:], "stdin": sys.stdin.read()}))
+print("fixture append accepted")
+"#,
+    )
+    .map_err(|error| format!("validate series writer: cannot write fixture script: {error}"))?;
+    let row = |attempt| {
+        serde_json::json!({
+            "schema": 4,
+            "attempt": attempt,
+            "hermit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "source_tree_dirty": false,
+            "test": "applications/fixture",
+            "category": "applications",
+            "lane": "portable",
+            "mode": "verify",
+            "backend": "ptrace",
+            "outcome": if attempt == 1 { "FAIL" } else { "PASS" },
+        })
+    };
+    std::fs::write(
+        results.join("results.jsonl"),
+        format!("{}\n{}\n", row(1), row(2)),
+    )
+    .map_err(|error| format!("validate series writer: cannot write result fixture: {error}"))?;
+    let saved = std::env::var_os("E2E_RUN_ID");
+    // SAFETY: the validate self-test is single-threaded here and restores the
+    // process environment before returning.
+    unsafe { std::env::set_var("E2E_RUN_ID", "validate-series-fixture") };
+    let appended = append_validate_series(
+        Some(&parent),
+        &checkout,
+        &root.join("results"),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    match saved {
+        Some(value) => unsafe { std::env::set_var("E2E_RUN_ID", value) },
+        None => unsafe { std::env::remove_var("E2E_RUN_ID") },
+    }
+    appended?;
+    let captured: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(parent.join("captured.json"))
+            .map_err(|error| format!("validate series writer: cannot read captured call: {error}"))?,
+    )
+    .map_err(|error| format!("validate series writer: malformed captured call: {error}"))?;
+    let argv = captured["argv"]
+        .as_array()
+        .ok_or("validate series writer: captured argv is not an array")?;
+    let arguments = argv.iter().filter_map(serde_json::Value::as_str).collect::<Vec<_>>();
+    for pair in [
+        ["--checkout", checkout.to_str().ok_or("fixture checkout is not UTF-8")?],
+        ["--producer", "validate"],
+        ["--run-id", "validate-series-fixture"],
+        ["--tree", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+    ] {
+        if !arguments.windows(2).any(|window| window == pair) {
+            return Err(format!("validate series writer: omitted argument pair {pair:?}"));
+        }
+    }
+    let rows = captured["stdin"]
+        .as_str()
+        .ok_or("validate series writer: captured stdin is not a string")?
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("validate series writer: malformed captured row: {error}"))?;
+    if rows.len() != 2 || rows[0]["attempt"] != 1 || rows[1]["attempt"] != 2 {
+        return Err(format!(
+            "validate series writer: ordinary appended attempts were not both sent: {rows:?}"
+        ));
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    println!("  validate series writer: checkout identity and both appended attempts carried");
     Ok(())
 }
 
@@ -11987,10 +12189,14 @@ impl FinalValidateStatus {
 }
 
 fn final_validate_status_from_output(output: &str) -> Result<Option<FinalValidateStatus>, String> {
+    // `next_back()`, not `last()`: both yield the final matching line, but `last()`
+    // walks the whole iterator to get there and clippy refuses it on a
+    // double-ended iterator. The LAST occurrence is deliberate -- a nested run can
+    // emit the prefix more than once and the outermost status is the one that counts.
     let Some(value) = output
         .lines()
         .filter_map(|line| line.strip_prefix(FINAL_VALIDATE_STATUS_PREFIX))
-        .last()
+        .next_back()
     else {
         return Ok(None);
     };
@@ -12736,6 +12942,14 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         );
     }
     let parent = find_parent(&root);
+    if std::env::var_os(PARENT_ENV).is_none() {
+        if let Some(parent) = &parent {
+            // Child test-harness processes use the same parent checkout for the
+            // per-cell series writer. The validate driver already discovered
+            // this path for its ledger, so do not make every child rediscover it.
+            std::env::set_var(PARENT_ENV, parent);
+        }
+    }
     // The profile name is needed by the admission gates below, which run BEFORE
     // the plan exists. It is derived exactly as `build_plan` derives it, so the
     // lock record and the ledger row can never disagree about what was running.
@@ -13590,6 +13804,17 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // INT TERM HUP` bought the bash.
     validate_runtime::enter_cleanup_critical_section();
     let interruption = interrupted_by().map(|s| s.to_string());
+    let series_error = if nesting.nested {
+        None
+    } else {
+        match append_validate_series(parent.as_deref(), &root, &e2e_result_root, &commit) {
+            Ok(_) => None,
+            Err(error) => {
+                eprintln!("validate: ERROR: completed cell results were not added to the series: {error}");
+                Some(error)
+            }
+        }
+    };
     // Stop the monitor and take the peak ONCE, here, so the ledger and the
     // summary cannot disagree about how crowded the box was.
     let (peak_active, peak_live) = match &monitor {
@@ -13707,16 +13932,22 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         }
         drop(run_record);
         let _ = std::fs::remove_dir_all(&tmp);
+        let mut detail = vec![
+            format!("stopped by SIG{sig}; recorded as a NO-RESULT, not a failure"),
+            "an interrupt learned nothing about the tree, so it does not establish a product \
+             verdict — a TIMEOUT, by contrast, does"
+                .into(),
+        ];
+        if let Some(error) = &series_error {
+            detail.push(format!(
+                "completed cell results could not be added to the series: {error}"
+            ));
+        }
         let mut s = RunSummary::new(
             Verdict::Interrupted,
             130,
             &plan.profile,
-            vec![
-                format!("stopped by SIG{sig}; recorded as a NO-RESULT, not a failure"),
-                "an interrupt learned nothing about the tree, so it does not establish a product \
-                 verdict — a TIMEOUT, by contrast, does"
-                    .into(),
-            ],
+            detail,
         );
         s.nodes_executed = outcomes.len();
         s.nodes_failed = outcomes.iter().filter(|o| outcome_is_failure(o)).count();
@@ -13850,6 +14081,9 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     }
     if let Some((code, _)) = &envelope_error {
         exit_code = *code;
+    }
+    if series_error.is_some() {
+        exit_code = 1;
     }
     if !execution_complete {
         eprintln!(

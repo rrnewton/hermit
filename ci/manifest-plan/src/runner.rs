@@ -25,6 +25,7 @@ use sha2::Digest;
 use sha2::Sha256;
 
 pub use crate::canonical_verdict::VerificationReport;
+pub use crate::canonical_verdict::VerificationRuntime;
 use crate::ci_selection::CiDisabledReasonSpec;
 use crate::ci_selection::CiSelection;
 use crate::ci_selection::CiSelectionSpec;
@@ -353,6 +354,17 @@ impl ManifestSet {
             documents.push(document);
         }
         Ok(Self { documents, tests })
+    }
+
+    /// Is `id` a test this manifest set has ever heard of?
+    ///
+    /// ⚠️ THIS EXISTS TO SEPARATE "NO CELLS" FROM "NO SUCH TEST". `select` returns an
+    /// empty vector for both, and they mean opposite things: an unfiltered population
+    /// that is legitimately empty ("no gaps") versus a filter naming something that
+    /// does not exist (a typo). A caller that cannot tell them apart must either
+    /// refuse a good answer or accept a meaningless one.
+    pub fn knows_test(&self, id: &str) -> bool {
+        self.tests.contains_key(id)
     }
 
     pub fn select(&self, selection: &Selection) -> Result<Vec<SelectedCell>, String> {
@@ -798,6 +810,8 @@ pub struct AttemptResult {
     pub stderr: String,
     pub verification_report: Option<String>,
     pub verification_report_sha256: Option<String>,
+    /// Runtime totals for the two executions compared by this attempt.
+    pub runtime: Option<VerificationRuntime>,
     /// The divergence position, LIFTED OUT of `verification_report` so it is a
     /// field rather than a substring.
     ///
@@ -872,7 +886,12 @@ pub struct CellResult {
     pub error_kind: Option<String>,
     /// The cell wall-clock bound used for this observation.
     pub timeout_seconds: u64,
-    pub duration_ms: u128,
+    /// Measured wall time for a cell that reached execution. Absent when the
+    /// cell never ran; a measured zero remains a valid sub-millisecond result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u128>,
+    /// Runtime totals from the first attempt that produced them.
+    pub runtime: Option<VerificationRuntime>,
     pub log_level: Option<String>,
     pub effective_args: Vec<String>,
     pub argv: Vec<String>,
@@ -1639,6 +1658,7 @@ fn execute_spec_until(
     }
     let mut report_json = None;
     let mut report_sha = None;
+    let mut runtime = None;
     let mut first_divergent_scheduler_turn = None;
     let mut first_divergent_virtual_nanoseconds = None;
     let mut first_divergent_record = None;
@@ -1661,6 +1681,7 @@ fn execute_spec_until(
                 report_json = Some(String::from_utf8_lossy(&bytes).into_owned());
                 match VerificationReport::from_json_slice(&bytes) {
                     Ok(report) => {
+                        runtime = report.runtime.clone();
                         // Recorded BEFORE the classification chain below,
                         // because where the divergence began is a fact about
                         // the report rather than a consequence of how the
@@ -1756,6 +1777,7 @@ fn execute_spec_until(
         stderr,
         verification_report: report_json,
         verification_report_sha256: report_sha,
+        runtime,
         first_divergent_scheduler_turn,
         first_divergent_virtual_nanoseconds,
         first_divergent_record,
@@ -1895,6 +1917,7 @@ fn cell_timeout_attempt(
         stderr: String::new(),
         verification_report: None,
         verification_report_sha256: None,
+        runtime: None,
         first_divergent_scheduler_turn: None,
         first_divergent_virtual_nanoseconds: None,
         first_divergent_record: None,
@@ -2180,7 +2203,8 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         outcome,
         error_kind,
         timeout_seconds: cell.timeout_seconds,
-        duration_ms: started.elapsed().as_millis(),
+        duration_ms: Some(started.elapsed().as_millis()),
+        runtime: attempts.iter().find_map(|attempt| attempt.runtime.clone()),
         log_level: (cell.id.mode != "naked").then(|| "info".into()),
         effective_args: literal_argv.iter().skip(1).cloned().collect(),
         argv: literal_argv,
@@ -2245,7 +2269,8 @@ pub fn infrastructure_error_result(
         outcome: "ERROR".into(),
         error_kind: Some("infrastructure".into()),
         timeout_seconds: cell.timeout_seconds,
-        duration_ms: 0,
+        duration_ms: None,
+        runtime: None,
         log_level: (cell.id.mode != "naked").then(|| "info".into()),
         effective_args: Vec::new(),
         argv: Vec::new(),
@@ -2302,7 +2327,8 @@ pub fn host_inapplicable_result(
         outcome: "HOST-INAPPLICABLE".into(),
         error_kind: None,
         timeout_seconds: cell.timeout_seconds,
-        duration_ms: 0,
+        duration_ms: None,
+        runtime: None,
         log_level: None,
         effective_args: Vec::new(),
         argv: Vec::new(),
@@ -2523,13 +2549,17 @@ pub fn write_junit(path: &Path, results: &[CellResult]) -> Result<(), String> {
         results.len()
     );
     for result in results {
+        let time = result
+            .duration_ms
+            .map(|duration_ms| format!(" time=\"{:.3}\"", duration_ms as f64 / 1000.0))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "  <testcase classname=\"{}\" name=\"{}/{}/{}\" time=\"{:.3}\">",
+            "  <testcase classname=\"{}\" name=\"{}/{}/{}\"{}>",
             xml(&result.category),
             xml(&result.test),
             xml(&result.mode),
             xml(result.backend.as_deref().unwrap_or("none")),
-            result.duration_ms as f64 / 1000.0
+            time,
         ));
         if result.outcome == "FAIL" {
             out.push_str(&format!(
@@ -2966,6 +2996,46 @@ mod tests {
         }
     }
 
+    /// ⚠️ "NO CELLS" AND "NO SUCH TEST" ARE DIFFERENT ANSWERS, AND `select` GIVES
+    /// THE SAME EMPTY VECTOR FOR BOTH. Measured 2026-08-26 before this existed:
+    /// `test-harness plan --lane portable --test no-such-test-xyz` printed nothing and
+    /// exited 0 -- and so did the same command with a REAL id, so the exit code
+    /// carried no information either way and anything bisecting off `plan` read a typo
+    /// as "nothing failed here".
+    ///
+    /// The fix could NOT be `cells.is_empty()`, which is why this predicate exists:
+    /// `print_plan` also serves `audit-gaps`, where empty legitimately means NO GAPS.
+    /// Measured on the same head, a real id filtered to a lane it has no cells in
+    /// (`--lane privileged --test applications/c-toolchain-workflow`) prints `[]` and
+    /// exits 0 -- a correct, well-formed query that an emptiness guard would refuse.
+    #[test]
+    fn knows_test_separates_an_absent_id_from_an_empty_population() {
+        let test = recipe(false);
+        let id = test.id.clone();
+        let set = ManifestSet {
+            documents: Vec::new(),
+            tests: BTreeMap::from([(id.clone(), ("fixture".into(), 15, test))]),
+        };
+        assert!(set.knows_test(&id), "a declared test must be known");
+        assert!(
+            !set.knows_test("no-such-test-xyz"),
+            "an id in no manifest must NOT be known -- this is the typo a bisect would \
+             otherwise read as a pass"
+        );
+        // The control that makes the pair meaningful: the KNOWN id still selects zero
+        // cells in the Required population, so emptiness and unknown-ness genuinely
+        // come apart here rather than only in principle.
+        assert!(
+            set.select(&Selection {
+                population: Some(Population::Required),
+                ..Selection::default()
+            })
+            .unwrap()
+            .is_empty(),
+            "fixture must be empty in Required, or this test proves nothing"
+        );
+    }
+
     #[test]
     fn required_and_enabled_are_distinct_populations() {
         let test = recipe(false);
@@ -3172,10 +3242,12 @@ mod tests {
             result.attempts[1].reason.as_deref(),
             Some("cell exceeded 1 s")
         );
+        let duration_ms = result
+            .duration_ms
+            .expect("a cell that executed must report measured wall time");
         assert!(
-            result.duration_ms < 2_000,
-            "three independent one-second bounds would take longer: {}ms",
-            result.duration_ms
+            duration_ms < 2_000,
+            "three independent one-second bounds would take longer: {duration_ms}ms"
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -3227,6 +3299,19 @@ mod tests {
         assert!(result.attempts.is_empty());
         assert!(result.binary_sha256.is_none());
         assert_eq!(result.error_kind, None);
+        assert_eq!(result.duration_ms, None);
+        let row = serde_json::to_value(&result).unwrap();
+        assert!(
+            row.get("duration_ms").is_none(),
+            "a cell that never executed must not publish a measured zero wall time"
+        );
+        let mut measured_zero = result.clone();
+        measured_zero.duration_ms = Some(0);
+        assert_eq!(
+            serde_json::to_value(measured_zero).unwrap()["duration_ms"],
+            0,
+            "a measured sub-millisecond duration must remain zero"
+        );
 
         let junit = root.join("junit.xml");
         write_junit(&junit, &[result]).unwrap();
@@ -3237,6 +3322,7 @@ mod tests {
                 "<skipped message=\"NOT RUN, NOT a pass, no coverage: planted absence\"/>"
             )
         );
+        assert!(!xml.contains(" time=\"0.000\""));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3282,7 +3368,8 @@ mod tests {
         let mut first = infrastructure_error_result(&context, &cell, "forced failure".into());
         first.outcome = "FAIL".into();
         first.error_kind = None;
-        first.duration_ms = 111;
+        assert_eq!(first.duration_ms, None);
+        first.duration_ms = Some(111);
         append_result(&path, &first).unwrap();
 
         // A validate retry starts a fresh harness process and prepares the same
@@ -3293,7 +3380,7 @@ mod tests {
         let mut second = infrastructure_error_result(&context, &cell, "forced retry".into());
         second.outcome = "FAIL".into();
         second.error_kind = None;
-        second.duration_ms = 222;
+        second.duration_ms = Some(222);
         append_result(&path, &second).unwrap();
 
         let rows = fs::read_to_string(&path).unwrap();
@@ -4139,7 +4226,8 @@ backends_disabled:
             outcome: "PASS".into(),
             error_kind: None,
             timeout_seconds: 1,
-            duration_ms: 1,
+            duration_ms: Some(1),
+            runtime: None,
             log_level: None,
             effective_args: Vec::new(),
             argv: vec!["hermit".into()],
@@ -4239,6 +4327,7 @@ backends_disabled:
             stderr: String::new(),
             verification_report: None,
             verification_report_sha256: None,
+            runtime: None,
             sabre_path_evidence: Some(evidence.into()),
             sabre_path_evidence_sha256: Some("b".into()),
             reason: None,
@@ -4306,6 +4395,7 @@ backends_disabled:
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            runtime: None,
             compared_log_messages: Some(crate::canonical_verdict::ComparedLogMessages {
                 left: 1,
                 right: 1,
@@ -4525,6 +4615,7 @@ backends_disabled:
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            runtime: None,
         })
         .unwrap();
         let spec = CellRunSpec {

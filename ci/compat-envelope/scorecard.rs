@@ -248,6 +248,16 @@ enum CellStatus {
     NotApplicable,
 }
 
+impl CellStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Green => "green",
+            Self::Red => "red",
+            Self::NotApplicable => "not-applicable",
+        }
+    }
+}
+
 /// WHICH MECHANISM produced an observation. Two mechanisms answer two different
 /// questions and their bounds must never be merged into one range.
 ///
@@ -1069,6 +1079,10 @@ fn run() -> Result<(), String> {
             no_more(&mut args)?;
             let derived = derive(&root)?;
             print!("{}", render_scorecard(&derived));
+            if let Some(mut tracked) = load_existing(&root)? {
+                refresh_measurement(&mut tracked);
+                print!("{}", render_measurement_section(&tracked));
+            }
             print!("{}", render_evidence_coverage(&root)?);
         }
         "check" => {
@@ -1638,6 +1652,93 @@ all of them; a failing green cell is a regression, not permission to move it to 
     out
 }
 
+fn render_measurement_section(tracked: &TrackedCells) -> String {
+    let statuses = [
+        CellStatus::Green,
+        CellStatus::Red,
+        CellStatus::NotApplicable,
+    ];
+    let measurements = [
+        MeasurementState::NeverMeasured,
+        MeasurementState::MeasuredAndPassed,
+        MeasurementState::MeasuredNoVerdict,
+        MeasurementState::DivergedUnlocated,
+        MeasurementState::Diverged,
+    ];
+    let count = |status, measurement| {
+        tracked
+            .cells
+            .iter()
+            .filter(|cell| cell.status == status && cell.measurement == measurement)
+            .count()
+    };
+
+    let mut out = String::from(
+        "\n## Status and measurement\n\n\
+The table above reports status. This table reports the separate `measurement` field derived from \
+observations stored in `ci/compat-envelope/cells.json`; it does not change status or which cells \
+ordinary validation selects. Retained history that has not been imported is not counted here. A \
+stored measurement does not establish that it describes current code; `show` reports whether the \
+recorded last test still matches `HEAD:detcore`.\n\n",
+    );
+    out.push_str(&format!(
+        "The count table includes all **{}** tracked cells; no row is omitted.\n\n",
+        tracked.cells.len()
+    ));
+    out.push_str(
+        "| Status | `never-measured` | `measured-and-passed` | `measured-no-verdict` | `diverged-unlocated` | `diverged` | Total |\n\
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+    );
+    for status in statuses {
+        out.push_str(&format!("| `{}`", status.as_str()));
+        for measurement in measurements {
+            out.push_str(&format!(" | {}", count(status, measurement)));
+        }
+        let status_total = tracked
+            .cells
+            .iter()
+            .filter(|cell| cell.status == status)
+            .count();
+        out.push_str(&format!(" | {status_total} |\n"));
+    }
+    out.push_str("| **Total**");
+    for measurement in measurements {
+        let measurement_total = tracked
+            .cells
+            .iter()
+            .filter(|cell| cell.measurement == measurement)
+            .count();
+        out.push_str(&format!(" | **{measurement_total}**"));
+    }
+    out.push_str(&format!(" | **{}** |\n\n", tracked.cells.len()));
+
+    out.push_str(
+        "Cells whose stored `measurement` is not `never-measured` are shown individually so status \
+and measurement remain visible together.\n\n\
+| Test | Mode | Backend | Status | Measurement |\n\
+| --- | --- | --- | --- | --- |\n",
+    );
+    let mut displayed = 0usize;
+    for cell in &tracked.cells {
+        if cell.measurement == MeasurementState::NeverMeasured {
+            continue;
+        }
+        displayed += 1;
+        out.push_str(&format!(
+            "| `{}` | `{}` | `{}` | `{}` | `{}` |\n",
+            cell.id.test,
+            cell.id.mode,
+            cell.id.backend,
+            cell.status.as_str(),
+            cell.measurement.as_str()
+        ));
+    }
+    if displayed == 0 {
+        out.push_str("| _none_ | — | — | — | — |\n");
+    }
+    out
+}
+
 fn tracked_from(
     derived: &Derived,
     existing: Option<TrackedCells>,
@@ -1976,8 +2077,6 @@ fn check_tracked(root: &Path) -> Result<Derived, String> {
     // cause correctly, because that path has no SCORECARD.md difference to mask it -- which is
     // why this looked intermittent rather than ordered.
     let mut cells = tracked_from(&derived, load_existing(root)?, None, false)?;
-    let expected_scorecard = render_scorecard(&derived);
-    compare_file(&root.join(SCORECARD), &expected_scorecard)?;
     // The WRITE path applies this before serialising (see `update_tracked`), so the READ path
     // must too or the two derive different bytes from the same inputs and `check` reports a
     // staleness that `update` cannot clear. Measured 2026-08-25: `update` was a fixed point --
@@ -1987,6 +2086,12 @@ fn check_tracked(root: &Path) -> Result<Derived, String> {
     // run. The asymmetry only became reachable once observations were non-empty for the first
     // time, which is why it appeared tonight rather than when it was introduced.
     refresh_measurement(&mut cells);
+    let expected_scorecard = format!(
+        "{}{}",
+        render_scorecard(&derived),
+        render_measurement_section(&cells)
+    );
+    compare_file(&root.join(SCORECARD), &expected_scorecard)?;
     compare_file(&root.join(CELLS), &encoded_cells(&cells)?)?;
     Ok(derived)
 }
@@ -2024,7 +2129,12 @@ fn update_tracked(
     if let Some(before) = existing.as_ref() {
         enforce_writer_boundary(before, &cells, Writer::Update)?;
     }
-    fs::write(root.join(SCORECARD), render_scorecard(&derived))
+    let scorecard = format!(
+        "{}{}",
+        render_scorecard(&derived),
+        render_measurement_section(&cells)
+    );
+    fs::write(root.join(SCORECARD), scorecard)
         .map_err(|e| format!("cannot write {SCORECARD}: {e}"))?;
     fs::write(root.join(CELLS), encoded_cells(&cells)?)
         .map_err(|e| format!("cannot write {CELLS}: {e}"))?;
@@ -3210,6 +3320,10 @@ fn verify_results(root: &Path, result_root: &Path, lanes: &BTreeSet<String>) -> 
     }
 
     print!("{}", render_scorecard(&derived));
+    if let Some(mut tracked) = load_existing(root)? {
+        refresh_measurement(&mut tracked);
+        print!("{}", render_measurement_section(&tracked));
+    }
     let green_checked = expected
         .iter()
         .filter(|id| derived.green.contains(*id))
@@ -3750,6 +3864,9 @@ fn self_test() -> Result<(), String> {
                             canonical_verdict::RecordEnvelopeReport::AllRecordsV1,
                     }),
                     compared_log_messages: Some(canonical_verdict::ComparedLogMessages { left: 1, right: 1 }),
+                    // This fixture predates runtime totals. Keep "not recorded"
+                    // distinct from a measured zero.
+                    runtime: None,
                     // A matched verdict located no divergence, so both
                     // positions are absent -- the same value a pre-field
                     // report carries.
@@ -3926,6 +4043,18 @@ fn self_test() -> Result<(), String> {
         || !encoded_cells(&visible_tracked)?.contains("ci_disabled_reason")
     {
         return Err("per-backend CI reason was not emitted into tracked scorecard data".into());
+    }
+    let mut measured_red = visible_tracked.clone();
+    measured_red.cells[0].measurement = MeasurementState::MeasuredAndPassed;
+    let measured_row = format!(
+        "| `{}` | `{}` | `{}` | `red` | `measured-and-passed` |",
+        id.test, id.mode, id.backend
+    );
+    if !render_measurement_section(&measured_red).contains(&measured_row) {
+        return Err("measurement display did not show red and measured-and-passed together".into());
+    }
+    if render_measurement_section(&visible_tracked).contains(&measured_row) {
+        return Err("measurement display showed measured-and-passed without that measurement".into());
     }
     let old_green = TrackedCells {
         schema: SCHEMA,
@@ -5494,7 +5623,7 @@ fn self_test() -> Result<(), String> {
     }
 
     println!(
-        "compatibility scorecard self-test: provenance, distinct-evidence, result, selected-chaos, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, source-identity, writer-boundary, projection, path-independence, infrastructure-refusal, and divergence-without-a-comparison brackets pass"
+        "compatibility scorecard self-test: provenance, distinct-evidence, result, selected-chaos, status-measurement-display, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, source-identity, writer-boundary, projection, path-independence, infrastructure-refusal, and divergence-without-a-comparison brackets pass"
     );
     Ok(())
 }

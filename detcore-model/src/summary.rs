@@ -101,6 +101,10 @@ pub struct RunSummary {
     /// The number of total system threads that were created during the execution.
     pub num_threads: u64,
 
+    /// Total syscalls completed by all guest threads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub syscalls: Option<u64>,
+
     /// Deterministic virtual nanoseconds elapsed while computing.
     pub virttime_elapsed: u64,
     /// Absolute (virtual) time in nanoseconds since epoch at program completion.
@@ -130,6 +134,7 @@ impl fmt::Display for RunSummary {
             reprio_descrip,
             num_processes,
             num_threads,
+            syscalls,
             virttime_elapsed,
             virttime_final,
             realtime_elapsed,
@@ -143,6 +148,9 @@ impl fmt::Display for RunSummary {
             "There were {} group leaders of {} thread(s) total.",
             num_processes, num_threads
         )?;
+        if let Some(syscalls) = syscalls {
+            writeln!(f, "Guest threads completed {syscalls} syscalls.")?;
+        }
         writeln!(
             f,
             "Internally, the hermit scheduler ran {} turns, recorded {} events, replayed {} events ({} desynced)",
@@ -219,6 +227,7 @@ Timeslice stats: min=199999995ns max=200000000ns mean=199999998ns count=4
 
 #[cfg(test)]
 mod tests {
+    use super::RunSummary;
     use super::TimesliceStats;
 
     #[test]
@@ -266,5 +275,23 @@ mod tests {
         let mut empty = TimesliceStats::default();
         empty.merge(&b);
         assert_eq!(empty, b);
+    }
+
+    #[test]
+    fn older_summary_json_keeps_an_unrecorded_syscall_total_absent() {
+        let value = serde_json::to_value(RunSummary::default()).unwrap();
+        let mut object = value.as_object().unwrap().clone();
+        object.remove("syscalls");
+        let parsed: RunSummary = serde_json::from_value(object.into()).unwrap();
+        assert_eq!(parsed.syscalls, None);
+
+        let measured = RunSummary {
+            syscalls: Some(0),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&measured).unwrap();
+        assert_eq!(value["syscalls"], 0);
+        let parsed: RunSummary = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.syscalls, Some(0));
     }
 }

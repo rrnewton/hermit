@@ -647,6 +647,9 @@ pub struct Scheduler {
     /// final run report. BTreeMap for deterministic iteration order.
     pub per_thread_timeslice: BTreeMap<DetTid, TimesliceStats>,
 
+    /// Final syscall count reported by each thread when it deregisters.
+    pub per_thread_syscalls: BTreeMap<DetTid, u64>,
+
     /// A record of which preemptions occured on each thread.  Only used IF `--record-preemptions`
     /// was specified in the Config, otherwise this remains empty.
     pub preemption_writer: Option<PreemptionWriter>,
@@ -1413,6 +1416,7 @@ impl Scheduler {
             priorities: Default::default(),
             timeslices: Default::default(),
             per_thread_timeslice: Default::default(),
+            per_thread_syscalls: Default::default(),
             fuzz_futexes: cfg.fuzz_futexes,
             chaos_target_races: cfg.chaos_target_races,
             fuzz_prng: Pcg64Mcg::seed_from_u64(cfg.fuzz_seed()),
@@ -4479,6 +4483,11 @@ impl Scheduler {
             .merge(&stats);
     }
 
+    /// Record an exiting thread's final completed-syscall count.
+    pub fn record_syscall_count(&mut self, dettid: DetTid, count: u64) {
+        self.per_thread_syscalls.insert(dettid, count);
+    }
+
     /// Summarize the run after completion, as a RunSummary. This is partial because the Scheduler
     /// does not have all the necessary information.
     ///
@@ -4570,6 +4579,7 @@ impl Scheduler {
         for (_, st) in &per_thread_timeslice {
             timeslice_stats.merge(st);
         }
+        let syscalls = self.per_thread_syscalls.values().copied().sum();
 
         Ok(RunSummary {
             sched_turns: self.turn,
@@ -4582,6 +4592,7 @@ impl Scheduler {
             threads_descrip,
             num_processes,
             num_threads,
+            syscalls: Some(syscalls),
             virttime_elapsed: 0, // Cannot fill.
             virttime_final: 0,   // Cannot fill.
             realtime_elapsed: None,

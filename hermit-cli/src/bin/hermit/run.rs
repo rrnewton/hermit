@@ -29,6 +29,7 @@ use clap::Parser;
 use colored::Colorize;
 use detcore_model::happens_before::HappensBeforeProgram;
 use detcore_model::happens_before::Strength;
+use detcore_model::summary::RunSummary;
 use hermit::Backend;
 use hermit::Context;
 use hermit::DetConfig;
@@ -65,6 +66,7 @@ use super::verify::ComparisonOptions;
 use super::verify::LogCompareStrictness;
 use super::verify::NoResultReason;
 use super::verify::VerificationReport;
+use super::verify::VerificationRuntime;
 use super::verify::announce_verification_outcome;
 use super::verify::compare_two_runs;
 use super::verify::retain_verification_logs;
@@ -83,6 +85,41 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
+}
+
+fn read_verify_summary(path: &Path) -> Option<RunSummary> {
+    match fs::read(path)
+        .with_context(|| format!("reading verification run summary {}", path.display()))
+        .and_then(|bytes| {
+            serde_json::from_slice(&bytes)
+                .with_context(|| format!("parsing verification run summary {}", path.display()))
+        }) {
+        Ok(summary) => Some(summary),
+        Err(error) => {
+            eprintln!("WARNING: verification runtime statistics unavailable: {error:#}");
+            None
+        }
+    }
+}
+
+fn private_verify_summary() -> Result<tempfile::NamedTempFile, Error> {
+    tempfile::Builder::new()
+        .prefix(".hermit-verify-summary-")
+        // Hermit's isolated /tmp is not the host /tmp. The checkout is visible
+        // to both run containers, and the temporary file is removed on drop.
+        .tempfile_in(std::env::current_dir()?)
+        .context("creating private verification run summary")
+}
+
+fn take_verify_summary_before_next_run(path: &Path) -> Result<Option<RunSummary>, Error> {
+    let summary = read_verify_summary(path);
+    fs::write(path, b"").with_context(|| {
+        format!(
+            "resetting private verification run summary {} before run 2",
+            path.display()
+        )
+    })?;
+    Ok(summary)
 }
 
 fn extract_sabre_detlogs(path: &Path, stderr: &mut Vec<u8>) -> Result<usize, Error> {
@@ -3598,13 +3635,30 @@ impl RunOpts {
         let (log1_file, log1_path) = log1.into_parts();
         let (log2_file, log2_path) = log2.into_parts();
 
+        // Verification historically sent both executions to one --summary-json
+        // path, so run 2 overwrote run 1. Keep the public path's run-2 meaning,
+        // while capturing run 1 privately. When no public path was requested,
+        // the same private file is emptied before run 2 and reused.
+        //
+        // The private file lives in the checkout because Hermit's isolated /tmp
+        // is not the host /tmp. It is consequently guest-visible. Leaving run
+        // 1's JSON in it while run 2 executes changes the guest's input: a guest
+        // that reads the file sees zero bytes in run 1 and a completed summary
+        // in run 2. Emptying it before run 2 preserves the initial contents.
+        let summary1_file = private_verify_summary()?;
+        let summary2_path = self.summary_json.as_deref().unwrap_or(summary1_file.path());
+        let mut run1_options = self.clone();
+        run1_options.summary_json = Some(summary1_file.path().to_owned());
+        let mut run2_options = self.clone();
+        run2_options.summary_json = Some(summary2_path.to_owned());
+
         // Captured BEFORE run 1 so the same values can be put back before run 2.
         // See the restore call below for the measurement this exists for.
         let fd_flags_before_run1 = standard_fd_status_flags();
 
         eprintln!(":: {}", "Run1...".yellow().bold());
 
-        let mut out1: Output = match self.run_verify(log1_file, global) {
+        let mut out1: Output = match run1_options.run_verify(log1_file, global) {
             Ok(output) => output,
             Err(error) => {
                 if self.keep_logs {
@@ -3668,6 +3722,8 @@ impl RunOpts {
                 });
                 report.guest_exit_code = out1.status.code();
                 report.guest_signal = out1.status.signal();
+                let summary1 = read_verify_summary(summary1_file.path());
+                report.runtime = VerificationRuntime::from_summaries(summary1.as_ref(), None);
                 if let Err(error) = write_report_json(path, &report) {
                     eprintln!(
                         "WARNING: could not record the rejected first run in {}: {}",
@@ -3681,6 +3737,8 @@ impl RunOpts {
             }
             return Err(Error::msg(format!("First run during --verify {status}")));
         }
+
+        let summary1 = take_verify_summary_before_next_run(summary1_file.path())?;
 
         // ⚠️ THE TWO RUNS MUST START FROM IDENTICAL fd STATE, AND WITHOUT THIS
         // THEY DO NOT. Both runs inherit hermit's OWN stderr, so a guest that
@@ -3719,7 +3777,7 @@ impl RunOpts {
         restore_standard_fd_status_flags(fd_flags_before_run1);
 
         eprintln!(":: {}", "Run2...".yellow().bold());
-        let mut out2 = match self.run_verify(log2_file, global) {
+        let mut out2 = match run2_options.run_verify(log2_file, global) {
             Ok(output) => output,
             Err(error) => {
                 if self.keep_logs {
@@ -3782,7 +3840,8 @@ impl RunOpts {
             "Success: deterministic. Determinism verified."
         };
         let failure_message = "Failure: nondeterministic.";
-        let outcome = compare_two_runs(
+        let summary2 = read_verify_summary(summary2_path);
+        let mut outcome = compare_two_runs(
             ComparedRun {
                 output: &out1,
                 log: log1_path,
@@ -3799,6 +3858,7 @@ impl RunOpts {
             },
             comparison_options,
         )?;
+        outcome.runtime = VerificationRuntime::from_summaries(summary1.as_ref(), summary2.as_ref());
 
         // Emit the machine-readable verdict (if requested) before collapsing the
         // outcome to the historical exit-code convention. The verdict is recorded
@@ -4247,6 +4307,31 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    #[test]
+    fn run_one_summary_is_empty_again_before_run_two() -> Result<(), Error> {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let summary = RunSummary {
+            sched_turns: 12,
+            virttime_elapsed: 34,
+            syscalls: Some(5),
+            ..Default::default()
+        };
+        fs::write(
+            file.path(),
+            serde_json::to_vec(&summary).expect("summary fixture serializes"),
+        )
+        .unwrap();
+
+        let captured = take_verify_summary_before_next_run(file.path())?
+            .expect("run one summary remains readable");
+        assert_eq!(captured.sched_turns, 12);
+        assert_eq!(captured.virttime_elapsed, 34);
+        assert_eq!(captured.syscalls, Some(5));
+        assert_eq!(fs::read(file.path()).unwrap(), b"");
+
+        Ok::<(), Error>(())
+    }
 
     #[test]
     fn exit_status_diagnostic_reports_guest_exit_code_and_signal() {

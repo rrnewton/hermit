@@ -1539,6 +1539,7 @@ impl GlobalState {
             detpid,
             mm,
             timeslice_stats,
+            syscall_count,
             chaos_epochs,
         } = deregistration;
         // A fatal signal can tear down the caller after its local state has advanced to the
@@ -1577,6 +1578,7 @@ impl GlobalState {
             }
         }
         sched.record_timeslice_stats(dettid, timeslice_stats);
+        sched.record_syscall_count(dettid, syscall_count);
         if !sched.thread_is_logically_killed(dettid) {
             sched.logically_kill_thread(&dettid, &detpid, mm);
         }
@@ -1948,6 +1950,7 @@ pub struct ThreadDeregistration {
     pub(crate) detpid: DetPid,
     pub(crate) mm: MmId,
     pub(crate) timeslice_stats: TimesliceStats,
+    pub(crate) syscall_count: u64,
     pub(crate) chaos_epochs: Vec<ChaosEpochTransition>,
 }
 
@@ -3396,6 +3399,7 @@ mod tests {
                         detpid,
                         mm: old_mm,
                         timeslice_stats: TimesliceStats::default(),
+                        syscall_count: 0,
                         chaos_epochs: Vec::new(),
                     }),
                 ),
@@ -3588,6 +3592,7 @@ mod tests {
                     detpid,
                     mm: MmId::initial(detpid),
                     timeslice_stats: TimesliceStats::default(),
+                    syscall_count: 0,
                     chaos_epochs: Vec::new(),
                 },
             )
@@ -3612,6 +3617,7 @@ mod tests {
                     detpid,
                     mm: MmId::initial(detpid).for_exec(detpid),
                     timeslice_stats: TimesliceStats::default(),
+                    syscall_count: 0,
                     chaos_epochs: Vec::new(),
                 },
             )
@@ -3861,6 +3867,7 @@ mod tests {
                         detpid,
                         mm: MmId::initial(detpid),
                         timeslice_stats: final_stats,
+                        syscall_count: 17,
                         chaos_epochs: Vec::new(),
                     }),
                 ),
@@ -3876,6 +3883,10 @@ mod tests {
                 .get(&dettid),
             Some(&final_stats)
         );
+        assert_eq!(
+            state.sched.lock().unwrap().per_thread_syscalls.get(&dettid),
+            Some(&17)
+        );
 
         late_time.add_syscall();
         let duplicate_response = state
@@ -3889,6 +3900,7 @@ mod tests {
                         detpid,
                         mm: MmId::initial(detpid),
                         timeslice_stats: final_stats,
+                        syscall_count: 99,
                         chaos_epochs: Vec::new(),
                     }),
                 ),
@@ -3907,6 +3919,18 @@ mod tests {
                 .get(&dettid),
             Some(&final_stats)
         );
+        assert_eq!(
+            state.sched.lock().unwrap().per_thread_syscalls.get(&dettid),
+            Some(&17),
+            "a duplicate deregistration must not double-count or replace final accounting"
+        );
+        let summary = state
+            .sched
+            .lock()
+            .unwrap()
+            .generate_partial_run_summary(None)
+            .unwrap();
+        assert_eq!(summary.syscalls, Some(17));
         assert!(!state.sched.lock().unwrap().next_turns.contains_key(&dettid));
         let global_time = state.global_time.lock().unwrap();
         assert_eq!(global_time.as_nanos(), global_before);
