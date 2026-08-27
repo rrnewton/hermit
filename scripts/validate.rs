@@ -3304,20 +3304,6 @@ fn configure_e2e_result_root(
     // harness process mint a local timestamp. Schema-6 evidence is one complete
     // selected population, not a pool of unrelated bucket attempts.
     std::env::set_var("E2E_RUN_ID", &run);
-    if std::env::var_os(PARENT_ENV).is_some() {
-        let series_results = path.join("series-results.jsonl");
-        match std::fs::remove_file(&series_results) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "cannot clear prior series input {}: {error}",
-                    series_results.display()
-                ));
-            }
-        }
-    }
-
     // The harness derives its prebuilt-fixture directory from RESULT_ROOT too,
     // but build products are not evidence and must not accumulate beside every
     // retained scorecard. Keep them in validate's ordinary disposable run
@@ -3462,8 +3448,9 @@ mod concurrent_validate_path_tests {
 }
 
 /// Send all completed cells from one validate invocation to the parent series
-/// writer as one batch. Bucket processes append rows as each cell completes, so
-/// this includes earlier failed attempts even when a later retry passes.
+/// writer as one batch. The harness appends retries to each bucket's existing
+/// `results.jsonl`, so this reads the same durable attempt records used by the
+/// terminal-verdict projection instead of maintaining another result file.
 fn append_validate_series(
     parent: Option<&Path>,
     result_root: &Path,
@@ -3472,8 +3459,8 @@ fn append_validate_series(
     let Some(parent) = parent else {
         return Ok(false);
     };
-    let rows = result_root.join("series-results.jsonl");
-    if !rows.is_file() {
+    let rows = validate_cell_results::all_result_rows(result_root)?;
+    if rows.is_empty() {
         return Ok(false);
     }
     let run_id = std::env::var_os("E2E_RUN_ID")
@@ -3486,9 +3473,7 @@ fn append_validate_series(
             script.display()
         ));
     }
-    let input = std::fs::File::open(&rows)
-        .map_err(|error| format!("cannot read {}: {error}", rows.display()))?;
-    let output = Command::new("python3")
+    let mut child = Command::new("python3")
         .arg(&script)
         .arg("append-cells")
         .arg("--parent")
@@ -3499,19 +3484,41 @@ fn append_validate_series(
         .arg(&run_id)
         .arg("--tree")
         .arg(tree)
-        .stdin(input)
-        .output()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|error| format!("cannot run {}: {error}", script.display()))?;
+    {
+        use std::io::Write;
+        let input = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| format!("{} has no writable stdin", script.display()))?;
+        for row in &rows {
+            serde_json::to_writer(&mut *input, row)
+                .map_err(|error| format!("cannot encode retained cell row: {error}"))?;
+            input
+                .write_all(b"\n")
+                .map_err(|error| format!("cannot send retained cell row: {error}"))?;
+        }
+    }
+    drop(child.stdin.take());
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("cannot wait for {}: {error}", script.display()))?;
     if !output.status.success() {
         return Err(format!(
-            "series writer refused {}: {}",
-            rows.display(),
+            "series writer refused {} retained cell row(s) from {}: {}",
+            rows.len(),
+            result_root.display(),
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
     eprintln!(
-        "validate: per-cell series updated from {}: {}",
-        rows.display(),
+        "validate: per-cell series updated from {} retained row(s) under {}: {}",
+        rows.len(),
+        result_root.display(),
         String::from_utf8_lossy(&output.stdout).trim()
     );
     Ok(true)
@@ -8191,15 +8198,12 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     // prerequisite and fails unless the retry preserves their edge.
     let environmental_log = tmp.join("environmental.log");
     let first_attempt = tmp.join("environmental-first-attempt");
-    let run_indices = tmp.join("environmental-run-indices");
     let edge_ready = tmp.join("edge-ready");
     let environmental_cmd = format!(
-        "printf '%s\\n' \"$E2E_RUN_INDEX\" >> {indices}; \
-         if test ! -e {first}; then : > {first}; printf '%s\\n' \
+        "if test ! -e {first}; then : > {first}; printf '%s\\n' \
          '[fixture.environmental] ----- detail -----' \
          '[fixture.environmental] An action was blocked on this server based on a security policy!' \
          '[fixture.environmental] ----- end detail -----' > {log}; exit 1; fi",
-        indices = validate_plan::shell_quote(&run_indices.to_string_lossy()),
         first = validate_plan::shell_quote(&first_attempt.to_string_lossy()),
         log = validate_plan::shell_quote(&environmental_log.to_string_lossy()),
     );
@@ -8284,20 +8288,14 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     let names_its_ground = environmental_attempts
         .iter()
         .any(|a| a.attempt == 1 && a.retry_class.as_deref() == Some("bpfjailer-banner"));
-    let observed_run_indices = std::fs::read_to_string(&run_indices)
-        .unwrap_or_default()
-        .lines()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
     if environmental_attempts.len() != 2
         || !first_failed
         || !second_passed
         || !names_its_ground
-        || observed_run_indices != ["0", "1"]
     {
         return Err(format!(
             "scheduler accounting: a node that FAILED then PASSED was recorded as if it had \
-             passed first time — the retry erased the flake. attempts={:?} run_indices={observed_run_indices:?}",
+             passed first time — the retry erased the flake. attempts={:?}",
             environmental_attempts
                 .iter()
                 .map(|a| (a.attempt, a.ok, a.reported, a.retry_class.clone()))

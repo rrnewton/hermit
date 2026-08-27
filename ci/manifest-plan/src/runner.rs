@@ -5,7 +5,6 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::fs::{self};
 use std::io::Write;
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -1918,6 +1917,7 @@ fn cell_timeout_attempt(
         stderr: String::new(),
         verification_report: None,
         verification_report_sha256: None,
+        runtime: None,
         first_divergent_scheduler_turn: None,
         first_divergent_virtual_nanoseconds: None,
         first_divergent_record: None,
@@ -2520,29 +2520,12 @@ pub fn append_result(path: &Path, result: &CellResult) -> Result<(), String> {
         .append(true)
         .open(path)
         .map_err(|e| e.to_string())?;
-    let mut line = serde_json::to_vec(result).map_err(|e| e.to_string())?;
-    line.push(b'\n');
-    // Validate runs manifest buckets in separate processes. Their ordinary
-    // result files do not overlap, but every completed cell is also appended to
-    // one run-wide input for the series writer. Hold an advisory lock across the
-    // complete JSON line so two buckets cannot interleave their writes.
-    let fd = file.as_raw_fd();
-    if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
-        return Err(std::io::Error::last_os_error().to_string());
-    }
-    let write_result = file
-        .write_all(&line)
-        .and_then(|()| file.flush())
-        .map_err(|e| e.to_string());
-    let unlock_result = if unsafe { libc::flock(fd, libc::LOCK_UN) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error().to_string())
-    };
+    serde_json::to_writer(&mut file, result).map_err(|e| e.to_string())?;
+    file.write_all(b"\n").map_err(|e| e.to_string())?;
     // The bucket runner publishes each completed cell before printing its
     // PASS/FAIL/ERROR line. Flush the row now rather than waiting for the
     // bucket's JUnit/summary epilogue, which an outer node timeout may kill.
-    write_result.and(unlock_result)
+    file.flush().map_err(|e| e.to_string())
 }
 
 pub fn write_junit(path: &Path, results: &[CellResult]) -> Result<(), String> {
@@ -3259,10 +3242,12 @@ mod tests {
             result.attempts[1].reason.as_deref(),
             Some("cell exceeded 1 s")
         );
+        let duration_ms = result
+            .duration_ms
+            .expect("a cell that executed must report measured wall time");
         assert!(
-            result.duration_ms < 2_000,
-            "three independent one-second bounds would take longer: {}ms",
-            result.duration_ms
+            duration_ms < 2_000,
+            "three independent one-second bounds would take longer: {duration_ms}ms"
         );
         fs::remove_dir_all(root).unwrap();
     }
