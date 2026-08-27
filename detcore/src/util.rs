@@ -8,6 +8,7 @@
 
 //! Widely useful small utilities.
 
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -85,54 +86,167 @@ pub fn truncated(width: usize, mut s: String) -> String {
 /// would busy-spin against a full pipe, so it blocks in `poll(POLLOUT)`.
 pub struct RetryingStderr;
 
-/// Total wall-clock ALL diagnostic writes may spend waiting for a reader, for the
-/// whole life of the process.
+/// Total wall-clock ALL diagnostic writes may spend waiting for a reader, across
+/// EVERY hermit process in one invocation.
 ///
-/// ⚠️ THE BUDGET IS FOR THE PROCESS, NOT FOR ONE `write` CALL, AND THE DIFFERENCE
-/// IS NOT SMALL. `write_all` calls `write` repeatedly, and a single error report
-/// is several separate `writeln!`s -- `display_error` issues three, and the
-/// tracing writer issues one per log line. A budget scoped to one call is
-/// therefore multiplied by however many writes remain, so "five seconds" would
-/// mean fifteen on the ordinary guest-not-found path and 5s x lines under
-/// `--log info`. That is not the ceiling a reader of the constant thinks it is.
+/// ⚠️ THE BUDGET IS FOR THE INVOCATION, NOT FOR ONE `write` CALL AND NOT FOR ONE
+/// PROCESS. Both narrower readings have already been shipped and both understated
+/// the real ceiling by a whole factor:
 ///
-/// Waiting for a SLOW reader is the feature; waiting for a STOPPED one is a hang
-/// on the path that reports why hermit is stopping. This bounds the second
-/// without capping the first per-call, by charging every wait to one budget.
-const STDERR_WAIT_BUDGET: Duration = Duration::from_secs(5);
-
-/// ⚠️ RESIDUAL, MEASURED AND NOT FIXED HERE: THIS BOUNDS ONE OS PROCESS, AND ONE
-/// HERMIT INVOCATION IS SEVERAL. A `static` lives per process, so each hermit
-/// process that writes diagnostics carries its OWN accumulator and its own full
-/// budget. Counted directly on 2026-08-26 by reading `/proc/*/fd/2` for the pipe
-/// inode while a run was in flight:
+/// * Per `write` CALL. `write_all` calls `write` repeatedly and a single error
+///   report is several `writeln!`s -- `display_error` issues three, the tracing
+///   writer one per log line -- so the ceiling was multiplied by however many
+///   writes remained. Measured at 20.4s against a 5s constant.
+/// * Per PROCESS. A `static` lives per process, so each hermit process carried
+///   its own full budget. Measured at 10.66s against the same 5s constant.
+///
+/// ⚠️ WHERE THE NUMBER COMES FROM: IT IS DERIVED FROM THE RUNG OUTSIDE IT, NOT
+/// CHOSEN. `docs/TIMEOUT_LADDER.md` requires each rung to be strictly smaller
+/// than the rung enclosing it, because an inner bound at or above its outer bound
+/// can never fire and is dead configuration that reads as protection.
+///
+/// This wait happens on hermit's way OUT, so the rung enclosing it is hermit's
+/// own unwind grace, `RUN_TIMEOUT_UNWIND_GRACE` in `hermit-cli/src/lib.rs`,
+/// which is 10s. The arithmetic against the previous per-process bound:
 ///
 /// ```text
-///   distinct processes holding that stderr pipe on fd 2: 3
-///     pid 440249  hermit
-///     pid 440255  hermit
-///     pid 440257  true      (the guest; writes no diagnostics)
+///   hermit processes that write diagnostics   2   (measured 2026-08-26; see below)
+///   per-process budget                        5s
+///   invocation ceiling                     2 x 5s = 10s
+///   RUN_TIMEOUT_UNWIND_GRACE                       10s
+///                                                  ^ EQUAL, not smaller
 /// ```
 ///
-/// Two writing hermit processes, so the ceiling an invocation actually observes is
-/// about TWO budgets, not one. Measured end to end at `--log info` against a
-/// stopped reader: 10.66s extra over a 0.02s baseline, against a 5s budget. At
-/// `--log warn` the extra is 0.01s, because too little is written to fill the pipe
-/// at all -- the cost appears only when there is enough output to block.
+/// Equal is the failure. And the end-to-end measurement was 10.66s, so it did not
+/// merely tie the grace, it EXCEEDED it. Spending the whole grace on diagnostics
+/// makes the unwind fallback fire and print `HERMIT_RUN_TIMEOUT_FALLBACK`, which
+/// `docs/TIMEOUT_LADDER.md` defines as "the unwind itself did not finish -- this
+/// is a hermit defect, not a slow guest". So an over-large diagnostic budget does
+/// not just waste time; it MANUFACTURES a false hermit-defect signal and destroys
+/// the meaning of that marker, the same way the ladder describes for `kvm`.
 ///
-/// So this is a real ceiling and it is NOT the one-budget ceiling the name suggests
-/// on its own. It is stated here rather than left to be discovered because an
-/// unexplained partial bound reads as a complete one. A true per-invocation ceiling
-/// needs a deadline shared across the process tree -- an absolute time computed
-/// once and inherited by children rather than a per-process accumulator -- which is
-/// filed separately and deliberately not attempted here.
+/// So the invocation-wide ceiling is derived as HALF the enclosing grace, leaving
+/// the other half for the unwind that grace exists to cover:
 ///
-/// ⚠️ ALSO OBSERVED, SAME MEASUREMENT, NOT ADDRESSED: a stopped reader turns an
-/// otherwise successful run's exit status from 0 into 125 at `--log info`. The
-/// diagnostic path failing still moves the exit code, which is the same shape as
-/// the defect this machinery exists to bound.
-/// Wall-clock already spent waiting on stderr across this process, in
-/// milliseconds. Charged against `STDERR_WAIT_BUDGET` by every diagnostic write.
+/// ```text
+///   RUN_TIMEOUT_UNWIND_GRACE / 2 = 5s   invocation-wide ceiling
+///   share of the outermost hermit       2.5s   (see stderr_wait_budget)
+///   sum over a tree of ANY depth      < 5s
+/// ```
+///
+/// `hermit-cli/tests/cli.rs` pins that relationship against the real
+/// `RUN_TIMEOUT_UNWIND_GRACE` so the two cannot drift apart silently.
+///
+/// ⚠️ RESIDUAL, CARRIED FORWARD FROM THE PER-PROCESS VERSION AND STILL NOT FIXED:
+/// a stopped reader turns an otherwise successful run's exit status from 0 into
+/// 125 at `--log info`. The diagnostic path failing still moves the exit code,
+/// which is the same shape as the defect this machinery exists to bound. Bounding
+/// the WAIT does not address it -- giving up on the write is exactly when the
+/// status moves -- so it is restated here rather than dropped along with the
+/// residual this change did close.
+const STDERR_TREE_WAIT_BUDGET: Duration = Duration::from_millis(5_000);
+
+/// This process's share of [`STDERR_TREE_WAIT_BUDGET`].
+///
+/// ⚠️ THE SHARE HALVES AT EACH NESTING LEVEL SO THE TOTAL IS BOUNDED WITHOUT ANY
+/// CHANNEL BETWEEN THE PROCESSES. A hermit nested `d` levels inside another
+/// hermit takes `STDERR_TREE_WAIT_BUDGET / 2^(d+1)`, so the outermost gets 2.5s,
+/// a child 1.25s, a grandchild 0.625s, and the sum over a chain of ANY depth
+/// stays strictly under the 5s invocation ceiling. Nothing has to be shared,
+/// inherited or agreed: each process computes its own share and the arithmetic
+/// does the rest.
+///
+/// ⚠️ WHY NOT SIMPLY DIVIDE BY THE PROCESS COUNT. Measured 2026-08-26, hermit
+/// runs as exactly two processes in a parent/child chain, and that did NOT change
+/// with the guest's own process count:
+///
+/// ```text
+///   guest with 1 process    max concurrent hermit processes = 2   (373462 -> 373472)
+///   guest with 4 processes  max concurrent hermit processes = 2   (377374 -> 377384)
+/// ```
+///
+/// Two is therefore the shape today, but dividing by a hard-coded 2 would silently
+/// become wrong the day a third appears, and it would be wrong in the direction
+/// that overshoots the grace -- which is exactly how the two earlier versions of
+/// this bound failed. Halving per level cannot overshoot however deep the tree
+/// turns out to be, so it does not need the count to stay 2.
+///
+/// The nesting depth comes from walking `/proc/<pid>/stat` upward while the parent
+/// is also `hermit`. That is a bounded walk over `/proc` with no new inter-process
+/// channel. ⚠️ IT DELIBERATELY DOES NOT USE THE ENVIRONMENT: a value set on
+/// hermit's environment reaches the GUEST by default (`BaseEnv::Host` does not
+/// clear it, measured), and a per-run-varying value visible to the guest, in a
+/// determinism tool, on a surface the argv/env hashing covers, would be a worse
+/// defect than the one being fixed.
+fn stderr_process_wait_budget() -> Duration {
+    static SHARE_MS: OnceLock<u64> = OnceLock::new();
+    let share_ms = *SHARE_MS
+        .get_or_init(|| stderr_share_for_depth(hermit_nesting_depth()).as_millis() as u64);
+    Duration::from_millis(share_ms)
+}
+
+/// The share arithmetic on its own, so it can be exercised at depths this process
+/// is not actually running at.
+///
+/// ⚠️ THE TEST MUST CALL THIS RATHER THAN RESTATE IT. An earlier version of the
+/// bracket recomputed the same shift inline and therefore passed against a build
+/// with the halving removed entirely -- it was checking a copy of the arithmetic
+/// against itself. Caught by mutation, not by reading it.
+fn stderr_share_for_depth(depth: u32) -> Duration {
+    // `>> (depth + 1)` is the halving: depth 0 -> /2, depth 1 -> /4. Saturates at
+    // 1ms rather than 0 so a deeply nested process still makes one attempt rather
+    // than dropping its first diagnostic unconditionally.
+    let ms = ((STDERR_TREE_WAIT_BUDGET.as_millis() as u64) >> (depth.min(16) + 1)).max(1);
+    Duration::from_millis(ms)
+}
+
+/// How many `hermit` processes enclose this one, by walking `/proc` upward.
+///
+/// Returns 0 for the outermost hermit. Any unreadable or malformed `/proc` entry
+/// stops the walk and yields the depth found so far, which under-counts rather
+/// than over-counts -- an under-count gives this process a LARGER share, so the
+/// failure direction is a slightly looser bound rather than a diagnostic dropped
+/// on its first attempt. The loop is capped independently of that.
+fn hermit_nesting_depth() -> u32 {
+    let mut depth = 0;
+    let mut pid = match proc_stat_ppid(std::process::id()) {
+        Some(ppid) => ppid,
+        None => return 0,
+    };
+    // Capped so a malformed or cyclic /proc cannot spin on hermit's exit path.
+    for _ in 0..16 {
+        if pid <= 1 || !proc_comm_is_hermit(pid) {
+            break;
+        }
+        depth += 1;
+        pid = match proc_stat_ppid(pid) {
+            Some(ppid) => ppid,
+            None => break,
+        };
+    }
+    depth
+}
+
+fn proc_comm_is_hermit(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|comm| comm.trim_end() == "hermit")
+        .unwrap_or(false)
+}
+
+/// The parent pid from `/proc/<pid>/stat`, field 4.
+///
+/// ⚠️ FIELD 2 IS THE COMM AND IT CAN CONTAIN SPACES AND PARENTHESES, so the fields
+/// cannot simply be split on whitespace. Everything after the LAST `)` is parsed
+/// instead, which is the standard way to read this file and the reason a naive
+/// split misreads any process whose name contains a space.
+fn proc_stat_ppid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Wall-clock already spent waiting on stderr in THIS process, in milliseconds.
+/// Charged against [`stderr_process_wait_budget`] by every diagnostic write.
 ///
 /// `Relaxed` is sufficient: this is an approximate accumulator whose only reader
 /// is the comparison below, and over-shooting by one poll interval is harmless
@@ -146,11 +260,25 @@ pub fn reset_stderr_wait_budget_for_test() {
     STDERR_WAITED_MS.store(0, Ordering::Relaxed);
 }
 
-/// The budget, exposed so a bracket can pin it BY VALUE rather than restating a
-/// literal that could drift away from the code it claims to describe.
+/// This process's share, exposed so a bracket can pin it BY VALUE rather than
+/// restating a literal that could drift away from the code it claims to describe.
 #[doc(hidden)]
 pub fn stderr_wait_budget() -> Duration {
-    STDERR_WAIT_BUDGET
+    stderr_process_wait_budget()
+}
+
+/// The invocation-wide ceiling, exposed so a bracket can pin it against
+/// `RUN_TIMEOUT_UNWIND_GRACE` and fail closed if the two ever cross.
+#[doc(hidden)]
+pub fn stderr_tree_wait_budget() -> Duration {
+    STDERR_TREE_WAIT_BUDGET
+}
+
+/// This process's nesting depth, exposed so a bracket can assert the sum over a
+/// real tree rather than over an assumed one.
+#[doc(hidden)]
+pub fn stderr_wait_nesting_depth() -> u32 {
+    hermit_nesting_depth()
 }
 
 impl std::io::Write for RetryingStderr {
@@ -172,14 +300,17 @@ impl std::io::Write for RetryingStderr {
                     // ⚠️ BOUNDED. Waiting for a slow reader is the point; waiting
                     // for a stopped one is a hang on hermit's exit path. Give up
                     // and let the caller drop the line rather than never return.
-                    // Charged against the PROCESS budget, not this call's own
-                    // elapsed time, so three writeln!s cannot each buy the full
-                    // ceiling. See STDERR_WAIT_BUDGET.
-                    if STDERR_WAITED_MS.load(Ordering::Relaxed)
-                        >= STDERR_WAIT_BUDGET.as_millis() as u64
-                    {
+                    // Charged against this process's SHARE of the invocation-wide
+                    // ceiling, not against this call's own elapsed time and not
+                    // against a whole budget per process -- so neither three
+                    // writeln!s nor a second hermit can buy the ceiling again.
+                    // See STDERR_TREE_WAIT_BUDGET.
+                    let share_ms = stderr_process_wait_budget().as_millis() as u64;
+                    let spent_ms = STDERR_WAITED_MS.load(Ordering::Relaxed);
+                    let Some(remaining_ms) = share_ms.checked_sub(spent_ms).filter(|r| *r > 0)
+                    else {
                         return Err(err);
-                    }
+                    };
                     let waited = std::time::Instant::now();
                     // Block until the reader makes room. A failed or timed-out
                     // poll falls through to another write attempt rather than
@@ -189,9 +320,18 @@ impl std::io::Write for RetryingStderr {
                         events: libc::POLLOUT,
                         revents: 0,
                     };
+                    // ⚠️ THE POLL IS CLAMPED TO WHAT IS LEFT, AND WITHOUT THAT THE
+                    // BOUND DOES NOT HOLD. Checking the budget only BEFORE a poll
+                    // that can block for a fixed 1000ms lets each process overshoot
+                    // its share by almost a full second, and every process in the
+                    // tree overshoots independently. Measured with the fixed 1000ms
+                    // poll and a 5s invocation ceiling: 6.37s. That is the same
+                    // defect as charging per call -- a bound tested at the wrong
+                    // granularity to the thing it bounds -- one level further down.
+                    let timeout_ms = remaining_ms.min(1000) as libc::c_int;
                     // SAFETY: one initialised `pollfd`, count 1, timeout in ms.
                     unsafe {
-                        libc::poll(&mut pfd, 1, 1000);
+                        libc::poll(&mut pfd, 1, timeout_ms);
                     }
                     STDERR_WAITED_MS.fetch_add(
                         waited.elapsed().as_millis() as u64,
@@ -206,5 +346,151 @@ impl std::io::Write for RetryingStderr {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod stderr_wait_tests {
+    use super::*;
+
+    /// Drive the real writer against a real full pipe and measure the real wait.
+    ///
+    /// ⚠️ THIS IS THE ONLY TEST THAT MEASURES THE BOUND, AND THE END-TO-END ONES IN
+    /// `hermit-cli/tests/cli.rs` DO NOT, WHICH IS MEASURED RATHER THAN ASSUMED. Those
+    /// compare a subprocess's total elapsed time against a baseline, and that
+    /// difference is dominated by something this mechanism does not control.
+    /// Instrumented on 2026-08-26 to print each process's accounting at give-up,
+    /// three runs of the same fixture:
+    ///
+    /// ```text
+    ///   elapsed=5.51s   spent_ms=2500   (one process, depth 0)
+    ///   elapsed=10.88s  spent_ms=2500   (one process, depth 0)
+    ///   elapsed=5.41s   spent_ms=2500   (one process, depth 0)
+    /// ```
+    ///
+    /// The wait is EXACTLY the share every time; the elapsed time varies by 5.5s
+    /// with the wait held constant. So an assertion on elapsed-minus-baseline is
+    /// not an assertion about this budget, and the 10.88s run would read as "two
+    /// budgets were spent" when one was. Measuring the writer directly, in this
+    /// process, is what removes that confound.
+    #[test]
+    fn the_wait_stops_at_this_processes_share() {
+        use std::io::Write;
+
+        // A pipe nobody reads, with the smallest capacity the kernel will take, so
+        // the writer blocks rather than fitting the payload.
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        const F_SETPIPE_SZ: i32 = 1031;
+        unsafe { libc::fcntl(write_fd, F_SETPIPE_SZ, 4096) };
+        let flags = unsafe { libc::fcntl(write_fd, libc::F_GETFL) };
+        unsafe { libc::fcntl(write_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+
+        // `RetryingStderr` writes fd 2 by construction -- that is the descriptor it
+        // exists to protect -- so point fd 2 at the full pipe for the duration.
+        let saved_stderr = unsafe { libc::dup(libc::STDERR_FILENO) };
+        assert!(saved_stderr >= 0, "dup stderr");
+        assert!(
+            unsafe { libc::dup2(write_fd, libc::STDERR_FILENO) } >= 0,
+            "dup2 the full pipe onto fd 2"
+        );
+
+        reset_stderr_wait_budget_for_test();
+        let share = stderr_process_wait_budget();
+        let payload = vec![b'x'; 64 * 1024];
+
+        let started = std::time::Instant::now();
+        // Keep writing until the writer refuses. Each call charges the same
+        // accumulator, so the total is the share however many calls it takes.
+        let mut refused = false;
+        for _ in 0..64 {
+            if RetryingStderr.write(&payload).is_err() {
+                refused = true;
+                break;
+            }
+        }
+        let elapsed = started.elapsed();
+
+        // Restore fd 2 before any assertion can print.
+        unsafe {
+            libc::dup2(saved_stderr, libc::STDERR_FILENO);
+            libc::close(saved_stderr);
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+
+        assert!(
+            refused,
+            "the writer never refused against a pipe nobody reads, so the bound was \
+             not exercised at all"
+        );
+        // ⚠️ UPPER BOUND WITH A REAL TOLERANCE, NOT A GENEROUS ONE. The budget is
+        // checked before each poll AND the poll is clamped to what is left, so the
+        // only overshoot is the scheduling delay in returning from the final poll.
+        // 500ms covers that on a loaded box; a multiple of the share would not
+        // distinguish this bound from one twice its size.
+        assert!(
+            elapsed < share + Duration::from_millis(500),
+            "the writer waited {elapsed:?} against a {share:?} share: the wait is \
+             overshooting its own bound, which is how a per-call and a per-process \
+             budget both looked correct before"
+        );
+        // And it must not give up early, or the diagnostic is dropped on a reader
+        // that was merely slow -- the failure the wait exists to avoid.
+        assert!(
+            elapsed >= share,
+            "the writer gave up after {elapsed:?} with a {share:?} share still \
+             unspent, so a slow reader would lose diagnostics it should have got"
+        );
+    }
+
+    /// The share must shrink with nesting depth, or the tree total is unbounded.
+    #[test]
+    fn the_share_halves_at_each_nesting_level() {
+        let tree = STDERR_TREE_WAIT_BUDGET.as_millis() as u64;
+        // ⚠️ CALLS THE REAL ARITHMETIC. Recomputing the shift here instead left this
+        // test green against a build with the halving deleted -- it compared a copy
+        // of the formula with itself. `stderr_share_for_depth` is the function the
+        // writer actually uses, evaluated at depths this process is not running at.
+        let share_at = |depth: u32| stderr_share_for_depth(depth).as_millis() as u64;
+
+        assert_eq!(share_at(0), 2_500, "the outermost hermit takes half the ceiling");
+        assert_eq!(share_at(1), 1_250, "a nested hermit takes half of that");
+        assert_eq!(share_at(2), 625);
+
+        // ⚠️ THE PROPERTY THAT MATTERS IS THE SUM, NOT ANY ONE SHARE. Two hermit
+        // processes at a full budget each was the defect; the sum over a chain of
+        // ANY depth has to stay under one ceiling.
+        let total: u64 = (0..16).map(share_at).sum();
+        assert!(
+            total < tree,
+            "shares over a 16-deep chain sum to {total}ms, at or past the {tree}ms \
+             invocation ceiling"
+        );
+    }
+
+    /// A process whose parent is not `hermit` is the outermost one.
+    #[test]
+    fn the_nesting_walk_reports_zero_outside_a_hermit_tree() {
+        // The test binary is not named `hermit`, so the walk must stop immediately.
+        // If this ever reports nonzero, the walk is matching something it should
+        // not and every share below the top is wrong.
+        assert_eq!(hermit_nesting_depth(), 0);
+    }
+
+    /// The parent pid must survive a process name containing spaces and brackets.
+    #[test]
+    fn the_stat_parser_reads_past_a_comm_with_spaces() {
+        // Field 2 of /proc/<pid>/stat is `(comm)` and comm may contain spaces and
+        // parentheses, so a whitespace split misreads the parent pid. Parse our own
+        // stat and cross-check against the value the kernel reports elsewhere.
+        let ours = proc_stat_ppid(std::process::id()).expect("read our own ppid");
+        let expected = unsafe { libc::getppid() } as u32;
+        assert_eq!(
+            ours, expected,
+            "the /proc/<pid>/stat parse disagrees with getppid(), so the nesting \
+             walk is reading the wrong field"
+        );
     }
 }
