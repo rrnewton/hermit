@@ -5,6 +5,7 @@
 //!
 //! ```cargo
 //! [dependencies]
+//! hermit-manifest-plan = { path = "../manifest-plan" }
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
 //! sha2 = "0.10"
@@ -30,6 +31,10 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 use sha2::Digest;
 use sha2::Sha256;
+use hermit_manifest_plan::stress_series::{
+    HostCapability, HostCapabilityVerdict, SeriesCoordinates, SeriesOutcome, SeriesPayload,
+    SeriesProducer, SeriesRow, SeriesSchema, SourceDepth,
+};
 
 const SCORECARD: &str = "SCORECARD.md";
 const CELLS: &str = "ci/compat-envelope/cells.json";
@@ -588,14 +593,6 @@ struct LastTested {
     /// keyspaces and a bare number would be read against the wrong one.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     depth: BTreeMap<String, SourceDepth>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct SourceDepth {
-    /// `git rev-list --count HEAD`: total reachable ancestry, merges included.
-    commits: u64,
-    /// `git rev-list --count --first-parent HEAD`: mainline distance.
-    first_parent: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3851,99 +3848,6 @@ fn write_observation_files(
     Ok(())
 }
 
-/// The four divergence positions, as the store nests them.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SeriesCoordinates {
-    #[serde(default)]
-    first_divergent_scheduler_turn: Option<u64>,
-    #[serde(default)]
-    first_divergent_virtual_nanoseconds: Option<u64>,
-    #[serde(default)]
-    first_divergent_record: Option<u64>,
-    #[serde(default)]
-    first_divergent_syscall: Option<u64>,
-}
-
-/// The `series` payload inside an envelope.
-///
-/// ⚠️ `coordinates` IS OPTIONAL AND ITS ABSENCE IS MEANINGFUL. A `diverged` row
-/// that located no position omits the object entirely; that is the store's
-/// `diverged-unlocated` state, not a malformed row. Requiring it would force a
-/// producer to invent a position it does not have.
-#[derive(Clone, Debug, Deserialize)]
-struct SeriesPayload {
-    cell: String,
-    tree: String,
-    #[serde(default)]
-    detcore_tree: Option<String>,
-    outcome: String,
-    run_index: u64,
-    #[serde(default = "one_run")]
-    num_runs: u64,
-    #[serde(default)]
-    source_tree_dirty: bool,
-    #[serde(default)]
-    depth: BTreeMap<String, SourceDepth>,
-    #[serde(default)]
-    coordinates: Option<SeriesCoordinates>,
-}
-
-fn one_run() -> u64 {
-    1
-}
-
-/// One row as the series store ACTUALLY carries it: an envelope wrapping a
-/// `series` payload.
-///
-/// ⚠️ THIS USED TO BE A FLAT STRUCT WITH `deny_unknown_fields`, AND IT COULD NOT
-/// READ A SINGLE REAL ROW. `ci-hub/series/series.py` is the schema authority and
-/// it validates an ENVELOPE -- schema, event_id, event_type, producer,
-/// emitted_at, host, team, run_id, plus a nested `series` object. Every such row
-/// failed to deserialize here on `unknown field \`schema\``, and because a
-/// failed line is skipped rather than fatal, the projection reported "the series
-/// is EMPTY" and exited 0. Measured 2026-08-25: one row in the producer's own
-/// format projected 0 cells, the target cell kept `never-measured`, and every
-/// surface reported success.
-///
-/// Canonical envelope fields are required and checked, but this deliberately
-/// does NOT carry `deny_unknown_fields`: the envelope is the producer's to
-/// extend, and rejecting a field this consumer does not need is what created
-/// the outage.
-#[derive(Clone, Debug, Deserialize)]
-struct SeriesRow {
-    #[serde(skip)]
-    source: String,
-    schema: String,
-    event_id: String,
-    event_type: String,
-    emitted_at: String,
-    team: String,
-    host: String,
-    producer: String,
-    run_id: String,
-    series: SeriesPayload,
-}
-
-impl SeriesRow {
-    fn cell(&self) -> &str {
-        &self.series.cell
-    }
-
-    fn label(&self) -> String {
-        format!(
-            "{}:{}: {} from {} run {} repetition {} @ {}",
-            self.source,
-            self.event_id,
-            self.series.cell,
-            self.producer,
-            self.run_id,
-            self.series.run_index,
-            self.series.tree
-        )
-    }
-}
-
 #[derive(Debug)]
 struct ProjectObservationsOutcome {
     cells: usize,
@@ -3973,22 +3877,27 @@ fn is_object_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn series_provenance(producer: &str) -> Result<ObservationProvenance, String> {
+fn series_provenance(producer: SeriesProducer) -> ObservationProvenance {
     match producer {
-        "hermit-repeat" => Ok(ObservationProvenance::HermitRepeat),
-        "pressure-test" => Ok(ObservationProvenance::PressureTest),
-        "validate" => Ok(ObservationProvenance::Validate),
-        other => Err(format!("unsupported producer {other:?}")),
+        SeriesProducer::HermitRepeat => ObservationProvenance::HermitRepeat,
+        SeriesProducer::PressureTest => ObservationProvenance::PressureTest,
+        SeriesProducer::Validate => ObservationProvenance::Validate,
     }
 }
 
-fn series_result(outcome: &str, mode: &str) -> Result<Option<ObservedResult>, String> {
+fn series_result(outcome: SeriesOutcome, mode: &str) -> Option<ObservedResult> {
     match (outcome, mode) {
-        ("passed", _) => Ok(Some(ObservedResult::Pass)),
-        ("diverged", "replay") => Ok(Some(ObservedResult::ReplayFailure)),
-        ("diverged", _) => Ok(Some(ObservedResult::DeterminismFailure)),
-        ("no_result" | "timeout" | "errored" | "error" | "skipped", _) => Ok(None),
-        (other, _) => Err(format!("unknown outcome {other:?}")),
+        (SeriesOutcome::Passed, _) => Some(ObservedResult::Pass),
+        (SeriesOutcome::Diverged, "replay") => Some(ObservedResult::ReplayFailure),
+        (SeriesOutcome::Diverged, _) => Some(ObservedResult::DeterminismFailure),
+        (
+            SeriesOutcome::NoResult
+            | SeriesOutcome::Timeout
+            | SeriesOutcome::Errored
+            | SeriesOutcome::Error
+            | SeriesOutcome::Skipped,
+            _,
+        ) => None,
     }
 }
 
@@ -4037,33 +3946,8 @@ fn apply_series_rows(
     let mut skipped = Vec::new();
     for row in rows {
         let label = row.label();
-        if row.schema != "stress-series/v1"
-            || row.event_type != "series.observation"
-            || row.team != "hermit"
-        {
-            skipped.push(format!(
-                "{label}: expected schema stress-series/v1, event_type series.observation, and team hermit"
-            ));
-            continue;
-        }
-        if row.event_id.trim().is_empty()
-            || row.emitted_at.trim().is_empty()
-            || row.host.trim().is_empty()
-            || row.run_id.trim().is_empty()
-        {
-            skipped.push(format!(
-                "{label}: event_id, emitted_at, host and run_id must be nonempty"
-            ));
-            continue;
-        }
-        if row.series.num_runs == 0 {
-            skipped.push(format!("{label}: num_runs must be positive"));
-            continue;
-        }
-        if row.series.source_tree_dirty {
-            skipped.push(format!(
-                "{label}: source_tree_dirty is true; dirty source is not checked-in evidence"
-            ));
+        if let Err(why) = row.validate_for_projection() {
+            skipped.push(format!("{label}: {why}"));
             continue;
         }
         let Some(indices) = cell_indices.get(row.cell()) else {
@@ -4080,44 +3964,17 @@ fn apply_series_rows(
             continue;
         }
         let cell_index = indices[0];
-        let provenance = match series_provenance(&row.producer) {
-            Ok(provenance) => provenance,
-            Err(why) => {
-                skipped.push(format!("{label}: {why}"));
-                continue;
-            }
-        };
-        let result = match series_result(&row.series.outcome, &tracked.cells[cell_index].id.mode) {
-            Ok(Some(result)) => result,
-            Ok(None) => {
+        let provenance = series_provenance(row.producer);
+        let result = match series_result(row.series.outcome, &tracked.cells[cell_index].id.mode) {
+            Some(result) => result,
+            None => {
                 skipped.push(format!(
                     "{label}: outcome {:?} produced no comparison and is not evidence",
-                    row.series.outcome
+                    row.series.outcome.as_str()
                 ));
                 continue;
             }
-            Err(why) => {
-                skipped.push(format!("{label}: {why}"));
-                continue;
-            }
         };
-        if result == ObservedResult::Pass
-            && row
-                .series
-                .coordinates
-                .as_ref()
-                .is_some_and(|coordinates| {
-                    coordinates.first_divergent_scheduler_turn.is_some()
-                        || coordinates.first_divergent_virtual_nanoseconds.is_some()
-                        || coordinates.first_divergent_record.is_some()
-                        || coordinates.first_divergent_syscall.is_some()
-                })
-        {
-            skipped.push(format!(
-                "{label}: a passing comparison carries a divergence position"
-            ));
-            continue;
-        }
         let detcore_tree = match series_detcore_tree(root, row) {
             Ok(tree) => tree,
             Err(why) => {
@@ -7856,27 +7713,35 @@ red/`measured-and-passed` count is **0**.",
     let fixture_hermit_tree = git_head(&root)?;
     let fixture_detcore_tree = git_rev_parse(&root, "HEAD:detcore")?;
     let series_row = |cell: &str,
-                      outcome: &str,
-                      producer: &str,
+                      outcome: SeriesOutcome,
+                      producer: SeriesProducer,
                       num_runs: u64,
                       detcore_tree: Option<String>,
                       coordinate: Option<u64>| SeriesRow {
         source: "fixture-series:1".into(),
-        schema: "stress-series/v1".into(),
-        event_id: format!("fixture-{cell}-{outcome}-{producer}"),
+        schema: SeriesSchema::V2,
+        event_id: format!(
+            "fixture-{cell}-{}-{}",
+            outcome.as_str(),
+            producer.as_str()
+        ),
         event_type: "series.observation".into(),
         emitted_at: "2026-08-27T05:00:00Z".into(),
         team: "hermit".into(),
         host: "fixture-host".into(),
-        producer: producer.into(),
+        producer,
         run_id: "fixture-run".into(),
         series: SeriesPayload {
             cell: cell.into(),
             tree: fixture_hermit_tree.clone(),
             detcore_tree,
-            outcome: outcome.into(),
+            outcome,
             run_index: 1,
+            attempt: None,
             num_runs,
+            last_run_index: None,
+            main_ancestry: Some(true),
+            runtime: None,
             source_tree_dirty: false,
             depth: BTreeMap::from([(
                 "hermit".into(),
@@ -7889,6 +7754,25 @@ red/`measured-and-passed` count is **0**.",
                 first_divergent_scheduler_turn: Some(position),
                 ..SeriesCoordinates::default()
             }),
+            first_divergent_messages: None,
+            machine_shortname: Some("fixture-host".into()),
+            kernel_version: Some("7.1.3-fixture".into()),
+            host_capabilities: Some(BTreeMap::from([
+                (
+                    HostCapability::CpuidFaulting,
+                    HostCapabilityVerdict {
+                        present: true,
+                        evidence: "fixture cpuid probe".into(),
+                    },
+                ),
+                (
+                    HostCapability::Kvm,
+                    HostCapabilityVerdict {
+                        present: false,
+                        evidence: "fixture kvm probe".into(),
+                    },
+                ),
+            ])),
         },
     };
     let mut projected_from_series = TrackedCells {
@@ -7899,24 +7783,24 @@ red/`measured-and-passed` count is **0**.",
     let projection_rows = vec![
         series_row(
             "fixture/boundary/verify/ptrace",
-            "diverged",
-            "pressure-test",
+            SeriesOutcome::Diverged,
+            SeriesProducer::PressureTest,
             3,
             None,
             Some(68),
         ),
         series_row(
             "fixture/boundary/verify/ptrace",
-            "passed",
-            "pressure-test",
+            SeriesOutcome::Passed,
+            SeriesProducer::PressureTest,
             2,
             None,
             None,
         ),
         series_row(
             "fixture/boundary/verify/ptrace",
-            "no_result",
-            "validate",
+            SeriesOutcome::NoResult,
+            SeriesProducer::Validate,
             4,
             None,
             None,
@@ -7979,8 +7863,8 @@ red/`measured-and-passed` count is **0**.",
     preserve_newer.cells[0].last_tested = Some(current_last_tested.clone());
     let mut older_row = series_row(
         "fixture/boundary/verify/ptrace",
-        "passed",
-        "pressure-test",
+        SeriesOutcome::Passed,
+        SeriesProducer::PressureTest,
         1,
         Some(older_detcore_tree),
         None,
@@ -8016,8 +7900,8 @@ red/`measured-and-passed` count is **0**.",
     };
     let current_validate_row = series_row(
         "fixture/boundary/verify/ptrace",
-        "passed",
-        "validate",
+        SeriesOutcome::Passed,
+        SeriesProducer::Validate,
         1,
         Some(fixture_detcore_tree.clone()),
         None,
@@ -8044,8 +7928,8 @@ red/`measured-and-passed` count is **0**.",
     };
     let no_result = series_row(
         "fixture/boundary/verify/ptrace",
-        "no_result",
-        "validate",
+        SeriesOutcome::NoResult,
+        SeriesProducer::Validate,
         1,
         Some(fixture_detcore_tree.clone()),
         None,
@@ -8069,50 +7953,55 @@ red/`measured-and-passed` count is **0**.",
         projection: None,
         cells: vec![boundary_cell(Vec::new(), CellStatus::Green)],
     };
-    let mut wrong_schema = series_row(
+    let mut legacy_schema = series_row(
         "fixture/boundary/verify/ptrace",
-        "passed",
-        "validate",
+        SeriesOutcome::Passed,
+        SeriesProducer::Validate,
         1,
         Some(fixture_detcore_tree.clone()),
         None,
     );
-    wrong_schema.schema = "stress-series/v99".into();
-    let mut wrong_event_type = wrong_schema.clone();
-    wrong_event_type.schema = "stress-series/v1".into();
+    legacy_schema.schema = SeriesSchema::V1;
+    legacy_schema.series.machine_shortname = None;
+    legacy_schema.series.kernel_version = None;
+    legacy_schema.series.host_capabilities = None;
+    let mut wrong_event_type = legacy_schema.clone();
+    wrong_event_type.schema = SeriesSchema::V2;
+    wrong_event_type.series.machine_shortname = Some("fixture-host".into());
+    wrong_event_type.series.kernel_version = Some("7.1.3-fixture".into());
     wrong_event_type.event_type = "run.result".into();
-    let mut wrong_team = wrong_schema.clone();
-    wrong_team.schema = "stress-series/v1".into();
+    let mut wrong_team = wrong_event_type.clone();
+    wrong_team.event_type = "series.observation".into();
     wrong_team.team = "reverie".into();
-    let mut empty_host = wrong_schema.clone();
-    empty_host.schema = "stress-series/v1".into();
+    let mut empty_host = wrong_event_type.clone();
+    empty_host.event_type = "series.observation".into();
     empty_host.host.clear();
     let exact_rows = vec![
         series_row(
             "fixture/boundary/verify/ptrace",
-            "passed",
-            "hermit-repeat",
+            SeriesOutcome::Passed,
+            SeriesProducer::HermitRepeat,
             1,
             Some(fixture_detcore_tree.clone()),
             None,
         ),
         series_row(
             "fixture/boundary/replay/ptrace",
-            "passed",
-            "validate",
+            SeriesOutcome::Passed,
+            SeriesProducer::Validate,
             1,
             Some(fixture_detcore_tree.clone()),
             None,
         ),
         series_row(
             "fixture/boundary/verify/ptrace",
-            "passed",
-            "validate",
+            SeriesOutcome::Passed,
+            SeriesProducer::Validate,
             1,
             Some("f".repeat(40)),
             None,
         ),
-        wrong_schema,
+        legacy_schema,
         wrong_event_type,
         wrong_team,
         empty_host,
@@ -8125,13 +8014,21 @@ red/`measured-and-passed` count is **0**.",
         || exact
             .skipped
             .iter()
-            .filter(|line| line.contains("expected schema stress-series/v1"))
+            .filter(|line| line.contains("stress-series/v1 does not record"))
             .count()
-            != 3
+            != 1
         || !exact
             .skipped
             .iter()
-            .any(|line| line.contains("host and run_id must be nonempty"))
+            .any(|line| line.contains("event_type must be series.observation"))
+        || !exact
+            .skipped
+            .iter()
+            .any(|line| line.contains("team must be hermit"))
+        || !exact
+            .skipped
+            .iter()
+            .any(|line| line.contains("host must be nonempty"))
         || exact_mapping.cells[0].observations[0].provenance
             != ObservationProvenance::HermitRepeat
     {

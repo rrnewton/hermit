@@ -64,7 +64,7 @@ fn host_requirement_pairs(documents: &[Value]) -> Result<Vec<(String, String)>, 
                     return Err(format!("{id}.requires: array values must be strings"));
                 };
                 if let Some(capability) = requires_capability(token)? {
-                    out.push((capability.to_string(), id.to_string()));
+                    out.push((capability.value().to_string(), id.to_string()));
                 }
             }
         }
@@ -1491,13 +1491,13 @@ mod tests {
     #[test]
     fn the_one_probeable_token_maps_to_the_shared_capability_name() {
         // The name must be exactly what
-        // `scripts/lib/validate_plan.rs::HostCapability::value` emits and what
+        // `host_capability::HostCapability::value` emits and what
         // `scripts/validate.rs --probe-host-capability` accepts. A typo here
         // would make the probe silently unreachable, so the cell would run and
         // fail — safe, but the mechanism would be inert, which this catches.
         assert_eq!(
             requires_capability("cpuid").unwrap(),
-            Some("cpuid-faulting")
+            Some(hermit_manifest_plan::stress_series::HostCapability::CpuidFaulting)
         );
     }
 
