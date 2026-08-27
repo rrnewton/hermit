@@ -96,10 +96,14 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
     assert!(
         trace_stderr.contains("inbound syscall: writev")
             && trace_stderr.contains(
+                "NonblockableSyscall: converting to nonblocking syscall (internal polling): write",
+            )
+            && trace_stderr.contains(
                 "NonblockableSyscall: converting to nonblocking syscall (internal polling): writev",
             )
+            && trace_stderr.contains("Retry #1 for blocking pipe write")
             && trace_stderr.contains("Retry #1 for atomic blocking pipe writev after EAGAIN"),
-        "writev did not reach typed dispatch and internal-fd scheduling\n\
+        "write/writev did not reach typed dispatch and internal-fd scheduling\n\
          stdout:\n{trace_stdout}\nstderr:\n{trace_stderr}",
     );
 
@@ -111,13 +115,21 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
             Some("--passthru-opt"),
         ),
     ] {
+        let report_dir = tempfile::tempdir().expect("failed to create verification directory");
+        let report_path = report_dir.path().join("verify.json");
         let mut verify = Command::new("timeout");
         verify
             .args(["--kill-after", "5s", "30s"])
             .arg(hermit_test::hermit_binary())
             .args(["--log=info", "run", "--verify", "--base-env=minimal"]);
         if strict {
-            verify.args(["--strict", "--panic-on-unsupported-syscalls"]);
+            verify
+                .args([
+                    "--strict",
+                    "--panic-on-unsupported-syscalls",
+                    "--verify-strict",
+                ])
+                .arg(format!("--verify-json={}", report_path.display()));
         }
         if let Some(arg) = extra_arg {
             verify.args(["--allow-unsupported-syscalls", arg]);
@@ -140,8 +152,85 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
                 "passthru-opt writev run omitted the compatibility warning\n\
                  stderr:\n{verify_stderr}",
             );
+        } else {
+            let report: serde_json::Value = serde_json::from_slice(
+                &fs::read(&report_path).expect("strict write verification report was not written"),
+            )
+            .expect("strict write verification report is valid JSON");
+            assert_eq!(report["verdict"], "matched", "verify report: {report}");
+            assert_eq!(report["verified"], true, "verify report: {report}");
+            assert_eq!(report["bitwise_parity"], true, "verify report: {report}");
+            assert_eq!(
+                report["comparison"]["strictness"], "canonical",
+                "verify report: {report}"
+            );
+            assert_eq!(
+                report["comparison"]["log_scope"], "info",
+                "verify report: {report}"
+            );
+            assert_eq!(
+                report["comparison"]["compare_io_buffers"], true,
+                "verify report: {report}"
+            );
+            for side in ["left", "right"] {
+                assert!(
+                    report["compared_log_messages"][side]
+                        .as_u64()
+                        .is_some_and(|count| count > 0),
+                    "verify report compared no INFO evidence on {side}: {report}"
+                );
+            }
         }
     }
+
+    // A blocking write that yielded on a full pipe must not resume through a
+    // descriptor number that another thread replaced. Reverie does not yet
+    // expose a backend-neutral retained-fd handle, so the safe current behavior
+    // is an explicit EOPNOTSUPP before any byte reaches the replacement pipe.
+    let replacement_report_dir =
+        tempfile::tempdir().expect("failed to create replacement verification directory");
+    let replacement_report = replacement_report_dir.path().join("verify.json");
+    let mut replacement = Command::new("timeout");
+    replacement
+        .args(["--kill-after", "5s", "30s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=info",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--allow-unsupported-syscalls",
+            "--base-env=minimal",
+        ])
+        .arg(format!("--verify-json={}", replacement_report.display()))
+        .arg("--")
+        .arg(&guest)
+        .arg("fd-replacement");
+    let replacement_output = command_output(replacement, "pipe fd replacement verification");
+    let replacement_stdout = String::from_utf8_lossy(&replacement_output.stdout);
+    let replacement_stderr = String::from_utf8_lossy(&replacement_output.stderr);
+    assert!(
+        replacement_stdout.contains("pipe-fd-replacement-refused-without-redirection"),
+        "fd replacement probe omitted its success marker\n\
+         stdout:\n{replacement_stdout}\nstderr:\n{replacement_stderr}",
+    );
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(&replacement_report)
+            .expect("pipe fd replacement verification report was not written"),
+    )
+    .expect("pipe fd replacement verification report is valid JSON");
+    assert_eq!(report["verdict"], "matched", "verify report: {report}");
+    assert_eq!(report["verified"], true, "verify report: {report}");
+    assert_eq!(report["bitwise_parity"], true, "verify report: {report}");
+    assert_eq!(
+        report["comparison"]["strictness"], "canonical",
+        "verify report: {report}"
+    );
+    assert_eq!(
+        report["comparison"]["compare_io_buffers"], true,
+        "verify report: {report}"
+    );
 
     // Exercise record mode on pipe retries separately. Replaying dynamically allocated
     // pipe fds is currently blocked by the recorder's independent fd-numbering gap.

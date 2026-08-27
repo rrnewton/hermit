@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -745,6 +746,443 @@ static int check_large_blocking_pipe(void) {
   return 0;
 }
 
+static int check_large_blocking_write(void) {
+  enum { PAYLOAD_SIZE = 131072 };
+  static char payload[PAYLOAD_SIZE];
+  for (size_t index = 0; index < sizeof(payload); index++) {
+    payload[index] = (char)('a' + (index % 26));
+  }
+
+  int pipe_fds[2];
+  if (pipe(pipe_fds) != 0) {
+    perror("large scalar pipe");
+    return -1;
+  }
+  pid_t child = fork();
+  if (child < 0) {
+    perror("large scalar fork");
+    return -1;
+  }
+  if (child == 0) {
+    close(pipe_fds[1]);
+    size_t received = 0;
+    char buffer[4096];
+    while (received < sizeof(payload)) {
+      ssize_t count = read(pipe_fds[0], buffer, sizeof(buffer));
+      if (count < 0 && errno == EINTR) {
+        continue;
+      }
+      if (count <= 0) {
+        _exit(2);
+      }
+      for (ssize_t index = 0; index < count; index++) {
+        size_t position = received + (size_t)index;
+        if (buffer[index] != (char)('a' + (position % 26))) {
+          _exit(4);
+        }
+      }
+      received += (size_t)count;
+    }
+    close(pipe_fds[0]);
+    _exit(received == sizeof(payload) ? 0 : 3);
+  }
+
+  close(pipe_fds[0]);
+  ssize_t written = write(pipe_fds[1], payload, sizeof(payload));
+  close(pipe_fds[1]);
+  int status = 0;
+  if (waitpid(child, &status, 0) != child) {
+    perror("large scalar waitpid");
+    return -1;
+  }
+  if (written != (ssize_t)sizeof(payload) || !WIFEXITED(status) ||
+      WEXITSTATUS(status) != 0) {
+    fprintf(stderr,
+            "large blocking pipe write returned %zd/%zu, child status %#x\n",
+            written, sizeof(payload), status);
+    return -1;
+  }
+  return 0;
+}
+
+struct blocked_pipe_writer {
+  int fd;
+  char byte;
+  size_t length;
+  pthread_barrier_t *barrier;
+  _Atomic int *entered;
+  _Atomic int *finished;
+  _Atomic int *completion_counter;
+  int completion_order;
+  ssize_t result;
+  int error;
+  int vectored;
+};
+
+static void *run_blocked_pipe_writer(void *opaque) {
+  struct blocked_pipe_writer *writer = opaque;
+  char *payload = malloc(writer->length);
+  if (payload == NULL) {
+    writer->error = ENOMEM;
+    return NULL;
+  }
+  memset(payload, writer->byte, writer->length);
+  pthread_barrier_wait(writer->barrier);
+  atomic_fetch_add_explicit(writer->entered, 1, memory_order_release);
+  if (writer->vectored) {
+    struct iovec iov[2] = {
+        {.iov_base = payload, .iov_len = writer->length / 2},
+        {.iov_base = payload + writer->length / 2,
+         .iov_len = writer->length - writer->length / 2},
+    };
+    writer->result = writev(writer->fd, iov, 2);
+  } else {
+    writer->result = write(writer->fd, payload, writer->length);
+  }
+  writer->error = errno;
+  writer->completion_order =
+      atomic_fetch_add_explicit(writer->completion_counter, 1,
+                                memory_order_acq_rel);
+  atomic_fetch_add_explicit(writer->finished, 1, memory_order_release);
+  free(payload);
+  return NULL;
+}
+
+static int check_two_blocked_pipe_writers(void) {
+  int pipe_fds[2];
+  if (pipe(pipe_fds) != 0) {
+    perror("two-writer pipe");
+    return -1;
+  }
+  int capacity = fcntl(pipe_fds[1], F_GETPIPE_SZ);
+  if (capacity <= 0) {
+    perror("two-writer capacity");
+    return -1;
+  }
+  char *fill = malloc((size_t)capacity);
+  if (fill == NULL) {
+    perror("two-writer fill allocation");
+    return -1;
+  }
+  memset(fill, 'F', (size_t)capacity);
+  if (write(pipe_fds[1], fill, (size_t)capacity) != capacity) {
+    perror("two-writer fill");
+    return -1;
+  }
+
+  pthread_barrier_t barrier;
+  if (pthread_barrier_init(&barrier, NULL, 3) != 0) {
+    perror("two-writer barrier");
+    return -1;
+  }
+  _Atomic int entered = 0;
+  _Atomic int finished = 0;
+  _Atomic int completion_counter = 0;
+  const size_t length = (size_t)capacity + 1024;
+  struct blocked_pipe_writer writers[2] = {
+      {.fd = pipe_fds[1],
+       .byte = 'A',
+       .length = length,
+       .barrier = &barrier,
+       .entered = &entered,
+       .finished = &finished,
+       .completion_counter = &completion_counter,
+       .completion_order = -1,
+       .result = -1,
+       .error = 0,
+       .vectored = 0},
+      {.fd = pipe_fds[1],
+       .byte = 'B',
+       .length = length,
+       .barrier = &barrier,
+       .entered = &entered,
+       .finished = &finished,
+       .completion_counter = &completion_counter,
+       .completion_order = -1,
+       .result = -1,
+       .error = 0,
+       .vectored = 1},
+  };
+  pthread_t threads[2];
+  for (size_t index = 0; index < 2; index++) {
+    if (pthread_create(&threads[index], NULL, run_blocked_pipe_writer,
+                       &writers[index]) != 0) {
+      perror("two-writer pthread_create");
+      return -1;
+    }
+  }
+  pthread_barrier_wait(&barrier);
+  while (atomic_load_explicit(&entered, memory_order_acquire) != 2) {
+    sched_yield();
+  }
+  for (int attempt = 0; attempt < 64; attempt++) {
+    sched_yield();
+  }
+  if (atomic_load_explicit(&finished, memory_order_acquire) != 0) {
+    fprintf(stderr, "a writer completed while the pipe was still full\n");
+    return -1;
+  }
+
+  char *received = malloc(length * 2);
+  if (received == NULL || read_exact(pipe_fds[0], fill, (size_t)capacity) != 0 ||
+      read_exact(pipe_fds[0], received, length * 2) != 0) {
+    return -1;
+  }
+  for (size_t index = 0; index < 2; index++) {
+    pthread_join(threads[index], NULL);
+    if (writers[index].result != (ssize_t)length) {
+      fprintf(stderr,
+              "blocked writer %zu returned %zd/%zu with errno %d\n", index,
+              writers[index].result, length, writers[index].error);
+      return -1;
+    }
+  }
+
+  size_t count_a = 0;
+  size_t count_b = 0;
+  size_t transitions = 0;
+  for (size_t index = 0; index < length * 2; index++) {
+    count_a += received[index] == 'A';
+    count_b += received[index] == 'B';
+    if (index > 0 && received[index] != received[index - 1]) {
+      transitions++;
+    }
+  }
+  if (count_a != length || count_b != length) {
+    fprintf(stderr, "blocked writers changed payload: A=%zu B=%zu expected=%zu\n",
+            count_a, count_b, length);
+    return -1;
+  }
+  printf("two-blocked-pipe-writers:%c:%zu:%d,%d\n", received[0], transitions,
+         writers[0].completion_order, writers[1].completion_order);
+
+  free(received);
+  free(fill);
+  close(pipe_fds[0]);
+  close(pipe_fds[1]);
+  pthread_barrier_destroy(&barrier);
+  return 0;
+}
+
+static void pipe_interrupt_handler(int signal_number) {
+  (void)signal_number;
+}
+
+static int check_interrupted_blocking_pipe_write(int vectored) {
+  enum { PIPE_BUF_BYTES = 4096 };
+  int pipe_fds[2];
+  if (pipe(pipe_fds) != 0) {
+    perror("interrupted pipe");
+    return -1;
+  }
+  int capacity = fcntl(pipe_fds[1], F_GETPIPE_SZ);
+  if (capacity <= PIPE_BUF_BYTES) {
+    fprintf(stderr, "interrupted pipe capacity %d is too small\n", capacity);
+    return -1;
+  }
+  size_t prefill = (size_t)capacity - PIPE_BUF_BYTES;
+  char *fill = malloc(prefill);
+  if (fill == NULL) {
+    perror("interrupted fill allocation");
+    return -1;
+  }
+  memset(fill, 'F', prefill);
+  if (write(pipe_fds[1], fill, prefill) != (ssize_t)prefill) {
+    perror("interrupted pipe fill");
+    return -1;
+  }
+
+  struct sigaction action = {.sa_handler = pipe_interrupt_handler};
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGUSR1, &action, NULL) != 0) {
+    perror("sigaction");
+    return -1;
+  }
+
+  _Atomic int entered = 0;
+  _Atomic int finished = 0;
+  _Atomic int completion_counter = 0;
+  pthread_barrier_t barrier;
+  pthread_barrier_init(&barrier, NULL, 2);
+  struct blocked_pipe_writer writer = {
+      .fd = pipe_fds[1],
+      .byte = vectored ? 'V' : 'S',
+      .length = (size_t)capacity + 1000,
+      .barrier = &barrier,
+      .entered = &entered,
+      .finished = &finished,
+      .completion_counter = &completion_counter,
+      .completion_order = -1,
+      .result = -1,
+      .error = 0,
+      .vectored = vectored,
+  };
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, run_blocked_pipe_writer, &writer) != 0) {
+    perror("interrupted pthread_create");
+    return -1;
+  }
+  pthread_barrier_wait(&barrier);
+
+  int unread = 0;
+  for (int attempt = 0; attempt < 10000; attempt++) {
+    if (ioctl(pipe_fds[0], FIONREAD, &unread) != 0) {
+      perror("interrupted FIONREAD");
+      return -1;
+    }
+    if ((size_t)unread > prefill) {
+      break;
+    }
+    sched_yield();
+  }
+  if ((size_t)unread <= prefill || (size_t)unread > (size_t)capacity) {
+    fprintf(stderr, "writer made no measurable partial progress: unread=%d\n",
+            unread);
+    return -1;
+  }
+  if (pthread_kill(thread, SIGUSR1) != 0 || pthread_join(thread, NULL) != 0) {
+    perror("interrupt writer");
+    return -1;
+  }
+  size_t partial = (size_t)unread - prefill;
+  if (writer.result != (ssize_t)partial || partial == 0 ||
+      partial >= writer.length) {
+    fprintf(stderr,
+            "interrupted writer vectored=%d returned %zd, measured partial=%zu, errno=%d\n",
+            vectored, writer.result, partial, writer.error);
+    return -1;
+  }
+
+  char *received = malloc((size_t)unread);
+  if (received == NULL ||
+      read_exact(pipe_fds[0], received, (size_t)unread) != 0) {
+    return -1;
+  }
+  for (size_t index = 0; index < prefill; index++) {
+    if (received[index] != 'F') {
+      fprintf(stderr, "interrupted writer changed prefill at %zu\n", index);
+      return -1;
+    }
+  }
+  for (size_t index = prefill; index < (size_t)unread; index++) {
+    if (received[index] != writer.byte) {
+      fprintf(stderr, "interrupted writer changed payload at %zu\n", index);
+      return -1;
+    }
+  }
+
+  free(received);
+  free(fill);
+  close(pipe_fds[0]);
+  close(pipe_fds[1]);
+  pthread_barrier_destroy(&barrier);
+  return (int)partial;
+}
+
+static int check_replaced_blocking_pipe_fd(int vectored) {
+  int original[2];
+  int replacement[2];
+  if (pipe(original) != 0 || pipe(replacement) != 0) {
+    perror("replacement pipe");
+    return -1;
+  }
+  int capacity = fcntl(original[1], F_GETPIPE_SZ);
+  if (capacity <= 0) {
+    perror("replacement pipe capacity");
+    return -1;
+  }
+  char *fill = malloc((size_t)capacity);
+  if (fill == NULL) {
+    perror("replacement fill allocation");
+    return -1;
+  }
+  memset(fill, 'F', (size_t)capacity);
+  if (write(original[1], fill, (size_t)capacity) != capacity) {
+    perror("replacement pipe fill");
+    return -1;
+  }
+
+  _Atomic int entered = 0;
+  _Atomic int finished = 0;
+  _Atomic int completion_counter = 0;
+  pthread_barrier_t barrier;
+  pthread_barrier_init(&barrier, NULL, 2);
+  struct blocked_pipe_writer writer = {
+      .fd = original[1],
+      .byte = vectored ? 'V' : 'S',
+      .length = (size_t)capacity + 1000,
+      .barrier = &barrier,
+      .entered = &entered,
+      .finished = &finished,
+      .completion_counter = &completion_counter,
+      .completion_order = -1,
+      .result = -1,
+      .error = 0,
+      .vectored = vectored,
+  };
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, run_blocked_pipe_writer, &writer) != 0) {
+    perror("replacement pthread_create");
+    return -1;
+  }
+  pthread_barrier_wait(&barrier);
+  while (atomic_load_explicit(&entered, memory_order_acquire) != 1) {
+    sched_yield();
+  }
+  for (int attempt = 0; attempt < 64; attempt++) {
+    sched_yield();
+  }
+  if (atomic_load_explicit(&finished, memory_order_acquire) != 0) {
+    fprintf(stderr, "replacement writer completed while the pipe was full\n");
+    return -1;
+  }
+  if (dup2(replacement[1], original[1]) != original[1]) {
+    perror("replacement dup2");
+    return -1;
+  }
+  if (pthread_join(thread, NULL) != 0) {
+    perror("replacement pthread_join");
+    return -1;
+  }
+  if (writer.result != -1 || writer.error != EOPNOTSUPP) {
+    fprintf(stderr,
+            "replaced writer vectored=%d returned %zd with errno %d, expected EOPNOTSUPP\n",
+            vectored, writer.result, writer.error);
+    return -1;
+  }
+
+  if (read_exact(original[0], fill, (size_t)capacity) != 0) {
+    return -1;
+  }
+  for (int index = 0; index < capacity; index++) {
+    if (fill[index] != 'F') {
+      fprintf(stderr, "replaced writer changed the original pipe at %d\n", index);
+      return -1;
+    }
+  }
+  int flags = fcntl(replacement[0], F_GETFL);
+  if (flags < 0 || fcntl(replacement[0], F_SETFL, flags | O_NONBLOCK) != 0) {
+    perror("replacement read O_NONBLOCK");
+    return -1;
+  }
+  char unexpected = 0;
+  errno = 0;
+  if (read(replacement[0], &unexpected, 1) != -1 || errno != EAGAIN) {
+    fprintf(stderr,
+            "replaced writer vectored=%d sent a tail to the replacement pipe\n",
+            vectored);
+    return -1;
+  }
+
+  free(fill);
+  close(original[0]);
+  close(original[1]);
+  close(replacement[0]);
+  close(replacement[1]);
+  pthread_barrier_destroy(&barrier);
+  return 0;
+}
+
 static int check_failed_write_preserves_metadata(void) {
   char path[] = "/tmp/hermit-writev-XXXXXX";
   int fd = mkstemp(path);
@@ -794,7 +1232,8 @@ int main(int argc, char **argv) {
   }
   if (argc > 1 && strcmp(argv[1], "record-pipe") == 0) {
     if (check_atomic_full_pipe() != 0 || check_large_iovec_snapshot() != 0 ||
-        check_large_blocking_pipe() != 0) {
+        check_large_blocking_pipe() != 0 || check_large_blocking_write() != 0 ||
+        check_two_blocked_pipe_writers() != 0) {
       return 1;
     }
     puts("writev-determinism-ok");
@@ -817,6 +1256,14 @@ int main(int argc, char **argv) {
   }
   if (argc > 1 && strcmp(argv[1], "partial-mixed") == 0) {
     return check_signal_after_partial_writev(PARTIAL_SIGNAL_MIXED) == 0 ? 0 : 1;
+  }
+  if (argc > 1 && strcmp(argv[1], "fd-replacement") == 0) {
+    if (check_replaced_blocking_pipe_fd(0) != 0 ||
+        check_replaced_blocking_pipe_fd(1) != 0) {
+      return 1;
+    }
+    puts("pipe-fd-replacement-refused-without-redirection");
+    return 0;
   }
 
   int pipe_fds[2];
@@ -843,9 +1290,13 @@ int main(int argc, char **argv) {
   close(sockets[0]);
   close(sockets[1]);
 
+  int scalar_partial = check_interrupted_blocking_pipe_write(0);
+  int vector_partial = check_interrupted_blocking_pipe_write(1);
   if (check_atomic_full_pipe() != 0 || check_readonly_iovec() != 0 ||
       check_large_iovec_snapshot() != 0 || check_large_blocking_pipe() != 0 ||
-      check_failed_write_preserves_metadata() != 0 ||
+      check_large_blocking_write() != 0 ||
+      check_two_blocked_pipe_writers() != 0 || scalar_partial <= 0 ||
+      vector_partial <= 0 || check_failed_write_preserves_metadata() != 0 ||
       check_signal_interrupts_full_pipe_writev(0) != 0 ||
       check_signal_interrupts_full_pipe_writev(1) != 0 ||
       check_signal_after_partial_writev(PARTIAL_SIGNAL_CAUGHT) != 0 ||
@@ -855,6 +1306,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  printf("interrupted-pipe-write:%d,%d\n", scalar_partial, vector_partial);
   puts("writev-determinism-ok");
   return 0;
 }

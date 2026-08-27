@@ -1959,16 +1959,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
         }
 
-        let (fd_type, physically_nonblocking, logically_nonblocking, resource, raw_ino) =
-            guest.thread_state().with_detfd(call.fd(), |detfd| {
-                (
-                    detfd.ty(),
-                    detfd.physically_nonblocking(),
-                    detfd.is_nonblocking(),
-                    detfd.resource(),
-                    detfd.stat().map(|x| x.inode),
-                )
-            })?;
+        let (
+            fd_type,
+            physically_nonblocking,
+            logically_nonblocking,
+            open_file_id,
+            resource,
+            raw_ino,
+        ) = guest.thread_state().with_detfd(call.fd(), |detfd| {
+            (
+                detfd.ty(),
+                detfd.physically_nonblocking(),
+                detfd.is_nonblocking(),
+                detfd.open_file_id(),
+                detfd.resource(),
+                detfd.stat().map(|x| x.inode),
+            )
+        })?;
         // It doesn't matter much where the linearization point for this mtime bump falls:
         if guest.config().virtualize_metadata {
             let r =
@@ -1997,7 +2004,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         // to run in the background, which assumes non-interference -- but a pipe/socket write
         // and its paired read are not independent, deadlocking the scheduler. Blocking-fd
         // writes therefore use the original synchronous path, as before this feature.
-        let res = if physically_nonblocking
+        let res = if physically_nonblocking && fd_type == FdType::Pipe && !logically_nonblocking {
+            self.execute_blocking_pipe_write(guest, call, open_file_id)
+                .await
+        } else if physically_nonblocking
             && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
         {
             self.execute_nonblockable_fd_syscall(guest, call).await
@@ -2169,16 +2179,23 @@ impl<T: RecordOrReplay> Detcore<T> {
             return self.writev_timer_slack(guest, call.fd(), iovecs, 0).await;
         }
 
-        let (fd_type, physically_nonblocking, logically_nonblocking, resource, raw_ino) =
-            guest.thread_state().with_detfd(call.fd(), |detfd| {
-                (
-                    detfd.ty(),
-                    detfd.physically_nonblocking(),
-                    detfd.is_nonblocking(),
-                    detfd.resource(),
-                    detfd.stat().map(|x| x.inode),
-                )
-            })?;
+        let (
+            fd_type,
+            physically_nonblocking,
+            logically_nonblocking,
+            open_file_id,
+            resource,
+            raw_ino,
+        ) = guest.thread_state().with_detfd(call.fd(), |detfd| {
+            (
+                detfd.ty(),
+                detfd.physically_nonblocking(),
+                detfd.is_nonblocking(),
+                detfd.open_file_id(),
+                detfd.resource(),
+                detfd.stat().map(|x| x.inode),
+            )
+        })?;
 
         if let Some(resource) = resource {
             let mut request = guest.thread_state().mk_request(resource, Permission::W);
@@ -2195,7 +2212,8 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let result = if physically_nonblocking && fd_type == FdType::Pipe && !logically_nonblocking
         {
-            self.execute_blocking_pipe_writev(guest, call).await
+            self.execute_blocking_pipe_writev(guest, call, open_file_id)
+                .await
         } else if physically_nonblocking
             && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
         {
