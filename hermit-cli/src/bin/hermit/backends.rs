@@ -766,11 +766,18 @@ pub(super) fn run_dbt(
     apply_exact_environment(&mut guest, &environment);
     guest.args(&prepared.args);
 
+    // The Detcore RPC handler can wait on the scheduler. Keep the scheduler
+    // and coordinator service on independent executor threads so a synchronous
+    // guest request cannot block the task that must answer it.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|error| Error::msg(format!("failed to start the DBT coordinator: {error}")))?;
+
     if !verify {
         if stdin_is_terminal {
-            let status = runner
-                .status(&guest)
-                .map_err(|error| dbt_run_error(&drrun, error))?;
+            let status = run_status(&runtime, &runner, &guest, &drrun, config)?;
             if summary {
                 eprintln!(
                     ":: DBT summary: see the `reverie-dbt: tool=Detcore ...` line above \
@@ -779,7 +786,7 @@ pub(super) fn run_dbt(
             }
             return Ok(process_status(status));
         }
-        let output = run_once(&runner, &guest, &drrun, std::io::stdin())?;
+        let output = run_once(&runtime, &runner, &guest, &drrun, config, std::io::stdin())?;
         write_output(&output)?;
         if summary {
             match detcore_summary(&output) {
@@ -830,19 +837,21 @@ pub(super) fn run_dbt(
 
     eprintln!(":: DBT Run1...");
     let first_raw = if terminal_stdin {
-        run_once_with_terminal_input(&runner1, &guest, &drrun)
+        run_once_with_terminal_input(&runtime, &runner1, &guest, &drrun, config)
     } else {
         match replayable_stdin {
             Some(input) => run_once(
+                &runtime,
                 &runner1,
                 &guest,
                 &drrun,
+                config,
                 TeeReader {
                     input,
                     replay: replay.try_clone()?,
                 },
             ),
-            None => run_once(&runner1, &guest, &drrun, std::io::empty()),
+            None => run_once(&runtime, &runner1, &guest, &drrun, config, std::io::empty()),
         }
     };
     let first_raw = match first_raw {
@@ -919,9 +928,16 @@ pub(super) fn run_dbt(
     replay.seek(SeekFrom::Start(0))?;
     eprintln!(":: DBT Run2...");
     let second_raw = match if terminal_stdin {
-        run_once_with_terminal_input(&runner2, &guest, &drrun)
+        run_once_with_terminal_input(&runtime, &runner2, &guest, &drrun, config)
     } else {
-        run_once(&runner2, &guest, &drrun, replay.try_clone()?)
+        run_once(
+            &runtime,
+            &runner2,
+            &guest,
+            &drrun,
+            config,
+            replay.try_clone()?,
+        )
     } {
         Ok(output) => output,
         Err(error) => {
@@ -1079,25 +1095,71 @@ pub(super) fn run_dbt(
 
 #[cfg(feature = "dbt")]
 fn run_once<R: Read + Send + 'static>(
+    runtime: &tokio::runtime::Runtime,
     runner: &DbtRunner,
     guest: &StdCommand,
     drrun: &Path,
+    config: &Config,
     input: R,
 ) -> Result<Output, Error> {
-    runner
-        .output_with_detached_reader(guest, input)
-        .map_err(|error| dbt_run_error(drrun, error))
+    let (output, global) = runtime
+        .block_on(
+            runner.output_with_detached_reader_and_global::<detcore::GlobalState, _>(
+                guest,
+                input,
+                config.clone(),
+            ),
+        )
+        .map_err(|error| dbt_run_error(drrun, error))?;
+    clean_up_dbt_global(runtime, &output.status, global);
+    Ok(output)
 }
 
 #[cfg(feature = "dbt")]
 fn run_once_with_terminal_input(
+    runtime: &tokio::runtime::Runtime,
     runner: &DbtRunner,
     guest: &StdCommand,
     drrun: &Path,
+    config: &Config,
 ) -> Result<Output, Error> {
-    runner
-        .output_with_inherited_stdin(guest)
-        .map_err(|error| dbt_run_error(drrun, error))
+    let (output, global) = runtime
+        .block_on(
+            runner.output_with_inherited_stdin_and_global::<detcore::GlobalState>(
+                guest,
+                config.clone(),
+            ),
+        )
+        .map_err(|error| dbt_run_error(drrun, error))?;
+    clean_up_dbt_global(runtime, &output.status, global);
+    Ok(output)
+}
+
+#[cfg(feature = "dbt")]
+fn run_status(
+    runtime: &tokio::runtime::Runtime,
+    runner: &DbtRunner,
+    guest: &StdCommand,
+    drrun: &Path,
+    config: &Config,
+) -> Result<std::process::ExitStatus, Error> {
+    let (status, global) = runtime
+        .block_on(runner.status_with_global::<detcore::GlobalState>(guest, config.clone()))
+        .map_err(|error| dbt_run_error(drrun, error))?;
+    clean_up_dbt_global(runtime, &status, global);
+    Ok(status)
+}
+
+#[cfg(feature = "dbt")]
+fn clean_up_dbt_global(
+    runtime: &tokio::runtime::Runtime,
+    status: &std::process::ExitStatus,
+    global: detcore::GlobalState,
+) {
+    if !status.success() {
+        global.force_shutdown_with_error();
+    }
+    runtime.block_on(global.clean_up(false, &None));
 }
 
 /// Name the stage that actually failed.
@@ -1124,30 +1186,11 @@ fn run_once_with_terminal_input(
 /// executable, `ExecutableFileBusy`). Where the kind does not prove a spawn
 /// failure this deliberately does NOT claim one.
 ///
-/// THE RESIDUAL, STATED BECAUSE IT IS NOT FIXED HERE. Most post-launch failures
-/// arrive as `Other` -- including the evidence-finalization error that motivated
-/// this function, which is built with `io::Error::other` -- but NOT all of them.
-/// `reverie-dbt` launcher.rs, in the `(Ok(status), Err(error))` arm, re-emits the
-/// inner evidence error's OWN kind rather than forcing `Other`:
-///
-///     (Ok(status), Err(error)) => Err(io::Error::new(error.kind(), ...))
-///
-/// and the evidence layer can produce spawn-shaped kinds after the guest is
-/// already running: `PermissionDenied` from its peer-credential checks, and
-/// `NotFound` from a bare `?` on `/proc/<pid>/stat` when the peer exits before
-/// it is read. Both still misreport here as launch failures.
-///
-/// That `NotFound` case is the sharpest one, and worth naming so nobody has to
-/// rediscover it: the pid exists ONLY because the guest launched, so the error
-/// that most conclusively proves a successful launch is the one that would be
-/// blamed on the binary.
-///
-/// This is narrower than what it replaces -- previously EVERY post-launch error
-/// claimed a launch failure -- but it is not zero. The fix belongs in
-/// reverie-dbt, whose arm already holds `Ok(status)` and therefore knows the
-/// guest ran: it should not re-emit a spawn-shaped kind at all. Do NOT patch it
-/// here by matching on the message text; classifying a typed error by its
-/// display string is the shape this project removes elsewhere.
+/// The pinned Reverie revision preserves this distinction: once it has an exit
+/// status, an evidence-finalization failure is returned as `Other`, even when
+/// the underlying error was `NotFound` or `PermissionDenied`. Spawn failures
+/// bypass that combination and retain their original kind. Do not replace this
+/// typed boundary with matching on display text.
 #[cfg(feature = "dbt")]
 fn dbt_run_error(drrun: &Path, error: std::io::Error) -> Error {
     use std::io::ErrorKind;
