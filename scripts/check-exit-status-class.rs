@@ -150,6 +150,8 @@ const EXEMPT_FILES: [(&str, &str); 1] = [(
 /// hermit-chosen value use `HERMIT_INTERNAL_FAILURE_EXIT` rather than `125`.
 const BASELINE: usize = 17;
 
+const REQUIRED_SCAN_ROOTS: [&str; 3] = ["hermit-cli/tests", "detcore/tests", "tests"];
+
 struct Site {
     file: String,
     line: usize,
@@ -157,20 +159,80 @@ struct Site {
     text: String,
 }
 
-fn tracked_test_files() -> Vec<String> {
-    let out = Command::new("git")
-        .args([
-            "ls-files",
-            "hermit-cli/tests/*.rs",
-            "detcore/tests/*.rs",
-            "tests/*.rs",
-        ])
-        .output()
-        .expect("git ls-files failed");
-    String::from_utf8_lossy(&out.stdout)
+fn require_scan_roots(mut is_dir: impl FnMut(&str) -> bool) -> Result<(), String> {
+    let missing: Vec<_> = REQUIRED_SCAN_ROOTS
+        .iter()
+        .copied()
+        .filter(|root| !is_dir(root))
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "missing required scan root(s): {}",
+            missing.join(", ")
+        ))
+    }
+}
+
+fn files_from_git_output(out: std::process::Output) -> Result<Vec<String>, String> {
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!(
+            "git ls-files exited {}{}",
+            out.status,
+            if stderr.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", stderr.trim())
+            }
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
         .lines()
         .map(str::to_owned)
-        .collect()
+        .collect())
+}
+
+fn tracked_test_files_with(
+    is_dir: impl FnMut(&str) -> bool,
+    git_ls_files: impl FnOnce(&[String]) -> std::io::Result<std::process::Output>,
+) -> Result<Vec<String>, String> {
+    require_scan_roots(is_dir)?;
+    let pathspecs: Vec<_> = REQUIRED_SCAN_ROOTS
+        .iter()
+        .map(|root| format!("{root}/*.rs"))
+        .collect();
+    let out =
+        git_ls_files(&pathspecs).map_err(|error| format!("could not run git ls-files: {error}"))?;
+    let files = files_from_git_output(out)?;
+    let empty_roots: Vec<_> = REQUIRED_SCAN_ROOTS
+        .iter()
+        .copied()
+        .filter(|root| {
+            let prefix = format!("{root}/");
+            !files.iter().any(|file| file.starts_with(&prefix))
+        })
+        .collect();
+    if !empty_roots.is_empty() {
+        return Err(format!(
+            "git ls-files returned no tracked Rust files under required scan root(s): {}",
+            empty_roots.join(", ")
+        ));
+    }
+    Ok(files)
+}
+
+fn tracked_test_files() -> Result<Vec<String>, String> {
+    tracked_test_files_with(
+        |root| Path::new(root).is_dir(),
+        |pathspecs| {
+            Command::new("git")
+                .args(["ls-files", "--"])
+                .args(pathspecs)
+                .output()
+        },
+    )
 }
 
 /// True when `window` looks like an exit-status comparison rather than any other
@@ -184,15 +246,14 @@ fn declared(context: &str) -> bool {
     DECLARATIONS.iter().any(|d| context.contains(d))
 }
 
-fn scan(files: &[String]) -> Vec<Site> {
+fn scan(files: &[String]) -> Result<Vec<Site>, String> {
     let mut found = Vec::new();
     for file in files {
-        let Ok(body) = fs::read_to_string(Path::new(file)) else {
-            continue;
-        };
+        let body = fs::read_to_string(Path::new(file))
+            .map_err(|error| format!("could not read tracked test file {file}: {error}"))?;
         found.extend(scan_text(file, &body));
     }
-    found
+    Ok(found)
 }
 
 /// The matcher itself, over (path, contents), so it can be exercised on fixtures.
@@ -251,7 +312,16 @@ fn scan_text(file: &str, body: &str) -> Vec<Site> {
 fn main() {
     rust_script_prelude::init();
     let gate = std::env::args().any(|a| a == "--gate");
-    let sites = scan(&tracked_test_files());
+    let files = tracked_test_files().unwrap_or_else(|error| {
+        eprintln!("COULD NOT DETERMINE: {error}");
+        eprintln!("  This is not a clean result because the required scan did not complete.");
+        std::process::exit(2);
+    });
+    let sites = scan(&files).unwrap_or_else(|error| {
+        eprintln!("COULD NOT DETERMINE: {error}");
+        eprintln!("  This is not a clean result because the required scan did not complete.");
+        std::process::exit(2);
+    });
     let colliding: BTreeMap<u32, &str> = COLLIDING.iter().copied().collect();
 
     for (file, reason) in EXEMPT_FILES {
@@ -311,11 +381,11 @@ fn main() {
 /// dropping the `.code()` half of `is_exit_status_context`, collapsing the
 /// FORWARD context window, and widening the declaration window DOWNWARD. Each
 /// makes the matcher see less, so the count falls and reads as progress. They
-/// survived for one reason worth remembering: every fixture written for `.code()`
-/// spelled it `output.status.code()`, which also contains `status`, and every
-/// fixture put the status mention ABOVE the value. A suite inherits the blind
-/// spots of whoever wrote its fixtures, so the question to ask of this module is
-/// never "do the tests pass" but "which shapes are still unpinned".
+/// survived for one reason worth remembering: every `.code()` fixture also
+/// contained `status`, and no fixture put the status mention BELOW the value. A
+/// suite inherits the blind spots of whoever wrote its fixtures, so the question
+/// to ask of this module is never "do the tests pass" but "which shapes are still
+/// unpinned".
 ///
 /// The three are pinned below. If you add a recognised shape, add its case here
 /// and verify by MUTATION that removing the shape fails your new case -- a test
@@ -326,7 +396,8 @@ fn main() {
 /// the most extreme narrowing and left every intermediate value green: the
 /// forward window passed at `i + 6` down to `i + 2`, the downward declaration
 /// window at `i + 3` through `i + 7`, the upward one at `i - 4` through `i - 6`.
-/// Each assertion message named a range the fixture did not hold.
+/// The forward-window assertion message named a range its fixture did not hold;
+/// the declaration-window assertions only called their fixtures distant.
 /// `agent(hermit-007)`'s codex lane found the first by sweeping instead of
 /// spot-checking; the other two came out of the same sweep. **A boundary test
 /// belongs ON the boundary** -- at the nearest position the window excludes -- so
@@ -487,11 +558,21 @@ mod tests {
     }
 
     #[test]
+    fn exit_class_declaration_requires_the_colon() {
+        assert_eq!(
+            count("// EXIT-CLASS guest\nassert_eq!(output.status.code(), Some(1));"),
+            1,
+            "EXIT-CLASS without the colon must not satisfy the site"
+        );
+    }
+
+    #[test]
     fn a_declaration_far_above_the_site_does_not_satisfy_it() {
         // ⚠️ FOUR LINES ABOVE, NOT SIX, AND THE DISTANCE IS THE TEST. `clo =
         // i - 3` admits from `i - 3`, so `i - 4` is the nearest position it
-        // excludes. At six lines this passed with `clo` widened to `i - 4`,
-        // `i - 5` and `i - 6` -- it caught only a widening past six. Third
+        // excludes. With six filler lines the declaration sat at `i - 7`, so
+        // this passed with `clo` widened to `i - 4`, `i - 5` and `i - 6` -- it
+        // caught only a widening past six. Third
         // instance of the boundary-test-off-the-boundary defect in this module,
         // found by sweeping the range after `agent(hermit-007)`'s codex lane
         // found the first.
@@ -532,6 +613,70 @@ mod tests {
                 "{file} is exempt without a substantive reason"
             );
         }
+    }
+
+    // ---- scan inputs must not disappear -------------------------------------
+
+    #[test]
+    fn all_required_scan_roots_are_pinned() {
+        assert_eq!(
+            REQUIRED_SCAN_ROOTS,
+            ["hermit-cli/tests", "detcore/tests", "tests"]
+        );
+
+        let error = tracked_test_files_with(
+            |root| root != "detcore/tests",
+            |_| -> std::io::Result<std::process::Output> {
+                panic!("git ls-files must not run when a required scan root is missing")
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("detcore/tests"),
+            "the refusal must name the missing required scan root: {error}"
+        );
+    }
+
+    #[test]
+    fn git_ls_files_nonzero_exit_refuses_even_with_stdout() {
+        let out = Command::new("sh")
+            .args(["-c", "printf 'tests/false.rs\\n'; exit 128"])
+            .output()
+            .unwrap();
+        let error = tracked_test_files_with(|_| true, |_| Ok(out)).unwrap_err();
+        assert!(error.contains("git ls-files exited"), "{error}");
+        assert!(error.contains("128"), "{error}");
+    }
+
+    #[test]
+    fn git_output_must_cover_every_required_scan_root() {
+        let out = Command::new("sh")
+            .args([
+                "-c",
+                "printf 'hermit-cli/tests/a.rs\\ndetcore/tests/b.rs\\n'",
+            ])
+            .output()
+            .unwrap();
+        let error = tracked_test_files_with(|_| true, |_| Ok(out)).unwrap_err();
+        assert!(error.contains("tests"), "{error}");
+        assert!(
+            !error.contains("hermit-cli/tests") && !error.contains("detcore/tests"),
+            "the refusal must name only the uncovered required root: {error}"
+        );
+    }
+
+    #[test]
+    fn a_tracked_file_read_failure_is_not_skipped() {
+        let missing = "/definitely-not-a-hermit-checker-fixture.rs";
+        let error = match scan(&[missing.to_owned()]) {
+            Ok(_) => panic!("an unreadable tracked test file must refuse the scan"),
+            Err(error) => error,
+        };
+        assert!(error.contains(missing), "{error}");
+        assert!(
+            error.contains("could not read tracked test file"),
+            "{error}"
+        );
     }
 
     // ---- reporting -----------------------------------------------------------
