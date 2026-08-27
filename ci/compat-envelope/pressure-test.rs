@@ -1825,153 +1825,6 @@ fn series_run_index(dir_name: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn series_result_run_index(
-    metadata: &RunMetadata,
-    dir_name: &str,
-    attempt: u64,
-) -> Result<u64, String> {
-    if attempt == 0 {
-        return Err("series result attempt must be positive".into());
-    }
-    let repetition = series_run_index(dir_name);
-    let stride = u64::try_from(metadata.repetitions.unwrap_or(1))
-        .map_err(|_| "series repetition count does not fit u64")?;
-    repetition
-        .checked_add(
-            (attempt - 1)
-                .checked_mul(stride)
-                .ok_or("series result-attempt index overflow")?,
-        )
-        .ok_or_else(|| "series run index overflow".into())
-}
-
-/// Pull the located coordinates out of a row's attempts.
-///
-/// FIRST attempt that located each coordinate wins, matching the runner's own
-/// `attempts.iter().find_map(..)` rule: a passing retry must not erase a
-/// divergence a previous attempt found. Absent and explicitly-null are both
-/// treated as "not located" and simply omitted, so the object is present only
-/// when it carries something.
-fn series_coordinates(attempts: &[JsonValue]) -> Option<JsonValue> {
-    let mut located = serde_json::Map::new();
-    for key in SERIES_COORDINATES {
-        if let Some(value) = attempts.iter().find_map(|attempt| {
-            attempt
-                .pointer(&format!("/verification/{key}"))
-                .or_else(|| attempt.get(key))
-                .and_then(JsonValue::as_u64)
-        }) {
-            located.insert(key.to_string(), JsonValue::from(value));
-        }
-    }
-    (!located.is_empty()).then_some(JsonValue::Object(located))
-}
-
-fn logical_time_nanoseconds(text: &str) -> Option<u64> {
-    let value = text.trim().replace('_', "");
-    if let Some(nanoseconds) = value.strip_suffix("ns") {
-        return nanoseconds.parse().ok();
-    }
-    let seconds = value.strip_suffix('s')?;
-    let (whole, fraction) = seconds.split_once('.').unwrap_or((seconds, ""));
-    if fraction.len() > 9 || !whole.bytes().all(|b| b.is_ascii_digit())
-        || !fraction.bytes().all(|b| b.is_ascii_digit())
-    {
-        return None;
-    }
-    let whole = whole.parse::<u64>().ok()?;
-    let mut fraction = fraction.to_string();
-    fraction.extend(std::iter::repeat_n('0', 9 - fraction.len()));
-    whole
-        .checked_mul(1_000_000_000)?
-        .checked_add(fraction.parse::<u64>().ok()?)
-}
-
-/// Build one series row per retained cell result.
-///
-/// Separated from the filesystem and the subprocess so every mapping decision is
-/// testable without a campaign on disk.
-fn series_rows(
-    metadata: &RunMetadata,
-    results: &[(String, ResultRow)],
-    emitted_at: &str,
-) -> Result<Vec<JsonValue>, String> {
-    let mut rows = Vec::new();
-    for (dir_name, row) in results {
-        let outcome = series_outcome(&row.outcome)?;
-        let run_index = series_result_run_index(metadata, dir_name, row.attempt)?;
-        let mut payload = serde_json::Map::new();
-        payload.insert(
-            "cell".into(),
-            JsonValue::from(series_cell(&row.test, &row.mode, row.backend.as_deref())),
-        );
-        // The tree this measurement is attributed to. See the note below on why
-        // the binary's provenance rides alongside rather than replacing it.
-        payload.insert("tree".into(), JsonValue::from(metadata.hermit_sha.clone()));
-        payload.insert(
-            "run_index".into(),
-            JsonValue::from(run_index),
-        );
-        payload.insert("outcome".into(), JsonValue::from(outcome));
-        payload.insert("attempt".into(), JsonValue::from(row.attempt));
-        if let Some(timeout_seconds) = row.timeout_seconds {
-            payload.insert(
-                "timeout_seconds".into(),
-                JsonValue::from(timeout_seconds),
-            );
-        }
-        payload.insert(
-            "runtime".into(),
-            serde_json::json!({
-                "wall_time_min_ms": row.duration_ms,
-                "wall_time_max_ms": row.duration_ms,
-            }),
-        );
-        if let Some(coordinates) = series_coordinates(&row.attempts) {
-            payload.insert("coordinates".into(), coordinates);
-        }
-        // ⚠️ NON-IDENTITY, AND RECORDED ON PURPOSE. `tree` above is the CHECKOUT
-        // sha, which is what every other store keys on today, so it stays the
-        // identity and this store merges with the others. But a checkout sha is
-        // not the provenance of the binary that produced the measurement, and
-        // recording only it is how a result gets attributed to a commit that
-        // never built it. Carrying the run's dirty flag beside the key means a
-        // later audit can at least SEE the discrepancy instead of having to
-        // reconstruct it from artefacts that may no longer exist.
-        payload.insert(
-            "source_tree_dirty".into(),
-            JsonValue::from(metadata.source_tree_dirty),
-        );
-
-        let mut envelope = serde_json::Map::new();
-        envelope.insert("schema".into(), JsonValue::from("stress-series/v1"));
-        envelope.insert(
-            "event_id".into(),
-            JsonValue::from(if row.attempt == 1 {
-                format!("{}-{}", row.run_id, dir_name)
-            } else {
-                format!("{}-{}-attempt-{}", row.run_id, dir_name, row.attempt)
-            }),
-        );
-        envelope.insert("event_type".into(), JsonValue::from("series.cell"));
-        envelope.insert("emitted_at".into(), JsonValue::from(emitted_at));
-        envelope.insert("team".into(), JsonValue::from("hermit"));
-        envelope.insert("host".into(), JsonValue::from(series_host()));
-        envelope.insert("run_id".into(), JsonValue::from(row.run_id.clone()));
-        envelope.insert(
-            "producer".into(),
-            serde_json::json!({
-                "source": "observed",
-                "tool": "pressure-test",
-                "tool_version": "1",
-            }),
-        );
-        envelope.insert("series".into(), JsonValue::Object(payload));
-        rows.push(JsonValue::Object(envelope));
-    }
-    Ok(rows)
-}
-
 fn runtime_from_log(path: &Path) -> Result<JsonValue, String> {
     let text = fs::read_to_string(path)
         .map_err(|error| format!("cannot read retained verification log {}: {error}", path.display()))?;
@@ -2105,11 +1958,16 @@ fn emit_series(results: &Path) -> Result<(), String> {
         }
         let dir_name = entry.file_name().to_string_lossy().into_owned();
         for mut row in read_result_rows(&result_file)? {
-            row.run_index = Some(series_run_index(&dir_name));
+            let repetition = series_run_index(&dir_name);
+            row.run_index = Some(repetition);
             if row.runtime.is_none() && row.mode == "verify" {
                 row.runtime = retained_verification_runtime(&row.attempts)?;
             }
-            collected.push((dir_name.clone(), row));
+            let key = format!(
+                "{}/{}/{:020}/{:020}",
+                dir_name, row.test, repetition, row.attempt,
+            );
+            collected.push((key, row));
         }
     }
     if collected.is_empty() {
@@ -2186,315 +2044,6 @@ fn emit_series(results: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The SHORT host, which is what the shard path is keyed on.
-///
-/// `HOSTNAME` is frequently the FQDN. Sharding on `somehost.some.domain` rather
-/// than `somehost` would put one machine's rows in a different shard depending
-/// on how its resolver happened to be configured, so the first label is taken
-/// deliberately rather than incidentally. The example host is deliberately
-/// generic: scripts/check-portable-paths.sh rejects a literal developer host
-/// anywhere in a tracked build/run file, comments included.
-/// Checks for the series emission mapping.
-///
-/// Every one of these is a decision that would be invisible in the store if it
-/// were wrong: a mislabelled outcome, a dropped row, or an ordinal that made a
-/// five-run series look like five separate single runs.
-fn series_self_test() -> Result<(), String> {
-    for (outcome, expected) in [
-        ("PASS", "passed"),
-        ("FAIL", "diverged"),
-        ("TIMEOUT", "timeout"),
-        ("NO_RESULT", "no_result"),
-        ("ERROR", "errored"),
-    ] {
-        let got = series_outcome(outcome)?;
-        if got != expected {
-            return Err(format!("{outcome} mapped to {got:?}, expected {expected:?}"));
-        }
-    }
-    // An outcome nobody mapped must REFUSE, not be guessed into the nearest
-    // bucket. A wrong bucket is a permanent wrong row in an append-only store.
-    if series_outcome("SOMETHING_NEW").is_ok() {
-        return Err("an unmapped pressure outcome must refuse, not be guessed".into());
-    }
-
-    if series_cell("applications/timed-progress-bar", "verify", Some("ptrace"))
-        != "applications/timed-progress-bar/verify/ptrace"
-    {
-        return Err("cell identity must be <test>/<mode>/<backend>".into());
-    }
-
-    if series_run_index("a-cell-repetition-0004") != 4 {
-        return Err("the repetition ordinal must come from the retained directory".into());
-    }
-    // ⚠️ AN APPENDED RETRY MUST NOT VOID THE CELL. #2708 made the runner append a
-    // row per attempt; both readers here required exactly one and so discarded a
-    // retried cell entirely -- outcome, invocation and the divergence coordinates
-    // its verification report had already located. These brackets pin the three
-    // behaviours that replaced that refusal.
-    {
-        let path = std::env::temp_dir().join(format!(
-            "pressure-series-result-rows-{}",
-            std::process::id()
-        ));
-        let legacy_one = r#"{"schema":4,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"FAIL","duration_ms":100,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null,"artifact_dir":"/retained/runs/r/t-verify-ptrace"}"#;
-        let one = r#"{"schema":4,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"FAIL","timeout_seconds":15,"duration_ms":100,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null,"artifact_dir":"/retained/runs/r/t-verify-ptrace"}"#;
-        let two = r#"{"schema":4,"attempt":2,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"PASS","timeout_seconds":15,"duration_ms":200,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null,"artifact_dir":"/retained/runs/r/t-verify-ptrace-attempt-2"}"#;
-        // A pre-retry row with no ordinal or bound remains readable as attempt
-        // 1; once a retry exists, every observation must carry its own bound.
-        fs::write(&path, format!("{legacy_one}\n"))
-            .map_err(|e| format!("cannot write one-row series fixture: {e}"))?;
-        let single = read_result_rows(&path)?;
-        if single.len() != 1 || single[0].attempt != 1 || single[0].outcome != "FAIL" {
-            return Err("a row without an ordinal must read as attempt 1".into());
-        }
-        // Both attempts remain readable, while the last one is the terminal row
-        // whose outcome is compared with the harness exit.
-        fs::write(&path, format!("{one}\n{two}\n"))
-            .map_err(|e| format!("cannot write retry series fixture: {e}"))?;
-        let retried = read_result_rows(&path)?;
-        if retried.len() != 2
-            || retried[0].attempt != 1
-            || retried[0].outcome != "FAIL"
-            || retried[1].attempt != 2
-            || retried[1].outcome != "PASS"
-        {
-            return Err("a retried cell must select the terminal attempt".into());
-        }
-        // Append order is evidence. Reversing it is malformed rather than an
-        // invitation for the reader to silently reorder the retained file.
-        fs::write(&path, format!("{two}\n{one}\n"))
-            .map_err(|e| format!("cannot write reversed series fixture: {e}"))?;
-        if read_result_rows(&path).is_ok() {
-            return Err("result attempt order was silently rewritten by the reader".into());
-        }
-        // A repeated ordinal is a malformed file, not a retry.
-        fs::write(&path, format!("{one}\n{one}\n"))
-            .map_err(|e| format!("cannot write duplicate series fixture: {e}"))?;
-        if read_result_rows(&path).is_ok() {
-            return Err("a repeated attempt ordinal must be refused".into());
-        }
-        // A retained retry history must include every attempt in order. A gap
-        // would make the missing observation look as though it never ran.
-        let three = two.replace("\"attempt\":2", "\"attempt\":3");
-        fs::write(&path, format!("{one}\n{three}\n"))
-            .map_err(|e| format!("cannot write skipped-attempt series fixture: {e}"))?;
-        if read_result_rows(&path).is_ok() {
-            return Err("a retry history with a missing attempt must be refused".into());
-        }
-        // elapsed without the bound it ran against is not a usable retry
-        // observation. The old single-row shape above remains readable.
-        fs::write(&path, format!("{legacy_one}\n{two}\n"))
-            .map_err(|e| format!("cannot write missing-bound series fixture: {e}"))?;
-        if read_result_rows(&path).is_ok() {
-            return Err("a retry history missing attempt 1's bound must be refused".into());
-        }
-        // Rows from different cells are not one cell's log.
-        let other = one.replace("\"test\":\"t\"", "\"test\":\"other\"");
-        fs::write(&path, format!("{one}\n{other}\n"))
-            .map_err(|e| format!("cannot write mixed-cell series fixture: {e}"))?;
-        if read_result_rows(&path).is_ok() {
-            return Err("rows from more than one cell must be refused".into());
-        }
-        fs::write(&path, "\n  \n")
-            .map_err(|e| format!("cannot write empty series fixture: {e}"))?;
-        if read_result_rows(&path).is_ok() {
-            return Err("an empty result file must be refused".into());
-        }
-        fs::remove_file(&path)
-            .map_err(|e| format!("cannot remove series result fixture: {e}"))?;
-    }
-
-    // ⚠️ A DIVERGENCE ON AN EARLIER ATTEMPT MUST SURVIVE A PASSING RETRY.
-    // Without this the flake case is silently dropped: attempt 1 diverges,
-    // attempt 2 passes, the terminal row reports the pass and the coordinate the
-    // first attempt located is never seen by any cell.
-    {
-        let path = std::env::temp_dir().join(format!(
-            "pressure-series-divergence-rows-{}",
-            std::process::id()
-        ));
-        let diverged = r#"{"schema":4,"attempt":1,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"FAIL","first_divergent_record":93,"first_divergent_syscall":37,"first_divergent_scheduler_turn":68,"first_divergent_virtual_nanoseconds":7,"timeout_seconds":15,"duration_ms":100,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null,"artifact_dir":"/retained/runs/r/t-verify-ptrace"}"#;
-        let passed = r#"{"schema":4,"attempt":2,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"PASS","first_divergent_record":null,"first_divergent_syscall":null,"first_divergent_scheduler_turn":null,"first_divergent_virtual_nanoseconds":null,"timeout_seconds":15,"duration_ms":200,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null,"artifact_dir":"/retained/runs/r/t-verify-ptrace-attempt-2"}"#;
-        fs::write(&path, format!("{diverged}\n{passed}\n"))
-            .map_err(|e| format!("cannot write divergence retry fixture: {e}"))?;
-        let all = read_result_rows(&path)?;
-        if all.len() != 2 {
-            return Err("both attempts must parse".into());
-        }
-        let earlier = earlier_attempts_that_located(&all, 2);
-        if earlier.len() != 1 || earlier[0].attempt != 1 {
-            return Err(format!(
-                "the diverging first attempt must be reported as an earlier observation; got {} row(s)",
-                earlier.len()
-            ));
-        }
-        if earlier[0].first_divergent_record != Some(93) {
-            return Err("the earlier attempt must carry its own coordinate".into());
-        }
-        // The terminal attempt is still the one the cell's own row reports.
-        let terminal = all.last().ok_or("a terminal row must still be selected")?;
-        if terminal.attempt != 2 || terminal.outcome != "PASS" {
-            return Err("the terminal attempt must still be the cell's reported row".into());
-        }
-        // ⚠️ AND AN ATTEMPT THAT LOCATED NOTHING IS NOT AN OBSERVATION OF A
-        // DIVERGENCE. Absence and null both mean "did not locate", so neither may
-        // manufacture a row; only a located coordinate does.
-        if !earlier_attempts_that_located(&all, 1).is_empty() {
-            return Err("nothing precedes the first attempt, so nothing may be reported".into());
-        }
-        let both_clean = format!(
-            "{}\n{}\n",
-            diverged.replace("\"first_divergent_record\":93", "\"first_divergent_record\":null")
-                .replace("\"first_divergent_syscall\":37", "\"first_divergent_syscall\":null")
-                .replace("\"first_divergent_scheduler_turn\":68", "\"first_divergent_scheduler_turn\":null")
-                .replace("\"first_divergent_virtual_nanoseconds\":7", "\"first_divergent_virtual_nanoseconds\":null"),
-            passed
-        );
-        fs::write(&path, both_clean)
-            .map_err(|e| format!("cannot write clean retry fixture: {e}"))?;
-        let clean = read_result_rows(&path)?;
-        if !earlier_attempts_that_located(&clean, 2).is_empty() {
-            return Err(
-                "an earlier attempt that located NOTHING must not be reported as a divergence"
-                    .into(),
-            );
-        }
-        fs::remove_file(&path)
-            .map_err(|e| format!("cannot remove divergence retry fixture: {e}"))?;
-    }
-
-    if series_run_index("a-cell-with-no-suffix") != 0 {
-        return Err("a single-run campaign is a series of length one, ordinal 0".into());
-    }
-
-    // Absent and explicitly-null are both "not located" and must produce NO
-    // coordinates object, so a diverged row stays diverged-unlocated rather
-    // than carrying an empty one.
-    if series_coordinates(&[serde_json::json!({"verification": {"first_divergent_record": null}})])
-        .is_some()
-    {
-        return Err("a null coordinate must not produce a coordinates object".into());
-    }
-    let located = series_coordinates(&[
-        serde_json::json!({"verification": {"first_divergent_record": null}}),
-        serde_json::json!({"verification": {"first_divergent_record": 98}}),
-    ])
-    .ok_or("a located coordinate must produce a coordinates object")?;
-    if located.pointer("/first_divergent_record").and_then(JsonValue::as_u64) != Some(98) {
-        return Err("the first attempt that located a coordinate must win".into());
-    }
-
-    // ⚠️ THE ONE THAT MATTERS MOST. A red cell whose position could not be
-    // located must still EMIT A ROW, marked diverged and carrying no
-    // coordinates. Skipping it would make the store silently under-count
-    // exactly the cells that could not locate a divergence.
-    let metadata = RunMetadata {
-        schema: RUN_SCHEMA,
-        hermit_sha: "d601651a3a0f4865b72af50a9c5967eaf60c351a".into(),
-        detcore_tree: "0".repeat(40),
-        source_tree_dirty: false,
-        run_timeout_seconds: 60,
-        mode: None,
-        test: None,
-        backend: None,
-        cell_timeout_seconds: None,
-        sample: None,
-        seed: None,
-        unavailable_cells: 0,
-        repetitions: None,
-        run_id_prefix: None,
-        green: false,
-        jobs: 1,
-        eligible_cells: 0,
-        cells: Vec::new(),
-    };
-    let row = ResultRow {
-        first_divergent_record: None,
-        first_divergent_syscall: None,
-        first_divergent_scheduler_turn: None,
-        first_divergent_virtual_nanoseconds: None,
-        attempt: 1,
-        schema: 4,
-        run_id: "campaign".into(),
-        run_index: None,
-        hermit_sha: metadata.hermit_sha.clone(),
-        source_tree_dirty: false,
-        test: "language-runtimes/node-v8-jit".into(),
-        category: "language-runtimes".into(),
-        lane: "portable".into(),
-        mode: "verify".into(),
-        backend: Some("ptrace".into()),
-        classification: "required".into(),
-        outcome: "FAIL".into(),
-        timeout_seconds: Some(15),
-        duration_ms: Some(14_800),
-        runtime: None,
-        argv: Vec::new(),
-        guest_argv: Vec::new(),
-        env: BTreeMap::new(),
-        cwd: String::new(),
-        shell_command: String::new(),
-        attempts: Vec::new(),
-        reason: None,
-        error_kind: None,
-        artifact_dir: "/retained/runs/campaign/node-v8-jit-verify-ptrace".into(),
-        extra: BTreeMap::new(),
-    };
-    let rows = series_rows(
-        &metadata,
-        &[("a-cell-repetition-0000".to_string(), row.clone())],
-        "2026-08-25T00:00:00Z",
-    )?;
-    if rows.len() != 1 {
-        return Err("a diverged-but-unlocated cell must still emit exactly one row".into());
-    }
-    let payload = rows[0]
-        .get("series")
-        .ok_or("emitted row carries no series payload")?;
-    if payload.get("outcome").and_then(JsonValue::as_str) != Some("diverged") {
-        return Err("an unlocated divergence must still be recorded as diverged".into());
-    }
-    if payload.get("coordinates").is_some() {
-        return Err("an unlocated divergence must carry NO coordinates object".into());
-    }
-    let first = row;
-    let mut retry = first.clone();
-    retry.attempt = 2;
-    retry.duration_ms = Some(14_900);
-    retry.artifact_dir.push_str("-attempt-2");
-    let retry_rows = series_rows(
-        &metadata,
-        &[
-            ("a-cell-repetition-0000".to_string(), first),
-            ("a-cell-repetition-0000".to_string(), retry),
-        ],
-        "2026-08-25T00:00:00Z",
-    )?;
-    if retry_rows.len() != 2
-        || retry_rows[0]["series"]["run_index"] != 0
-        || retry_rows[0]["series"]["attempt"] != 1
-        || retry_rows[0]["series"]["runtime"]["wall_time_min_ms"] != 14_800
-        || retry_rows[0]["series"]["timeout_seconds"] != 15
-        || retry_rows[1]["series"]["run_index"] != 1
-        || retry_rows[1]["series"]["attempt"] != 2
-        || retry_rows[1]["series"]["runtime"]["wall_time_min_ms"] != 14_900
-        || retry_rows[0]["event_id"] == retry_rows[1]["event_id"]
-    {
-        return Err(format!(
-            "appended result observations did not emit independently with elapsed times and bounds: {retry_rows:?}"
-        ));
-    }
-    Ok(())
-}
-
-fn series_host() -> String {
-    std::env::var("HOSTNAME")
-        .ok()
-        .map(|h| h.split('.').next().unwrap_or("").to_string())
-        .filter(|h| !h.is_empty() && !h.contains('/') && h != "." && h != "..")
-        .unwrap_or_else(|| "unknown-host".to_string())
-}
 fn default_result_root(root: &Path) -> Result<PathBuf, String> {
     let sha = git_output(root, &["rev-parse", "--short=12", "HEAD"])?;
     let now = SystemTime::now()
@@ -5321,6 +4870,81 @@ fn self_test(root: &Path) -> Result<(), String> {
     {
         return Err("pressure repetition ordinals no longer match retained result directories".into());
     }
+    {
+        let path = Path::new("results.jsonl");
+        let one = r#"{"schema":4,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"FAIL","argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null}"#;
+        let two = r#"{"schema":4,"attempt":2,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"PASS","argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null}"#;
+        let history = attempt_rows(path, &format!("{two}\n{one}\n"))?;
+        if history.len() != 2
+            || history[0].attempt != 1
+            || history[0].outcome != "FAIL"
+            || history[1].attempt != 2
+            || history[1].outcome != "PASS"
+        {
+            return Err("appended retry history did not retain both attempts in order".into());
+        }
+        let terminal = terminal_attempt_row(path, &format!("{one}\n{two}\n"))?
+            .ok_or("a retried cell must still select a terminal row")?;
+        if terminal.attempt != 2 || terminal.outcome != "PASS" {
+            return Err("the scorecard projection did not select the terminal attempt".into());
+        }
+        if attempt_rows(path, &format!("{one}\n{one}\n")).is_ok() {
+            return Err("a repeated attempt ordinal must be refused".into());
+        }
+        let other = one.replace("\"test\":\"t\"", "\"test\":\"other\"");
+        if attempt_rows(path, &format!("{one}\n{other}\n")).is_ok() {
+            return Err("rows from more than one cell must be refused".into());
+        }
+    }
+    // A divergence located by an earlier attempt remains an observation even
+    // when the terminal retry passes. An attempt that located nothing does not
+    // manufacture a divergence observation.
+    {
+        let path = Path::new("results.jsonl");
+        let diverged = r#"{"schema":4,"attempt":1,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"FAIL","first_divergent_record":93,"first_divergent_syscall":37,"first_divergent_scheduler_turn":68,"first_divergent_virtual_nanoseconds":7,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null}"#;
+        let passed = r#"{"schema":4,"attempt":2,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"PASS","first_divergent_record":null,"first_divergent_syscall":null,"first_divergent_scheduler_turn":null,"first_divergent_virtual_nanoseconds":null,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null}"#;
+        let all = attempt_rows(path, &format!("{diverged}\n{passed}\n"))?;
+        let earlier = earlier_attempts_that_located(&all, 2);
+        if earlier.len() != 1
+            || earlier[0].attempt != 1
+            || earlier[0].first_divergent_record != Some(93)
+        {
+            return Err(format!(
+                "the diverging first attempt must remain an earlier observation; got {} row(s)",
+                earlier.len()
+            ));
+        }
+        let terminal = terminal_attempt_row(path, &format!("{diverged}\n{passed}\n"))?
+            .ok_or("a terminal row must still be selected")?;
+        if terminal.attempt != 2 || terminal.outcome != "PASS" {
+            return Err("the terminal retry must remain the cell's reported row".into());
+        }
+        let both_clean = format!(
+            "{}\n{}\n",
+            diverged
+                .replace(
+                    "\"first_divergent_record\":93",
+                    "\"first_divergent_record\":null",
+                )
+                .replace(
+                    "\"first_divergent_syscall\":37",
+                    "\"first_divergent_syscall\":null",
+                )
+                .replace(
+                    "\"first_divergent_scheduler_turn\":68",
+                    "\"first_divergent_scheduler_turn\":null",
+                )
+                .replace(
+                    "\"first_divergent_virtual_nanoseconds\":7",
+                    "\"first_divergent_virtual_nanoseconds\":null",
+                ),
+            passed
+        );
+        let clean = attempt_rows(path, &both_clean)?;
+        if !earlier_attempts_that_located(&clean, 2).is_empty() {
+            return Err("an earlier attempt that located nothing must not be reported".into());
+        }
+    }
     // The checked files remain immutable throughout this self-test. Production
     // plan/run still checks at its command boundary before constructing a plan.
     let checked_scorecard = check_scorecard(root)?;
@@ -7149,7 +6773,6 @@ fn self_test(root: &Path) -> Result<(), String> {
         first_divergent_syscall: None,
         first_divergent_scheduler_turn: None,
         first_divergent_virtual_nanoseconds: None,
-        attempt: 1,
         schema: CELL_RESULT_SCHEMA,
         run_id: sample_slug.clone(),
         run_index: Some(0),
@@ -7338,7 +6961,6 @@ fn self_test(root: &Path) -> Result<(), String> {
         first_divergent_syscall: None,
         first_divergent_scheduler_turn: None,
         first_divergent_virtual_nanoseconds: None,
-        attempt: 1,
         schema: CELL_RESULT_SCHEMA,
         run_id: first_repetition_slug.clone(),
         run_index: Some(1),
