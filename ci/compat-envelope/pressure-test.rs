@@ -1476,7 +1476,7 @@ fn run() -> Result<(), String> {
                 Ok(())
             })();
             let series_result = if std::env::var_os("DEV_HERMIT_PARENT").is_some() {
-                emit_series(&results)
+                emit_series(&results, execution_root)
             } else {
                 Ok(())
             };
@@ -1518,7 +1518,7 @@ fn run() -> Result<(), String> {
             if output.is_some() {
                 return Err("emit-series does not accept --output".into());
             }
-            emit_series(&results)?;
+            emit_series(&results, &root)?;
         }
         "self-test" => {
             if args.next().is_some() {
@@ -1945,7 +1945,57 @@ fn retained_verification_runtime(attempts: &[JsonValue]) -> Result<Option<JsonVa
 /// It sends the typed cell results to `series.py append-cells`, so outcome,
 /// coordinates, source depth, ancestry and compression have one implementation.
 /// The writer refuses the batch whole if any result cannot be represented.
-fn emit_series(results: &Path) -> Result<(), String> {
+fn collect_series_result_files(path: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries = fs::read_dir(path)
+        .map_err(|e| format!("cannot read pressure result directory {}: {e}", path.display()))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|e| format!("cannot read pressure result entry under {}: {e}", path.display()))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("cannot classify {}: {e}", entry.path().display()))?;
+        if file_type.is_dir() {
+            collect_series_result_files(&entry.path(), output)?;
+        } else if file_type.is_file() && entry.file_name() == "results.jsonl" {
+            output.push(entry.path());
+        }
+    }
+    Ok(())
+}
+
+fn collect_series_rows(results: &Path) -> Result<Vec<(String, ResultRow)>, String> {
+    let mut result_files = Vec::new();
+    collect_series_result_files(results, &mut result_files)?;
+    result_files.sort();
+    let mut collected: Vec<(String, ResultRow)> = Vec::new();
+    for result_file in result_files {
+        let dir_name = result_file
+            .parent()
+            .and_then(Path::file_name)
+            .ok_or_else(|| format!("{} has no result-directory name", result_file.display()))?
+            .to_string_lossy()
+            .into_owned();
+        for mut row in read_result_rows(&result_file)? {
+            let repetition = series_run_index(&dir_name);
+            row.run_index = Some(repetition);
+            if row.runtime.is_none() && row.mode == "verify" {
+                row.runtime = retained_verification_runtime(&row.attempts)?;
+            }
+            let key = format!(
+                "{}/{}/{:020}/{:020}",
+                dir_name, row.test, repetition, row.attempt,
+            );
+            collected.push((key, row));
+        }
+    }
+    collected.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.attempt.cmp(&b.1.attempt))
+    });
+    Ok(collected)
+}
+
+fn emit_series(results: &Path, checkout: &Path) -> Result<(), String> {
     let parent = std::env::var("DEV_HERMIT_PARENT")
         .ok()
         .filter(|value| !value.is_empty())
@@ -1969,43 +2019,13 @@ fn emit_series(results: &Path) -> Result<(), String> {
     // right for reading a campaign you are standing in; emitting a RETAINED
     // campaign from a checkout that has since moved is the normal case, and the
     // tree being attributed is recorded in the campaign, not read from git.
-    let mut collected: Vec<(String, ResultRow)> = Vec::new();
-    let entries = fs::read_dir(results)
-        .map_err(|e| format!("cannot read {}: {e}", results.display()))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("cannot walk {}: {e}", results.display()))?;
-        if !entry.path().is_dir() {
-            continue;
-        }
-        let result_file = entry.path().join("results.jsonl");
-        if !result_file.is_file() {
-            continue;
-        }
-        let dir_name = entry.file_name().to_string_lossy().into_owned();
-        for mut row in read_result_rows(&result_file)? {
-            let repetition = series_run_index(&dir_name);
-            row.run_index = Some(repetition);
-            if row.runtime.is_none() && row.mode == "verify" {
-                row.runtime = retained_verification_runtime(&row.attempts)?;
-            }
-            let key = format!(
-                "{}/{}/{:020}/{:020}",
-                dir_name, row.test, repetition, row.attempt,
-            );
-            collected.push((key, row));
-        }
-    }
+    let collected = collect_series_rows(results)?;
     if collected.is_empty() {
         return Err(format!(
             "no per-cell results under {}; nothing to emit",
             results.display()
         ));
     }
-    collected.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| a.1.attempt.cmp(&b.1.attempt))
-    });
-
     let run_id = if metadata.run_id.is_empty() {
         results
             .file_name()
@@ -2036,6 +2056,8 @@ fn emit_series(results: &Path) -> Result<(), String> {
         .arg("append-cells")
         .arg("--parent")
         .arg(&parent)
+        .arg("--checkout")
+        .arg(checkout)
         .arg("--producer")
         .arg("pressure-test")
         .arg("--run-id")
@@ -6918,6 +6940,25 @@ fn self_test(root: &Path) -> Result<(), String> {
     {
         return Err(format!(
             "two appended result observations were not retained independently: {appended:?}"
+        ));
+    }
+    let nested_results = scratch.join("series-layout");
+    let nested_cell = nested_results
+        .join("cells")
+        .join("portable-sample-a-verify-ptrace-repetition-0004");
+    fs::create_dir_all(&nested_cell)
+        .map_err(|e| format!("cannot create nested series result fixture: {e}"))?;
+    fs::copy(&appended_results, nested_cell.join("results.jsonl"))
+        .map_err(|e| format!("cannot copy nested series result fixture: {e}"))?;
+    let nested_rows = collect_series_rows(&nested_results)?;
+    if nested_rows.len() != 2
+        || nested_rows[0].1.run_index != Some(4)
+        || nested_rows[0].1.attempt != 1
+        || nested_rows[1].1.run_index != Some(4)
+        || nested_rows[1].1.attempt != 2
+    {
+        return Err(format!(
+            "pressure series writer did not retain both attempts from the ordinary nested layout: {nested_rows:?}"
         ));
     }
     let mut reused_artifact = second_row.clone();
