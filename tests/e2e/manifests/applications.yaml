@@ -150,7 +150,7 @@ test:
         timeout_seconds:
           kvm: 60
         slow_reason:
-          kvm: Retained passing validations measured 14.87-56.51 seconds across devbig014 and devbig030; the same SHA measured 16.29 and 39.85 seconds respectively, so the 15-second default and a 30-second override both cut valid L2 work.
+          kvm: Retained passing validations recorded for this cell in docs/TESTING_ENVIRONMENTS.md under "Named measurement hosts" measured 14.87-56.51 seconds; the same SHA measured 16.29 and 39.85 seconds, so the 15-second default and a 30-second override both cut valid L2 work.
         backends_enabled:
           - kvm
         backends_disabled:

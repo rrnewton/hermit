@@ -225,7 +225,7 @@ from Reverie `ab07a89239150df3726a036bee9f5e897893dfc1`. It produced two
 passes, the three earlier test-specific failures described below, and one
 `simple_env_shebang` failure with a single process image missing `FINAL`; none
 of the six results contained `UnexpectedEnd`. The retained node log is
-`/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-141-4944fb5b3cc0-1787834650301238559-798721-c47ac7c9/safe-ci-dag-runner/test.cli.log`,
+`/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-141-4944fb5b3cc0-1787834650301238559-798721-c47ac7c9/dagrun/test.cli.log`,
 and the full validate log is
 `/home/newton/work/dev-hermit/ignored/validate/validate-hermit-141-4944fb5b3cc0-1787834650301238559-798721-c47ac7c9.log`.
 Hermit source also changed between `6172478eae28` and `4944fb5b3cc0`, so this
@@ -259,7 +259,7 @@ stated explicitly.
 - Last retained green: `PASS 9.984s` at Hermit
   `f77d7c44067a12ba11e75b5a85864ce0bc23e8f4`, run finished
   `2026-08-26T23:24:13.766596Z`; exact line in
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-105-f77d7c44067a-1787783997/safe-ci-dag-runner/test.app_strict_verify.log`.
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-105-f77d7c44067a-1787783997/dagrun/test.app_strict_verify.log`.
 - Findings: one attempt hit the cap and one produced a real L2 mismatch. Do not
   combine those as one cause. The retained failure does not yet localize the
   first divergent record.
@@ -283,7 +283,7 @@ stated explicitly.
   2026-07-25, in `hermit-cli/src/bin/hermit/run.rs`.
 - Last retained green before diagnosis: `PASS 0.004s` at
   `f77d7c44067a12ba11e75b5a85864ce0bc23e8f4`, in
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-105-f77d7c44067a-1787783997/safe-ci-dag-runner/test.hermit_unit.log`.
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-105-f77d7c44067a-1787783997/dagrun/test.hermit_unit.log`.
 - Findings: `NamedTempFile` follows `TMPDIR`, while validate redirects `TMPDIR`
   away from literal `/tmp`. This was a test environment assumption, not a
   product failure. Commit `e2d89097f1baa8af260c68994201121ac4c557da`
@@ -299,7 +299,7 @@ stated explicitly.
 - Last retained green: `PASS 28.818s` at
   `f630aef3d18e87e49a1e099a5bcf4d2bf43987d1`, run finished
   `2026-08-27T10:51:24.977917Z`, in
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-130-f630aef3d18e-1787825672660163077-1370230-b619c59f/safe-ci-dag-runner/test.cli.log`.
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-130-f630aef3d18e-1787825672660163077-1370230-b619c59f/dagrun/test.cli.log`.
   That overall run was a non-verdict; the individual PASS line remains direct
   evidence.
 - Findings: the green observation consumed 28.818 of its 30 seconds, so the
@@ -315,7 +315,7 @@ stated explicitly.
 - Last retained green: `PASS 1.989s` at
   `8e2579d4f0640414f563a3f9f5e6eb4c21a0c884`, run finished
   `2026-08-26T20:55:44.967642Z`, in
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-001-8e2579d4f064-1787774099/safe-ci-dag-runner/test.cli.log`.
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-001-8e2579d4f064-1787774099/dagrun/test.cli.log`.
 - Findings: this is a DBT copied-process path. Earlier apparent DBT failures
   caused by building without `third-party-backends` were separately fixed by
   `740cc656`; the failing a6 run did build those features, so that older
@@ -332,7 +332,7 @@ stated explicitly.
 - Last retained green: `PASS 0.455s` at
   `d19c112c7035672437b2a78d90a42fe7d690c6cb`, run finished
   `2026-08-25T11:26:31.756955Z`, in
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-014-d19c112c7035-1787655221/safe-ci-dag-runner/test.cli.log`.
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-014-d19c112c7035-1787655221/dagrun/test.cli.log`.
 - Findings: this is an ESRCH/self-signal failure, distinct from the missing
   backend build configuration fixed by `740cc656`. The clean matched run at
   `4944fb5b3cc029459056a3b9743f0d0df3ad0209` reached the same historical
@@ -404,7 +404,7 @@ stated explicitly.
   in `hermit-cli/tests/cli.rs`.
 - Last retained green: `PASS 2.572s` at Hermit
   `4944fb5b3cc029459056a3b9743f0d0df3ad0209`, in
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-141-4944fb5b3cc0-1787834650301238559-798721-c47ac7c9/safe-ci-dag-runner/test.cli.log`.
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-141-4944fb5b3cc0-1787834650301238559-798721-c47ac7c9/dagrun/test.cli.log`.
 - Findings: prior triage associates the failure with DBT process identity. The
   retained a6 failure does not isolate one identity syscall, so resume from the
   full stderr rather than assuming it is the same `prlimit64` failure. The
@@ -423,7 +423,7 @@ stated explicitly.
 - Last retained green: `PASS 0.012s` at
   `992b7eb5b7922d55233ceda5a29afedcace03242`, run finished
   `2026-08-25T15:21:08.052800Z`, in
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-005-992b7eb5b792-1787669771/safe-ci-dag-runner/test.cli.log`.
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-005-992b7eb5b792-1787669771/dagrun/test.cli.log`.
 - Findings: the expected-refusal test was itself rejected earlier than the
   assertion it meant to exercise. The dedicated staging fix was developed as
   `8f7b74095e57aaea73bd5e0539b92622a6a6003a`, but that commit is not an
@@ -462,7 +462,7 @@ stated explicitly.
   2026-07-27, in `hermit-cli/tests/command_strict_verify.rs`.
 - Last retained green: `PASS 1.735s` at
   `f77d7c44067a12ba11e75b5a85864ce0bc23e8f4`, in
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-105-f77d7c44067a-1787783997/safe-ci-dag-runner/test.command_strict_verify.log`.
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-105-f77d7c44067a-1787783997/dagrun/test.command_strict_verify.log`.
 - Findings: this is a strict-verification failure in `findmnt`, not a timeout.
   No narrower retained root cause was found.
 
@@ -476,7 +476,7 @@ stated explicitly.
 - Last retained green: `PASS 0.238s` at
   `55cb93a9fd76ddba7c9de853e2ce6bee012c1708`, run finished
   `2026-08-25T14:50:30Z`, in
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-004-55cb93a9fd76-1787667933/safe-ci-dag-runner/test.hermit_modes.log`.
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-004-55cb93a9fd76-1787667933/dagrun/test.hermit_modes.log`.
 - Findings: the onset was narrowed to `556efd6f9e` against parent
   `9f258c6c64`, each checked three times. The verifier correctly finds the
   intended exit-status divergence, but returns Hermit's internal-failure status
@@ -519,7 +519,7 @@ stated explicitly.
   2026-07-26, in `hermit-cli/tests/liteinst_advanced.rs`.
 - Last retained green: `PASS 6.618s` at
   `55cb93a9fd76ddba7c9de853e2ce6bee012c1708`, in
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-004-55cb93a9fd76-1787667933/safe-ci-dag-runner/test.liteinst_strict.log`.
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-004-55cb93a9fd76-1787667933/dagrun/test.liteinst_strict.log`.
 - Findings: reproduced with a matching release Hermit/runtime, so it is not the
   missing-revision staging problem. Activation succeeds, then the unsupported
   fork path reaches cancellation cleanup and that cleanup is not acknowledged.
@@ -548,7 +548,7 @@ stated explicitly.
   2026-07-31, in `hermit-cli/tests/sabre_examples.rs`.
 - Last retained green: `PASS 12.814s` at
   `55cb93a9fd76ddba7c9de853e2ce6bee012c1708`, in
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-004-55cb93a9fd76-1787667933/safe-ci-dag-runner/test.sabre_examples.log`.
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-004-55cb93a9fd76-1787667933/dagrun/test.sabre_examples.log`.
 - Findings: separate retained diagnosis shows a real SaBRe divergence in
   CPython shutdown/glibc arena trimming: the two runs had 2,989 versus 2,985
   syscall records and first differed at `madvise` address/length and virtual
@@ -567,7 +567,7 @@ stated explicitly.
   2026-08-12, in `hermit-cli/tests/signal_determinism.rs`.
 - Last retained green before the failing observation: `PASS 0.181s` at
   `55cb93a9fd76ddba7c9de853e2ce6bee012c1708`, in
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-004-55cb93a9fd76-1787667933/safe-ci-dag-runner/test.hermit_integration.log`.
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-004-55cb93a9fd76-1787667933/dagrun/test.hermit_integration.log`.
 - Findings: the scheduler did not hang; the test had a stale exit-status literal
   after `556efd6f9e`. Commit `2dd8565bee2d13e7fa42edd1f5d6987f4e4191bf`
   replaced it with `HERMIT_INTERNAL_FAILURE_EXIT` and is on current main. No
@@ -598,7 +598,7 @@ stated explicitly.
   (author date 2026-08-06), in `hermit-cli/tests/cli.rs`.
 - Last retained green: `PASS 0.912s` at Hermit
   `4944fb5b3cc029459056a3b9743f0d0df3ad0209`, in
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-141-4944fb5b3cc0-1787834650301238559-798721-c47ac7c9/safe-ci-dag-runner/test.cli.log`.
+  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-141-4944fb5b3cc0-1787834650301238559-798721-c47ac7c9/dagrun/test.cli.log`.
 - Findings: the comparator was stable. DBT `wait4`/`waitid` fell back to
   host-timed `InternalIOPolling`, so physical child readiness changed protected
   scheduler records while guest stdout and status agreed. The repair landed via
