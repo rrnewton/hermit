@@ -16,13 +16,21 @@ fi
 
 readonly PROGRAM=$1
 readonly FIXTURE_ROOT=${REAL_COMPAT_FIXTURES:-/tmp/hermit-real-compat-fixtures}
-readonly WORK_DIR="/tmp/hermit-real-compat-$PROGRAM"
+# A real allocation, not a name derived from the program. The old
+# "/tmp/hermit-real-compat-$PROGRAM" was the same directory for every concurrent
+# run of one program, and the two lines below made that MUTUALLY DESTRUCTIVE
+# rather than merely shared: the second run's `rm -rf` deleted the first run's
+# tree mid-flight, and whichever finished first deleted it again from its EXIT
+# trap. Measured over ten concurrent pairs of `curl-localhost`: seven pairs had
+# at least one side fail. `mktemp -d` creates the directory itself, so the
+# `rm -rf`/`mkdir` that opened the window are gone with it, and the trap now
+# only ever removes this run's own tree.
+WORK_DIR="$(mktemp -d "/tmp/hermit-real-compat-$PROGRAM.XXXXXXXX")"
+readonly WORK_DIR
 export LC_ALL=C
 export TZ=UTC
 umask 022
 
-rm -rf "$WORK_DIR"
-mkdir -p "$WORK_DIR"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
 function write_assembly_fixture {
@@ -314,7 +322,11 @@ import java.util.concurrent.FutureTask;
 
 class Compat {
     public static void main(String[] args) throws Exception {
-        Path path = Paths.get("/tmp/hermit-real-compat-java/data.txt");
+        // The work directory arrives as argv rather than being spelled out: the
+        // heredoc is quoted, so $WORK_DIR cannot be interpolated here, and the
+        // literal it used to hold silently stopped tracking the real directory
+        // the moment that stopped being a fixed name.
+        Path path = Paths.get(args[0], "data.txt");
         Files.write(path, Arrays.asList("gamma", "alpha", "beta"), StandardCharsets.UTF_8);
         List<String> lines = new ArrayList<>(Files.readAllLines(path));
         Collections.sort(lines);
@@ -336,7 +348,7 @@ EOF
         javac -J-Xint -J-XX:+UseSerialGC -J-XX:ActiveProcessorCount=1 \
             -d "$WORK_DIR" "$WORK_DIR/Compat.java"
         java -Xint -XX:+UseSerialGC -XX:ActiveProcessorCount=1 \
-            -cp "$WORK_DIR" Compat
+            -cp "$WORK_DIR" Compat "$WORK_DIR"
         ;;
     git)
         if [[ -x /usr/local/bin/git.meta.real ]]; then
