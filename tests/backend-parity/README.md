@@ -45,7 +45,7 @@ The historical 22/28 guest-visible count predates retained-log comparison and
 is therefore not reused as a current result.
 
 The task's pre-existing DBT-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 23/24 number above is deliberately
+measures the backend's own Reverie suite. The 23/28 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBT path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
