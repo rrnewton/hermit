@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
+import re
 import signal
 import socket
 import subprocess
@@ -41,7 +43,7 @@ FINAL_VALIDATE_STATUSES = frozenset(("PASSED", "FAILED", "COULD_NOT_RUN"))
 
 
 class ValidateChildRefused(RuntimeError):
-    """The child reported that validation could not run."""
+    """The child hit the re-entrancy guard before the stop-test seam."""
 
 
 def final_validate_status(output: str) -> str | None:
@@ -57,6 +59,37 @@ def final_validate_status(output: str) -> str | None:
     if status not in FINAL_VALIDATE_STATUSES:
         raise AssertionError(f"validate emitted unknown final status {status!r}")
     return status
+
+
+_REFUSAL_SUMMARY = re.compile(
+    r"🚫 validate REFUSED \(exit 75\) — profile .+ @ (?:[0-9a-f]{40}|unknown)"
+)
+_REENTRANCY_REFUSAL = "   refused by: the re-entrancy guard"
+
+
+def child_hit_reentrancy_refusal(output: str, returncode: int) -> bool:
+    """Did this child report the refusal that kept it from reaching the seam?"""
+    if (
+        returncode != NO_RESULT_EXIT_CODE
+        or final_validate_status(output) != "COULD_NOT_RUN"
+    ):
+        return False
+
+    lines = output.splitlines()
+    status_index = max(
+        index
+        for index, line in enumerate(lines)
+        if line.startswith(FINAL_VALIDATE_STATUS_PREFIX)
+    )
+    summary_indices = [
+        index
+        for index, line in enumerate(lines[:status_index])
+        if _REFUSAL_SUMMARY.fullmatch(line)
+    ]
+    if not summary_indices:
+        return False
+    summary_index = summary_indices[-1]
+    return lines[summary_index + 1 : summary_index + 2] == [_REENTRANCY_REFUSAL]
 
 
 class NoParentAdapter(RuntimeError):
@@ -268,12 +301,15 @@ def wait_for_text(log: Path, text: str, process: subprocess.Popen[bytes]) -> Non
     while time.monotonic() < deadline:
         if log.exists() and text in log.read_text(errors="replace"):
             return
-        if process.poll() is not None:
-            seen = log.read_text(errors="replace") if log.exists() else ""
+        returncode = process.poll()
+        if returncode is not None:
+            seen = log.read_text(errors="replace") if log.exists() else "<log never created>"
             status = final_validate_status(seen)
-            if status == "COULD_NOT_RUN" and process.returncode == NO_RESULT_EXIT_CODE:
+            if child_hit_reentrancy_refusal(seen, returncode):
                 raise ValidateChildRefused(
-                    f"validate could not run before ready: rc={process.returncode}"
+                    f"the spawned validate hit the re-entrancy guard before ready "
+                    f"(rc={returncode}); the stop path was never exercised.\n"
+                    f"--- validate output ({len(seen)} bytes) ---\n{seen[-2000:]}"
                 )
             if status is not None:
                 expected = {
@@ -281,14 +317,16 @@ def wait_for_text(log: Path, text: str, process: subprocess.Popen[bytes]) -> Non
                     "FAILED": 1,
                     "COULD_NOT_RUN": NO_RESULT_EXIT_CODE,
                 }[status]
-                if process.returncode != expected:
+                if returncode != expected:
                     raise AssertionError(
                         f"validate final status {status} disagrees with "
-                        f"rc={process.returncode}; expected {expected}"
+                        f"rc={returncode}; expected {expected}\n"
+                        f"--- validate output ({len(seen)} bytes) ---\n{seen[-2000:]}"
                     )
             raise AssertionError(
-                f"validate exited before ready: rc={process.returncode}; "
-                f"final_status={status or 'absent'}"
+                f"validate exited before ready: rc={returncode}; "
+                f"final_status={status or 'absent'}\n"
+                f"--- validate output ({len(seen)} bytes) ---\n{seen[-2000:]}"
             )
         time.sleep(0.05)
     # SHOW WHAT IT ACTUALLY SAW. The bare form of this message cost real time:
@@ -305,7 +343,7 @@ def wait_for_text(log: Path, text: str, process: subprocess.Popen[bytes]) -> Non
 
 
 def run_final_validate_status_contract() -> None:
-    """Pin genuine refusal, quoted-earlier, and absent-status behavior."""
+    """Pin the final status, child status, and refusal-reason contract."""
 
     class Exited:
         def __init__(self, returncode: int):
@@ -314,40 +352,86 @@ def run_final_validate_status_contract() -> None:
         def poll(self) -> int:
             return self.returncode
 
-    with tempfile.TemporaryDirectory(prefix="validate-final-status-") as tmp:
-        log = Path(tmp) / "validate.log"
-        log.write_text("FINAL_VALIDATE_STATUS: COULD_NOT_RUN\n", encoding="utf-8")
-        try:
-            wait_for_text(log, "never-written", Exited(NO_RESULT_EXIT_CODE))
-        except ValidateChildRefused:
-            pass
-        else:
-            raise AssertionError("a genuine could-not-run status was not classified by name")
-
-        log.write_text(
+    sample_commit = "0123456789abcdef0123456789abcdef01234567"
+    genuine = (
+        f"🚫 validate REFUSED (exit 75) — profile full @ {sample_commit}\n"
+        f"{_REENTRANCY_REFUSAL}\n"
+        "   nodes: none executed (stopped before the DAG ran)\n"
+        "FINAL_VALIDATE_STATUS: COULD_NOT_RUN\n"
+    )
+    cases = (
+        ("re-entrancy refusal", genuine, NO_RESULT_EXIT_CODE, True),
+        (
+            "other output before the final refusal",
+            "wrapper mentioned FINAL_VALIDATE_STATUS: FAILED\n" + genuine,
+            NO_RESULT_EXIT_CODE,
+            True,
+        ),
+        (
+            "unknown commit fallback",
+            "🚫 validate REFUSED (exit 75) — profile full @ unknown\n"
+            f"{_REENTRANCY_REFUSAL}\n"
+            "FINAL_VALIDATE_STATUS: COULD_NOT_RUN\n",
+            NO_RESULT_EXIT_CODE,
+            True,
+        ),
+        (
+            "line that only starts like a refusal",
+            "🚫 validate REFUSED is quoted documentation, not a final summary\n"
+            f"{_REENTRANCY_REFUSAL}\n"
+            "FINAL_VALIDATE_STATUS: COULD_NOT_RUN\n",
+            NO_RESULT_EXIT_CODE,
+            False,
+        ),
+        (
+            "argument parsing refusal",
+            f"🚫 validate REFUSED (exit 75) — profile full @ {sample_commit}\n"
+            "   refused by: argument parsing\n"
+            "FINAL_VALIDATE_STATUS: COULD_NOT_RUN\n",
+            NO_RESULT_EXIT_CODE,
+            False,
+        ),
+        (
+            "child-status mismatch",
+            genuine,
+            1,
+            False,
+        ),
+        (
+            "earlier quoted status",
             "FINAL_VALIDATE_STATUS: COULD_NOT_RUN\n"
             "quoted documentation above must not win\n"
             "FINAL_VALIDATE_STATUS: FAILED\n",
-            encoding="utf-8",
-        )
-        try:
-            wait_for_text(log, "never-written", Exited(1))
-        except ValidateChildRefused as exc:
-            raise AssertionError("an earlier quoted status overrode the real final status") from exc
-        except AssertionError:
-            pass
-        else:
-            raise AssertionError("a failed child unexpectedly reached readiness")
+            1,
+            False,
+        ),
+        (
+            "status without a refusal reason",
+            "FINAL_VALIDATE_STATUS: COULD_NOT_RUN\n",
+            NO_RESULT_EXIT_CODE,
+            False,
+        ),
+        (
+            "status absence",
+            "ordinary output with no status\n",
+            NO_RESULT_EXIT_CODE,
+            False,
+        ),
+    )
 
-        log.write_text("ordinary output with no status\n", encoding="utf-8")
-        try:
-            wait_for_text(log, "never-written", Exited(NO_RESULT_EXIT_CODE))
-        except ValidateChildRefused as exc:
-            raise AssertionError("absence was misclassified as could-not-run") from exc
-        except AssertionError:
-            pass
-        else:
-            raise AssertionError("status absence unexpectedly reached readiness")
+    with tempfile.TemporaryDirectory(prefix="validate-final-status-") as tmp:
+        log = Path(tmp) / "validate.log"
+        for name, output, returncode, should_refuse in cases:
+            log.write_text(output, encoding="utf-8")
+            try:
+                wait_for_text(log, "never-written", Exited(returncode))
+            except ValidateChildRefused:
+                refused = True
+            except AssertionError:
+                refused = False
+            else:
+                raise AssertionError(f"{name}: an exited child reached readiness")
+            assert refused is should_refuse, (name, refused, should_refuse, output)
 
 
 def assert_schema5_contract(row: dict, *, admitted: bool = False) -> None:
@@ -611,8 +695,7 @@ def run_cleanup_signal_race() -> None:
         assert rows[0]["interruption_signal"] is None, rows[0]
 
 
-def main() -> None:
-    run_final_validate_status_contract()
+def run_signal_cases() -> None:
     warm_validate_binary()
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         run_signal(sig, expect_record=True)
@@ -622,7 +705,55 @@ def main() -> None:
     # The retired shell contract trusted these caller-selected values. Rust must
     # ignore them: only the canonical authority query can establish admission.
     run_signal(signal.SIGTERM, expect_record=True, forged_owner=True)
-    run_incomplete_exit()
+
+
+def run_signal_cases_then_incomplete_exit(
+    signal_cases: Callable[[], None], incomplete_exit: Callable[[], None]
+) -> str | None:
+    """Keep the incomplete-exit check independent of a refused signal child."""
+    unevaluated: str | None = None
+    try:
+        signal_cases()
+    except ValidateChildRefused as exc:
+        unevaluated = f"signal stop paths (validate declined to start): {exc}"
+    incomplete_exit()
+    return unevaluated
+
+
+def check_signal_refusal_does_not_skip_incomplete_exit() -> None:
+    calls: list[str] = []
+
+    def refused_signal_cases() -> None:
+        calls.append("signal cases")
+        raise ValidateChildRefused("fixture refusal")
+
+    def incomplete_exit() -> None:
+        calls.append("incomplete exit")
+
+    unevaluated = run_signal_cases_then_incomplete_exit(
+        refused_signal_cases, incomplete_exit
+    )
+    assert calls == ["signal cases", "incomplete exit"], calls
+    assert unevaluated is not None and unevaluated.startswith("signal stop paths"), (
+        unevaluated
+    )
+
+
+def main() -> None:
+    # Every child this file spawns is a fixture, not a nested validation. The
+    # re-entrancy guard runs before the stop-test seam, so inheriting the outer
+    # run's marker would prevent the fixture from observing any stop path.
+    os.environ.pop("HERMIT_VALIDATE_ACTIVE", None)
+
+    run_final_validate_status_contract()
+    check_signal_refusal_does_not_skip_incomplete_exit()
+
+    unevaluated: list[str] = []
+    signal_unevaluated = run_signal_cases_then_incomplete_exit(
+        run_signal_cases, run_incomplete_exit
+    )
+    if signal_unevaluated is not None:
+        unevaluated.append(signal_unevaluated)
     # ⚠️ SKIP ONLY WHAT CANNOT BE EVALUATED, AND KEEP GOING.
     # An earlier version let NoParentAdapter propagate out of main(), which
     # abandoned the four steps below it -- refuse=True, the cleanup race and the
@@ -631,7 +762,6 @@ def main() -> None:
     # refuse=True arm plants its own adapter and never needed a parent. Claiming
     # they ran was false, and abandoning them cost real coverage for a precondition
     # that affects exactly one arm of one case.
-    unevaluated: list[str] = []
     try:
         run_canonical_adapter_contract(refuse=False)
     except NoParentAdapter as exc:
@@ -669,11 +799,23 @@ def main() -> None:
             "Run from a checkout nested under the dev-hermit parent to evaluate them.",
             file=sys.stderr,
         )
+    signals_ran = not any(item.startswith("signal stop paths") for item in unevaluated)
+    adapter_unevaluated = any(
+        item.startswith("canonical adapter") for item in unevaluated
+    )
     print(
-        "PASS: TERM/INT/HUP => NO-RESULT; KILL => no record; "
-        "prior failure remains fail; forged owner path is unadmitted; "
-        + ("canonical adapter REFUSE arm only (accept arm not evaluable here); "
-           if unevaluated else "canonical adapter accept/refuse bracketed; ")
+        "PASS: "
+        + (
+            "TERM/INT/HUP => NO-RESULT; KILL => no record; "
+            "prior failure remains fail; forged owner path is unadmitted; "
+            if signals_ran
+            else "signal stop paths NOT EVALUATED (validate declined to start); "
+        )
+        + (
+            "canonical adapter REFUSE arm only (accept arm not evaluable here); "
+            if adapter_unevaluated
+            else "canonical adapter accept/refuse bracketed; "
+        )
         + "cleanup is signal-atomic"
     )
 
