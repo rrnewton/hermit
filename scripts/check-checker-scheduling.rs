@@ -404,9 +404,9 @@ fn runner_flag_path(text: &str, path: &str) -> bool {
     const PYTHON_NO_VALUE: [&str; 13] = [
         "-B", "-E", "-I", "-O", "-OO", "-s", "-S", "-u", "-v", "-b", "-d", "-q", "-x",
     ];
-    const SHELL_NO_VALUE: [&str; 17] = [
+    const SHELL_NO_VALUE: [&str; 18] = [
         "-e", "-x", "-u", "-v", "-n", "-f", "-C", "-a", "-h", "-i", "-l", "-m", "-p",
-        "-r", "-s", "-t", "-c",
+        "-r", "-s", "-t", "-c", "-D",
     ];
     const RUSTC_NO_VALUE: [&str; 5] = ["-O", "-g", "-V", "-h", "-v"];
 
@@ -424,7 +424,7 @@ fn runner_flag_path(text: &str, path: &str) -> bool {
     // coverage -- the silent direction, and exactly what this guard exists to prevent.
     // Erring loud: any of these before the candidate makes the occurrence an orphan.
     const PYTHON_NO_EXEC: [&str; 4] = ["-V", "--version", "-h", "--help"];
-    const SHELL_NO_EXEC: [&str; 4] = ["-n", "--help", "--version", "-V"];
+    const SHELL_NO_EXEC: [&str; 5] = ["-n", "-D", "--help", "--version", "-V"];
     const RUSTC_NO_EXEC: [&str; 4] = ["-V", "--version", "-h", "--help"];
 
     // Flags whose VALUE is the program, so a path AFTER that value is an argument.
@@ -449,7 +449,7 @@ fn runner_flag_path(text: &str, path: &str) -> bool {
         "--crate-type", "--cfg", "--check-cfg", "-L", "-l", "-C", "-Z", "-W", "-A", "-D",
     ];
     const PYTHON_VALUE: [&str; 5] = ["-c", "-m", "-X", "-W", "-Q"];
-    const SHELL_VALUE: [&str; 4] = ["-o", "-O", "--rcfile", "-D"];
+    const SHELL_VALUE: [&str; 3] = ["-o", "-O", "--rcfile"];
 
     enum Arity {
         None,
@@ -481,7 +481,17 @@ fn runner_flag_path(text: &str, path: &str) -> bool {
             "python" | "python3" => &PYTHON_NO_EXEC,
             _ => &SHELL_NO_EXEC,
         };
-        modes.contains(&flag)
+        if modes.contains(&flag) {
+            return true;
+        }
+        // Bash accepts `-D` inside a short-option bundle. Do not generalise this
+        // to every character in SHELL_NO_EXEC: Bash also accepts single-hyphen
+        // long options such as `-norc`, and those DO execute the following script.
+        matches!(runner, "bash" | "sh")
+            && flag.starts_with('-')
+            && !flag.starts_with("--")
+            && flag.len() > 2
+            && flag[1..].contains('D')
     }
 
     let dotted = format!("./{path}");
@@ -872,6 +882,18 @@ fn self_test() {
             "bash -n is a syntax check: rc 0 and the script's marker ABSENT, measured",
         ),
         (
+            "bash -D -x ./scripts/check-z.sh",
+            "scripts/check-z.sh",
+            "bash -D implies -n and takes no value; a following flag must not make the \
+             script look executed",
+        ),
+        (
+            "bash -Dx ./scripts/check-z.sh",
+            "scripts/check-z.sh",
+            "bash accepts bundled short options, and -D still prevents execution when \
+             bundled with -x",
+        ),
+        (
             "bash -o noexec ./scripts/check-z.sh",
             "scripts/check-z.sh",
             "noexec arrives through -o's VALUE, not the flag, so the flag table alone \
@@ -951,6 +973,21 @@ fn self_test() {
             "scripts/check-z.sh",
             "the SHELLS execute the token after -c, so that token IS an invocation -- \
              the mirror of the python case above, and why the table is per-runner",
+        ),
+        (
+            "bash -norc ./scripts/check-z.sh",
+            "scripts/check-z.sh",
+            "-norc is a single-hyphen long option, not a bundle containing -n",
+        ),
+        (
+            "bash -noprofile ./scripts/check-z.sh",
+            "scripts/check-z.sh",
+            "-noprofile is a single-hyphen long option and still executes the script",
+        ),
+        (
+            "bash -login ./scripts/check-z.sh",
+            "scripts/check-z.sh",
+            "-login is a single-hyphen long option and still executes the script",
         ),
         (
             "cargo build && scripts/check-y.sh --gate",
