@@ -4305,7 +4305,6 @@ fn read_current_pressure_evidence(
     summaries: &[PathBuf],
     tracked: &TrackedCells,
 ) -> Result<CurrentPressureEvidence, String> {
-    let history = git_history_ranks(root)?;
     let current_tree = git_rev_parse(root, "HEAD:detcore")?;
     let mut results: BTreeMap<CellId, Vec<CurrentPressureResult>> = BTreeMap::new();
     let mut uncheckable: BTreeMap<CellId, Vec<String>> = BTreeMap::new();
@@ -4314,32 +4313,33 @@ fn read_current_pressure_evidence(
     for path in summaries {
         let summary: PressureSummary = read_json(path)?;
         offered_rows += summary.rows.len();
-        let summary_problem = if !history.contains_key(&summary.hermit_sha) {
-            Some(format!(
-                "{} belongs to {}, which is not on HEAD's history",
+        // These summaries are explicit command-line inputs, often produced by
+        // separate clean worktrees. Requiring their Hermit commit to be an
+        // ancestor of this implementation branch discards independent runs of
+        // the exact same Detcore tree. Verify both identities directly instead:
+        // the named Hermit commit must exist, it must contain the tree recorded
+        // by the summary, and that tree must equal the one being classified.
+        let summary_problem = match git_rev_parse(root, &format!("{}:detcore", summary.hermit_sha))
+        {
+            Err(error) => Some(format!(
+                "{} names Hermit commit {} whose Detcore tree cannot be read: {error}",
                 path.display(),
                 summary.hermit_sha
-            ))
-        } else {
-            let recorded_tree = git_rev_parse(root, &format!("{}:detcore", summary.hermit_sha))?;
-            if summary.detcore_tree != recorded_tree {
-                Some(format!(
-                    "{} names detcore tree {}, but {} contains {}",
-                    path.display(),
-                    summary.detcore_tree,
-                    summary.hermit_sha,
-                    recorded_tree
-                ))
-            } else if summary.detcore_tree != current_tree {
-                Some(format!(
-                    "{} measured detcore tree {}, but HEAD contains {}",
-                    path.display(),
-                    summary.detcore_tree,
-                    current_tree
-                ))
-            } else {
-                None
-            }
+            )),
+            Ok(recorded_tree) if summary.detcore_tree != recorded_tree => Some(format!(
+                "{} names detcore tree {}, but {} contains {}",
+                path.display(),
+                summary.detcore_tree,
+                summary.hermit_sha,
+                recorded_tree
+            )),
+            Ok(_) if summary.detcore_tree != current_tree => Some(format!(
+                "{} measured detcore tree {}, but HEAD contains {}",
+                path.display(),
+                summary.detcore_tree,
+                current_tree
+            )),
+            Ok(_) => None,
         };
 
         for row in &summary.rows {
