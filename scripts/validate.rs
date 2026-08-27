@@ -14071,66 +14071,81 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         );
     }
 
-    // The parent remains the plan/coverage authority. Correct only the one case
-    // it cannot see in a failed nextest log: a planned node it classified as zero
-    // whose typed final outcome carries a positive executed-test count.
-    let receipt = receipt_evidence(parent.as_deref(), &root, &log_path, &commit);
-    let coverage = correct_test_node_coverage(
-        receipt.coverage.clone(),
-        &plan.planned_test_nodes,
-        &outcomes,
-    );
-
-    let behind_ahead = sh("git", &["rev-list", "--left-right", "--count", "origin/main...HEAD"])
-        .unwrap_or_else(|| "0 0".into());
-    let mut ba = behind_ahead.split_whitespace();
-    let git_behind: i64 = ba.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let git_ahead: i64 = ba.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let dirty_now = tree_dirty();
-    let commit_anchored = commit != "unknown" && !dirty_now;
     // Observed, not inferred: did the pin gate actually run and pass in THIS run?
     let pin_gate_passed = outcomes.iter().any(|o| o.tag == PIN_GATE_TAG && o.ok);
-    let lock_admitted =
-        canonical_validate_lock_admission(parent.as_deref(), &commit, &host).is_ok();
-    let ctx = LedgerCtx {
-        started_at,
-        host: host.clone(),
-        toolchain: toolchain.clone(),
-        slot: slot_name(&root, parent.as_deref()),
-        cwd: root.to_string_lossy().into(),
-        profile: plan.profile.clone(),
-        selection_mode: plan.selection_mode.into(),
-        cache_state: cache.into(),
-        commit: commit.clone(),
-        tree: git_tree(),
-        git_depth,
-        git_ahead,
-        git_behind,
-        commit_anchored,
-        tree_dirty: dirty_now,
-        dag_jobs: jobs,
-        admission: lock_admitted.then_some("ci-hub-validate-lock"),
-        base_sha: receipt.base_sha,
-        base_tree: receipt.base_tree,
-        reverie_base_sha: receipt.reverie_base_sha,
-        reverie_base_tree: receipt.reverie_base_tree,
-        reverie_pin_current: pin_gate_passed,
-        concurrent_validates: peak_active,
-        concurrency_proof: if lock_admitted {
-            Some(if peak_active.unwrap_or(0) == 0 {
-                "validate_lock_owner_ancestry"
+    // Only a top-level run writes a ledger row or publishes a receipt. Building
+    // those records for a nested payload had no consumer, yet repeated the
+    // receipt finalizer, git inspection, and `ci-hub validate-lock
+    // authority-status` after all 193 compatibility nodes had finished. The
+    // required authority admission BEFORE product work remains unchanged above;
+    // its self-test explicitly requires the same exact authority for nested
+    // payloads and rejects every weakened identity claim.
+    let (ctx, coverage, dirty_now, commit_anchored) = if nesting.nested {
+        (None, serde_json::Value::Null, false, false)
+    } else {
+        // The parent remains the plan/coverage authority. Correct only the one
+        // case it cannot see in a failed nextest log: a planned node it
+        // classified as zero whose typed final outcome carries a positive
+        // executed-test count.
+        let receipt = receipt_evidence(parent.as_deref(), &root, &log_path, &commit);
+        let coverage = correct_test_node_coverage(
+            receipt.coverage.clone(),
+            &plan.planned_test_nodes,
+            &outcomes,
+        );
+        let behind_ahead = sh(
+            "git",
+            &["rev-list", "--left-right", "--count", "origin/main...HEAD"],
+        )
+        .unwrap_or_else(|| "0 0".into());
+        let mut ba = behind_ahead.split_whitespace();
+        let git_behind: i64 = ba.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let git_ahead: i64 = ba.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let dirty_now = tree_dirty();
+        let commit_anchored = commit != "unknown" && !dirty_now;
+        let lock_admitted =
+            canonical_validate_lock_admission(parent.as_deref(), &commit, &host).is_ok();
+        let ctx = LedgerCtx {
+            started_at,
+            host: host.clone(),
+            toolchain: toolchain.clone(),
+            slot: slot_name(&root, parent.as_deref()),
+            cwd: root.to_string_lossy().into(),
+            profile: plan.profile.clone(),
+            selection_mode: plan.selection_mode.into(),
+            cache_state: cache.into(),
+            commit: commit.clone(),
+            tree: git_tree(),
+            git_depth,
+            git_ahead,
+            git_behind,
+            commit_anchored,
+            tree_dirty: dirty_now,
+            dag_jobs: jobs,
+            admission: lock_admitted.then_some("ci-hub-validate-lock"),
+            base_sha: receipt.base_sha,
+            base_tree: receipt.base_tree,
+            reverie_base_sha: receipt.reverie_base_sha,
+            reverie_base_tree: receipt.reverie_base_tree,
+            reverie_pin_current: pin_gate_passed,
+            concurrent_validates: peak_active,
+            concurrency_proof: if lock_admitted {
+                Some(if peak_active.unwrap_or(0) == 0 {
+                    "validate_lock_owner_ancestry"
+                } else {
+                    "validate_lock_owner_ancestry+live_flock_registry_cpu_delta"
+                })
             } else {
-                "validate_lock_owner_ancestry+live_flock_registry_cpu_delta"
-            })
-        } else {
-            peak_active.map(|_| "live_flock_registry_cpu_delta")
-        },
-        interruption: interruption.clone(),
-        cpu_user,
-        cpu_sys,
-        env_block_retries: env_retries as i64,
-        executed_tests,
-        filtered_tests,
+                peak_active.map(|_| "live_flock_registry_cpu_delta")
+            },
+            interruption: interruption.clone(),
+            cpu_user,
+            cpu_sys,
+            env_block_retries: env_retries as i64,
+            executed_tests,
+            filtered_tests,
+        };
+        (Some(ctx), coverage, dirty_now, commit_anchored)
     };
     if let (Some(a), Some(l)) = (peak_active, peak_live) {
         println!(
@@ -14151,7 +14166,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         if !nesting.nested {
             write_ledger(
                 &ledger,
-                &ctx,
+                ctx.as_ref().expect("top-level run constructed ledger context"),
                 &outcomes,
                 &attempts,
                 &skipped,
@@ -14416,7 +14431,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     if !nesting.nested {
         write_ledger(
             &ledger,
-            &ctx,
+            ctx.as_ref().expect("top-level run constructed ledger context"),
             &outcomes,
             &attempts,
             &skipped,
