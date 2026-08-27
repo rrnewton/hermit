@@ -2104,39 +2104,59 @@ fn series_self_test() -> Result<(), String> {
     // its verification report had already located. These brackets pin the three
     // behaviours that replaced that refusal.
     {
-        let path = Path::new("results.jsonl");
-        let one = r#"{"schema":4,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"FAIL","argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null}"#;
-        let two = r#"{"schema":4,"attempt":2,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"PASS","argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null}"#;
+        let path = std::env::temp_dir().join(format!(
+            "pressure-series-result-rows-{}",
+            std::process::id()
+        ));
+        let one = r#"{"schema":4,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"FAIL","duration_ms":100,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null,"artifact_dir":"/retained/runs/r/t-verify-ptrace"}"#;
+        let two = r#"{"schema":4,"attempt":2,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"PASS","timeout_seconds":15,"duration_ms":200,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null,"artifact_dir":"/retained/runs/r/t-verify-ptrace-attempt-2"}"#;
         // A row with no ordinal is attempt 1, not a missing value.
-        let single = terminal_attempt_row(path, one)?.ok_or("one row must select")?;
-        if single.attempt != 1 || single.outcome != "FAIL" {
+        fs::write(&path, format!("{one}\n"))
+            .map_err(|e| format!("cannot write one-row series fixture: {e}"))?;
+        let single = read_result_rows(&path)?;
+        if single.len() != 1 || single[0].attempt != 1 || single[0].outcome != "FAIL" {
             return Err("a row without an ordinal must read as attempt 1".into());
         }
-        // Two attempts select the TERMINAL one, which is what the harness exit
-        // reports; taking the first would compare an earlier outcome to a later exit.
-        let retried = terminal_attempt_row(path, &format!("{one}\n{two}\n"))?
-            .ok_or("a retried cell must still select a row")?;
-        if retried.attempt != 2 || retried.outcome != "PASS" {
+        // Both attempts remain readable, while the last one is the terminal row
+        // whose outcome is compared with the harness exit.
+        fs::write(&path, format!("{one}\n{two}\n"))
+            .map_err(|e| format!("cannot write retry series fixture: {e}"))?;
+        let retried = read_result_rows(&path)?;
+        if retried.len() != 2
+            || retried[0].attempt != 1
+            || retried[0].outcome != "FAIL"
+            || retried[1].attempt != 2
+            || retried[1].outcome != "PASS"
+        {
             return Err("a retried cell must select the terminal attempt".into());
         }
-        // Order in the file must not decide it.
-        let reversed = terminal_attempt_row(path, &format!("{two}\n{one}\n"))?
-            .ok_or("a retried cell must still select a row")?;
-        if reversed.attempt != 2 {
-            return Err("selection must be by ordinal, not by position in the file".into());
+        // Append order is evidence. Reversing it is malformed rather than an
+        // invitation for the reader to silently reorder the retained file.
+        fs::write(&path, format!("{two}\n{one}\n"))
+            .map_err(|e| format!("cannot write reversed series fixture: {e}"))?;
+        if read_result_rows(&path).is_ok() {
+            return Err("result attempt order was silently rewritten by the reader".into());
         }
         // A repeated ordinal is a malformed file, not a retry.
-        if terminal_attempt_row(path, &format!("{one}\n{one}\n")).is_ok() {
+        fs::write(&path, format!("{one}\n{one}\n"))
+            .map_err(|e| format!("cannot write duplicate series fixture: {e}"))?;
+        if read_result_rows(&path).is_ok() {
             return Err("a repeated attempt ordinal must be refused".into());
         }
         // Rows from different cells are not one cell's log.
         let other = one.replace("\"test\":\"t\"", "\"test\":\"other\"");
-        if terminal_attempt_row(path, &format!("{one}\n{other}\n")).is_ok() {
+        fs::write(&path, format!("{one}\n{other}\n"))
+            .map_err(|e| format!("cannot write mixed-cell series fixture: {e}"))?;
+        if read_result_rows(&path).is_ok() {
             return Err("rows from more than one cell must be refused".into());
         }
-        if terminal_attempt_row(path, "\n  \n")?.is_some() {
-            return Err("an empty file must select nothing".into());
+        fs::write(&path, "\n  \n")
+            .map_err(|e| format!("cannot write empty series fixture: {e}"))?;
+        if read_result_rows(&path).is_ok() {
+            return Err("an empty result file must be refused".into());
         }
+        fs::remove_file(&path)
+            .map_err(|e| format!("cannot remove series result fixture: {e}"))?;
     }
 
     if series_run_index("a-cell-with-no-suffix") != 0 {
@@ -2188,7 +2208,6 @@ fn series_self_test() -> Result<(), String> {
         attempt: 1,
         schema: 4,
         run_id: "campaign".into(),
-        attempt: 1,
         hermit_sha: metadata.hermit_sha.clone(),
         source_tree_dirty: false,
         test: "language-runtimes/node-v8-jit".into(),
@@ -6799,7 +6818,6 @@ fn self_test(root: &Path) -> Result<(), String> {
         attempt: 1,
         schema: CELL_RESULT_SCHEMA,
         run_id: sample_slug.clone(),
-        attempt: 1,
         hermit_sha: sample_metadata.hermit_sha.clone(),
         source_tree_dirty: false,
         test: sample_a.test.clone(),
@@ -6982,7 +7000,6 @@ fn self_test(root: &Path) -> Result<(), String> {
         attempt: 1,
         schema: CELL_RESULT_SCHEMA,
         run_id: first_repetition_slug.clone(),
-        attempt: 1,
         hermit_sha: repeated_metadata.hermit_sha.clone(),
         source_tree_dirty: false,
         test: green_id.test.clone(),
