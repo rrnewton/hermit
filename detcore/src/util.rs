@@ -208,18 +208,51 @@ fn stderr_share_for_depth(depth: u32) -> Duration {
 /// failure direction is a slightly looser bound rather than a diagnostic dropped
 /// on its first attempt. The loop is capped independently of that.
 fn hermit_nesting_depth() -> u32 {
+    hermit_nesting_depth_of(std::process::id(), proc_stat_ppid, proc_comm_is_hermit)
+}
+
+/// The walk with its inputs injected, so the cases `/proc` cannot be put into
+/// during a unit test can still be exercised.
+fn hermit_nesting_depth_of(
+    me: u32,
+    parent_of: impl Fn(u32) -> Option<u32>,
+    comm_is_hermit: impl Fn(u32) -> bool,
+) -> u32 {
+    // ⚠️ THE NESTED HERMIT IS PID 1 IN ITS OWN PID NAMESPACE, SO THE WALK CANNOT
+    // SEE ITS PARENT AND MUST NOT CONCLUDE IT HAS NONE. Measured 2026-08-26 from
+    // outside the container, `NSpid` for the two hermit processes of one run:
+    //
+    // ```text
+    //   host_pid=1455593  NSpid: 1455593      host_ppid=1455493 (bash)
+    //   host_pid=1455601  NSpid: 1455601 1    host_ppid=1455593 (hermit)
+    // ```
+    //
+    // The second column is the point: the inner hermit is pid 1 inside the pid
+    // namespace hermit builds for the container, so from in there `/proc/1/stat`
+    // is ITSELF and reports parent 0. Reading that as "no hermit above me" would
+    // give the inner process the OUTERMOST share, making the total 2.5s + 2.5s =
+    // 5s -- exactly the ceiling rather than under it, which is the same
+    // equal-not-smaller defect this whole change exists to remove, reintroduced
+    // one level down.
+    //
+    // Being pid 1 without being the machine's init therefore counts as one level
+    // of nesting on its own. If hermit is ever genuinely run as pid 1 this
+    // under-shares rather than over-shares, which keeps the total bounded.
+    if me == 1 {
+        return 1;
+    }
     let mut depth = 0;
-    let mut pid = match proc_stat_ppid(std::process::id()) {
+    let mut pid = match parent_of(me) {
         Some(ppid) => ppid,
         None => return 0,
     };
     // Capped so a malformed or cyclic /proc cannot spin on hermit's exit path.
     for _ in 0..16 {
-        if pid <= 1 || !proc_comm_is_hermit(pid) {
+        if pid <= 1 || !comm_is_hermit(pid) {
             break;
         }
         depth += 1;
-        pid = match proc_stat_ppid(pid) {
+        pid = match parent_of(pid) {
             Some(ppid) => ppid,
             None => break,
         };
@@ -468,6 +501,48 @@ mod stderr_wait_tests {
             "shares over a 16-deep chain sum to {total}ms, at or past the {tree}ms \
              invocation ceiling"
         );
+    }
+
+    /// ⚠️ THE NESTED HERMIT IS PID 1 IN ITS OWN NAMESPACE AND MUST NOT READ AS
+    /// OUTERMOST. This is the case the /proc walk cannot be put into from a unit
+    /// test, and the one that was wrong: measured `NSpid: 1455601 1` for the inner
+    /// hermit of a real run, so from inside that namespace `/proc/1/stat` is itself
+    /// and reports parent 0. Treating that as depth 0 gave BOTH processes the
+    /// outermost share -- 2.5s + 2.5s = 5s, exactly the ceiling instead of under
+    /// it, which is the very defect this change removes.
+    #[test]
+    fn the_container_init_does_not_read_as_the_outermost_hermit() {
+        // Inside the container's pid namespace: we are pid 1 and there is no
+        // parent to see. The real /proc would answer exactly this way.
+        let depth = hermit_nesting_depth_of(1, |_| Some(0), |_| false);
+        assert!(
+            depth >= 1,
+            "a hermit that is pid 1 in its own namespace reported depth {depth}, so \
+             it would take the OUTERMOST share and the tree total would reach the \
+             ceiling instead of staying under it"
+        );
+        // And its share must actually be smaller than the outermost one, or the
+        // depth is right and the arithmetic still is not.
+        assert!(
+            stderr_share_for_depth(depth) < stderr_share_for_depth(0),
+            "the nested share is not smaller than the outermost share"
+        );
+    }
+
+    /// A real chain of hermit processes still counts levels normally.
+    #[test]
+    fn an_ordinary_hermit_chain_counts_its_levels() {
+        // 100 -> 101 -> 102, all named hermit, then 103 which is not.
+        let parent_of = |pid: u32| match pid {
+            100 => Some(101),
+            101 => Some(102),
+            102 => Some(103),
+            _ => Some(0),
+        };
+        let is_hermit = |pid: u32| matches!(pid, 101 | 102);
+        assert_eq!(hermit_nesting_depth_of(100, parent_of, is_hermit), 2);
+        // And the outermost, whose parent is a shell, is still depth 0.
+        assert_eq!(hermit_nesting_depth_of(100, |_| Some(999), |_| false), 0);
     }
 
     /// A process whose parent is not `hermit` is the outermost one.
