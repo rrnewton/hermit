@@ -2192,16 +2192,19 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
                 if let Some(process) =
                     run_ready(tool.registered_process_for_physical_pid(&mut guest, physical_pid))
                 {
-                    signal_context.uc_mcontext.gregs[target_register] =
-                        process.as_raw() as libc::greg_t;
+                    let target_value = process.as_raw() as libc::greg_t;
+                    let target_offset =
+                        std::ptr::addr_of!(signal_context.uc_mcontext.gregs[target_register])
+                            as usize
+                            - std::ptr::addr_of!(signal_context) as usize;
                     let wrote = unsafe {
                         write_memory(
-                            current.rsp as usize,
-                            (&signal_context as *const libc::ucontext_t).cast(),
-                            std::mem::size_of::<libc::ucontext_t>(),
+                            current.rsp as usize + target_offset,
+                            (&target_value as *const libc::greg_t).cast(),
+                            std::mem::size_of::<libc::greg_t>(),
                         )
                     };
-                    if wrote == 0 {
+                    if wrote != std::mem::size_of::<libc::greg_t>() {
                         emit_lifecycle_marker(
                             emit,
                             b"detcore-dbt: failed to rewrite a restarted child wait target\n",
