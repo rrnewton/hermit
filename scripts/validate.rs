@@ -348,7 +348,7 @@ fn usage() -> &'static str {
      \x20 --qemu-l2-only                Run the heavyweight QEMU L2 boot.\n\
      \x20 --portable-only               No PMU/CPUID hardware required.\n\
      \x20 --privileged-only             PMU/CPUID-dependent tests only.\n\
-     \x20 --requalify-cell TEST MODE BACKEND  Run one selected cell for schema-6 requalification.\n\
+     \x20 --requalify-cell TEST MODE BACKEND  Run one selected cell for schema-7 requalification.\n\
      \x20 --only <lane> <group.job>[,...]  Run those lane node(s) with their own\n\
      \x20                  declared caps; outside deps are dropped; preflight tags\n\
      \x20                  reuse validate's canonical preflight nodes.\n\
@@ -1715,6 +1715,7 @@ fn self_test() -> Result<(), String> {
     verdict_refusal_bracket()?;
     host_capability_bracket(&root)?;
     coverage_schema_bracket()?;
+    cell_results_schema_bracket()?;
     test_node_coverage_bracket()?;
     typed_libtest_count_bracket()?;
     ledger_gate_origin_bracket()?;
@@ -2371,6 +2372,15 @@ fn ledger_schema_and_coverage(
     }
 }
 
+fn ledger_schema_version(
+    coverage_schema: i64,
+    cell_results: Option<&validate_cell_results::RetainedCellResults>,
+) -> i64 {
+    cell_results
+        .map(|results| results.schema_version)
+        .unwrap_or(coverage_schema)
+}
+
 /// Two-sided producer bracket for [`ledger_schema_and_coverage`]. Inert: it
 /// serializes no row and writes no ledger.
 fn coverage_schema_bracket() -> Result<(), String> {
@@ -2401,6 +2411,31 @@ fn coverage_schema_bracket() -> Result<(), String> {
     println!(
         "  coverage schema: 1/1 real judgement -> schema 5; 4/4 unresolved shapes -> schema 5/null"
     );
+    Ok(())
+}
+
+/// Bind the outer ledger version to the retained payload that defines its
+/// shape. This makes reverting the payload version without changing the writer
+/// fail in `--self-test`, rather than silently relabeling new evidence as an old
+/// schema.
+fn cell_results_schema_bracket() -> Result<(), String> {
+    let retained = validate_cell_results::RetainedCellResults {
+        schema_version: validate_cell_results::CELL_RESULTS_LEDGER_SCHEMA_VERSION,
+        run_id: "schema-bracket".into(),
+        evidence: serde_json::json!({}),
+    };
+    let current = ledger_schema_version(COVERAGE_LEDGER_SCHEMA_VERSION, Some(&retained));
+    if current != 7 {
+        return Err(format!(
+            "cell-results schema: current payload must emit schema 7, got {current}"
+        ));
+    }
+    if ledger_schema_version(COVERAGE_LEDGER_SCHEMA_VERSION, None)
+        != COVERAGE_LEDGER_SCHEMA_VERSION
+    {
+        return Err("cell-results schema: a row without cell results changed schema".into());
+    }
+    println!("  cell-results schema: current payload -> schema 7; absent payload -> schema 5");
     Ok(())
 }
 
@@ -3302,7 +3337,7 @@ fn configure_e2e_result_root(
     std::env::set_var("E2E_RESULT_ROOT", &path);
     // One full validate invokes the harness once per manifest bucket. Bind all
     // bucket rows to the durable validate identity instead of letting each
-    // harness process mint a local timestamp. Schema-6 evidence is one complete
+    // harness process mint a local timestamp. Schema-7 evidence is one complete
     // selected population, not a pool of unrelated bucket attempts.
     std::env::set_var("E2E_RUN_ID", &run);
     // The harness derives its prebuilt-fixture directory from RESULT_ROOT too,
@@ -4006,7 +4041,7 @@ struct Plan {
     /// :655 runs before the `ENVELOPE_MODE` dispatch at :4877, with
     /// `VALIDATION_PROFILE=envelope-only`); that is a bug, not a contract.
     cacheable: bool,
-    /// Exact selected population for a targeted schema-6 evidence row. This is
+    /// Exact selected population for a targeted schema-7 evidence row. This is
     /// deliberately separate from `suite_complete`: it may satisfy one open
     /// cell obligation but can never authorize a whole-run landing receipt.
     cell_evidence_expected: Option<Vec<serde_json::Value>>,
@@ -4750,7 +4785,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
 
     // One-cell canonical requalification. The pressure runner already owns the
     // exact-cell build/run mechanics and resource declarations; validate wraps
-    // it as one boxed gate and retains its typed result as schema 6. This plan
+    // it as one boxed gate and retains its typed result as schema 7. This plan
     // is never suite-complete and therefore cannot grant whole-run authority.
     if let Some(Focused::RequalifyCell { test, mode, backend }) = &args.focused {
         let matches = validate_cell_results::expected_plan(root)?
@@ -11561,7 +11596,7 @@ fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
             return Err(format!("requalification plan: command omitted {token}"));
         }
     }
-    println!("  requalification plan: one exact selected cell, schema-6 eligible, never full authority");
+    println!("  requalification plan: one exact selected cell, schema-7 eligible, never full authority");
     Ok(())
 }
 
@@ -11823,7 +11858,7 @@ fn write_ledger(
     cell_results: Option<&validate_cell_results::RetainedCellResults>,
 ) {
     let (coverage_schema, coverage) = ledger_schema_and_coverage(coverage);
-    let ledger_schema = if cell_results.is_some() { 6 } else { coverage_schema };
+    let ledger_schema = ledger_schema_version(coverage_schema, cell_results);
     let gates_run = outcomes.len();
     let failures = outcomes.iter().filter(|o| outcome_is_failure(o)).count();
     let no_results = outcomes.iter().filter(|o| outcome_is_no_result(o)).count();
@@ -14196,7 +14231,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // A full top-level run must carry the exact per-cell population it just
     // judged. Older schema-5 rows could say only that buckets passed; they could
     // not open or satisfy a cell-specific failure obligation. Retain the typed
-    // rows before appending the ledger entry so schema 6 is emitted only when
+    // rows before appending the ledger entry so schema 7 is emitted only when
     // the artifact has actually been published and bound by checksum.
     let should_retain_cells = plan.suite_complete || plan.cell_evidence_expected.is_some();
     let retained_cell_results = if !nesting.nested && should_retain_cells && execution_complete {
@@ -14217,7 +14252,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             Err(error) => {
                 eprintln!(
                     "validate: ERROR: cannot retain complete per-cell evidence: {error}; \
-                     refusing a schema-6 receipt"
+                     refusing a schema-7 receipt"
                 );
                 exit_code = 1;
                 None
