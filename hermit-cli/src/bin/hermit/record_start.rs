@@ -45,6 +45,7 @@ use super::container::deterministic_container;
 use super::gdb_client::CLIENT_EXITED_BEFORE_CONNECTING;
 use super::gdb_client::GdbClientWatch;
 use super::global_opts::GlobalOpts;
+use super::run::GuestProgramFault;
 use super::record_envelope::RecordEnvelope;
 use super::run::BaseEnv;
 use super::run::apply_base_environment;
@@ -323,12 +324,23 @@ impl StartOpts {
     // TODO-HUMAN-REVIEW(PR-696): Review /proc magic-link rejection for record overlays.
     fn resolve_e9patch_record_target(&self) -> Result<PathBuf, Error> {
         let command = Command::new(self.program());
-        let resolved = command.find_program().with_context(|| {
-            format!(
-                "Could not resolve program {:?} in PATH for e9patch preprocessing",
-                self.program()
-            )
-        })?;
+        // ⚠️ TYPED, BECAUSE THE EXIT CODE IS THE ONLY THING A SCRIPT SEES. An
+        // untyped miss here falls through to HERMIT_INTERNAL_FAILURE_EXIT (125),
+        // which `bin/safehermit` also uses for a cgroup-killed run -- so a
+        // mistyped program name and a run killed at the log byte cap were
+        // indistinguishable. `RunOpts::validate_program` already types the same
+        // miss on the run path as 127; the record path never calls it, so this
+        // is the same fault reaching a different code purely by which
+        // subcommand was spelled.
+        let resolved = command
+            .find_program()
+            .with_context(|| {
+                format!(
+                    "Could not resolve program {:?} in PATH for e9patch preprocessing",
+                    self.program()
+                )
+            })
+            .map_err(|error| error.context(GuestProgramFault::NotFound))?;
         if path_resolution_visits_prefix(&resolved, Path::new("/proc"))? {
             anyhow::bail!(
                 "e9patch cannot safely overlay executable {} because its path resolves through \
@@ -808,10 +820,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn e9patch_record_target_rejects_proc_magic_links() {
-        let options = StartOpts {
-            program: Some(PathBuf::from("/proc/self/exe")),
+    /// One construction shared by both `resolve_e9patch_record_target` tests, so
+    /// they cannot drift apart on a field that is irrelevant to either.
+    fn e9patch_options_for(program: &str) -> StartOpts {
+        StartOpts {
+            program: Some(PathBuf::from(program)),
             _strict: false,
             args: Vec::new(),
             env: Vec::new(),
@@ -824,11 +837,40 @@ mod tests {
             verify_json: None,
             verify_strict: false,
             gdbex: Vec::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn e9patch_record_target_rejects_proc_magic_links() {
+        let options = e9patch_options_for("/proc/self/exe");
         let error = options.resolve_e9patch_record_target().unwrap_err();
         assert!(
             error.to_string().contains("resolves through /proc"),
             "unexpected error: {error}"
         );
+    }
+
+    /// A guest program the record path cannot resolve in PATH must carry
+    /// `GuestProgramFault::NotFound`, so `exit_code` reports 127 rather than
+    /// falling through to 125. 125 is also what `bin/safehermit` uses for a
+    /// cgroup-killed run, so an untyped miss here is indistinguishable from a
+    /// run killed at the log byte cap.
+    ///
+    /// This asserts the FAULT, not the message: the message was already correct
+    /// while the exit code was wrong, so a text assertion would have passed
+    /// throughout the defect.
+    #[test]
+    fn unresolvable_record_program_is_typed_as_guest_program_not_found() {
+        let options = e9patch_options_for("definitely-no-such-program-xyz");
+        let error = options.resolve_e9patch_record_target().unwrap_err();
+        let fault = error
+            .downcast_ref::<GuestProgramFault>()
+            .copied()
+            .unwrap_or_else(|| {
+                panic!("record PATH miss is untyped, so it exits 125 not 127: {error:#}")
+            });
+        assert_eq!(fault, GuestProgramFault::NotFound);
+        assert_eq!(fault.exit_code(), hermit::GUEST_PROGRAM_NOT_FOUND_EXIT);
+        assert_eq!(fault.class(), "guest-program-not-found");
     }
 }
