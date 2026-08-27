@@ -113,6 +113,9 @@ use dagrun::scheduler::BoxedCgroups;
 use dagrun::scheduler::monotonic_now_ns;
 use dagrun::scheduler::STEP_STARTED_MONOTONIC_NS_ENV;
 use hermit_manifest_plan::ledger::HistoryRow;
+use hermit_manifest_plan::runner::ManifestSet;
+use hermit_manifest_plan::runner::Population;
+use hermit_manifest_plan::runner::Selection;
 
 use validate_plan::CompatMode;
 use validate_plan::CompatDisposition;
@@ -131,6 +134,7 @@ const LEDGER_PRODUCER: &str = "hermit-validate-rs";
 /// and the fail-closed assertion that requires it cannot drift apart.
 const PIN_GATE_TAG: &str = "pre.reverie_pin";
 const MANIFEST_AUDIT_COMMAND: &str = "target/debug/test-harness validate";
+const QUICK_E2E_VERIFY_TIMEOUT_S: i64 = 1800;
 const PINNED_ROOT_FETCH_TAG: &str = "setup.pinned_root_fetch";
 const PINNED_ROOT_FETCH_COMMAND: &str = "seed=(); if [ -n \"${CARGO_HOME:-}\" ]; then seed=(--seed-cargo \"$CARGO_HOME\"); fi; ./ci/hermetic/run-split-validate.sh --fetch-only \"${seed[@]}\"";
 
@@ -158,11 +162,16 @@ enum ValidationStepIdentity {
 
 fn validation_step_identity(step: &Step) -> ValidationStepIdentity {
     let manifest_group = step.group == "e2e" || step.group.ends_with("-e2e");
+    let quick_manifest_run = step.group == "quick" && step.job == "e2e_verify";
+    let invokes_manifest_run = step.cmd.contains("target/debug/test-harness run ");
     if (step.group == "gate" && step.job == "manifest")
         || (manifest_group && step.job == "metadata")
     {
         ValidationStepIdentity::ManifestAudit
-    } else if manifest_group && step.job.starts_with("manifest_") {
+    } else if (manifest_group && step.job.starts_with("manifest_"))
+        || quick_manifest_run
+        || invokes_manifest_run
+    {
         ValidationStepIdentity::ManifestRun
     } else {
         ValidationStepIdentity::Other
@@ -170,9 +179,7 @@ fn validation_step_identity(step: &Step) -> ValidationStepIdentity {
 }
 
 fn set_manifest_attempt(step: &mut Step, attempt: usize) {
-    if validation_step_identity(step) == ValidationStepIdentity::ManifestRun
-        || step.cmd.contains("target/debug/test-harness run ")
-    {
+    if validation_step_identity(step) == ValidationStepIdentity::ManifestRun {
         step.env.insert(
             validate_plan::E2E_ATTEMPT_ENV.into(),
             attempt.to_string(),
@@ -5160,7 +5167,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         };
         add("build", "Build workspace", "cargo build --workspace --features third-party-backends".into(), vec![gate.into()], 3600, 16 * 1024 * 1024 * 1024);
         add("e2e_metadata", "Portable E2E metadata", "target/debug/test-harness validate".into(), vec!["quick.build".into()], 600, 4 * 1024 * 1024 * 1024);
-        add("e2e_verify", "Portable ptrace E2E verification", "target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only".into(), vec!["quick.build".into()], 1800, 8 * 1024 * 1024 * 1024);
+        add("e2e_verify", "Portable ptrace E2E verification", "target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only".into(), vec!["quick.build".into()], QUICK_E2E_VERIFY_TIMEOUT_S, 8 * 1024 * 1024 * 1024);
         add("detcore_unit", "Detcore core unit tests", "./ci/run-nextest-counted.sh -p hermit-detcore --lib".into(), vec!["quick.build".into(), "setup.nextest".into()], 1800, 8 * 1024 * 1024 * 1024);
         add("run_smoke", "Hermit run smoke test",
             format!("out=$(timeout 30s {hermit} {run_args} -- /bin/echo {marker}) && test \"$out\" = {marker}"),
@@ -8277,10 +8284,23 @@ mod scheduler_explanation_tests {
         assert!(retry_notice("test.liteinst_strict", "fixture", 2).ends_with("attempt 2/2)"));
 
         let tag = "test.liteinst_strict";
+        let cfg = DagConfig {
+            steps: vec![step_with_caps(
+                "test",
+                "liteinst_strict",
+                "fixture",
+                "false".into(),
+                Vec::new(),
+                30,
+                30,
+                64 * 1024 * 1024,
+            )],
+            ..Default::default()
+        };
         let mut attempts = vec![unreported_attempt(tag.into(), 1)];
-        assert!(retry_attempt_available(&attempts, tag));
+        assert!(retry_attempt_available(&cfg, &attempts, tag));
         attempts.push(unreported_attempt(tag.into(), 2));
-        assert!(!retry_attempt_available(&attempts, tag));
+        assert!(!retry_attempt_available(&cfg, &attempts, tag));
     }
 
     #[test]
@@ -8292,11 +8312,117 @@ mod scheduler_explanation_tests {
             unreported_attempt(capped.into(), 2),
             unreported_attempt(available.into(), 1),
         ];
+        let cfg = DagConfig {
+            steps: vec![
+                step_with_caps(
+                    "test",
+                    "capped_unknown",
+                    "fixture",
+                    "false".into(),
+                    Vec::new(),
+                    30,
+                    30,
+                    64 * 1024 * 1024,
+                ),
+                step_with_caps(
+                    "test",
+                    "available_failure",
+                    "fixture",
+                    "false".into(),
+                    Vec::new(),
+                    30,
+                    30,
+                    64 * 1024 * 1024,
+                ),
+            ],
+            ..Default::default()
+        };
         let mut keep = BTreeSet::from([capped.to_string(), available.to_string()]);
 
-        retain_cells_with_retry_attempt_available(&mut keep, &attempts);
+        retain_cells_with_retry_attempt_available(&mut keep, &cfg, &attempts);
 
         assert_eq!(keep, BTreeSet::from([available.to_string()]));
+    }
+
+    #[test]
+    fn manifest_nodes_get_one_outer_launch_while_other_nodes_keep_one_retry() {
+        let manifest = "e2e.manifest_applications";
+        let privileged_manifest = "privileged-e2e.manifest_backend_parity_c";
+        let quick_manifest = "quick.e2e_verify";
+        let ordinary = "test.cli";
+        let never_launched = "e2e.manifest_c_programs";
+        let cfg = DagConfig {
+            steps: vec![
+                step_with_caps(
+                    "e2e",
+                    "manifest_applications",
+                    "fixture",
+                    "false".into(),
+                    Vec::new(),
+                    30,
+                    30,
+                    64 * 1024 * 1024,
+                ),
+                step_with_caps(
+                    "privileged-e2e",
+                    "manifest_backend_parity_c",
+                    "fixture",
+                    "false".into(),
+                    Vec::new(),
+                    30,
+                    30,
+                    64 * 1024 * 1024,
+                ),
+                step_with_caps(
+                    "quick",
+                    "e2e_verify",
+                    "fixture",
+                    "false".into(),
+                    Vec::new(),
+                    30,
+                    30,
+                    64 * 1024 * 1024,
+                ),
+                step_with_caps(
+                    "test",
+                    "cli",
+                    "fixture",
+                    "false".into(),
+                    Vec::new(),
+                    30,
+                    30,
+                    64 * 1024 * 1024,
+                ),
+                step_with_caps(
+                    "e2e",
+                    "manifest_c_programs",
+                    "fixture",
+                    "false".into(),
+                    Vec::new(),
+                    30,
+                    30,
+                    64 * 1024 * 1024,
+                ),
+            ],
+            ..Default::default()
+        };
+        let attempts = vec![
+            unreported_attempt(manifest.into(), 1),
+            unreported_attempt(privileged_manifest.into(), 1),
+            unreported_attempt(quick_manifest.into(), 1),
+            unreported_attempt(ordinary.into(), 1),
+        ];
+
+        assert!(!retry_attempt_available(&cfg, &attempts, manifest));
+        assert!(!retry_attempt_available(
+            &cfg,
+            &attempts,
+            privileged_manifest
+        ));
+        assert!(!retry_attempt_available(&cfg, &attempts, quick_manifest));
+        assert!(retry_attempt_available(&cfg, &attempts, ordinary));
+        assert!(retry_attempt_available(&cfg, &attempts, never_launched));
+        assert!(!retry_attempt_available(&cfg, &attempts, "missing.tag"));
     }
 }
 
@@ -8437,65 +8563,6 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             .map_err(|e| format!("retry bounds: invalid {field} in {line:?}: {e}"))
     }
 
-    fn declared_manifest_caps(root: &Path) -> Result<Vec<i64>, String> {
-        let manifests = root.join("tests/e2e/manifests");
-        let mut paths = std::fs::read_dir(&manifests)
-            .map_err(|e| format!("retry bounds: cannot read {}: {e}", manifests.display()))?
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("retry bounds: cannot enumerate {}: {e}", manifests.display()))?;
-        paths.sort();
-
-        let mut caps = Vec::new();
-        for path in paths
-            .into_iter()
-            .filter(|path| path.extension().is_some_and(|ext| ext == "yaml"))
-        {
-            let source = std::fs::read_to_string(&path)
-                .map_err(|e| format!("retry bounds: cannot read {}: {e}", path.display()))?;
-            let mut timeout_map_indent = None;
-            for (index, line) in source.lines().enumerate() {
-                let trimmed = line.trim();
-                let indent = line.len() - line.trim_start().len();
-                if let Some(map_indent) = timeout_map_indent {
-                    if trimmed.is_empty() || trimmed.starts_with('#') {
-                        continue;
-                    }
-                    if indent <= map_indent {
-                        timeout_map_indent = None;
-                    } else if let Some((_, value)) = trimmed.split_once(':') {
-                        let value = value.trim();
-                        let seconds = value.parse::<i64>().map_err(|e| {
-                            format!(
-                                "retry bounds: invalid timeout override at {}:{}: {e}",
-                                path.display(),
-                                index + 1
-                            )
-                        })?;
-                        caps.push(seconds);
-                        continue;
-                    }
-                }
-                let Some(value) = trimmed.strip_prefix("timeout_seconds:") else {
-                    continue;
-                };
-                let value = value.trim();
-                if value.is_empty() {
-                    timeout_map_indent = Some(indent);
-                } else {
-                    caps.push(value.parse::<i64>().map_err(|e| {
-                        format!(
-                            "retry bounds: invalid timeout at {}:{}: {e}",
-                            path.display(),
-                            index + 1
-                        )
-                    })?);
-                }
-            }
-        }
-        Ok(caps)
-    }
-
     let nextest = std::fs::read_to_string(root.join(".config/nextest.toml"))
         .map_err(|e| format!("retry bounds: cannot read nextest config: {e}"))?;
     let manifest_defaults =
@@ -8534,17 +8601,11 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             Ok(period)
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let manifest_caps = declared_manifest_caps(root)?;
     let largest_nextest_cap_s = nextest_caps
         .iter()
         .copied()
         .max()
         .ok_or("retry bounds: no declared nextest cap")?;
-    let largest_manifest_cap_s = manifest_caps
-        .iter()
-        .copied()
-        .max()
-        .ok_or("retry bounds: no declared manifest cap")?;
 
     let smallest_enclosing_deadline_s = ["portable", "privileged"]
         .into_iter()
@@ -8556,31 +8617,104 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
     let attempts = validate_runtime::MAX_ATTEMPTS_PER_CELL as i64;
     let default_with_grace_s = DEFAULT_TEST_CAP_S + NEXTEST_TERMINATION_GRACE_S;
     let largest_nextest_with_grace_s = largest_nextest_cap_s + NEXTEST_TERMINATION_GRACE_S;
-    let largest_manifest_with_grace_s = largest_manifest_cap_s + MANIFEST_TERMINATION_GRACE_S;
-    // A retry is a new DAG execution of the node and receives a fresh node timeout.
-    // Multiplying an inner test timeout by the attempt count and comparing that
-    // product with one node attempt's deadline compares different scopes. Each
-    // inner timeout plus its own termination grace must fit one node attempt.
+
+    let manifests = ManifestSet::load(root)
+        .map_err(|e| format!("retry bounds: cannot load E2E manifests: {e}"))?;
+    let mut checked_manifest_nodes = 0usize;
+    let mut tightest_manifest_headroom_s = i64::MAX;
+    let mut check_manifest_selection =
+        |tag: &str, node_timeout_s: i64, selection: Selection| -> Result<(), String> {
+            let cells = manifests
+                .select(&selection)
+                .map_err(|e| format!("retry bounds: cannot select cells for {tag}: {e}"))?;
+            let Some(largest_cell_cap_s) = cells
+                .iter()
+                .map(|cell| i64::try_from(cell.timeout_seconds))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("retry bounds: invalid cell timeout for {tag}: {e}"))?
+                .into_iter()
+                .max()
+            else {
+                return Ok(());
+            };
+            let required_s = attempts * (largest_cell_cap_s + MANIFEST_TERMINATION_GRACE_S);
+            let headroom_s = node_timeout_s - required_s;
+            if headroom_s <= 0 {
+                return Err(format!(
+                    "retry bounds: {tag} has a {node_timeout_s}s node timeout but two cell \
+                     attempts can consume {required_s}s ({largest_cell_cap_s}s plus \
+                     {MANIFEST_TERMINATION_GRACE_S}s termination grace each)"
+                ));
+            }
+            checked_manifest_nodes += 1;
+            tightest_manifest_headroom_s = tightest_manifest_headroom_s.min(headroom_s);
+            Ok(())
+        };
+    for lane in ["portable", "privileged"] {
+        let cfg = validate_plan::lane_config(root, lane)
+            .map_err(|e| format!("retry bounds: cannot load {lane} lane: {e}"))?;
+        for step in cfg
+            .steps
+            .iter()
+            .filter(|step| validation_step_identity(step) == ValidationStepIdentity::ManifestRun)
+        {
+            let category = step
+                .job
+                .strip_prefix("manifest_")
+                .ok_or_else(|| {
+                    format!(
+                        "retry bounds: manifest node {} does not identify its category",
+                        step.tag()
+                    )
+                })?
+                .replace('_', "-");
+            check_manifest_selection(
+                &format!("{lane}:{}", step.tag()),
+                step.timeout,
+                Selection {
+                    population: Some(Population::Required),
+                    lane: Some(lane.into()),
+                    category: Some(category),
+                    ..Default::default()
+                },
+            )?;
+        }
+    }
+    check_manifest_selection(
+        "quick.e2e_verify",
+        QUICK_E2E_VERIFY_TIMEOUT_S,
+        Selection {
+            population: Some(Population::Required),
+            lane: Some("portable".into()),
+            mode: Some("verify".into()),
+            backend: Some("ptrace".into()),
+            ..Default::default()
+        },
+    )?;
+
+    // Non-manifest DAG retries receive fresh node deadlines. Manifest retries
+    // happen inside one node, so both bounded cell attempts and both cleanup
+    // grace periods must fit that node's declared timeout.
     if attempts != 2
         || nextest_caps.first().copied() != Some(DEFAULT_TEST_CAP_S)
         || default_with_grace_s >= smallest_enclosing_deadline_s
         || largest_nextest_with_grace_s >= smallest_enclosing_deadline_s
-        || largest_manifest_with_grace_s >= smallest_enclosing_deadline_s
+        || checked_manifest_nodes == 0
     {
         return Err(format!(
             "retry bounds: attempts={attempts}; default nextest cap including grace=\
              {default_with_grace_s}s; largest nextest cap including grace=\
-             {largest_nextest_with_grace_s}s; largest manifest cap including grace=\
-             {largest_manifest_with_grace_s}s; smallest enclosing lane deadline=\
+             {largest_nextest_with_grace_s}s; checked manifest nodes=\
+             {checked_manifest_nodes}; smallest enclosing lane deadline=\
              {smallest_enclosing_deadline_s}s"
         ));
     }
     Ok(format!(
-        "retry bounds: {attempts} attempts receive separate node deadlines; default nextest \
-         cap including grace={default_with_grace_s}s; largest nextest cap including grace=\
-         {largest_nextest_with_grace_s}s; largest manifest cap including grace=\
-         {largest_manifest_with_grace_s}s; each is below the smallest enclosing lane deadline \
-         of {smallest_enclosing_deadline_s}s"
+        "retry bounds: non-manifest retries receive separate node deadlines; default nextest \
+         cap including grace={default_with_grace_s}s and largest nextest cap including grace=\
+         {largest_nextest_with_grace_s}s are below the smallest enclosing lane deadline of \
+         {smallest_enclosing_deadline_s}s; {checked_manifest_nodes} manifest node(s) fit both \
+         cell attempts in one node deadline with at least {tightest_manifest_headroom_s}s left"
     ))
 }
 
@@ -9237,7 +9371,32 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         {
             return Err(format!(
                 "end-of-run summary: E2E rows did not retain test id, backend, mode, attempt, \
-                 node, and verdict: {e2e:?}"
+                node, and verdict: {e2e:?}"
+            ));
+        }
+        let e2e_retry_summary = test_id_summary(e2e, &[], &BTreeSet::new());
+        if e2e_retry_summary.recovered.len() != 1
+            || e2e_retry_summary.recovered[0].id != "applications/example [ptrace/verify]"
+            || e2e_retry_summary.recovered[0].retry_classes != ["always-eligible"]
+            || e2e_retry_summary.retry_occurrences != 1
+        {
+            return Err(format!(
+                "end-of-run summary: inner E2E fail-then-pass was not reported as one recovered retry: {e2e_retry_summary:?}"
+            ));
+        }
+        let mut e2e_green = RunSummary::new(Verdict::Pass, 0, "self-test", Vec::new());
+        e2e_green.flaky = e2e_retry_summary.recovered.clone();
+        e2e_green.retry_occurrences = e2e_retry_summary.retry_occurrences;
+        e2e_green.wall_s = Some(0.0);
+        e2e_green.nodes_executed = 1;
+        let e2e_rendered = run_summary_lines(&e2e_green, std::time::Instant::now()).join("\n");
+        if !e2e_rendered.contains("applications/example [ptrace/verify]  (1 retry")
+            || !e2e_rendered
+                .contains("retries: 1 occurrence(s) recorded from scheduler and per-cell attempts")
+        {
+            return Err(format!(
+                "end-of-run summary: inner-only retry was not rendered with truthful provenance: \
+                 {e2e_rendered}"
             ));
         }
         let failed_nodes = BTreeSet::from(["fixture.environmental".to_string()]);
@@ -9271,7 +9430,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             || !red_rendered.contains("hermit::fixture$recovered_on_retry  (1 retry")
             || !red_rendered.contains("hermit::fixture$hard_failure  (1 retry")
             || !red_rendered.contains(
-                "retries: 1 occurrence(s) recorded from attempts[].retry_class",
+                "retries: 1 occurrence(s) recorded from scheduler and per-cell attempts",
             )
         {
             return Err(format!(
@@ -9662,9 +9821,10 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         ));
     }
 
-    // The E2E harness writes every retry to the same bucket results.jsonl. Its
-    // row must therefore carry the scheduler's actual attempt ordinal rather
-    // than inferring one from whatever rows survived an interrupted attempt.
+    // Manifest cells own their retries inside test-harness. Once a manifest
+    // node has executed, the outer scheduler must not run that node again: an
+    // outer retry would rerun passing peers and restart the inner attempt
+    // ordinals at one.
     let e2e_attempts = tmp.join("e2e-attempts");
     let e2e_log = tmp.join("e2e-attempts.log");
     let e2e_cmd = format!(
@@ -9689,10 +9849,20 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     );
     let recorded_attempts = std::fs::read_to_string(&e2e_attempts)
         .map_err(|e| format!("scheduler accounting: cannot read E2E attempt fixture: {e}"))?;
-    if e2e_retry.ok || recorded_attempts.lines().collect::<Vec<_>>() != ["1", "2"] {
+    let e2e_node_attempts = e2e_retry
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.tag == "e2e.manifest_attempt")
+        .count();
+    if e2e_retry.ok
+        || e2e_retry.env_retries != 0
+        || e2e_node_attempts != 1
+        || recorded_attempts.lines().collect::<Vec<_>>() != ["1"]
+    {
         return Err(format!(
-            "scheduler accounting: E2E retry did not receive attempts 1 then 2: ok={} rows={recorded_attempts:?}",
-            e2e_retry.ok
+            "scheduler accounting: outer scheduler retried an executed manifest node: \
+             ok={} retries={} attempts={} rows={recorded_attempts:?}",
+            e2e_retry.ok, e2e_retry.env_retries, e2e_node_attempts
         ));
     }
 
@@ -10628,7 +10798,7 @@ fn run_lane_with_env_retries(
                 // The gate is here, ahead of every ground, so it binds uniformly:
                 // an environmental block cannot buy a third attempt any more than
                 // the blanket arm can.
-                if !retry_attempt_available(&attempts, &o.tag) {
+                if !retry_attempt_available(cfg, &attempts, &o.tag) {
                     return None;
                 }
                 environmental
@@ -13288,9 +13458,9 @@ struct RunSummary {
     /// Failed DAG nodes for which no individual failing test id was emitted.
     /// Kept separate so a node tag is never presented as a test id.
     failed_nodes_without_test_ids: Vec<String>,
-    /// Exact count of retry grants, read from non-null
-    /// `attempts[].retry_class`. This is deliberately not `retried_nodes`, which
-    /// includes successful peers re-run as part of a lane.
+    /// Exact count of retry grants, read from outer scheduler retry classes and
+    /// inner per-cell attempt rows. This is deliberately not `retried_nodes`,
+    /// which includes successful peers re-run as part of a lane.
     retry_occurrences: usize,
     wall_s: Option<f64>,
     jobs: Option<i64>,
@@ -13370,15 +13540,30 @@ fn attempts_so_far(attempts: &[NodeAttempt], tag: &str) -> usize {
         .unwrap_or(0)
 }
 
-fn retry_attempt_available(attempts: &[NodeAttempt], tag: &str) -> bool {
-    attempts_so_far(attempts, tag) < validate_runtime::MAX_ATTEMPTS_PER_CELL
+fn retry_attempt_limit(cfg: &DagConfig, tag: &str) -> usize {
+    cfg.steps
+        .iter()
+        .find(|step| step.tag() == tag)
+        .map(|step| {
+            if validation_step_identity(step) == ValidationStepIdentity::ManifestRun {
+                1
+            } else {
+                validate_runtime::MAX_ATTEMPTS_PER_CELL
+            }
+        })
+        .unwrap_or(0)
+}
+
+fn retry_attempt_available(cfg: &DagConfig, attempts: &[NodeAttempt], tag: &str) -> bool {
+    attempts_so_far(attempts, tag) < retry_attempt_limit(cfg, tag)
 }
 
 fn retain_cells_with_retry_attempt_available(
     keep: &mut BTreeSet<String>,
+    cfg: &DagConfig,
     attempts: &[NodeAttempt],
 ) {
-    keep.retain(|tag| retry_attempt_available(attempts, tag));
+    keep.retain(|tag| retry_attempt_available(cfg, attempts, tag));
 }
 
 fn retry_candidate_tags(
@@ -13394,7 +13579,7 @@ fn retry_candidate_tags(
     keep.extend(by_tag.values().filter(|outcome| outcome.aborted).map(|outcome| outcome.tag.clone()));
     keep.extend(unreported_non_intentional_steps(cfg, by_tag, skipped));
     keep.extend(latest_unreported.iter().cloned());
-    retain_cells_with_retry_attempt_available(&mut keep, attempts);
+    retain_cells_with_retry_attempt_available(&mut keep, cfg, attempts);
     keep
 }
 
@@ -13454,14 +13639,44 @@ fn retry_classes_for_test(
         .iter()
         .filter(|observation| !observation.passed)
         .filter_map(|observation| {
-            attempts
+            let outer_class = attempts
                 .iter()
                 .find(|attempt| {
                     attempt.tag == observation.node && attempt.attempt == observation.attempt
                 })
-                .and_then(|attempt| attempt.retry_class.clone())
+                .and_then(|attempt| attempt.retry_class.clone());
+            outer_class.or_else(|| {
+                observations
+                    .iter()
+                    .any(|later| {
+                        later.node == observation.node && later.attempt > observation.attempt
+                    })
+                    .then(|| "always-eligible".to_string())
+            })
         })
         .collect()
+}
+
+fn inner_retry_occurrences_for_test(
+    observations: &[TestAttemptObservation],
+    attempts: &[NodeAttempt],
+) -> usize {
+    observations
+        .iter()
+        .filter(|observation| !observation.passed)
+        .filter(|observation| {
+            observations.iter().any(|later| {
+                later.node == observation.node && later.attempt > observation.attempt
+            })
+        })
+        .filter(|observation| {
+            !attempts.iter().any(|attempt| {
+                attempt.tag == observation.node
+                    && attempt.attempt == observation.attempt
+                    && attempt.retry_class.is_some()
+            })
+        })
+        .count()
 }
 
 /// Parse a nextest terminal line after the `[node]` prefix.
@@ -13684,8 +13899,10 @@ fn test_id_summary(
     let mut recovered = Vec::new();
     let mut failed = Vec::new();
     let mut failed_nodes_with_test_ids = BTreeSet::new();
+    let mut inner_retry_occurrences = 0;
     for (id, observations) in by_id {
         let Some(last) = observations.last() else { continue };
+        inner_retry_occurrences += inner_retry_occurrences_for_test(&observations, attempts);
         let retry_classes = retry_classes_for_test(&observations, attempts);
         let was_retried = !retry_classes.is_empty();
         let item = TestIdRetry { id, retry_classes };
@@ -13705,7 +13922,8 @@ fn test_id_summary(
             .difference(&failed_nodes_with_test_ids)
             .cloned()
             .collect(),
-        retry_occurrences: attempts.iter().filter(|attempt| attempt.retry_class.is_some()).count(),
+        retry_occurrences: attempts.iter().filter(|attempt| attempt.retry_class.is_some()).count()
+            + inner_retry_occurrences,
     }
 }
 
@@ -13778,7 +13996,7 @@ fn run_summary_lines(s: &RunSummary, started: std::time::Instant) -> Vec<String>
     }
     if s.wall_s.is_some() && s.nodes_executed > 0 {
         lines.push(format!(
-            "   retries: {} occurrence(s) recorded from attempts[].retry_class",
+            "   retries: {} occurrence(s) recorded from scheduler and per-cell attempts",
             s.retry_occurrences
         ));
     }
@@ -15715,6 +15933,10 @@ mod e2e_attempt_tests {
             30,
             64 * 1024 * 1024,
         );
+        assert_eq!(
+            validation_step_identity(&manifest),
+            ValidationStepIdentity::ManifestRun
+        );
         set_manifest_attempt(&mut manifest, 2);
         assert_eq!(
             manifest
@@ -15736,5 +15958,38 @@ mod e2e_attempt_tests {
         );
         set_manifest_attempt(&mut unrelated, 2);
         assert!(!unrelated.env.contains_key(validate_plan::E2E_ATTEMPT_ENV));
+
+        let mut relabelled = step_with_caps(
+            "fixture",
+            "custom_manifest_runner",
+            "fixture",
+            "./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane portable"
+                .into(),
+            Vec::new(),
+            30,
+            30,
+            64 * 1024 * 1024,
+        );
+        assert_eq!(
+            validation_step_identity(&relabelled),
+            ValidationStepIdentity::ManifestRun
+        );
+        set_manifest_attempt(&mut relabelled, 1);
+        assert_eq!(
+            relabelled
+                .env
+                .get(validate_plan::E2E_ATTEMPT_ENV)
+                .map(String::as_str),
+            Some("1")
+        );
+        let relabelled_cfg = DagConfig {
+            steps: vec![relabelled],
+            ..Default::default()
+        };
+        assert!(!retry_attempt_available(
+            &relabelled_cfg,
+            &[unreported_attempt("fixture.custom_manifest_runner".into(), 1)],
+            "fixture.custom_manifest_runner"
+        ));
     }
 }

@@ -853,8 +853,8 @@ struct SabrePathRecord {
 pub struct CellResult {
     pub schema: u64,
     pub run_id: String,
-    /// The validate node attempt that produced this observation. A retry is a
-    /// second observation, so it receives the next positive ordinal instead of
+    /// The cell attempt that produced this observation. A retry is a second
+    /// observation, so it receives the next positive ordinal instead of
     /// replacing the earlier row.
     pub attempt: u64,
     /// HEAD of the CHECKOUT the harness ran in. NOT the provenance of the
@@ -963,6 +963,7 @@ impl ScheduledWorkerCapacity {
     }
 }
 
+#[derive(Clone)]
 pub struct RunContext {
     pub root: PathBuf,
     pub hermit_bin: PathBuf,
@@ -984,6 +985,15 @@ pub struct RunContext {
 }
 
 impl RunContext {
+    /// A copy of this context whose result row and retained artifacts use the
+    /// given cell-attempt ordinal.
+    pub fn with_attempt(&self, attempt: u64) -> Self {
+        Self {
+            attempt,
+            ..self.clone()
+        }
+    }
+
     pub fn from_env(root: PathBuf, prebuilt: bool) -> Result<Self, String> {
         let source_sha = git(&root, &["rev-parse", "HEAD"])?;
         let source_dirty =
@@ -1007,8 +1017,13 @@ impl RunContext {
                 value
                     .parse::<u64>()
                     .ok()
-                    .filter(|attempt| *attempt > 0)
-                    .ok_or_else(|| format!("E2E_ATTEMPT must be a positive integer, got {value:?}"))
+                    .filter(|attempt| (1..=MAX_ATTEMPTS_PER_CELL).contains(attempt))
+                    .ok_or_else(|| {
+                        format!(
+                            "E2E_ATTEMPT must be between 1 and {MAX_ATTEMPTS_PER_CELL}, got \
+                             {value:?}"
+                        )
+                    })
             })
             .transpose()?
             .unwrap_or(1);
@@ -1073,6 +1088,9 @@ impl RunContext {
         self
     }
 }
+
+/// One initial execution plus one retry, scoped to one selected cell.
+pub const MAX_ATTEMPTS_PER_CELL: u64 = 2;
 
 pub fn prepare_test(
     context: &RunContext,
@@ -3133,6 +3151,23 @@ mod tests {
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
         }
+    }
+
+    #[test]
+    fn cell_retry_attempts_use_distinct_artifact_directories() {
+        let root = PathBuf::from("/tmp/hermit-cell-retry-artifact-fixture");
+        let cell = ptrace_cell("verify");
+        let first = run_context(&root);
+        let second = first.with_attempt(2);
+
+        let first_dir = cell_artifact_dir(&first, &cell);
+        let second_dir = cell_artifact_dir(&second, &cell);
+        assert_ne!(first_dir, second_dir);
+        assert!(
+            second_dir
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with("-attempt-2"))
+        );
     }
 
     fn bound_workdir_source(spec: &CellRunSpec) -> PathBuf {

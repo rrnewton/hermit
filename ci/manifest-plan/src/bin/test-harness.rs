@@ -11,6 +11,8 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::thread;
 
+use hermit_manifest_plan::runner::CellResult;
+use hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL;
 use hermit_manifest_plan::runner::ManifestSet;
 use hermit_manifest_plan::runner::Population;
 use hermit_manifest_plan::runner::RunContext;
@@ -1243,24 +1245,26 @@ fn audit_compile(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode 
 }
 
 /// Execute `count` independent items with at most `jobs` workers, delivering
-/// each completed value to `consume` immediately.
+/// each emitted value to `consume` immediately and waiting for its
+/// acknowledgement before the worker may continue.
 ///
 /// The consumer stays on the calling thread so durable publication is
 /// serialized even while the expensive cell executions overlap. This is
 /// deliberately not a collect-then-publish helper: an outer bucket timeout
-/// must not discard rows that completed before the timeout.
+/// must not discard rows that completed before the timeout, and a retry must
+/// not start before the prior attempt is flushed.
 fn for_each_parallel<T: Send>(
     count: usize,
     capacity: ScheduledWorkerCapacity,
-    execute: impl Fn(usize) -> T + Sync,
-    mut consume: impl FnMut(usize, T),
+    execute: impl Fn(usize, &mut dyn FnMut(T, bool) -> bool) + Sync,
+    mut consume: impl FnMut(usize, T, bool) -> bool,
 ) {
     if count == 0 {
         return;
     }
     let workers = capacity.workers_for(count);
     let next = AtomicUsize::new(0);
-    let (sender, receiver) = mpsc::channel();
+    let (sender, receiver) = mpsc::channel::<(usize, T, bool, mpsc::SyncSender<bool>)>();
     thread::scope(|scope| {
         for _ in 0..workers {
             let sender = sender.clone();
@@ -1272,17 +1276,42 @@ fn for_each_parallel<T: Send>(
                     if index >= count {
                         break;
                     }
-                    if sender.send((index, execute(index))).is_err() {
-                        break;
-                    }
+                    let mut emit = |value, will_retry| {
+                        let (ack_sender, ack_receiver) = mpsc::sync_channel(0);
+                        if sender.send((index, value, will_retry, ack_sender)).is_err() {
+                            return false;
+                        }
+                        ack_receiver.recv().unwrap_or(false)
+                    };
+                    execute(index, &mut emit);
                 }
             });
         }
         drop(sender);
-        for (index, value) in receiver {
-            consume(index, value);
+        for (index, value, will_retry, ack_sender) in receiver {
+            let acknowledged = consume(index, value, will_retry);
+            let _ = ack_sender.send(acknowledged);
         }
     });
+}
+
+fn run_with_retry<T>(
+    first_attempt: u64,
+    mut execute: impl FnMut(u64) -> T,
+    mut retryable: impl FnMut(&T) -> bool,
+    mut emit: impl FnMut(T, bool) -> bool,
+) {
+    assert!(
+        (1..=MAX_ATTEMPTS_PER_CELL).contains(&first_attempt),
+        "first cell attempt must be within the shared attempt cap"
+    );
+    for attempt in first_attempt..=MAX_ATTEMPTS_PER_CELL {
+        let result = execute(attempt);
+        let will_retry = retryable(&result) && attempt < MAX_ATTEMPTS_PER_CELL;
+        if !emit(result, will_retry) || !will_retry {
+            break;
+        }
+    }
 }
 
 fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
@@ -1325,24 +1354,34 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     for_each_parallel(
         expected,
         capacity,
-        |index| {
+        |index, emit| {
             let cell = &cells[index];
             if let Some((_, reason)) =
                 host_inapplicable_reason(&cell.test.requires, &host_capabilities)
             {
-                host_inapplicable_result(&context, cell, reason)
-            } else {
-                match run_cell(&context, cell) {
-                    Ok(result) => result,
-                    Err(error) => infrastructure_error_result(&context, cell, error),
-                }
+                let _ = emit(host_inapplicable_result(&context, cell, reason), false);
+                return;
             }
+
+            run_with_retry(
+                context.attempt,
+                |attempt| {
+                    let attempt_context = context.with_attempt(attempt);
+                    match run_cell(&attempt_context, cell) {
+                        Ok(result) => result,
+                        Err(error) => infrastructure_error_result(&attempt_context, cell, error),
+                    }
+                },
+                |result| !matches!(result.outcome.as_str(), "PASS" | "HOST-INAPPLICABLE"),
+                emit,
+            );
         },
-        |index, mut result| {
+        |index, mut result: CellResult, will_retry| {
             // Publish before announcing the outcome. After a visible PASS line,
             // the complete typed row is already present even if the containing
-            // bucket is killed before its JUnit/summary epilogue.
-            if let Err(error) = append_result(&results_path, &result) {
+            // bucket is killed before its JUnit/summary epilogue. The worker
+            // waits for this acknowledgement before starting a retry.
+            let published = if let Err(error) = append_result(&results_path, &result) {
                 eprintln!(
                     "ERROR {} ({}/{}): completed cell result could not be published: {error}",
                     result.test,
@@ -1354,81 +1393,72 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 result.reason = Some(format!(
                     "completed cell result could not be published: {error}"
                 ));
-                failed = true;
+                false
             } else {
-                if result.outcome == "ERROR" {
-                    eprintln!(
-                        "ERROR {} ({}/{}): {}",
-                        result.test,
-                        result.mode,
-                        result.backend.as_deref().unwrap_or("native"),
-                        result.reason.as_deref().unwrap_or("infrastructure error")
-                    );
-                }
-                // A FAILURE MUST SAY ENOUGH TO BE CLASSIFIED, NOT JUST COUNTED.
-                //
-                // This line was `FAIL <cell> (verify/ptrace)` and nothing else,
-                // while `CellResult` already carried the divergence coordinates
-                // and the reason. So a bucket failure could not be sorted into a
-                // divergence class -- let alone located -- without re-running the
-                // cell, and this class is INTERMITTENT: the c-programs bucket was
-                // measured at 3 of 6 runs on the modern harness, so the
-                // re-roll is not reliably available. Every observation was
-                // costing a reproduction that might not come.
-                //
-                // PASS lines are deliberately untouched: they are the overwhelming
-                // majority and carry nothing worth saying.
-                let located = if result.outcome == "PASS" {
-                    String::new()
-                } else if result.outcome == "HOST-INAPPLICABLE" {
-                    format!(
-                        " {}",
-                        result.reason.as_deref().unwrap_or("host-inapplicable")
-                    )
-                } else {
-                    let coords = [
-                        ("turn", result.first_divergent_scheduler_turn),
-                        ("vns", result.first_divergent_virtual_nanoseconds),
-                        ("rec", result.first_divergent_record),
-                        ("sys", result.first_divergent_syscall),
-                    ]
-                    .iter()
-                    .filter_map(|(k, v)| v.map(|v| format!("{k}={v}")))
-                    .collect::<Vec<_>>();
-                    // Absent coordinates are OMITTED rather than printed as
-                    // null: a cell that failed without ever reaching comparison
-                    // has no location, and an empty bracket would suggest the
-                    // lookup failed instead of that there is nothing to locate.
-                    let mut suffix = String::new();
-                    if !coords.is_empty() {
-                        suffix.push_str(&format!(" [{}]", coords.join(" ")));
-                    }
-                    if let Some(reason) = result.reason.as_deref() {
-                        suffix.push_str(&format!(" {reason}"));
-                    }
-                    // POINT AT THE EVIDENCE THAT ALREADY EXISTS.
-                    //
-                    // The per-cell artifacts are retained -- verify report,
-                    // captures, the whole directory -- and the bucket log was
-                    // the only thing standing between an investigator and them.
-                    // 28 failures across 305 runs were investigable all along
-                    // and were not investigated, because a FAIL line named the
-                    // cell and no path. The coordinates above say WHERE the
-                    // divergence is; this says WHAT ELSE IS AVAILABLE.
-                    suffix.push_str(&format!("\n    evidence: {}", result.artifact_dir));
-                    suffix
-                };
-                println!(
-                    "{} {} ({}/{}){}",
-                    result.outcome,
+                true
+            };
+
+            if result.outcome == "ERROR" {
+                eprintln!(
+                    "ERROR {} ({}/{}): {}",
                     result.test,
                     result.mode,
                     result.backend.as_deref().unwrap_or("native"),
-                    located
+                    result.reason.as_deref().unwrap_or("infrastructure error")
                 );
-                failed |= matches!(result.outcome.as_str(), "FAIL" | "ERROR");
             }
-            indexed_results.push((index, result));
+            // A FAILURE MUST SAY ENOUGH TO BE CLASSIFIED, NOT JUST COUNTED.
+            let located = if result.outcome == "PASS" {
+                String::new()
+            } else if result.outcome == "HOST-INAPPLICABLE" {
+                format!(
+                    " {}",
+                    result.reason.as_deref().unwrap_or("host-inapplicable")
+                )
+            } else {
+                let coords = [
+                    ("turn", result.first_divergent_scheduler_turn),
+                    ("vns", result.first_divergent_virtual_nanoseconds),
+                    ("rec", result.first_divergent_record),
+                    ("sys", result.first_divergent_syscall),
+                ]
+                .iter()
+                .filter_map(|(key, value)| value.map(|value| format!("{key}={value}")))
+                .collect::<Vec<_>>();
+                let mut suffix = String::new();
+                if !coords.is_empty() {
+                    suffix.push_str(&format!(" [{}]", coords.join(" ")));
+                }
+                if let Some(reason) = result.reason.as_deref() {
+                    suffix.push_str(&format!(" {reason}"));
+                }
+                suffix.push_str(&format!("\n    evidence: {}", result.artifact_dir));
+                suffix
+            };
+            let effective_will_retry = published && will_retry;
+            let retry_note = if effective_will_retry {
+                format!(
+                    " [attempt {} of at most {}; retrying this cell only]",
+                    result.attempt, MAX_ATTEMPTS_PER_CELL
+                )
+            } else {
+                String::new()
+            };
+            println!(
+                "{} {} ({}/{}){}{}",
+                result.outcome,
+                result.test,
+                result.mode,
+                result.backend.as_deref().unwrap_or("native"),
+                retry_note,
+                located
+            );
+
+            if !effective_will_retry {
+                failed |= matches!(result.outcome.as_str(), "FAIL" | "ERROR");
+                indexed_results.push((index, result));
+            }
+            published
         },
     );
     if indexed_results.len() != expected {
@@ -1509,6 +1539,7 @@ mod tests {
     use super::host_inapplicable_reason;
     use super::parse;
     use super::parse_host_capability_verdict;
+    use super::run_with_retry;
     use super::scheduled_worker_capacity;
 
     #[test]
@@ -1624,19 +1655,143 @@ mod tests {
         for_each_parallel(
             8,
             ScheduledWorkerCapacity::new(4),
-            |index| {
+            |index, emit| {
                 let now = active.fetch_add(1, Ordering::SeqCst) + 1;
                 maximum.fetch_max(now, Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(10));
                 active.fetch_sub(1, Ordering::SeqCst);
-                index
+                assert!(emit(index, false));
             },
-            |index, value| consumed.lock().unwrap().push((index, value)),
+            |index, value, _| {
+                consumed.lock().unwrap().push((index, value));
+                true
+            },
         );
         let mut rows = consumed.into_inner().unwrap();
         rows.sort_unstable();
         assert_eq!(rows, (0..8).map(|index| (index, index)).collect::<Vec<_>>());
         assert!(maximum.load(Ordering::SeqCst) > 1);
+    }
+
+    #[test]
+    fn retry_waits_for_publication_and_stops_after_pass() {
+        let published = AtomicUsize::new(0);
+        let executions = AtomicUsize::new(0);
+        let rows = Mutex::new(Vec::new());
+        for_each_parallel(
+            1,
+            ScheduledWorkerCapacity::new(1),
+            |_, emit| {
+                run_with_retry(
+                    1,
+                    |attempt| {
+                        if attempt == 2 {
+                            assert_eq!(published.load(Ordering::SeqCst), 1);
+                        }
+                        executions.fetch_add(1, Ordering::SeqCst);
+                        attempt
+                    },
+                    |attempt| *attempt == 1,
+                    emit,
+                );
+            },
+            |_, attempt, will_retry| {
+                rows.lock().unwrap().push((attempt, will_retry));
+                published.fetch_add(1, Ordering::SeqCst);
+                true
+            },
+        );
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        assert_eq!(rows.into_inner().unwrap(), [(1, true), (2, false)]);
+    }
+
+    #[test]
+    fn retry_stops_after_two_failures() {
+        let executions = AtomicUsize::new(0);
+        let mut rows = Vec::new();
+        run_with_retry(
+            1,
+            |attempt| {
+                executions.fetch_add(1, Ordering::SeqCst);
+                attempt
+            },
+            |_| true,
+            |attempt, will_retry| {
+                rows.push((attempt, will_retry));
+                true
+            },
+        );
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        assert_eq!(rows, [(1, true), (2, false)]);
+    }
+
+    #[test]
+    fn retry_starting_at_second_attempt_cannot_create_a_third() {
+        let mut rows = Vec::new();
+        run_with_retry(
+            2,
+            |attempt| attempt,
+            |_| true,
+            |attempt, will_retry| {
+                rows.push((attempt, will_retry));
+                true
+            },
+        );
+        assert_eq!(rows, [(2, false)]);
+    }
+
+    #[test]
+    fn one_failing_cell_does_not_rerun_its_passing_peer() {
+        let executions = [AtomicUsize::new(0), AtomicUsize::new(0)];
+        let terminal = Mutex::new(Vec::new());
+        for_each_parallel(
+            2,
+            ScheduledWorkerCapacity::new(2),
+            |index, emit| {
+                run_with_retry(
+                    1,
+                    |attempt| {
+                        executions[index].fetch_add(1, Ordering::SeqCst);
+                        (index, attempt)
+                    },
+                    |(index, attempt)| *index == 0 && *attempt == 1,
+                    emit,
+                );
+            },
+            |index, _, will_retry| {
+                if !will_retry {
+                    terminal.lock().unwrap().push(index);
+                }
+                true
+            },
+        );
+        assert_eq!(executions[0].load(Ordering::SeqCst), 2);
+        assert_eq!(executions[1].load(Ordering::SeqCst), 1);
+        let mut terminal = terminal.into_inner().unwrap();
+        terminal.sort_unstable();
+        assert_eq!(terminal, [0, 1]);
+    }
+
+    #[test]
+    fn publication_refusal_prevents_the_retry() {
+        let executions = AtomicUsize::new(0);
+        for_each_parallel(
+            1,
+            ScheduledWorkerCapacity::new(1),
+            |_, emit| {
+                run_with_retry(
+                    1,
+                    |attempt| {
+                        executions.fetch_add(1, Ordering::SeqCst);
+                        attempt
+                    },
+                    |_| true,
+                    emit,
+                );
+            },
+            |_, _, _| false,
+        );
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
     }
 
     #[test]

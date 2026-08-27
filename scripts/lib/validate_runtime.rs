@@ -68,18 +68,12 @@ use std::time::Duration;
 /// retry by having already been retried.
 ///
 /// Owner ruling 2026-08-26: every failed cell gets exactly one retry attempt.
-pub const RETRIES_PER_CELL: usize = 1;
+/// The manifest runner owns the shared total so the harness and outer scheduler
+/// cannot silently drift to different budgets.
+pub const MAX_ATTEMPTS_PER_CELL: usize =
+    hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL as usize;
 
-/// ⚠️ THE BUDGET IS PER CELL, NOT PER LANE. Owner ruling 2026-08-26: a cell gets
-/// TWO ATTEMPTS -- the first plus one retry -- and what any other cell spent
-/// is irrelevant to it.
-///
-/// A lane-wide round budget, which is what shipped first, is incoherent: one
-/// permanently broken cell consumes the rounds that other cells needed, so a
-/// cell's chance of recovering depends on which OTHER cells happened to fail in
-/// the same run. Per-cell attempts make that impossible by construction.
-///
-pub const MAX_ATTEMPTS_PER_CELL: usize = 1 + RETRIES_PER_CELL;
+pub const RETRIES_PER_CELL: usize = MAX_ATTEMPTS_PER_CELL - 1;
 
 /// Derive the lane-round backstop from the work it encloses.
 ///
