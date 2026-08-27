@@ -1442,7 +1442,11 @@ async fn run_kvm(
     drop(backend);
     let teardown_finished = Instant::now();
 
-    tracing::info!(
+    // Every field below is a host wall-clock duration. Keep this diagnostic at
+    // DEBUG so it remains available for backend profiling without entering the
+    // INFO stream exposed to canonical comparison. KVM's built-in verification
+    // is still output/status-only; this classification does not claim KVM L2.
+    tracing::debug!(
         target: "hermit::kvm",
         prepare_us = setup_started.duration_since(dispatch_started).as_micros() as u64,
         setup_us = execution_started.duration_since(setup_started).as_micros() as u64,
