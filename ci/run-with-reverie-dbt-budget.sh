@@ -140,7 +140,16 @@ fi
 #     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
 #     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
 # so the measured key and conservative threshold carry unchanged.
-expected_pin=ab07a89239150df3726a036bee9f5e897893dfc1
+# CARRY TO 4f3fbd50 (2026-08-27): ab07a892..4f3fbd50 changes
+# reverie-dbt/src/lib.rs but neither input to the DynamoRIO content-key miss
+# whose elapsed time this wrapper bounds:
+#     reverie-dbt/vendor/dynamorio  a3c41e5d3630 -> a3c41e5d3630
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+# CMAKE and CMAKE_GENERATOR are host inputs rather than pin contents, so the
+# measured key and conservative threshold carry unchanged. The Rust source
+# change remains build-relevant and requires fresh validation; this carry does
+# not reuse a receipt.
+expected_pin=4f3fbd50bf922a8f589f1e985733d515868d1251
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

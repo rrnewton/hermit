@@ -30,8 +30,9 @@ ci/hermetic/assert-no-network.sh               # the boundary check, with a nega
 ci/hermetic/assert-build-dependencies.sh       # the executable build-dependency check
 ```
 
-Before the offline phase starts a DAG node, it checks four different
-populations rather than folding them into one tool list: 18 executable build
+Before each canonical pinned-root DAG node starts, the wrapper checks the
+network boundary and four different dependency populations rather than folding
+them into one tool list: 18 executable build
 dependencies, four native library packages with their development headers, 24
 commands selected portable cells run as hermit guests, and 11 literal FHS paths
 those cells name. Some commands occur in both executable sets because they are

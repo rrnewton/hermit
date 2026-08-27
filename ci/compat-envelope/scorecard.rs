@@ -1315,7 +1315,7 @@ struct RetainedDecision {
 
 enum ImportEvidence {
     Retained {
-        results: RetainedCellResults,
+        results: Box<RetainedCellResults>,
         store_positions: bool,
     },
     None,
@@ -4950,7 +4950,7 @@ fn retained_coordinate_decision(
         return RetainedDecision {
             state: RetainedComparisonState::Uncheckable,
             import: ImportEvidence::Retained {
-                results: retained,
+                results: Box::new(retained),
                 store_positions: false,
             },
             retained_coordinates,
@@ -4973,7 +4973,7 @@ fn retained_coordinate_decision(
         return RetainedDecision {
             state: RetainedComparisonState::Uncheckable,
             import: ImportEvidence::Retained {
-                results: retained,
+                results: Box::new(retained),
                 store_positions: false,
             },
             retained_coordinates,
@@ -4985,7 +4985,7 @@ fn retained_coordinate_decision(
         return RetainedDecision {
             state: RetainedComparisonState::Uncheckable,
             import: ImportEvidence::Retained {
-                results: retained,
+                results: Box::new(retained),
                 store_positions: false,
             },
             retained_coordinates,
@@ -5008,7 +5008,7 @@ fn retained_coordinate_decision(
         return RetainedDecision {
             state: RetainedComparisonState::Uncheckable,
             import: ImportEvidence::Retained {
-                results: retained,
+                results: Box::new(retained),
                 store_positions: false,
             },
             retained_coordinates,
@@ -5023,7 +5023,7 @@ fn retained_coordinate_decision(
             return RetainedDecision {
                 state: RetainedComparisonState::Uncheckable,
                 import: ImportEvidence::Retained {
-                    results: retained,
+                    results: Box::new(retained),
                     store_positions: false,
                 },
                 retained_coordinates,
@@ -5049,7 +5049,7 @@ fn retained_coordinate_decision(
         return RetainedDecision {
             state: RetainedComparisonState::Uncheckable,
             import: ImportEvidence::Retained {
-                results: retained,
+                results: Box::new(retained),
                 store_positions: false,
             },
             retained_coordinates,
@@ -5063,7 +5063,7 @@ fn retained_coordinate_decision(
         RetainedDecision {
             state: RetainedComparisonState::Fresh,
             import: ImportEvidence::Retained {
-                results: retained,
+                results: Box::new(retained),
                 store_positions: true,
             },
             retained_coordinates,

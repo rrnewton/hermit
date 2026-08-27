@@ -2178,6 +2178,68 @@ cleared-caps refusal names {} starved step(s)",
                     .into(),
             );
         }
+        // Exercise the actual full plan after lane fusion, then apply the
+        // pinned-root transformation. A synthetic producer graph cannot catch
+        // the dependency that fusion rewrites through gate.manifest.
+        let mut pinned_full = build_plan(&root, &full_args, &tmp)?;
+        apply_pinned_root(&mut pinned_full, &root, false)?;
+        let deps_of = |tag: &str| {
+            pinned_full
+                .cfg
+                .steps
+                .iter()
+                .find(|step| step.tag() == tag)
+                .map(|step| step.deps.clone())
+        };
+        for tag in [
+            "build.manifest_guests_in_pinned_root",
+            "privileged-build.manifest_guests_in_pinned_root",
+        ] {
+            let deps = deps_of(tag).ok_or_else(|| {
+                format!("full-plan bracket: post-fusion pinned-root producer {tag} disappeared")
+            })?;
+            if !deps
+                .iter()
+                .any(|dependency| dependency == "setup.manifest_plan_in_pinned_root")
+            {
+                return Err(format!(
+                    "full-plan bracket: post-fusion {tag} can run before \
+                     setup.manifest_plan_in_pinned_root builds the test harness: deps={deps:?}"
+                ));
+            }
+        }
+        for step in pinned_full.cfg.steps.iter().filter(|step| {
+            step.tag().ends_with("_in_pinned_root")
+                || validation_step_identity(step) == ValidationStepIdentity::ManifestRun
+        }) {
+            if !step
+                .cmd
+                .contains("/src/ci/hermetic/assert-build-dependencies.sh")
+            {
+                return Err(format!(
+                    "full-plan bracket: pinned-root node {} can start without the build-dependency assertion: {}",
+                    step.tag(), step.cmd
+                ));
+            }
+        }
+        for tag in [
+            "privileged-e2e.manifest_applications",
+            "privileged-e2e.manifest_backend_parity_c",
+        ] {
+            let deps = deps_of(tag)
+                .ok_or_else(|| format!("full-plan bracket: pinned-root cell {tag} disappeared"))?;
+            for required in [
+                "build.e2e_artifact_in_pinned_root",
+                "privileged-build.manifest_guests_in_pinned_root",
+            ] {
+                if !deps.iter().any(|dependency| dependency == required) {
+                    return Err(format!(
+                        "full-plan bracket: {tag} does not wait for pinned-root producer \
+                         {required}: deps={deps:?}"
+                    ));
+                }
+            }
+        }
         let sequential_args = parse_argv(&[
             "full".into(),
             "--sequential-lanes".into(),
@@ -7108,7 +7170,9 @@ fn pinned_root_command(root: &Path, out: &Path, step: &Step) -> String {
         "--".into(),
         "bash".into(),
         "-c".into(),
-        "/src/ci/hermetic/assert-no-network.sh && exec bash -c \"$1\"".into(),
+        "/src/ci/hermetic/assert-no-network.sh && \
+         /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\""
+            .into(),
         "bash".into(),
         step.cmd.clone(),
     ]);
@@ -7138,12 +7202,11 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
             return Err(format!("plan already contains reserved node {PINNED_ROOT_FETCH_TAG}"));
         }
         if index == 0 {
-            let fetch_deps = cfg
-                .steps
-                .iter()
-                .any(|step| step.tag() == PIN_GATE_TAG)
-                .then(|| vec![PIN_GATE_TAG.to_string()])
-                .unwrap_or_default();
+            let fetch_deps = if cfg.steps.iter().any(|step| step.tag() == PIN_GATE_TAG) {
+                vec![PIN_GATE_TAG.to_string()]
+            } else {
+                Vec::new()
+            };
             cfg.steps.push(step_with_caps(
                 "setup",
                 "pinned_root_fetch",
@@ -7174,9 +7237,17 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
         let producers: Vec<Step> = cfg
             .steps
             .iter()
-            .filter(|step| PINNED_ROOT_PRODUCER_STEPS.contains(&step.tag().as_str()))
+            .filter(|step| {
+                PINNED_ROOT_PRODUCER_STEPS.contains(&step.tag().as_str())
+                    || step.job == "manifest_guests"
+                    || (step.job == "privileged_tests"
+                        && step.cmd.contains("cargo ")
+                        && step.cmd.contains("publish-hermit-e2e-artifact.sh"))
+            })
             .cloned()
             .collect();
+        let producer_tags: BTreeSet<String> =
+            producers.iter().map(|producer| producer.tag()).collect();
         let mut twins = Vec::new();
         for producer in &producers {
             let mut twin = producer.clone();
@@ -7187,9 +7258,18 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
             twin.deps = producer
                 .deps
                 .iter()
-                .filter(|dep| PINNED_ROOT_PRODUCER_STEPS.contains(&dep.as_str()))
+                .filter(|dep| producer_tags.contains(*dep))
                 .map(|dep| pinned_root_producer_twin_tag(dep))
                 .collect();
+            // Fusion replaces e2e.metadata with the host gate.manifest node.
+            // That host node is deliberately not copied into the pinned root,
+            // so preserve the actual build prerequisite explicitly: this
+            // command invokes target/debug/test-harness and cannot run before
+            // the in-image manifest-plan producer builds it.
+            if producer.job == "manifest_guests" {
+                twin.deps
+                    .push(pinned_root_producer_twin_tag("setup.manifest_plan"));
+            }
             twin.env
                 .insert("HERMIT_E2E_EMPTY_WORKDIR".into(), "/test".into());
             twin.cmd = pinned_root_command(root, &out, &twin);
@@ -7197,12 +7277,13 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
                 twin.deps.push(PINNED_ROOT_FETCH_TAG.into());
             }
             twin.deps.sort();
+            twin.deps.dedup();
             twins.push(twin);
         }
         cfg.steps.extend(twins);
 
         for step in &mut cfg.steps {
-            if !step.tag().starts_with("e2e.manifest_") {
+            if validation_step_identity(step) != ValidationStepIdentity::ManifestRun {
                 continue;
             }
             // The selected E2E population has no naked or DBT cells. Every
@@ -7218,13 +7299,25 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
                 .deps
                 .iter()
                 .map(|dep| {
-                    if PINNED_ROOT_PRODUCER_STEPS.contains(&dep.as_str()) {
+                    if producer_tags.contains(dep) {
                         pinned_root_producer_twin_tag(dep)
                     } else {
                         dep.clone()
                     }
                 })
                 .collect();
+            // The fused privileged build node is a host-side assertion over the
+            // host artifact. Keep that edge, and also wait for the artifact built
+            // in the pinned root that this wrapped cell will actually execute.
+            if producer_tags.contains("build.e2e_artifact")
+                && !step
+                    .deps
+                    .iter()
+                    .any(|dep| dep == "build.e2e_artifact_in_pinned_root")
+            {
+                step.deps
+                    .push("build.e2e_artifact_in_pinned_root".into());
+            }
             step.cmd = pinned_root_command(root, &out, step);
             if index == 0 && !step.deps.iter().any(|dep| dep == PINNED_ROOT_FETCH_TAG) {
                 step.deps.push(PINNED_ROOT_FETCH_TAG.into());
@@ -7343,6 +7436,9 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
             .contains(&format!("--env {STEP_STARTED_MONOTONIC_NS_ENV}"))
         || !wrapped.cmd.contains("--env HERMIT_E2E_EMPTY_WORKDIR")
         || !wrapped.cmd.contains("/src/ci/hermetic/assert-no-network.sh")
+        || !wrapped
+            .cmd
+            .contains("/src/ci/hermetic/assert-build-dependencies.sh")
         || wrapped.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
         || !wrapped.deps.iter().any(|dep| dep == PINNED_ROOT_FETCH_TAG)
         || !wrapped.cmd.contains("--env FIXTURE_VALUE")
