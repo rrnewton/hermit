@@ -249,10 +249,17 @@ fn run_bounded_for_backend_with_limits(
     }
     command.args(["run", "--backend", backend, "--strict"]);
     if let Some(report) = verify_report {
+        let report_parent = report
+            .parent()
+            .expect("verification report should have a parent directory");
+        let report_name = report
+            .file_name()
+            .expect("verification report should have a file name");
         command
+            .current_dir(report_parent)
             .args(["--verify", "--verify-strict"])
             .arg("--verify-json")
-            .arg(report);
+            .arg(report_name);
     }
     command
         .arg("--")
@@ -641,7 +648,13 @@ fn waitid_honors_sa_restart_after_running_the_handler() {
 
 #[test]
 fn waitid_ready_child_path_is_ptrace_l2() {
-    let report = tempfile::NamedTempFile::new().expect("failed to create verify report");
+    let build_root = waitid_guest()
+        .parent()
+        .expect("waitid guest should have a parent");
+    let report = tempfile::Builder::new()
+        .prefix("waitid-verify-")
+        .tempfile_in(build_root)
+        .expect("failed to create verify report beside the guest");
     let run = run_bounded(&["--child-ready-wins"], false, Some(report.path()));
     assert!(
         run.status.success(),
