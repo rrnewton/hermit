@@ -14,6 +14,19 @@ the log has told you *where* to look.
 All commands below assume the repo root and the release binary
 `target/release/hermit` (use `target/debug/hermit` if that is what you built).
 
+Outside `validate` and the E2E manifest infrastructure's official runner,
+invoke every Hermit binary through the `dev-hermit` parent workspace's
+`bin/safehermit` wrapper. This includes arbitrary absolute-path binaries under
+`/tmp`:
+
+```bash
+../bin/safehermit ./target/release/hermit run -- ./prog
+../bin/safehermit /tmp/hermit-patched run -- ./prog
+```
+
+The wrapper caps the child process's stderr. It does not cap files written by
+`--log-file` or retained verify logs; those have separate guards.
+
 ## Establish what actually failed
 
 Start from the exact failing observation. For a manifest cell, record its lane,
