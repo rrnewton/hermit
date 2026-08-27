@@ -1,7 +1,9 @@
-# Hermetic validate - pinned root (v3 isolation, OPT-IN)
+# Hermetic validate - pinned root
 
-Nothing here runs by default. The ordinary validate path is unchanged; this directory
-contains the pinned-root validate path and its v3 per-cell isolation contract.
+The canonical validate driver stays on the host and runs its build and test DAG
+nodes in the pinned root. This directory contains that runner, its locked fetch
+phase, and the v3 per-cell isolation contract. The older whole-split invocation
+remains available as an explicit diagnostic path.
 
 ## What this is
 
@@ -11,18 +13,19 @@ system executable a required portable manifest cell runs as a hermit guest,
 plus a runner that executes a command inside it. The guest-tool inventory was
 audited from the selected portable population, including commands reached
 through shell fixtures rather than only top-level `program` entries.
-The shape is stage 1's recommendation unchanged: the existing outer
-`systemd-run`, `validate-lock` and cgroup policy stay, and this adds only the
-filesystem mechanism — one privileged podman container pinned by digest,
-`/dev/kvm` passed through, no runtime network, and source at `/src`. The
-wrapper defaults that source bind to read-only; the combined offline
-build-and-test phase explicitly makes it writable. Output and target volumes
-are separate and writable. No second cgroup layer.
+The existing outer `systemd-run`, `validate-lock`, DAG identities, accounting,
+and cgroup policy stay on the host. Each wrapped build or test node runs in a
+privileged podman container pinned by digest, with `/dev/kvm` passed through
+when present, no runtime network, and source at `/src`. The wrapper defaults
+that source bind to read-only; validation nodes explicitly make it writable.
+Output and target volumes are separate and writable. The container does not
+create a second cgroup layer.
 
 ```
 ci/hermetic/build-image.sh                     # build from the lock, load, record the digest
 ci/hermetic/run-in-pinned-root.sh --src DIR --out DIR -- CMD...
-ci/hermetic/run-split-validate.sh              # fetch (network) then build+test (no network)
+ci/hermetic/run-split-validate.sh --fetch-only # canonical driver's locked fetch node
+ci/hermetic/run-split-validate.sh              # explicit whole-split diagnostic path
 ci/hermetic/assert-no-network.sh               # the boundary check, with a negative control
 ci/hermetic/assert-build-dependencies.sh       # the executable build-dependency check
 ```
@@ -39,15 +42,15 @@ guest. The assertion also checks the exact headers and libraries consumed from
 
 ## V3 per-cell execution contract
 
-The offline phase selects one canonical execution root for every Hermit cell: a
+The pinned-root path selects one canonical execution root for every Hermit cell: a
 fresh private `tmpfs` mounted at `/test`, with the guest working directory set
 to `/test`. The outer podman root supplies an empty `/test` mountpoint; each
 verify, replay, chaos, or custom invocation overlays its own tmpfs there.
 A naked or DBT invocation fails closed because those paths cannot apply the
 mount. The default working directory and relative scratch namespace therefore
 cannot observe files or directory metadata written by sibling cells, even when every
-cell uses the same relative names. The combined offline build-and-test phase
-keeps `/src` writable and shared for build products and repository fixtures;
+cell uses the same relative names. The pinned-root validation nodes keep `/src`
+writable and shared for build products and repository fixtures;
 that tree is an explicit input/output surface, not part of the per-cell isolation
 claim. Manifest repository inputs are resolved to absolute `/src/...` paths
 before the cwd changes, and fixture roots cross through the explicit
@@ -64,26 +67,27 @@ inherited `PWD`. Record and replay now accept the same base-environment, mount,
 and working-directory controls as `hermit run`, so replay cells obey the
 identical contract.
 
-The concurrency boundary was measured rather than inferred. Two hundred live
+The mount mechanism has a standalone control measurement, not an integrated
+Hermit-harness result. Two hundred live
 children produced 200 distinct mount namespaces and 200 tmpfs mounts. The median
 metadata cost attributable to tmpfs was 278,528 bytes total (1.36 KiB per cell);
 writing 64 KiB in every mount charged approximately 12.5 MiB of file memory.
 After killing the run and waiting for the children, no guest process or mount
-survived and file memory returned to within 28 KiB of baseline. An integrated
-200-way Hermit run then completed 200/200. Every guest began in an empty
-`/test`, created the same relative `marker`, and observed a tmpfs filesystem.
+survived and file memory returned to within 28 KiB of baseline. The integrated
+single-run and 200-run evidence is still to be collected by the canonical
+validate path; this control does not substitute for it.
 
 ## The network boundary — what is and is not claimed
 
 This is the claim to read carefully, because it is easy to overstate and the
 earlier version of this file did.
 
-Validate runs as **two phases with a network boundary between them**:
+Validate has **two phases with a network boundary between them**:
 
 | phase | where | network | what it does |
 |---|---|---|---|
 | **fetch** | the host | **yes** | `cargo fetch --locked` into a `CARGO_HOME`. Downloads only; produces no build output. |
-| **offline** | the pinned root | **no** | build **and** test, against that cache and the pinned toolchain. |
+| **build and test** | the pinned root | **no** | each host-scheduled DAG node runs against that cache and the pinned toolchain. |
 
 The network window is deliberately a **pure download**. That matters because
 `cargo fetch --locked` cannot introduce variance: every byte it writes is
@@ -96,8 +100,8 @@ surface than a build phase that merely happens to have network available.
 So, precisely:
 
 - **Claimed, and enforced:** the build and the tests cannot reach the network.
-  `--network=none` and `--http-proxy=false`, asserted from *inside* the container by
-  `assert-no-network.sh` as the phase's first act, aborting before anything runs.
+  `--network=none` and `--http-proxy=false`, asserted from *inside* each container by
+  `assert-no-network.sh` before its payload, aborting before the node runs.
 - **Claimed:** the compiler is pinned (the offline phase runs in the nix root)
   and the crates are pinned (`Cargo.lock` versions + checksums).
 - **Not claimed:** that the fetch phase needs no upstreams. It needs
@@ -217,12 +221,16 @@ does not fall back to a tag and it does not fall back to the host. A run that is
 not in the pinned root must not be recorded as if it were — that would be a
 receipt claiming hermeticity it did not have.
 
-## Known gap: the DAG runner cannot box itself inside the container
+## Canonical driver and the whole-split diagnostic path
 
-The split script drives real DAG nodes through `ci/run-node.sh`, the same
-entrypoint `scripts/validate.rs` and GitHub CI use. Inside the pinned root that
-runner reaches its engine and then **fails closed**, for a reason that has
-nothing to do with the network:
+The canonical path keeps `scripts/validate.rs`, dagrun, the validation lock,
+receipts, and the scheduler-owned cgroup on the host. It wraps each build and
+test node individually, so the container supplies the pinned filesystem and
+network boundary without asking an inner DAG runner to create another cgroup.
+
+The older whole-split diagnostic path still drives `ci/run-node.sh` from inside
+one container. That inner runner reaches its engine and then **fails closed**
+unless the explicit diagnostic invocation permits the missing inner cgroup:
 
 ```
 [safe-ci] ERROR: systemd --user scope is unavailable; refusing advisory-only containment.
@@ -235,22 +243,19 @@ currently called. Quoting it literally here would rot the moment the tool is
 renamed — which it was, mid-flight, while this branch was open. Grep for the
 `cgroup boxing could not be established` half, which is stable.
 
-That refusal is correct — resource boxing is the runner's primary purpose and it
-declines to pretend. It is also the expected consequence of the stage-1 shape:
-the **outer** `systemd-run` and cgroup policy were meant to provide boxing, with
-the container supplying only the filesystem mechanism. Reconciling the two —
-either delegating the existing scope's cgroup into the container, or running the
-container inside that scope and passing `--allow-cgroup-failure` to the inner
-runner — is stage-3 integration work and is **not** done here.
+That refusal is correct: resource boxing is the runner's primary purpose and it
+declines to pretend. The canonical path avoids this topology rather than
+weakening the host-owned cgroup. Its nested strict-compatibility payload uses
+the existing explicit inner-cgroup opt-out while the outer DAG step remains
+boxed and supplies the scheduler deadline.
 
-So what is proven today is the boundary and the toolchain, end to end:
+Existing evidence proves the boundary and toolchain components end to end:
 `assert-no-network.sh` passes inside the container, `cargo metadata` and a real
 compile of the pinned `reverie` git dependency succeed offline, and `cargo
 fetch` inside the phase is refused. The split driver now selects the complete
 portable DAG and its selected portable cell population, with both counts derived
-from canonical repository data at runtime. What is **not** yet proven is that
-this full selection runs to completion in the pinned root; the cgroup
-integration limitation above still applies.
+from canonical repository data at runtime. The canonical full selection and
+its required single-run and 200-run evidence remain unexecuted in this change.
 
 ## Notes from building this
 

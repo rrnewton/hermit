@@ -324,12 +324,6 @@ test:
           native: Fixed content, identities, timestamps, and configuration make the repository transaction deterministic by construction
       verify:
         ci: true
-        # Bash inspects inherited PWD before this script can cd, and Git
-        # discovers repositories through cwd ancestors, so an ancestor
-        # directory's st_size changing between the verify pair produced
-        # unequal strict logs. Start in the fresh private guest /tmp, which
-        # hermit resolves AFTER installing guest mounts.
-        workdir: /tmp
         backends_enabled:
           - ptrace
         backends_disabled:
