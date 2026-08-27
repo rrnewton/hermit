@@ -5873,3 +5873,116 @@ fn run_timeout_refuses_backends_where_it_cannot_bound_the_run() {
         );
     }
 }
+
+/// The diagnostic deadline is spent ONCE across every write, not restarted by each.
+///
+/// ⚠️ THIS CELL EXISTS BECAUSE THE CELL ABOVE CANNOT DO THIS, AND THAT WAS FOUND BY
+/// ABLATION RATHER THAN BY READING. Reverting the clock in `detcore/src/util.rs`
+/// to per-`write()` and re-running
+/// `a_stopped_stderr_reader_does_not_hang_hermit_on_its_way_out` still PASSED, at
+/// 5.06s. Its pipe is prefilled to 3900 of 4096, so the short first diagnostic line
+/// fits in the 196 free bytes and EXACTLY ONE write ever blocks — and at N=1 a
+/// per-write budget and a per-exit budget are the same number. That cell pins the
+/// deadline's VALUE; nothing in it pins the SEMANTICS.
+///
+/// ⚠️ THE ONE-CHARACTER DIFFERENCE THAT MAKES THE PROPERTY VISIBLE: fill the pipe
+/// COMPLETELY. With zero free bytes even the first line blocks, so several writes
+/// block instead of one, and the two designs separate. Measured 2026-08-26, three
+/// runs each, on this exact fixture:
+///
+/// ```text
+///   per-exit  (shared clock)    2.52s  2.52s  2.52s
+///   per-write (clock in write)  10.04s 10.05s 10.05s
+/// ```
+///
+/// Deterministic, and a factor of four apart. The per-write column is the deadline
+/// times the number of diagnostic lines; the per-exit column is the deadline, once,
+/// no matter how many lines there are. That invariance is the whole guarantee, and
+/// it is what this asserts.
+///
+/// Only ONE process reports here: a missing guest fails before the container init
+/// is forked. The real-guest case costs twice this, which is why the derivation in
+/// `detcore/src/util.rs` divides by two.
+#[test]
+fn the_stderr_deadline_is_spent_once_across_writes_not_restarted_by_each() {
+    use std::os::unix::io::FromRawFd;
+    const F_SETPIPE_SZ: i32 = 1031;
+    const PIPE_BYTES: usize = 4096;
+
+    let program = String::from("/nonexistent-guest-program-for-the-shared-deadline-cell");
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    unsafe { libc::fcntl(write_fd, F_SETPIPE_SZ, PIPE_BYTES as i32) };
+
+    // ⚠️ COMPLETELY FULL, NOT NEARLY FULL. Leaving even a couple of hundred bytes
+    // free lets the first line through and collapses this back into the N=1 case
+    // the cell above already covers. Filled while still BLOCKING, before O_NONBLOCK
+    // goes on, so the fill itself cannot short-write.
+    let filler = vec![b'x'; PIPE_BYTES];
+    assert_eq!(
+        unsafe { libc::write(write_fd, filler.as_ptr().cast(), filler.len()) },
+        PIPE_BYTES as isize,
+        "the pipe must start completely full or this cell silently tests the N=1 case"
+    );
+    let flags = unsafe { libc::fcntl(write_fd, libc::F_GETFL) };
+    unsafe { libc::fcntl(write_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+
+    let started = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["run", "--", &program])
+        .stdout(Stdio::null())
+        .stderr(unsafe { Stdio::from_raw_fd(write_fd) })
+        .spawn()
+        .expect("spawn hermit");
+
+    // The read end is held and never read: that is what keeps every write returning
+    // EAGAIN rather than EPIPE.
+    let held = unsafe { std::fs::File::from_raw_fd(read_fd) };
+
+    // ⚠️ BOUNDED WAIT, AND THE BOUND IS BELOW THE NEXTEST PER-TEST CAP ON PURPOSE.
+    // Under the per-write regression this child runs ~10s; polling to completion
+    // would let `.config/nextest.toml`'s 15s cap terminate the cell instead, which
+    // reports as a timeout attributed to nextest rather than as this assertion
+    // failing by name. Give up at 8s, comfortably above the ~2.5s this takes when
+    // correct and comfortably below both 10s and 15s.
+    let poll_deadline = Duration::from_secs(8);
+    let status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => break Some(status),
+            None if started.elapsed() >= poll_deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            None => thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    let elapsed = started.elapsed();
+    drop(held);
+
+    // One process reports on this path, so the whole exit gets one deadline.
+    let ceiling = detcore::util::STDERR_DIAGNOSTIC_DEADLINE * 2;
+
+    assert!(
+        status.is_some(),
+        "hermit had not exited after {elapsed:?} with every diagnostic write blocked. \
+         The deadline is {:?} and is spent ONCE for the whole exit; a run that outlives \
+         it by this much is spending it again per `write()`, which multiplies the exit \
+         path by the number of diagnostic lines. Measured: 2.52s shared, 10.05s per-write.",
+        detcore::util::STDERR_DIAGNOSTIC_DEADLINE
+    );
+    assert!(
+        elapsed < ceiling,
+        "hermit took {elapsed:?} to give up on undeliverable diagnostics, above the \
+         {ceiling:?} ceiling. With several writes blocked the elapsed time must still be \
+         about one {:?} deadline, because the clock is shared. Growing with the number of \
+         lines is the per-write regression this cell exists to catch.",
+        detcore::util::STDERR_DIAGNOSTIC_DEADLINE
+    );
+    assert_eq!(
+        status.expect("checked above").code(),
+        Some(127),
+        "giving up on undeliverable diagnostics must not change the exit status"
+    );
+}
