@@ -1074,12 +1074,12 @@ struct SkidOvershootReport {
     enabled: bool,
 }
 
-fn take_skid_overshoot_warning() -> Option<String> {
+fn take_skid_overshoot_error() -> Option<Error> {
     let count = reverie::take_skid_overshoot_count();
     (count > 0).then(|| {
-        format!(
-            "WARNING: observed {count} {} report(s); a successful exit does not establish \
-             deterministic execution because precise PMU timer delivery passed its target.",
+        anyhow!(
+            "observed {count} {} report(s); refusing the result because precise PMU timer \
+             delivery passed its target and deterministic execution was not established",
             reverie::SKID_OVERSHOOT_MARKER
         )
     })
@@ -1094,13 +1094,18 @@ impl SkidOvershootReport {
         Self { enabled }
     }
 
-    fn finish<T>(self, result: T) -> T {
-        if self.enabled
-            && let Some(warning) = take_skid_overshoot_warning()
-        {
-            eprintln!("{warning}");
+    fn finish<T>(self, result: Result<T, Error>) -> Result<T, Error> {
+        if !self.enabled {
+            return result;
         }
-        result
+
+        let Some(overshoot) = take_skid_overshoot_error() else {
+            return result;
+        };
+        match result {
+            Ok(_) => Err(overshoot),
+            Err(error) => Err(error.context(overshoot.to_string())),
+        }
     }
 }
 
@@ -3063,25 +3068,42 @@ mod tests {
             0,
             "begin must clear evidence from a previous invocation"
         );
-        empty_run.finish(());
+        empty_run.finish(Ok::<_, Error>(())).unwrap();
 
         let success = SkidOvershootReport::begin(true);
         reverie::record_skid_overshoot();
         reverie::record_skid_overshoot();
-        assert_eq!(success.finish(Ok::<_, &str>(7)), Ok(7));
+        let error = success.finish(Ok::<_, Error>(7)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("observed 2 HERMIT_SKID_OVERSHOOT report(s)"),
+            "{error:#}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("deterministic execution was not established"),
+            "{error:#}"
+        );
         assert_eq!(reverie::take_skid_overshoot_count(), 0);
 
         let error = SkidOvershootReport::begin(true);
         reverie::record_skid_overshoot();
-        assert_eq!(
-            error.finish(Err::<(), _>("guest failed")),
-            Err("guest failed")
+        let error = error
+            .finish(Err::<(), _>(anyhow!("guest failed")))
+            .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("guest failed"), "{error}");
+        assert!(
+            error.contains("observed 1 HERMIT_SKID_OVERSHOOT report(s)"),
+            "{error}"
         );
         assert_eq!(reverie::take_skid_overshoot_count(), 0);
 
         reverie::record_skid_overshoot();
         let disabled = SkidOvershootReport::begin(false);
-        disabled.finish(());
+        disabled.finish(Ok::<_, Error>(())).unwrap();
         assert_eq!(
             reverie::take_skid_overshoot_count(),
             1,
@@ -3100,15 +3122,33 @@ mod tests {
     }
 
     #[test]
-    fn skid_overshoot_warning_names_the_limit_of_a_successful_exit() {
+    fn skid_overshoot_error_refuses_a_successful_result() {
         let _lock = SKID_OVERSHOOT_TEST_LOCK.lock().unwrap();
         let _ = reverie::take_skid_overshoot_count();
-        assert_eq!(take_skid_overshoot_warning(), None);
+        assert!(take_skid_overshoot_error().is_none());
 
         reverie::record_skid_overshoot();
-        let warning = take_skid_overshoot_warning().expect("recorded overshoot must be reported");
-        assert!(warning.contains("observed 1 HERMIT_SKID_OVERSHOOT report(s)"));
-        assert!(warning.contains("successful exit does not establish deterministic execution"));
+        let error = take_skid_overshoot_error().expect("recorded overshoot must be reported");
+        assert!(
+            error
+                .to_string()
+                .contains("observed 1 HERMIT_SKID_OVERSHOOT report(s)")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("deterministic execution was not established")
+        );
+        assert_eq!(reverie::take_skid_overshoot_count(), 0);
+    }
+
+    #[test]
+    fn skid_overshoot_report_preserves_success_without_an_overshoot() {
+        let _lock = SKID_OVERSHOOT_TEST_LOCK.lock().unwrap();
+        let _ = reverie::take_skid_overshoot_count();
+
+        let report = SkidOvershootReport::begin(true);
+        assert_eq!(report.finish(Ok::<_, Error>(7)).unwrap(), 7);
         assert_eq!(reverie::take_skid_overshoot_count(), 0);
     }
 
