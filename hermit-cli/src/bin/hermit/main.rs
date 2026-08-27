@@ -380,6 +380,14 @@ impl Subcommand {
 
 #[fbinit::main]
 fn main() {
+    // ⚠️ BEFORE ANYTHING THAT CAN FORK. The stderr diagnostic deadline is a total
+    // for the INVOCATION, and the origin every hermit process measures from is a
+    // shared mapping that children inherit across fork. A mapping made after the
+    // first fork is not shared with the child that already exists, so each would
+    // get its own origin and the deadline would be multiplied by the number of
+    // container inits -- three on `--verify`, which forks once per run. This
+    // placement dominates every with_container and run_guarded_at site.
+    detcore::util::init_shared_stderr_deadline_origin();
     if let Some(status) = liteinst_activation_probe() {
         status.raise_or_exit();
     }
