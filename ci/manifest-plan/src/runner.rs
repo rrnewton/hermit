@@ -2995,7 +2995,7 @@ mod tests {
         let id = test.id.clone();
         let set = ManifestSet {
             documents: Vec::new(),
-            tests: BTreeMap::from([(id.clone(), ("fixture".into(), test))]),
+            tests: BTreeMap::from([(id.clone(), ("fixture".into(), 15, test))]),
         };
         assert!(set.knows_test(&id), "a declared test must be known");
         assert!(
