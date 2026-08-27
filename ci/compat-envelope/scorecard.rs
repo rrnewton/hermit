@@ -2865,7 +2865,7 @@ fn apply_pressure_summary(
         };
         observation.hermit_shas.insert(summary.hermit_sha.clone());
         observation.results.insert(result);
-        let inserted = observation.invocations.insert(ObservedInvocation {
+        let mut observed_invocation = ObservedInvocation {
             hermit_sha: summary.hermit_sha.clone(),
             run_id: invocation.run_id,
             result,
@@ -2875,7 +2875,13 @@ fn apply_pressure_summary(
             cwd: invocation.cwd,
             shell_command: invocation.shell_command,
             attempts: invocation.attempts,
-        });
+        };
+        // `encoded_cells` normalises every stored invocation before writing.
+        // Normalise the incoming value before set insertion as well, or the
+        // same summary differs from its own stored form on the next process
+        // invocation and appends every coordinate again.
+        normalise_invocation_root(&mut observed_invocation);
+        let inserted = observation.invocations.insert(observed_invocation);
         if inserted {
             observation.first_divergent_scheduler_turn.record(turn);
             observation
@@ -5368,8 +5374,8 @@ fn self_test() -> Result<(), String> {
             argv: vec!["hermit".into(), "run".into()],
             guest_argv: vec!["fixture".into()],
             env: BTreeMap::from([("LC_ALL".into(), "C".into())]),
-            cwd: "/repo".into(),
-            shell_command: "cd /repo && env LC_ALL=C hermit run".into(),
+            cwd: "/workspace/pressure-fixture".into(),
+            shell_command: "cd /workspace/pressure-fixture && env LC_ALL=C hermit run".into(),
             attempts: vec![ObservedAttemptInvocation {
                 index: "1".into(),
                 outcome: if result == "pass" { "PASS" } else { "FAIL" }.into(),
@@ -5379,8 +5385,8 @@ fn self_test() -> Result<(), String> {
                 argv: vec!["hermit".into(), "run".into()],
                 guest_argv: vec!["fixture".into()],
                 env: BTreeMap::from([("LC_ALL".into(), "C".into())]),
-                cwd: "/repo".into(),
-                shell_command: "cd /repo && env LC_ALL=C hermit run".into(),
+                cwd: "/workspace/pressure-fixture".into(),
+                shell_command: "cd /workspace/pressure-fixture && env LC_ALL=C hermit run".into(),
             }],
         }),
     };
@@ -5462,6 +5468,23 @@ fn self_test() -> Result<(), String> {
         return Err(format!(
             "reapplying one pressure summary changed the stored observation: {first_difference}"
         ));
+    }
+    let mut stored_once: TrackedCells = serde_json::from_str(&once)
+        .map_err(|error| format!("cannot reload stored pressure observation: {error}"))?;
+    apply_pressure_summary(
+        &mut stored_once,
+        &campaign,
+        "sha-1",
+        "tree-1",
+        &depth_fixture,
+    )
+    .map_err(|error| format!("stored pressure-observation bracket failed: {error}"))?;
+    let stored_twice = encoded_cells(&stored_once)?;
+    if stored_twice != once {
+        return Err(
+            "reapplying one pressure summary after a write/read round trip duplicated coordinates"
+                .into(),
+        );
     }
     let same_engine = pressure_summary("sha-doc", "tree-1", vec![pressure_row("pass", None, None)]);
     apply_pressure_summary(
