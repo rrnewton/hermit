@@ -1327,11 +1327,31 @@ impl<T: RecordOrReplay> Detcore<T> {
                 mapping_identities.insert((raw_dev, raw_inode), (det_dev, det_inode.as_raw()));
             }
         }
+        let needs_mount_devices = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_mount_devices())?;
+        let mut mount_devices = BTreeMap::new();
+        if needs_mount_devices {
+            // Preserve first-observation order rather than sorting the raw
+            // values: the private proc/sys mounts receive host-global device
+            // numbers, while their semantic order in mountinfo is stable.
+            let mut seen = BTreeSet::new();
+            for raw_device in contents
+                .split(|byte| *byte == b'\n')
+                .filter_map(crate::procfs::mountinfo_device)
+            {
+                if seen.insert(raw_device) {
+                    let det_device = determinize_device(guest, raw_device).await;
+                    mount_devices.insert(raw_device, det_device);
+                }
+            }
+        }
         guest.thread_state().with_detfd(call.fd(), |detfd| {
             detfd.initialize_procfs(
                 contents.clone(),
                 ProcfsSnapshotContext {
                     mapping_identities: mapping_identities.clone(),
+                    mount_devices: mount_devices.clone(),
                     virtual_uptime_seconds,
                     virtual_realtime_seconds,
                     virtual_memory_kb,

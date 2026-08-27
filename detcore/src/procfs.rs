@@ -412,6 +412,10 @@ pub(crate) struct ProcfsSnapshotContext {
     /// exactly as `fdinfo_identity` above is built, and this table is only a
     /// lookup for rendering.
     pub(crate) mapping_identities: BTreeMap<(u64, u64), (u64, u64)>,
+    /// Raw `st_dev` -> determinized device for every filesystem named by a
+    /// `/proc/self/mountinfo` snapshot. Built by the caller through the same
+    /// `DevicePool` used by `stat`, so the text view and syscall view agree.
+    pub(crate) mount_devices: BTreeMap<u64, u64>,
     pub(crate) random_uuid: Option<[u8; 16]>,
 }
 
@@ -613,6 +617,12 @@ impl ProcfsFile {
         matches!(self.kind, ProcfsKind::Maps | ProcfsKind::Smaps)
     }
 
+    /// True when this snapshot contains mount-table device identities that
+    /// must agree with the deterministic `st_dev` reported by `stat`.
+    pub(crate) fn needs_mount_devices(&self) -> bool {
+        self.kind == ProcfsKind::Mountinfo
+    }
+
     pub(crate) fn needs_snapshot(&self) -> bool {
         !matches!(self.kind, ProcfsKind::TimerSlack(_)) && self.contents.is_none()
     }
@@ -662,8 +672,10 @@ impl ProcfsFile {
             fdinfo_identity,
             random_uuid,
             mapping_identities,
+            mount_devices,
         } = context;
         let mapping_identities = &mapping_identities;
+        let mount_devices = &mount_devices;
         self.contents = Some(match &self.kind {
             ProcfsKind::Stat => sanitize_stat(&contents, Some((virtual_pid, virtual_ppid))),
             ProcfsKind::Status => {
@@ -755,7 +767,7 @@ impl ProcfsFile {
             ProcfsKind::ModuleRefcnt(module) => {
                 sanitize_module_refcnt(&contents, module.as_str(), &read_host_modules())
             }
-            ProcfsKind::Mountinfo => sanitize_mountinfo(&contents),
+            ProcfsKind::Mountinfo => sanitize_mountinfo(&contents, mount_devices),
             ProcfsKind::RandomUuid => sanitize_random_uuid(
                 &contents,
                 random_uuid.expect("random UUID snapshot omitted deterministic bytes"),
@@ -3169,7 +3181,26 @@ fn sanitize_schedstat(contents: &[u8]) -> Vec<u8> {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-873): Review private mount-root normalization.
-fn sanitize_mountinfo(contents: &[u8]) -> Vec<u8> {
+pub(crate) fn mountinfo_device(line: &[u8]) -> Option<u64> {
+    fn decimal(field: &[u8]) -> Option<u64> {
+        parse_decimal(std::str::from_utf8(field).ok()?)
+    }
+
+    let mut fields = line
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty());
+    decimal(fields.next()?)?;
+    decimal(fields.next()?)?;
+    let mut device = fields.next()?.split(|byte| *byte == b':');
+    let major = u32::try_from(decimal(device.next()?)?).ok()?;
+    let minor = u32::try_from(decimal(device.next()?)?).ok()?;
+    if device.next().is_some() {
+        return None;
+    }
+    Some(libc::makedev(major, minor))
+}
+
+fn sanitize_mountinfo(contents: &[u8], devices: &BTreeMap<u64, u64>) -> Vec<u8> {
     fn is_private_temp_root(root: &[u8]) -> bool {
         fn is_tempfile_name(name: &[u8]) -> bool {
             let Some(suffix) = name.strip_prefix(b".tmp") else {
@@ -3203,22 +3234,75 @@ fn sanitize_mountinfo(contents: &[u8]) -> Vec<u8> {
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
     }
 
+    // Mount IDs are allocated by the kernel when a mount namespace is cloned.
+    // Two concurrent Hermit runs can therefore receive different numbers for
+    // the same mount tree. Assign stable IDs in the kernel's row order, then
+    // preserve parent relationships through that table. Parents outside the
+    // visible namespace are assigned after all visible mounts.
+    let mut mount_ids = BTreeMap::new();
+    let mut next_mount_id = 1_u64;
+    for line in contents.split(|byte| *byte == b'\n') {
+        let fields = line.split(|byte| *byte == b' ').collect::<Vec<_>>();
+        let Some(raw_mount_id) = fields
+            .first()
+            .and_then(|field| std::str::from_utf8(field).ok())
+            .and_then(parse_decimal)
+        else {
+            continue;
+        };
+        if let std::collections::btree_map::Entry::Vacant(entry) = mount_ids.entry(raw_mount_id) {
+            entry.insert(next_mount_id);
+            next_mount_id += 1;
+        }
+    }
+    for line in contents.split(|byte| *byte == b'\n') {
+        let fields = line.split(|byte| *byte == b' ').collect::<Vec<_>>();
+        let Some(raw_parent_id) = fields
+            .get(1)
+            .and_then(|field| std::str::from_utf8(field).ok())
+            .and_then(parse_decimal)
+        else {
+            continue;
+        };
+        if let std::collections::btree_map::Entry::Vacant(entry) = mount_ids.entry(raw_parent_id) {
+            entry.insert(next_mount_id);
+            next_mount_id += 1;
+        }
+    }
+
     let mut normalized = Vec::with_capacity(contents.len());
     for line in contents.split_inclusive(|byte| *byte == b'\n') {
         let has_newline = line.last() == Some(&b'\n');
         let body = line.strip_suffix(b"\n").unwrap_or(line);
         let fields = body.split(|byte| *byte == b' ').collect::<Vec<_>>();
 
-        if fields.len() >= 5 && is_private_temp_root(fields[3]) {
+        let identities = fields.first().and_then(|mount_id| {
+            let raw_mount_id = parse_decimal(std::str::from_utf8(mount_id).ok()?)?;
+            let raw_parent_id = parse_decimal(std::str::from_utf8(fields.get(1)?).ok()?)?;
+            let raw_device = mountinfo_device(body)?;
+            Some((
+                *mount_ids.get(&raw_mount_id)?,
+                *mount_ids.get(&raw_parent_id)?,
+                devices.get(&raw_device).copied().unwrap_or(raw_device),
+            ))
+        });
+
+        if let Some((mount_id, parent_id, device)) = identities {
             for (index, field) in fields.iter().enumerate() {
                 if index > 0 {
                     normalized.push(b' ');
                 }
-                if index == 3 {
-                    normalized.extend_from_slice(b"/tmpvol/.hermit");
-                    normalized.extend_from_slice(fields[4]);
-                } else {
-                    normalized.extend_from_slice(field);
+                match index {
+                    0 => normalized.extend_from_slice(mount_id.to_string().as_bytes()),
+                    1 => normalized.extend_from_slice(parent_id.to_string().as_bytes()),
+                    2 => normalized.extend_from_slice(
+                        format!("{}:{}", libc::major(device), libc::minor(device)).as_bytes(),
+                    ),
+                    3 if fields.len() >= 5 && is_private_temp_root(field) => {
+                        normalized.extend_from_slice(b"/tmpvol/.hermit");
+                        normalized.extend_from_slice(fields[4]);
+                    }
+                    _ => normalized.extend_from_slice(field),
                 }
             }
         } else {
@@ -4250,14 +4334,16 @@ Rss:                   4 kB\n" as &[u8];
     #[test]
     fn private_mount_roots_are_guest_stable() {
         let input = b"37 29 0:31 /tmpvol/.tmpAb12Z9 /tmp rw - btrfs /dev/md0 rw\n38 29 0:31 /host/data /data ro - btrfs /dev/md0 ro\n39 29 0:31 /tmp/.tmp654321 /etc/group ro - btrfs /dev/md0 ro\n40 29 0:31 /tmpvol/v_45e4xci/.tmpxZruR5 /run/nscd ro - btrfs /dev/md0 rw\n41 29 0:31 /tmpvol/vabcdefgh/.tmp123abc /etc/group ro - btrfs /dev/md0 rw\n";
+        let device = libc::makedev(0, 31);
         assert_eq!(
-            sanitize_mountinfo(input),
-            b"37 29 0:31 /tmpvol/.hermit/tmp /tmp rw - btrfs /dev/md0 rw\n38 29 0:31 /host/data /data ro - btrfs /dev/md0 ro\n39 29 0:31 /tmpvol/.hermit/etc/group /etc/group ro - btrfs /dev/md0 ro\n40 29 0:31 /tmpvol/.hermit/run/nscd /run/nscd ro - btrfs /dev/md0 rw\n41 29 0:31 /tmpvol/.hermit/etc/group /etc/group ro - btrfs /dev/md0 rw\n"
+            sanitize_mountinfo(input, &BTreeMap::from([(device, device)])),
+            b"1 6 0:31 /tmpvol/.hermit/tmp /tmp rw - btrfs /dev/md0 rw\n2 6 0:31 /host/data /data ro - btrfs /dev/md0 ro\n3 6 0:31 /tmpvol/.hermit/etc/group /etc/group ro - btrfs /dev/md0 ro\n4 6 0:31 /tmpvol/.hermit/run/nscd /run/nscd ro - btrfs /dev/md0 rw\n5 6 0:31 /tmpvol/.hermit/etc/group /etc/group ro - btrfs /dev/md0 rw\n"
         );
     }
 
     #[test]
     fn unrelated_mount_roots_are_preserved() {
+        let device = libc::makedev(0, 31);
         for root in [
             "/tmpvol/build/.tmpAb12Z9",
             "/tmpvol/v_short/.tmpAb12Z9",
@@ -4267,8 +4353,43 @@ Rss:                   4 kB\n" as &[u8];
             "/tmpvol/v_45e4xci/.tmpAb12Z!",
         ] {
             let input = format!("37 29 0:31 {root} /tmp rw - btrfs /dev/md0 rw\n");
-            assert_eq!(sanitize_mountinfo(input.as_bytes()), input.as_bytes());
+            assert_eq!(
+                sanitize_mountinfo(input.as_bytes(), &BTreeMap::from([(device, device)])),
+                format!("1 2 0:31 {root} /tmp rw - btrfs /dev/md0 rw\n").as_bytes()
+            );
         }
+    }
+
+    #[test]
+    fn mountinfo_namespace_identities_are_guest_stable() {
+        let first = b"395 133 0:32 / / rw,relatime shared:1 - btrfs /dev/root rw\n\
+409 395 0:7 / /dev rw,nosuid - devtmpfs devtmpfs rw\n\
+3079 533 0:64 / /proc rw,relatime - proc none rw\n";
+        let second = b"3085 3084 0:32 / / rw,relatime shared:1 - btrfs /dev/root rw\n\
+3086 3085 0:7 / /dev rw,nosuid - devtmpfs devtmpfs rw\n\
+3160 3102 0:117 / /proc rw,relatime - proc none rw\n";
+        let first_devices = BTreeMap::from([
+            (libc::makedev(0, 32), libc::makedev(0, 1)),
+            (libc::makedev(0, 7), libc::makedev(0, 2)),
+            (libc::makedev(0, 64), libc::makedev(0, 3)),
+        ]);
+        let second_devices = BTreeMap::from([
+            (libc::makedev(0, 32), libc::makedev(0, 1)),
+            (libc::makedev(0, 7), libc::makedev(0, 2)),
+            (libc::makedev(0, 117), libc::makedev(0, 3)),
+        ]);
+        let expected = b"1 4 0:1 / / rw,relatime shared:1 - btrfs /dev/root rw\n\
+2 1 0:2 / /dev rw,nosuid - devtmpfs devtmpfs rw\n\
+3 5 0:3 / /proc rw,relatime - proc none rw\n";
+
+        assert_eq!(sanitize_mountinfo(first, &first_devices), expected);
+        assert_eq!(sanitize_mountinfo(second, &second_devices), expected);
+    }
+
+    #[test]
+    fn malformed_mountinfo_is_preserved() {
+        let input = b"not a mountinfo row\n";
+        assert_eq!(sanitize_mountinfo(input, &BTreeMap::new()), input);
     }
 
     #[test]

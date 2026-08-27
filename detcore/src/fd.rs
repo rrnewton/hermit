@@ -408,6 +408,15 @@ impl DetFd {
             .is_some_and(ProcfsFile::needs_mapping_identities)
     }
 
+    /// Whether this procfs snapshot has mount-table devices that must be
+    /// translated through Detcore's deterministic device pool.
+    pub(crate) fn procfs_needs_mount_devices(&self) -> bool {
+        self.description()
+            .procfs
+            .as_ref()
+            .is_some_and(ProcfsFile::needs_mount_devices)
+    }
+
     pub(crate) fn procfs_needs_random_uuid(&self) -> bool {
         self.description()
             .procfs
