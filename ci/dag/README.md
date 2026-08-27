@@ -1,7 +1,7 @@
 # CI validation lanes as dagrun DAGs
 
 This directory holds a declarative migration of Hermit's CI validation lanes
-onto [`dagrun`](../../agent-utils/common/docs/dagrun/README.md)
+onto [`dagrun`](../../agent-utils/common/docs/dagrun/rendered/python/README.md)
 (from the `agent-utils` submodule). Each validation *gate* becomes a DAG node
 with explicit dependencies and resource limits, so the scheduler can run
 independent gates concurrently. On hosts with delegated cgroup v2 support, it

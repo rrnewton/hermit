@@ -52,6 +52,8 @@ use serde_json::json;
 
 const TRACKED_CELLS: &str = "ci/compat-envelope/cells.json";
 const PORTABLE_DAG: &str = "ci/dag/portable.json";
+const DAGRUN_MANIFEST: &str = "agent-utils/rs/dagrun/Cargo.toml";
+const CARGO_BUILD_JOBS_ENV: &str = "CARGO_BUILD_JOBS";
 const TRACKED_CELLS_SCHEMA: u64 = 5;
 const RUN_SCHEMA: u64 = 3;
 const CELL_RESULT_SCHEMA: u64 = 4;
@@ -686,7 +688,7 @@ impl FreshCheckout {
             )?;
             for required in [
                 "ci/compat-envelope/pressure-test.rs",
-                "agent-utils/rs/dagrun/Cargo.toml",
+                DAGRUN_MANIFEST,
             ] {
                 if !checkout.path.join(required).is_file() {
                     return Err(format!(
@@ -1626,6 +1628,88 @@ fn command_ok(command: &mut Command, purpose: &str) -> Result<(), String> {
     }
 }
 
+/// Bind this consumer to the exact agent-utils gitlink and the crate/entrypoint
+/// layout exported by that pin. This resolves the live contract instead of
+/// banning an old spelling: a future upstream rename must update the dependency,
+/// generated-checkout requirement, and launchers together.
+fn audit_dagrun_source_contract(root: &Path) -> Result<(), String> {
+    let expected_pin = git_output(root, &["rev-parse", "HEAD:agent-utils"])?;
+    let agent_utils = root.join("agent-utils");
+    let observed_pin = git_output(&agent_utils, &["rev-parse", "HEAD"])?;
+    if observed_pin != expected_pin {
+        return Err(format!(
+            "agent-utils checkout is at {observed_pin}, but this Hermit commit pins {expected_pin}"
+        ));
+    }
+
+    let manifest = root.join(DAGRUN_MANIFEST).canonicalize().map_err(|error| {
+        format!("pinned agent-utils checkout does not provide {DAGRUN_MANIFEST}: {error}")
+    })?;
+    let output = Command::new("cargo")
+        .arg("metadata")
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .args(["--no-deps", "--format-version", "1"])
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("cannot inspect pinned dagrun Cargo metadata: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "pinned dagrun Cargo metadata failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let metadata: JsonValue = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("pinned dagrun Cargo metadata is invalid JSON: {error}"))?;
+    let package = metadata["packages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|package| {
+            package["name"].as_str() == Some("dagrun")
+                && package["manifest_path"]
+                    .as_str()
+                    .and_then(|path| PathBuf::from(path).canonicalize().ok())
+                    .as_deref()
+                    == Some(manifest.as_path())
+        })
+        .ok_or_else(|| {
+            format!("{DAGRUN_MANIFEST} does not resolve to the pinned dagrun package")
+        })?;
+    let targets = package["targets"]
+        .as_array()
+        .ok_or_else(|| "pinned dagrun package has no Cargo targets".to_string())?;
+    for kind in ["lib", "bin"] {
+        let found = targets.iter().any(|target| {
+            target["name"].as_str() == Some("dagrun")
+                && target["kind"]
+                    .as_array()
+                    .is_some_and(|kinds| kinds.iter().any(|value| value.as_str() == Some(kind)))
+        });
+        if !found {
+            return Err(format!(
+                "pinned dagrun package does not export its {kind} target as `dagrun`"
+            ));
+        }
+    }
+
+    let agent_utils = agent_utils
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve pinned agent-utils checkout: {error}"))?;
+    for entrypoint in ["agent-utils/common/bin/dagrun", "agent-utils/py/bin/dagrun"] {
+        let resolved = root.join(entrypoint).canonicalize().map_err(|error| {
+            format!("pinned agent-utils checkout does not provide {entrypoint}: {error}")
+        })?;
+        if !resolved.starts_with(&agent_utils) {
+            return Err(format!(
+                "pinned dagrun entrypoint {entrypoint} escapes the agent-utils checkout: {}",
+                resolved.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 struct CheckedScorecard<'a> {
     root: &'a Path,
 }
@@ -2172,8 +2256,9 @@ fn write_plan_after_scorecard_check(
 
     let canonical_text = fs::read_to_string(root.join(PORTABLE_DAG))
         .map_err(|e| format!("cannot read {PORTABLE_DAG}: {e}"))?;
-    let canonical =
+    let mut canonical =
         dag_from_json(&canonical_text).map_err(|e| format!("invalid {PORTABLE_DAG}: {e}"))?;
+    canonical.default_jobs_env = CARGO_BUILD_JOBS_ENV.to_string();
     let includes_liteinst = cells.iter().any(|tracked| tracked.id.backend == "liteinst");
     let exact_cell = selection.is_exact().then(|| {
         (
@@ -2293,6 +2378,7 @@ fn write_plan_after_scorecard_check(
             timeout: wall,
             cpu_timeout: wall * 2,
             jobs_flag: None,
+            jobs_env: None,
             skip_reason: None,
             // Undeclared. These cells already serialize their cargo writes through
             // the `cargo_writer` resource cap above, and restating that as a write
@@ -2453,6 +2539,7 @@ fn write_plan_after_scorecard_check(
                 timeout: wall,
                 cpu_timeout: wall * 2,
                 jobs_flag: None,
+                jobs_env: None,
                 skip_reason: None,
                 write_domains: None,
                 write_domain_guarantee: None,
@@ -2485,6 +2572,7 @@ fn write_plan_after_scorecard_check(
         timeout: 120,
         cpu_timeout: 120,
         jobs_flag: None,
+        jobs_env: None,
         skip_reason: None,
         write_domains: None,
         write_domain_guarantee: None,
@@ -2557,6 +2645,12 @@ fn audit_dag(
     run_timeout: i64,
     expected_cell_timeouts: &BTreeMap<String, i64>,
 ) -> Result<(), String> {
+    if dag.default_jobs_env != CARGO_BUILD_JOBS_ENV {
+        return Err(format!(
+            "generated pressure DAG does not route declared width through {CARGO_BUILD_JOBS_ENV}: {:?}",
+            dag.default_jobs_env
+        ));
+    }
     let mut tags = BTreeSet::new();
     let mut deps = Vec::new();
     let mut cells = 0usize;
@@ -4116,6 +4210,8 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
 }
 
 fn self_test(root: &Path) -> Result<(), String> {
+    audit_dagrun_source_contract(root)?;
+
     safe_ci_scope::self_test()?;
     // The checked files remain immutable throughout this self-test. Production
     // plan/run still checks at its command boundary before constructing a plan.
@@ -4637,10 +4733,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     )?;
     fs::write(clone_source.join(".gitignore"), "/ignored/\n")
         .map_err(|e| format!("cannot write generated-checkout fixture ignore rule: {e}"))?;
-    for required in [
-        "ci/compat-envelope/pressure-test.rs",
-        "agent-utils/rs/dagrun/Cargo.toml",
-    ] {
+    for required in ["ci/compat-envelope/pressure-test.rs", DAGRUN_MANIFEST] {
         let path = clone_source.join(required);
         fs::create_dir_all(path.parent().expect("required fixture path has parent"))
             .map_err(|e| format!("cannot create generated-checkout fixture path: {e}"))?;
@@ -4656,7 +4749,7 @@ fn self_test(root: &Path) -> Result<(), String> {
                 ".gitignore",
                 "tracked",
                 "ci/compat-envelope/pressure-test.rs",
-                "agent-utils/rs/dagrun/Cargo.toml",
+                DAGRUN_MANIFEST,
             ])
             .current_dir(&clone_source),
         "stage no-hardlinks clone fixture",
@@ -6022,7 +6115,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     clone_source_cleanup.remove()?;
     scratch_cleanup.remove()?;
     println!(
-        "compatibility pressure-test self-test: no-hardlinks exact checkout, scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green selection, exact and batch repetitions, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass"
+        "compatibility pressure-test self-test: pinned dagrun source contract, no-hardlinks exact checkout, scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green selection, exact and batch repetitions, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass"
     );
     Ok(())
 }

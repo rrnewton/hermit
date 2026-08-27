@@ -684,6 +684,7 @@ fn run_one_nested_scope_probe_step(
 ) -> Result<(), String> {
     let mut cfg = DagConfig::default();
     cfg.description = "real nested safe-ci scope self-test".into();
+    cfg.default_jobs_env = validate_plan::CARGO_BUILD_JOBS_ENV.to_string();
     cfg.steps.push(step);
     let result = run_dag_boxed_deadline(
         &cfg, 1, true, 2, cgroups, None, Some(1), Some(run_timeout_s),
@@ -706,6 +707,7 @@ fn run_one_nested_scope_signal_step(
 ) -> Result<(), String> {
     let mut cfg = DagConfig::default();
     cfg.description = "real inherited-scope signal self-test".into();
+    cfg.default_jobs_env = validate_plan::CARGO_BUILD_JOBS_ENV.to_string();
     cfg.steps.push(step);
     let result = run_dag_boxed_deadline(
         &cfg, 1, true, 2, cgroups, None, Some(1), Some(run_timeout_s),
@@ -732,6 +734,16 @@ fn run_nested_scope_probe() -> Result<String, String> {
             let cgroups = safe_ci_scope::resolve_cgroups(
                 "safe-ci nested self-test outer", false, Some(NESTED_SCOPE_RUNTIME_S), true,
             ).map_err(|code| format!("outer cgroup setup refused with exit {code}"))?;
+            let carried_runtime_s = dagrun::cgroup::expected_scope_runtime_max_s()
+                .ok_or("nested outer scope did not receive DAGRUN_EXPECTED_RUNTIME_MAX_SEC")?;
+            if carried_runtime_s != NESTED_SCOPE_RUNTIME_S {
+                return Err(format!(
+                    "nested outer scope received DAGRUN_EXPECTED_RUNTIME_MAX_SEC={carried_runtime_s}, expected {NESTED_SCOPE_RUNTIME_S}"
+                ));
+            }
+            println!(
+                "nested outer read DAGRUN_EXPECTED_RUNTIME_MAX_SEC={carried_runtime_s}s"
+            );
             let exe = std::env::current_exe()
                 .map_err(|error| format!("cannot resolve self-test executable: {error}"))?;
             let exe = exe.to_str()
@@ -765,6 +777,14 @@ fn run_nested_scope_probe() -> Result<String, String> {
             )
         }
         Ok(NESTED_SCOPE_INNER) => {
+            let carried_jobs = std::env::var(validate_plan::CARGO_BUILD_JOBS_ENV)
+                .map_err(|error| format!("nested boxed child has no CARGO_BUILD_JOBS: {error}"))?;
+            if carried_jobs != "1" {
+                return Err(format!(
+                    "nested boxed child received CARGO_BUILD_JOBS={carried_jobs:?}, expected \"1\""
+                ));
+            }
+            println!("nested boxed child read CARGO_BUILD_JOBS={carried_jobs}");
             // This process inherited the outer scope's RuntimeMax; it did not
             // request a second systemd unit. Every other limit stays mandatory.
             let cgroups = safe_ci_scope::resolve_cgroups(
@@ -810,6 +830,7 @@ fn nested_scope_self_test() -> Result<String, String> {
         .arg(format!("{NESTED_WRAPPER_TIMEOUT_S}s"))
         .arg(exe).arg("--self-test")
         .env(NESTED_SCOPE_SELF_TEST_ENV, NESTED_SCOPE_OUTER)
+        .env(validate_plan::CARGO_BUILD_JOBS_ENV, "8")
         .env("DAGRUN_FORCE_SCOPE_ATTEMPT", "1")
         .env("DAGRUN_NO_STEP_LOGS", "1")
         .env_remove("DAGRUN_IN_SCOPE")
@@ -827,7 +848,11 @@ fn nested_scope_self_test() -> Result<String, String> {
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let runtime_evidence =
+        format!("nested outer read DAGRUN_EXPECTED_RUNTIME_MAX_SEC={NESTED_SCOPE_RUNTIME_S}s");
     for required in [
+        runtime_evidence.as_str(),
+        "nested boxed child read CARGO_BUILD_JOBS=1",
         "nested child verified the outer scope and dispatched its own boxed step",
         "safe-ci nested self-test inner: cgroup boxing ACTIVE",
         "outer cgroup audit at ",
@@ -844,6 +869,41 @@ fn nested_scope_self_test() -> Result<String, String> {
         }
     }
     Ok("safe-ci scope: real outer -> step child -> nested boxed step passed".into())
+}
+
+/// Prove the in-process Rust scheduler also overrides an ambient Cargo width
+/// when cgroup boxing is deliberately absent. The boxed case is covered by the
+/// real nested scope above; both must deliver the same admitted width.
+fn jobs_env_unboxed_self_test() -> Result<String, String> {
+    let mut step = nested_scope_probe_step(
+        "jobs_env_unboxed",
+        "test \"${CARGO_BUILD_JOBS:-}\" = 1".into(),
+        None,
+        5,
+    );
+    step.env
+        .insert(validate_plan::CARGO_BUILD_JOBS_ENV.into(), "8".into());
+    let cfg = validate_plan::config_from(vec![step], "unboxed dagrun jobs-env self-test");
+    if cfg.default_jobs_env != validate_plan::CARGO_BUILD_JOBS_ENV {
+        return Err(format!(
+            "unboxed DAG configured jobs env {:?}, expected {}",
+            cfg.default_jobs_env,
+            validate_plan::CARGO_BUILD_JOBS_ENV
+        ));
+    }
+    let result = run_dag_boxed_deadline(&cfg, 1, true, 0, None, None, Some(1), Some(10));
+    if !result.ok
+        || result.run_timed_out
+        || !result.skipped.is_empty()
+        || result.outcomes.len() != 1
+        || !result.outcomes[0].ok
+    {
+        return Err(format!(
+            "unboxed jobs-env step did not receive its admitted width: ok={} timed_out={} outcomes={:?} skipped={:?}",
+            result.ok, result.run_timed_out, result.outcomes, result.skipped
+        ));
+    }
+    Ok("dagrun jobs env: boxed and unboxed children receive the admitted Cargo width".into())
 }
 
 /// The literal flag that enables Hermit's strict execution mode.
@@ -1319,6 +1379,7 @@ fn self_test() -> Result<(), String> {
     for line in [
         safe_ci_scope::self_test()?,
         nested_scope_self_test()?,
+        jobs_env_unboxed_self_test()?,
         scheduler_accounting_bracket()?,
         budget_reason_bracket()?,
         validate_super::self_test(&root)?,
@@ -1349,6 +1410,13 @@ fn self_test() -> Result<(), String> {
         let root = repo_root();
         for lane in ["portable", "privileged"] {
             let base = validate_plan::lane_config(&root, lane)?;
+            if base.default_jobs_env != validate_plan::CARGO_BUILD_JOBS_ENV {
+                return Err(format!(
+                    "carry bracket: lane {lane} does not route admitted width through {}: {:?}",
+                    validate_plan::CARGO_BUILD_JOBS_ENV,
+                    base.default_jobs_env
+                ));
+            }
             // POSITIVE: a real lane's own config must carry, and must be grantable.
             let steps = validate_plan::lane_nodes(&root, lane, "", "gate.manifest")?;
             let carried = validate_plan::config_from_base(&base, steps, "bracket");
@@ -1385,6 +1453,15 @@ fn self_test() -> Result<(), String> {
                 return Err(format!(
                     "carry bracket: lane {lane} rebuilt from Default::default() compared EQUAL to \
                      its file config -- the assertion cannot detect the bug it exists for"));
+            }
+            let mut dropped_jobs_env = carried.clone();
+            dropped_jobs_env.default_jobs_env.clear();
+            let jobs_env_diff = validate_plan::assert_config_carried(&base, &dropped_jobs_env)
+                .expect_err("carry bracket accepted a dropped default_jobs_env");
+            if !jobs_env_diff.contains("default_jobs_env") {
+                return Err(format!(
+                    "carry bracket did not name its dropped jobs environment: {jobs_env_diff}"
+                ));
             }
             println!("  dag-config: {lane} carries {} cap(s), default_step_timeout={}s; \
 cleared-caps refusal names {} starved step(s)",
@@ -2208,6 +2285,7 @@ fn super_plan_bracket() -> Result<(), String> {
             timeout: 0,
             cpu_timeout: 0,
             jobs_flag: None,
+            jobs_env: None,
             skip_reason: None,
             write_domains: None,
             write_domain_guarantee: None,
@@ -4054,6 +4132,7 @@ fn step_with_caps(
         timeout,
         cpu_timeout,
         jobs_flag: None,
+        jobs_env: None,
         skip_reason: None,
         // Undeclared, as these nodes were before the runner grew the fields. See
         // validate_plan::node for why this is not `Some(vec![])`.

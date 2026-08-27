@@ -78,6 +78,10 @@ const MANIFEST_PLAN_BUILD_MEM_BYTES: i64 = 2 * 1024 * 1024 * 1024;
 /// the build spine legitimately burns many CPU-minutes; it exists to stop an
 /// unbounded spin, not to police normal cost.
 const LANE_DEFAULT_CPU_TIMEOUT_S: i64 = 7200;
+/// Hermit's Cargo-bearing nodes accept their admitted width through this
+/// environment variable. The shell DAG launcher declares the same channel via
+/// the pinned runner's host-level setting; in-process Rust clients set it directly.
+pub const CARGO_BUILD_JOBS_ENV: &str = "CARGO_BUILD_JOBS";
 
 /// Wall budget for one compatibility probe. Mirrors `STRICT_COMPAT_TIMEOUT=60`
 /// (validate.sh:1091).
@@ -212,6 +216,7 @@ pub fn node(
         timeout,
         cpu_timeout,
         jobs_flag: None,
+        jobs_env: None,
         skip_reason: None,
         // `None` means "this step declares nothing", which is what every node here
         // meant before the runner grew these fields. `Some(vec![])` would be the
@@ -576,14 +581,18 @@ pub fn sanitize_job(label: &str) -> String {
 ///
 /// `lane_nodes` returns steps because the fusion path rewrites their tags, but a
 /// DAG file is more than a bag of steps: `resource_caps`, `default_step_timeout`,
-/// `mem_cap_factor`, `mem_cap_floor_bytes` and `outer_mem_safety_factor` are all
-/// top-level, and every one of them silently reverts to `DagConfig::default()` if
-/// the caller rebuilds the config instead of carrying it.
+/// `mem_cap_factor`, `mem_cap_floor_bytes`, `outer_mem_safety_factor`, and the
+/// inner jobs environment channel are all top-level, and every one of them
+/// silently reverts to `DagConfig::default()` if the caller rebuilds the config
+/// instead of carrying it.
 pub fn lane_config(root: &Path, lane: &str) -> Result<DagConfig, String> {
     let path = lane_dag_path(root, lane);
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    dag_from_json(&text).map_err(|e| format!("invalid DAG {}: {e}", path.display()))
+    let mut cfg =
+        dag_from_json(&text).map_err(|e| format!("invalid DAG {}: {e}", path.display()))?;
+    cfg.default_jobs_env = CARGO_BUILD_JOBS_ENV.to_string();
+    Ok(cfg)
 }
 
 /// Assemble a `DagConfig`, CARRYING every top-level field from `base`.
@@ -622,7 +631,9 @@ pub fn config_from_base(base: &DagConfig, steps: Vec<Step>, description: &str) -
 
 /// Synthesised plans that have no source DAG file (compat, quick, envelope, ...).
 pub fn config_from(steps: Vec<Step>, description: &str) -> DagConfig {
-    config_from_base(&DagConfig::default(), steps, description)
+    let mut cfg = config_from_base(&DagConfig::default(), steps, description);
+    cfg.default_jobs_env = CARGO_BUILD_JOBS_ENV.to_string();
+    cfg
 }
 
 /// Field-by-field proof that `derived` carried `base`'s configuration.
@@ -651,6 +662,9 @@ pub fn assert_config_carried(base: &DagConfig, derived: &DagConfig) -> Result<()
     }
     if base.default_jobs_flag != derived.default_jobs_flag {
         bad.push(format!("default_jobs_flag {:?} != {:?}", base.default_jobs_flag, derived.default_jobs_flag));
+    }
+    if base.default_jobs_env != derived.default_jobs_env {
+        bad.push(format!("default_jobs_env {:?} != {:?}", base.default_jobs_env, derived.default_jobs_env));
     }
     if base.default_step_mem_cap_bytes != derived.default_step_mem_cap_bytes {
         bad.push(format!("default_step_mem_cap_bytes {:?} != {:?}", base.default_step_mem_cap_bytes, derived.default_step_mem_cap_bytes));
