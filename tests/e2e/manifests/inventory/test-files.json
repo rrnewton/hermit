@@ -218,6 +218,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/environment_and_workdir.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (portable CI)",
+      "why": "tests/backend-parity/fixtures/environment_and_workdir.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (portable CI): the ptrace verify and custom cells assert the exact guest environment name set and prove each guest starts in an empty writable tmpfs at /test"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/dup_shared_offset.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/dup_shared_offset.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
