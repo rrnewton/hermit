@@ -2232,7 +2232,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 && selection.mode.is_none()
                 && !matches!(cell.id.mode.as_str(), "verify" | "replay" | "chaos"));
         match cell.status.as_str() {
-            "red" if selected && !selection.repeats_green_cell() => {
+            "not-selected" if selected && !selection.repeats_green_cell() => {
                 let budget = budgets
                     .get(&(
                         cell.id.test.clone(),
@@ -2256,8 +2256,8 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                     unavailable.push(cell);
                 }
             }
-            "red" => {}
-            "green" if selected && selection.repeats_green_cell() && cell.enabled => {
+            "not-selected" => {}
+            "selected" if selected && selection.repeats_green_cell() && cell.enabled => {
                 let budget = budgets
                     .get(&(
                         cell.id.test.clone(),
@@ -2278,7 +2278,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 }
                 selected_cells.push(cell);
             }
-            "green" => {}
+            "selected" => {}
             // NOT APPLICABLE IS NOT A CANDIDATE, AND SAYING SO IS THE POINT. The
             // backend is not enabled for this mode, so there is nothing to
             // pressure-test: repeating a cell that was never asked to run
@@ -5893,7 +5893,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         .iter()
         .find(|tracked| {
             tracked.enabled
-                && tracked.status == "green"
+                && tracked.status == "selected"
                 && tracked.id.mode == "verify"
                 && tracked.id.backend == "ptrace"
         })
@@ -6199,7 +6199,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     let expected_green_ids: BTreeSet<_> = tracked
         .cells
         .iter()
-        .filter(|tracked| tracked.enabled && tracked.status == "green")
+        .filter(|tracked| tracked.enabled && tracked.status == "selected")
         .map(|tracked| tracked.id.clone())
         .collect();
     let selected_green_batch = pressure_cells(root, &green_batch_selection)?;
@@ -7246,7 +7246,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     clone_source_cleanup.remove()?;
     scratch_cleanup.remove()?;
     println!(
-        "compatibility pressure-test self-test: no-hardlinks exact checkout, scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green selection, exact and batch repetitions, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass"
+        "compatibility pressure-test self-test: no-hardlinks exact checkout, scorecard/manifest refusal, direct scheduler, multi-failure continuation, selected/not-selected selection, exact and batch repetitions, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass"
     );
     Ok(())
 }

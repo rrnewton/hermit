@@ -236,8 +236,23 @@ struct CiDisabledReasonData {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum CellStatus {
-    Green,
-    Red,
+    /// The cell is listed in `ci/expected-e2e-plan.json`, so ordinary validation
+    /// requires it to pass.
+    ///
+    /// ⚠️ NAMED FOR WHAT IT IS, BECAUSE THE COLOUR SAID SOMETHING ELSE. The
+    /// generated prose has always read "**Green** means the cell is SELECTED"
+    /// and, two sentences later, "Green does not mean measured, and it does not
+    /// mean passing." A reader who trusted the colour and skipped the paragraph
+    /// read a selection count as a pass count. The variant now says what the
+    /// paragraph already said.
+    Selected,
+    /// An enabled cell that is not selected: measured failure, unavailable, or
+    /// not yet run all sit here until the cell is promoted into the plan.
+    ///
+    /// `rename_all = "lowercase"` would emit `notselected`, so the hyphenated
+    /// form is spelled out, exactly as `NotApplicable` already is.
+    #[serde(rename = "not-selected")]
+    NotSelected,
     /// The backend is not enabled for this test and mode, so the cell was never
     /// asked to do anything and cannot have failed.
     ///
@@ -257,8 +272,8 @@ enum CellStatus {
 impl CellStatus {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Green => "green",
-            Self::Red => "red",
+            Self::Selected => "selected",
+            Self::NotSelected => "not-selected",
             Self::NotApplicable => "not-applicable",
         }
     }
@@ -1737,20 +1752,20 @@ fn render_scorecard(derived: &Derived) -> String {
         "# Compatibility scorecard\n\n\
 This table is derived from the manifest, not from a separately maintained parent-workspace CSV. \
 `./ci/compat-envelope/scorecard.rs check` verifies it.\n\n\
-**Green** means the cell is SELECTED: it is listed in `ci/expected-e2e-plan.json` and is therefore \
-required to pass by ordinary validation. **Red** means an enabled cell is not selected: measured \
-failure, unavailable, or not yet run all remain red until the cell is promoted into the regression \
-plan and passes. The summary table below classifies the current **{na_total}** manifest-disabled \
-combinations as **Not applicable**, not red or omitted: a cell that cannot run cannot pass or fail.\n\n\
-**Green does not mean measured, and it does not mean passing.** Selection, measurement, and result \
-are three separate facts, and the Green column below reports only the first of them. Green is a \
-statement about what the plan REQUIRES, not about what has been OBSERVED. Whether a result was ever \
-seen is a per-cell `measurement` field in `ci/compat-envelope/cells.json`, independent of colour \
-and reading `never-measured`, `measured-and-passed`, or `diverged`; a cell can be green and \
-`never-measured`, or red and `measured-and-passed`. The generated Status and measurement section \
+**Selected** means the cell is listed in `ci/expected-e2e-plan.json` and is therefore \
+required to pass by ordinary validation. **Not selected** means an enabled cell is absent from that \
+plan: measured failure, unavailable, or not yet run all remain not selected until the cell is \
+promoted into the regression plan and passes. The summary table below classifies the current **{na_total}** manifest-disabled \
+combinations as **Not applicable**, not as not-selected or omitted: a cell that cannot run cannot pass or fail.\n\n\
+**Selected does not mean measured, and it does not mean passing.** Selection, measurement, and \
+result are three separate facts, and the Selected column below reports only the first of them. It is \
+a statement about what the plan REQUIRES, not about what has been OBSERVED. Whether a result was ever \
+seen is a per-cell `measurement` field in `ci/compat-envelope/cells.json`, independent of selection \
+and reading `never-measured`, `measured-and-passed`, or `diverged`; a cell can be selected and \
+`never-measured`, or not selected and `measured-and-passed`. The generated Status and measurement section \
 below states whether those combinations are present today and quotes their exact current counts. \
 To count what has actually run, count that field -- do not count this table. Conflating the three \
-has repeatedly produced project-status reports that quoted the Green total as a number of passing \
+has repeatedly produced project-status reports that quoted the Selected total as a number of passing \
 tests, which it has never been.\n\n\
 Every selected `verify` cell, and every seed in a selected `chaos` cell, runs the same backend \
 twice. The manifest runner adds `--verify-strict` when the selected Hermit binary supports it, and \
@@ -1759,7 +1774,7 @@ accepts a result only when the typed report says `verified=true`, `verdict=match
 `record_envelope`, and both INFO-message counts are nonzero. Bare `--verify` remains a Stripped \
 comparison when invoked directly and does not satisfy \
 this regression plan. These same-backend results do not establish cross-backend parity.\n\n\
-| Backend | Green | Red | Not applicable | Total |\n\
+| Backend | Selected | Not selected | Not applicable | Total |\n\
 | --- | ---: | ---: | ---: | ---: |\n",
     );
     let mut green_total = 0usize;
@@ -1822,20 +1837,20 @@ this regression plan. These same-backend results do not establish cross-backend 
         .collect();
     out.push_str(&format!(
         "## Denominator, and why the percentage is not comparable across changes to it\n\n\
-Green is **{green_total} of {total}**, which is **{percent:.2}%** — over THIS population and no \
+Selected is **{green_total} of {total}**, which is **{percent:.2}%** — over THIS population and no \
 other. The population is every combination the manifest declares, and it is composed of:\n\n\
 - backends: {}\n\
 - modes: {}\n\n\
 ⚠️ **{na} of those {total} cells are NOT APPLICABLE** — their backend is not enabled for their \
 mode, so they were never asked to run and cannot pass or fail. Over the {applicable} cells that \
-CAN run, green is **{applicable_percent:.2}%**.\n\n\
-⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same {green_total} green cells \
+CAN run, the selected share is **{applicable_percent:.2}%**.\n\n\
+⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same {green_total} selected cells \
 measured against a smaller denominator. Nothing was fixed to produce it; it is what the first \
 figure always meant once the cells that cannot run are excluded. Quote both or neither, and never \
 compare one against the other as though something moved.\n\n\
 ⚠️ **Adding or removing a backend or mode changes this denominator and therefore the percentage, \
-without anything about the product changing.** Removing a backend whose cells are mostly red \
-RAISES the reported figure; adding honest red cells LOWERS it. Neither is progress. Before \
+without anything about the product changing.** Removing a backend whose cells are mostly not selected \
+RAISES the reported figure; adding honest not-selected cells LOWERS it. Neither is progress. Before \
 comparing this percentage against an earlier one, diff the two lists above: if they differ, the \
 numbers are not comparable and the difference is not a result.\n\n",
         ordered
@@ -1858,14 +1873,14 @@ numbers are not comparable and the difference is not a result.\n\n",
     ));
     out.push_str(
         "The mode view makes the current order of work explicit: expand `verify` first, then \
-`replay`, then `chaos`. Each backend cell is `green / total`; an em dash means that mode does \
-not exist for that backend. The summary columns use the same Green, Red, and Not applicable \
+`replay`, then `chaos`. Each backend cell is `selected / total`; an em dash means that mode does \
+not exist for that backend. The summary columns use the same Selected, Not selected, and Not applicable \
 statuses as the table above.\n\n| Mode",
     );
     for backend in &ordered {
         out.push_str(&format!(" | `{backend}`"));
     }
-    out.push_str(" | Green | Red | Not applicable | Total |\n| ---");
+    out.push_str(" | Selected | Not selected | Not applicable | Total |\n| ---");
     for _ in &ordered {
         out.push_str(" | ---:");
     }
@@ -1918,9 +1933,9 @@ Until a cell actually compares a fresh ptrace log with the corresponding backend
 reports no cross-backend parity number.\n\n\
 ## Ptrace by manifest category\n\n\
 This view uses the same Basic Sanity Milestone 1 contracts as the tables above, but makes the ptrace \
-workload mix visible. Each entry is `green / total`; `custom` commands are not part of this \
+workload mix visible. Each entry is `selected / total`; `custom` commands are not part of this \
 denominator.\n\n\
-| Manifest category | Verify | Replay | Chaos | Green | Total |\n\
+| Manifest category | Verify | Replay | Chaos | Selected | Total |\n\
 | --- | ---: | ---: | ---: | ---: | ---: |\n",
     );
     let categories: BTreeSet<&str> = derived
@@ -1965,10 +1980,10 @@ denominator.\n\n\
         .filter(|id| id.mode == "custom")
         .count();
     out.push_str(&format!(
-        "Ordinary full validation executes {} selected regression cells: the {green_total} green \
+        "Ordinary full validation executes {} selected regression cells: the {green_total} selected \
 compatibility cells above (including {chaos} chaos-mode race-exposure checks), and {custom} \
 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for \
-all of them; a failing green cell is a regression, not permission to move it to red.\n",
+all of them; a failing selected cell is a regression, not permission to deselect it.\n",
         derived.selected.len()
     ));
     out
@@ -1976,8 +1991,8 @@ all of them; a failing green cell is a regression, not permission to move it to 
 
 fn render_measurement_section(tracked: &TrackedCells) -> String {
     let statuses = [
-        CellStatus::Green,
-        CellStatus::Red,
+        CellStatus::Selected,
+        CellStatus::NotSelected,
         CellStatus::NotApplicable,
     ];
     let measurements = [
@@ -1998,8 +2013,8 @@ fn render_measurement_section(tracked: &TrackedCells) -> String {
     // table. An import changed one count to zero while leaving the prose saying
     // both combinations were present. Derive the claims through the table's
     // own count so another import changes both together.
-    let green_never_measured = count(CellStatus::Green, MeasurementState::NeverMeasured);
-    let red_measured_and_passed = count(CellStatus::Red, MeasurementState::MeasuredAndPassed);
+    let green_never_measured = count(CellStatus::Selected, MeasurementState::NeverMeasured);
+    let red_measured_and_passed = count(CellStatus::NotSelected, MeasurementState::MeasuredAndPassed);
 
     let mut out = String::from(
         "\n## Status and measurement\n\n\
@@ -2011,8 +2026,8 @@ recorded last test still matches `HEAD:detcore`.\n\n",
     );
     out.push_str(&format!(
         "The count table includes all **{}** tracked cells; no row is omitted. The current \
-green/`never-measured` count is **{green_never_measured}**, and the current \
-red/`measured-and-passed` count is **{red_measured_and_passed}**. These values use the same counts \
+selected/`never-measured` count is **{green_never_measured}**, and the current \
+not-selected/`measured-and-passed` count is **{red_measured_and_passed}**. These values use the same counts \
 printed in the table below.\n\n",
         tracked.cells.len(),
     ));
@@ -2108,7 +2123,7 @@ fn tracked_from(
     let regressed: Vec<_> = previous
         .values()
         .filter(|cell| {
-            cell.status == CellStatus::Green
+            cell.status == CellStatus::Selected
                 && derived.population.contains(&cell.id)
                 && !derived.green.contains(&cell.id)
         })
@@ -2147,9 +2162,9 @@ fn tracked_from(
             let status = if !enabled {
                 CellStatus::NotApplicable
             } else if derived.green.contains(&id) {
-                CellStatus::Green
+                CellStatus::Selected
             } else {
-                CellStatus::Red
+                CellStatus::NotSelected
             };
             let ci_disabled_reason = derived.ci_disabled_reasons.get(&id).cloned();
             let not_applicable_reason = derived.not_applicable_reasons.get(&id).cloned();
@@ -2481,12 +2496,12 @@ fn update_tracked(
         cells
             .cells
             .iter()
-            .filter(|cell| cell.status == CellStatus::Green)
+            .filter(|cell| cell.status == CellStatus::Selected)
             .count(),
         cells
             .cells
             .iter()
-            .filter(|cell| cell.status == CellStatus::Red)
+            .filter(|cell| cell.status == CellStatus::NotSelected)
             .count(),
         not_applicable,
         derived.population.len()
@@ -5749,8 +5764,8 @@ fn self_test() -> Result<(), String> {
     let mut measured_red = visible_tracked.clone();
     measured_red.cells[0].measurement = MeasurementState::MeasuredAndPassed;
     let measured_section = render_measurement_section(&measured_red);
-    let current_counts = "The current green/`never-measured` count is **0**, and the current \
-red/`measured-and-passed` count is **1**.";
+    let current_counts = "The current selected/`never-measured` count is **0**, and the current \
+not-selected/`measured-and-passed` count is **1**.";
     if !measured_section.contains(current_counts)
         || !measured_section.contains("| `red` | 0 | 1 | 0 | 0 | 0 | 1 |")
     {
@@ -5773,8 +5788,8 @@ red/`measured-and-passed` count is **1**.";
         );
     }
     if !unmeasured_section.contains(
-        "The current green/`never-measured` count is **0**, and the current \
-red/`measured-and-passed` count is **0**.",
+        "The current selected/`never-measured` count is **0**, and the current \
+not-selected/`measured-and-passed` count is **0**.",
     ) {
         return Err("measurement prose kept a stale cross-combination count".into());
     }
@@ -5805,7 +5820,7 @@ red/`measured-and-passed` count is **0**.",
         cells: vec![TrackedCell {
             id: id.clone(),
             enabled: true,
-            status: CellStatus::Green,
+            status: CellStatus::Selected,
             ci_disabled_reason: None,
             not_applicable_reason: None,
             last_tested: None,
@@ -5831,7 +5846,7 @@ red/`measured-and-passed` count is **0**.",
         cells: vec![TrackedCell {
             id: id.clone(),
             enabled: true,
-            status: CellStatus::Green,
+            status: CellStatus::Selected,
             ci_disabled_reason: None,
             not_applicable_reason: None,
             last_tested: None,
@@ -5875,7 +5890,7 @@ red/`measured-and-passed` count is **0**.",
     let recovered = tracked_from(&back_to_green, Some(overridden), None, false)
         .map_err(|e| format!("recovery after an override was refused: {e}"))?;
     if let Some(cell) = recovered.cells.iter().find(|cell| cell.id == id) {
-        if cell.status == CellStatus::Green && cell.green_removal_reason.is_some() {
+        if cell.status == CellStatus::Selected && cell.green_removal_reason.is_some() {
             return Err(format!(
                 "green cell {} still carries a green-removal reason",
                 display_id(&id)
@@ -5889,7 +5904,7 @@ red/`measured-and-passed` count is **0**.",
         cells: vec![TrackedCell {
             id: id.clone(),
             enabled: false,
-            status: CellStatus::Red,
+            status: CellStatus::NotSelected,
             ci_disabled_reason: None,
             not_applicable_reason: None,
             last_tested: None,
@@ -6599,7 +6614,7 @@ red/`measured-and-passed` count is **0**.",
             cells: vec![TrackedCell {
                 id: validate_id.clone(),
                 enabled: true,
-                status: CellStatus::Red,
+                status: CellStatus::NotSelected,
                 ci_disabled_reason: None,
                 not_applicable_reason: None,
                 last_tested: None,
@@ -6627,7 +6642,7 @@ red/`measured-and-passed` count is **0**.",
         cells: vec![TrackedCell {
             id: dbt_id.clone(),
             enabled: true,
-            status: CellStatus::Red,
+            status: CellStatus::NotSelected,
             ci_disabled_reason: None,
             not_applicable_reason: None,
             last_tested: None,
@@ -6714,7 +6729,7 @@ red/`measured-and-passed` count is **0**.",
         cells: vec![TrackedCell {
             id: validate_id.clone(),
             enabled: true,
-            status: CellStatus::Red,
+            status: CellStatus::NotSelected,
             ci_disabled_reason: None,
             not_applicable_reason: None,
             last_tested: None,
@@ -6769,7 +6784,7 @@ red/`measured-and-passed` count is **0**.",
             cells: vec![TrackedCell {
                 id: validate_id.clone(),
                 enabled: true,
-                status: CellStatus::Red,
+                status: CellStatus::NotSelected,
                 ci_disabled_reason: None,
                 not_applicable_reason: None,
                 last_tested: None,
@@ -6976,7 +6991,7 @@ red/`measured-and-passed` count is **0**.",
     let bare_cell = |id: &CellId| TrackedCell {
         id: id.clone(),
         enabled: true,
-        status: CellStatus::Red,
+        status: CellStatus::NotSelected,
         ci_disabled_reason: None,
         not_applicable_reason: None,
         last_tested: None,
@@ -7468,14 +7483,14 @@ red/`measured-and-passed` count is **0**.",
     // the most informative thing a pressure test can report: stressing a cell
     // harder than validate did and finding it red.
     let mut green_target = observed.clone();
-    green_target.cells[0].status = CellStatus::Green;
+    green_target.cells[0].status = CellStatus::Selected;
     let green_outcome =
         apply_pressure_summary(&mut green_target, &first, "sha-1", "tree-1", &depth_fixture)
             .map_err(|e| format!("green-cell admission bracket failed: {e}"))?;
     if green_outcome.rows != 1 || !green_outcome.skipped.is_empty() {
         return Err("a green cell was not admitted on equal terms with a red one".into());
     }
-    if green_target.cells[0].status != CellStatus::Green {
+    if green_target.cells[0].status != CellStatus::Selected {
         return Err("folding pressure evidence changed a cell's status".into());
     }
 
@@ -7568,17 +7583,17 @@ red/`measured-and-passed` count is **0**.",
     let with_evidence = TrackedCells {
         schema: SCHEMA,
         projection: None,
-        cells: vec![boundary_cell(vec![sample.clone()], CellStatus::Red)],
+        cells: vec![boundary_cell(vec![sample.clone()], CellStatus::NotSelected)],
     };
     let evidence_dropped = TrackedCells {
         schema: SCHEMA,
         projection: None,
-        cells: vec![boundary_cell(Vec::new(), CellStatus::Red)],
+        cells: vec![boundary_cell(Vec::new(), CellStatus::NotSelected)],
     };
     let ratchet_moved = TrackedCells {
         schema: SCHEMA,
         projection: None,
-        cells: vec![boundary_cell(vec![sample.clone()], CellStatus::Green)],
+        cells: vec![boundary_cell(vec![sample.clone()], CellStatus::Selected)],
     };
     if enforce_writer_boundary(&with_evidence, &evidence_dropped, Writer::Update).is_ok() {
         return Err("writer boundary allowed `update` to drop measured observations".into());
@@ -7740,7 +7755,7 @@ red/`measured-and-passed` count is **0**.",
             MeasurementState::Diverged,
         ),
     ] {
-        let cell = boundary_cell(observations, CellStatus::Red);
+        let cell = boundary_cell(observations, CellStatus::NotSelected);
         if cell.measurement != expected {
             return Err(format!(
                 "measurement derivation: expected `{}` for the {label} case, got `{}`",
@@ -7753,7 +7768,7 @@ red/`measured-and-passed` count is **0**.",
     // ⚠️ A CRASH IS NOT A DIVERGENCE. Reading a non-verdict as a product failure
     // is how an infrastructure hiccup becomes a false regression, so this is
     // asserted separately rather than left implicit in the table above.
-    let crashed = boundary_cell(vec![crashed_observation()], CellStatus::Red);
+    let crashed = boundary_cell(vec![crashed_observation()], CellStatus::NotSelected);
     if crashed.measurement == MeasurementState::Diverged
         || crashed.measurement == MeasurementState::DivergedUnlocated
     {
@@ -7761,7 +7776,7 @@ red/`measured-and-passed` count is **0**.",
     }
 
     // THE REFUSAL: a stored value that disagrees with the row's own evidence.
-    let mut lying = boundary_cell(vec![diverged_observation(true)], CellStatus::Red);
+    let mut lying = boundary_cell(vec![diverged_observation(true)], CellStatus::NotSelected);
     lying.measurement = MeasurementState::MeasuredAndPassed;
     let lying_cells = TrackedCells {
         schema: SCHEMA,
@@ -7785,7 +7800,7 @@ red/`measured-and-passed` count is **0**.",
         projection: None,
         cells: vec![boundary_cell(
             vec![diverged_observation(true)],
-            CellStatus::Red,
+            CellStatus::NotSelected,
         )],
     };
     if enforce_writer_boundary(&honest, &honest, Writer::Observations).is_err() {
@@ -7803,7 +7818,7 @@ red/`measured-and-passed` count is **0**.",
         schema: SCHEMA,
         projection: None,
         cells: vec![
-            boundary_cell(vec![sample.clone()], CellStatus::Red),
+            boundary_cell(vec![sample.clone()], CellStatus::NotSelected),
             TrackedCell {
                 id: CellId {
                     lane: "portable".into(),
@@ -7813,7 +7828,7 @@ red/`measured-and-passed` count is **0**.",
                     backend: "ptrace".into(),
                 },
                 enabled: true,
-                status: CellStatus::Red,
+                status: CellStatus::NotSelected,
                 ci_disabled_reason: None,
                 not_applicable_reason: None,
                 last_tested: None,
@@ -7845,7 +7860,7 @@ red/`measured-and-passed` count is **0**.",
     let with_located = TrackedCells {
         schema: SCHEMA,
         projection: None,
-        cells: vec![boundary_cell(vec![located.clone()], CellStatus::Red)],
+        cells: vec![boundary_cell(vec![located.clone()], CellStatus::NotSelected)],
     };
     // A series row must CREATE an observation; rewriting only observations
     // already present leaves the exact target cell reading `never-measured`.
@@ -7894,7 +7909,7 @@ red/`measured-and-passed` count is **0**.",
     let mut projected_from_series = TrackedCells {
         schema: SCHEMA,
         projection: None,
-        cells: vec![boundary_cell(Vec::new(), CellStatus::Green)],
+        cells: vec![boundary_cell(Vec::new(), CellStatus::Selected)],
     };
     let projection_rows = vec![
         series_row(
@@ -7974,7 +7989,7 @@ red/`measured-and-passed` count is **0**.",
     let mut preserve_newer = TrackedCells {
         schema: SCHEMA,
         projection: None,
-        cells: vec![boundary_cell(Vec::new(), CellStatus::Green)],
+        cells: vec![boundary_cell(Vec::new(), CellStatus::Selected)],
     };
     preserve_newer.cells[0].last_tested = Some(current_last_tested.clone());
     let mut older_row = series_row(
@@ -8012,7 +8027,7 @@ red/`measured-and-passed` count is **0**.",
     let mut preserve_import = TrackedCells {
         schema: SCHEMA,
         projection: None,
-        cells: vec![boundary_cell(vec![imported_observation], CellStatus::Green)],
+        cells: vec![boundary_cell(vec![imported_observation], CellStatus::Selected)],
     };
     let current_validate_row = series_row(
         "fixture/boundary/verify/ptrace",
@@ -8040,7 +8055,7 @@ red/`measured-and-passed` count is **0**.",
     let mut no_comparison = TrackedCells {
         schema: SCHEMA,
         projection: None,
-        cells: vec![boundary_cell(Vec::new(), CellStatus::Green)],
+        cells: vec![boundary_cell(Vec::new(), CellStatus::Selected)],
     };
     let no_result = series_row(
         "fixture/boundary/verify/ptrace",
@@ -8067,7 +8082,7 @@ red/`measured-and-passed` count is **0**.",
     let mut exact_mapping = TrackedCells {
         schema: SCHEMA,
         projection: None,
-        cells: vec![boundary_cell(Vec::new(), CellStatus::Green)],
+        cells: vec![boundary_cell(Vec::new(), CellStatus::Selected)],
     };
     let mut wrong_schema = series_row(
         "fixture/boundary/verify/ptrace",
@@ -8146,7 +8161,7 @@ red/`measured-and-passed` count is **0**.",
     let coordinates_blanked = TrackedCells {
         schema: SCHEMA,
         projection: None,
-        cells: vec![boundary_cell(vec![sample.clone()], CellStatus::Red)],
+        cells: vec![boundary_cell(vec![sample.clone()], CellStatus::NotSelected)],
     };
     match enforce_projection_preserves_evidence(&with_located, &coordinates_blanked, 0) {
         Ok(()) => {
@@ -8207,7 +8222,7 @@ red/`measured-and-passed` count is **0**.",
             rows_read: 7,
             pre_series_corpus: false,
         }),
-        cells: vec![boundary_cell(vec![sample.clone()], CellStatus::Red)],
+        cells: vec![boundary_cell(vec![sample.clone()], CellStatus::NotSelected)],
     };
     let projection_dropped = TrackedCells {
         projection: None,
