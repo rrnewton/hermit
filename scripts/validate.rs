@@ -7061,8 +7061,6 @@ fn propagate_verbosity(plan: &mut Plan, verbosity: i64) {
 const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
     // builds target/debug/test-harness, which the cell command invokes directly
     "setup.manifest_plan",
-    // runs test-harness
-    "e2e.metadata",
     // builds target/debug/hermit, which the cells run as the guest tracer
     "build.workspace",
     // stages target/install_pkg, bundled into the artifact and executed by the cells
@@ -7073,10 +7071,18 @@ const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
     "build.manifest_guests",
 ];
 
-fn pinned_root_step(step: &Step) -> bool {
-    let tag = step.tag();
-    tag.starts_with("e2e.manifest_") || PINNED_ROOT_PRODUCER_STEPS.contains(&tag.as_str())
-}
+// ⚠️ e2e.metadata IS DELIBERATELY ABSENT FROM THAT LIST, AND THE REASON CORRECTS MY OWN
+// FIRST DRAFT. I had listed it because it RUNS test-harness, but running a tool is not
+// the criterion -- PRODUCING SOMETHING THE CELLS EXECUTE is. `e2e.metadata` runs
+// `target/debug/test-harness validate`, which validates the manifest and emits no
+// binary the cells go on to run, so a second in-image copy would buy nothing.
+// Separately, and only visible in a real plan: its command is identical to
+// gate.manifest's, so lane fusion deduplicates the two and `e2e.metadata` does not
+// survive as its own node at all -- "deduped 4 identical node(s): check.reverie_pin,
+// e2e.metadata, ...". A list that names it is describing a node the fused plan does
+// not contain.
+
+
 
 fn pinned_root_command(root: &Path, out: &Path, step: &Step) -> String {
     let mut env_names: BTreeSet<&str> = PINNED_ROOT_FORWARDED_ENV.iter().copied().collect();
@@ -7113,6 +7119,10 @@ fn pinned_root_command(root: &Path, out: &Path, step: &Step) -> String {
 /// neither is a test. The fetched Cargo input and target directory are shared by
 /// all pinned-root commands, so the existing fused portable+privileged plan is
 /// preserved rather than replaced with a second runner or a different node set.
+fn pinned_root_producer_twin_tag(tag: &str) -> String {
+    format!("{tag}_in_pinned_root")
+}
+
 fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Result<(), String> {
     if already_inside {
         return Ok(());
@@ -7144,8 +7154,53 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
             ));
         }
 
+        // ⚠️ THE PRODUCERS ARE DUPLICATED, NOT MOVED, AND THAT IS THE WHOLE DESIGN.
+        // Wrapping a producer in place starves its HOST consumers: measured at
+        // 31f5c2da0f82, moving setup.manifest_plan into the image left gate.manifest
+        // with "bash: line 6: target/debug/test-harness: No such file or directory",
+        // exit 127. Leaving it on the host starves the CONTAINER consumers instead --
+        // measured at 53539dea0dea, all 13 cell nodes failed with "artifact pointer is
+        // missing or empty". test-harness is consumed by BOTH lanes (gate.manifest and
+        // e2e.audit_compile_backend_parity_c on the host; the cells in the image), so
+        // no single placement feeds both and the producer/consumer edges of this DAG
+        // do not cut into a host half and a container half.
+        //
+        // So each shared producer gets a second copy that builds inside the image,
+        // and the cells depend on THAT copy. The host copy is untouched, so every
+        // host consumer keeps working. The cost is a second build: test-harness
+        // measured 23s in the image.
+        let producers: Vec<Step> = cfg
+            .steps
+            .iter()
+            .filter(|step| PINNED_ROOT_PRODUCER_STEPS.contains(&step.tag().as_str()))
+            .cloned()
+            .collect();
+        let mut twins = Vec::new();
+        for producer in &producers {
+            let mut twin = producer.clone();
+            twin.job = format!("{}_in_pinned_root", producer.job);
+            // A twin depends on the twins of its producer dependencies, so the
+            // in-image sub-DAG builds in the same order as the host one, and on the
+            // locked fetch because the image has no network.
+            twin.deps = producer
+                .deps
+                .iter()
+                .filter(|dep| PINNED_ROOT_PRODUCER_STEPS.contains(&dep.as_str()))
+                .map(|dep| pinned_root_producer_twin_tag(dep))
+                .collect();
+            twin.env
+                .insert("HERMIT_E2E_EMPTY_WORKDIR".into(), "/test".into());
+            twin.cmd = pinned_root_command(root, &out, &twin);
+            if index == 0 {
+                twin.deps.push(PINNED_ROOT_FETCH_TAG.into());
+            }
+            twin.deps.sort();
+            twins.push(twin);
+        }
+        cfg.steps.extend(twins);
+
         for step in &mut cfg.steps {
-            if !pinned_root_step(step) {
+            if !step.tag().starts_with("e2e.manifest_") {
                 continue;
             }
             // The selected E2E population has no naked or DBT cells. Every
@@ -7154,11 +7209,25 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
             // silently running it outside /test.
             step.env
                 .insert("HERMIT_E2E_EMPTY_WORKDIR".into(), "/test".into());
+            // Point the cell at the in-image producers. Depending on the host copies
+            // would order the cell correctly and still hand it binaries the image
+            // cannot load -- measured rc=127 on libunwind.
+            step.deps = step
+                .deps
+                .iter()
+                .map(|dep| {
+                    if PINNED_ROOT_PRODUCER_STEPS.contains(&dep.as_str()) {
+                        pinned_root_producer_twin_tag(dep)
+                    } else {
+                        dep.clone()
+                    }
+                })
+                .collect();
             step.cmd = pinned_root_command(root, &out, step);
             if index == 0 && !step.deps.iter().any(|dep| dep == PINNED_ROOT_FETCH_TAG) {
                 step.deps.push(PINNED_ROOT_FETCH_TAG.into());
-                step.deps.sort();
             }
+            step.deps.sort();
         }
     }
     Ok(())
@@ -7168,7 +7237,7 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
     let step = |group: &str, job: &str, cmd: &str, deps: Vec<String>| {
         step_with_caps(group, job, "fixture", cmd.into(), deps, 30, 30, 1024 * 1024)
     };
-    let mut cell = step("e2e", "manifest_fixture", "echo cells", vec![]);
+    let mut cell = step("e2e", "manifest_fixture", "echo cells", vec!["build.workspace".into()]);
     cell.env.insert("FIXTURE_VALUE".into(), "literal".into());
     let mut plan = Plan {
         cfg: validate_plan::config_from(
@@ -7232,19 +7301,32 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
         }
     }
 
-    // A producer step is wrapped for the same reason a cell is: its output executes
-    // inside the image. If this stops holding, the cells get a host-built binary the
-    // image cannot load -- rc=127 on libunwind, measured -- and every cell fails with
-    // a message about the artifact rather than about the toolchain.
-    let producer = by_tag
+    // ⚠️ THE SHARED PRODUCER IS BUILT TWICE, AND BOTH HALVES ARE ASSERTED.
+    // The HOST copy must survive untouched, because gate.manifest and
+    // e2e.audit_compile_backend_parity_c consume it there -- wrapping it in place
+    // gave "target/debug/test-harness: No such file or directory", exit 127.
+    let host_producer = by_tag
         .get("build.workspace")
-        .ok_or("pinned-root bracket: the producer node disappeared")?;
-    if !producer.cmd.contains("run-in-pinned-root.sh")
-        || producer.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
+        .ok_or("pinned-root bracket: the host producer node disappeared")?;
+    if host_producer.cmd.contains("run-in-pinned-root.sh")
+        || host_producer.env.contains_key("HERMIT_E2E_EMPTY_WORKDIR")
     {
         return Err(format!(
-            "pinned-root bracket: build.workspace produces binaries the cells execute and must be built in the image, but it was left on the host: cmd={:?} env={:?}",
-            producer.cmd, producer.env
+            "pinned-root bracket: build.workspace is consumed on the host too and its host copy must stay unwrapped, but it was moved into the image: cmd={:?} env={:?}",
+            host_producer.cmd, host_producer.env
+        ));
+    }
+    // The IN-IMAGE copy must exist and be wrapped, because the cells execute what it
+    // builds and a host-built binary cannot load in the image -- rc=127 on libunwind.
+    let twin = by_tag
+        .get("build.workspace_in_pinned_root")
+        .ok_or("pinned-root bracket: the in-image copy of build.workspace was not added; the cells would get host-built binaries the image cannot load")?;
+    if !twin.cmd.contains("run-in-pinned-root.sh")
+        || twin.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
+    {
+        return Err(format!(
+            "pinned-root bracket: the in-image copy of build.workspace is not actually in the image: cmd={:?} env={:?}",
+            twin.cmd, twin.env
         ));
     }
 
@@ -7263,10 +7345,27 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
         || !wrapped.deps.iter().any(|dep| dep == PINNED_ROOT_FETCH_TAG)
         || !wrapped.cmd.contains("--env FIXTURE_VALUE")
         || !wrapped.cmd.ends_with(" bash 'echo cells'")
+
     {
         return Err(format!(
             "pinned-root bracket: the scheduled cell lost its image wrapper, /test gate, per-step environment or fetch edge: cmd={:?} env={:?} deps={:?}",
             wrapped.cmd, wrapped.env, wrapped.deps
+        ));
+    }
+
+    // ⚠️ SEPARATE ASSERTION WITH ITS OWN MESSAGE, because the combined check above
+    // would report a dependency fault as "lost its image wrapper" and send the reader
+    // to the wrong place. Depending on the HOST producer orders the cell correctly and
+    // still hands it a binary the image cannot load -- rc=127 on libunwind, measured.
+    if wrapped.deps.iter().any(|dep| dep == "build.workspace")
+        || !wrapped
+            .deps
+            .iter()
+            .any(|dep| dep == "build.workspace_in_pinned_root")
+    {
+        return Err(format!(
+            "pinned-root bracket: the scheduled cell must depend on build.workspace_in_pinned_root, not the host build.workspace, or it runs against binaries the image cannot load: deps={:?}",
+            wrapped.deps
         ));
     }
 
@@ -7325,7 +7424,7 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
             "pinned-root bracket: sequential lanes must fetch once then reuse the cache: first_fetches={first_fetches} second_fetches={second_fetches} second={second_step:?}"
         ));
     }
-    Ok("pinned root: scheduled manifest cells and the producers they execute wrapped with the /test gate; 6 non-producer steps verified still on the host; 1 locked fetch added".into())
+    Ok("pinned root: scheduled manifest cells wrapped and repointed at in-image copies of the producers they execute; the host copies of those producers verified untouched; 6 non-producer steps verified still on the host; 1 locked fetch added".into())
 }
 
 // --------------------------------------------------------------------------- interruption
