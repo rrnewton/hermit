@@ -847,8 +847,10 @@ struct ResultRow {
 fn read_result_rows(path: &Path) -> Result<Vec<ResultRow>, String> {
     let text = fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let mut rows = Vec::new();
+    let mut rows: Vec<ResultRow> = Vec::new();
     let mut attempts = BTreeSet::new();
+    let mut artifact_dirs = BTreeSet::new();
+    let mut previous_attempt = None;
     for (index, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -860,6 +862,14 @@ fn read_result_rows(path: &Path) -> Result<Vec<ResultRow>, String> {
                 "{}:{} has non-positive result attempt 0",
                 path.display(),
                 index + 1
+            ));
+        }
+        if previous_attempt.is_some_and(|previous| row.attempt <= previous) {
+            return Err(format!(
+                "{}:{} result attempt {} does not follow the preceding attempt",
+                path.display(),
+                index + 1,
+                row.attempt
             ));
         }
         if !attempts.insert(row.attempt) {
@@ -877,12 +887,46 @@ fn read_result_rows(path: &Path) -> Result<Vec<ResultRow>, String> {
                 row.attempt
             ));
         }
+        if row.artifact_dir.is_empty() || !artifact_dirs.insert(row.artifact_dir.clone()) {
+            return Err(format!(
+                "{}:{} result attempt {} has an empty or reused artifact directory",
+                path.display(),
+                index + 1,
+                row.attempt
+            ));
+        }
+        if row.schema != CELL_RESULT_SCHEMA {
+            return Err(format!(
+                "{}:{} has unsupported cell-result schema {}",
+                path.display(),
+                index + 1,
+                row.schema
+            ));
+        }
+        if let Some(first) = rows.first() {
+            if row.run_id != first.run_id
+                || row.hermit_sha != first.hermit_sha
+                || row.source_tree_dirty != first.source_tree_dirty
+                || row.test != first.test
+                || row.category != first.category
+                || row.lane != first.lane
+                || row.mode != first.mode
+                || row.backend != first.backend
+                || row.classification != first.classification
+            {
+                return Err(format!(
+                    "{}:{} mixes a different cell identity into one result file",
+                    path.display(),
+                    index + 1
+                ));
+            }
+        }
+        previous_attempt = Some(row.attempt);
         rows.push(row);
     }
     if rows.is_empty() {
         return Err(format!("{} contains no result rows", path.display()));
     }
-    rows.sort_by_key(|row| row.attempt);
     Ok(rows)
 }
 
@@ -6858,6 +6902,22 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err(format!(
             "two appended result observations were not retained independently: {appended:?}"
         ));
+    }
+    let mut reused_artifact = second_row.clone();
+    reused_artifact.artifact_dir = first_row.artifact_dir.clone();
+    fs::write(
+        &appended_results,
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&first_row)
+                .map_err(|e| format!("cannot encode reused-artifact fixture: {e}"))?,
+            serde_json::to_string(&reused_artifact)
+                .map_err(|e| format!("cannot encode reused-artifact fixture: {e}"))?,
+        ),
+    )
+    .map_err(|e| format!("cannot write reused-artifact fixture: {e}"))?;
+    if read_result_rows(&appended_results).is_ok() {
+        return Err("two result attempts were allowed to reuse one artifact directory".into());
     }
     fs::write(
         &appended_results,
