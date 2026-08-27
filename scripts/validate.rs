@@ -3383,6 +3383,7 @@ mod concurrent_validate_path_tests {
 /// terminal-verdict projection instead of maintaining another result file.
 fn append_validate_series(
     parent: Option<&Path>,
+    checkout: &Path,
     result_root: &Path,
     tree: &str,
 ) -> Result<bool, String> {
@@ -3408,6 +3409,8 @@ fn append_validate_series(
         .arg("append-cells")
         .arg("--parent")
         .arg(parent)
+        .arg("--checkout")
+        .arg(checkout)
         .arg("--producer")
         .arg("validate")
         .arg("--run-id")
@@ -13279,7 +13282,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let series_error = if nesting.nested {
         None
     } else {
-        match append_validate_series(parent.as_deref(), &e2e_result_root, &commit) {
+        match append_validate_series(parent.as_deref(), &root, &e2e_result_root, &commit) {
             Ok(_) => None,
             Err(error) => {
                 eprintln!("validate: ERROR: completed cell results were not added to the series: {error}");
