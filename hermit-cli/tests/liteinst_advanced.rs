@@ -24,6 +24,8 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
+
 static LITEINST_ADVANCED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_COMPAT_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
@@ -805,7 +807,7 @@ fn assert_clone_boundary(mode: &str) {
     assert_eq!(output.status, status);
     assert_eq!(
         status.code(),
-        Some(1),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
         "status={:?}\nstdout={}\nstderr={}",
         output.status,
         String::from_utf8_lossy(&output.stdout),

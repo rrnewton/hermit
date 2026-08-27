@@ -143,12 +143,13 @@ const EXEMPT_FILES: [(&str, &str); 1] = [(
      see task do_not_flip_stress. Exempt at file level so the file is never edited.",
 )];
 
-/// Measured at `cec4602d32a8`: 22 colliding sites, minus the 5 exempt, is 17.
+/// Measured after classifying the five newer CLI sites and the LiteInst
+/// clone-boundary assertion: 12 undeclared sites remain.
 ///
 /// ⚠️ This is a RATCHET, not a target. It may only go down. Lowering it is the
 /// migration: give each site an `EXIT-CLASS:` or a typed `ExpectedExit`, and for a
 /// hermit-chosen value use `HERMIT_INTERNAL_FAILURE_EXIT` rather than `125`.
-const BASELINE: usize = 13;
+const BASELINE: usize = 12;
 
 const REQUIRED_SCAN_ROOTS: [&str; 3] = ["hermit-cli/tests", "detcore/tests", "tests"];
 
@@ -555,6 +556,20 @@ mod tests {
             let body = format!("{decl}\nassert_eq!(output.status.code(), Some(1));");
             assert_eq!(count(&body), 0, "{decl:?} must satisfy the site");
         }
+    }
+
+    #[test]
+    fn liteinst_clone_boundary_names_the_hermit_exit_class() {
+        let file = "hermit-cli/tests/liteinst_advanced.rs";
+        let body = include_str!("../hermit-cli/tests/liteinst_advanced.rs");
+        assert!(
+            body.contains("Some(HERMIT_INTERNAL_FAILURE_EXIT)"),
+            "the measured LiteInst clone-boundary failure must use Hermit's named exit constant"
+        );
+        assert!(
+            scan_text(file, &body).is_empty(),
+            "LiteInst advanced tests contain an undeclared colliding exit status"
+        );
     }
 
     #[test]
