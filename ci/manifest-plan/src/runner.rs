@@ -3138,6 +3138,29 @@ mod tests {
     }
 
     #[test]
+    fn shipped_kvm_python_examples_uses_its_measured_timeout() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let defaults: ManifestDefaults = serde_yaml::from_str(
+            &fs::read_to_string(root.join("tests/e2e/manifests/defaults.yaml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(defaults.timeout_seconds, 15);
+
+        let cells = ManifestSet::load(&root)
+            .unwrap()
+            .select(&Selection {
+                population: Some(Population::Required),
+                test: Some("applications/kvm-python-examples".into()),
+                mode: Some("verify".into()),
+                backend: Some("kvm".into()),
+                ..Selection::default()
+            })
+            .unwrap();
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].timeout_seconds, 60);
+    }
+
+    #[test]
     fn bucket_timeout_requires_a_reason_and_must_change_the_global_default() {
         let mut document = ManifestDocument {
             schema: MANIFEST_SCHEMA,
