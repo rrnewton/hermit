@@ -5205,9 +5205,18 @@ fn self_test(root: &Path) -> Result<(), String> {
     // checkout filesystem. Hermit replaces guest /tmp, so silently falling
     // back there would make script-backed cells refuse before execution.
     // Refuse that placement before scheduling.
-    let tmp_source = scratch.join("tmp-source");
+    let host_tmp = PathBuf::from("/tmp");
+    let tmp_source = host_tmp.join(format!(
+        "hermit-pressure-host-tmp-self-test-{}-{nonce}",
+        std::process::id()
+    ));
     fs::create_dir(&tmp_source)
         .map_err(|e| format!("cannot create host-/tmp checkout fixture: {e}"))?;
+    let tmp_source_cleanup = SelfTestDirectory::at(
+        tmp_source.clone(),
+        host_tmp,
+        "hermit-pressure-host-tmp-self-test-",
+    );
     command_ok(
         Command::new("git")
             .args(["init", "-q"])
@@ -5241,6 +5250,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     if tmp_source.join("ignored").exists() {
         return Err("host-/tmp refusal created a generated-checkout parent".into());
     }
+    tmp_source_cleanup.remove()?;
 
     // A local clone must also copy objects rather than hard-link them: hard
     // links fail with EXDEV when source and destination are on different
