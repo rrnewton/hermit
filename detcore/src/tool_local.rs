@@ -733,7 +733,23 @@ impl FileMetadata {
         if fd_flags & libc::FD_CLOEXEC != 0 {
             flags.insert(OFlag::O_CLOEXEC);
         }
-        self.add_fd(owner, fd, flags, ty, Some(raw_stat.into()))?;
+        let inherited_stdio_alias = stdio_resource(fd).and_then(|_| {
+            (0..fd).find_map(|candidate| {
+                same_open_file_description(candidate, fd).then(|| {
+                    self.file_handles
+                        .get(&candidate)
+                        .expect("earlier stdio descriptor must be registered")
+                        .clone()
+                        .with_fd(fd)
+                        .with_fd_flags(flags)
+                })
+            })
+        });
+        if let Some(detfd) = inherited_stdio_alias {
+            self.add_detfd(detfd);
+        } else {
+            self.add_fd(owner, fd, flags, ty, Some(raw_stat.into()))?;
+        }
         self.with_detfd(fd, |detfd| detfd.forget_flock_mode())?;
         if let Some(resource) = stdio_resource(fd) {
             self.with_detfd(fd, |detfd| detfd.set_resource(resource.clone()))?;
@@ -1034,6 +1050,22 @@ mod file_metadata_tests {
     use std::os::fd::AsRawFd;
 
     use super::*;
+
+    #[test]
+    fn kcmp_distinguishes_an_alias_from_a_separate_open() {
+        let first = std::fs::File::open("/dev/null").expect("open first description");
+        let alias = first.try_clone().expect("duplicate first description");
+        let separate = std::fs::File::open("/dev/null").expect("open separate description");
+
+        assert!(same_open_file_description(
+            first.as_raw_fd(),
+            alias.as_raw_fd()
+        ));
+        assert!(!same_open_file_description(
+            first.as_raw_fd(),
+            separate.as_raw_fd()
+        ));
+    }
 
     #[test]
     fn on_demand_discovery_finds_a_live_descriptor() {
