@@ -25,6 +25,7 @@ use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::WaitPidFlag;
 use tracing::debug;
@@ -530,20 +531,102 @@ fn signal_is_blocked(mask: &libc::sigset_t, signal: SigWrapper) -> bool {
     unsafe { libc::sigismember(mask, signal.0 as libc::c_int) == 1 }
 }
 
-/// Decide whether a scheduler resume actually interrupts a wait.
-///
-/// A resume carrying the waking signals is only an interruption if at least one
-/// of them is deliverable under the mask the guest installed before it blocked;
-/// a signal the guest itself blocked stays pending instead. A resume that names
-/// no signals keeps the historical all-signals-interrupt behavior.
-fn resume_interrupts_wait(status: ResumeStatus, guest_signal_mask: &libc::sigset_t) -> bool {
-    match status {
-        ResumeStatus::Normal => false,
-        ResumeStatus::Signaled(Some(signals)) => signals
-            .into_iter()
-            .any(|signal| !signal_is_blocked(guest_signal_mask, signal)),
-        ResumeStatus::Signaled(None) => true,
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct KernelSigaction {
+    handler: u64,
+    flags: u64,
+    restorer: u64,
+    mask: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WaitSignalDisposition {
+    Interrupt,
+    Restart,
+}
+
+fn signal_default_disposition_does_not_interrupt_child_wait(signal: SigWrapper) -> bool {
+    matches!(
+        signal.raw(),
+        libc::SIGCHLD | libc::SIGCONT | libc::SIGURG | libc::SIGWINCH
+    )
+}
+
+async fn wait_signal_disposition<G, T>(
+    guest: &mut G,
+    status: ResumeStatus,
+    guest_signal_mask: &libc::sigset_t,
+    action_addr: AddrMut<'_, KernelSigaction>,
+) -> Result<Option<WaitSignalDisposition>, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let ResumeStatus::Signaled(signals) = status else {
+        return Ok(None);
+    };
+    let Some(mut signals) = signals else {
+        return Ok(Some(WaitSignalDisposition::Interrupt));
+    };
+    let inspect_action = guest
+        .config()
+        .backend_requires_thread_directed_process_signals;
+    signals.sort_by_key(|signal| signal.raw());
+    for signal in signals {
+        if signal_is_blocked(guest_signal_mask, signal) {
+            continue;
+        }
+        if !inspect_action {
+            return Ok(Some(WaitSignalDisposition::Interrupt));
+        }
+        let call = syscalls::RtSigaction::new()
+            .with_signum(signal.raw())
+            .with_action(None)
+            .with_old_action(Some(action_addr.cast()))
+            .with_sigsetsize(std::mem::size_of::<u64>());
+        guest.inject_with_retry(call).await?;
+        let action: KernelSigaction = guest.memory().read_value(action_addr)?;
+        if action.handler == libc::SIG_IGN as u64
+            || action.handler == libc::SIG_DFL as u64
+                && signal_default_disposition_does_not_interrupt_child_wait(signal)
+        {
+            continue;
+        }
+        return Ok(Some(
+            if action.handler != libc::SIG_DFL as u64 && action.flags & libc::SA_RESTART as u64 != 0
+            {
+                WaitSignalDisposition::Restart
+            } else {
+                WaitSignalDisposition::Interrupt
+            },
+        ));
     }
+    Ok(None)
+}
+
+async fn interrupted_child_wait_result<G, T, S>(
+    guest: &mut G,
+    call: S,
+    _spec: ChildWaitSpec,
+    disposition: WaitSignalDisposition,
+) -> Result<i64, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+    S: SyscallInfo,
+{
+    if !guest
+        .config()
+        .backend_requires_thread_directed_process_signals
+    {
+        return Err(Errno::ERESTARTSYS.into());
+    }
+    if disposition == WaitSignalDisposition::Interrupt {
+        return Err(Errno::EINTR.into());
+    }
+
+    guest.tail_inject(call).await
 }
 
 fn snapshot_process_group(pid: Pid) -> Result<libc::pid_t, Errno> {
@@ -826,7 +909,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         );
 
         if !parent_blocks_for_child && !backend_uninstrumented_thread {
-            create_child_thread(guest, child_dettid, ctid, Some(flags), exit_signal).await;
+            create_child_thread(guest, child_dettid, ctid, Some(flags), exit_signal, None).await;
         }
 
         {
@@ -1305,74 +1388,107 @@ impl<T: RecordOrReplay> Detcore<T> {
                 guest.inject_with_retry(call).await?
             }
         } else if let Some(spec) = managed_spec {
-            // Keep ordinary signals pending until child readiness is resolved.
-            let mut blocked_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
-            unsafe {
-                libc::sigfillset(&mut blocked_mask);
-                libc::sigdelset(&mut blocked_mask, reverie::PERF_EVENT_SIGNAL as i32);
-            }
-            let mut stack = guest.stack().await;
-            let blocked_mask_addr = stack.push(blocked_mask);
-            let old_mask_addr = stack.reserve::<libc::sigset_t>();
-            let _mask_guard = stack.commit()?;
-            let block_signals = syscalls::RtSigprocmask::new()
-                .with_how(libc::SIG_SETMASK)
-                .with_set(Some(blocked_mask_addr))
-                .with_oldset(Some(old_mask_addr))
-                .with_sigsetsize(std::mem::size_of::<u64>());
-            guest.inject_with_retry(block_signals).await?;
-            let guest_signal_mask: libc::sigset_t = guest.memory().read_value(old_mask_addr)?;
+            {
+                // The ptrace backend must block ordinary signals until child
+                // readiness is resolved. DBT already delays application signal
+                // delivery while this callback is active, and replacing its
+                // application mask here also hides those signals from
+                // rt_sigpending. Read that mask without changing it instead.
+                let mut blocked_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+                unsafe {
+                    libc::sigfillset(&mut blocked_mask);
+                    libc::sigdelset(&mut blocked_mask, reverie::PERF_EVENT_SIGNAL as i32);
+                }
+                let mut stack = guest.stack().await;
+                let blocked_mask_addr = stack.push(blocked_mask);
+                let old_mask_addr = stack.reserve::<libc::sigset_t>();
+                let action_addr = stack.reserve::<KernelSigaction>();
+                let _mask_guard = stack.commit()?;
+                let block_signals = syscalls::RtSigprocmask::new()
+                    .with_how(libc::SIG_SETMASK)
+                    .with_set(
+                        (!guest
+                            .config()
+                            .backend_requires_thread_directed_process_signals)
+                            .then_some(blocked_mask_addr),
+                    )
+                    .with_oldset(Some(old_mask_addr))
+                    .with_sigsetsize(std::mem::size_of::<u64>());
+                guest.inject_with_retry(block_signals).await?;
+                let guest_signal_mask: libc::sigset_t = guest.memory().read_value(old_mask_addr)?;
 
-            let poll_call = call.with_options(call.options() | WaitPidFlag::WNOHANG);
-            let mut pending_signal = false;
-            let result: Result<i64, Error> = loop {
-                let signaled = resume_interrupts_wait(
-                    wait_for_child_lifecycle(guest, spec).await,
-                    &guest_signal_mask,
-                );
-                pending_signal |= signaled;
-                let (ready, has_child) = ready_child_wait(guest, spec).await;
-                if let Some(child) = ready {
-                    let _ = await_exact_child_physical_exit(guest, child).await;
-                    match guest.inject_with_retry(call.with_pid(child.as_raw())).await {
-                        Ok(value) => break Ok(value),
-                        Err(Errno::ECHILD) => {
-                            let _ = consume_child_wait(guest, child).await;
-                            if child_wait_can_retry_after_stale(spec) {
-                                let (next_ready, _) = ready_child_wait(guest, spec).await;
-                                if stale_any_wait_must_interrupt(pending_signal, next_ready) {
-                                    break Err(Errno::ERESTARTSYS.into());
+                let poll_call = call.with_options(call.options() | WaitPidFlag::WNOHANG);
+                let mut pending_signal = None;
+                let result: Result<i64, Error> = loop {
+                    let status = wait_for_child_lifecycle(guest, spec).await;
+                    if pending_signal.is_none() {
+                        pending_signal =
+                            wait_signal_disposition(guest, status, &guest_signal_mask, action_addr)
+                                .await?;
+                    }
+                    let (ready, has_child) = ready_child_wait(guest, spec).await;
+                    if let Some(child) = ready {
+                        let _ = await_exact_child_physical_exit(guest, child).await;
+                        match guest.inject_with_retry(call.with_pid(child.as_raw())).await {
+                            Ok(value) => break Ok(value),
+                            Err(Errno::ECHILD) => {
+                                let _ = consume_child_wait(guest, child).await;
+                                if child_wait_can_retry_after_stale(spec) {
+                                    let (next_ready, _) = ready_child_wait(guest, spec).await;
+                                    if stale_any_wait_must_interrupt(
+                                        pending_signal.is_some(),
+                                        next_ready,
+                                    ) {
+                                        break interrupted_child_wait_result(
+                                            guest,
+                                            call,
+                                            spec,
+                                            pending_signal.expect("signal checked above"),
+                                        )
+                                        .await;
+                                    }
+                                    continue;
                                 }
-                                continue;
+                                break Err(Errno::ECHILD.into());
                             }
-                            break Err(Errno::ECHILD.into());
+                            Err(errno) => break Err(errno.into()),
+                        }
+                    }
+                    if !has_child {
+                        break Err(Errno::ECHILD.into());
+                    }
+                    match guest.inject(poll_call).await {
+                        Ok(value) => {
+                            if value > 0 {
+                                break Ok(value);
+                            }
+                            if let Some(disposition) = pending_signal {
+                                break interrupted_child_wait_result(
+                                    guest,
+                                    call,
+                                    spec,
+                                    disposition,
+                                )
+                                .await;
+                            }
                         }
                         Err(errno) => break Err(errno.into()),
                     }
-                }
-                if !has_child {
-                    break Err(Errno::ECHILD.into());
-                }
-                match guest.inject(poll_call).await {
-                    Ok(value) => {
-                        if value > 0 {
-                            break Ok(value);
-                        }
-                        if pending_signal {
-                            break Err(Errno::ERESTARTSYS.into());
-                        }
-                    }
-                    Err(errno) => break Err(errno.into()),
-                }
-            };
+                };
 
-            let restore_signals = syscalls::RtSigprocmask::new()
-                .with_how(libc::SIG_SETMASK)
-                .with_set(Some(old_mask_addr.into()))
-                .with_oldset(None)
-                .with_sigsetsize(std::mem::size_of::<u64>());
-            guest.inject_with_retry(restore_signals).await?;
-            result?
+                if !guest
+                    .config()
+                    .backend_requires_thread_directed_process_signals
+                {
+                    let restore_signals = syscalls::RtSigprocmask::new()
+                        .with_how(libc::SIG_SETMASK)
+                        .with_set(Some(old_mask_addr.into()))
+                        .with_oldset(None)
+                        .with_sigsetsize(std::mem::size_of::<u64>());
+                    guest.inject_with_retry(restore_signals).await?;
+                }
+                result?
+            }
         } else {
             // wait4 is a scheduler poll, not a record/replay data read (see doc above),
             // so it is not routed through the record/replay subtool.
@@ -1572,151 +1688,186 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         }
 
-        // A signal can arrive after the scheduler wakes this logical wait but
-        // before the zero-timeout kernel probe that resolves Linux's
-        // child-ready-versus-interrupt precedence. Keep ordinary signals pending
-        // across that probe, then restore the guest's exact mask before returning.
-        // The tracer's private preemption signal must remain unblocked.
-        let mut blocked_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
-        unsafe {
-            libc::sigfillset(&mut blocked_mask);
-            libc::sigdelset(&mut blocked_mask, reverie::PERF_EVENT_SIGNAL as i32);
-        }
-        let mut stack = guest.stack().await;
-        let blocked_mask_addr = stack.push(blocked_mask);
-        let old_mask_addr = stack.reserve::<libc::sigset_t>();
-        let _mask_guard = stack.commit()?;
-        let block_signals = syscalls::RtSigprocmask::new()
-            .with_how(libc::SIG_SETMASK)
-            .with_set(Some(blocked_mask_addr))
-            .with_oldset(Some(old_mask_addr))
-            .with_sigsetsize(std::mem::size_of::<u64>());
-        guest.inject_with_retry(block_signals).await?;
-        let guest_signal_mask: libc::sigset_t = guest.memory().read_value(old_mask_addr)?;
+        {
+            // A signal can arrive after the scheduler wakes this logical wait but
+            // before the zero-timeout kernel probe that resolves Linux's
+            // child-ready-versus-interrupt precedence. The ptrace backend blocks
+            // ordinary signals across that probe, then restores the guest's exact
+            // mask before returning. DBT reads the mask without replacing it because
+            // DynamoRIO already delays application delivery while this callback runs.
+            // The tracer's private preemption signal must remain unblocked.
+            let mut blocked_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+            unsafe {
+                libc::sigfillset(&mut blocked_mask);
+                libc::sigdelset(&mut blocked_mask, reverie::PERF_EVENT_SIGNAL as i32);
+            }
+            let mut stack = guest.stack().await;
+            let blocked_mask_addr = stack.push(blocked_mask);
+            let old_mask_addr = stack.reserve::<libc::sigset_t>();
+            let action_addr = stack.reserve::<KernelSigaction>();
+            let _mask_guard = stack.commit()?;
+            let block_signals = syscalls::RtSigprocmask::new()
+                .with_how(libc::SIG_SETMASK)
+                .with_set(
+                    (!guest
+                        .config()
+                        .backend_requires_thread_directed_process_signals)
+                        .then_some(blocked_mask_addr),
+                )
+                .with_oldset(Some(old_mask_addr))
+                .with_sigsetsize(std::mem::size_of::<u64>());
+            guest.inject_with_retry(block_signals).await?;
+            let guest_signal_mask: libc::sigset_t = guest.memory().read_value(old_mask_addr)?;
 
-        let poll_call = call.with_options(call.options() | libc::WNOHANG);
-        let mut pending_signal = false;
-        let result: Result<i64, Error> = loop {
-            // Match the polling protocol used by wait4: the first request with
-            // poll_attempt zero establishes an ordinary runnable turn, while later
-            // nonzero attempts receive the scheduler's poller backoff. Omitting the
-            // first request starts directly as a poller and can keep the run queue
-            // nonempty forever, preventing logical time from reaching a pending
-            // signal's deadline.
-            //
-            // Do not return on Signaled yet. Linux lets an already-waitable child
-            // status win over an interrupt, so the zero-timeout kernel probe below
-            // remains authoritative when readiness and a signal coincide.
-            let managed_spec = managed_terminal_spec;
-            // Both ways of parking inside waitid -- the scheduler-managed child
-            // wait and the legacy kernel-polling loop -- can now be resumed with
-            // the signals that woke the thread, so both consult the guest mask.
-            let signaled = if let Some(spec) = managed_spec {
-                resume_interrupts_wait(
-                    wait_for_child_lifecycle(guest, spec).await,
-                    &guest_signal_mask,
-                )
-            } else {
-                resume_interrupts_wait(
-                    resource_request(guest, rsrc.clone()).await,
-                    &guest_signal_mask,
-                )
-            };
-            pending_signal |= signaled;
-            let (ready, has_child) = if let Some(spec) = managed_spec {
-                ready_child_wait(guest, spec).await
-            } else {
-                (None, true)
-            };
-            if let Some(child) = ready {
-                let _ = await_exact_child_physical_exit(guest, child).await;
+            let poll_call = call.with_options(call.options() | libc::WNOHANG);
+            let mut pending_signal = None;
+            let result: Result<i64, Error> = loop {
+                // Match the polling protocol used by wait4: the first request with
+                // poll_attempt zero establishes an ordinary runnable turn, while later
+                // nonzero attempts receive the scheduler's poller backoff. Omitting the
+                // first request starts directly as a poller and can keep the run queue
+                // nonempty forever, preventing logical time from reaching a pending
+                // signal's deadline.
+                //
+                // Do not return on Signaled yet. Linux lets an already-waitable child
+                // status win over an interrupt, so the zero-timeout kernel probe below
+                // remains authoritative when readiness and a signal coincide.
+                let managed_spec = managed_terminal_spec;
+                // Both ways of parking inside waitid -- the scheduler-managed child
+                // wait and the legacy kernel-polling loop -- can now be resumed with
+                // the signals that woke the thread, so both consult the guest mask.
+                let status = if let Some(spec) = managed_spec {
+                    wait_for_child_lifecycle(guest, spec).await
+                } else {
+                    resource_request(guest, rsrc.clone()).await
+                };
+                if pending_signal.is_none() {
+                    pending_signal =
+                        wait_signal_disposition(guest, status, &guest_signal_mask, action_addr)
+                            .await?;
+                }
+                let (ready, has_child) = if let Some(spec) = managed_spec {
+                    ready_child_wait(guest, spec).await
+                } else {
+                    (None, true)
+                };
+                if let Some(child) = ready {
+                    let _ = await_exact_child_physical_exit(guest, child).await;
+                    if let Err(error) = guest.memory().write_value(info, &empty_info) {
+                        break Err(error.into());
+                    }
+                    let exact_call = call.with_which(libc::P_PID as i32).with_pid(child.as_raw());
+                    match guest.inject_with_retry(exact_call).await {
+                        Ok(value) => {
+                            let info_value = match guest.memory().read_value(info) {
+                                Ok(value) => value,
+                                Err(error) => break Err(error.into()),
+                            };
+                            break finish_waitid_result(guest, call, value, info_value);
+                        }
+                        Err(Errno::ECHILD) => {
+                            let _ = consume_child_wait(guest, child).await;
+                            if managed_spec.is_some_and(child_wait_can_retry_after_stale) {
+                                let (next_ready, _) =
+                                    ready_child_wait(guest, managed_spec.expect("managed spec"))
+                                        .await;
+                                if stale_any_wait_must_interrupt(
+                                    pending_signal.is_some(),
+                                    next_ready,
+                                ) {
+                                    break interrupted_child_wait_result(
+                                        guest,
+                                        call,
+                                        managed_spec.expect("managed spec"),
+                                        pending_signal.expect("signal checked above"),
+                                    )
+                                    .await;
+                                }
+                                continue;
+                            }
+                            break Err(Errno::ECHILD.into());
+                        }
+                        Err(errno) => break Err(errno.into()),
+                    }
+                }
+                if managed_spec.is_some() && !has_child {
+                    break Err(Errno::ECHILD.into());
+                }
+
                 if let Err(error) = guest.memory().write_value(info, &empty_info) {
                     break Err(error.into());
                 }
-                let exact_call = call.with_which(libc::P_PID as i32).with_pid(child.as_raw());
-                match guest.inject_with_retry(exact_call).await {
+                let result = guest.inject(poll_call).await;
+                match result {
                     Ok(value) => {
-                        let info_value = match guest.memory().read_value(info) {
+                        let info_value: libc::siginfo_t = match guest.memory().read_value(info) {
                             Ok(value) => value,
                             Err(error) => break Err(error.into()),
                         };
-                        break finish_waitid_result(guest, call, value, info_value);
-                    }
-                    Err(Errno::ECHILD) => {
-                        let _ = consume_child_wait(guest, child).await;
-                        if managed_spec.is_some_and(child_wait_can_retry_after_stale) {
-                            let (next_ready, _) =
-                                ready_child_wait(guest, managed_spec.expect("managed spec")).await;
-                            if stale_any_wait_must_interrupt(pending_signal, next_ready) {
-                                break Err(Errno::ERESTARTSYS.into());
+                        // waitid writes the SIGCHLD variant of siginfo_t. A zeroed
+                        // structure is used only for the no-event WNOHANG result.
+                        let child_pid = unsafe { info_value.si_pid() };
+                        match exact_wait_poll_decision(
+                            child_pid != 0,
+                            pending_signal.is_some(),
+                            None,
+                        ) {
+                            ExactWaitPollDecision::ChildReady => {
+                                break finish_waitid_result(guest, call, value, info_value);
+                            }
+                            ExactWaitPollDecision::Interrupted => {
+                                break interrupted_child_wait_result(
+                                    guest,
+                                    call,
+                                    managed_spec.expect("managed spec"),
+                                    pending_signal.expect("signal checked above"),
+                                )
+                                .await;
+                            }
+                            ExactWaitPollDecision::Retry => {}
+                            ExactWaitPollDecision::AwaitPhysicalExit
+                            | ExactWaitPollDecision::ReapAfterLogicalExit => unreachable!(),
+                        }
+                        if managed_spec.is_some() {
+                            if !has_child {
+                                break Ok(value);
                             }
                             continue;
                         }
-                        break Err(Errno::ECHILD.into());
+                        rsrc.poll_attempt += 1;
+                        trace!(
+                            "Retry #{} for waitid because no child state is ready",
+                            rsrc.poll_attempt
+                        );
+                        record_retry_event(guest, poll_call).await;
+                    }
+                    Err(Errno::ERESTARTSYS) if pending_signal.is_some() => {
+                        break Err(Errno::EINTR.into());
                     }
                     Err(errno) => break Err(errno.into()),
                 }
-            }
-            if managed_spec.is_some() && !has_child {
-                break Err(Errno::ECHILD.into());
-            }
+            };
 
-            if let Err(error) = guest.memory().write_value(info, &empty_info) {
-                break Err(error.into());
+            if !guest
+                .config()
+                .backend_requires_thread_directed_process_signals
+            {
+                let restore_signals = syscalls::RtSigprocmask::new()
+                    .with_how(libc::SIG_SETMASK)
+                    .with_set(Some(old_mask_addr.into()))
+                    .with_oldset(None)
+                    .with_sigsetsize(std::mem::size_of::<u64>());
+                guest.inject_with_retry(restore_signals).await?;
             }
-            let result = guest.inject(poll_call).await;
-            match result {
-                Ok(value) => {
-                    let info_value: libc::siginfo_t = match guest.memory().read_value(info) {
-                        Ok(value) => value,
-                        Err(error) => break Err(error.into()),
-                    };
-                    // waitid writes the SIGCHLD variant of siginfo_t. A zeroed
-                    // structure is used only for the no-event WNOHANG result.
-                    let child_pid = unsafe { info_value.si_pid() };
-                    match exact_wait_poll_decision(child_pid != 0, pending_signal, None) {
-                        ExactWaitPollDecision::ChildReady => {
-                            break finish_waitid_result(guest, call, value, info_value);
-                        }
-                        ExactWaitPollDecision::Interrupted => {
-                            break Err(Errno::ERESTARTSYS.into());
-                        }
-                        ExactWaitPollDecision::Retry => {}
-                        ExactWaitPollDecision::AwaitPhysicalExit
-                        | ExactWaitPollDecision::ReapAfterLogicalExit => unreachable!(),
-                    }
-                    if managed_spec.is_some() {
-                        if !has_child {
-                            break Ok(value);
-                        }
-                        continue;
-                    }
-                    rsrc.poll_attempt += 1;
-                    trace!(
-                        "Retry #{} for waitid because no child state is ready",
-                        rsrc.poll_attempt
-                    );
-                    record_retry_event(guest, poll_call).await;
+            if result.is_ok() && call.options() & libc::WNOWAIT == 0 {
+                let info_value: libc::siginfo_t = guest.memory().read_value(info)?;
+                let child_pid = unsafe { info_value.si_pid() };
+                if child_pid != 0 && waitid_code_is_termination(info_value.si_code) {
+                    let _ = consume_child_wait(guest, DetPid::from_raw(child_pid)).await;
                 }
-                Err(Errno::ERESTARTSYS) if pending_signal => break Err(Errno::EINTR.into()),
-                Err(errno) => break Err(errno.into()),
             }
-        };
-
-        let restore_signals = syscalls::RtSigprocmask::new()
-            .with_how(libc::SIG_SETMASK)
-            .with_set(Some(old_mask_addr.into()))
-            .with_oldset(None)
-            .with_sigsetsize(std::mem::size_of::<u64>());
-        guest.inject_with_retry(restore_signals).await?;
-        if result.is_ok() && call.options() & libc::WNOWAIT == 0 {
-            let info_value: libc::siginfo_t = guest.memory().read_value(info)?;
-            let child_pid = unsafe { info_value.si_pid() };
-            if child_pid != 0 && waitid_code_is_termination(info_value.si_code) {
-                let _ = consume_child_wait(guest, DetPid::from_raw(child_pid)).await;
-            }
+            result
         }
-        result
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2093,6 +2244,20 @@ impl<T: RecordOrReplay> Detcore<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_default_dispositions_that_do_not_interrupt_child_waits() {
+        for signal in [libc::SIGCHLD, libc::SIGCONT, libc::SIGURG, libc::SIGWINCH] {
+            assert!(signal_default_disposition_does_not_interrupt_child_wait(
+                SigWrapper(signal)
+            ));
+        }
+        for signal in [libc::SIGALRM, libc::SIGSTOP, libc::SIGUSR1] {
+            assert!(!signal_default_disposition_does_not_interrupt_child_wait(
+                SigWrapper(signal)
+            ));
+        }
+    }
 
     #[test]
     fn waitid_ready_child_wins_when_scheduler_also_reports_a_signal() {

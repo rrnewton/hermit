@@ -194,10 +194,30 @@ fn watchdog_limit_failure(
 }
 
 fn run_bounded(args: &[&str], trace_retries: bool, verify_report: Option<&Path>) -> GuestRun {
-    run_bounded_with_limits(args, trace_retries, verify_report, WATCHDOG_LIMITS)
+    run_bounded_for_backend_with_limits(
+        "ptrace",
+        args,
+        trace_retries,
+        verify_report,
+        WATCHDOG_LIMITS,
+    )
 }
 
 fn run_bounded_with_limits(
+    args: &[&str],
+    trace_retries: bool,
+    verify_report: Option<&Path>,
+    limits: WatchdogLimits,
+) -> GuestRun {
+    run_bounded_for_backend_with_limits("ptrace", args, trace_retries, verify_report, limits)
+}
+
+fn run_bounded_for_backend(backend: &str, args: &[&str], trace_retries: bool) -> GuestRun {
+    run_bounded_for_backend_with_limits(backend, args, trace_retries, None, WATCHDOG_LIMITS)
+}
+
+fn run_bounded_for_backend_with_limits(
+    backend: &str,
     args: &[&str],
     trace_retries: bool,
     verify_report: Option<&Path>,
@@ -227,12 +247,19 @@ fn run_bounded_with_limits(
     } else {
         command.arg("--log=info");
     }
-    command.args(["run", "--backend=ptrace", "--strict"]);
+    command.args(["run", "--backend", backend, "--strict"]);
     if let Some(report) = verify_report {
+        let report_parent = report
+            .parent()
+            .expect("verification report should have a parent directory");
+        let report_name = report
+            .file_name()
+            .expect("verification report should have a file name");
         command
+            .current_dir(report_parent)
             .args(["--verify", "--verify-strict"])
             .arg("--verify-json")
-            .arg(report);
+            .arg(report_name);
     }
     command
         .arg("--")
@@ -353,6 +380,19 @@ fn run_bounded_with_limits(
     }
 }
 
+fn dbt_unavailable(test: &str) -> bool {
+    if cfg!(feature = "dbt") {
+        return false;
+    }
+    assert!(
+        std::env::var_os("HERMIT_REQUIRE_DBT").is_none(),
+        "HERMIT_REQUIRE_DBT is set, but this test binary was built without the dbt feature, so \
+         {test} cannot exercise DBT"
+    );
+    eprintln!("skipping {test}: built without the dbt feature");
+    true
+}
+
 #[test]
 fn retry_watchdog_fires_and_reports_before_stderr_backlog_drains() {
     let (send, receive) = mpsc::channel();
@@ -430,8 +470,9 @@ fn waitid_interrupted_by_a_signal_returns_instead_of_spinning() {
     );
     assert!(
         run.stdout
-            .contains("waitid-signal-interrupt rc=-1 errno=4 handler=1"),
-        "waitid did not report EINTR with its handler run\nguest stdout:\n{}",
+            .contains("waitid-signal-interrupt rc=-1 errno=4 handler=1 target-match=1"),
+        "waitid did not report EINTR with its handler seeing the guest child ID\n\
+         guest stdout:\n{}",
         run.stdout,
     );
     assert!(
@@ -607,7 +648,13 @@ fn waitid_honors_sa_restart_after_running_the_handler() {
 
 #[test]
 fn waitid_ready_child_path_is_ptrace_l2() {
-    let report = tempfile::NamedTempFile::new().expect("failed to create verify report");
+    let build_root = waitid_guest()
+        .parent()
+        .expect("waitid guest should have a parent");
+    let report = tempfile::Builder::new()
+        .prefix("waitid-verify-")
+        .tempfile_in(build_root)
+        .expect("failed to create verify report beside the guest");
     let run = run_bounded(&["--child-ready-wins"], false, Some(report.path()));
     assert!(
         run.status.success(),
@@ -659,6 +706,185 @@ fn waitid_ready_child_path_is_ptrace_l2() {
             "verify report compared no INFO evidence on {side}: {report}"
         );
     }
+}
+
+fn assert_dbt_wait_case(args: &[&str], expected: &str, done: Option<&str>) {
+    let run = run_bounded_for_backend("dbt", args, true);
+    assert!(
+        run.status.success(),
+        "DBT Hermit exited with {}\nguest stdout:\n{}\nhermit stderr:\n{}",
+        run.status,
+        run.stdout,
+        run.stderr,
+    );
+    assert!(
+        run.stdout.contains(expected),
+        "DBT child wait did not preserve the expected Linux result\nexpected: {expected}\n\
+         guest stdout:\n{}\nhermit stderr:\n{}",
+        run.stdout,
+        run.stderr,
+    );
+    if let Some(done) = done {
+        assert!(
+            run.stdout.contains(done),
+            "DBT guest did not finish child cleanup\nguest stdout:\n{}\nhermit stderr:\n{}",
+            run.stdout,
+            run.stderr,
+        );
+    }
+}
+
+#[test]
+fn dbt_exact_child_waits_return_eintr_without_sa_restart() {
+    if dbt_unavailable("dbt_exact_child_waits_return_eintr_without_sa_restart") {
+        return;
+    }
+    assert_dbt_wait_case(
+        &[],
+        "waitid-signal-interrupt rc=-1 errno=4 handler=1 target-match=1",
+        Some("waitid-signal-interrupt-done"),
+    );
+    assert_dbt_wait_case(
+        &["--wait4-signal-interrupt"],
+        "wait4-signal-interrupt rc=-1 errno=4 handler=1 target-match=1",
+        Some("wait4-signal-interrupt-done"),
+    );
+}
+
+#[test]
+fn dbt_exact_child_waits_honor_sa_restart() {
+    if dbt_unavailable("dbt_exact_child_waits_honor_sa_restart") {
+        return;
+    }
+    assert_dbt_wait_case(
+        &["--signal-restart"],
+        "waitid-signal-restart rc=0 errno=0 handler=1 pid-match=1 code=1 status=17",
+        None,
+    );
+    assert_dbt_wait_case(
+        &["--wait4-signal-restart"],
+        "wait4-signal-restart rc-ok=1 errno=0 handler=1 pid-match=1 exited=1 status=17",
+        None,
+    );
+    assert_dbt_wait_case(
+        &["--signal-restart-handler"],
+        "waitid-restart-handler rc=0 errno=0 handler=1 pid-match=1 code=2 status=9",
+        None,
+    );
+    assert_dbt_wait_case(
+        &["--wait4-signal-restart-handler"],
+        "wait4-restart-handler rc-ok=1 errno=0 handler=1 pid-match=1 signaled=1 signal=9",
+        None,
+    );
+}
+
+#[test]
+fn dbt_exact_child_waits_apply_each_signal_restart_disposition() {
+    if dbt_unavailable("dbt_exact_child_waits_apply_each_signal_restart_disposition") {
+        return;
+    }
+    assert_dbt_wait_case(
+        &["--signal-restart-then-interrupt"],
+        "waitid-restart-then-interrupt rc=-1 errno=4 restart-handler=1 interrupt-handler=1 target-live=1 sender-live=1",
+        None,
+    );
+    assert_dbt_wait_case(
+        &["--wait4-signal-restart-then-interrupt"],
+        "wait4-restart-then-interrupt rc=-1 errno=4 restart-handler=1 interrupt-handler=1 target-live=1 sender-live=1",
+        None,
+    );
+}
+
+#[test]
+fn dbt_exact_child_waits_honor_a_changed_signal_context() {
+    if dbt_unavailable("dbt_exact_child_waits_honor_a_changed_signal_context") {
+        return;
+    }
+    assert_dbt_wait_case(
+        &["--signal-restart-context"],
+        "waitid-restart-context rc=-1 errno=4 handler=1 target-match=1",
+        None,
+    );
+    assert_dbt_wait_case(
+        &["--wait4-signal-restart-context"],
+        "wait4-restart-context rc=-1 errno=4 handler=1 target-match=1",
+        None,
+    );
+}
+
+#[test]
+fn dbt_exact_child_waits_preserve_a_handler_changed_target() {
+    if dbt_unavailable("dbt_exact_child_waits_preserve_a_handler_changed_target") {
+        return;
+    }
+    assert_dbt_wait_case(
+        &["--signal-restart-target"],
+        "waitid-restart-target rc=0 errno=0 handler=1 target-match=1 replacement-match=1 code=2 status=9 original-live=1",
+        None,
+    );
+    assert_dbt_wait_case(
+        &["--wait4-signal-restart-target"],
+        "wait4-restart-target rc-ok=1 errno=0 handler=1 target-match=1 replacement-match=1 signaled=1 signal=9 original-live=1",
+        None,
+    );
+}
+
+#[test]
+fn dbt_exact_child_waits_respect_noninterrupting_default_dispositions() {
+    if dbt_unavailable("dbt_exact_child_waits_respect_noninterrupting_default_dispositions") {
+        return;
+    }
+    for signal in [libc::SIGCHLD, libc::SIGCONT, libc::SIGURG, libc::SIGWINCH] {
+        let signal = signal.to_string();
+        assert_dbt_wait_case(
+            &["--waitid-default-disposition", &signal],
+            &format!(
+                "waitid-default-disposition signal={signal} rc=0 errno=0 pid-match=1 code=2 signal-status=9 sender-live=1"
+            ),
+            None,
+        );
+        assert_dbt_wait_case(
+            &["--wait4-default-disposition", &signal],
+            &format!(
+                "wait4-default-disposition signal={signal} rc-ok=1 errno=0 pid-match=1 signaled=1 signal-status=9 sender-live=1"
+            ),
+            None,
+        );
+    }
+}
+
+#[test]
+fn dbt_exact_child_waits_preserve_mask_and_result_for_blocked_signals() {
+    if dbt_unavailable("dbt_exact_child_waits_preserve_mask_and_result_for_blocked_signals") {
+        return;
+    }
+    assert_dbt_wait_case(
+        &["--live-sibling-signal-blocked"],
+        "waitid-live-sibling-blocked rc=0 errno=0 handler=0 pid-match=1 code=1 status=29 mask-preserved=1 sender-live=1",
+        Some("waitid-live-sibling-done"),
+    );
+    assert_dbt_wait_case(
+        &["--wait4-live-sibling-signal-blocked"],
+        "wait4-live-sibling-blocked rc-ok=1 errno=0 handler=0 pid-match=1 exited=1 status=29 mask-preserved=1 signals-pending=1 sender-live=1",
+        Some("wait4-live-sibling-done"),
+    );
+}
+
+#[test]
+fn dbt_exact_child_waits_return_a_ready_child_before_the_signal() {
+    if dbt_unavailable("dbt_exact_child_waits_return_a_ready_child_before_the_signal") {
+        return;
+    }
+    assert_dbt_wait_case(
+        &["--child-ready-wins"],
+        "waitid-ready-wins rc=0 errno=0 handler=1 pid-match=1 code=1 status=23",
+        None,
+    );
+    assert_dbt_wait_case(
+        &["--wait4-child-ready-wins"],
+        "wait4-ready-wins rc-ok=1 errno=0 handler=1 pid-match=1 exited=1 status=23",
+        None,
+    );
 }
 
 /// End-to-end proof that the watchdog is EFFECTIVE, not merely present.

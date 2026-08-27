@@ -117,7 +117,30 @@ fi
 # and nothing in the bump said so. A Reverie bump and this expected_pin are coupled
 # and the coupling is invisible from the bump side; whoever moves the pin next
 # should expect to move this too.
-expected_pin=86d9003a7a2a8d5399ef94a251e4d991d6c504a5
+# CARRY TO 7137c5dd (2026-08-27):
+# 86d9003a..7137c5dd changes no DBT build input. Verified by git object ID:
+#     reverie-dbt/vendor/dynamorio  de352475846e -> de352475846e
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+#     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
+# so the measured effective-job-seconds budget carries unchanged.
+#
+# BOUND TO 49ae9401 (2026-08-27): this revision changes the vendored
+# DynamoRIO source, so the earlier recipe identity does not carry. A cold
+# `cargo check -p reverie-dbt --locked --offline` reported cache MISS then
+# PUBLISHED for
+#     key=sha256:c9c1ee55257cbb0635b56f494a75ee1dc6af839ca8e289231f533b0208340463
+# and the native source build took 33.38s at jobs=16, or 534.08 effective
+# job-seconds. The existing 1050 effective-job-second threshold remains above
+# that one cold local measurement. It is retained conservatively; this sample
+# does not replace the original n=3 hosted measurement or satisfy the >=5-sample
+# replacement rule.
+# CARRY TO 1645b64b (2026-08-27): the three source_recipe_key repository
+# inputs are byte-identical to 49ae9401:
+#     reverie-dbt/vendor/dynamorio  a3c41e5d3630 -> a3c41e5d3630
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+#     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
+# so the measured key and conservative threshold carry unchanged.
+expected_pin=b4e01a4ecbb2694db25c545d9df8d661cc4f5308
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
@@ -182,6 +205,6 @@ export REVERIE_DBT_BUDGET_BOUND_PIN
 # shellcheck source=ci/configure-build-jobs.sh
 source "$ROOT_DIR/ci/configure-build-jobs.sh" reverie-dbt-budget-child
 
-echo "run-with-reverie-dbt-budget.sh: reverie-dbt-budget={pin:$REVERIE_DBT_BUDGET_BOUND_PIN,source:$REVERIE_DBT_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBT_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBT_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBT_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBT_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBT_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4,carried-to-pin-on-dynamorio-recipe-key:132d77130980c546c8867fc196d97e664bc4816b1dfa9ea9c18de4a94d109c4d}" >&2
+echo "run-with-reverie-dbt-budget.sh: reverie-dbt-budget={pin:$REVERIE_DBT_BUDGET_BOUND_PIN,source:$REVERIE_DBT_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBT_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBT_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBT_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBT_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBT_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4,carried-to-pin-on-dynamorio-recipe-key:c9c1ee55257cbb0635b56f494a75ee1dc6af839ca8e289231f533b0208340463}" >&2
 
 exec "$@"
