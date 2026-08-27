@@ -134,13 +134,13 @@ fi
 # that one cold local measurement. It is retained conservatively; this sample
 # does not replace the original n=3 hosted measurement or satisfy the >=5-sample
 # replacement rule.
-# CARRY TO 5fcfe11c (2026-08-27): the three source_recipe_key repository
+# CARRY TO 1645b64b (2026-08-27): the three source_recipe_key repository
 # inputs are byte-identical to 49ae9401:
 #     reverie-dbt/vendor/dynamorio  a3c41e5d3630 -> a3c41e5d3630
 #     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
 #     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
 # so the measured key and conservative threshold carry unchanged.
-expected_pin=5fcfe11c7a849e416aff4a757142936093a49f4c
+expected_pin=1645b64b33db17856248f375d5f8a4a63770e3a5
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
