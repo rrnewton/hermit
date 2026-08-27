@@ -1972,44 +1972,62 @@ async fn run_dbt(
         "launching guest through reverie-dbt with Detcore<DbtGuest>",
     );
 
-    if capture_output {
+    let (status, stdout, stderr, global) = if capture_output {
         let launch = || {
-            runner
-                .output_with_environment(&guest, &environment)
-                .map_err(|error| anyhow!("failed to launch drrun ({}): {error}", drrun.display()))
+            runner.output_with_environment_and_global::<detcore::GlobalState>(
+                &guest,
+                &environment,
+                config.clone(),
+            )
         };
-        let mut output = launch()?;
+        let (mut output, mut global) = launch()
+            .await
+            .map_err(|error| anyhow!("failed to launch drrun ({}): {error}", drrun.display()))?;
         if dbt_client_thread_start_failed(&output.status) {
             tracing::warn!(
                 target: "hermit::dbt",
                 "DynamoRIO client thread failed before guest start; retrying once",
             );
-            output = launch()?;
+            global.force_shutdown_with_error();
+            global.clean_up(false, &None).await;
+            (output, global) = launch().await.map_err(|error| {
+                anyhow!("failed to launch drrun ({}): {error}", drrun.display())
+            })?;
         }
-        return Ok(Output {
-            status: output.status.into(),
-            stdout: output.stdout,
-            stderr: output.stderr,
-        });
-    }
-
-    let launch = || {
-        runner
-            .status_with_environment(&guest, &environment)
-            .map_err(|error| anyhow!("failed to launch drrun ({}): {error}", drrun.display()))
+        (output.status, output.stdout, output.stderr, global)
+    } else {
+        let launch = || {
+            runner.status_with_environment_and_global::<detcore::GlobalState>(
+                &guest,
+                &environment,
+                config.clone(),
+            )
+        };
+        let (mut status, mut global) = launch()
+            .await
+            .map_err(|error| anyhow!("failed to launch drrun ({}): {error}", drrun.display()))?;
+        if dbt_client_thread_start_failed(&status) {
+            tracing::warn!(
+                target: "hermit::dbt",
+                "DynamoRIO client thread failed before guest start; retrying once",
+            );
+            global.force_shutdown_with_error();
+            global.clean_up(false, &None).await;
+            (status, global) = launch().await.map_err(|error| {
+                anyhow!("failed to launch drrun ({}): {error}", drrun.display())
+            })?;
+        }
+        (status, Vec::new(), Vec::new(), global)
     };
-    let mut status = launch()?;
-    if dbt_client_thread_start_failed(&status) {
-        tracing::warn!(
-            target: "hermit::dbt",
-            "DynamoRIO client thread failed before guest start; retrying once",
-        );
-        status = launch()?;
+
+    if !status.success() {
+        global.force_shutdown_with_error();
     }
+    global.clean_up(print_summary, &None).await;
     Ok(Output {
         status: status.into(),
-        stdout: Vec::new(),
-        stderr: Vec::new(),
+        stdout,
+        stderr,
     })
 }
 
@@ -2098,7 +2116,7 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     config.use_thread_local_clock_reads = false;
     config.detect_host_clock_futex_timeouts = backend == Backend::Sabre;
     config.syscall_clobbers_virtualized_by_backend = backend == Backend::Sabre;
-    config.cancel_killed_thread_rpcs = backend == Backend::Sabre;
+    config.cancel_killed_thread_rpcs = matches!(backend, Backend::Sabre | Backend::Dbt);
     config.backend_reports_physical_process_exits = backend == Backend::Sabre;
     // TODO-HUMAN-REVIEW(PR-1122): Review concurrent KVM process-child scheduling.
     config.backend_serializes_fork_children = false;
@@ -3460,6 +3478,7 @@ mod tests {
     #[test]
     fn dbt_backend_config_translates_process_signals_to_host_threads() {
         let config = prepare_backend_config(super::DetConfig::default(), Backend::Dbt);
+        assert!(config.cancel_killed_thread_rpcs);
         assert!(!config.backend_tracks_process_children);
         assert!(config.backend_requires_thread_directed_process_signals);
         assert!(!config.backend_defers_vfork_child_registration);
