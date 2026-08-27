@@ -87,7 +87,37 @@ fi
 #     MAX_BUILD_SECONDS = ceil(MAX_BUILD_EFFECTIVE_JOB_SECONDS / EFFECTIVE_BUILD_JOBS)
 # so the budget already scales with width and must not be "topped up" by hand. If
 # it is ever too tight, re-measure the job-seconds; do not raise the elapsed bound.
-expected_pin=ad598995c8018bf17414a92119acfac6c9fd58ee
+# CARRY TO 86d9003a (2026-08-27):
+# ad598995..86d9003a is eight Reverie commits touching reverie-sabre, reverie-kvm,
+# reverie-process and reverie-ptrace. `git diff ad598995 86d9003a -- reverie-dbt`
+# is EMPTY -- the directory is unchanged in its entirety -- and all three recipe
+# inputs are byte-identical by git object id:
+#     reverie-dbt/vendor/dynamorio  de352475846e -> de352475846e
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+#     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
+# so the measured effective-job-seconds budget carries unchanged. This is the
+# no-argument-required shape, like the a16e3c46 and f4152f8f carries above.
+#
+# CONFIRMED EMPIRICALLY AT THE NEW PIN, from a genuinely cold state rather than by
+# source comparison alone: `target/debug/reverie-dbt-native-cache` was deleted and
+# reverie-dbt `cargo clean`ed, then rebuilt at this pin. The build reported cache
+# MISS then PUBLISHED on
+#     key=sha256:132d77130980c546c8867fc196d97e664bc4816b1dfa9ea9c18de4a94d109c4d
+# which is the key this budget was measured against, so the complete selected
+# recipe -- including CMAKE and CMAKE_GENERATOR -- is identical. DynamoRIO source
+# build took 30.85s at jobs=16. `cargo check --workspace --all-targets --locked`
+# is rc=0 at this pin.
+#
+# ⚠️ WHY THIS RECALIBRATION IS ITS OWN COMMIT AND NOT PART OF THE BUMP. The pin
+# moved from ad598995 to 86d9003a in 164d10f54e and 26d0230beb without this file
+# changing, and every node behind this wrapper DECLINED for that whole window --
+# correctly, and not silently: the decline is exit 75, which validate propagates
+# as `no_result` and reports as FINAL_VALIDATE_STATUS: COULD_NOT_RUN. No run could
+# report PASSED while these nodes had no verdict. But the coverage was really gone,
+# and nothing in the bump said so. A Reverie bump and this expected_pin are coupled
+# and the coupling is invisible from the bump side; whoever moves the pin next
+# should expect to move this too.
+expected_pin=86d9003a7a2a8d5399ef94a251e4d991d6c504a5
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
