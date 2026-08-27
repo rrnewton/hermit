@@ -7,8 +7,10 @@
  */
 
 /*
- * Reads stderr's file status flags, sets O_APPEND, and reads them back,
- * reporting only whether the guest itself saw the bit change.
+ * Reads stdout's file status flags, sets O_APPEND, reads them back, and writes
+ * through stdout. The caller places the shared file offset before EOF, so the
+ * final write proves the flag has behavior rather than being reflected only by
+ * F_GETFL.
  *
  * This separates the two halves of a containment claim that are easy to
  * conflate. `fcntl(F_SETFL)` mutates the open file DESCRIPTION, which Hermit
@@ -27,23 +29,28 @@
 #include <unistd.h>
 
 int main(void) {
-    int before = fcntl(STDERR_FILENO, F_GETFL);
+    int before = fcntl(STDOUT_FILENO, F_GETFL);
     if (before < 0) {
         perror("fcntl(F_GETFL) before");
         return 1;
     }
-    if (fcntl(STDERR_FILENO, F_SETFL, before | O_APPEND) < 0) {
+    if (fcntl(STDOUT_FILENO, F_SETFL, before | O_APPEND) < 0) {
         perror("fcntl(F_SETFL, O_APPEND)");
         return 1;
     }
-    int after = fcntl(STDERR_FILENO, F_GETFL);
+    int after = fcntl(STDOUT_FILENO, F_GETFL);
     if (after < 0) {
         perror("fcntl(F_GETFL) after");
         return 1;
     }
-    printf(
+    dprintf(
+        STDERR_FILENO,
         "append_before=%d append_after=%d\n",
         (before & O_APPEND) != 0,
         (after & O_APPEND) != 0);
+    if (write(STDOUT_FILENO, "guest\n", 6) != 6) {
+        perror("write(stdout)");
+        return 1;
+    }
     return 0;
 }
