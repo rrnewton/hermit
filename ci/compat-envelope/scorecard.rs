@@ -553,18 +553,13 @@ impl ObservedResult {
 /// and depth can.
 ///
 /// ⚠️ ABSENCE MEANS "NO WRITER HAS RECORDED ONE", NOT "NEVER TESTED". The two
-/// are easy to confuse and the difference matters. Only the two explicit fold
-/// commands write this field, and validate only ever runs the ~282 selected
-/// cells, so every red cell will carry NOTHING here until a pressure-test
-/// campaign covers it -- not because it was never exercised, but because
-/// nothing was ever asked to record that it was. `scorecard.rs show` prints how
-/// many cells carry the field precisely so this emptiness stays visible instead
-/// of being read as evidence.
+/// are easy to confuse and the difference matters. Only the explicit fold and
+/// import commands write this field. A cell can therefore have retained runs
+/// while carrying no imported record. `scorecard.rs show` prints how many cells
+/// carry the field precisely so this emptiness stays visible instead of being
+/// read as evidence.
 ///
-/// This is recorded for EVERY tested cell, including passing ones, which is why
-/// it is on the cell row rather than inside `observations`: an observation only
-/// exists where a divergence was located, so a green cell that stays green
-/// would otherwise leave no trace of having been checked at all.
+/// This is recorded for EVERY imported tested cell, including passing ones.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct LastTested {
     hermit_sha: String,
@@ -1251,6 +1246,14 @@ fn score_cell(derived: &Derived, cell: &TrackedCell) -> CellStatus {
         CellStatus::Green
     } else {
         CellStatus::Red
+    }
+}
+
+fn retained_comparison_state(comparison_sha: Option<&str>, head: &str) -> &'static str {
+    match comparison_sha {
+        Some(sha) if sha == head => "fresh",
+        Some(_) => "stale",
+        None => "NO_RESULT",
     }
 }
 
@@ -3284,6 +3287,9 @@ fn import_results(root: &Path, results: &Path) -> Result<(), String> {
         stale_coordinate_rows,
         stale_coordinates,
         stale_coordinate_cells,
+        fresh_cells,
+        stale_cells,
+        no_result_cells,
     } = read_retained_selected_results(root, results, &derived.enabled, &derived.green)?;
     let mut tracked = tracked_from(&derived, Some(before.clone()), None, false)?;
     // This command is a projection of the latest retained validate evidence,
@@ -3345,11 +3351,12 @@ fn import_results(root: &Path, results: &Path) -> Result<(), String> {
         })
         .map(display_id)
         .collect::<Vec<_>>();
-    if !missing_after.is_empty() {
+    let missing_after = missing_after.into_iter().collect::<BTreeSet<_>>();
+    if missing_after != no_result_cells {
         return Err(format!(
-            "import left {} selected compatibility cells without a recorded comparison; first is {}",
+            "imported comparison coverage disagrees with its NO_RESULT classification: {} cell(s) lacked a stored comparison but {} were classified NO_RESULT",
             missing_after.len(),
-            missing_after[0]
+            no_result_cells.len()
         ));
     }
     enforce_writer_boundary(&before, &tracked, Writer::ValidateObservations)?;
@@ -3401,6 +3408,16 @@ fn import_results(root: &Path, results: &Path) -> Result<(), String> {
     );
     for cell in &stale_coordinate_cells {
         println!("    stale coordinate: {cell}");
+    }
+    println!(
+        "  retained comparison state for the {} selected compatibility cells: fresh={} stale={} NO_RESULT={}",
+        derived.green.len(),
+        fresh_cells.len(),
+        stale_cells.len(),
+        no_result_cells.len()
+    );
+    for cell in &no_result_cells {
+        println!("    cannot currently be checked from retained results: {cell}");
     }
     println!(
         "  before: {} green / {} red / {} not-applicable / {} total",
@@ -3839,6 +3856,9 @@ struct RetainedImport {
     stale_coordinate_rows: usize,
     stale_coordinates: usize,
     stale_coordinate_cells: BTreeSet<String>,
+    fresh_cells: BTreeSet<String>,
+    stale_cells: BTreeSet<String>,
+    no_result_cells: BTreeSet<String>,
 }
 
 /// Read retained validate rows without pretending they belong to the current
@@ -3868,6 +3888,7 @@ fn read_retained_selected_results(
         ));
     }
 
+    let head = git_head(root)?;
     let history = git_history_ranks(root)?;
     let retained_workspace = result_root
         .ancestors()
@@ -3975,24 +3996,11 @@ fn read_retained_selected_results(
             .push(candidate);
     }
 
-    let missing = selected
+    let no_result_cells = selected
         .iter()
         .filter(|id| !by_cell_and_rank.contains_key(*id))
         .map(display_id)
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        return Err(format!(
-            "retained history has no clean BitwiseInfoV1 terminal comparison for {} of {} selected compatibility cells:\n{}",
-            missing.len(),
-            selected.len(),
-            missing
-                .iter()
-                .take(20)
-                .map(|id| format!("  {id}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ));
-    }
+        .collect::<BTreeSet<_>>();
 
     let mut metadata: BTreeMap<String, (String, BTreeMap<String, SourceDepth>)> = BTreeMap::new();
     let mut cells = Vec::new();
@@ -4000,6 +4008,8 @@ fn read_retained_selected_results(
     let mut stale_coordinate_rows = 0usize;
     let mut stale_coordinates = 0usize;
     let mut stale_coordinate_cells = BTreeSet::new();
+    let mut fresh_cells = BTreeSet::new();
+    let mut stale_cells = BTreeSet::new();
     for (id, mut ranks) in by_cell_and_rank {
         let latest_rank = *ranks.keys().next().expect("cell has retained evidence");
         let latest_candidates = ranks.get(&latest_rank).expect("latest rank exists");
@@ -4062,6 +4072,15 @@ fn read_retained_selected_results(
             }
         };
         terminal_comparisons += candidates.len();
+        match retained_comparison_state(Some(&sha), &head) {
+            "fresh" => {
+                fresh_cells.insert(display_id(&id));
+            }
+            "stale" => {
+                stale_cells.insert(display_id(&id));
+            }
+            _ => unreachable!("a present comparison is fresh or stale"),
+        }
         cells.push(RetainedCellResults {
             id,
             hermit_sha: sha,
@@ -4078,6 +4097,9 @@ fn read_retained_selected_results(
         stale_coordinate_rows,
         stale_coordinates,
         stale_coordinate_cells,
+        fresh_cells,
+        stale_cells,
+        no_result_cells,
     })
 }
 
@@ -4473,6 +4495,17 @@ fn recorded_shell_quote(value: &str) -> String {
 }
 
 fn self_test() -> Result<(), String> {
+    let retained_states = [
+        retained_comparison_state(Some("head"), "head"),
+        retained_comparison_state(Some("ancestor"), "head"),
+        retained_comparison_state(None, "head"),
+    ];
+    if retained_states != ["fresh", "stale", "NO_RESULT"] {
+        return Err(format!(
+            "retained comparison state collapsed fresh, stale, and NO_RESULT: {:?}",
+            retained_states
+        ));
+    }
     let summary = fresh_result_summary(172, "fixture-sha", 170, 2, 2);
     let expected_summary = "Fresh result check: 172/172 selected cells passed at fixture-sha \
 (170 compatibility green, including 2 chaos; 2 custom outside the comparable denominator).";
@@ -5265,7 +5298,7 @@ fn self_test() -> Result<(), String> {
     // TELLABLE APART. Two of them look identical in every field except
     // `measurement`, and they need OPPOSITE follow-ups:
     //
-    //   never-measured      nothing ever compared this cell   -> run it
+    //   never-measured      no comparison was imported         -> inspect retained evidence
     //   diverged-unlocated  it was compared, it DID diverge,
     //                       and no axis could say where       -> fix the comparator
     //
@@ -6486,7 +6519,7 @@ fn self_test() -> Result<(), String> {
     }
 
     println!(
-        "compatibility scorecard self-test: provenance, distinct-evidence, result, selected-chaos, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, source-identity, writer-boundary, projection, path-independence, infrastructure-refusal, and divergence-without-a-comparison brackets pass"
+        "compatibility scorecard self-test: retained-comparison-state, provenance, distinct-evidence, result, selected-chaos, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, source-identity, writer-boundary, projection, path-independence, infrastructure-refusal, and divergence-without-a-comparison brackets pass"
     );
     Ok(())
 }
