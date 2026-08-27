@@ -2748,7 +2748,7 @@ fn run_kvm_f_getfl_and_reads_standard_input() {
 }
 
 #[test]
-fn run_kvm_verify_f_getfl_with_isolated_standard_input() {
+fn run_kvm_verify_f_getfl_and_replays_standard_input() {
     if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/perl").exists() {
         return;
     }
@@ -2764,9 +2764,9 @@ fn run_kvm_verify_f_getfl_with_isolated_standard_input() {
         "/usr/bin/perl",
         "-MFcntl=F_GETFL",
         "-e",
-        r#"defined(fcntl(STDIN, F_GETFL, 0)) or die "fcntl failed: $!\n"; my $line = <STDIN>; !defined($line) or die "verify stdin was not isolated\n"; print "fcntl-verify-ok\n";"#,
+        r#"defined(fcntl(STDIN, F_GETFL, 0)) or die "fcntl failed: $!\n"; my $line = <STDIN>; defined($line) && $line eq "hello\n" or die "stdin mismatch\n"; print "fcntl-verify-ok\n";"#,
     ];
-    let output = hermit_with_stdin(&args, b"not-visible-during-capture\n");
+    let output = hermit_with_stdin(&args, b"hello\n");
 
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "fcntl-verify-ok\n");
@@ -2774,25 +2774,35 @@ fn run_kvm_verify_f_getfl_with_isolated_standard_input() {
 }
 
 #[test]
-fn run_kvm_verify_isolates_standard_input() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
+fn run_verify_replays_standard_input() {
+    for backend in ["ptrace", "kvm"] {
+        if backend == "kvm" && !Path::new("/dev/kvm").exists() {
+            continue;
+        }
+
+        let args = [
+            "run",
+            "--backend",
+            backend,
+            "--strict",
+            "--verify",
+            "--base-env=minimal",
+            "--",
+            "/bin/cat",
+        ];
+        let output = hermit_with_stdin(&args, b"visible-in-both-runs\n");
+
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            "visible-in-both-runs\n",
+            "backend={backend}"
+        );
+        assert!(
+            stderr(&output).contains(":: Success: deterministic. Determinism verified."),
+            "backend={backend}"
+        );
     }
-
-    let args = [
-        "run",
-        "--backend",
-        "kvm",
-        "--strict",
-        "--verify",
-        "--base-env=minimal",
-        "--",
-        "/bin/cat",
-    ];
-    let output = hermit_with_stdin(&args, b"not-visible-during-capture\n");
-
-    assert_success(&output, &args);
-    assert_eq!(stdout(&output), "");
 }
 
 #[test]
@@ -2843,40 +2853,50 @@ fn run_kvm_preserves_closed_standard_input() {
 }
 
 #[test]
-fn run_kvm_verify_does_not_write_to_standard_input() {
-    if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/perl").exists() {
+fn run_verify_does_not_write_to_standard_input() {
+    if !Path::new("/usr/bin/perl").exists() {
         return;
     }
 
-    let temp = tempfile::tempdir().expect("failed to create stdin fixture");
-    let path = temp.path().join("stdin");
-    fs::write(&path, b"original-data").expect("failed to write stdin fixture");
-    let stdin = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .expect("failed to open stdin fixture");
-    let args = [
-        "run",
-        "--backend",
-        "kvm",
-        "--strict",
-        "--verify",
-        "--base-env=minimal",
-        "--",
-        "/usr/bin/perl",
-        "-MPOSIX",
-        "-e",
-        "POSIX::write(0, \"leak\", 4); exit 0",
-    ];
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args(args)
-        .stdin(Stdio::from(stdin))
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"));
+    for backend in ["ptrace", "kvm"] {
+        if backend == "kvm" && !Path::new("/dev/kvm").exists() {
+            continue;
+        }
 
-    assert_success(&output, &args);
-    assert_eq!(fs::read(path).unwrap(), b"original-data");
+        let temp = tempfile::tempdir().expect("failed to create stdin fixture");
+        let path = temp.path().join("stdin");
+        fs::write(&path, b"original-data").expect("failed to write stdin fixture");
+        let stdin = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("failed to open stdin fixture");
+        let args = [
+            "run",
+            "--backend",
+            backend,
+            "--strict",
+            "--verify",
+            "--base-env=minimal",
+            "--",
+            "/usr/bin/perl",
+            "-MPOSIX",
+            "-e",
+            "POSIX::write(0, \"leak\", 4); exit 0",
+        ];
+        let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+            .args(args)
+            .stdin(Stdio::from(stdin))
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"));
+
+        assert_success(&output, &args);
+        assert_eq!(
+            fs::read(path).unwrap(),
+            b"original-data",
+            "backend={backend}"
+        );
+    }
 }
 
 #[test]
