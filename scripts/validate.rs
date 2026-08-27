@@ -9725,7 +9725,7 @@ fn canonical_validate_lock_admission(
         commit,
         host,
         boot_id.as_deref(),
-        validate_runtime::identity_in_ancestry,
+        &mut validate_runtime::identity_in_ancestry,
     )
 }
 
@@ -9738,7 +9738,7 @@ fn canonical_validate_lock_status_admits(
     commit: &str,
     host: &str,
     boot_id: Option<&str>,
-    identity_in_ancestry: impl FnMut(i32, u64) -> bool,
+    identity_in_ancestry: &mut dyn FnMut(i32, u64) -> bool,
 ) -> bool {
     canonical_validate_lock_status_reason(status, commit, host, boot_id, identity_in_ancestry)
         .is_ok()
@@ -9761,12 +9761,26 @@ fn canonical_validate_lock_status_admits(
 /// here is relaxed and no caller is exempted -- `..._admits` is derived from
 /// this function, so the decision cannot drift from the explanation. Only the
 /// diagnosis is added.
+/// ⚠️ `identity_in_ancestry` IS A TRAIT OBJECT, NOT `impl FnMut`, AND IT HAS TO
+/// STAY ONE. This function RECURSES over the `authorities` array and passes
+/// `&mut identity_in_ancestry` down, so with a generic parameter each level
+/// instantiates one more reference layer -- `F`, `&mut F`, `&mut &mut F`, ...
+/// -- and monomorphization never terminates. Measured 2026-08-26: as
+/// `impl FnMut` this failed to compile with "reached the recursion limit while
+/// instantiating `canonical_validate_lock_status_reason::<&mut &mut &mut &mut
+/// &mut ...>`", which took the whole validate gate off the air on `main` --
+/// validate could not build, so nothing could be validated at all.
+///
+/// ⚠️ IT DID NOT SHOW UP IN `--self-test`. `rust-script --test` builds a
+/// different crate configuration and passed 16/16 while the release build the
+/// gate actually runs could not compile. A green self-test is therefore NOT
+/// evidence that this file builds; only a release build is.
 fn canonical_validate_lock_status_reason(
     status: &[u8],
     commit: &str,
     host: &str,
     boot_id: Option<&str>,
-    mut identity_in_ancestry: impl FnMut(i32, u64) -> bool,
+    identity_in_ancestry: &mut dyn FnMut(i32, u64) -> bool,
 ) -> Result<(), String> {
     fn object_string<'a>(
         object: &'a serde_json::Map<String, serde_json::Value>,
@@ -9796,7 +9810,7 @@ fn canonical_validate_lock_status_reason(
                 commit,
                 host,
                 boot_id,
-                &mut identity_in_ancestry,
+                &mut *identity_in_ancestry,
             ) {
                 Ok(()) => return Ok(()),
                 Err(reason) => reasons.push(reason),
@@ -9978,7 +9992,7 @@ fn product_front_door_bracket() -> Result<(), String> {
         commit,
         host,
         Some(boot_id),
-        |pid, ticks| pid == 4242 && ticks == 987654,
+        &mut (|pid, ticks| pid == 4242 && ticks == 987654),
     ) {
         return Err("product front door refused exact canonical authority".into());
     }
@@ -10035,7 +10049,7 @@ fn product_front_door_bracket() -> Result<(), String> {
             commit,
             host,
             Some(boot_id),
-            |pid, ticks| pid == 4242 && ticks == 987654,
+            &mut (|pid, ticks| pid == 4242 && ticks == 987654),
         ) {
             return Err(format!("product front door accepted weakened authority: {label}"));
         }
@@ -10045,7 +10059,7 @@ fn product_front_door_bracket() -> Result<(), String> {
         commit,
         host,
         Some(boot_id),
-        |_pid, _ticks| false,
+        &mut (|_pid, _ticks| false),
     ) {
         return Err("product front door accepted authority outside owner ancestry".into());
     }
@@ -10069,7 +10083,7 @@ fn product_front_door_bracket() -> Result<(), String> {
         commit,
         host,
         Some(boot_id),
-        |_pid, _ticks| true,
+        &mut (|_pid, _ticks| true),
     );
     for (name, value) in saved {
         match value {
