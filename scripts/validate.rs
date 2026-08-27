@@ -12258,11 +12258,10 @@ fn nextest_test_observation(rest: &str) -> Option<(bool, String)> {
         let verdicts = ["FAIL", "TIMEOUT", "LEAK", "ABORT", "SIGSEGV", "SIGABRT"];
         if let Some(rest) = verdicts.iter().find_map(|verdict| rest.strip_prefix(verdict)) {
             (false, rest)
-        } else if let Some(rest) = rest.strip_prefix("TRY ") {
+        } else {
+            let rest = rest.strip_prefix("TRY ")?;
             let (_ordinal, rest) = rest.split_once(" FAIL")?;
             (false, rest)
-        } else {
-            return None;
         }
     };
     let after_verdict = after_verdict.trim_start();
