@@ -5461,6 +5461,7 @@ fn a_stopped_stderr_reader_does_not_hang_hermit_on_its_way_out() {
              exit path (killed to keep this a red rather than a wedged runner)"
         )
     });
+    // EXIT-CLASS: hermit
     assert_eq!(
         status.code(),
         Some(127),
@@ -5552,6 +5553,7 @@ fn diagnostics_survive_a_nonblocking_stderr_under_back_pressure() {
         .output()
         .expect("control run");
     let expected = control.stderr;
+    // EXIT-CLASS: hermit
     assert_eq!(
         control.status.code(),
         Some(127),
@@ -5612,6 +5614,7 @@ fn diagnostics_survive_a_nonblocking_stderr_under_back_pressure() {
     let got = reader.join().expect("reader");
     let diagnostic = &got[filled.min(got.len())..];
 
+    // EXIT-CLASS: hermit
     assert_eq!(
         status.code(),
         Some(127),
@@ -5958,6 +5961,7 @@ fn run_timeout_refuses_backends_where_it_cannot_bound_the_run() {
             .expect("failed to run hermit");
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
+        // EXIT-CLASS: hermit
         assert_eq!(
             output.status.code(),
             Some(122),
@@ -6084,6 +6088,7 @@ fn the_stderr_deadline_is_spent_once_across_writes_not_restarted_by_each() {
          lines is the per-write regression this cell exists to catch.",
         detcore::util::STDERR_DIAGNOSTIC_DEADLINE
     );
+    // EXIT-CLASS: hermit
     assert_eq!(
         status.expect("checked above").code(),
         Some(127),
