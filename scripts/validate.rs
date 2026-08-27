@@ -1161,11 +1161,31 @@ fn self_test() -> Result<(), String> {
     ]);
     refusal.cpu_wall = Some((1.0, 0.1, 0.1));
     let rendered = run_summary_lines(&refusal, std::time::Instant::now());
-    if rendered.last() != Some(&final_command) {
+    let final_status = format!("{FINAL_VALIDATE_STATUS_PREFIX}COULD_NOT_RUN");
+    if rendered.last() != Some(&final_status)
+        || rendered.get(rendered.len().saturating_sub(2)) != Some(&final_command)
+        || rendered
+            .iter()
+            .filter(|line| line.starts_with(FINAL_VALIDATE_STATUS_PREFIX))
+            .count()
+            != 1
+    {
         return Err(format!(
-            "summary: holder tail command must be the final CLI line, got {:?}",
-            rendered.last()
+            "summary: refusal must end with exactly one final status after the holder command, got {:?}",
+            rendered
         ));
+    }
+    let quoted = format!(
+        "{FINAL_VALIDATE_STATUS_PREFIX}PASSED\nforeign output\n{FINAL_VALIDATE_STATUS_PREFIX}FAILED"
+    );
+    if final_validate_status_from_output(&quoted) != Ok(Some(FinalValidateStatus::Failed))
+        || final_validate_status_from_output("ordinary output") != Ok(None)
+        || final_validate_status_from_output("FINAL_VALIDATE_STATUS: MAYBE").is_ok()
+    {
+        return Err(
+            "summary: final-status reader did not take the last occurrence, preserve absence, or reject an unknown value"
+                .into(),
+        );
     }
     let exe = std::env::current_exe()
         .map_err(|error| format!("summary: cannot resolve self-test executable: {error}"))?;
@@ -1176,9 +1196,12 @@ fn self_test() -> Result<(), String> {
         .map_err(|error| format!("summary: cannot launch CLI output probe: {error}"))?;
     let stdout = String::from_utf8(output.stdout)
         .map_err(|error| format!("summary: CLI output was not UTF-8: {error}"))?;
-    if output.status.code() != Some(3) || stdout.lines().last() != Some(final_command.as_str()) {
+    if output.status.code() != Some(i32::from(COULD_NOT_RUN_EXIT_CODE))
+        || stdout.lines().last() != Some(final_status.as_str())
+        || stdout.lines().rev().nth(1) != Some(final_command.as_str())
+    {
         return Err(format!(
-            "summary: real refused CLI must exit 3 and end with the tail command; status={} last={:?}",
+            "summary: real refused CLI must exit {COULD_NOT_RUN_EXIT_CODE}, preserve the holder command, and end with {final_status:?}; status={} last={:?}",
             output.status,
             stdout.lines().last()
         ));
@@ -11709,6 +11732,67 @@ enum Verdict {
     Help,
 }
 
+const FINAL_VALIDATE_STATUS_PREFIX: &str = "FINAL_VALIDATE_STATUS: ";
+const FAILED_EXIT_CODE: u8 = 1;
+const COULD_NOT_RUN_EXIT_CODE: u8 = NO_RESULT_EXIT_CODE as u8;
+
+/// The machine-readable result of an actual validation attempt.
+///
+/// Help, host-capability queries and `--show-plan` do not attempt validation, so
+/// they do not emit this contract. Every path that does attempt validation maps
+/// to exactly one of these three values and to exactly one exit code.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FinalValidateStatus {
+    Passed,
+    Failed,
+    CouldNotRun,
+}
+
+impl FinalValidateStatus {
+    fn for_verdict(verdict: Verdict) -> Option<Self> {
+        match verdict {
+            Verdict::Pass | Verdict::SelfTest | Verdict::CacheHit => Some(Self::Passed),
+            Verdict::Fail => Some(Self::Failed),
+            Verdict::NoResult | Verdict::Refused | Verdict::Interrupted => {
+                Some(Self::CouldNotRun)
+            }
+            Verdict::PlanOnly | Verdict::Help => None,
+        }
+    }
+
+    fn word(self) -> &'static str {
+        match self {
+            Self::Passed => "PASSED",
+            Self::Failed => "FAILED",
+            Self::CouldNotRun => "COULD_NOT_RUN",
+        }
+    }
+
+    fn exit_code(self) -> u8 {
+        match self {
+            Self::Passed => 0,
+            Self::Failed => FAILED_EXIT_CODE,
+            Self::CouldNotRun => COULD_NOT_RUN_EXIT_CODE,
+        }
+    }
+}
+
+fn final_validate_status_from_output(output: &str) -> Result<Option<FinalValidateStatus>, String> {
+    let Some(value) = output
+        .lines()
+        .filter_map(|line| line.strip_prefix(FINAL_VALIDATE_STATUS_PREFIX))
+        .last()
+    else {
+        return Ok(None);
+    };
+    match value {
+        "PASSED" => Ok(Some(FinalValidateStatus::Passed)),
+        "FAILED" => Ok(Some(FinalValidateStatus::Failed)),
+        "COULD_NOT_RUN" => Ok(Some(FinalValidateStatus::CouldNotRun)),
+        other => Err(format!("unknown final validate status {other:?}")),
+    }
+}
+
 impl Verdict {
     fn marker(self) -> &'static str {
         match self {
@@ -11754,8 +11838,10 @@ struct RunSummary {
     exit_code: u8,
     /// One or more lines naming what happened; for a refusal, what and why.
     detail: Vec<String>,
-    /// Operator action rendered after the common footer. A refusal's pasteable
-    /// recovery command belongs here so it is the invocation's final line.
+    /// Operator action rendered after the common footer and immediately before
+    /// the final machine-readable status. A refusal's pasteable recovery command
+    /// belongs here so it stays adjacent to the conclusion without violating the
+    /// status-line ordering contract.
     epilogue: Vec<String>,
     profile: String,
     commit: String,
@@ -11786,6 +11872,9 @@ struct RunSummary {
 
 impl RunSummary {
     fn new(verdict: Verdict, exit_code: u8, profile: &str, detail: Vec<String>) -> Self {
+        let exit_code = FinalValidateStatus::for_verdict(verdict)
+            .map(FinalValidateStatus::exit_code)
+            .unwrap_or(exit_code);
         RunSummary {
             verdict,
             exit_code,
@@ -12038,6 +12127,12 @@ fn run_summary_lines(s: &RunSummary, started: std::time::Instant) -> Vec<String>
         validate_runtime::cpu_wall_line(human_duration, wall, user, sys, host_cpus)
     ));
     lines.extend(s.epilogue.iter().cloned());
+    if let Some(status) = FinalValidateStatus::for_verdict(s.verdict) {
+        // LAST by contract. A wrapper, guest, fixture or quoted diagnostic may
+        // have written an earlier lookalike to the same channel; readers use the
+        // last occurrence and require its value to agree with the exit code.
+        lines.push(format!("{FINAL_VALIDATE_STATUS_PREFIX}{}", status.word()));
+    }
     lines
 }
 
