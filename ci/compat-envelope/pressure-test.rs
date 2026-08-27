@@ -1893,14 +1893,18 @@ fn runtime_from_log(path: &Path) -> Result<JsonValue, String> {
             .and_modify(|seen| *seen = (*seen).max(syscalls))
             .or_insert(syscalls);
     }
-    let syscalls = per_thread.values().try_fold(0_u64, |total, count| {
-        total.checked_add(*count)
-    }).ok_or_else(|| format!("{} syscall total overflowed u64", path.display()))?;
-    Ok(serde_json::json!({
+    let mut runtime = serde_json::json!({
         "scheduler_turns": scheduler_turns,
         "virtual_nanoseconds": virtual_nanoseconds,
-        "syscalls": syscalls,
-    }))
+    });
+    if !per_thread.is_empty() {
+        let syscalls = per_thread
+            .values()
+            .try_fold(0_u64, |total, count| total.checked_add(*count))
+            .ok_or_else(|| format!("{} syscall total overflowed u64", path.display()))?;
+        runtime["syscalls"] = JsonValue::from(syscalls);
+    }
+    Ok(runtime)
 }
 
 fn retained_verification_runtime(attempts: &[JsonValue]) -> Result<Option<JsonValue>, String> {
@@ -4890,6 +4894,37 @@ fn self_test(root: &Path) -> Result<(), String> {
         || series_run_index("a-cell-with-no-suffix") != 0
     {
         return Err("pressure repetition ordinals no longer match retained result directories".into());
+    }
+    {
+        let path = std::env::temp_dir().join(format!(
+            "pressure-runtime-summary-{}",
+            std::process::id()
+        ));
+        let summary = "Internally, the hermit scheduler ran 12 turns, recorded 0 events, replayed 0 events (0 desynced)\nElapsed virtual global (cpu) time: 34ns\n";
+        fs::write(&path, summary)
+            .map_err(|e| format!("cannot write runtime summary fixture: {e}"))?;
+        let missing = runtime_from_log(&path)?;
+        if missing["scheduler_turns"] != 12
+            || missing["virtual_nanoseconds"] != 34
+            || missing.get("syscalls").is_some()
+        {
+            return Err(format!(
+                "a runtime log without syscall accounting did not keep it absent: {missing}"
+            ));
+        }
+        fs::write(
+            &path,
+            format!("{summary}INFO [detcore, dtid 7] finish syscall #5\n"),
+        )
+        .map_err(|e| format!("cannot write counted runtime summary fixture: {e}"))?;
+        let counted = runtime_from_log(&path)?;
+        if counted["syscalls"] != 5 {
+            return Err(format!(
+                "a runtime log with syscall accounting did not retain it: {counted}"
+            ));
+        }
+        fs::remove_file(&path)
+            .map_err(|e| format!("cannot remove runtime summary fixture: {e}"))?;
     }
     // A divergence located by an earlier attempt remains an observation even
     // when the terminal retry passes. An attempt that located nothing does not

@@ -4592,7 +4592,7 @@ impl Scheduler {
             threads_descrip,
             num_processes,
             num_threads,
-            syscalls,
+            syscalls: Some(syscalls),
             virttime_elapsed: 0, // Cannot fill.
             virttime_final: 0,   // Cannot fill.
             realtime_elapsed: None,
