@@ -278,6 +278,97 @@ fn proc_stat_ppid(pid: u32) -> Option<u32> {
     after_comm.split_whitespace().nth(1)?.parse().ok()
 }
 
+/// The accumulator EVERY hermit process of one invocation charges, when there is
+/// one. Holds the address of an `AtomicU64` in a shared anonymous mapping, or 0
+/// if the mapping could not be made.
+///
+/// ⚠️ THE DEPTH SPLIT BELOW WAS NOT ENOUGH, BECAUSE HERMIT PROCESSES ARE NOT
+/// ALWAYS A CHAIN. Halving the share per nesting level bounds a chain of any
+/// depth, and says nothing about two processes at the SAME depth. Measured
+/// 2026-08-26 on `hermit run --verify`, sampling distinct pids for the whole
+/// invocation rather than the count alive at one instant:
+///
+/// ```text
+///   pid=2357886 ppid=2357368     outer hermit
+///   pid=2357924 ppid=2357886     container init #1   depth 1
+///   pid=2360654 ppid=2357886     container init #2   depth 1   <- same parent
+/// ```
+///
+/// `--verify` runs the guest twice with a fresh child-process boundary between
+/// runs, so the fan-out is two and it is deliberate. Each of those computes depth
+/// 1 and takes 1.25s, giving 2.5 + 1.25 + 1.25 = 5s -- the ceiling EXACTLY rather
+/// than under it. `record --verify` has the same shape by construction, forking
+/// once to record and once to replay.
+///
+/// An earlier measurement recorded "chain" and was wrong because it counted the
+/// processes alive AT ONE MOMENT. The two inits are sequential, so that count is
+/// 2 and reads as a clean chain. A budget is spent per process, not per
+/// concurrently-live process, so it was never the right quantity.
+///
+/// ⚠️ SO THE FIX IS TO STOP DERIVING THE SHARE FROM THE TOPOLOGY AT ALL. A shared
+/// anonymous mapping made before the first fork is inherited by every container
+/// init, so all of them charge ONE counter against ONE ceiling and neither depth
+/// nor fan-out enters the arithmetic. It needs no environment variable (which
+/// would reach the guest), no file (which would put I/O on the path that runs
+/// while hermit is already failing), and no fd the guest can name. The guest
+/// itself never shares it: `exec` drops the mapping.
+static SHARED_WAITED_ADDR: OnceLock<usize> = OnceLock::new();
+
+/// Create the accumulator shared by every hermit process of this invocation.
+///
+/// ⚠️ MUST BE CALLED BEFORE THE FIRST CONTAINER FORK, and is called from the top
+/// of `main`. A mapping made after a fork is not shared with the child that
+/// already exists, so a late call would silently give each process its own
+/// counter -- the exact failure this exists to remove. `main` dominates all seven
+/// fork sites in `run.rs`, `replay.rs` and `record_start.rs`.
+pub fn init_shared_stderr_wait_accumulator() {
+    SHARED_WAITED_ADDR.get_or_init(|| {
+        // SAFETY: an anonymous shared mapping of one page, no fd, no fixed
+        // address. Never unmapped: it must outlive every child, and one page per
+        // invocation is not worth a teardown path on an exit route.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                std::mem::size_of::<AtomicU64>(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if addr == libc::MAP_FAILED {
+            // Not fatal, and NOT silent: `stderr_wait_is_tree_shared` reports
+            // false and the per-process split below still bounds each process.
+            return 0;
+        }
+        // SAFETY: freshly mapped, correctly aligned for u64, sole owner so far.
+        unsafe { (addr as *mut AtomicU64).write(AtomicU64::new(0)) };
+        addr as usize
+    });
+}
+
+/// The shared accumulator, if one was made before the forks.
+fn shared_waited() -> Option<&'static AtomicU64> {
+    match SHARED_WAITED_ADDR.get() {
+        None | Some(0) => None,
+        // SAFETY: the address came from `mmap` above, was initialised there, is
+        // never unmapped, and `AtomicU64` is safe to share across processes in a
+        // `MAP_SHARED` page.
+        Some(&addr) => Some(unsafe { &*(addr as *const AtomicU64) }),
+    }
+}
+
+/// Whether the wait is bounded across the whole invocation or only per process.
+///
+/// ⚠️ THIS EXISTS SO THE WEAKER STATE CANNOT BE SILENT. If the mapping failed, or
+/// something forks before `init_shared_stderr_wait_accumulator`, the bound
+/// degrades to per-process with a depth-derived share -- which does NOT hold
+/// across fan-out. A reader and a test can both ask which one is in force.
+#[doc(hidden)]
+pub fn stderr_wait_is_tree_shared() -> bool {
+    shared_waited().is_some()
+}
+
 /// Wall-clock already spent waiting on stderr in THIS process, in milliseconds.
 /// Charged against [`stderr_process_wait_budget`] by every diagnostic write.
 ///
@@ -291,6 +382,11 @@ static STDERR_WAITED_MS: AtomicU64 = AtomicU64::new(0);
 #[doc(hidden)]
 pub fn reset_stderr_wait_budget_for_test() {
     STDERR_WAITED_MS.store(0, Ordering::Relaxed);
+    // Reset the shared one too when a test has made it, or a bracket that runs
+    // after another would start with the previous one's spend already charged.
+    if let Some(shared) = shared_waited() {
+        shared.store(0, Ordering::Relaxed);
+    }
 }
 
 /// This process's share, exposed so a bracket can pin it BY VALUE rather than
@@ -298,6 +394,21 @@ pub fn reset_stderr_wait_budget_for_test() {
 #[doc(hidden)]
 pub fn stderr_wait_budget() -> Duration {
     stderr_process_wait_budget()
+}
+
+/// The bound this process will ACTUALLY stop at, whichever mechanism is in force.
+///
+/// ⚠️ THE TWO ARE DIFFERENT NUMBERS AND A TEST THAT ASSUMES ONE IS MEASURING THE
+/// WRONG THING. With the shared mapping the process stops at the whole invocation
+/// ceiling, because every other process charges the same counter; without it, at
+/// its own depth-derived share. `stderr_wait_is_tree_shared` says which.
+#[doc(hidden)]
+pub fn stderr_effective_wait_budget() -> Duration {
+    if shared_waited().is_some() {
+        STDERR_TREE_WAIT_BUDGET
+    } else {
+        stderr_process_wait_budget()
+    }
 }
 
 /// The invocation-wide ceiling, exposed so a bracket can pin it against
@@ -338,8 +449,18 @@ impl std::io::Write for RetryingStderr {
                     // against a whole budget per process -- so neither three
                     // writeln!s nor a second hermit can buy the ceiling again.
                     // See STDERR_TREE_WAIT_BUDGET.
-                    let share_ms = stderr_process_wait_budget().as_millis() as u64;
-                    let spent_ms = STDERR_WAITED_MS.load(Ordering::Relaxed);
+                    // ⚠️ ONE COUNTER AND ONE CEILING WHEN THE MAPPING EXISTS, so
+                    // neither nesting depth nor fan-out enters the arithmetic.
+                    // The per-process split is the fallback for when it does not,
+                    // and `stderr_wait_is_tree_shared` says which is in force.
+                    let (counter, share_ms) = match shared_waited() {
+                        Some(shared) => (shared, STDERR_TREE_WAIT_BUDGET.as_millis() as u64),
+                        None => (
+                            &STDERR_WAITED_MS,
+                            stderr_process_wait_budget().as_millis() as u64,
+                        ),
+                    };
+                    let spent_ms = counter.load(Ordering::Relaxed);
                     let Some(remaining_ms) = share_ms.checked_sub(spent_ms).filter(|r| *r > 0)
                     else {
                         return Err(err);
@@ -366,10 +487,9 @@ impl std::io::Write for RetryingStderr {
                     unsafe {
                         libc::poll(&mut pfd, 1, timeout_ms);
                     }
-                    STDERR_WAITED_MS.fetch_add(
-                        waited.elapsed().as_millis() as u64,
-                        Ordering::Relaxed,
-                    );
+                    // Charged to whichever counter the bound was read from, so a
+                    // process can never test one and pay into the other.
+                    counter.fetch_add(waited.elapsed().as_millis() as u64, Ordering::Relaxed);
                     continue;
                 }
                 _ => return Err(err),
@@ -430,7 +550,12 @@ mod stderr_wait_tests {
         );
 
         reset_stderr_wait_budget_for_test();
-        let share = stderr_process_wait_budget();
+        // ⚠️ THE BOUND IN FORCE, NOT THE PER-PROCESS SHARE. Another test in this
+        // binary may have installed the shared mapping, after which this process
+        // stops at the whole ceiling rather than at its share -- and asserting the
+        // share would then fail for a correct build. Which one is in force is
+        // exactly what `stderr_effective_wait_budget` answers.
+        let share = stderr_effective_wait_budget();
         let payload = vec![b'x'; 64 * 1024];
 
         let started = std::time::Instant::now();
@@ -543,6 +668,64 @@ mod stderr_wait_tests {
         assert_eq!(hermit_nesting_depth_of(100, parent_of, is_hermit), 2);
         // And the outermost, whose parent is a shell, is still depth 0.
         assert_eq!(hermit_nesting_depth_of(100, |_| Some(999), |_| false), 0);
+    }
+
+    /// The counter must actually be SHARED across a fork, or nothing else holds.
+    ///
+    /// ⚠️ THIS IS THE PROPERTY THE WHOLE BOUND NOW RESTS ON, and it is the one
+    /// thing that cannot be checked by reading the code: `MAP_SHARED` versus
+    /// `MAP_PRIVATE` is one token, and getting it wrong yields a counter that
+    /// looks identical in every single-process test and silently gives each
+    /// container init its own ceiling. So this forks for real and checks that a
+    /// charge made in the child is visible in the parent.
+    ///
+    /// It also removes the need to assume anything about the process topology:
+    /// if one counter is shared by every process, neither nesting depth nor
+    /// fan-out can multiply the ceiling.
+    #[test]
+    fn the_accumulator_is_shared_across_a_fork() {
+        init_shared_stderr_wait_accumulator();
+        let shared = shared_waited()
+            .expect("the shared mapping must be available after init");
+        shared.store(0, Ordering::Relaxed);
+
+        // SAFETY: the child does no allocation and no locking -- one atomic add
+        // and `_exit` -- so forking from a test harness thread is safe here.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            shared_waited()
+                .expect("child inherited no mapping")
+                .fetch_add(1234, Ordering::Relaxed);
+            unsafe { libc::_exit(0) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid, "waitpid");
+        assert_eq!(status, 0, "child exited nonzero");
+
+        assert_eq!(
+            shared.load(Ordering::Relaxed),
+            1234,
+            "the parent cannot see the child's charge, so every container init \
+             would carry its OWN ceiling and the bound would be multiplied by the \
+             number of them -- check MAP_SHARED in \
+             init_shared_stderr_wait_accumulator"
+        );
+    }
+
+    /// Which bound is in force must be answerable, not assumed.
+    #[test]
+    fn whether_the_bound_is_tree_wide_is_observable() {
+        init_shared_stderr_wait_accumulator();
+        // ⚠️ THE POINT IS THAT THE WEAKER STATE CANNOT BE SILENT. If the mapping
+        // ever fails, or something forks before the init call, the bound degrades
+        // to per-process with a depth-derived share, which does NOT hold across
+        // fan-out. A reader and a test can both ask which one they have.
+        assert!(
+            stderr_wait_is_tree_shared(),
+            "the accumulator is not tree-shared after init, so the bound is \
+             per-process and does not hold across fan-out"
+        );
     }
 
     /// A process whose parent is not `hermit` is the outermost one.
