@@ -17,12 +17,9 @@
  * that models the flag without asking the kernel makes the next socket syscall
  * on that descriptor abort the container.
  *
- * It has to be `recv` and not `read`. `setup_stdio` types the standard streams
- * `FdType::Regular`, and `handle_read` only routes Socket/Pipe/notification
- * descriptors through the nonblockable path, so `read(0, ...)` never classifies
- * and never reaches the invariant. The socket handlers in `syscalls/io.rs` call
- * it unconditionally by syscall kind, with no fd-type guard. A regression test
- * built on `read` would pass while the defect was live.
+ * It uses `recv` rather than `read` because the socket handler reaches the
+ * nonblocking invariant directly. That keeps this regression independent of
+ * the fd-type branch in the ordinary read handler.
  *
  * The caller supplies a socket as stdin with a byte already readable, so this
  * is not a question about blocking: the recv can be satisfied immediately, and
