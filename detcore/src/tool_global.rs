@@ -440,21 +440,24 @@ impl GlobalState {
         sched_loop_external(self.sched.clone(), self.global_time.clone(), observer).await;
     }
 
-    /// Reports that a backend supervisor received a process's final kernel exit status.
+    /// Reports that a backend supervisor received a task's final kernel exit status.
     ///
     /// This only records a barrier observation when the backend advertises physical-exit
     /// reporting; it is therefore a no-op for ptrace, DBT, KVM, and LiteInst execution. The
     /// exact process's barrier is released at this physical-waitability boundary.
     pub fn complete_physical_process_exit(&self, raw_pid: i32) {
+        let dettid = DetTid::from_raw(raw_pid);
         let detpid = DetPid::from_raw(raw_pid);
         self.pending_exec_states.lock().unwrap().remove(&detpid);
         self.post_exec_fd_blocking.lock().unwrap().remove(&detpid);
-        if self
-            .sched
-            .lock()
-            .unwrap()
-            .complete_physical_process_exit(detpid)
-        {
+        let mut sched = self.sched.lock().unwrap();
+        if sched.complete_physical_thread_exit(dettid) {
+            trace!(
+                "[detcore, dtid {}] backend completed final physical thread exit",
+                dettid
+            );
+        }
+        if sched.complete_physical_process_exit(detpid) {
             trace!(
                 "[detcore, dpid {}] backend completed final physical process exit",
                 detpid
@@ -462,18 +465,18 @@ impl GlobalState {
         }
     }
 
-    /// Releases all physical-process-exit barriers after a backend supervisor has drained every
-    /// tracee and no guest thread can race another lifecycle event.
+    /// Releases all physical-exit barriers after a backend supervisor has drained every tracee
+    /// and no guest thread can race another lifecycle event.
     pub fn release_all_physical_process_exits(&self) {
         self.pending_exec_states.lock().unwrap().clear();
         self.post_exec_fd_blocking.lock().unwrap().clear();
-        let released = self
-            .sched
-            .lock()
-            .unwrap()
-            .release_all_physical_process_exits();
-        if released != 0 {
-            trace!("released {released} final physical process-exit barrier(s)");
+        let mut sched = self.sched.lock().unwrap();
+        let released_threads = sched.release_all_physical_thread_exits();
+        let released_processes = sched.release_all_physical_process_exits();
+        if released_threads != 0 || released_processes != 0 {
+            trace!(
+                "released {released_threads} final physical thread-exit barrier(s) and {released_processes} process-exit barrier(s)"
+            );
         }
     }
 
