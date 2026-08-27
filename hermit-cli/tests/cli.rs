@@ -5407,14 +5407,18 @@ fn the_stderr_diagnostic_deadline_fits_inside_the_unwind_grace() {
     let unwind_grace = Duration::from_secs(10);
     let per_process = detcore::util::STDERR_DIAGNOSTIC_DEADLINE;
 
-    // ⚠️ TWO, BECAUSE HERMIT FORKS. `Container::run` forks the container init, which
-    // gets its own copy of the process-wide clock in detcore/src/util.rs and spends
-    // its own full deadline; both write to the same fd 2 on the way out. Measured
-    // 2026-08-26 against a stopped reader on a real guest: a 5000ms per-process
-    // deadline produced 10.03s, and 2500ms produced 5.02s. A derivation that forgets
-    // the fork is out by exactly this factor.
-    let writing_processes = 2;
-    let diagnostics = per_process * writing_processes;
+    // ⚠️ THE MULTIPLIER IS GONE, AND ITS ABSENCE IS THE POINT. This used to read
+    // `let writing_processes = 2;` -- "hermit plus the forked init" -- and the
+    // assertion below then evaluated to 10000 <= 10000, passing EXACTLY on the
+    // boundary. It is not two on every path: `hermit run --verify` runs the guest
+    // twice and forks once per run, so it is the outer hermit plus TWO container
+    // inits. At three the same assertion is 15000 <= 10000 and fails.
+    //
+    // The origin is now shared across the invocation (detcore's STDERR_ORIGIN_ADDR),
+    // so every hermit process measures from the same start and the invocation spends
+    // ONE deadline however many of them write. A count that is not in the arithmetic
+    // cannot be the wrong count.
+    let diagnostics = per_process;
 
     assert!(
         diagnostics < unwind_grace,
@@ -5425,10 +5429,9 @@ fn the_stderr_diagnostic_deadline_fits_inside_the_unwind_grace() {
     );
     assert!(
         diagnostics * 2 <= unwind_grace,
-        "diagnostics across all {writing_processes} writing processes ({diagnostics:?}, \
-         from a per-process deadline of {per_process:?}) must leave at least as much of \
-         the unwind grace ({unwind_grace:?}) for the unwind itself as they take for \
-         reporting; that half-and-half split is the stated derivation in \
+        "diagnostics for the whole invocation ({diagnostics:?}) must leave at least as \
+         much of the unwind grace ({unwind_grace:?}) for the unwind itself as they take \
+         for reporting; that half-and-half split is the stated derivation in \
          detcore/src/util.rs and this is what holds the two numbers together"
     );
 }
