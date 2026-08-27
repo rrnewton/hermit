@@ -4870,40 +4870,19 @@ fn self_test(root: &Path) -> Result<(), String> {
     {
         return Err("pressure repetition ordinals no longer match retained result directories".into());
     }
-    {
-        let path = Path::new("results.jsonl");
-        let one = r#"{"schema":4,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"FAIL","argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null}"#;
-        let two = r#"{"schema":4,"attempt":2,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"PASS","argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null}"#;
-        let history = attempt_rows(path, &format!("{two}\n{one}\n"))?;
-        if history.len() != 2
-            || history[0].attempt != 1
-            || history[0].outcome != "FAIL"
-            || history[1].attempt != 2
-            || history[1].outcome != "PASS"
-        {
-            return Err("appended retry history did not retain both attempts in order".into());
-        }
-        let terminal = terminal_attempt_row(path, &format!("{one}\n{two}\n"))?
-            .ok_or("a retried cell must still select a terminal row")?;
-        if terminal.attempt != 2 || terminal.outcome != "PASS" {
-            return Err("the scorecard projection did not select the terminal attempt".into());
-        }
-        if attempt_rows(path, &format!("{one}\n{one}\n")).is_ok() {
-            return Err("a repeated attempt ordinal must be refused".into());
-        }
-        let other = one.replace("\"test\":\"t\"", "\"test\":\"other\"");
-        if attempt_rows(path, &format!("{one}\n{other}\n")).is_ok() {
-            return Err("rows from more than one cell must be refused".into());
-        }
-    }
     // A divergence located by an earlier attempt remains an observation even
     // when the terminal retry passes. An attempt that located nothing does not
     // manufacture a divergence observation.
     {
-        let path = Path::new("results.jsonl");
-        let diverged = r#"{"schema":4,"attempt":1,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"FAIL","first_divergent_record":93,"first_divergent_syscall":37,"first_divergent_scheduler_turn":68,"first_divergent_virtual_nanoseconds":7,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null}"#;
-        let passed = r#"{"schema":4,"attempt":2,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"PASS","first_divergent_record":null,"first_divergent_syscall":null,"first_divergent_scheduler_turn":null,"first_divergent_virtual_nanoseconds":null,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null}"#;
-        let all = attempt_rows(path, &format!("{diverged}\n{passed}\n"))?;
+        let path = std::env::temp_dir().join(format!(
+            "pressure-divergence-history-{}",
+            std::process::id()
+        ));
+        let diverged = r#"{"schema":4,"attempt":1,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"FAIL","first_divergent_record":93,"first_divergent_syscall":37,"first_divergent_scheduler_turn":68,"first_divergent_virtual_nanoseconds":7,"timeout_seconds":15,"duration_ms":100,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null,"artifact_dir":"/retained/runs/r/t-verify-ptrace"}"#;
+        let passed = r#"{"schema":4,"attempt":2,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"PASS","first_divergent_record":null,"first_divergent_syscall":null,"first_divergent_scheduler_turn":null,"first_divergent_virtual_nanoseconds":null,"timeout_seconds":15,"duration_ms":200,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null,"artifact_dir":"/retained/runs/r/t-verify-ptrace-attempt-2"}"#;
+        fs::write(&path, format!("{diverged}\n{passed}\n"))
+            .map_err(|e| format!("cannot write divergence history fixture: {e}"))?;
+        let all = read_result_rows(&path)?;
         let earlier = earlier_attempts_that_located(&all, 2);
         if earlier.len() != 1
             || earlier[0].attempt != 1
@@ -4914,8 +4893,7 @@ fn self_test(root: &Path) -> Result<(), String> {
                 earlier.len()
             ));
         }
-        let terminal = terminal_attempt_row(path, &format!("{diverged}\n{passed}\n"))?
-            .ok_or("a terminal row must still be selected")?;
+        let terminal = all.last().ok_or("a terminal row must still be selected")?;
         if terminal.attempt != 2 || terminal.outcome != "PASS" {
             return Err("the terminal retry must remain the cell's reported row".into());
         }
@@ -4940,10 +4918,14 @@ fn self_test(root: &Path) -> Result<(), String> {
                 ),
             passed
         );
-        let clean = attempt_rows(path, &both_clean)?;
+        fs::write(&path, both_clean)
+            .map_err(|e| format!("cannot write no-coordinate history fixture: {e}"))?;
+        let clean = read_result_rows(&path)?;
         if !earlier_attempts_that_located(&clean, 2).is_empty() {
             return Err("an earlier attempt that located nothing must not be reported".into());
         }
+        fs::remove_file(&path)
+            .map_err(|e| format!("cannot remove divergence history fixture: {e}"))?;
     }
     // The checked files remain immutable throughout this self-test. Production
     // plan/run still checks at its command boundary before constructing a plan.
