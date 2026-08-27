@@ -169,6 +169,37 @@ self_test() {
         "$(HERMIT_LITEINST_RUNTIME=$scratch/good/libreverie_liteinst.so \
            HERMIT_LITEINST_STAGE_DIR=$scratch/absent classify)"
 
+    # The standalone producer is the documented way to stage this runtime. Use
+    # a fake Cargo command so this self-test checks its file contract without
+    # compiling Reverie.
+    cat >"$scratch/fake-cargo" <<'FAKE_CARGO'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${HERMIT_LITEINST_STAGE:?missing HERMIT_LITEINST_STAGE}"
+printf 'self-test runtime\n' >"$HERMIT_LITEINST_STAGE"
+FAKE_CARGO
+    chmod +x "$scratch/fake-cargo"
+    mkdir -p "$scratch/producer"
+    local produced="$scratch/producer/libreverie_liteinst.so"
+    printf 'stale-revision\n' >"$produced.revision"
+    if CARGO="$scratch/fake-cargo" ./scripts/stage-liteinst-runtime.sh \
+        dev "$produced" "$scratch/runtime-target" \
+        >"$scratch/producer.out" 2>"$scratch/producer.err"; then
+        local expected_pin recorded_pin
+        expected_pin=$(./ci/run-reverie-pin-check.sh --repo "$PWD" --print-pin \
+            2>"$scratch/pin.err")
+        recorded_pin=$(cat "$produced.revision" 2>/dev/null || true)
+        check 'the standalone producer replaces a stale marker with the current Reverie pin' \
+            "$expected_pin" "$recorded_pin"
+        check 'the standalone runtime is accepted by the consumer preflight' \
+            "staged $produced" \
+            "$(HERMIT_LITEINST_RUNTIME=$produced classify)"
+    else
+        printf 'FAIL the standalone producer command failed\n' >&2
+        cat "$scratch/producer.out" "$scratch/producer.err" >&2
+        failures=$((failures + 1))
+    fi
+
     if ((failures)); then
         printf 'liteinst-strict-node --self-test: %d case(s) failed\n' "$failures" >&2
         return 1
