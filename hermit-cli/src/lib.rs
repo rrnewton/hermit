@@ -2076,7 +2076,10 @@ pub fn run_with_backend(
 ///
 /// `timeout: None` is byte-for-byte the old behaviour: no alarm is armed and no
 /// timer is created, so an unbounded run is not paying for a feature it did not
-/// ask for. See [`with_run_deadline`] for what firing actually does.
+/// ask for. See `with_run_deadline` in this module for what firing actually
+/// does; it is private, so this deliberately names it rather than linking to
+/// it — a public doc link to a private item is refused by
+/// `-D rustdoc::private-intra-doc-links`.
 ///
 /// ⚠️ NOT PART OF `DetConfig`, DELIBERATELY. A wall-clock bound is host state,
 /// and `DetConfig` is the determinism configuration that is serialized to disk
