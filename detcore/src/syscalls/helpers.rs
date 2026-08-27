@@ -22,6 +22,7 @@ use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::ProtFlags;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
+use reverie::syscalls::Sysno;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::WaitPidFlag;
 
@@ -45,6 +46,7 @@ use crate::tool_local::Detcore;
 use crate::tool_local::finish_partial_record_or_replay_write;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
+use crate::types::OpenFileId;
 use crate::types::SchedEvent;
 use crate::types::SyscallPhase;
 
@@ -285,6 +287,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         call: syscalls::Writev,
+        expected_open_file: OpenFileId,
     ) -> Result<i64, Error> {
         const MAX_IOVECS: usize = 1024;
         // Linux limits a single vectored transfer to INT_MAX rounded down to a page.
@@ -386,6 +389,22 @@ impl<T: RecordOrReplay> Detcore<T> {
                 break result;
             }
 
+            if resources.poll_attempt > 0
+                && !guest
+                    .thread_state()
+                    .with_detfd(call.fd(), |detfd| {
+                        detfd.open_file_id() == expected_open_file
+                    })
+                    .unwrap_or(false)
+            {
+                break if written_total > 0 {
+                    Ok(written_total as i64)
+                } else {
+                    self.refuse_unserviceable_operation(guest, Sysno::writev, Errno::EOPNOTSUPP)
+                        .await
+                };
+            }
+
             let result = if atomic_pipe_write {
                 self.execute_atomic_pipe_writev_attempt(guest, call, &iovecs, atomic_scratch_iov)
                     .await
@@ -454,6 +473,130 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         restore_signals_after_disposition(guest, old_mask_addr).await?;
         result
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#2176): Review scalar blocking-pipe write completion and
+    // the fail-closed descriptor-replacement boundary.
+    /// Complete a logically blocking scalar pipe write after Hermit has made the pipe
+    /// physically nonblocking.
+    ///
+    /// Linux may return a positive short write for a request larger than `PIPE_BUF`, then
+    /// continue blocking for the remainder. Hermit's physical `O_NONBLOCK` is an internal
+    /// scheduler mechanism, so exposing that first short write changes guest behavior. Retry
+    /// the unconsumed suffix until the logical write completes, a signal arrives, or a real
+    /// error occurs. A signal or error after progress returns the partial byte count, matching
+    /// Linux.
+    ///
+    /// A concurrent close/dup2 can replace the numeric fd while this helper is yielded. Linux
+    /// keeps the original open-file description alive inside a blocking syscall, but Reverie
+    /// does not yet expose a backend-neutral retained-fd handle. Detect replacement before a
+    /// retry and fail closed rather than writing the suffix into an unrelated object.
+    pub async fn execute_blocking_pipe_write<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Write,
+        expected_open_file: OpenFileId,
+    ) -> Result<i64, Error> {
+        const MAX_RW_COUNT: usize = 0x7fff_f000;
+
+        let target = call.len().min(MAX_RW_COUNT);
+        if target == 0 {
+            return self.execute_nonblockable_fd_syscall(guest, call).await;
+        }
+
+        tracing::trace!(
+            "NonblockableSyscall: converting to nonblocking syscall (internal polling): write"
+        );
+        let mut resources = Resources::new(guest.thread_state().dettid);
+        resources.insert(ResourceID::InternalIOPolling, Permission::W);
+        resources.fyi(call.name());
+        let subtool = self.cfg.recordreplay_modes.then_some(self);
+        let mut current = call;
+        let mut written_total = 0usize;
+
+        loop {
+            if resources.poll_attempt > 0
+                && matches!(
+                    resource_request(guest, resources.clone()).await,
+                    ResumeStatus::Signaled(_)
+                )
+            {
+                break if written_total > 0 {
+                    Ok(written_total as i64)
+                } else {
+                    Err(call.signal_interrupt_errno().into())
+                };
+            }
+
+            if resources.poll_attempt > 0
+                && !guest
+                    .thread_state()
+                    .with_detfd(call.fd(), |detfd| {
+                        detfd.open_file_id() == expected_open_file
+                    })
+                    .unwrap_or(false)
+            {
+                break if written_total > 0 {
+                    Ok(written_total as i64)
+                } else {
+                    self.refuse_unserviceable_operation(guest, Sysno::write, Errno::EOPNOTSUPP)
+                        .await
+                };
+            }
+
+            let result = match subtool {
+                Some(detcore) => {
+                    detcore
+                        .record_or_replay_preserving_tool_errors(guest, current)
+                        .await
+                }
+                None => guest.inject_with_retry(current).await.map_err(Error::from),
+            };
+            match result {
+                Ok(written) if written > 0 => {
+                    let written = usize::try_from(written).map_err(|_| Errno::EIO)?;
+                    let remaining = target.checked_sub(written_total).ok_or(Errno::EIO)?;
+                    if written > remaining {
+                        break Err(Errno::EIO.into());
+                    }
+                    written_total = written_total.checked_add(written).ok_or(Errno::EIO)?;
+                    if written_total == target {
+                        break Ok(written_total as i64);
+                    }
+                    let Some(buffer) = call.buf() else {
+                        break Err(Errno::EFAULT.into());
+                    };
+                    let Some(next_buffer) = buffer
+                        .as_raw()
+                        .checked_add(written_total)
+                        .and_then(Addr::<u8>::from_raw)
+                    else {
+                        break finish_partial_record_or_replay_write(
+                            written_total as i64,
+                            Errno::EFAULT.into(),
+                        );
+                    };
+                    current = call
+                        .with_buf(Some(next_buffer))
+                        .with_len(target - written_total);
+                }
+                Ok(0) => break Ok(written_total as i64),
+                Err(Error::Errno(Errno::EAGAIN)) => {}
+                Err(error) => {
+                    break finish_partial_record_or_replay_write(written_total as i64, error);
+                }
+                Ok(_) => break Err(Errno::EIO.into()),
+            }
+
+            resources.poll_attempt += 1;
+            tracing::trace!(
+                "Retry #{} for blocking pipe write: {}",
+                resources.poll_attempt,
+                call.display(&guest.memory())
+            );
+            record_retry_event(guest, call).await;
+        }
     }
 
     async fn execute_atomic_pipe_writev_attempt<G: Guest<Self>>(
