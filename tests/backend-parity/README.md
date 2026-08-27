@@ -218,6 +218,147 @@ without per-child Detcore tool callbacks. The CPUID row similarly validates
 reverie-kvm's backend-local `KVM_SET_CPUID2` policy, not Detcore CPUID-event
 parity.
 
+### `hardware-trap-identity`: pre-fix DBT child-exit polling changed the canonical log
+
+Before Hermit `221c3d77959ebdef08f2890aaf3ce5185ea5d425`, the canonical
+`backend-parity-c/hardware-trap-identity/verify@dbt` cell was a measured
+divergence, but the hardware-trap results were correct. The guest forks a child
+for each wait-status check and each `SA_SIGINFO` check, then calls blocking
+`waitpid(child, ..., 0)`. Three direct DBT runs produced the same exact stdout
+and exited zero:
+
+```text
+ud2: expect sig=4 si_code=ILL_ILLOPN
+ud2/status: signalled sig=4
+  handler: signo=4 si_code=2
+divzero: expect sig=8 si_code=FPE_INTDIV
+divzero/status: signalled sig=8
+  handler: signo=8 si_code=1
+nullstore: expect sig=11 si_code=SEGV_MAPERR
+nullstore/status: signalled sig=11
+  handler: signo=11 si_code=1
+failures=0
+```
+
+The stdout SHA-256 was
+`4c2481d4f16c6db9d602985664b29deb657eebe10b8bb28b13100d2dcf258453`
+in all three runs. This is positive evidence that DBT delivered #UD, #DE, and
+#PF with the expected signal and `si_code`; the failing observation is not trap
+delivery.
+
+The imported scorecard observation contains three canonical failures at
+records 492, 366, and 374. An older retained observation named record 330, but
+the three fresh positions replaced it rather than being combined with it. The
+four distinct positions establish that the record number is not a stable
+anchor. The raw log pairs for those four positions are no longer present, so
+their record contents cannot be reconstructed from the scorecard summary.
+
+Two later clean-tree canonical comparisons at Hermit
+`8aa5b75fa3ba63c04b8bac0149d4770c91b6ecf8` retained both raw logs. Their first
+differences moved again, to records 600 and 616, but both expose the same
+operation. In the first comparison, record 600 is:
+
+```text
+run 1: DETLOG [syscall][detcore, dtid 3] finish syscall #37: wait4(4, 0x7fffffffddb0, WaitPidFlag(0x0), NULL) = Ok(4)
+run 2: NONCOMMIT turn 508, SKIP dettid 3 polling resource Resources { tid: DetPid(3), resources: {InternalIOPolling: W}, poll_attempt: 252, fyi: "wait4" }
+```
+
+Run 2 continued polling and finished the same `wait4(4)` at record 618 after
+poll attempt 260. In the second comparison, record 616 is:
+
+```text
+run 1: DETLOG [syscall][detcore, dtid 3] finish syscall #37: wait4(4, 0x7fffffffddb0, WaitPidFlag(0x0), NULL) = Ok(4)
+run 2: NONCOMMIT turn 524, SKIP dettid 3 polling resource Resources { tid: DetPid(3), resources: {InternalIOPolling: W}, poll_attempt: 260, fyi: "wait4" }
+```
+
+That run 2 finished at record 656 after poll attempt 279. The compared INFO
+counts were 1723/1575 and 1457/1569, while each pair had identical DBT counted
+branches, 25561/25561, guest exit code zero, and the unrelaxed canonical
+`BitwiseInfoV1` comparison. The moving first-difference position therefore
+tracks how many scheduler-visible polls occur before Linux reports the physical
+child ready; it is not a fixed instruction or trap event.
+
+The source path agrees with the records. `hermit-cli/src/lib.rs` sets
+`backend_tracks_process_children` false only for DBT. When this parent enters
+blocking `wait4` before DBT has published the child's exit, the
+`detcore/src/syscalls/threads.rs` path has no complete child-lifecycle state and
+falls through to `retry_nonblocking_syscall`. That helper converts the call to
+nonblocking form and records every `InternalIOPolling` retry. Physical child
+completion is timed by the host, so two otherwise equal runs can record a
+different number of polling turns before both return the same child and status.
+
+This mechanism is shared with
+`backend-parity-c/signal-waitstatus-identity/verify@dbt`, not with the SaBRe TLS
+ordering defect and not with the KVM signal-result defect. On Hermit
+`19bd0aba608f08f294e2057990878c446d0da548` with Reverie
+`6ba873cec2316f4f5d662487bf4d2b773795efdd`, the signal-waitstatus cell diverged
+three times at `wait4`/`InternalIOPolling`, with compared INFO counts 934/1196,
+1526/1422, and 3448/4174, while its guest output still ended in `failures=0`.
+The ptrace control matched 336/336 canonical INFO records. By contrast, the KVM
+defect changed guest-visible statuses, reporting SIGTERM as a normal exit and
+SIGKILL as exit code 137. Equal guest results plus differing DBT polling records
+join the two DBT cells; wrong guest results separate the KVM case.
+
+The retained later artifacts had these hashes before their relevant records
+were copied here:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| comparison 1 run 1 log | `cf7cb4a456ccbb916a11d3e646b95da5fe45aaeba4ecb7f9c6aa75d8018fd3e1` |
+| comparison 1 run 2 log | `626a4e8b3c11dddfbbca6037a6775162c9a721e63e2651eeef67c783fcd2dbce` |
+| comparison 1 report | `1a0f79f1a3d2f12b1746cff5c68c877534fdb671093c431fb8a7c903ac830d09` |
+| comparison 1 result row | `42c1d857b64af9a62caa31cb611a25d59688e2fe6d02cf4721fa37fbb4c1346c` |
+| comparison 2 run 1 log | `216e8cbccfea55facc4f4b8a80d3817e49900296f33b131827c28271d06c3a1c` |
+| comparison 2 run 2 log | `5b57bea8c7602565c97f5e73204c9f2aac71c502ac4e438e6dc4c720e39b8267` |
+| comparison 2 report | `8e4e6ff86c76d840d96ba3680bfd832651a8f282562636fb7746589053efb2f9` |
+| comparison 2 result row | `4678b4b59794ab87cbb32dc98066b3ad222da5bcac221f64fb522b714470961b` |
+
+The fixture, DBT backend configuration, and `wait4` polling implementation were
+byte-identical between those retained comparisons and Hermit commit
+`4a1f8b8c6c5b0cc3fdd225e66af2689c67497bda`. Hermit
+`221c3d77959ebdef08f2890aaf3ce5185ea5d425`, backed by Reverie's child-lifecycle
+work, subsequently removed the host-polling path. Its exact candidate passed
+the DBT lifecycle test 20/20 without changing the canonical comparator.
+
+That repair removes the diagnosed divergence mechanism, but it does **not**
+make these two exact manifest cells pass. On Hermit main
+`6172478eae288c9f5005545d4f68c00c780f41c0`, the complete published E2E
+artifact had binary SHA-256
+`82e5d9e0f1ba554a2cedf4e970e94c43761bbca42087a2797443aca22c0da695`.
+Main later moved the Reverie pin from the pull-request head `1393db62` to
+main-line `ab07a892`; that recovery commit records that the whole Reverie tree
+diff is two SaBRe files and one DBT test script, while the DBT runtime source is
+unchanged. The result therefore exercises the same DBT runtime contents that
+landed from https://github.com/rrnewton/reverie/pull/506.
+With the checked-in 15-second timeout and unrelaxed canonical comparison:
+
+* `backend-parity-c/hardware-trap-identity/verify@dbt` produced `ERROR` with
+  `verdict=no_result` in 3 of 3 attempts. Two Run1 logs completed the same
+  guest trace through root syscall number 48, contained no `InternalIOPolling`,
+  were byte-identical
+  at SHA-256
+  `03a22d52750074e8d661e173540a1495f288272c3d4fa67b68e57a78adbc51bb`,
+  and ended with the root process entering `exit_group(0)`. Those attempts then
+  timed out after starting Run2; the other attempt timed out in Run1 with an
+  empty log.
+
+  ```text
+  1970-01-01T00:00:00.000000Z INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: exit_group(0) = ?
+  ```
+
+* `backend-parity-c/signal-waitstatus-identity/verify@dbt` produced the same
+  `ERROR` and `verdict=no_result` in 3 of 3 attempts. Each stopped in Run1 and
+  retained an empty log, so there is no record whose contents can locate that
+  stall more narrowly.
+
+These are not post-fix divergences and not passes: no attempt produced a
+terminal comparison. The earlier moving coordinate correctly identified host
+timing in `wait4` polling, and that record pattern is gone. The current exact
+cells remain uncheckable until DBT completes both runs. In particular, the
+`hardware-trap-identity` name still does not identify the failing subsystem:
+the trap results were correct, the old failure was child reaping, and the
+post-fix failure is DBT run completion.
+
 ### Memory-layout ADDRESSES are not a parity contract under DBT
 
 `anonymous_mmap_layout` checks that a backend places anonymous mappings

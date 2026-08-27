@@ -8,6 +8,12 @@
     },
     {
       "disposition": "support-data",
+      "path": "tests/DEBUGGING.md",
+      "runner": "Hermit determinism investigation maintainers",
+      "why": "tests/DEBUGGING.md is owned by Hermit determinism investigation maintainers: It indexes current manifest-cell failures by bucket and preserves bounded evidence, current explanations, and the next discriminating check without acting as an executable workload."
+    },
+    {
+      "disposition": "support-data",
       "path": "tests/backend-parity/README.md",
       "runner": "tests/backend-parity/run_matrix.py maintainers",
       "why": "tests/backend-parity/README.md is owned by tests/backend-parity/run_matrix.py maintainers: This README specifies backend-parity matrix semantics and reproduction commands. It documents the driver but contains no executable workload."
