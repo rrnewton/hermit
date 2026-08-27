@@ -28,6 +28,8 @@ use std::process::Stdio;
 use std::time::Duration;
 use std::time::Instant;
 
+use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
+
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DEADLOCK_HEADLINE: &str =
@@ -985,7 +987,7 @@ fn terminal_scheduler_deadlock_reports_and_tears_down_tracees() {
 
     assert_eq!(
         status.code(),
-        Some(1),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
         "terminal scheduler deadlock must exit exactly 1, not timeout/signal/success: {status}"
     );
     assert!(

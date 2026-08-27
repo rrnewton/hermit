@@ -23,6 +23,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::Instant;
 
+use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
+
 static HERMIT_RECORD_LOCK: Mutex<()> = Mutex::new(());
 static WORKLOADS: OnceLock<Vec<Workload>> = OnceLock::new();
 
@@ -668,7 +670,7 @@ fn replay_output_sink_failure_aborts_once_without_guest_retry() {
 
     assert_eq!(
         replay_output.status.code(),
-        Some(1),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
         "replay output failure did not terminate as one tool error: {rendered}\n\
          elapsed: {elapsed:?}\nstderr:\n{stderr}"
     );
@@ -761,7 +763,7 @@ fn replay_captured_output_ftruncate_failure_aborts_without_panicking() {
 
     assert_eq!(
         replay_output.status.code(),
-        Some(1),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
         "captured-output ftruncate failure did not terminate as one tool error: {rendered}\n\
          elapsed: {elapsed:?}\nstderr:\n{stderr}"
     );
