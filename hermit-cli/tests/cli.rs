@@ -1106,6 +1106,64 @@ fn run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls()
         "unsupported guest published its success marker"
     );
 
+    // ⚠️ FAILING IS NOT ENOUGH; THE STATUS HAS TO SAY WHICH KIND OF FAILURE.
+    // Measured 2026-08-27: this run exited 101 with no marker. 101 is what
+    // reverie-dbt's `exit_runtime_tree` uses for the unsupported-syscall
+    // sentinel AND for a dozen unrelated internal faults, and it sits inside
+    // the 1..=121 band `hermit-cli/src/lib.rs` reserves for the guest's own
+    // status passed through untouched. A caller separating "hermit refused"
+    // from "the guest failed" was therefore right for ptrace and kvm and wrong
+    // for dbt. The assertions above all passed while that was true, which is
+    // why they are not sufficient on their own.
+    assert_eq!(
+        default.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "default DBT refusal did not report HERMIT_POLICY_REFUSAL_EXIT:\n{}",
+        stderr(&default)
+    );
+    assert!(
+        stderr(&default).contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "default DBT refusal omitted the policy-refusal marker:\n{}",
+        stderr(&default)
+    );
+
+    // ⚠️ THE CONTROL THAT MUST COME OUT THE OTHER WAY. Mapping 101 to 122
+    // wherever it appears would satisfy every assertion above and would be
+    // wrong: 101 is a legal guest status. A guest that chooses it must still
+    // report it, and must not acquire a refusal marker it did not earn.
+    let guest_101_args = ["run", "--backend", "dbt", "--", "/bin/sh", "-c", "exit 101"];
+    let guest_101 = hermit(&guest_101_args);
+    assert_eq!(
+        guest_101.status.code(),
+        Some(101),
+        "a guest that exited 101 of its own accord was relabelled:\n{}",
+        stderr(&guest_101)
+    );
+    assert!(
+        !stderr(&guest_101).contains("HERMIT_POLICY_REFUSAL"),
+        "a guest failure was reported as a policy refusal:\n{}",
+        stderr(&guest_101)
+    );
+
+    // ⚠️ ONE DECISION MUST NOT CHANGE CLASS BECAUSE `--verify` WAS PASSED.
+    // Measured 2026-08-27: this reported 125 `class=cli-error`, "hermit broke",
+    // for the identical refusal the plain run above reports as a refusal. The
+    // run still stops -- `verify_allow` is not satisfied by a refusal and should
+    // not be -- so only the name on the way out was wrong.
+    let verify_refusal_args = ["run", "--backend", "dbt", "--verify", "--", program];
+    let verify_refusal = hermit(&verify_refusal_args);
+    assert_eq!(
+        verify_refusal.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "DBT refusal under --verify did not report HERMIT_POLICY_REFUSAL_EXIT:\n{}",
+        stderr(&verify_refusal)
+    );
+    assert!(
+        stderr(&verify_refusal).contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "DBT refusal under --verify omitted the policy-refusal marker:\n{}",
+        stderr(&verify_refusal)
+    );
+
     let normal_args = [
         "run",
         "--backend",

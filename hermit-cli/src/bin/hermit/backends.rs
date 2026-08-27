@@ -65,6 +65,8 @@ use reverie_dbt::backend_stats::DbtBackendStatsSnapshot;
 use tracing::metadata::LevelFilter;
 
 #[cfg(feature = "dbt")]
+use super::container::PolicyRefusal;
+#[cfg(feature = "dbt")]
 use super::record_envelope::RecordEnvelope;
 use super::run::VerifyAllow;
 #[cfg(feature = "dbt")]
@@ -435,6 +437,11 @@ struct DbtUnsupportedSyscallReport {
     reader: std::fs::File,
     _writer: std::fs::File,
     _report_fd: InstalledFd,
+    /// The names drained from the protected descriptor, or `None` if the pipe
+    /// has not been read yet. Memoized because the pipe can only be drained
+    /// once and two callers now want the answer: the exit-status decision, and
+    /// `Drop` as the backstop for every path that does not reach it.
+    drained: Option<BTreeSet<String>>,
 }
 
 #[cfg(feature = "dbt")]
@@ -457,10 +464,29 @@ impl DbtUnsupportedSyscallReport {
             reader,
             _writer: writer,
             _report_fd: report_fd,
+            drained: None,
         })
     }
 
-    fn emit(&mut self) -> std::io::Result<()> {
+    /// Drain the protected descriptor once, print the aggregate warning, and
+    /// return the syscall names it carried.
+    ///
+    /// Idempotent by memoization rather than by luck: a pipe read twice yields
+    /// nothing the second time, so an un-memoized second call would report an
+    /// empty set and silently retract the first answer.
+    fn drain(&mut self) -> std::io::Result<BTreeSet<String>> {
+        if let Some(drained) = &self.drained {
+            return Ok(drained.clone());
+        }
+        let syscalls = self.read_report()?;
+        if let Some(message) = detcore::format_unsupported_syscall_warning(&syscalls) {
+            eprintln!("WARNING: {message}");
+        }
+        self.drained = Some(syscalls.clone());
+        Ok(syscalls)
+    }
+
+    fn read_report(&mut self) -> std::io::Result<BTreeSet<String>> {
         const MAX_REPORT_BYTES: usize = 1024 * 1024;
         let mut contents = Vec::new();
         let mut buffer = [0_u8; 4096];
@@ -503,20 +529,76 @@ impl DbtUnsupportedSyscallReport {
             })
             .take(512)
             .collect::<BTreeSet<_>>();
-        if let Some(message) = detcore::format_unsupported_syscall_warning(&syscalls) {
-            eprintln!("WARNING: {message}");
-        }
-        Ok(())
+        Ok(syscalls)
     }
 }
 
 #[cfg(feature = "dbt")]
 impl Drop for DbtUnsupportedSyscallReport {
     fn drop(&mut self) {
-        if let Err(error) = self.emit() {
+        if self.drained.is_some() {
+            return;
+        }
+        if let Err(error) = self.drain() {
             eprintln!("WARNING: failed to read DBT unsupported-syscall report: {error}");
         }
     }
+}
+
+/// Was this failed DBT run a fail-closed policy refusal rather than a guest
+/// failure?
+///
+/// ⚠️ THE EXIT STATUS CANNOT ANSWER THIS AND MUST NOT BE ASKED. The DynamoRIO
+/// client refuses through `exit_runtime_tree(101)` (reverie-dbt
+/// `native/client.c`), which is its GENERIC fatal code: the refusal reaches that
+/// line because the runtime callback returned a value outside `0..=2`, and a
+/// dozen unrelated internal faults reach it too. 101 also sits inside the
+/// `1..=121` band that `hermit-cli/src/lib.rs` reserves for the guest's own
+/// status passed through untouched, so keying on the number would relabel a
+/// guest that genuinely exited 101 and would still miss a refusal that exited
+/// any other way.
+///
+/// The protected descriptor is asked instead. `detcore` now names the syscall on
+/// it before the fail-closed branch terminates, so a non-empty report is a
+/// statement the refusing code made on a channel of its own -- not a number with
+/// several meanings, and not the diagnostic's English, which is what the
+/// failure-class discriminant exists to avoid matching.
+///
+/// Both guards are load-bearing. `panic_on_unsupported_syscalls` is required
+/// because the opt-out run reports on the SAME descriptor and must stay a
+/// success; the status check is required because a report says the syscall was
+/// seen, not that it stopped the run.
+#[cfg(feature = "dbt")]
+fn dbt_policy_refusal(
+    status: ExitStatus,
+    panic_on_unsupported_syscalls: bool,
+    report: &mut DbtUnsupportedSyscallReport,
+) -> Option<Error> {
+    if !panic_on_unsupported_syscalls || status.success() {
+        return None;
+    }
+    let syscalls = match report.drain() {
+        Ok(syscalls) => syscalls,
+        Err(error) => {
+            eprintln!("WARNING: failed to read DBT unsupported-syscall report: {error}");
+            return None;
+        }
+    };
+    if syscalls.is_empty() {
+        return None;
+    }
+    // ⚠️ SAME SHAPE AS THE ptrace ARM IN `container.rs`, DELIBERATELY:
+    // `error.context(PolicyRefusal)`, with the diagnostic as the base and the
+    // marker attached on top. `Error::new(PolicyRefusal)` on its own would say
+    // "the refusal reason is above" while discarding the one line that names
+    // WHICH syscall was refused.
+    Some(
+        Error::msg(format!(
+            "unsupported syscall: {}",
+            syscalls.iter().cloned().collect::<Vec<_>>().join(",")
+        ))
+        .context(PolicyRefusal),
+    )
 }
 
 #[cfg(feature = "dbt")]
@@ -751,7 +833,7 @@ pub(super) fn run_dbt(
         drrun.display()
     );
 
-    let _unsupported_report = DbtUnsupportedSyscallReport::new()?;
+    let mut unsupported_report = DbtUnsupportedSyscallReport::new()?;
     let prepared = prepare_dbt_guest_command(
         program,
         args,
@@ -784,7 +866,15 @@ pub(super) fn run_dbt(
                      (run without a terminal on stdin for the labeled block)"
                 );
             }
-            return Ok(process_status(status));
+            let status = process_status(status);
+            if let Some(refusal) = dbt_policy_refusal(
+                status,
+                panic_on_unsupported_syscalls,
+                &mut unsupported_report,
+            ) {
+                return Err(refusal);
+            }
+            return Ok(status);
         }
         let output = run_once(&runtime, &runner, &guest, &drrun, config, std::io::stdin())?;
         write_output(&output)?;
@@ -794,7 +884,15 @@ pub(super) fn run_dbt(
                 Err(error) => eprintln!(":: DBT summary unavailable: {error}"),
             }
         }
-        return Ok(output_status(&output));
+        let status = output_status(&output);
+        if let Some(refusal) = dbt_policy_refusal(
+            status,
+            panic_on_unsupported_syscalls,
+            &mut unsupported_report,
+        ) {
+            return Err(refusal);
+        }
+        return Ok(status);
     }
 
     let (log1, log2) = temp_log_files_in("dbt-run1", "dbt-run2", verify_log_dir)
@@ -882,6 +980,8 @@ pub(super) fn run_dbt(
         std::io::stderr().write_all(&fs::read(&log1_path)?)?;
     }
     if !verify_allow.satisfies(process_status(first_raw.status)) {
+        // Read before `dbt_verification_output` consumes the output.
+        let first_status = process_status(first_raw.status);
         let first = dbt_verification_output(first_raw);
         eprintln!(
             "First run errored during --verify, not continuing to a second. Stdout:\n{}\nStderr:\n{}",
@@ -890,6 +990,20 @@ pub(super) fn run_dbt(
         );
         if keep_logs {
             retain_verification_logs([("run 1", log1_path)])?;
+        }
+        // ⚠️ THE SAME DECISION MUST NOT CHANGE CLASS BECAUSE `--verify` WAS
+        // PASSED. Measured 2026-08-27: a fail-closed refusal under
+        // `--backend dbt --verify` reported 125 `class=cli-error` -- "hermit
+        // broke" -- for the identical policy decision the plain run reports as a
+        // refusal. `verify_allow` is not satisfied by a refusal and never should
+        // be, so the run does stop here; what was wrong is only what it is
+        // called on the way out.
+        if let Some(refusal) = dbt_policy_refusal(
+            first_status,
+            panic_on_unsupported_syscalls,
+            &mut unsupported_report,
+        ) {
+            return Err(refusal);
         }
         return Err(Error::msg("First run during --verify exited in error"));
     }

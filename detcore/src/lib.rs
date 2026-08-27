@@ -379,6 +379,28 @@ impl<T: RecordOrReplay> Detcore<T> {
                 dettid,
                 call.display(&guest.memory()),
             );
+            // ⚠️ THE REFUSAL NEEDS A CHANNEL OF ITS OWN, AND UNTIL NOW THE
+            // FAIL-CLOSED BRANCH WROTE TO NONE. Reporting happened only in the
+            // passthrough branch below, so a run that REFUSED named its syscall
+            // in log text and nowhere else. That is fine for the ptrace and KVM
+            // backends, whose refusal already reaches the parent as
+            // `HERMIT_POLICY_REFUSAL_EXIT` through the status channel. It is not
+            // fine for DBT: the guest runs as a separate process under
+            // DynamoRIO, and the native client turns this refusal into
+            // `exit_runtime_tree(101)` -- the same generic fatal code it uses for
+            // a dozen unrelated conditions, and a value inside the band
+            // `hermit-cli/src/lib.rs` reserves for the guest's own status. The
+            // parent was left to choose between a number that means several
+            // things and matching the diagnostic's English, which is the thing
+            // the failure-class discriminant exists to avoid.
+            //
+            // Naming the syscall on the protected descriptor costs one global
+            // request and gives the parent something typed to classify on.
+            // Guarded on the descriptor being installed, which is the DBT
+            // backend alone, so the ptrace and KVM paths are untouched.
+            if guest.config().unsupported_syscall_report_fd.is_some() {
+                report_unsupported_syscall(guest, call.number()).await;
+            }
             if guest.config().shutdown_on_unsupported_syscall {
                 // A fail-closed policy decision: the run named a syscall hermit
                 // cannot service and `shutdown_on_unsupported_syscall` says stop.
