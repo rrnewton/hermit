@@ -821,7 +821,7 @@ struct PressureSummaryRow {
     repetition: Option<u64>,
     result: String,
     #[serde(default)]
-    verification: Option<PressureVerification>,
+    verification: Option<canonical_verdict::VerificationReport>,
     #[serde(default)]
     evidence_errors: Vec<String>,
     invocation: Option<PressureInvocation>,
@@ -836,20 +836,6 @@ struct PressureInvocation {
     cwd: String,
     shell_command: String,
     attempts: Vec<ObservedAttemptInvocation>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct PressureVerification {
-    #[serde(default)]
-    first_divergent_scheduler_turn: Option<u64>,
-    #[serde(default)]
-    first_divergent_virtual_nanoseconds: Option<u64>,
-    /// `#[serde(default)]` like its siblings, so every verify report written
-    /// before this field existed still parses and simply reports None.
-    #[serde(default)]
-    first_divergent_record: Option<u64>,
-    #[serde(default)]
-    first_divergent_syscall: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1297,7 +1283,10 @@ struct RetainedDecision {
 }
 
 enum ImportEvidence {
-    Retained(RetainedCellResults),
+    Retained {
+        results: RetainedCellResults,
+        store_positions: bool,
+    },
     None,
 }
 
@@ -1306,12 +1295,16 @@ struct CurrentPressureResult {
     summary: PressureSummary,
     result: ObservedResult,
     coordinates: DivergenceCoordinates,
+    missing_retained_logs: bool,
 }
 
 struct CurrentPressureEvidence {
     results: BTreeMap<CellId, Vec<CurrentPressureResult>>,
     uncheckable: BTreeMap<CellId, Vec<String>>,
 }
+
+const MISSING_RETAINED_VERIFY_LOGS: &str =
+    "terminal verify result must retain exactly one nonempty run1 log and one nonempty run2 log";
 
 fn main() -> ExitCode {
     rust_script_prelude::init();
@@ -3006,6 +2999,7 @@ fn apply_validate_results(
     detcore_tree: &str,
     depth: &BTreeMap<String, SourceDepth>,
     store_invocation: bool,
+    store_positions: bool,
 ) -> Result<ValidateFold, String> {
     let mut fold = ValidateFold::default();
     for (id, candidates) in rows {
@@ -3178,7 +3172,7 @@ fn apply_validate_results(
             // Re-importing the same retained evidence must be byte-idempotent.
             // Positions are vectors, so appending them when the invocation set
             // rejected a duplicate would silently inflate the sample count.
-            if inserted {
+            if inserted && store_positions {
                 observation
                     .first_divergent_scheduler_turn
                     .record(row.first_divergent_scheduler_turn);
@@ -3199,7 +3193,7 @@ fn apply_validate_results(
             });
             if result == ObservedResult::Pass {
                 fold.passed += 1;
-            } else if located_nothing {
+            } else if located_nothing || !store_positions {
                 fold.unlocated += 1;
             } else {
                 fold.located += 1;
@@ -3234,7 +3228,15 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
     }
     let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
     let before = tracked.clone();
-    let fold = apply_validate_results(&mut tracked, &rows, &head, &detcore_tree, &depth, true)?;
+    let fold = apply_validate_results(
+        &mut tracked,
+        &rows,
+        &head,
+        &detcore_tree,
+        &depth,
+        true,
+        true,
+    )?;
     refresh_measurement(&mut tracked);
     enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
     fs::write(root.join(SCORECARD), render_scorecard(&derived, &tracked))
@@ -3352,6 +3354,7 @@ fn import_results(
     let mut outcome_rows = Vec::new();
     let mut retained_rows_imported = 0usize;
     let mut current_rows_imported = 0usize;
+    let mut current_rows_missing_retained_logs = Vec::new();
     for current_results in current.results.values() {
         for current_result in current_results {
             let depth = BTreeMap::from([(
@@ -3371,6 +3374,10 @@ fn import_results(
                 &depth,
             )?;
             current_rows_imported += 1;
+            if current_result.missing_retained_logs {
+                current_rows_missing_retained_logs
+                    .push(display_id(&current_result.summary.rows[0].cell));
+            }
         }
     }
     for retained in retained_cells {
@@ -3391,6 +3398,7 @@ fn import_results(
                 &retained.detcore_tree,
                 &retained.depth,
                 false,
+                true,
             )?;
             retained_rows_imported += retained.candidates.len();
             fold.passed += one.passed;
@@ -3402,7 +3410,10 @@ fn import_results(
         let Some(decision) = decision else { continue };
         *outcome_counts.entry(decision.state).or_default() += 1;
         match decision.import {
-            ImportEvidence::Retained(retained) => {
+            ImportEvidence::Retained {
+                results: retained,
+                store_positions,
+            } => {
                 let rows = BTreeMap::from([(retained.id.clone(), retained.candidates.clone())]);
                 let one = apply_validate_results(
                     &mut tracked,
@@ -3411,6 +3422,7 @@ fn import_results(
                     &retained.detcore_tree,
                     &retained.depth,
                     false,
+                    store_positions,
                 )?;
                 retained_rows_imported += retained.candidates.len();
                 fold.passed += one.passed;
@@ -3481,6 +3493,13 @@ fn import_results(
         "  retained comparisons without a divergence coordinate: {historical_without_coordinates}; enabled cells with no retained canonical comparison: {}",
         no_result_cells.len()
     );
+    println!(
+        "  current canonical divergence row(s) imported from typed reports without retained run logs: {}",
+        current_rows_missing_retained_logs.len()
+    );
+    for cell in &current_rows_missing_retained_logs {
+        println!("    missing retained run logs: {cell}");
+    }
     println!(
         "  retained coordinate freshness: FRESH={} DRIFTED={} WRONG={} UNCHECKABLE={}",
         outcome_counts
@@ -4175,11 +4194,64 @@ fn read_retained_results(
     })
 }
 
+/// Admit the one current DBT shape whose product result is present in the typed
+/// verification report even though the raw run logs were not retained.
+///
+/// The ordinary pressure-observation writer still refuses this row: it cannot
+/// claim to have retained artifacts that are absent. `import-results` needs a
+/// narrower answer for the four-state coordinate check. A canonical,
+/// non-vacuous `verdict=diverged` receipt proves the current divergence and its
+/// position, so treating the row only as infrastructure trouble would preserve
+/// a retained position that three current reports have already contradicted.
+/// No other evidence error is cleared, and a matched or non-canonical report
+/// remains refused.
+fn admit_current_dbt_divergence_without_retained_logs(
+    summary: &mut PressureSummary,
+) -> Result<bool, String> {
+    let row = summary
+        .rows
+        .first_mut()
+        .ok_or("current pressure summary contains no row")?;
+    if row.cell.mode != "verify"
+        || row.cell.backend != "dbt"
+        || row.result != "infrastructure-error"
+        || row.evidence_errors.as_slice() != [MISSING_RETAINED_VERIFY_LOGS]
+    {
+        return Ok(false);
+    }
+    let report = row
+        .verification
+        .as_ref()
+        .ok_or("DBT row missing retained run logs also has no verification report")?;
+    report.require_canonical_comparison().map_err(|error| {
+        format!("DBT row missing retained run logs has no canonical comparison to import: {error}")
+    })?;
+    if report.verdict != "diverged" || report.verified || report.bitwise_parity {
+        return Err(format!(
+            "DBT row missing retained run logs is not a canonical divergence: verdict={} verified={} bitwise_parity={}",
+            report.verdict, report.verified, report.bitwise_parity
+        ));
+    }
+    let coordinates = DivergenceCoordinates {
+        scheduler_turn: report.first_divergent_scheduler_turn,
+        virtual_nanoseconds: report.first_divergent_virtual_nanoseconds,
+        record: report.first_divergent_record,
+        syscall: report.first_divergent_syscall,
+    };
+    if coordinates.is_empty() {
+        return Err("DBT canonical divergence missing retained run logs has no coordinate".into());
+    }
+    row.result = "determinism-failure".into();
+    row.evidence_errors.clear();
+    Ok(true)
+}
+
 fn checked_current_pressure_result(
     tracked: &TrackedCells,
-    summary: PressureSummary,
+    mut summary: PressureSummary,
     current_tree: &str,
 ) -> Result<CurrentPressureResult, String> {
+    let missing_retained_logs = admit_current_dbt_divergence_without_retained_logs(&mut summary)?;
     let row = summary
         .rows
         .first()
@@ -4220,6 +4292,7 @@ fn checked_current_pressure_result(
         summary,
         result,
         coordinates,
+        missing_retained_logs,
     })
 }
 
@@ -4339,7 +4412,10 @@ fn retained_coordinate_decision(
     if current_by_run.values().any(|values| values.len() != 1) {
         return RetainedDecision {
             state: RetainedComparisonState::Uncheckable,
-            import: ImportEvidence::None,
+            import: ImportEvidence::Retained {
+                results: retained,
+                store_positions: false,
+            },
             retained_coordinates,
             current_coordinates: BTreeSet::new(),
             reason: "one current run identity carries conflicting results".into(),
@@ -4359,7 +4435,10 @@ fn retained_coordinate_decision(
     if let Some(reasons) = current.uncheckable.get(&retained.id) {
         return RetainedDecision {
             state: RetainedComparisonState::Uncheckable,
-            import: ImportEvidence::None,
+            import: ImportEvidence::Retained {
+                results: retained,
+                store_positions: false,
+            },
             retained_coordinates,
             current_coordinates,
             reason: reasons.join("; "),
@@ -4368,7 +4447,10 @@ fn retained_coordinate_decision(
     if current_results.is_empty() {
         return RetainedDecision {
             state: RetainedComparisonState::Uncheckable,
-            import: ImportEvidence::None,
+            import: ImportEvidence::Retained {
+                results: retained,
+                store_positions: false,
+            },
             retained_coordinates,
             current_coordinates,
             reason: "no current pressure summary row was supplied".into(),
@@ -4388,7 +4470,10 @@ fn retained_coordinate_decision(
     if no_verdict > 0 {
         return RetainedDecision {
             state: RetainedComparisonState::Uncheckable,
-            import: ImportEvidence::None,
+            import: ImportEvidence::Retained {
+                results: retained,
+                store_positions: false,
+            },
             retained_coordinates,
             current_coordinates,
             reason: format!(
@@ -4400,7 +4485,10 @@ fn retained_coordinate_decision(
         if matched < 2 {
             return RetainedDecision {
                 state: RetainedComparisonState::Uncheckable,
-                import: ImportEvidence::None,
+                import: ImportEvidence::Retained {
+                    results: retained,
+                    store_positions: false,
+                },
                 retained_coordinates,
                 current_coordinates,
                 reason: format!(
@@ -4423,7 +4511,10 @@ fn retained_coordinate_decision(
     {
         return RetainedDecision {
             state: RetainedComparisonState::Uncheckable,
-            import: ImportEvidence::None,
+            import: ImportEvidence::Retained {
+                results: retained,
+                store_positions: false,
+            },
             retained_coordinates,
             current_coordinates,
             reason: format!(
@@ -4434,7 +4525,10 @@ fn retained_coordinate_decision(
     if current_coordinates == retained_coordinates {
         RetainedDecision {
             state: RetainedComparisonState::Fresh,
-            import: ImportEvidence::Retained(retained),
+            import: ImportEvidence::Retained {
+                results: retained,
+                store_positions: true,
+            },
             retained_coordinates,
             current_coordinates,
             reason: format!(
@@ -5219,16 +5313,43 @@ fn self_test() -> Result<(), String> {
     // asserted range below is distinct (turn 10..30, record 50..150, syscall
     // 5..15). Four different keyspaces, so a fold that read one coordinate off
     // another's value fails the bracket instead of passing by coincidence.
+    let pressure_verification =
+        |result: &str, scheduler_turn, virtual_nanoseconds, record, syscall| {
+            canonical_verdict::VerificationReport {
+                verified: result == "pass",
+                bitwise_parity: result == "pass",
+                verdict: if result == "pass" {
+                    "matched".into()
+                } else {
+                    "diverged".into()
+                },
+                comparison: Some(canonical_verdict::ComparisonReport {
+                    strictness: "canonical".into(),
+                    compare_logs: true,
+                    record_envelope: canonical_verdict::RecordEnvelopeReport::AllRecordsV1,
+                }),
+                compared_log_messages: Some(canonical_verdict::ComparedLogMessages {
+                    left: 100,
+                    right: 100,
+                }),
+                first_divergent_scheduler_turn: scheduler_turn,
+                first_divergent_virtual_nanoseconds: virtual_nanoseconds,
+                first_divergent_record: record,
+                first_divergent_syscall: syscall,
+                runtime: None,
+            }
+        };
     let pressure_row = |result: &str, turn: Option<u64>, virtual_nanoseconds| PressureSummaryRow {
         cell: id.clone(),
         repetition: None,
         result: result.into(),
-        verification: Some(PressureVerification {
-            first_divergent_scheduler_turn: turn,
-            first_divergent_virtual_nanoseconds: virtual_nanoseconds,
-            first_divergent_record: turn.map(|turn| turn * 5),
-            first_divergent_syscall: turn.map(|turn| turn / 2),
-        }),
+        verification: Some(pressure_verification(
+            result,
+            turn,
+            virtual_nanoseconds,
+            turn.map(|turn| turn * 5),
+            turn.map(|turn| turn / 2),
+        )),
         evidence_errors: Vec::new(),
         invocation: Some(PressureInvocation {
             run_id: format!("fixture-{result}"),
@@ -5557,12 +5678,13 @@ fn self_test() -> Result<(), String> {
             coordinates.scheduler_turn,
             coordinates.virtual_nanoseconds,
         );
-        row.verification = Some(PressureVerification {
-            first_divergent_scheduler_turn: coordinates.scheduler_turn,
-            first_divergent_virtual_nanoseconds: coordinates.virtual_nanoseconds,
-            first_divergent_record: coordinates.record,
-            first_divergent_syscall: coordinates.syscall,
-        });
+        row.verification = Some(pressure_verification(
+            result,
+            coordinates.scheduler_turn,
+            coordinates.virtual_nanoseconds,
+            coordinates.record,
+            coordinates.syscall,
+        ));
         row
     };
     let current_result = |row: PressureSummaryRow| {
@@ -5586,6 +5708,7 @@ fn self_test() -> Result<(), String> {
             summary: pressure_summary("sha-1", "tree-1", vec![row]),
             result,
             coordinates,
+            missing_retained_logs: false,
         }
     };
     let current_run = |run_id: &str, mut row: PressureSummaryRow| {
@@ -5643,7 +5766,13 @@ fn self_test() -> Result<(), String> {
         },
     );
     if fresh.state != RetainedComparisonState::Fresh
-        || !matches!(fresh.import, ImportEvidence::Retained(_))
+        || !matches!(
+            fresh.import,
+            ImportEvidence::Retained {
+                store_positions: true,
+                ..
+            }
+        )
     {
         return Err("equal retained and current coordinates were not FRESH".into());
     }
@@ -5730,7 +5859,13 @@ fn self_test() -> Result<(), String> {
         },
     );
     if one_match.state != RetainedComparisonState::Uncheckable
-        || !matches!(one_match.import, ImportEvidence::None)
+        || !matches!(
+            one_match.import,
+            ImportEvidence::Retained {
+                store_positions: false,
+                ..
+            }
+        )
     {
         return Err(
             "one matching run was treated as proof that a retained coordinate is WRONG".into(),
@@ -5817,6 +5952,81 @@ fn self_test() -> Result<(), String> {
     )
     .err()
     .ok_or("a current row with missing retained logs was accepted")?;
+
+    // DBT can return a complete typed canonical divergence report while its
+    // evidence transport fails to retain the two raw run logs. The general
+    // pressure writer above still refuses that shape. This import-only check
+    // admits exactly that report so a current coordinate can replace a retained
+    // one instead of being misreported as infrastructure trouble.
+    let mut dbt_id = validate_id.clone();
+    dbt_id.backend = "dbt".into();
+    let dbt_tracked = TrackedCells {
+        schema: SCHEMA,
+        projection: None,
+        cells: vec![TrackedCell {
+            id: dbt_id.clone(),
+            enabled: true,
+            status: CellStatus::Red,
+            ci_disabled_reason: None,
+            not_applicable_reason: None,
+            last_tested: None,
+            observations: Vec::new(),
+            measurement: MeasurementState::NeverMeasured,
+            green_removal_reason: None,
+        }],
+    };
+    let mut dbt_row = pressure_at(
+        "infrastructure-error",
+        coordinates(Some(3), Some(30), Some(330), Some(7)),
+    );
+    dbt_row.cell = dbt_id.clone();
+    dbt_row.evidence_errors = vec![MISSING_RETAINED_VERIFY_LOGS.into()];
+    let admitted_dbt = checked_current_pressure_result(
+        &dbt_tracked,
+        pressure_summary("sha-1", "tree-1", vec![dbt_row.clone()]),
+        "tree-1",
+    )
+    .map_err(|error| {
+        format!("a typed current DBT canonical divergence was not admitted: {error}")
+    })?;
+    if !admitted_dbt.missing_retained_logs
+        || admitted_dbt.result != ObservedResult::DeterminismFailure
+        || admitted_dbt.coordinates.record != Some(330)
+    {
+        return Err(
+            "current DBT canonical divergence was not preserved as a located product result".into(),
+        );
+    }
+    let mut extra_error = dbt_row.clone();
+    extra_error
+        .evidence_errors
+        .push("second evidence error".into());
+    if checked_current_pressure_result(
+        &dbt_tracked,
+        pressure_summary("sha-1", "tree-1", vec![extra_error]),
+        "tree-1",
+    )
+    .is_ok()
+    {
+        return Err("DBT missing-log admission cleared an unrelated evidence error".into());
+    }
+    let mut weak_dbt = dbt_row;
+    weak_dbt
+        .verification
+        .as_mut()
+        .and_then(|report| report.comparison.as_mut())
+        .expect("fixture report has comparison")
+        .strictness = "stripped".into();
+    if checked_current_pressure_result(
+        &dbt_tracked,
+        pressure_summary("sha-1", "tree-1", vec![weak_dbt]),
+        "tree-1",
+    )
+    .is_ok()
+    {
+        return Err("DBT missing-log admission accepted a non-canonical comparison".into());
+    }
+
     let uncheckable = retained_coordinate_decision(
         retained_cell(vec![validate_candidate(
             "uncheckable-retained",
@@ -5827,10 +6037,69 @@ fn self_test() -> Result<(), String> {
             uncheckable: BTreeMap::from([(validate_id.clone(), vec![uncheckable_error])]),
         },
     );
-    if uncheckable.state != RetainedComparisonState::Uncheckable
-        || !matches!(uncheckable.import, ImportEvidence::None)
-    {
+    if uncheckable.state != RetainedComparisonState::Uncheckable {
         return Err("an untrustworthy current comparison was not UNCHECKABLE".into());
+    }
+    let ImportEvidence::Retained {
+        results: uncheckable_results,
+        store_positions: false,
+    } = uncheckable.import
+    else {
+        return Err("UNCHECKABLE discarded the retained canonical comparison".into());
+    };
+    let mut uncheckable_tracked = TrackedCells {
+        schema: SCHEMA,
+        projection: None,
+        cells: vec![TrackedCell {
+            id: validate_id.clone(),
+            enabled: true,
+            status: CellStatus::Red,
+            ci_disabled_reason: None,
+            not_applicable_reason: None,
+            last_tested: None,
+            observations: Vec::new(),
+            measurement: MeasurementState::NeverMeasured,
+            green_removal_reason: None,
+        }],
+    };
+    let uncheckable_rows = BTreeMap::from([(
+        uncheckable_results.id.clone(),
+        uncheckable_results.candidates.clone(),
+    )]);
+    apply_validate_results(
+        &mut uncheckable_tracked,
+        &uncheckable_rows,
+        &uncheckable_results.hermit_sha,
+        &uncheckable_results.detcore_tree,
+        &uncheckable_results.depth,
+        false,
+        false,
+    )?;
+    refresh_measurement(&mut uncheckable_tracked);
+    let uncheckable_observation = &uncheckable_tracked.cells[0].observations[0];
+    if uncheckable_tracked.cells[0].measurement != MeasurementState::DivergedUnlocated
+        || uncheckable_observation.canonical_comparisons.len() != 1
+        || uncheckable_observation
+            .first_divergent_scheduler_turn
+            .range()
+            .is_some()
+        || uncheckable_observation
+            .first_divergent_virtual_nanoseconds
+            .range()
+            .is_some()
+        || uncheckable_observation
+            .first_divergent_record
+            .range()
+            .is_some()
+        || uncheckable_observation
+            .first_divergent_syscall
+            .range()
+            .is_some()
+    {
+        return Err(
+            "UNCHECKABLE did not retain the canonical comparison while withholding all four coordinates"
+                .into(),
+        );
     }
     if checked_current_pressure_result(
         &TrackedCells {
@@ -5882,6 +6151,7 @@ fn self_test() -> Result<(), String> {
         "sha-1",
         "tree-1",
         &depth_fixture,
+        true,
         true,
     )
     .map_err(|e| format!("validate-observation bracket failed: {e}"))?;
@@ -6099,6 +6369,7 @@ fn self_test() -> Result<(), String> {
         "tree-1",
         &depth_fixture,
         true,
+        true,
     )
     .map_err(|e| format!("diverged-unlocated bracket failed: {e}"))?;
     refresh_measurement(&mut unlocated);
@@ -6130,6 +6401,7 @@ fn self_test() -> Result<(), String> {
         "sha-1",
         "tree-1",
         &depth_fixture,
+        true,
         true,
     )
     .map_err(|e| format!("coordinate-less PASS bracket failed: {e}"))?;
@@ -6175,6 +6447,7 @@ fn self_test() -> Result<(), String> {
         "tree-1",
         &depth_fixture,
         true,
+        true,
     )
     .is_ok()
     {
@@ -6200,6 +6473,7 @@ fn self_test() -> Result<(), String> {
         "sha-1",
         "tree-1",
         &depth_fixture,
+        true,
         true,
     )
     .map_err(|e| {
@@ -6287,6 +6561,7 @@ fn self_test() -> Result<(), String> {
             "sha-1",
             "tree-1",
             &depth_fixture,
+            true,
             true,
         )
         .map_err(|e| format!("a coordinate-less {outcome} failed the fold outright: {e}"))?;
