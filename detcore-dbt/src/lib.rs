@@ -2128,10 +2128,15 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         );
         return -1;
     }
-    if clone_properties.blocks_parent {
+    if clone_properties.blocks_parent
+        && !scratch.runtime_state.is_null()
+        && unsafe { &*scratch.runtime_state }
+            .state
+            .has_unsafe_vfork_flock_state()
+    {
         emit_lifecycle_marker(
             emit,
-            b"detcore-dbt: refusing vfork/CLONE_VFORK; the copied child cannot register with Detcore before exec\n",
+            b"detcore-dbt: refusing vfork/CLONE_VFORK while an open file description may hold a flock\n",
         );
         return -1;
     }
@@ -2702,7 +2707,7 @@ mod tests {
                 libc::SIGCHLD,
             ),
             None,
-            "vfork is refused before any parent-side registration"
+            "vfork keeps the existing copied-child path"
         );
         assert!(
             process_child_registration(libc::SYS_clone3, 91_005, 8, 0, libc::SIGUSR2).is_some()
@@ -2855,17 +2860,17 @@ mod tests {
         let lifecycle = dispatch
             .find("if requires_native_lifecycle(sysnum)")
             .expect("native lifecycle early return");
-        let vfork_refusal = dispatch
+        let vfork_policy = dispatch
             .find("if clone_properties.blocks_parent")
-            .expect("vfork refusal");
+            .expect("vfork flock policy");
 
         assert!(
             initialize < lifecycle,
             "fork/clone/exec must not return before lazy thread-state initialization"
         );
         assert!(
-            vfork_refusal < lifecycle,
-            "vfork/CLONE_VFORK must fail before native execution"
+            vfork_policy < lifecycle,
+            "vfork/CLONE_VFORK flock state must be checked before native execution"
         );
         assert!(
             !dispatch[..lifecycle].contains("if tid == pid && !scratch.runtime_state.is_null()"),
