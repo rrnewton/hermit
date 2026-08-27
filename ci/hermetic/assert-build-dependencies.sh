@@ -171,23 +171,23 @@ self_test() {
         return 1
     }
 
-    rm "$fixture/include/zlib.h"
+    rm "$fixture/lib/libunwind-ptrace.so"
     set +e
     output=$(check_native_libraries "$fixture/include" "$fixture/lib" 2>&1)
     rc=$?
     set -e
     [[ $rc -eq 2 ]] || {
-        echo "assert-build-dependencies --self-test: missing zlib returned $rc, expected 2" >&2
+        echo "assert-build-dependencies --self-test: missing libunwind-ptrace returned $rc, expected 2" >&2
         echo "$output" >&2
         return 1
     }
-    [[ $output == *"missing required native library: zlib"* ]] || {
-        echo "assert-build-dependencies --self-test: missing zlib was not named" >&2
+    [[ $output == *"missing required native library: libunwind"* ]] || {
+        echo "assert-build-dependencies --self-test: missing libunwind-ptrace was not reported as libunwind" >&2
         echo "$output" >&2
         return 1
     }
 
-    echo "PASS: assert-build-dependencies accepts 18/18 executables and 4/4 native libraries, and names xxd and zlib when absent"
+    echo "PASS: assert-build-dependencies accepts 18/18 executables and 4/4 native libraries, and names xxd and libunwind when required files are absent"
 }
 
 case ${1:-} in
