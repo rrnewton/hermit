@@ -444,7 +444,6 @@ macro_rules! buck_chaos_tests {
     ($($test_name:ident => $workload_name:literal),+ $(,)?) => {
         $(
             #[test]
-            #[ignore = "requires PMU branch counters and working mount namespaces"]
             fn $test_name() {
                 run_buck_chaos_workload($workload_name);
             }
@@ -457,10 +456,24 @@ buck_chaos_tests! {
     chaos_buck_uname => "uname",
     chaos_buck_sysinfo => "sysinfo",
     chaos_buck_wait_on_child => "wait_on_child",
-    chaos_buck_nanosleep_parallel => "nanosleep_parallel",
     chaos_buck_clone => "clone",
     chaos_buck_hello_alarm => "hello_alarm",
-    chaos_buck_mem_race => "rust_mem_race",
+}
+
+// TODO(#2792): Replace this static PMU partition with shared RCB/PMU
+// prerequisite selection once that policy is decided.
+#[test]
+#[ignore = "known PMU chaos failure; tracked by #2791"]
+// TODO(#2791): The workload fails after an interrupted nanosleep reports EINTR.
+fn chaos_buck_nanosleep_parallel() {
+    run_buck_chaos_workload("nanosleep_parallel");
+}
+
+#[test]
+#[ignore = "known PMU chaos no-verdict; tracked by #2791"]
+// TODO(#2791): The workload produced no verdict within its 300-second bound.
+fn chaos_buck_mem_race() {
+    run_buck_chaos_workload("rust_mem_race");
 }
 
 #[test]

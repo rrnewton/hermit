@@ -21,14 +21,8 @@ frontier_app_benchmarks	http_server_session_is_nondeterministic_natively_and_l2_
 frontier_app_benchmarks	redis_commands_are_nondeterministic_natively_and_l2_under_hermit	requires PMU, mount namespaces, redis-server, and redis-cli
 frontier_app_benchmarks	redis_deep_session_is_nondeterministic_natively_and_l2_under_hermit	occasional full Redis session is too slow for every-commit CI; requires namespaces, redis-server, and redis-cli
 frontier_app_benchmarks	sqlite_transaction_is_nondeterministic_natively_and_l2_under_hermit	requires PMU, mount namespaces, and sqlite3
-hermit_modes	chaos_buck_clone	requires PMU branch counters and working mount namespaces
-hermit_modes	chaos_buck_getpid	requires PMU branch counters and working mount namespaces
-hermit_modes	chaos_buck_hello_alarm	requires PMU branch counters and working mount namespaces
-hermit_modes	chaos_buck_mem_race	requires PMU branch counters and working mount namespaces
-hermit_modes	chaos_buck_nanosleep_parallel	requires PMU branch counters and working mount namespaces
-hermit_modes	chaos_buck_sysinfo	requires PMU branch counters and working mount namespaces
-hermit_modes	chaos_buck_uname	requires PMU branch counters and working mount namespaces
-hermit_modes	chaos_buck_wait_on_child	requires PMU branch counters and working mount namespaces
+hermit_modes	chaos_buck_mem_race	known PMU chaos no-verdict within 300 seconds; tracked by #2791; RCB/PMU selection policy tracked by #2792
+hermit_modes	chaos_buck_nanosleep_parallel	known PMU chaos failure after interrupted nanosleep reports EINTR; tracked by #2791; RCB/PMU selection policy tracked by #2792
 hermit_modes	default_cargo_bind_connect_race	racy default mode can block in Hermit connect emulation
 hermit_modes	default_cargo_clock_total_order	default mode can block in clock total-order scheduling
 language_runtime_determinism	go_runtime_entropy_is_determinized	requires the optional Go runtime matrix toolchain
