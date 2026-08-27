@@ -361,11 +361,12 @@ Typical flow for a change:
 
 - Branch from `origin/main` and make one coherent change per branch. When the
   `dev-hermit` parent is available, obtain the exact disclosure with
-  `./ci-hub/bin/who-am-i --tag --role ROLE`; paste it at the start of the commit
-  subject and do not reconstruct it. After the disclosure, write an imperative,
-  descriptive subject that states the substantive change.
-- The first commit-body section is exactly **Plain Language Summary and Project
-  Impact**. Explain what project capability, correctness property, evidence
+  `./ci-hub/bin/who-am-i --tag --role ROLE`; paste it on the first line of the
+  commit body and do not reconstruct it. Never put the disclosure in a commit
+  subject or pull-request title. Keep both titles as concise, descriptive prose.
+- Immediately after the disclosure, the first commit-body section is exactly
+  **Plain Language Summary and Project Impact**. Explain what project
+  capability, correctness property, evidence
   quality, or developer workflow moves forward; connect it to the product
   vision or owner request; and state the meaningful before/after difference.
   Administrative history, task bookkeeping, and review mechanics come later.
@@ -399,7 +400,8 @@ into virtual-time/epoch scheduling, is the canonical good example. Routine
 backend-parity work toward the golden ptrace reference does not trigger review
 unless it also meets one of these four criteria.
 
-After the mandatory disclosure line, every PR description starts with **Plain
+The exact `who-am-i` disclosure belongs on the first line of the PR description,
+never in its title. After that line, every PR description starts with **Plain
 Language Summary and Project Impact**, giving the substantive outcome and its
 connection to the product vision or owner request rather than administrative
 history. It also requires **Determinism** (why the change is

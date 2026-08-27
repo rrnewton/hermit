@@ -23,6 +23,7 @@ comments.
 
 Examples: `[impl agent, gpt-5.6-sol]`,
 `[adversarial-reviewer agent, opus-4.8]`.
+The role tag belongs in the description or comment body, never in the PR title.
 
 *Distilled from retrospectives on a set of unusually effective planning, build, and audit sessions (the "Fable" threads). These are working habits, not domain knowledge: they apply equally to research, architecture, coding, audit, and multi-agent work. The aim is to make careful sequencing automatic, so raw capability is never squandered on avoidable errors: confident wrong conclusions, unverified claims, scope drift.*
 
