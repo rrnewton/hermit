@@ -752,14 +752,45 @@ fn dbt_exact_child_waits_honor_sa_restart() {
         "wait4-signal-restart rc-ok=1 errno=0 handler=1 pid-match=1 exited=1 status=17",
         None,
     );
+    assert_dbt_wait_case(
+        &["--signal-restart-handler"],
+        "waitid-restart-handler rc=0 errno=0 handler=1 pid-match=1 code=2 status=9",
+        None,
+    );
+    assert_dbt_wait_case(
+        &["--wait4-signal-restart-handler"],
+        "wait4-restart-handler rc-ok=1 errno=0 handler=1 pid-match=1 signaled=1 signal=9",
+        None,
+    );
 }
 
 #[test]
-fn dbt_exact_child_waits_preserve_mask_and_result_while_blocked_signals_are_outside_rt_sigpending()
-{
-    if dbt_unavailable(
-        "dbt_exact_child_waits_preserve_mask_and_result_while_blocked_signals_are_outside_rt_sigpending",
-    ) {
+fn dbt_exact_child_waits_ignore_default_ignored_signals() {
+    if dbt_unavailable("dbt_exact_child_waits_ignore_default_ignored_signals") {
+        return;
+    }
+    for signal in [libc::SIGCHLD, libc::SIGURG, libc::SIGWINCH] {
+        let signal = signal.to_string();
+        assert_dbt_wait_case(
+            &["--waitid-default-ignore", &signal],
+            &format!(
+                "waitid-default-ignore signal={signal} rc=0 errno=0 pid-match=1 code=2 signal-status=9 sender-live=1"
+            ),
+            None,
+        );
+        assert_dbt_wait_case(
+            &["--wait4-default-ignore", &signal],
+            &format!(
+                "wait4-default-ignore signal={signal} rc-ok=1 errno=0 pid-match=1 signaled=1 signal-status=9 sender-live=1"
+            ),
+            None,
+        );
+    }
+}
+
+#[test]
+fn dbt_exact_child_waits_keep_blocked_signals_pending_and_preserve_the_mask() {
+    if dbt_unavailable("dbt_exact_child_waits_keep_blocked_signals_pending_and_preserve_the_mask") {
         return;
     }
     assert_dbt_wait_case(
@@ -767,13 +798,9 @@ fn dbt_exact_child_waits_preserve_mask_and_result_while_blocked_signals_are_outs
         "waitid-live-sibling-blocked rc=0 errno=0 handler=0 pid-match=1 code=1 status=29 mask-preserved=1 sender-live=1",
         Some("waitid-live-sibling-done"),
     );
-    // DynamoRIO keeps delayable blocked signals outside the kernel set read by
-    // rt_sigpending while its callback is active. This pre-existing DBT limit
-    // is checked explicitly here rather than being reported as pending-signal
-    // support; the ptrace test above continues to require signals-pending=1.
     assert_dbt_wait_case(
-        &["--wait4-live-sibling-signal-blocked", "--dbt"],
-        "wait4-live-sibling-blocked rc-ok=1 errno=0 handler=0 pid-match=1 exited=1 status=29 mask-preserved=1 signals-pending=0 sender-live=1",
+        &["--wait4-live-sibling-signal-blocked"],
+        "wait4-live-sibling-blocked rc-ok=1 errno=0 handler=0 pid-match=1 exited=1 status=29 mask-preserved=1 signals-pending=1 sender-live=1",
         Some("wait4-live-sibling-done"),
     );
 }
