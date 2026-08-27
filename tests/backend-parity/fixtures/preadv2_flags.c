@@ -54,9 +54,9 @@ int main(void) {
         return 1;
     }
 
-    char c0[6] = "AAAAA\n";
-    char c1[6] = "BBBBB\n";
-    char c2[6] = "CCCCC\n";
+    char c0[6] = {'A', 'A', 'A', 'A', 'A', '\n'};
+    char c1[6] = {'B', 'B', 'B', 'B', 'B', '\n'};
+    char c2[6] = {'C', 'C', 'C', 'C', 'C', '\n'};
     char r[6];
 
     struct iovec w0 = {c0, sizeof(c0)};
