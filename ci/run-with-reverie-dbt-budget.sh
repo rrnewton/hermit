@@ -140,7 +140,14 @@ fi
 #     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
 #     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
 # so the measured key and conservative threshold carry unchanged.
-expected_pin=ab07a89239150df3726a036bee9f5e897893dfc1
+# CARRY TO 063fa37b (2026-08-27): ab07a892..063fa37b is three commits touching
+# reverie-sabre, reverie-dbt runtime code, and reverie-kvm. The three
+# source_recipe_key repository inputs are byte-identical:
+#     reverie-dbt/vendor/dynamorio  a3c41e5d3630 -> a3c41e5d3630
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+#     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
+# so the measured key and conservative threshold carry unchanged.
+expected_pin=063fa37b05e562760f3d27c80ed8a6482b97b44a
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
