@@ -3189,8 +3189,17 @@ fn import_results(root: &Path, results: &Path) -> Result<(), String> {
     if !status.status.success() {
         return Err("git status failed while checking the working tree".into());
     }
-    if !status.stdout.is_empty() {
-        return Err("import-results requires a clean tracked working tree".into());
+    let dirty = String::from_utf8_lossy(&status.stdout);
+    let unrelated_dirty = dirty
+        .lines()
+        .filter_map(|line| line.get(3..))
+        .filter(|path| *path != SCORECARD && *path != CELLS)
+        .collect::<Vec<_>>();
+    if !unrelated_dirty.is_empty() {
+        return Err(format!(
+            "import-results refuses unrelated tracked changes; first is {}",
+            unrelated_dirty[0]
+        ));
     }
 
     let derived = derive(root)?;
@@ -3209,6 +3218,16 @@ fn import_results(root: &Path, results: &Path) -> Result<(), String> {
         terminal_comparisons,
     } = read_retained_selected_results(root, results, &derived.green)?;
     let mut tracked = tracked_from(&derived, Some(before.clone()), None, false)?;
+    // This command is a projection of the latest retained validate evidence,
+    // not an append-only history store. Replace its prior validate projection
+    // for the selected cells so rerunning with the same retained corpus is
+    // byte-identical and a newer comparison can supersede an older one.
+    for cell in &mut tracked.cells {
+        if derived.green.contains(&cell.id) {
+            cell.observations
+                .retain(|observation| observation.provenance != ObservationProvenance::Validate);
+        }
+    }
     let mut fold = ValidateFold::default();
     for retained in imported_cells {
         let rows = BTreeMap::from([(retained.id, retained.candidates)]);
@@ -3770,6 +3789,12 @@ fn read_retained_selected_results(
     }
 
     let history = git_history_ranks(root)?;
+    let retained_workspace = result_root
+        .ancestors()
+        .find(|path| path.file_name().is_some_and(|name| name == "ignored"))
+        .and_then(Path::parent)
+        .and_then(Path::to_str)
+        .map(str::to_string);
     let mut grouped: BTreeMap<(CellId, String, String), Vec<ResultCandidate>> = BTreeMap::new();
     let mut rows_scanned = 0usize;
     for path in &files {
@@ -3796,6 +3821,9 @@ fn read_retained_selected_results(
                 )
             })?;
             normalise_recorded_root(&mut row);
+            if let Some(prefix) = retained_workspace.as_deref() {
+                normalise_recorded_prefix(&mut row, prefix);
+            }
             if row.classification != "required" || row.source_tree_dirty || row.attempt == 0 {
                 continue;
             }
@@ -4298,6 +4326,28 @@ fn normalise_recorded_root(row: &mut ResultRow) {
         normalise_attempt_root(attempt, &root);
     }
     row.cwd = RECORDED_ROOT.to_string();
+    row.shell_command = literal_shell_command(&row.cwd, &row.env, &row.argv);
+}
+
+fn normalise_recorded_prefix(row: &mut ResultRow, prefix: &str) {
+    if prefix.is_empty() || prefix == RECORDED_ROOT || !prefix.starts_with('/') {
+        return;
+    }
+    for argument in row
+        .argv
+        .iter_mut()
+        .chain(row.guest_argv.iter_mut())
+        .chain(row.effective_args.iter_mut())
+    {
+        rewrite_recorded_root(argument, prefix);
+    }
+    for value in row.env.values_mut() {
+        rewrite_recorded_root(value, prefix);
+    }
+    for attempt in row.attempts.iter_mut() {
+        normalise_attempt_root(attempt, prefix);
+    }
+    rewrite_recorded_root(&mut row.cwd, prefix);
     row.shell_command = literal_shell_command(&row.cwd, &row.env, &row.argv);
 }
 
