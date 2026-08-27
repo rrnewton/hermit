@@ -47,6 +47,7 @@
 //! ```cargo
 //! [dependencies]
 //! dagrun = { path = "../agent-utils/rs/dagrun" }
+//! hermit-manifest-plan = { path = "../ci/manifest-plan" }
 //! serde_json = "1"
 //! sha2 = "0.10"
 //! libc = "0.2"
@@ -110,6 +111,7 @@ use dagrun::scheduler::steps_violating_run_timeout;
 use dagrun::scheduler::BoxedCgroups;
 use dagrun::scheduler::monotonic_now_ns;
 use dagrun::scheduler::STEP_STARTED_MONOTONIC_NS_ENV;
+use hermit_manifest_plan::ledger::HistoryRow;
 
 use validate_plan::CompatMode;
 use validate_plan::CompatDisposition;
@@ -12042,6 +12044,12 @@ fn write_ledger(
         "cell_results": cell_results.map(|results| &results.evidence),
         "gates": gates,
     });
+    if let Err(error) = serde_json::from_value::<HistoryRow>(record.clone()) {
+        eprintln!(
+            "validate: warning: generated ledger row does not match the shared HistoryRow: {error}"
+        );
+        return;
+    }
     let line = format!("{}\n", serde_json::to_string(&record).unwrap());
     let explicit = std::env::var(LEDGER_ENV)
         .ok()
