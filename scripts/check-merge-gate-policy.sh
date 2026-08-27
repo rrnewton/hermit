@@ -23,59 +23,36 @@ fail() {
 
 [[ -f $WORKFLOW ]] || fail "missing $WORKFLOW"
 
-# Scope core-review assertions to that job and remove YAML comments before
-# matching. A literal pasted into an unrelated job or a `#` comment is not
-# executable wiring and must not keep this policy check green.
+# Scope core-review assertions to that whole job and preserve every raw line.
+# Even a blank or apparent comment can terminate a backslash continuation and
+# change which environment reaches the linter.
 core_review_job=$(awk '
-    /^  core-review-protocol:[[:space:]]*$/ { in_job = 1 }
-    in_job && /^  [[:alnum:]_-]+:[[:space:]]*$/ \
-        && $0 !~ /^  core-review-protocol:[[:space:]]*$/ { exit }
-    in_job {
-        line = $0
-        if (line ~ /^[[:space:]]*#/) next
-        sub(/[[:space:]]+#.*$/, "", line)
-        print line
+    /^  core-review-protocol:[[:space:]]*$/ {
+        job_count++
+        in_job = 1
     }
-' "$WORKFLOW")
-[[ -n $core_review_job ]] || fail "missing core-review-protocol job"
-core_job_has() {
-    grep -Fq -- "$1" <<<"$core_review_job"
-}
+    in_job && /^  [[:alnum:]_-]+:[[:space:]]*$/ \
+        && $0 !~ /^  core-review-protocol:[[:space:]]*$/ { in_job = 0 }
+    in_job {
+        print
+    }
+    END {
+        if (job_count != 1) {
+            exit 1
+        }
+    }
+' "$WORKFLOW") || fail "workflow must contain exactly one core-review-protocol job"
+[[ -n $core_review_job ]] || fail "core-review-protocol job must not be empty"
 
-core_job_has 'pr_head="$(jq -r '\''.head.sha'\'' <<< "$pr_json")"' ||
-    fail "core-review protocol must read the exact pull-request head"
-core_job_has 'issues/${pr_number}/comments?per_page=100' ||
-    fail "core-review protocol must fetch the complete issue-comment history"
-core_job_has '--paginate --slurp | jq -c '\''add // []'\'' > "$pr_comments_file"' ||
-    fail "core-review comment fetch must preserve all pages in one JSON array"
-core_job_has 'PR_HEAD_SHA="$pr_head"' ||
-    fail "core-review linter must receive the exact pull-request head"
-core_job_has 'PR_COMMENTS_FILE="$pr_comments_file"' ||
-    fail "core-review linter must receive the fetched comment history"
-core_job_has 'grep -qiE '\''kvm'\'' <<< "$files" || files_kvm_status=$?' ||
-    fail "KVM changed-file grep status must be captured"
-core_job_has 'grep -Fixq kvm <<< "$labels" || labels_kvm_status=$?' ||
-    fail "KVM label grep status must be captured"
-core_job_has 'case "$files_kvm_status" in' ||
-    fail "KVM changed-file grep errors must be handled"
-core_job_has 'case "$labels_kvm_status" in' ||
-    fail "KVM label grep errors must be handled"
-core_job_has 'if [ "$files_kvm_status" -eq 0 ] || [ "$labels_kvm_status" -eq 0 ]; then' ||
-    fail "KVM classification must use only checked match statuses"
-files_kvm_case=$(awk '
-    /case "\$files_kvm_status" in/ { in_case = 1 }
-    in_case { print }
-    in_case && /esac/ { exit }
-' <<<"$core_review_job")
-labels_kvm_case=$(awk '
-    /case "\$labels_kvm_status" in/ { in_case = 1 }
-    in_case { print }
-    in_case && /esac/ { exit }
-' <<<"$core_review_job")
-[[ $files_kvm_case == *'0 | 1)'* && $files_kvm_case == *'exit 2'* ]] ||
-    fail "KVM changed-file grep must accept only status 0/1 and refuse every error"
-[[ $labels_kvm_case == *'0 | 1)'* && $labels_kvm_case == *'exit 2'* ]] ||
-    fail "KVM label grep must accept only status 0/1 and refuse every error"
+# Pin the job from its YAML boundary. Starting at a shell assignment is unsafe:
+# a continuation immediately before it can turn that assignment into an
+# argument to the preceding command while leaving every line in the narrower
+# fingerprint unchanged.
+CORE_REVIEW_JOB_SHA256=ff1d8b5ccfbd5c332a638a5d78b7e918dd8f6d67d1607bbfdac3894937d2898b
+core_review_job_digest=$(sha256sum <<<"$core_review_job")
+core_review_job_digest=${core_review_job_digest%% *}
+[[ $core_review_job_digest == "$CORE_REVIEW_JOB_SHA256" ]] ||
+    fail "core-review protocol job must match the reviewed executable structure"
 grep -Fq 'actions: write' "$WORKFLOW" || fail "NO_RESULT must be able to re-dispatch and cancel"
 grep -Fq 'ref=4b78d727f35bc8612ac460a6e270dda5f5df304c' "$WORKFLOW" ||
     fail "gate must pin the parent authority commit"
