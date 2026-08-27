@@ -6,6 +6,7 @@
 //! chrono = "0.4"
 //! csv = "1"
 //! dagrun = { path = "../../agent-utils/rs/dagrun" }
+//! hermit-manifest-plan = { path = "../manifest-plan" }
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
 //! ```
@@ -15,9 +16,6 @@ mod rust_script_prelude;
 
 #[path = "../../scripts/lib/safe_ci_scope.rs"]
 mod safe_ci_scope;
-
-#[path = "../manifest-plan/src/canonical_verdict.rs"]
-mod canonical_verdict;
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -48,6 +46,15 @@ use dagrun::cgroup::aggregate_slice_max_cpus;
 use dagrun::container_core_budget;
 use dagrun::scheduler::BoxedCgroups;
 use dagrun::scheduler::run_dag_boxed_deadline;
+use hermit_manifest_plan::canonical_verdict::RuntimeStats;
+use hermit_manifest_plan::canonical_verdict::VerificationReport;
+use hermit_manifest_plan::canonical_verdict::VerificationRuntime;
+use hermit_manifest_plan::host_capability::CapabilityVerdict;
+use hermit_manifest_plan::host_capability::HostCapability;
+use hermit_manifest_plan::runner::AttemptResult;
+use hermit_manifest_plan::runner::CELL_RESULT_SCHEMA;
+use hermit_manifest_plan::runner::CellResult;
+use hermit_manifest_plan::runner::E2E_RUN_INDEX_ENV;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -63,7 +70,6 @@ const PORTABLE_DAG: &str = "ci/dag/portable.json";
 /// points at the other -- which is how it was missed when 5 became 6.
 const TRACKED_CELLS_SCHEMA: u64 = 6;
 const RUN_SCHEMA: u64 = 3;
-const CELL_RESULT_SCHEMA: u64 = 4;
 const SUMMARY_SCHEMA: u64 = 4;
 const REQUIRED_BUILD_TAGS: [&str; 5] = [
     "setup.manifest_plan",
@@ -805,77 +811,10 @@ struct ManifestBudgetRow {
     attempts: JsonValue,
 }
 
-fn first_attempt() -> u64 {
-    1
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct ResultRow {
-    schema: u64,
-    run_id: String,
-    /// Which attempt of this cell the row describes.
-    ///
-    /// ⚠️ DEFAULTED, BECAUSE ABSENCE MEANS "WRITTEN BEFORE RETRIES APPENDED".
-    /// Rows produced before https://github.com/rrnewton/hermit/pull/2708 have no
-    /// ordinal and are single-attempt by construction, so they read as attempt 1
-    /// rather than as a missing value. That keeps "this predates the field" and
-    /// "this is the first attempt" from being the same thing anywhere downstream.
-    #[serde(default = "first_attempt")]
-    attempt: u64,
-    /// This attempt's own first-divergence coordinates.
-    ///
-    /// ⚠️ `#[serde(default)]`, SO ABSENCE STAYS "WRITTEN BEFORE THE FIELD
-    /// EXISTED" rather than "this attempt located nothing", which is an explicit
-    /// null. The producer emits every field on every row and a test in
-    /// `ci/manifest-plan/src/runner.rs` holds it to that.
-    #[serde(default)]
-    first_divergent_record: Option<u64>,
-    #[serde(default)]
-    first_divergent_syscall: Option<u64>,
-    #[serde(default)]
-    first_divergent_scheduler_turn: Option<u64>,
-    #[serde(default)]
-    first_divergent_virtual_nanoseconds: Option<u64>,
-    #[serde(default)]
-    first_divergent_left_message: Option<String>,
-    #[serde(default)]
-    first_divergent_right_message: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    run_index: Option<u64>,
-    hermit_sha: String,
-    source_tree_dirty: bool,
-    test: String,
-    category: String,
-    lane: String,
-    mode: String,
-    backend: Option<String>,
-    classification: String,
-    outcome: String,
-    #[serde(default)]
-    timeout_seconds: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    duration_ms: Option<u128>,
-    #[serde(default)]
-    runtime: Option<JsonValue>,
-    argv: Vec<String>,
-    guest_argv: Vec<String>,
-    env: BTreeMap<String, String>,
-    cwd: String,
-    shell_command: String,
-    attempts: Vec<JsonValue>,
-    #[serde(default)]
-    reason: Option<String>,
-    #[serde(default)]
-    error_kind: Option<String>,
-    artifact_dir: String,
-    #[serde(flatten)]
-    extra: BTreeMap<String, JsonValue>,
-}
-
-fn read_result_rows(path: &Path) -> Result<Vec<ResultRow>, String> {
+fn read_result_rows(path: &Path) -> Result<Vec<CellResult>, String> {
     let text = fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let mut rows: Vec<ResultRow> = Vec::new();
+    let mut rows: Vec<CellResult> = Vec::new();
     let mut attempts = BTreeSet::new();
     let mut artifact_dirs = BTreeSet::new();
     let mut previous_attempt = None;
@@ -883,7 +822,7 @@ fn read_result_rows(path: &Path) -> Result<Vec<ResultRow>, String> {
         if line.trim().is_empty() {
             continue;
         }
-        let row: ResultRow = serde_json::from_str(line)
+        let row: CellResult = serde_json::from_str(line)
             .map_err(|e| format!("invalid {}:{}: {e}", path.display(), index + 1))?;
         if row.attempt == 0 {
             return Err(format!(
@@ -909,7 +848,7 @@ fn read_result_rows(path: &Path) -> Result<Vec<ResultRow>, String> {
                 row.attempt
             ));
         }
-        if row.attempt > 1 && row.timeout_seconds.is_none() {
+        if row.attempt > 1 && row.timeout_seconds == 0 {
             return Err(format!(
                 "{}:{} retry attempt {} has no wall-clock bound",
                 path.display(),
@@ -957,27 +896,13 @@ fn read_result_rows(path: &Path) -> Result<Vec<ResultRow>, String> {
     if rows.is_empty() {
         return Err(format!("{} contains no result rows", path.display()));
     }
-    if rows.len() > 1 && rows[0].timeout_seconds.is_none() {
+    if rows.len() > 1 && rows[0].timeout_seconds == 0 {
         return Err(format!(
             "{}:1 retry history attempt 1 has no wall-clock bound",
             path.display()
         ));
     }
     Ok(rows)
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct InvocationAttempt {
-    index: String,
-    outcome: String,
-    status: Option<i32>,
-    signal: Option<i32>,
-    timed_out: bool,
-    argv: Vec<String>,
-    guest_argv: Vec<String>,
-    env: BTreeMap<String, String>,
-    cwd: String,
-    shell_command: String,
 }
 
 /// A coordinate that must be PRESENT and may be NULL.
@@ -1859,7 +1784,7 @@ fn logical_time_nanoseconds(text: &str) -> Option<u64> {
         .checked_add(fraction.parse::<u64>().ok()?)
 }
 
-fn runtime_from_log(path: &Path) -> Result<JsonValue, String> {
+fn runtime_from_log(path: &Path) -> Result<RuntimeStats, String> {
     let text = fs::read_to_string(path)
         .map_err(|error| format!("cannot read retained verification log {}: {error}", path.display()))?;
     let scheduler_turns = text
@@ -1906,28 +1831,30 @@ fn runtime_from_log(path: &Path) -> Result<JsonValue, String> {
             .and_modify(|seen| *seen = (*seen).max(syscalls))
             .or_insert(syscalls);
     }
-    let mut runtime = serde_json::json!({
-        "scheduler_turns": scheduler_turns,
-        "virtual_nanoseconds": virtual_nanoseconds,
-    });
-    if !per_thread.is_empty() {
-        let syscalls = per_thread
+    let syscalls = if per_thread.is_empty() {
+        None
+    } else {
+        Some(
+            per_thread
             .values()
             .try_fold(0_u64, |total, count| total.checked_add(*count))
-            .ok_or_else(|| format!("{} syscall total overflowed u64", path.display()))?;
-        runtime["syscalls"] = JsonValue::from(syscalls);
-    }
-    Ok(runtime)
+            .ok_or_else(|| format!("{} syscall total overflowed u64", path.display()))?,
+        )
+    };
+    Ok(RuntimeStats {
+        scheduler_turns,
+        virtual_nanoseconds,
+        syscalls,
+    })
 }
 
-fn retained_verification_runtime(attempts: &[JsonValue]) -> Result<Option<JsonValue>, String> {
+fn retained_verification_runtime(
+    attempts: &[AttemptResult],
+) -> Result<Option<VerificationRuntime>, String> {
     for attempt in attempts {
-        let Some(stderr) = attempt.get("stderr").and_then(JsonValue::as_str) else {
-            continue;
-        };
         let mut run1 = None;
         let mut run2 = None;
-        for line in stderr.lines() {
+        for line in attempt.stderr.lines() {
             if let Some(path) = line.strip_prefix("::   run 1: ") {
                 run1 = Some(runtime_from_log(Path::new(path))?);
             } else if let Some(path) = line.strip_prefix("::   run 2: ") {
@@ -1935,14 +1862,7 @@ fn retained_verification_runtime(attempts: &[JsonValue]) -> Result<Option<JsonVa
             }
         }
         if run1.is_some() || run2.is_some() {
-            let mut runtime = serde_json::Map::new();
-            if let Some(run1) = run1 {
-                runtime.insert("run1".into(), run1);
-            }
-            if let Some(run2) = run2 {
-                runtime.insert("run2".into(), run2);
-            }
-            return Ok(Some(JsonValue::Object(runtime)));
+            return Ok(Some(VerificationRuntime { run1, run2 }));
         }
     }
     Ok(None)
@@ -1976,11 +1896,11 @@ fn collect_series_result_files(path: &Path, output: &mut Vec<PathBuf>) -> Result
     Ok(())
 }
 
-fn collect_series_rows(results: &Path) -> Result<Vec<(String, ResultRow)>, String> {
+fn collect_series_rows(results: &Path) -> Result<Vec<(String, CellResult)>, String> {
     let mut result_files = Vec::new();
     collect_series_result_files(results, &mut result_files)?;
     result_files.sort();
-    let mut collected: Vec<(String, ResultRow)> = Vec::new();
+    let mut collected: Vec<(String, CellResult)> = Vec::new();
     for result_file in result_files {
         let dir_name = result_file
             .parent()
@@ -1990,7 +1910,14 @@ fn collect_series_rows(results: &Path) -> Result<Vec<(String, ResultRow)>, Strin
             .into_owned();
         for mut row in read_result_rows(&result_file)? {
             let repetition = series_run_index(&dir_name);
-            row.run_index = Some(repetition);
+            if row.run_index != Some(repetition) {
+                return Err(format!(
+                    "{} records run_index {:?}, but its pressure result directory identifies run {}",
+                    result_file.display(),
+                    row.run_index,
+                    repetition,
+                ));
+            }
             if row.runtime.is_none() && row.mode == "verify" {
                 row.runtime = retained_verification_runtime(&row.attempts)?;
             }
@@ -2979,11 +2906,12 @@ fn write_plan_after_scorecard_check(
                     junit = shell_quote(&junit_in_progress.to_string_lossy()),
                 )
             };
+            let run_index = repetition.unwrap_or(0);
             let cmd = format!(
                 "mkdir -p {cell_dir}; if test -f {status_file}; then exit 0; fi; \
              printf '{incomplete}\\n' > {status_file}; {preparation_guard}status=0; \
              env E2E_RESULT_ROOT={results} E2E_BUILD_ROOT={build_root} E2E_RUN_ID={run_id} \
-             E2E_KEEP_VERIFY_LOGS=1 \
+             {run_index_env}={run_index} E2E_KEEP_VERIFY_LOGS=1 \
              {harness} \
              || status=$?; \
              if test -e {result_in_progress}; then mv -- {result_in_progress} {result_file} || status=$?; fi; \
@@ -2993,6 +2921,8 @@ fn write_plan_after_scorecard_check(
                 results = shell_quote(&results.to_string_lossy()),
                 build_root = shell_quote(&build_root.to_string_lossy()),
                 run_id = shell_quote(&evidence_run_id),
+                run_index_env = E2E_RUN_INDEX_ENV,
+                run_index = run_index,
                 harness = harness,
                 result_in_progress = shell_quote(&result_in_progress.to_string_lossy()),
                 result_file = shell_quote(&result_file.to_string_lossy()),
@@ -3652,8 +3582,8 @@ fn runner_observed_terminal_attempt(runner: RunnerEvidence, harness_status: Opti
 /// their own framework-written attempt ordinal. The scorecard keys its duplicate
 /// guard on all three values, so retries remain distinct without changing what a
 /// repetition means.
-fn earlier_attempts_that_located(rows: &[ResultRow], terminal: u64) -> Vec<&ResultRow> {
-    let mut earlier: Vec<&ResultRow> = rows
+fn earlier_attempts_that_located(rows: &[CellResult], terminal: u64) -> Vec<&CellResult> {
+    let mut earlier: Vec<&CellResult> = rows
         .iter()
         .filter(|row| row.attempt < terminal)
         .filter(|row| {
@@ -3670,7 +3600,7 @@ fn earlier_attempts_that_located(rows: &[ResultRow], terminal: u64) -> Vec<&Resu
 }
 
 fn result_row_identity_and_invocation_match(
-    row: &ResultRow,
+    row: &CellResult,
     slug: &str,
     metadata: &RunMetadata,
     cell: &CellId,
@@ -3707,19 +3637,17 @@ fn result_row_identity_and_invocation_match(
         && !row.attempts.is_empty()
         && invocation_attempts(row).is_ok()
         && row.attempts.first().is_some_and(|attempt| {
-            attempt.get("argv") == Some(&serde_json::to_value(&row.argv).unwrap())
-                && attempt.get("guest_argv")
-                    == Some(&serde_json::to_value(&row.guest_argv).unwrap())
-                && attempt.get("env") == Some(&serde_json::to_value(&row.env).unwrap())
-                && attempt.get("cwd") == Some(&JsonValue::String(row.cwd.clone()))
-                && attempt.get("shell_command")
-                    == Some(&JsonValue::String(row.shell_command.clone()))
+            attempt.argv == row.argv
+                && attempt.guest_argv == row.guest_argv
+                && attempt.env == row.env
+                && attempt.cwd == row.cwd
+                && attempt.shell_command == row.shell_command
         });
     identity_matches && invocation_is_bound
 }
 
 fn result_row_matches_cell(
-    row: &ResultRow,
+    row: &CellResult,
     slug: &str,
     metadata: &RunMetadata,
     cell: &CellId,
@@ -3735,14 +3663,8 @@ fn result_row_matches_cell(
         && exit_matches
 }
 
-fn invocation_attempts(row: &ResultRow) -> Result<Vec<InvocationAttempt>, String> {
-    let attempts = row
-        .attempts
-        .iter()
-        .cloned()
-        .map(serde_json::from_value)
-        .collect::<Result<Vec<InvocationAttempt>, _>>()
-        .map_err(|error| format!("result row has an invalid attempt invocation: {error}"))?;
+fn invocation_attempts(row: &CellResult) -> Result<&[AttemptResult], String> {
+    let attempts = row.attempts.as_slice();
     if attempts.is_empty()
         || attempts.iter().any(|attempt| {
             attempt.index.trim().is_empty()
@@ -3761,7 +3683,7 @@ fn invocation_attempts(row: &ResultRow) -> Result<Vec<InvocationAttempt>, String
     Ok(attempts)
 }
 
-fn result_row_invocation(row: &ResultRow) -> Result<JsonValue, String> {
+fn result_row_invocation(row: &CellResult) -> Result<JsonValue, String> {
     Ok(json!({
         "run_id": row.run_id,
         "argv": row.argv,
@@ -3873,7 +3795,7 @@ fn top_level_repeated_result_description(
     }
 }
 
-fn result_artifact_dir(results: &Path, row: &ResultRow) -> Result<PathBuf, String> {
+fn result_artifact_dir(results: &Path, row: &CellResult) -> Result<PathBuf, String> {
     let path = PathBuf::from(&row.artifact_dir);
     let retained_root = results.join("runs").join(&row.run_id);
     if row.artifact_dir.is_empty()
@@ -4042,7 +3964,7 @@ fn read_verification_report(
         .map_err(|e| format!("invalid verification report {}: {e}", path.display()))?;
     let evidence: VerificationEvidence = serde_json::from_value(report.clone())
         .map_err(|e| format!("incomplete verification report {}: {e}", path.display()))?;
-    let canonical = canonical_verdict::VerificationReport::from_json_value(report.clone())
+    let canonical = VerificationReport::from_json_value(report.clone())
         .map_err(|e| format!("incomplete canonical verification report {}: {e}", path.display()))?;
     match (evidence.verdict.as_str(), evidence.verified) {
         ("matched", true) | ("diverged" | "no_result", false) => {}
@@ -4936,6 +4858,53 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn fixture_host_capabilities() -> BTreeMap<HostCapability, CapabilityVerdict> {
+    HostCapability::ALL
+        .into_iter()
+        .map(|capability| {
+            (
+                capability,
+                CapabilityVerdict {
+                    present: true,
+                    evidence: "pressure-test self-test fixture".into(),
+                },
+            )
+        })
+        .collect()
+}
+
+fn fixture_attempt(outcome: &str, status: i32) -> AttemptResult {
+    AttemptResult {
+        index: "1".into(),
+        outcome: outcome.into(),
+        error_kind: None,
+        status: Some(status),
+        signal: None,
+        timed_out: false,
+        duration_ms: 1,
+        observation_sha256: None,
+        argv: vec!["hermit".into(), "run".into()],
+        guest_argv: vec!["fixture".into()],
+        env: BTreeMap::from([("LC_ALL".into(), "C".into())]),
+        cwd: "/repo".into(),
+        shell_command: "cd /repo && env LC_ALL=C hermit run".into(),
+        stdout: String::new(),
+        stderr: String::new(),
+        verification_report: None,
+        verification_report_sha256: None,
+        runtime: None,
+        first_divergent_scheduler_turn: None,
+        first_divergent_virtual_nanoseconds: None,
+        first_divergent_record: None,
+        first_divergent_syscall: None,
+        first_divergent_left_message: None,
+        first_divergent_right_message: None,
+        sabre_path_evidence: None,
+        sabre_path_evidence_sha256: None,
+        reason: None,
+    }
+}
+
 fn self_test(root: &Path) -> Result<(), String> {
     safe_ci_scope::self_test()?;
     if series_run_index("a-cell-repetition-0004") != 4
@@ -4952,12 +4921,12 @@ fn self_test(root: &Path) -> Result<(), String> {
         fs::write(&path, summary)
             .map_err(|e| format!("cannot write runtime summary fixture: {e}"))?;
         let missing = runtime_from_log(&path)?;
-        if missing["scheduler_turns"] != 12
-            || missing["virtual_nanoseconds"] != 34
-            || missing.get("syscalls").is_some()
+        if missing.scheduler_turns != 12
+            || missing.virtual_nanoseconds != 34
+            || missing.syscalls.is_some()
         {
             return Err(format!(
-                "a runtime log without syscall accounting did not keep it absent: {missing}"
+                "a runtime log without syscall accounting did not keep it absent: {missing:?}"
             ));
         }
         fs::write(
@@ -4966,9 +4935,9 @@ fn self_test(root: &Path) -> Result<(), String> {
         )
         .map_err(|e| format!("cannot write counted runtime summary fixture: {e}"))?;
         let counted = runtime_from_log(&path)?;
-        if counted["syscalls"] != 5 {
+        if counted.syscalls != Some(5) {
             return Err(format!(
-                "a runtime log with syscall accounting did not retain it: {counted}"
+                "a runtime log with syscall accounting did not retain it: {counted:?}"
             ));
         }
         fs::remove_file(&path)
@@ -6072,6 +6041,10 @@ fn self_test(root: &Path) -> Result<(), String> {
             || !step
                 .cmd
                 .contains(&format!("E2E_RUN_ID='validate-one-pid100--{}'", step.job))
+            || !step.cmd.contains(&format!(
+                "{E2E_RUN_INDEX_ENV}={}",
+                series_run_index(&step.job)
+            ))
             || !step.cmd.contains(&format!("/cells/{}/", step.job))
         {
             return Err(format!(
@@ -6866,7 +6839,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         .join("runs")
         .join(&sample_slug)
         .join("sample-a-verify-ptrace");
-    let mut result_row = ResultRow {
+    let mut result_row = CellResult {
         first_divergent_record: None,
         first_divergent_syscall: None,
         first_divergent_scheduler_turn: None,
@@ -6877,8 +6850,14 @@ fn self_test(root: &Path) -> Result<(), String> {
         schema: CELL_RESULT_SCHEMA,
         run_id: sample_slug.clone(),
         run_index: Some(0),
+        machine_shortname: "fixture-host".into(),
+        kernel_version: "7.1.3-fixture".into(),
+        host_capabilities: fixture_host_capabilities(),
         hermit_sha: sample_metadata.hermit_sha.clone(),
         source_tree_dirty: false,
+        binary_sha256: None,
+        binary_build_sha: None,
+        test_sha256: "fixture-test-sha256".into(),
         test: sample_a.test.clone(),
         category: sample_a.category.clone(),
         lane: sample_a.lane.clone(),
@@ -6886,30 +6865,23 @@ fn self_test(root: &Path) -> Result<(), String> {
         backend: Some(sample_a.backend.clone()),
         classification: "required".into(),
         outcome: "FAIL".into(),
-        timeout_seconds: Some(20),
+        error_kind: None,
+        timeout_seconds: 20,
         duration_ms: Some(19_000),
         runtime: None,
+        log_level: Some("info".into()),
+        effective_args: vec!["run".into()],
         argv: vec!["hermit".into(), "run".into()],
         guest_argv: vec!["fixture".into()],
         env: BTreeMap::from([("LC_ALL".into(), "C".into())]),
         cwd: "/repo".into(),
         shell_command: "cd /repo && env LC_ALL=C hermit run".into(),
-        attempts: vec![json!({
-            "index":"1",
-            "outcome":"FAIL",
-            "status":1,
-            "signal":null,
-            "timed_out":false,
-            "argv":["hermit","run"],
-            "guest_argv":["fixture"],
-            "env":{"LC_ALL":"C"},
-            "cwd":"/repo",
-            "shell_command":"cd /repo && env LC_ALL=C hermit run"
-        })],
+        relaxations: Vec::new(),
+        execution_path: None,
+        diversity: None,
+        attempts: vec![fixture_attempt("FAIL", 1)],
         reason: None,
-        error_kind: None,
         artifact_dir: sample_artifact_dir.to_string_lossy().into_owned(),
-        extra: BTreeMap::new(),
     };
     if !result_row_matches_cell(
         &result_row,
@@ -6933,10 +6905,10 @@ fn self_test(root: &Path) -> Result<(), String> {
     second_row.attempt = 2;
     second_row.outcome = "PASS".into();
     second_row.duration_ms = Some(19_500);
-    second_row.timeout_seconds = Some(20);
+    second_row.timeout_seconds = 20;
     second_row.artifact_dir = format!("{}-attempt-2", first_row.artifact_dir);
-    second_row.attempts[0]["outcome"] = json!("PASS");
-    second_row.attempts[0]["status"] = json!(0);
+    second_row.attempts[0].outcome = "PASS".into();
+    second_row.attempts[0].status = Some(0);
     fs::write(
         &appended_results,
         format!(
@@ -6952,7 +6924,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     if appended.len() != 2
         || appended[0].attempt != 1
         || appended[0].duration_ms != Some(19_000)
-        || appended[0].timeout_seconds != Some(20)
+        || appended[0].timeout_seconds != 20
         || appended[0].first_divergent_syscall != Some(37)
         || appended[0].first_divergent_left_message.as_deref()
             != Some("INFO detcore: left event")
@@ -6960,7 +6932,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             != Some("INFO detcore: right event")
         || appended[1].attempt != 2
         || appended[1].duration_ms != Some(19_500)
-        || appended[1].timeout_seconds != Some(20)
+        || appended[1].timeout_seconds != 20
         || appended[1].first_divergent_left_message.is_some()
         || appended[1].first_divergent_right_message.is_some()
         || !appended.iter().all(|row| {
@@ -7001,8 +6973,21 @@ fn self_test(root: &Path) -> Result<(), String> {
         .join("portable-sample-a-verify-ptrace-repetition-0004");
     fs::create_dir_all(&nested_cell)
         .map_err(|e| format!("cannot create nested series result fixture: {e}"))?;
-    fs::copy(&appended_results, nested_cell.join("results.jsonl"))
-        .map_err(|e| format!("cannot copy nested series result fixture: {e}"))?;
+    let mut nested_first = first_row.clone();
+    nested_first.run_index = Some(4);
+    let mut nested_second = second_row.clone();
+    nested_second.run_index = Some(4);
+    fs::write(
+        nested_cell.join("results.jsonl"),
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&nested_first)
+                .map_err(|e| format!("cannot encode first nested-row fixture: {e}"))?,
+            serde_json::to_string(&nested_second)
+                .map_err(|e| format!("cannot encode second nested-row fixture: {e}"))?,
+        ),
+    )
+    .map_err(|e| format!("cannot write nested series result fixture: {e}"))?;
     let nested_rows = collect_series_rows(&nested_results)?;
     if nested_rows.len() != 2
         || nested_rows[0].1.run_index != Some(4)
@@ -7017,6 +7002,21 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err(format!(
             "pressure series writer did not retain both attempts from the ordinary nested layout: {nested_rows:?}"
         ));
+    }
+    nested_second.run_index = Some(3);
+    fs::write(
+        nested_cell.join("results.jsonl"),
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&nested_first)
+                .map_err(|e| format!("cannot encode matching nested-row fixture: {e}"))?,
+            serde_json::to_string(&nested_second)
+                .map_err(|e| format!("cannot encode mismatched nested-row fixture: {e}"))?,
+        ),
+    )
+    .map_err(|e| format!("cannot write mismatched nested series fixture: {e}"))?;
+    if collect_series_rows(&nested_results).is_ok() {
+        return Err("a framework result whose run_index disagreed with its pressure directory was accepted".into());
     }
     let mut reused_artifact = second_row.clone();
     reused_artifact.artifact_dir = first_row.artifact_dir.clone();
@@ -7053,7 +7053,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     if read_result_rows(&appended_results).is_ok() {
         return Err("a malformed appended result row was accepted".into());
     }
-    result_row.attempts[0]["argv"] = json!(["hermit", "run", "--hidden-policy"]);
+    result_row.attempts[0].argv = vec!["hermit".into(), "run".into(), "--hidden-policy".into()];
     if result_row_matches_cell(
         &result_row,
         &sample_slug,
@@ -7064,9 +7064,9 @@ fn self_test(root: &Path) -> Result<(), String> {
     ) {
         return Err("a result row whose published argv differs from execution was accepted".into());
     }
-    result_row.attempts[0]["argv"] = json!(["hermit", "run"]);
+    result_row.attempts[0].argv = vec!["hermit".into(), "run".into()];
     result_row.shell_command = "true".into();
-    result_row.attempts[0]["shell_command"] = json!("true");
+    result_row.attempts[0].shell_command = "true".into();
     if result_row_matches_cell(
         &result_row,
         &sample_slug,
@@ -7078,8 +7078,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err("a result row whose shell command does not encode argv/env was accepted".into());
     }
     result_row.shell_command = "cd /repo && env LC_ALL=C hermit run".into();
-    result_row.attempts[0]["shell_command"] =
-        json!("cd /repo && env LC_ALL=C hermit run");
+    result_row.attempts[0].shell_command = "cd /repo && env LC_ALL=C hermit run".into();
     result_row.hermit_sha = "foreign".into();
     if result_row_matches_cell(
         &result_row,
@@ -7093,7 +7092,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
     let first_repetition_slug = cell_run_slug(&green_id, Some(1));
     let second_repetition_slug = cell_run_slug(&green_id, Some(2));
-    let repeated_result_row = ResultRow {
+    let repeated_result_row = CellResult {
         first_divergent_record: None,
         first_divergent_syscall: None,
         first_divergent_scheduler_turn: None,
@@ -7104,8 +7103,14 @@ fn self_test(root: &Path) -> Result<(), String> {
         schema: CELL_RESULT_SCHEMA,
         run_id: first_repetition_slug.clone(),
         run_index: Some(1),
+        machine_shortname: "fixture-host".into(),
+        kernel_version: "7.1.3-fixture".into(),
+        host_capabilities: fixture_host_capabilities(),
         hermit_sha: repeated_metadata.hermit_sha.clone(),
         source_tree_dirty: false,
+        binary_sha256: None,
+        binary_build_sha: None,
+        test_sha256: "fixture-test-sha256".into(),
         test: green_id.test.clone(),
         category: green_id.category.clone(),
         lane: green_id.lane.clone(),
@@ -7113,35 +7118,28 @@ fn self_test(root: &Path) -> Result<(), String> {
         backend: Some(green_id.backend.clone()),
         classification: "required".into(),
         outcome: "PASS".into(),
-        timeout_seconds: Some(20),
+        error_kind: None,
+        timeout_seconds: 20,
         duration_ms: Some(1_000),
         runtime: None,
+        log_level: Some("info".into()),
+        effective_args: vec!["run".into()],
         argv: vec!["hermit".into(), "run".into()],
         guest_argv: vec!["fixture".into()],
         env: BTreeMap::from([("LC_ALL".into(), "C".into())]),
         cwd: "/repo".into(),
         shell_command: "cd /repo && env LC_ALL=C hermit run".into(),
-        attempts: vec![json!({
-            "index":"1",
-            "outcome":"PASS",
-            "status":0,
-            "signal":null,
-            "timed_out":false,
-            "argv":["hermit","run"],
-            "guest_argv":["fixture"],
-            "env":{"LC_ALL":"C"},
-            "cwd":"/repo",
-            "shell_command":"cd /repo && env LC_ALL=C hermit run"
-        })],
+        relaxations: Vec::new(),
+        execution_path: None,
+        diversity: None,
+        attempts: vec![fixture_attempt("PASS", 0)],
         reason: None,
-        error_kind: None,
         artifact_dir: scratch
             .join("runs")
             .join(&first_repetition_slug)
             .join("green-a-verify-ptrace")
             .to_string_lossy()
             .into_owned(),
-        extra: BTreeMap::new(),
     };
     if !result_row_matches_cell(
         &repeated_result_row,

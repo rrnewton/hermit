@@ -45,6 +45,11 @@ const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
 pub const CELL_RESULT_SCHEMA: u64 = 4;
 pub const E2E_MACHINE_SHORTNAME_ENV: &str = "E2E_MACHINE_SHORTNAME";
 pub const E2E_KERNEL_VERSION_ENV: &str = "E2E_KERNEL_VERSION";
+pub const E2E_RUN_INDEX_ENV: &str = "E2E_RUN_INDEX";
+
+fn first_attempt() -> u64 {
+    1
+}
 
 /// Closed vocabulary for manifest `requires` tokens.
 ///
@@ -798,7 +803,7 @@ pub struct CellRunSpec {
     fixed_workdir_source: PathBuf,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AttemptResult {
     pub index: String,
     pub outcome: String,
@@ -806,6 +811,7 @@ pub struct AttemptResult {
     pub status: Option<i32>,
     pub signal: Option<i32>,
     pub timed_out: bool,
+    #[serde(default)]
     pub duration_ms: u128,
     pub observation_sha256: Option<String>,
     pub argv: Vec<String>,
@@ -813,7 +819,9 @@ pub struct AttemptResult {
     pub env: BTreeMap<String, String>,
     pub cwd: String,
     pub shell_command: String,
+    #[serde(default)]
     pub stdout: String,
+    #[serde(default)]
     pub stderr: String,
     pub verification_report: Option<String>,
     pub verification_report_sha256: Option<String>,
@@ -856,23 +864,38 @@ struct SabrePathRecord {
     trusted_shared_objects: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+/// One test-harness cell observation written to `results.jsonl`.
+///
+/// This is not [`crate::ledger::CellResult`]. That type is the validation
+/// ledger's compact cell verdict; this type is the test framework's complete
+/// execution result, including invocation, attempts, timing, and retained
+/// evidence.
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CellResult {
     pub schema: u64,
     pub run_id: String,
     /// Short machine name measured with this row. A hostname alone is not a
     /// stable host class, but it is the existing per-machine key used by the
     /// parent store.
+    #[serde(default)]
     pub machine_shortname: String,
     /// `uname -r` for the kernel under which this cell ran.
+    #[serde(default)]
     pub kernel_version: String,
     /// The complete closed set of capability verdicts that determined which
     /// cells could execute on this host.
+    #[serde(default)]
     pub host_capabilities: HostCapabilities,
     /// The validate node attempt that produced this observation. A retry is a
     /// second observation, so it receives the next positive ordinal instead of
     /// replacing the earlier row.
+    #[serde(default = "first_attempt")]
     pub attempt: u64,
+    /// Pressure-test repetition number supplied to the test framework.
+    /// Ordinary validate rows leave this absent and use `attempt` as their
+    /// series run index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_index: Option<u64>,
     /// HEAD of the CHECKOUT the harness ran in. NOT the provenance of the
     /// binary that produced this measurement, despite the name.
     ///
@@ -897,6 +920,7 @@ pub struct CellResult {
     /// answer recognisably -- deliberately distinct from a value, so "not
     /// established" never reads as agreement.
     pub binary_build_sha: Option<String>,
+    #[serde(default)]
     pub test_sha256: String,
     pub test: String,
     pub category: String,
@@ -907,6 +931,7 @@ pub struct CellResult {
     pub outcome: String,
     pub error_kind: Option<String>,
     /// The cell wall-clock bound used for this observation.
+    #[serde(default)]
     pub timeout_seconds: u64,
     /// Measured wall time for a cell that reached execution. Absent when the
     /// cell never ran; a measured zero remains a valid sub-millisecond result.
@@ -915,12 +940,14 @@ pub struct CellResult {
     /// Runtime totals from the first attempt that produced them.
     pub runtime: Option<VerificationRuntime>,
     pub log_level: Option<String>,
+    #[serde(default)]
     pub effective_args: Vec<String>,
     pub argv: Vec<String>,
     pub guest_argv: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub cwd: String,
     pub shell_command: String,
+    #[serde(default)]
     pub relaxations: Vec<String>,
     pub execution_path: Option<JsonValue>,
     pub diversity: Option<JsonValue>,
@@ -989,6 +1016,7 @@ pub struct RunContext {
     pub kernel_version: String,
     pub host_capabilities: HostCapabilities,
     pub attempt: u64,
+    pub run_index: Option<u64>,
     pub source_sha: String,
     pub source_dirty: bool,
     /// Provenance the hermit binary reports about itself, probed once per run.
@@ -1031,6 +1059,14 @@ impl RunContext {
             })
             .transpose()?
             .unwrap_or(1);
+        let run_index = std::env::var(E2E_RUN_INDEX_ENV)
+            .ok()
+            .map(|value| {
+                value.parse::<u64>().map_err(|_| {
+                    format!("{E2E_RUN_INDEX_ENV} must be a non-negative integer, got {value:?}")
+                })
+            })
+            .transpose()?;
         let machine_name = match std::env::var(E2E_MACHINE_SHORTNAME_ENV) {
             Ok(value) if !value.is_empty() => value,
             _ => command_text("hostname", &["-s"])
@@ -1097,6 +1133,7 @@ impl RunContext {
             kernel_version,
             host_capabilities,
             attempt,
+            run_index,
             source_sha,
             source_dirty,
             binary_build_sha,
@@ -2274,6 +2311,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         kernel_version: context.kernel_version.clone(),
         host_capabilities: context.host_capabilities.clone(),
         attempt: context.attempt,
+        run_index: context.run_index,
         hermit_sha: context.source_sha.clone(),
         binary_build_sha: context.binary_build_sha.clone(),
         source_tree_dirty: context.source_dirty,
@@ -2347,6 +2385,7 @@ pub fn infrastructure_error_result(
         kernel_version: context.kernel_version.clone(),
         host_capabilities: context.host_capabilities.clone(),
         attempt: context.attempt,
+        run_index: context.run_index,
         hermit_sha: context.source_sha.clone(),
         binary_build_sha: context.binary_build_sha.clone(),
         source_tree_dirty: context.source_dirty,
@@ -2412,6 +2451,7 @@ pub fn host_inapplicable_result(
         kernel_version: context.kernel_version.clone(),
         host_capabilities: context.host_capabilities.clone(),
         attempt: context.attempt,
+        run_index: context.run_index,
         hermit_sha: context.source_sha.clone(),
         binary_build_sha: context.binary_build_sha.clone(),
         source_tree_dirty: context.source_dirty,
@@ -3223,6 +3263,7 @@ mod tests {
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
             attempt: 1,
+            run_index: None,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -3294,6 +3335,7 @@ mod tests {
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
             attempt: 1,
+            run_index: None,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -3463,6 +3505,7 @@ mod tests {
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
             attempt: 1,
+            run_index: None,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -3523,6 +3566,7 @@ mod tests {
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
             attempt: 1,
+            run_index: None,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -3605,6 +3649,7 @@ mod tests {
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
             attempt: 1,
+            run_index: None,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -3822,6 +3867,7 @@ backends_disabled:
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
             attempt: 1,
+            run_index: None,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -3875,6 +3921,7 @@ backends_disabled:
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
             attempt: 1,
+            run_index: None,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -4122,6 +4169,7 @@ backends_disabled:
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
             attempt: 1,
+            run_index: None,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -4208,6 +4256,7 @@ backends_disabled:
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
             attempt: 1,
+            run_index: None,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -4513,6 +4562,7 @@ backends_disabled:
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
             attempt: 1,
+            run_index: None,
             hermit_sha: "sha".into(),
             binary_build_sha: None,
             source_tree_dirty: false,
@@ -4583,6 +4633,10 @@ backends_disabled:
         let row = cell_result_that_located_nothing();
         let rendered = serde_json::to_value(&row).expect("row serializes");
         let object = rendered.as_object().expect("row is a JSON object");
+        assert!(
+            !object.contains_key("run_index"),
+            "ordinary validate rows must not invent a pressure repetition"
+        );
         assert_eq!(object["machine_shortname"], "fixture-host");
         assert_eq!(object["kernel_version"], "7.1.3-fixture");
         assert_eq!(
@@ -4611,6 +4665,20 @@ backends_disabled:
                 "{key} must be an explicit null on the row when nothing was located, got {found}"
             );
         }
+
+        let decoded: CellResult =
+            serde_json::from_value(rendered).expect("the producer-owned result type reads its row");
+        assert_eq!(decoded.attempt, 1);
+        assert_eq!(decoded.run_index, None);
+        assert_eq!(decoded.attempts.len(), 1);
+
+        let mut pressure_row = row;
+        pressure_row.run_index = Some(4);
+        let rendered = serde_json::to_value(&pressure_row).expect("pressure row serializes");
+        assert_eq!(rendered["run_index"], 4);
+        let decoded: CellResult = serde_json::from_value(rendered)
+            .expect("the producer-owned result type reads a pressure row");
+        assert_eq!(decoded.run_index, Some(4));
     }
 
     fn attempt_with_sabre_evidence(evidence: &str) -> AttemptResult {
@@ -5017,6 +5085,7 @@ backends_disabled:
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
             attempt: 1,
+            run_index: None,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -5088,6 +5157,7 @@ backends_disabled:
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
             attempt: 1,
+            run_index: None,
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
