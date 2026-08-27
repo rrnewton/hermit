@@ -4775,7 +4775,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // binary was already built by a lane node, which this focused path does
         // not have; retaining it would make every cold targeted run exit 127.
         steps.retain(|step| step.tag() != gate);
-        steps.push(step_with_caps(
+        let mut requalification = step_with_caps(
             "requalify",
             "cell",
             "Targeted canonical cell requalification",
@@ -4784,7 +4784,12 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             3600,
             7200,
             16 * 1024 * 1024 * 1024,
-        ));
+        );
+        // The nested pressure plan may need its release-Hermit build, whose
+        // declared worker width is eight. Giving the wrapper only the default
+        // one CPU makes dagrun refuse before the selected cell can start.
+        requalification.hint.preferred_inner_jobs = Some(8);
+        steps.push(requalification);
         let cfg = validate_plan::config_from(steps, "targeted cell requalification");
         return Ok(Plan {
             planned_test_nodes: BTreeSet::new(),
@@ -11361,6 +11366,12 @@ fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
         .iter()
         .find(|step| step.tag() == "requalify.cell")
         .ok_or("requalification plan: exact cell step is absent")?;
+    if step.hint.preferred_inner_jobs != Some(8) {
+        return Err(
+            "requalification plan: wrapper cannot admit the nested release build's eight workers"
+                .into(),
+        );
+    }
     for token in [
         "--test applications/timed-progress-bar",
         "--mode verify",
