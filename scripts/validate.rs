@@ -1616,6 +1616,7 @@ fn self_test() -> Result<(), String> {
     for line in [
         safe_ci_scope::self_test()?,
         nested_scope_self_test()?,
+        retry_timeout_bound_bracket(&root)?,
         scheduler_accounting_bracket()?,
         budget_reason_bracket()?,
         summary_listing_bracket()?,
@@ -7278,18 +7279,15 @@ mod scheduler_explanation_tests {
     }
 
     #[test]
-    fn retry_notice_has_two_retries_and_never_advertises_a_fourth_attempt() {
-        assert_eq!(validate_runtime::RETRIES_PER_CELL, 2);
-        assert_eq!(validate_runtime::MAX_ATTEMPTS_PER_CELL, 3);
-        assert!(retry_notice("test.liteinst_strict", "fixture", 2).ends_with("attempt 2/3)"));
-        assert!(retry_notice("test.liteinst_strict", "fixture", 3).ends_with("attempt 3/3)"));
+    fn retry_notice_has_one_retry_and_never_advertises_a_third_attempt() {
+        assert_eq!(validate_runtime::RETRIES_PER_CELL, 1);
+        assert_eq!(validate_runtime::MAX_ATTEMPTS_PER_CELL, 2);
+        assert!(retry_notice("test.liteinst_strict", "fixture", 2).ends_with("attempt 2/2)"));
 
         let tag = "test.liteinst_strict";
         let mut attempts = vec![unreported_attempt(tag.into(), 1)];
         assert!(retry_attempt_available(&attempts, tag));
         attempts.push(unreported_attempt(tag.into(), 2));
-        assert!(retry_attempt_available(&attempts, tag));
-        attempts.push(unreported_attempt(tag.into(), 3));
         assert!(!retry_attempt_available(&attempts, tag));
     }
 
@@ -7300,7 +7298,6 @@ mod scheduler_explanation_tests {
         let attempts = vec![
             unreported_attempt(capped.into(), 1),
             unreported_attempt(capped.into(), 2),
-            unreported_attempt(capped.into(), 3),
             unreported_attempt(available.into(), 1),
         ];
         let mut keep = BTreeSet::from([capped.to_string(), available.to_string()]);
@@ -7430,6 +7427,160 @@ fn retry_steps_with_satisfied_prerequisites(
             step
         })
         .collect()
+}
+
+fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
+    const DEFAULT_TEST_CAP_S: i64 = 15;
+    const NEXTEST_TERMINATION_GRACE_S: i64 = 2;
+
+    fn quoted_seconds(line: &str, field: &str) -> Result<i64, String> {
+        let prefix = format!("{field} = \"");
+        let value = line
+            .split_once(&prefix)
+            .and_then(|(_, rest)| rest.split_once("s\"").map(|(seconds, _)| seconds))
+            .ok_or_else(|| format!("retry bounds: cannot parse {field} from {line:?}"))?;
+        value
+            .parse::<i64>()
+            .map_err(|e| format!("retry bounds: invalid {field} in {line:?}: {e}"))
+    }
+
+    fn declared_manifest_caps(root: &Path) -> Result<Vec<i64>, String> {
+        let manifests = root.join("tests/e2e/manifests");
+        let mut paths = std::fs::read_dir(&manifests)
+            .map_err(|e| format!("retry bounds: cannot read {}: {e}", manifests.display()))?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("retry bounds: cannot enumerate {}: {e}", manifests.display()))?;
+        paths.sort();
+
+        let mut caps = Vec::new();
+        for path in paths
+            .into_iter()
+            .filter(|path| path.extension().is_some_and(|ext| ext == "yaml"))
+        {
+            let source = std::fs::read_to_string(&path)
+                .map_err(|e| format!("retry bounds: cannot read {}: {e}", path.display()))?;
+            let mut timeout_map_indent = None;
+            for (index, line) in source.lines().enumerate() {
+                let trimmed = line.trim();
+                let indent = line.len() - line.trim_start().len();
+                if let Some(map_indent) = timeout_map_indent {
+                    if trimmed.is_empty() || trimmed.starts_with('#') {
+                        continue;
+                    }
+                    if indent <= map_indent {
+                        timeout_map_indent = None;
+                    } else if let Some((_, value)) = trimmed.split_once(':') {
+                        let value = value.trim();
+                        let seconds = value.parse::<i64>().map_err(|e| {
+                            format!(
+                                "retry bounds: invalid timeout override at {}:{}: {e}",
+                                path.display(),
+                                index + 1
+                            )
+                        })?;
+                        caps.push(seconds);
+                        continue;
+                    }
+                }
+                let Some(value) = trimmed.strip_prefix("timeout_seconds:") else {
+                    continue;
+                };
+                let value = value.trim();
+                if value.is_empty() {
+                    timeout_map_indent = Some(indent);
+                } else {
+                    caps.push(value.parse::<i64>().map_err(|e| {
+                        format!(
+                            "retry bounds: invalid timeout at {}:{}: {e}",
+                            path.display(),
+                            index + 1
+                        )
+                    })?);
+                }
+            }
+        }
+        Ok(caps)
+    }
+
+    let nextest = std::fs::read_to_string(root.join(".config/nextest.toml"))
+        .map_err(|e| format!("retry bounds: cannot read nextest config: {e}"))?;
+    let manifest_defaults =
+        std::fs::read_to_string(root.join("tests/e2e/manifests/defaults.yaml"))
+            .map_err(|e| format!("retry bounds: cannot read manifest defaults: {e}"))?;
+    if !nextest.contains(
+        "slow-timeout = { period = \"15s\", terminate-after = 1, grace-period = \"2s\" }",
+    ) || !manifest_defaults
+        .lines()
+        .any(|line| line == "timeout_seconds: 15")
+    {
+        return Err(
+            "retry bounds: the owner-ruled 15-second per-test default is not present in both \
+             nextest and the manifest defaults"
+                .into(),
+        );
+    }
+    let nextest_caps = nextest
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("slow-timeout ="))
+        .map(|line| {
+            if !line.contains("terminate-after = 1") {
+                return Err(format!(
+                    "retry bounds: slow-timeout is not a one-period cap: {line:?}"
+                ));
+            }
+            let period = quoted_seconds(line, "period")?;
+            let grace = quoted_seconds(line, "grace-period")?;
+            if grace != NEXTEST_TERMINATION_GRACE_S {
+                return Err(format!(
+                    "retry bounds: expected {NEXTEST_TERMINATION_GRACE_S}s termination grace, \
+                     got {grace}s in {line:?}"
+                ));
+            }
+            Ok(period)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let manifest_caps = declared_manifest_caps(root)?;
+    let largest_test_cap_s = nextest_caps
+        .iter()
+        .chain(&manifest_caps)
+        .copied()
+        .max()
+        .ok_or("retry bounds: no declared per-test cap")?;
+
+    let smallest_enclosing_deadline_s = ["portable", "privileged"]
+        .into_iter()
+        .map(|lane| validate_plan::lane_config(root, lane).map(|cfg| cfg.default_step_timeout))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .min()
+        .ok_or("retry bounds: no enclosing lane deadline")?;
+    let attempts = validate_runtime::MAX_ATTEMPTS_PER_CELL as i64;
+    let default_execution_s = attempts * DEFAULT_TEST_CAP_S;
+    let default_with_grace_s = attempts * (DEFAULT_TEST_CAP_S + NEXTEST_TERMINATION_GRACE_S);
+    let largest_with_grace_s =
+        attempts * (largest_test_cap_s + NEXTEST_TERMINATION_GRACE_S);
+    if attempts != 2
+        || default_execution_s != 30
+        || nextest_caps.first().copied() != Some(DEFAULT_TEST_CAP_S)
+        || default_with_grace_s >= smallest_enclosing_deadline_s
+        || largest_with_grace_s >= smallest_enclosing_deadline_s
+    {
+        return Err(format!(
+            "retry bounds: attempts={attempts}; default={default_execution_s}s execution / \
+             {default_with_grace_s}s including termination grace; largest declared override \
+             including grace={largest_with_grace_s}s; smallest enclosing lane deadline=\
+             {smallest_enclosing_deadline_s}s"
+        ));
+    }
+    Ok(format!(
+        "retry bounds: {attempts} attempts x {DEFAULT_TEST_CAP_S}s = {default_execution_s}s; \
+         with {NEXTEST_TERMINATION_GRACE_S}s termination grace per attempt = \
+         {default_with_grace_s}s < {smallest_enclosing_deadline_s}s; largest declared \
+         {largest_test_cap_s}s override including grace = {largest_with_grace_s}s < \
+         {smallest_enclosing_deadline_s}s"
+    ))
 }
 
 /// Fast front-door bracket for the scheduler result shape consumed below.
@@ -7924,6 +8075,26 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
                 .collect::<Vec<_>>()
         ));
     }
+    let environmental_outcome = retried
+        .outcomes
+        .iter()
+        .find(|outcome| outcome.tag == "fixture.environmental")
+        .ok_or("scheduler accounting: recovered environmental outcome disappeared")?;
+    let environmental_gate =
+        ledger_gate_with_attempts(environmental_outcome, &retried.attempts);
+    if environmental_gate["result"] != "pass"
+        || environmental_gate["retries"] != 1
+        || environmental_gate["attempts"].as_array().map(Vec::len) != Some(2)
+        || environmental_gate["attempts"][0]["result"] != "fail"
+        || environmental_gate["attempts"][0]["retry_class"] != "bpfjailer-banner"
+        || environmental_gate["attempts"][1]["result"] != "pass"
+        || !environmental_gate["attempts"][1]["retry_class"].is_null()
+    {
+        return Err(format!(
+            "scheduler accounting: the ledger erased or misreported a failure followed by a \
+             retry pass: {environmental_gate}"
+        ));
+    }
     // ⚠️ THE FLAKY WARNING MUST APPEAR ON A RUN THAT PASSED, and this is the
     // bracket that holds it there. `retried` above is GREEN — ok=true, no
     // failures — and it contains a node that failed once and recovered. That is
@@ -8235,9 +8406,10 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         ));
     }
 
-    // MULTIPLE RETRIES: every classified attempt gets its own conclusion. The
-    // first failure's rerun fails with the same signature (REFUTED/Persistent),
-    // while the second failure's rerun passes (CONFIRMED).
+    // TWO-ATTEMPT CAP: every classified attempt gets its own conclusion. The
+    // first failure's only retry fails with the same signature, so attempt 1 is
+    // REFUTED/Persistent and terminal attempt 2 is UNCONFIRMED. The command
+    // would pass on attempt 3; reaching that pass would prove the cap failed.
     let multi_log = tmp.join("multiple-retries.log");
     let multi_first = tmp.join("multiple-retries-first");
     let multi_second = tmp.join("multiple-retries-second");
@@ -8271,20 +8443,21 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         .iter()
         .filter(|attempt| attempt.tag == "fixture.multiple")
         .collect();
-    if !multiple.ok
+    if multiple.ok
         || !multiple.complete
-        || multiple_attempts.len() != 3
+        || multiple_attempts.len() != 2
         || environmental_assessment(&multiple.attempts, multiple_attempts[0])
             != Some((
                 validate_runtime::EnvBlockVerdict::Refuted,
                 Some(validate_runtime::RefutedShape::Persistent),
             ))
         || environmental_assessment(&multiple.attempts, multiple_attempts[1])
-            != Some((validate_runtime::EnvBlockVerdict::Confirmed, None))
+            != Some((validate_runtime::EnvBlockVerdict::Unconfirmed, None))
     {
         return Err(format!(
-            "scheduler accounting: failure/failure/pass collapsed its per-attempt environmental \
-             verdicts: ok={} complete={} attempts={} first={:?} second={:?}",
+            "scheduler accounting: a failure/failure/pass-on-third fixture crossed the \
+             two-attempt cap or collapsed its per-attempt environmental verdicts: ok={} \
+             complete={} attempts={} first={:?} second={:?}",
             multiple.ok,
             multiple.complete,
             multiple_attempts.len(),
@@ -8484,12 +8657,11 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         ));
     }
 
-    // MULTI-ROUND MISSING THEN OTHER TRIGGER. Attempt 2 of `multi_missing`
+    // MISSING ATTEMPT PLUS ANOTHER FAILURE. Attempt 2 of `multi_missing`
     // produces no payload because `multi_trigger` wins the only serial slot and
-    // fails with its own environmental signature. That DIFFERENT node starts
-    // retry round 2. The explicit latest-unreported set must carry
-    // `multi_missing` into that round, where both nodes actually pass. Looking
-    // only at cumulative `by_tag` would omit it and strand the lane incomplete.
+    // fails with its own environmental signature. Both cells have now spent
+    // their two attempts, so neither may start a third. The explicit
+    // latest-unreported set keeps the missing attempt visible and the lane RED.
     let multi_missing_log = tmp.join("multi-round-missing.log");
     let multi_missing_first = tmp.join("multi-round-missing-first");
     let multi_trigger_first = tmp.join("multi-round-trigger-first");
@@ -8547,27 +8719,24 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         .iter()
         .filter(|attempt| attempt.tag == "fixture.multi_trigger")
         .collect();
-    if !multi_missing.complete
-        || !multi_missing.ok
-        || multi_missing.env_retries != 2
-        || multi_missing_attempts.len() != 3
+    if multi_missing.complete
+        || multi_missing.ok
+        || multi_missing.env_retries != 1
+        || multi_missing_attempts.len() != 2
         || multi_missing_attempts[0].execution != AttemptExecution::Completed
         || multi_missing_attempts[1].execution != AttemptExecution::Unknown
         || multi_missing_attempts[1].reported
-        || multi_missing_attempts[2].execution != AttemptExecution::Completed
-        || multi_missing_attempts[2].ok != Some(true)
-        || multi_trigger_attempts.len() != 3
+        || multi_trigger_attempts.len() != 2
         || multi_trigger_attempts[0].execution != AttemptExecution::Unknown
         || multi_trigger_attempts[1].ok != Some(false)
-        || multi_trigger_attempts[2].ok != Some(true)
         || environmental_assessment(&multi_missing.attempts, multi_missing_attempts[0])
-            != Some((validate_runtime::EnvBlockVerdict::Confirmed, None))
+            != Some((validate_runtime::EnvBlockVerdict::Unconfirmed, None))
         || environmental_assessment(&multi_missing.attempts, multi_trigger_attempts[1])
-            != Some((validate_runtime::EnvBlockVerdict::Confirmed, None))
+            != Some((validate_runtime::EnvBlockVerdict::Unconfirmed, None))
     {
         return Err(format!(
-            "scheduler accounting: a later trigger did not carry an earlier round's missing node \
-             into the next retry: complete={} ok={} retries={} missing={:?} trigger={:?}",
+            "scheduler accounting: a missing cell or later failure crossed the two-attempt cap, \
+             disappeared, or became green: complete={} ok={} retries={} missing={:?} trigger={:?}",
             multi_missing.complete,
             multi_missing.ok,
             multi_missing.env_retries,
@@ -8582,114 +8751,35 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         ));
     }
 
-    // STAGGERED PER-CELL CAP. `capped_peer` fails in the first pass, then loses
-    // the one serial slot in retry rounds 1 and 2 while two later cells fail in
-    // sequence. It has now spent exactly three attempts: fail, unknown, unknown.
-    // The second later failure starts retry round 3. Before the retry-set cap was
-    // applied to carried peers, `capped_peer` ran a FOURTH time in that round and
-    // passed, even though the failed trigger nodes themselves obeyed the cap.
-    let staggered_log = tmp.join("staggered-cap.log");
-    let capped_first = tmp.join("staggered-capped-first");
-    let capped_passed = tmp.join("staggered-capped-passed");
-    let first_trigger_first = tmp.join("staggered-first-trigger-first");
-    let second_trigger_first = tmp.join("staggered-second-trigger-first");
-    let capped_cmd = format!(
-        "if test ! -e {first}; then : > {first}; printf '%s\\n' \
-         '[fixture.capped_peer] ----- detail -----' \
-         '[fixture.capped_peer] Enforcer: FS, Reason: FILE_OPEN' \
-         '[fixture.capped_peer] ----- end detail -----' > {log}; sleep 0.3; exit 1; fi; \
-         : > {passed}",
-        first = validate_plan::shell_quote(&capped_first.to_string_lossy()),
-        passed = validate_plan::shell_quote(&capped_passed.to_string_lossy()),
-        log = validate_plan::shell_quote(&staggered_log.to_string_lossy()),
-    );
-    let first_trigger_cmd = format!(
-        "if test ! -e {first}; then : > {first}; printf '%s\\n' \
-         '[fixture.first_late_trigger] ----- detail -----' \
-         '[fixture.first_late_trigger] Enforcer: FS, Reason: FILE_OPEN' \
-         '[fixture.first_late_trigger] ----- end detail -----' >> {log}; exit 1; fi",
-        first = validate_plan::shell_quote(&first_trigger_first.to_string_lossy()),
-        log = validate_plan::shell_quote(&staggered_log.to_string_lossy()),
-    );
-    let second_trigger_cmd = format!(
-        "if test ! -e {first}; then : > {first}; printf '%s\\n' \
-         '[fixture.second_late_trigger] ----- detail -----' \
-         '[fixture.second_late_trigger] Enforcer: FS, Reason: FILE_OPEN' \
-         '[fixture.second_late_trigger] ----- end detail -----' >> {log}; exit 1; fi",
-        first = validate_plan::shell_quote(&second_trigger_first.to_string_lossy()),
-        log = validate_plan::shell_quote(&staggered_log.to_string_lossy()),
-    );
-    let mut capped_step = step("capped_peer", &capped_cmd);
-    capped_step.hint.est_duration_s = 10.0;
-    capped_step.hint.resources.insert("serial".into(), 1);
-    let mut first_trigger_step = step("first_late_trigger", &first_trigger_cmd);
-    first_trigger_step.deps = vec!["fixture.staggered_prerequisite".into()];
-    first_trigger_step.hint.est_duration_s = 20.0;
-    first_trigger_step.hint.resources.insert("serial".into(), 1);
-    let mut second_trigger_step = step("second_late_trigger", &second_trigger_cmd);
-    second_trigger_step.deps = vec!["fixture.first_late_trigger".into()];
-    second_trigger_step.hint.est_duration_s = 30.0;
-    second_trigger_step.hint.resources.insert("serial".into(), 1);
-    let mut staggered_cfg = DagConfig {
-        steps: vec![
-            capped_step,
-            step("staggered_prerequisite", "true"),
-            first_trigger_step,
-            second_trigger_step,
-        ],
+    // CARRIED-PEER CAP. With two total attempts, every planned cell has either a
+    // reported or an explicit unknown attempt 1 before the first retry starts.
+    // Therefore a natural second retry round cannot be constructed without first
+    // applying this selection rule. Exercise the exact production helper instead:
+    // a dependency-skipped peer already at attempt 2 must be removed after all
+    // carried sources are unioned, while the failed cell at attempt 1 remains.
+    let capped = "fixture.capped_peer";
+    let available = "fixture.available_peer";
+    let retry_set_cfg = DagConfig {
+        steps: vec![step("capped_peer", "true"), step("available_peer", "true")],
         ..Default::default()
     };
-    staggered_cfg.resource_caps.insert("serial".into(), 1);
-    let staggered = run_lane_with_env_retries(
-        &staggered_cfg,
-        2,
-        false,
-        0,
-        None,
-        &staggered_log,
-        None,
-        3,
+    let retry_set_attempts = vec![
+        unreported_attempt(capped.into(), 1),
+        unreported_attempt(capped.into(), 2),
+        unreported_attempt(available.into(), 1),
+    ];
+    let retry_set = retry_candidate_tags(
+        &retry_set_cfg,
+        &[(available.to_string(), "always-eligible: exit 1".to_string())],
+        &[capped.to_string()],
         &BTreeMap::new(),
-        false,
+        &BTreeSet::new(),
+        &retry_set_attempts,
     );
-    let attempts_for = |tag: &str| -> Vec<&NodeAttempt> {
-        staggered.attempts.iter().filter(|attempt| attempt.tag == tag).collect()
-    };
-    let capped_attempts = attempts_for("fixture.capped_peer");
-    let first_trigger_attempts = attempts_for("fixture.first_late_trigger");
-    let second_trigger_attempts = attempts_for("fixture.second_late_trigger");
-    if staggered.complete
-        || staggered.ok
-        || staggered.env_retries != 3
-        || capped_attempts.len() != validate_runtime::MAX_ATTEMPTS_PER_CELL
-        || capped_attempts.last().is_none_or(|attempt| {
-            attempt.attempt != validate_runtime::MAX_ATTEMPTS_PER_CELL
-                || attempt.execution != AttemptExecution::Unknown
-        })
-        || capped_passed.exists()
-        || first_trigger_attempts.last().is_none_or(|attempt| attempt.ok != Some(true))
-        || second_trigger_attempts.last().is_none_or(|attempt| attempt.ok != Some(true))
-    {
+    if retry_set != BTreeSet::from([available.to_string()]) {
         return Err(format!(
-            "retry budget: a carried peer crossed its three-attempt per-cell cap when later \
-             failures opened another retry round: complete={} ok={} retries={} capped={:?} \
-             capped_passed={} first_trigger={:?} second_trigger={:?}",
-            staggered.complete,
-            staggered.ok,
-            staggered.env_retries,
-            capped_attempts
-                .iter()
-                .map(|attempt| (attempt.attempt, attempt.execution, attempt.ok))
-                .collect::<Vec<_>>(),
-            capped_passed.exists(),
-            first_trigger_attempts
-                .iter()
-                .map(|attempt| (attempt.attempt, attempt.execution, attempt.ok))
-                .collect::<Vec<_>>(),
-            second_trigger_attempts
-                .iter()
-                .map(|attempt| (attempt.attempt, attempt.execution, attempt.ok))
-                .collect::<Vec<_>>()
+            "retry budget: the production retry-set path admitted a carried peer after its \
+             two attempts: {retry_set:?}"
         ));
     }
 
@@ -8759,8 +8849,8 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         ));
     }
 
-    // REFUSAL 1: an ordinary product failure is still paid for ONCE. Nothing
-    // classifies it, so it must not be retried even though the budget allows it.
+    // ALWAYS-ELIGIBLE ORDINARY FAILURE. Nothing classifies it more specifically,
+    // so the blanket ground grants its one retry.
     let ordinary_only_log = tmp.join("ordinary-only.log");
     std::fs::write(
         &ordinary_only_log,
@@ -8784,20 +8874,18 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     // ⚠️ THIS BRACKET ASSERTED THE OPT-IN POLICY ITSELF AND THE OWNER SUPERSEDED IT
     // (2026-08-26). It required an unclassified product failure to cost ONE attempt
     // -- that was the whole point of opt-in retry. Every cell is now always
-    // eligible, so this failure costs up to `max` retries; at the max=2 passed
-    // above that is 2 retries and 3 attempts.
+    // eligible, so this failure gets one retry and two total attempts.
     //
     // WHAT IS STILL ASSERTED, and is the part worth keeping: the lane is STILL NOT
-    // ok. Retrying a genuine red three times must return the same red, never a
+    // ok. Retrying a genuine red twice must return the same red, never a
     // pass. The cost changed by directive; the verdict must not.
     // ⚠️ PER-CELL BUDGET (owner ruling 2026-08-26): this fixture fails every time,
     // so it uses its whole allowance and stays red. The lane round backstop passed
-    // above is 2, so it reaches 3 attempts here -- the cell cap and the backstop
-    // agree at this size, and the bracket below is the one that separates them.
+    // above exceeds the one retry it needs; the per-cell cap is what stops it.
     //
-    // The verdict is the invariant: retrying a genuine red, once or three times,
+    // The verdict is the invariant: retrying a genuine red twice
     // must return the same red. The cost is policy; the verdict is not.
-    if ordinary_only.ok || ordinary_only.env_retries != 2 || ordinary_only.attempts.len() != 3 {
+    if ordinary_only.ok || ordinary_only.env_retries != 1 || ordinary_only.attempts.len() != 2 {
         return Err(format!(
             "scheduler accounting: an always-eligible failure must spend its per-cell \
              allowance and STILL be red: ok={} retries={} attempts={}",
@@ -8807,7 +8895,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         ));
     }
 
-    // ⚠️ THE POINT OF THE RULING: A SECOND CELL GETS ITS OWN THREE, WHATEVER THE
+    // ⚠️ THE POINT OF THE RULING: A SECOND CELL GETS ITS OWN TWO, WHATEVER THE
     // FIRST SPENT. Two cells in ONE lane, both failing every time. Under the lane
     // round budget that shipped first, the two shared a pool: whichever failed
     // first consumed the rounds and the other's chance of recovering depended on
@@ -8815,20 +8903,18 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     // here rather than described.
     //
     // Both must reach exactly MAX_ATTEMPTS_PER_CELL, and the cap must be what
-    // stops them: removing the per-cell gate lets the lane backstop run them to 33
-    // attempts each and this bracket fails.
+    // stops them: removing the per-cell gate lets the derived lane backstop run
+    // them to three attempts each and this bracket fails.
     //
     // ⚠️ WHAT THIS BRACKET DOES NOT PROVE, MEASURED RATHER THAN ASSUMED. It does
     // not discriminate a per-cell cap from a lane-round budget on its own. These
     // two cells fail in the SAME round, so they share every round efficiently and
-    // a lane budget of 2 rounds also yields 3 attempts each -- checked by setting
-    // the backstop to 2, and the bracket still passed. The starvation case the
+    // a lane budget of 1 round also yields 2 attempts each. The starvation case the
     // ruling names -- one cell exhausting the pool BEFORE another has failed --
     // cannot be built in this harness, because a node that has passed is never
     // added to a retry set and so can never fail late. The per-cell property is
     // carried by the gate's position in the code, ahead of every ground and keyed
-    // on the cell's own tag; this bracket pins that the gate binds and binds at
-    // three.
+    // on the cell's own tag; this bracket pins that the gate binds at two.
     let twin_log = tmp.join("twin.log");
     let twin_cfg = DagConfig {
         steps: vec![
@@ -8845,7 +8931,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         None,
         &twin_log,
         None,
-        validate_runtime::LANE_ROUND_BACKSTOP,
+        validate_runtime::lane_round_backstop(twin_cfg.steps.len()),
         &BTreeMap::new(),
         false,
     );
@@ -8871,14 +8957,14 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             twins.ok
         ));
     }
-    // And the cap is a CAP: neither may exceed it, or "three attempts" means
+    // And the cap is a CAP: neither may exceed it, or "two attempts" means
     // nothing. The equality above already pins this; stated so a later edit that
     // relaxes it to `>=` has to argue with a comment.
 
     // REFUSAL 2: a registry entry with a ONE-SIDED sample grants no retry. This
     // is the structural-`no_result` shape the flakiness investigation measured
     // (eight DBT identities `no_result` 5 of 5 because DBT never publishes a
-    // terminal verify report), and retrying it returns the same answer three
+    // terminal verify report), and retrying it returns the same answer twice
     // times. The registry reader must reject it on its own numbers.
     let registry = tmp.join("flaky-cells.json");
     std::fs::write(
@@ -9056,8 +9142,8 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
 /// * **The classification reads the FAILING NODE's own output**, extracted from
 ///   the runner's `[tag] ----- detail -----` region, not a whole-log tail. A jail
 ///   banner printed by a different concurrent node cannot excuse a real red.
-/// * **Retries are bounded per cell**: one initial attempt plus exactly two
-///   retry attempts. A *persistent* breakage — a bad Reverie pin, a genuinely missing
+/// * **Retries are bounded per cell**: one initial attempt plus exactly one
+///   retry attempt. A *persistent* breakage — a bad Reverie pin, a genuinely missing
 ///   header — fails every attempt and still leaves the run RED. Its per-attempt
 ///   environmental hypothesis is refuted or left unconfirmed, never silently
 ///   promoted to a pass.
@@ -9200,8 +9286,8 @@ fn run_lane_with_env_retries(
         // deterministic success, because DBT never publishes a terminal verify
         // report and the invocation-bound pending one is left standing; and
         // `dbt-unsupported-syscall/ptrace` was pre-comparison `no_result` 5/5.
-        // Those are 100% reproducible, so a retry buys three identical answers
-        // at three times the cost. Accordingly a node that merely reported
+        // Those are 100% reproducible, so a retry buys two identical answers
+        // at twice the cost. Accordingly a node that merely reported
         // nothing is NOT retried on that ground alone: it is recorded (above)
         // and it rides along in the retry set only when one of the three
         // grounds fires for something else.
@@ -9225,7 +9311,7 @@ fn run_lane_with_env_retries(
                 // no more, and what any OTHER cell spent does not touch it.
                 //
                 // The gate is here, ahead of every ground, so it binds uniformly:
-                // an environmental block cannot buy a fourth attempt any more than
+                // an environmental block cannot buy a third attempt any more than
                 // the blanket arm can.
                 if !retry_attempt_available(&attempts, &o.tag) {
                     return None;
@@ -9270,21 +9356,18 @@ fn run_lane_with_env_retries(
         // aborted) because of them. The scheduler's fail-fast result reports only
         // dependency-skipped nodes; an independent runnable node can otherwise be
         // absent from both outcomes and skipped.
-        let mut keep: BTreeSet<String> = blocked.iter().map(|(t, _)| t.clone()).collect();
-        keep.extend(skipped.iter().cloned());
-        keep.extend(by_tag.values().filter(|o| o.aborted).map(|o| o.tag.clone()));
-        keep.extend(unreported_non_intentional_steps(cfg, &by_tag, &skipped));
         // A retry-round miss is hidden by cumulative `by_tag`, which still holds
-        // the prior attempt. Carry the explicit latest-unknown set forward so a
-        // different node's later retry trigger can give it another real chance.
-        keep.extend(latest_unreported.iter().cloned());
-        // The cap applies to EVERY cell admitted to the retry DAG, not only the
-        // failed cell that triggered this round. Aborted, dependency-skipped, and
-        // unreported peers are carried above so they get another real chance, but
-        // without this filter a different failure could carry one of those peers
-        // through a fourth (or later) attempt. That silently turns the lane-round
-        // backstop into their real budget, contradicting the per-cell ruling.
-        retain_cells_with_retry_attempt_available(&mut keep, &attempts);
+        // the prior attempt. The helper carries the explicit latest-unknown set,
+        // along with skipped and aborted peers, then applies the per-cell cap to
+        // every candidate before any can enter the retry DAG.
+        let keep = retry_candidate_tags(
+            cfg,
+            &blocked,
+            &skipped,
+            &by_tag,
+            &latest_unreported,
+            &attempts,
+        );
         let steps = retry_steps_with_satisfied_prerequisites(cfg, &by_tag, keep);
         let retry_tags: BTreeSet<String> = steps.iter().map(|step| step.tag()).collect();
         if !blocked.iter().any(|(tag, _)| retry_tags.contains(tag)) {
@@ -11708,6 +11791,23 @@ fn retain_cells_with_retry_attempt_available(
     keep.retain(|tag| retry_attempt_available(attempts, tag));
 }
 
+fn retry_candidate_tags(
+    cfg: &DagConfig,
+    blocked: &[(String, String)],
+    skipped: &[String],
+    by_tag: &BTreeMap<String, StepOutcome>,
+    latest_unreported: &BTreeSet<String>,
+    attempts: &[NodeAttempt],
+) -> BTreeSet<String> {
+    let mut keep: BTreeSet<String> = blocked.iter().map(|(tag, _)| tag.clone()).collect();
+    keep.extend(skipped.iter().cloned());
+    keep.extend(by_tag.values().filter(|outcome| outcome.aborted).map(|outcome| outcome.tag.clone()));
+    keep.extend(unreported_non_intentional_steps(cfg, by_tag, skipped));
+    keep.extend(latest_unreported.iter().cloned());
+    retain_cells_with_retry_attempt_available(&mut keep, attempts);
+    keep
+}
+
 /// Cap for every id list in the end-of-run summary, so the block stays roughly
 /// fixed size however wide the failure is.
 const SUMMARY_LIST_CAP: usize = 12;
@@ -12825,7 +12925,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             cgroups.clone(),
             &log_path,
             deadline,
-            validate_runtime::env_block_max_retries(cfg.steps.len()),
+            validate_runtime::lane_round_backstop(cfg.steps.len()),
             &unstable,
             true,
         )

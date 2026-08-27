@@ -57,26 +57,21 @@ use std::time::Duration;
 
 // ------------------------------------------------------------------ environmental blocks
 
-/// Legacy lane-round backstop (`VALIDATE_ENV_BLOCK_RETRIES`, validate.sh:903).
-///
 /// ⚠️ THIS IS NO LONGER ENVIRONMENTAL-ONLY. Owner directive 2026-08-26 made EVERY
-/// cell always eligible for retry rather than opt-in. The name is kept because
-/// the override variable is deployed under it and renaming would silently drop
-/// any caller still setting the old spelling. The per-cell limit below is the
-/// policy; this larger number only prevents a pathological lane loop.
+/// cell always eligible for retry rather than opt-in. The per-cell limit below
+/// is the policy.
 ///
 /// Why the opt-in had to go, measured: across all 106 recorded runs carrying
 /// `retried_nodes`, 12 rows had a retry and ALL 12 were granted on the
 /// environmental ground. The registry ground has never once granted a retry, and
 /// the registry itself holds a single cell measured 22 days ago -- a cell earned
 /// retry by having already been retried.
-pub const ENV_BLOCK_RETRIES_DEFAULT: usize = LANE_ROUND_BACKSTOP;
-
-/// Owner ruling 2026-08-26: every failed cell gets exactly two retry attempts.
-pub const RETRIES_PER_CELL: usize = 2;
+///
+/// Owner ruling 2026-08-26: every failed cell gets exactly one retry attempt.
+pub const RETRIES_PER_CELL: usize = 1;
 
 /// ⚠️ THE BUDGET IS PER CELL, NOT PER LANE. Owner ruling 2026-08-26: a cell gets
-/// THREE ATTEMPTS -- the first plus two retries -- and what any other cell spent
+/// TWO ATTEMPTS -- the first plus one retry -- and what any other cell spent
 /// is irrelevant to it.
 ///
 /// A lane-wide round budget, which is what shipped first, is incoherent: one
@@ -84,32 +79,15 @@ pub const RETRIES_PER_CELL: usize = 2;
 /// cell's chance of recovering depends on which OTHER cells happened to fail in
 /// the same run. Per-cell attempts make that impossible by construction.
 ///
-/// `ENV_BLOCK_RETRIES_DEFAULT` above is only a RUNAWAY BACKSTOP on the number
-/// of lane rounds, not the policy. It has to exceed the per-cell cap because
-/// different cells fail in different rounds: cell A can exhaust its three while
-/// cell B has not yet failed once, and B must still get its own three.
 pub const MAX_ATTEMPTS_PER_CELL: usize = 1 + RETRIES_PER_CELL;
 
-/// Default lane-round backstop. Production resolves this against the selected
-/// cell count, so it can never bind before every cell's own retry allowance.
-pub const LANE_ROUND_BACKSTOP: usize = 32;
-
-fn lane_round_backstop(configured: usize, cell_count: usize) -> usize {
-    configured.max(cell_count.saturating_mul(RETRIES_PER_CELL))
-}
-
-/// Resolve the legacy lane-round backstop from the environment.
+/// Derive the lane-round backstop from the work it encloses.
 ///
-/// The override may raise the runaway guard, but it may not lower it below the
-/// number of rounds needed for every selected cell to spend both of its retries.
-/// Otherwise `VALIDATE_ENV_BLOCK_RETRIES=1` would silently turn the owner's
-/// three-attempt PER-CELL rule back into one shared lane retry.
-pub fn env_block_max_retries(cell_count: usize) -> usize {
-    let configured = match std::env::var("VALIDATE_ENV_BLOCK_RETRIES") {
-        Ok(v) if !v.is_empty() => v.parse().unwrap_or(ENV_BLOCK_RETRIES_DEFAULT),
-        _ => ENV_BLOCK_RETRIES_DEFAULT,
-    };
-    lane_round_backstop(configured, cell_count)
+/// Every retry round grants at least one selected cell one of its remaining
+/// retries. There are `cell_count * RETRIES_PER_CELL` such grants in the whole
+/// lane, so that product is an enclosing bound rather than an unrelated number.
+pub fn lane_round_backstop(cell_count: usize) -> usize {
+    cell_count.saturating_mul(RETRIES_PER_CELL)
 }
 
 // ------------------------------------------------------------------ measured-unstable nodes
@@ -145,7 +123,7 @@ fn flaky_cell_registry_path(parent: Option<&Path>) -> Option<PathBuf> {
 /// structural reason: at SHA 0f1f6cd0, eight DBT identities reported `no_result`
 /// 5 runs out of 5 because DBT never publishes a terminal verify report, and
 /// `dbt-unsupported-syscall/ptrace` was pre-comparison `no_result` 5/5. Those
-/// are 100% reproducible, so retrying them costs three runs and returns the
+/// are 100% reproducible, so retrying them costs two runs and returns the
 /// same answer. An entry recording `observed_pass: 0` describes exactly that
 /// shape, so it is rejected here with its numbers named rather than silently
 /// granted a retry budget.
@@ -1526,27 +1504,23 @@ pub fn enter_cleanup_critical_section() {
 /// registers a FAKE peer record held by a short-lived child of this process, which
 /// cannot authorize anything.
 pub fn self_test() -> Result<String, String> {
-    if RETRIES_PER_CELL != 2 || MAX_ATTEMPTS_PER_CELL != 3 {
+    if RETRIES_PER_CELL != 1 || MAX_ATTEMPTS_PER_CELL != 2 {
         return Err(format!(
-            "retry policy: expected one initial attempt plus exactly two retries, got \
+            "retry policy: expected one initial attempt plus exactly one retry, got \
              RETRIES_PER_CELL={RETRIES_PER_CELL} MAX_ATTEMPTS_PER_CELL={MAX_ATTEMPTS_PER_CELL}"
         ));
     }
-    if ENV_BLOCK_RETRIES_DEFAULT < LANE_ROUND_BACKSTOP {
-        return Err(format!(
-            "retry policy: default lane backstop {ENV_BLOCK_RETRIES_DEFAULT} is below the \
-             declared backstop {LANE_ROUND_BACKSTOP}"
-        ));
-    }
-    let cells = LANE_ROUND_BACKSTOP / RETRIES_PER_CELL + 1;
-    let required = cells * RETRIES_PER_CELL;
-    if lane_round_backstop(0, cells) != required
-        || lane_round_backstop(1, cells) != required
-        || lane_round_backstop(required + 1, cells) != required + 1
+    if lane_round_backstop(0) != 0
+        || lane_round_backstop(1) != RETRIES_PER_CELL
+        || lane_round_backstop(67) != 67 * RETRIES_PER_CELL
     {
         return Err(format!(
-            "retry policy: the legacy lane-round override can bind before {cells} cells spend \
-             their {RETRIES_PER_CELL} retries each"
+            "retry policy: the lane-round backstop is not derived from selected cells times \
+             RETRIES_PER_CELL={} (0 -> {}, 1 -> {}, 67 -> {})",
+            RETRIES_PER_CELL,
+            lane_round_backstop(0),
+            lane_round_backstop(1),
+            lane_round_backstop(67),
         ));
     }
 
@@ -2252,7 +2226,7 @@ pub fn self_test() -> Result<String, String> {
     let _ = std::fs::remove_dir_all(&sandbox);
 
     Ok(format!(
-        "runtime: two retries per cell; environmental classifier bracketed {accepted} accept / {refused} refuse \
+        "runtime: one retry per cell; environmental classifier bracketed {accepted} accept / {refused} refuse \
          (incl. the proxy/VCS classes and the 5 measured build-tool phrasings, one of them \
          spanning a cargo Caused-by block), node-detail extraction 1 hit / 2 miss (incl. partial), \
          retry verdict 1 confirmed / 1 refuted / 1 unconfirmed with all 3 refuted shapes, \
