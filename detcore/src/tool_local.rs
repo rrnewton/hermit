@@ -637,56 +637,69 @@ impl FileMetadata {
         closed
     }
 
-    /// set default fds
+    /// Register the three descriptions inherited from the process that invoked
+    /// Hermit. Their status flags are live input, not an empty placeholder, and
+    /// aliases that already name the same Linux open file description must
+    /// share one modeled description too.
     fn setup_stdio(mut self, _pid: Pid, owner: DetTid) -> Self {
-        // guest stdio can be a pipe, which make things difficult
-        // hence use a dummy stat here.
-        // SAFETY: stating stdin is likely to always be safe
-        let stat: DetStat = stat::fstat(unsafe { BorrowedFd::borrow_raw(0) })
-            .unwrap()
-            .into();
-        let stdin = DetFd::new(
-            0,
-            OFlag::empty(),
-            FdType::Regular,
-            self.allocate_open_file_id(owner, FdType::Regular),
-        )
-        .with_stat(stat)
-        .with_resource(ResourceID::Device(Device::ContainerStdin));
-        let stdout = DetFd::new(
-            1,
-            OFlag::empty(),
-            FdType::Regular,
-            self.allocate_open_file_id(owner, FdType::Regular),
-        )
-        .with_stat(stat)
-        .with_resource(ResourceID::Device(Device::ContainerStdout));
-        let stderr = DetFd::new(
-            2,
-            OFlag::empty(),
-            FdType::Regular,
-            self.allocate_open_file_id(owner, FdType::Regular),
-        )
-        .with_stat(stat)
-        .with_resource(ResourceID::Device(Device::ContainerStderr));
+        for fd in 0..=2 {
+            let status_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(
+                status_flags >= 0 && fd_flags >= 0,
+                "container stdio descriptor {fd} must be open"
+            );
+            // SAFETY: the descriptor was just confirmed live by fcntl.
+            let raw_stat = stat::fstat(unsafe { BorrowedFd::borrow_raw(fd) }).unwrap();
+            let mut flags = OFlag::from_bits_truncate(status_flags);
+            if fd_flags & libc::FD_CLOEXEC != 0 {
+                flags.insert(OFlag::O_CLOEXEC);
+            }
 
-        // These descriptors existed before Detcore began observing the guest,
-        // so they may already carry flock state that we cannot query.
-        stdin.mark_flock_mode_unobserved();
-        stdout.mark_flock_mode_unobserved();
-        stderr.mark_flock_mode_unobserved();
+            let alias = (0..fd).find_map(|candidate| {
+                same_open_file_description(candidate, fd).then(|| {
+                    self.file_handles
+                        .get(&candidate)
+                        .expect("earlier stdio descriptor must be registered")
+                        .clone()
+                        .with_fd(fd)
+                        .with_fd_flags(flags)
+                })
+            });
+            let detfd = alias.unwrap_or_else(|| {
+                // Preserve setup_stdio's existing Regular classification. The
+                // socket-specific handlers still identify recv/send by syscall,
+                // while changing this classification would alter the ordinary
+                // read/write scheduling policy beyond status-flag containment.
+                DetFd::new(
+                    fd,
+                    flags,
+                    FdType::Regular,
+                    self.allocate_open_file_id(owner, FdType::Regular),
+                )
+                .with_stat(DetStat::from(raw_stat))
+            });
 
-        // Their status flags were never observed either: the `OFlag::empty()`
-        // above is a placeholder, not a reading. The first guest `F_GETFL`
-        // adopts the kernel's answer (see `handle_fcntl`).
-        stdin.mark_status_flags_unobserved();
-        stdout.mark_status_flags_unobserved();
-        stderr.mark_status_flags_unobserved();
+            // Prefer an output name when stdin aliases an output description,
+            // because output-specific stream semantics must apply to every alias.
+            match (fd, detfd.resource()) {
+                (0, None) => {
+                    detfd.set_resource(ResourceID::Device(Device::ContainerStdin));
+                }
+                (1, _) => {
+                    detfd.set_resource(ResourceID::Device(Device::ContainerStdout));
+                }
+                (2, None | Some(ResourceID::Device(Device::ContainerStdin))) => {
+                    detfd.set_resource(ResourceID::Device(Device::ContainerStderr));
+                }
+                _ => {}
+            }
 
-        self.add_detfd(stdin);
-        self.add_detfd(stdout);
-        self.add_detfd(stderr);
-
+            // These descriptions existed before Detcore began observing the
+            // guest, so they may already carry flock state that we cannot query.
+            detfd.mark_flock_mode_unobserved();
+            self.add_detfd(detfd);
+        }
         self
     }
 
@@ -853,6 +866,28 @@ fn stdio_resource(fd: RawFd) -> Option<ResourceID> {
         1 => Some(ResourceID::Device(Device::ContainerStdout)),
         2 => Some(ResourceID::Device(Device::ContainerStderr)),
         _ => None,
+    }
+}
+
+/// Return whether two descriptors in Hermit's process name the same Linux open
+/// file description. `kcmp(KCMP_FILE)` is the kernel operation that answers
+/// exactly that question; inode equality is not enough because two independent
+/// opens of one file have separate offsets and status flags.
+fn same_open_file_description(left: RawFd, right: RawFd) -> bool {
+    const KCMP_FILE: libc::c_int = 0;
+    // SAFETY: kcmp only compares descriptor-table entries owned by this process.
+    let pid = unsafe { libc::getpid() };
+    let comparison = unsafe { libc::syscall(libc::SYS_kcmp, pid, pid, KCMP_FILE, left, right) };
+    if comparison == -1 {
+        tracing::warn!(
+            left,
+            right,
+            error = %std::io::Error::last_os_error(),
+            "could not compare inherited stdio open file descriptions; treating them as distinct"
+        );
+        false
+    } else {
+        comparison == 0
     }
 }
 
