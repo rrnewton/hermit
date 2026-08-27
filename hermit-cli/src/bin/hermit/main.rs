@@ -380,6 +380,14 @@ impl Subcommand {
 
 #[fbinit::main]
 fn main() {
+    // ⚠️ BEFORE ANYTHING THAT CAN FORK. The stderr diagnostic wait is bounded per
+    // INVOCATION, and the counter every hermit process of this invocation charges
+    // is a shared mapping that children inherit across fork. A mapping made after
+    // the first fork is not shared with the child that already exists, so each
+    // would get its own counter and the ceiling would be multiplied by the number
+    // of container inits -- which is two on every `--verify` path. This placement
+    // dominates all seven fork sites in run.rs, replay.rs and record_start.rs.
+    detcore::util::init_shared_stderr_wait_accumulator();
     if let Some(status) = liteinst_activation_probe() {
         status.raise_or_exit();
     }
