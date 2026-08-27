@@ -6,7 +6,6 @@
 
 import http.server
 import secrets
-import sys
 import threading
 import time
 import urllib.request
@@ -28,8 +27,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 
-port = int(sys.argv[1])
-server = http.server.HTTPServer(("127.0.0.1", port), Handler)
+server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+port = server.server_port
 server.timeout = 10
 thread = threading.Thread(target=server.handle_request)
 thread.start()

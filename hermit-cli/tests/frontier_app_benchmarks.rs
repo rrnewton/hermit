@@ -15,7 +15,6 @@
 //! are used.
 
 use std::ffi::OsString;
-use std::net::TcpListener;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -199,14 +198,6 @@ fn assert_occasional_application_script(script_name: &str, success_marker: &str)
     );
 }
 
-fn unused_loopback_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .expect("failed to reserve a loopback port")
-        .local_addr()
-        .expect("failed to read the reserved loopback port")
-        .port()
-}
-
 #[test]
 #[ignore = "requires PMU, mount namespaces, and sqlite3"]
 fn sqlite_transaction_is_nondeterministic_natively_and_l2_under_hermit() {
@@ -262,17 +253,37 @@ fn redis_deep_session_is_nondeterministic_natively_and_l2_under_hermit() {
 #[ignore = "requires PMU, mount namespaces, and Python 3"]
 fn http_server_is_nondeterministic_natively_and_l2_under_hermit() {
     let script = repository().join("hermit-cli/tests/fixtures/frontier-apps/http_server.py");
-    let port = unused_loopback_port().to_string();
     let workload = Workload {
         name: "Python HTTP server benchmark",
         nondeterminism: "response-clock-and-entropy",
         program: required_app("python3", &["/usr/bin/python3", "/usr/local/bin/python3"]),
-        args: vec![script.into_os_string(), port.into()],
+        args: vec![script.into_os_string()],
         output_marker: "status=200 path=/frontier time=",
     };
 
     workload.assert_native_nondeterminism();
     workload.assert_l2_under_strict_hermit();
+}
+
+#[test]
+fn http_server_port_allocation_handles_two_concurrent_instances() {
+    let script = repository().join("tests/e2e/lib/applications/http_server.sh");
+    let output = Command::new("timeout")
+        .args(["--kill-after", KILL_AFTER, NATIVE_TIMEOUT])
+        .arg(&script)
+        .arg("--self-test-port-allocation")
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start {}: {error}", script.display()));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success()
+            && stdout.contains("PID-derived collision:")
+            && stdout.contains("second-instance=refused")
+            && stdout.contains("kernel-assigned concurrent ports:")
+            && stdout.contains("both=passed"),
+        "HTTP server port-allocation controls did not pass\n{}",
+        render_output(&output),
+    );
 }
 
 #[test]
