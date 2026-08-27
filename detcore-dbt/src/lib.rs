@@ -41,6 +41,7 @@ use detcore::DetTid;
 use detcore::Detcore;
 use detcore::GlobalState;
 use detcore::UnsupportedSyscallError;
+use detcore::prepare_exec;
 use rand::RngExt as _;
 use reverie::Error;
 use reverie::ExitStatus;
@@ -73,7 +74,7 @@ const MAX_OBSERVED_BUFFER: usize = 1024 * 1024;
 const RANDOM_FILL_CHUNK_BYTES: usize = 4096;
 const GETRANDOM_MAX_BYTES: usize = (i32::MAX as usize) & !4095;
 const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | libc::GRND_INSECURE;
-const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 3;
+const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 4;
 const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 48;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -430,6 +431,55 @@ fn translate_self_identity_targets(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+fn restarted_exact_child_wait_target(
+    signal_context: &libc::ucontext_t,
+    opcode: [u8; 2],
+) -> Option<(usize, i32)> {
+    if opcode != [0x0f, 0x05] {
+        return None;
+    }
+    let gregs = &signal_context.uc_mcontext.gregs;
+    let sysnum = gregs[libc::REG_RAX as usize];
+    let (target_register, physical_pid, terminal_events_only) =
+        if sysnum == libc::SYS_wait4 as libc::greg_t {
+            let options = gregs[libc::REG_RDX as usize] as libc::c_int;
+            (
+                libc::REG_RDI as usize,
+                gregs[libc::REG_RDI as usize],
+                options
+                    & (libc::WNOHANG
+                        | libc::WUNTRACED
+                        | libc::WCONTINUED
+                        | libc::__WCLONE
+                        | libc::__WALL)
+                    == 0,
+            )
+        } else if sysnum == libc::SYS_waitid as libc::greg_t
+            && gregs[libc::REG_RDI as usize] == libc::P_PID as libc::greg_t
+        {
+            let options = gregs[libc::REG_R10 as usize] as libc::c_int;
+            (
+                libc::REG_RSI as usize,
+                gregs[libc::REG_RSI as usize],
+                options & libc::WEXITED != 0
+                    && options
+                        & (libc::WNOHANG
+                            | libc::WSTOPPED
+                            | libc::WCONTINUED
+                            | libc::__WCLONE
+                            | libc::__WALL)
+                        == 0,
+            )
+        } else {
+            return None;
+        };
+    if !terminal_events_only || physical_pid <= 0 || physical_pid > i32::MAX as libc::greg_t {
+        return None;
+    }
+    Some((target_register, physical_pid as i32))
+}
+
 fn run_cooperative<F: Future<Output = ()>>(future: F, idle: Idler) {
     let mut future = pin!(future);
     let waker = Waker::noop();
@@ -466,6 +516,50 @@ fn run_ready<F: Future>(future: F) -> F::Output {
             Poll::Pending => std::thread::yield_now(),
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_dbt_prepare_exec(
+    context: *mut c_void,
+    scheduler_tid: Pid,
+    physical_pid: i32,
+    branches: u64,
+    thread_state: &mut DetcoreThreadState,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    write_registers: RegisterWriter,
+) {
+    let runtime = current_runtime();
+    let mm = thread_state.mm_id;
+    let (tid, pid) = prepare_exec_guest_identity(scheduler_tid, physical_pid);
+    let mut guest = DbtGuest::<Detcore>::new(
+        context as usize,
+        tid,
+        pid,
+        None,
+        branches,
+        thread_state,
+        &runtime.global,
+        &runtime.config,
+        invoke_syscall,
+        read_registers,
+        write_registers,
+    );
+    run_ready(prepare_exec(
+        &mut guest,
+        mm,
+        std::collections::BTreeSet::new(),
+    ));
+}
+
+fn prepare_exec_guest_identity(scheduler_tid: Pid, physical_pid: i32) -> (Pid, Pid) {
+    (scheduler_tid, Pid::from_raw(physical_pid))
+}
+
+fn should_send_dbt_prepare_exec(initialized: bool, _physical_tid: i32, _physical_pid: i32) -> bool {
+    // Linux permits a nonleader thread to exec; physical thread/process
+    // equality must not gate the scheduler reconnect.
+    initialized
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -558,6 +652,7 @@ struct NativeThreadScratch {
 static RUNTIME: LazyLock<RwLock<Option<Arc<Runtime>>>> = LazyLock::new(|| RwLock::new(None));
 static PENDING_THREAD_PARENTS: LazyLock<Mutex<HashMap<i32, PendingThreadParent>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static RUNTIME_BACKGROUND_OWNER_PID: AtomicI32 = AtomicI32::new(0);
 static IMAGE_GENERATION: AtomicU64 = AtomicU64::new(0);
 static READY_IMAGE: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -572,13 +667,14 @@ static MEMORY_HASH: AtomicU64 = AtomicU64::new(FNV_OFFSET);
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#2348): Single wiring point for the backend-selected detpid.
-/// Build a DBT thread's Detcore state and publish `det_pid` into it.
+/// Build a DBT thread's Detcore state and publish its scheduler process ID and
+/// host thread ID into it.
 ///
 /// This exists as a named function because the assignment it performs was
 /// previously duplicated at the two call sites below and lacked a direct
 /// regression test. Routing both sites through one function makes removal of
 /// the backend-selected process identity a unit-test failure; see
-/// `dbt_thread_state_publishes_the_backend_selected_detpid`.
+/// `dbt_thread_state_publishes_scheduler_and_host_identities`.
 ///
 /// `det_pid` is what `RuntimeAbi::runtime_identity` selected: the client's
 /// published virtual pid on the current v2+ callback path, the host pid under v1. It reaches
@@ -589,10 +685,12 @@ fn init_dbt_thread_state(
     tool: &Detcore,
     det_tid: Tid,
     det_pid: DetTid,
+    physical_tid: i32,
     parent: Option<(Tid, &DetcoreThreadState)>,
 ) -> DetcoreThreadState {
     let mut state = tool.init_thread_state(det_tid, parent);
     state.detpid = Some(det_pid);
+    state.physical_tid = Some(physical_tid);
     state
 }
 
@@ -1024,6 +1122,7 @@ unsafe fn runtime_background_init(callbacks: &reverie_dbt::DbtRuntimeCallbacks, 
     RUNTIME_SHUTDOWN.store(false, Ordering::Release);
     RUNTIME_PAUSE_REQUESTED.store(false, Ordering::Release);
     RUNTIME_PAUSED.store(false, Ordering::Release);
+    RUNTIME_BACKGROUND_OWNER_PID.store(unsafe { libc::getpid() }, Ordering::Release);
     emit_lifecycle_marker(
         emit_diagnostic,
         b"detcore-dbt: background client thread entered\n",
@@ -1208,7 +1307,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
     context: *mut c_void,
     tid: i32,
     pid: i32,
-    _in_tree_ppid: i32,
+    in_tree_ppid: i32,
     branch_count: u64,
     defer_runtime: i32,
     invoke_syscall: SyscallInvoker,
@@ -1253,6 +1352,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
     if host_tid <= 0 || host_pid <= 0 {
         return -1;
     }
+    reverie_dbt::set_current_ppid(in_tree_ppid);
     let runtime = current_runtime();
     let Some((det_tid, det_pid)) =
         runtime
@@ -1264,6 +1364,20 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
     let tool = runtime
         .tool
         .get_or_init(|| Detcore::new(det_pid, &runtime.config));
+    let mut inherited_parent = if host_tid == host_pid && !scratch.runtime_state.is_null() {
+        // A copied DynamoRIO process owns a copy-on-write copy of the
+        // parent's allocation. Replace it with state initialized for the
+        // child's virtual process identity.
+        let parent = Some(unsafe { Box::from_raw(scratch.runtime_state) });
+        scratch.runtime_state = std::ptr::null_mut();
+        parent
+    } else {
+        None
+    };
+    if let Some(parent) = inherited_parent.as_mut() {
+        parent.state.clone_flags =
+            Some(CloneFlags::from_bits_truncate(scratch.pending_clone_flags));
+    }
     let parent = if host_tid == host_pid {
         None
     } else {
@@ -1279,20 +1393,36 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
             Err(status) => return status,
         }
     };
-    let parent_ref = parent
+    let parent_ref = inherited_parent
         .as_ref()
-        .map(|parent| (parent.parent_tid, &parent.state));
+        .map(|parent| (Tid::from_raw(parent.tid.into()), &parent.state))
+        .or_else(|| {
+            parent
+                .as_ref()
+                .map(|parent| (parent.parent_tid, &parent.state))
+        });
     let host_pid = Pid::from_raw(host_pid);
-    let mut state =
-        init_dbt_thread_state(tool, det_tid, DetTid::from_raw(det_pid.into()), parent_ref);
+    let mut state = init_dbt_thread_state(
+        tool,
+        det_tid,
+        DetTid::from_raw(det_pid.into()),
+        host_tid,
+        parent_ref,
+    );
     if let Some(parent) = &parent {
         state.reseed_child_rngs(&parent.state, parent.rng_entropy);
+    } else if let Some(parent) = &inherited_parent {
+        let child_ordinal = runtime.next_child_ordinal.fetch_add(1, Ordering::SeqCst);
+        let Some(rng_entropy) = dbt_child_rng_entropy(scratch.virtual_pid, child_ordinal) else {
+            return -1;
+        };
+        state.reseed_child_rngs(&parent.state, rng_entropy);
     }
     let mut thread = Box::new(ThreadRuntime {
         tid: Pid::from_raw(det_tid.into()),
         state,
         initialized: false,
-        post_exec_pending: host_tid == pid,
+        post_exec_pending: host_tid == pid && inherited_parent.is_none(),
     });
     if reverie_dbt::run_tool_thread_start(
         tool,
@@ -1313,6 +1443,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
     }
     thread.initialized = true;
     scratch.runtime_state = Box::into_raw(thread);
+    scratch.pending_clone_flags = 0;
     0
 }
 
@@ -1404,6 +1535,8 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_created_v2(
             child_scheduler_tid,
             child_tid_addr as usize,
             flags,
+            (flags.bits() & 0xff) as libc::c_int,
+            Some((pid, child_tid)),
         ));
     }
     parent.state.clone_flags = None;
@@ -1418,10 +1551,30 @@ fn successful_process_clone_result(sysnum: i64, result: i64) -> bool {
         )
 }
 
+fn process_child_registration(
+    sysnum: i64,
+    result: i64,
+    virtual_child_tid: i32,
+    raw_flags: u64,
+    exit_signal: i32,
+) -> Option<(Tid, CloneFlags, libc::c_int)> {
+    if result <= 0 || virtual_child_tid <= 0 {
+        return None;
+    }
+    let flags = CloneFlags::from_bits_truncate(raw_flags);
+    if flags.intersects(CloneFlags::CLONE_THREAD | CloneFlags::CLONE_VFORK)
+        || !matches!(sysnum, libc::SYS_fork | libc::SYS_clone | libc::SYS_clone3)
+    {
+        return None;
+    }
+    Some((Tid::from_raw(virtual_child_tid), flags, exit_signal))
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ProcessCloneProperties {
     blocks_parent: bool,
     shares_files_without_thread: bool,
+    shares_memory_without_thread: bool,
 }
 
 /// Decode process-lifecycle properties that must be decided before a copy.
@@ -1462,6 +1615,8 @@ fn process_clone_properties(
         blocks_parent: flags & libc::CLONE_VFORK as u64 != 0,
         shares_files_without_thread: flags & libc::CLONE_FILES as u64 != 0
             && flags & libc::CLONE_THREAD as u64 == 0,
+        shares_memory_without_thread: flags & libc::CLONE_VM as u64 != 0
+            && flags & (libc::CLONE_THREAD | libc::CLONE_VFORK) as u64 == 0,
     }
 }
 
@@ -1478,15 +1633,78 @@ fn process_clone_properties(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reverie_dbt_runtime_process_clone_result(
     scratch: *mut c_void,
+    context: *mut c_void,
+    _parent_tid: i32,
+    pid: i32,
+    branch_count: u64,
     sysnum: i64,
     result: i64,
-) {
+    virtual_child_tid: i32,
+    child_tid_addr: u64,
+    raw_flags: u64,
+    exit_signal: i32,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    write_registers: RegisterWriter,
+) -> i32 {
     let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
     if successful_process_clone_result(sysnum, result) && !scratch.runtime_state.is_null() {
         unsafe { &mut *scratch.runtime_state }
             .state
             .forget_flock_modes();
     }
+
+    if result > 0
+        && virtual_child_tid > 0
+        && matches!(sysnum, libc::SYS_fork | libc::SYS_clone | libc::SYS_clone3)
+        && raw_flags & (libc::CLONE_THREAD | libc::CLONE_VFORK) as u64 == 0
+        && exit_signal < 0
+    {
+        return -1;
+    }
+    let Some((child_scheduler_tid, flags, exit_signal)) =
+        process_child_registration(sysnum, result, virtual_child_tid, raw_flags, exit_signal)
+    else {
+        return 0;
+    };
+    if scratch.runtime_state.is_null() {
+        return 0;
+    }
+
+    let runtime = current_runtime();
+    let tool = runtime
+        .tool
+        .get()
+        .expect("Detcore DBT tool was initialized");
+    let parent = unsafe { &mut *scratch.runtime_state };
+    let Some(child_scheduler_tid) = runtime
+        .abi
+        .scheduler_tid(child_scheduler_tid.as_raw(), result as i32)
+    else {
+        return -1;
+    };
+    let mut guest = DbtGuest::new(
+        context as usize,
+        parent.tid,
+        Pid::from_raw(pid),
+        None,
+        branch_count,
+        &mut parent.state,
+        &runtime.global,
+        &runtime.config,
+        invoke_syscall,
+        read_registers,
+        write_registers,
+    );
+    run_ready(tool.register_external_child(
+        &mut guest,
+        child_scheduler_tid,
+        child_tid_addr as usize,
+        flags,
+        exit_signal,
+        Some((result as i32, result as i32)),
+    ));
+    0
 }
 
 /// Compatibility entry point for native clients using callback ABI version 1.
@@ -1536,9 +1754,9 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_created(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reverie_dbt_runtime_thread_exit(
     scratch: *mut c_void,
-    _context: *mut c_void,
+    context: *mut c_void,
     _tid: i32,
-    _invoke_syscall: SyscallInvoker,
+    invoke_syscall: SyscallInvoker,
 ) {
     let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
     if scratch.runtime_state.is_null() {
@@ -1557,8 +1775,10 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_exit(
             .tool
             .get()
             .expect("Detcore DBT tool was initialized");
-        let _ = reverie_dbt::run_tool_thread_exit(
+        let _ = reverie_dbt::run_tool_thread_exit_from_guest(
             tool,
+            context as usize,
+            invoke_syscall,
             tid,
             state,
             &runtime.global,
@@ -1838,70 +2058,17 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
     } else {
         None
     };
-    if sysnum == libc::SYS_execveat {
-        unsafe { result.write(-(Errno::ENOSYS.into_raw() as i64)) };
-        TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
-        return 1;
-    }
-    let clone_properties = process_clone_properties(sysnum, raw_args, |address, bytes| unsafe {
-        read_memory(address, bytes.as_mut_ptr(), bytes.len()) != 0
-    });
-    if clone_properties.shares_files_without_thread {
-        emit_lifecycle_marker(
-            emit,
-            b"detcore-dbt: refusing process clone with CLONE_FILES without CLONE_THREAD; copied child cannot share descriptor-table provenance\n",
-        );
-        return -1;
-    }
-    if clone_properties.blocks_parent
-        && !scratch.runtime_state.is_null()
-        && unsafe { &*scratch.runtime_state }
-            .state
-            .has_unsafe_vfork_flock_state()
-    {
-        emit_lifecycle_marker(
-            emit,
-            b"detcore-dbt: refusing vfork/CLONE_VFORK while an open file description may hold a flock\n",
-        );
-        return -1;
-    }
 
-    // clone(2) and clone3(2) return in both the parent and child. Injecting
-    // either from this callback makes the child return on the client stack.
-    if requires_native_lifecycle(sysnum) {
-        if sysnum == libc::SYS_execve {
-            READY_IMAGE.store(0, Ordering::Release);
-            RUNTIME_PAUSE_REQUESTED.store(true, Ordering::Release);
-            while !RUNTIME_PAUSED.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
-            assert_eq!(
-                IMAGE_GENERATION.load(Ordering::Acquire),
-                image_generation,
-                "DBT image generation changed while pausing for exec"
-            );
-        }
-        return 0;
-    }
+    // Clone-family and exec syscalls return through native lifecycle handling
+    // below. Initialize the local Detcore state before that early return so a
+    // process whose first intercepted syscall is fork/clone/exec still has a
+    // parent state for the post-clone callback and can send PrepareExec.
     TOTAL_BRANCHES.store(branches, Ordering::Relaxed);
-    update_memory_hash(sysnum, raw_args, read_memory);
     let host_pid = Pid::from_raw(pid);
     let det_tid = Pid::from_raw(det_tid.into());
     let tool = runtime
         .tool
         .get_or_init(|| Detcore::new(det_pid, &runtime.config));
-    let syscall = Syscall::from_raw(
-        Sysno::from(sysnum as i32),
-        SyscallArgs::new(
-            dispatch_args[0] as usize,
-            dispatch_args[1] as usize,
-            dispatch_args[2] as usize,
-            dispatch_args[3] as usize,
-            dispatch_args[4] as usize,
-            dispatch_args[5] as usize,
-        ),
-    );
-
     if first_event {
         emit_lifecycle_marker(emit, b"detcore-dbt: initializing Detcore thread state\n");
     }
@@ -1913,6 +2080,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
             tool,
             Tid::from_raw(det_tid.into()),
             DetTid::from_raw(det_pid.into()),
+            tid,
             None,
         );
         let Some(open_file_creator) = runtime.abi.open_file_creator(scratch.virtual_tid, tid)
@@ -1986,6 +2154,151 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         }
         thread.post_exec_pending = false;
     }
+
+    #[cfg(target_arch = "x86_64")]
+    if sysnum == libc::SYS_rt_sigreturn {
+        let mut current: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        let read_current = unsafe { read_registers(context as usize, &mut current) };
+        let mut signal_context: libc::ucontext_t = unsafe { std::mem::zeroed() };
+        let read_context = unsafe {
+            read_memory(
+                current.rsp as usize,
+                (&mut signal_context as *mut libc::ucontext_t).cast(),
+                std::mem::size_of::<libc::ucontext_t>(),
+            )
+        };
+        if read_current != 0 && read_context != 0 {
+            let mut opcode = [0_u8; 2];
+            let restart_rip = signal_context.uc_mcontext.gregs[libc::REG_RIP as usize];
+            let read_opcode =
+                unsafe { read_memory(restart_rip as usize, opcode.as_mut_ptr(), opcode.len()) };
+            if read_opcode != 0
+                && let Some((target_register, physical_pid)) =
+                    restarted_exact_child_wait_target(&signal_context, opcode)
+            {
+                let mut guest = DbtGuest::<Detcore>::new(
+                    context as usize,
+                    det_tid,
+                    host_pid,
+                    None,
+                    branches,
+                    &mut thread.state,
+                    &runtime.global,
+                    &runtime.config,
+                    invoke_syscall,
+                    read_registers,
+                    write_registers,
+                );
+                if let Some(process) =
+                    run_ready(tool.registered_process_for_physical_pid(&mut guest, physical_pid))
+                {
+                    signal_context.uc_mcontext.gregs[target_register] =
+                        process.as_raw() as libc::greg_t;
+                    let wrote = unsafe {
+                        write_memory(
+                            current.rsp as usize,
+                            (&signal_context as *const libc::ucontext_t).cast(),
+                            std::mem::size_of::<libc::ucontext_t>(),
+                        )
+                    };
+                    if wrote == 0 {
+                        emit_lifecycle_marker(
+                            emit,
+                            b"detcore-dbt: failed to rewrite a restarted child wait target\n",
+                        );
+                        return -1;
+                    }
+                }
+            }
+        }
+    }
+
+    if sysnum == libc::SYS_execveat {
+        unsafe { result.write(-(Errno::ENOSYS.into_raw() as i64)) };
+        TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+        return 1;
+    }
+    let clone_properties = process_clone_properties(sysnum, raw_args, |address, bytes| unsafe {
+        read_memory(address, bytes.as_mut_ptr(), bytes.len()) != 0
+    });
+    if clone_properties.shares_files_without_thread {
+        emit_lifecycle_marker(
+            emit,
+            b"detcore-dbt: refusing process clone with CLONE_FILES without CLONE_THREAD; copied child cannot share descriptor-table provenance\n",
+        );
+        return -1;
+    }
+    if clone_properties.shares_memory_without_thread {
+        emit_lifecycle_marker(
+            emit,
+            b"detcore-dbt: refusing process clone with CLONE_VM without CLONE_THREAD or CLONE_VFORK; copied child cannot own inherited Detcore state\n",
+        );
+        return -1;
+    }
+    if clone_properties.blocks_parent
+        && !scratch.runtime_state.is_null()
+        && unsafe { &*scratch.runtime_state }
+            .state
+            .has_unsafe_vfork_flock_state()
+    {
+        emit_lifecycle_marker(
+            emit,
+            b"detcore-dbt: refusing vfork/CLONE_VFORK while an open file description may hold a flock\n",
+        );
+        return -1;
+    }
+
+    // clone(2) and clone3(2) return in both the parent and child. Injecting
+    // either from this callback makes the child return on the client stack.
+    if requires_native_lifecycle(sysnum) {
+        if sysnum == libc::SYS_execve {
+            // Linux permits a nonleader thread to exec. Detcore's PrepareExec
+            // reconnect path accepts that thread's scheduler identity, so
+            // every initialized thread must notify it before entering exec.
+            // Only the external runtime pause below remains process-owner
+            // gated.
+            if !scratch.runtime_state.is_null() {
+                let thread = unsafe { &mut *scratch.runtime_state };
+                if should_send_dbt_prepare_exec(thread.initialized, tid, pid) {
+                    send_dbt_prepare_exec(
+                        context,
+                        thread.tid,
+                        pid,
+                        branches,
+                        &mut thread.state,
+                        invoke_syscall,
+                        read_registers,
+                        write_registers,
+                    );
+                }
+            }
+            if RUNTIME_BACKGROUND_OWNER_PID.load(Ordering::Acquire) == pid {
+                READY_IMAGE.store(0, Ordering::Release);
+                RUNTIME_PAUSE_REQUESTED.store(true, Ordering::Release);
+                while !RUNTIME_PAUSED.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                assert_eq!(
+                    IMAGE_GENERATION.load(Ordering::Acquire),
+                    image_generation,
+                    "DBT image generation changed while pausing for exec"
+                );
+            }
+        }
+        return 0;
+    }
+    update_memory_hash(sysnum, raw_args, read_memory);
+    let syscall = Syscall::from_raw(
+        Sysno::from(sysnum as i32),
+        SyscallArgs::new(
+            dispatch_args[0] as usize,
+            dispatch_args[1] as usize,
+            dispatch_args[2] as usize,
+            dispatch_args[3] as usize,
+            dispatch_args[4] as usize,
+            dispatch_args[5] as usize,
+        ),
+    );
 
     if first_event {
         emit_lifecycle_marker(
@@ -2143,7 +2456,7 @@ mod tests {
 
     #[test]
     fn exported_runtime_identity_matches_the_pinned_reverie_abi() {
-        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 3);
+        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 4);
         assert_eq!(
             reverie_dbt::DBT_RUNTIME_ABI_VERSION,
             IMPLEMENTED_DBT_RUNTIME_ABI_VERSION
@@ -2289,8 +2602,22 @@ mod tests {
         let _: unsafe extern "C" fn(*mut c_void, *mut c_void, i32, SyscallInvoker) =
             reverie_dbt_runtime_thread_exit;
         let _: unsafe extern "C" fn(*mut c_void, i32) = reverie_dbt_runtime_exec_failed;
-        let _: unsafe extern "C" fn(*mut c_void, i64, i64) =
-            reverie_dbt_runtime_process_clone_result;
+        let _: unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            i32,
+            i32,
+            u64,
+            i64,
+            i64,
+            i32,
+            u64,
+            u64,
+            i32,
+            SyscallInvoker,
+            RegisterReader,
+            RegisterWriter,
+        ) -> i32 = reverie_dbt_runtime_process_clone_result;
         let _: unsafe extern "C" fn(i64, *const u64) -> i32 = reverie_dbt_runtime_copied_syscall;
         let _: unsafe extern "C" fn(
             *mut c_void,
@@ -2453,6 +2780,48 @@ mod tests {
     }
 
     #[test]
+    fn process_child_registration_uses_only_successful_parent_results() {
+        let fork = process_child_registration(libc::SYS_fork, 91_001, 4, 0, libc::SIGCHLD)
+            .expect("successful parent-side fork must register the virtual child");
+        assert_eq!(fork.0, Tid::from_raw(4));
+        assert!(fork.1.is_empty());
+        assert_eq!(fork.2, libc::SIGCHLD);
+
+        let raw_flags = libc::CLONE_PARENT as u64;
+        let clone =
+            process_child_registration(libc::SYS_clone, 91_002, 5, raw_flags, libc::SIGUSR1)
+                .expect("successful parent-side process clone must be registered");
+        assert_eq!(clone.0, Tid::from_raw(5));
+        assert!(clone.1.contains(CloneFlags::CLONE_PARENT));
+        assert_eq!(clone.2, libc::SIGUSR1);
+
+        assert_eq!(
+            process_child_registration(libc::SYS_fork, 0, 4, 0, libc::SIGCHLD),
+            None,
+            "the child-side result must not register itself"
+        );
+        assert_eq!(
+            process_child_registration(libc::SYS_clone, 91_003, 6, libc::CLONE_THREAD as u64, 0,),
+            None,
+            "thread clones keep the existing thread-created callback"
+        );
+        assert_eq!(
+            process_child_registration(
+                libc::SYS_vfork,
+                91_004,
+                7,
+                libc::CLONE_VFORK as u64,
+                libc::SIGCHLD,
+            ),
+            None,
+            "vfork keeps the existing copied-child path"
+        );
+        assert!(
+            process_child_registration(libc::SYS_clone3, 91_005, 8, 0, libc::SIGUSR2).is_some()
+        );
+    }
+
+    #[test]
     fn process_clone_properties_cover_vfork_and_shared_files_forms() {
         let empty = [0; 6];
         assert_eq!(
@@ -2468,6 +2837,7 @@ mod tests {
             ProcessCloneProperties {
                 blocks_parent: true,
                 shares_files_without_thread: false,
+                shares_memory_without_thread: false,
             }
         );
 
@@ -2482,8 +2852,20 @@ mod tests {
             !process_clone_properties(libc::SYS_clone, &clone, |_, _| false)
                 .shares_files_without_thread
         );
+        clone[0] = libc::CLONE_VM as u64;
+        assert!(
+            process_clone_properties(libc::SYS_clone, &clone, |_, _| false)
+                .shares_memory_without_thread
+        );
+        clone[0] = (libc::CLONE_VM | libc::CLONE_THREAD) as u64;
+        assert!(
+            !process_clone_properties(libc::SYS_clone, &clone, |_, _| false)
+                .shares_memory_without_thread
+        );
         clone[0] = libc::CLONE_VFORK as u64;
-        assert!(process_clone_properties(libc::SYS_clone, &clone, |_, _| false).blocks_parent);
+        let vfork = process_clone_properties(libc::SYS_clone, &clone, |_, _| false);
+        assert!(vfork.blocks_parent);
+        assert!(!vfork.shares_memory_without_thread);
 
         let address = 0x2345;
         let mut clone3 = [0; 6];
@@ -2547,6 +2929,63 @@ mod tests {
     }
 
     #[test]
+    fn prepare_exec_uses_scheduler_tid_and_physical_pid() {
+        let scheduler_tid = Pid::from_raw(4);
+        let physical_pid = 918_851;
+
+        assert_eq!(
+            prepare_exec_guest_identity(scheduler_tid, physical_pid),
+            (scheduler_tid, Pid::from_raw(physical_pid))
+        );
+        assert!(should_send_dbt_prepare_exec(
+            true,
+            physical_pid + 1,
+            physical_pid
+        ));
+        assert!(should_send_dbt_prepare_exec(
+            true,
+            physical_pid,
+            physical_pid
+        ));
+        assert!(!should_send_dbt_prepare_exec(
+            false,
+            physical_pid + 1,
+            physical_pid
+        ));
+    }
+
+    #[test]
+    fn lifecycle_syscalls_follow_thread_state_initialization() {
+        let source = include_str!("lib.rs");
+        let dispatch = source
+            .split_once("pub unsafe extern \"C\" fn reverie_dbt_runtime_pre_syscall")
+            .expect("pre-syscall callback")
+            .1;
+        let initialize = dispatch
+            .find("if scratch.runtime_state.is_null()")
+            .expect("lazy thread-state initialization");
+        let lifecycle = dispatch
+            .find("if requires_native_lifecycle(sysnum)")
+            .expect("native lifecycle early return");
+        let vfork_policy = dispatch
+            .find("if clone_properties.blocks_parent")
+            .expect("vfork flock policy");
+
+        assert!(
+            initialize < lifecycle,
+            "fork/clone/exec must not return before lazy thread-state initialization"
+        );
+        assert!(
+            vfork_policy < lifecycle,
+            "vfork/CLONE_VFORK flock state must be checked before native execution"
+        );
+        assert!(
+            !dispatch[..lifecycle].contains("if tid == pid && !scratch.runtime_state.is_null()"),
+            "nonleader exec must send PrepareExec"
+        );
+    }
+
+    #[test]
     fn version_one_child_handoff_matches_on_physical_identity() {
         let config = Config::default();
         let tool: Detcore = Detcore::new(Pid::from_raw(44_003), &config);
@@ -2593,10 +3032,10 @@ mod tests {
     // TODO-HUMAN-REVIEW(#2348)
     /// THE WIRING BRACKET. The other identity tests exercise `RuntimeAbi` as a
     /// pure selector; this one reaches the assignment that delivers the selected
-    /// process id into the thread state. It fails when that assignment is
-    /// removed or fed the wrong identity.
+    /// process id and host thread ID into the thread state. It fails when either
+    /// assignment is removed or fed the wrong identity.
     #[test]
-    fn dbt_thread_state_publishes_the_backend_selected_detpid() {
+    fn dbt_thread_state_publishes_scheduler_and_host_identities() {
         let config = Config::default();
         let tool: Detcore = Detcore::new(Pid::from_raw(3), &config);
 
@@ -2610,7 +3049,13 @@ mod tests {
         let (det_tid, det_pid) = RuntimeAbi::Current
             .runtime_identity(virtual_tid, virtual_pid, host_tid, host_pid)
             .expect("current callbacks publish positive virtual ids");
-        let state = init_dbt_thread_state(&tool, det_tid, DetTid::from_raw(det_pid.into()), None);
+        let state = init_dbt_thread_state(
+            &tool,
+            det_tid,
+            DetTid::from_raw(det_pid.into()),
+            host_tid,
+            None,
+        );
         assert_eq!(
             state.detpid,
             Some(DetTid::from_raw(virtual_pid)),
@@ -2623,6 +3068,7 @@ mod tests {
             Some(DetTid::from_raw(host_pid)),
             "the host pid must not replace current callback path's published virtual process identity"
         );
+        assert_eq!(state.physical_tid, Some(host_tid));
 
         // v1 selects the PHYSICAL pid, so the same helper must carry a different
         // value. Without this the test would pass against an implementation that
@@ -2630,13 +3076,19 @@ mod tests {
         let (det_tid_v1, det_pid_v1) = RuntimeAbi::V1
             .runtime_identity(virtual_tid, virtual_pid, host_tid, host_pid)
             .expect("v1 falls back to positive physical ids");
-        let state_v1 =
-            init_dbt_thread_state(&tool, det_tid_v1, DetTid::from_raw(det_pid_v1.into()), None);
+        let state_v1 = init_dbt_thread_state(
+            &tool,
+            det_tid_v1,
+            DetTid::from_raw(det_pid_v1.into()),
+            host_tid,
+            None,
+        );
         assert_eq!(
             state_v1.detpid,
             Some(DetTid::from_raw(host_pid)),
             "v1 keeps physical process identity"
         );
+        assert_eq!(state_v1.physical_tid, Some(host_tid));
         assert_ne!(
             state.detpid, state_v1.detpid,
             "if the two ABIs published the same pid this bracket would prove nothing"
@@ -3018,6 +3470,59 @@ mod tests {
         ] {
             assert!(!requires_native_lifecycle(sysnum));
         }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn restarted_exact_child_wait_target_requires_kernel_restart_context() {
+        let mut context: libc::ucontext_t = unsafe { std::mem::zeroed() };
+        context.uc_mcontext.gregs[libc::REG_RAX as usize] = libc::SYS_wait4 as libc::greg_t;
+        context.uc_mcontext.gregs[libc::REG_RDI as usize] = 42;
+        assert_eq!(
+            restarted_exact_child_wait_target(&context, [0x0f, 0x05]),
+            Some((libc::REG_RDI as usize, 42))
+        );
+
+        context.uc_mcontext.gregs[libc::REG_RAX as usize] = -(libc::EINTR as libc::greg_t);
+        assert_eq!(
+            restarted_exact_child_wait_target(&context, [0x0f, 0x05]),
+            None,
+            "a non-restarting signal frame must retain its EINTR result"
+        );
+
+        context.uc_mcontext.gregs[libc::REG_RAX as usize] = libc::SYS_wait4 as libc::greg_t;
+        assert_eq!(
+            restarted_exact_child_wait_target(&context, [0x48, 0x3d]),
+            None,
+            "a ucontext redirected past the syscall must not be rewritten"
+        );
+        context.uc_mcontext.gregs[libc::REG_RDX as usize] = libc::WNOHANG as libc::greg_t;
+        assert_eq!(
+            restarted_exact_child_wait_target(&context, [0x0f, 0x05]),
+            None,
+            "a nonblocking wait must not enter the blocking restart path"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn restarted_exact_waitid_target_uses_the_saved_pid_argument() {
+        let mut context: libc::ucontext_t = unsafe { std::mem::zeroed() };
+        context.uc_mcontext.gregs[libc::REG_RAX as usize] = libc::SYS_waitid as libc::greg_t;
+        context.uc_mcontext.gregs[libc::REG_RDI as usize] = libc::P_PID as libc::greg_t;
+        context.uc_mcontext.gregs[libc::REG_RSI as usize] = 43;
+        context.uc_mcontext.gregs[libc::REG_R10 as usize] = libc::WEXITED as libc::greg_t;
+        assert_eq!(
+            restarted_exact_child_wait_target(&context, [0x0f, 0x05]),
+            Some((libc::REG_RSI as usize, 43))
+        );
+
+        context.uc_mcontext.gregs[libc::REG_RDI as usize] = libc::P_ALL as libc::greg_t;
+        assert_eq!(
+            restarted_exact_child_wait_target(&context, [0x0f, 0x05]),
+            None,
+            "only an exact P_PID wait belongs to this translation"
+        );
     }
 
     /// Every `Determinized` syscall that this gate currently lets run natively

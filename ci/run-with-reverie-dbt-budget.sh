@@ -117,7 +117,13 @@ fi
 # and nothing in the bump said so. A Reverie bump and this expected_pin are coupled
 # and the coupling is invisible from the bump side; whoever moves the pin next
 # should expect to move this too.
-expected_pin=86d9003a7a2a8d5399ef94a251e4d991d6c504a5
+# CARRY TO 7137c5dd (2026-08-27):
+# 86d9003a..7137c5dd changes no DBT build input. Verified by git object ID:
+#     reverie-dbt/vendor/dynamorio  de352475846e -> de352475846e
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+#     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
+# so the measured effective-job-seconds budget carries unchanged.
+expected_pin=7137c5ddba398728f8fc8e7068a198ce4223f9c3
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
