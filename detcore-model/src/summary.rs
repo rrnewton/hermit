@@ -102,8 +102,8 @@ pub struct RunSummary {
     pub num_threads: u64,
 
     /// Total syscalls completed by all guest threads.
-    #[serde(default)]
-    pub syscalls: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub syscalls: Option<u64>,
 
     /// Deterministic virtual nanoseconds elapsed while computing.
     pub virttime_elapsed: u64,
@@ -148,7 +148,9 @@ impl fmt::Display for RunSummary {
             "There were {} group leaders of {} thread(s) total.",
             num_processes, num_threads
         )?;
-        writeln!(f, "Guest threads completed {syscalls} syscalls.")?;
+        if let Some(syscalls) = syscalls {
+            writeln!(f, "Guest threads completed {syscalls} syscalls.")?;
+        }
         writeln!(
             f,
             "Internally, the hermit scheduler ran {} turns, recorded {} events, replayed {} events ({} desynced)",
@@ -276,11 +278,20 @@ mod tests {
     }
 
     #[test]
-    fn older_summary_json_defaults_the_new_syscall_total() {
+    fn older_summary_json_keeps_an_unrecorded_syscall_total_absent() {
         let value = serde_json::to_value(RunSummary::default()).unwrap();
         let mut object = value.as_object().unwrap().clone();
         object.remove("syscalls");
         let parsed: RunSummary = serde_json::from_value(object.into()).unwrap();
-        assert_eq!(parsed.syscalls, 0);
+        assert_eq!(parsed.syscalls, None);
+
+        let measured = RunSummary {
+            syscalls: Some(0),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&measured).unwrap();
+        assert_eq!(value["syscalls"], 0);
+        let parsed: RunSummary = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.syscalls, Some(0));
     }
 }
