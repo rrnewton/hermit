@@ -836,6 +836,10 @@ struct ResultRow {
     first_divergent_scheduler_turn: Option<u64>,
     #[serde(default)]
     first_divergent_virtual_nanoseconds: Option<u64>,
+    #[serde(default)]
+    first_divergent_left_message: Option<String>,
+    #[serde(default)]
+    first_divergent_right_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     run_index: Option<u64>,
     hermit_sha: String,
@@ -992,6 +996,11 @@ struct InvocationAttempt {
 #[derive(Debug, Deserialize)]
 struct RequiredNullableU64(Option<u64>);
 
+/// A string field that must be PRESENT and may be NULL. The same producer
+/// contract as `RequiredNullableU64`, applied to the compared messages.
+#[derive(Debug, Deserialize)]
+struct RequiredNullableString(Option<String>);
+
 #[derive(Debug, Deserialize)]
 struct VerificationEvidence {
     verified: bool,
@@ -1040,6 +1049,8 @@ struct VerificationEvidence {
     /// DESERIALIZATION.
     #[allow(dead_code)]
     first_divergent_syscall: RequiredNullableU64,
+    first_divergent_left_message: RequiredNullableString,
+    first_divergent_right_message: RequiredNullableString,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -3653,6 +3664,8 @@ fn earlier_attempts_that_located(rows: &[ResultRow], terminal: u64) -> Vec<&Resu
                 || row.first_divergent_syscall.is_some()
                 || row.first_divergent_scheduler_turn.is_some()
                 || row.first_divergent_virtual_nanoseconds.is_some()
+                || row.first_divergent_left_message.is_some()
+                || row.first_divergent_right_message.is_some()
         })
         .collect();
     earlier.sort_by_key(|row| row.attempt);
@@ -4073,12 +4086,25 @@ fn read_verification_report(
             )
         })?;
     }
-    if evidence.verdict != "diverged"
-        && (evidence.first_divergent_scheduler_turn.0.is_some()
-            || evidence.first_divergent_virtual_nanoseconds.0.is_some())
+    let has_divergence_evidence = evidence.first_divergent_scheduler_turn.0.is_some()
+        || evidence.first_divergent_virtual_nanoseconds.0.is_some()
+        || evidence.first_divergent_record.0.is_some()
+        || evidence.first_divergent_syscall.0.is_some()
+        || evidence.first_divergent_left_message.0.is_some()
+        || evidence.first_divergent_right_message.0.is_some();
+    if evidence.verdict != "diverged" && has_divergence_evidence
     {
         return Err(format!(
             "verification report {} records a divergence position without a divergent verdict",
+            path.display()
+        ));
+    }
+    if evidence.verdict == "diverged"
+        && evidence.first_divergent_left_message.0.is_none()
+        && evidence.first_divergent_right_message.0.is_none()
+    {
+        return Err(format!(
+            "verification report {} records a divergent verdict without either first differing compared message",
             path.display()
         ));
     }
@@ -4216,6 +4242,8 @@ fn summarize(
                                     "first_divergent_syscall": row.first_divergent_syscall,
                                     "first_divergent_scheduler_turn": row.first_divergent_scheduler_turn,
                                     "first_divergent_virtual_nanoseconds": row.first_divergent_virtual_nanoseconds,
+                                    "first_divergent_left_message": row.first_divergent_left_message,
+                                    "first_divergent_right_message": row.first_divergent_right_message,
                                 })
                             })
                             .collect();
@@ -4448,6 +4476,10 @@ fn summarize(
                                             earlier_row.first_divergent_scheduler_turn,
                                         "first_divergent_virtual_nanoseconds":
                                             earlier_row.first_divergent_virtual_nanoseconds,
+                                        "first_divergent_left_message":
+                                            earlier_row.first_divergent_left_message,
+                                        "first_divergent_right_message":
+                                            earlier_row.first_divergent_right_message,
                                     },
                                     "verification_logs": verification_logs,
                                     "normalized_ptrace_golden": normalized_ptrace_golden,
@@ -6833,6 +6865,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         first_divergent_syscall: None,
         first_divergent_scheduler_turn: None,
         first_divergent_virtual_nanoseconds: None,
+        first_divergent_left_message: None,
+        first_divergent_right_message: None,
         attempt: 1,
         schema: CELL_RESULT_SCHEMA,
         run_id: sample_slug.clone(),
@@ -7041,6 +7075,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         first_divergent_syscall: None,
         first_divergent_scheduler_turn: None,
         first_divergent_virtual_nanoseconds: None,
+        first_divergent_left_message: None,
+        first_divergent_right_message: None,
         attempt: 1,
         schema: CELL_RESULT_SCHEMA,
         run_id: first_repetition_slug.clone(),

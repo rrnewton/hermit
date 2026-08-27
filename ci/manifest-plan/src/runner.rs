@@ -829,6 +829,10 @@ pub struct AttemptResult {
     /// Syscalls the guest completed before diverging. A different keyspace from
     /// every other coordinate here; see the note in canonical_verdict.
     pub first_divergent_syscall: Option<u64>,
+    /// Compared message from the first run at the first differing record.
+    pub first_divergent_left_message: Option<String>,
+    /// Compared message from the second run at the first differing record.
+    pub first_divergent_right_message: Option<String>,
     pub sabre_path_evidence: Option<String>,
     pub sabre_path_evidence_sha256: Option<String>,
     pub reason: Option<String>,
@@ -922,6 +926,10 @@ pub struct CellResult {
     pub first_divergent_record: Option<u64>,
     /// Syscalls completed before diverging. Same first-attempt rule.
     pub first_divergent_syscall: Option<u64>,
+    /// First differing compared message from the first attempt that recorded it.
+    pub first_divergent_left_message: Option<String>,
+    /// First differing compared message from the first attempt that recorded it.
+    pub first_divergent_right_message: Option<String>,
     pub reason: Option<String>,
     /// Where this cell's retained evidence lives.
     ///
@@ -1663,6 +1671,8 @@ fn execute_spec_until(
     let mut first_divergent_virtual_nanoseconds = None;
     let mut first_divergent_record = None;
     let mut first_divergent_syscall = None;
+    let mut first_divergent_left_message = None;
+    let mut first_divergent_right_message = None;
     let (sabre_path_evidence, sabre_path_evidence_sha256) = spec
         .sabre_path_evidence
         .as_ref()
@@ -1698,6 +1708,10 @@ fn execute_spec_until(
                                 report.first_divergent_virtual_nanoseconds;
                             first_divergent_record = report.first_divergent_record;
                             first_divergent_syscall = report.first_divergent_syscall;
+                            first_divergent_left_message =
+                                report.first_divergent_left_message.clone();
+                            first_divergent_right_message =
+                                report.first_divergent_right_message.clone();
                         }
                         if launch_refusal || backend_unavailable {
                             // The process never created a guest.  A report at
@@ -1782,6 +1796,8 @@ fn execute_spec_until(
         first_divergent_virtual_nanoseconds,
         first_divergent_record,
         first_divergent_syscall,
+        first_divergent_left_message,
+        first_divergent_right_message,
         sabre_path_evidence,
         sabre_path_evidence_sha256,
         reason,
@@ -1922,6 +1938,8 @@ fn cell_timeout_attempt(
         first_divergent_virtual_nanoseconds: None,
         first_divergent_record: None,
         first_divergent_syscall: None,
+        first_divergent_left_message: None,
+        first_divergent_right_message: None,
         sabre_path_evidence: None,
         sabre_path_evidence_sha256: None,
         reason: Some(format!(
@@ -2085,6 +2103,8 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
     let first_divergent_virtual_nanoseconds = position.virtual_nanoseconds;
     let first_divergent_record = position.record;
     let first_divergent_syscall = position.syscall;
+    let first_divergent_left_message = position.left_message;
+    let first_divergent_right_message = position.right_message;
     let mut error_kind = attempts
         .iter()
         .find_map(|attempt| attempt.error_kind.clone());
@@ -2232,6 +2252,8 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         first_divergent_virtual_nanoseconds,
         first_divergent_record,
         first_divergent_syscall,
+        first_divergent_left_message,
+        first_divergent_right_message,
         reason,
     })
 }
@@ -2292,6 +2314,8 @@ pub fn infrastructure_error_result(
         first_divergent_virtual_nanoseconds: None,
         first_divergent_record: None,
         first_divergent_syscall: None,
+        first_divergent_left_message: None,
+        first_divergent_right_message: None,
         reason: Some(reason),
     }
 }
@@ -2344,6 +2368,8 @@ pub fn host_inapplicable_result(
         first_divergent_virtual_nanoseconds: None,
         first_divergent_record: None,
         first_divergent_syscall: None,
+        first_divergent_left_message: None,
+        first_divergent_right_message: None,
         reason: Some(reason),
     }
 }
@@ -2367,12 +2393,14 @@ pub fn host_inapplicable_result(
 /// already had a bare ordinal read against the wrong axis. Each field is a
 /// DIFFERENT KEYSPACE -- measured on one real divergence, the same event was
 /// record 98, syscall 37 and scheduler turn 4.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DivergencePosition {
     pub scheduler_turn: Option<u64>,
     pub virtual_nanoseconds: Option<u64>,
     pub record: Option<u64>,
     pub syscall: Option<u64>,
+    pub left_message: Option<String>,
+    pub right_message: Option<String>,
 }
 
 fn cell_divergence_position(attempts: &[AttemptResult]) -> DivergencePosition {
@@ -2389,6 +2417,12 @@ fn cell_divergence_position(attempts: &[AttemptResult]) -> DivergencePosition {
         syscall: attempts
             .iter()
             .find_map(|attempt| attempt.first_divergent_syscall),
+        left_message: attempts
+            .iter()
+            .find_map(|attempt| attempt.first_divergent_left_message.clone()),
+        right_message: attempts
+            .iter()
+            .find_map(|attempt| attempt.first_divergent_right_message.clone()),
     }
 }
 
@@ -4141,6 +4175,8 @@ backends_disabled:
                 virtual_nanoseconds: Some(400),
                 record: Some(40),
                 syscall: Some(14),
+                left_message: None,
+                right_message: None,
             },
             "the first located position wins; a later, earlier-diverging attempt \
              must not silently replace it, and this is NOT a min across attempts"
@@ -4165,6 +4201,8 @@ backends_disabled:
                 virtual_nanoseconds: Some(900),
                 record: Some(3),
                 syscall: Some(5),
+                left_message: None,
+                right_message: None,
             }
         );
     }
@@ -4266,13 +4304,15 @@ backends_disabled:
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            first_divergent_left_message: None,
+            first_divergent_right_message: None,
             reason: None,
             artifact_dir: "/repo/artifacts".into(),
         }
     }
 
     #[test]
-    fn a_located_nothing_row_still_carries_all_four_coordinate_keys() {
+    fn a_located_nothing_row_still_carries_all_divergence_keys() {
         let attempt = attempt_with_sabre_evidence("evidence");
         let rendered = serde_json::to_value(&attempt).expect("attempt serializes");
         let object = rendered.as_object().expect("attempt is a JSON object");
@@ -4281,6 +4321,8 @@ backends_disabled:
             "first_divergent_syscall",
             "first_divergent_scheduler_turn",
             "first_divergent_virtual_nanoseconds",
+            "first_divergent_left_message",
+            "first_divergent_right_message",
         ] {
             let found = object.get(key).unwrap_or_else(|| {
                 panic!(
@@ -4306,6 +4348,8 @@ backends_disabled:
             "first_divergent_syscall",
             "first_divergent_scheduler_turn",
             "first_divergent_virtual_nanoseconds",
+            "first_divergent_left_message",
+            "first_divergent_right_message",
         ] {
             let found = object.get(key).unwrap_or_else(|| {
                 panic!(
@@ -4328,6 +4372,8 @@ backends_disabled:
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            first_divergent_left_message: None,
+            first_divergent_right_message: None,
             index: "1".into(),
             outcome: "PASS".into(),
             error_kind: None,
@@ -4418,6 +4464,8 @@ backends_disabled:
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            first_divergent_left_message: None,
+            first_divergent_right_message: None,
             runtime: None,
             compared_log_messages: Some(crate::canonical_verdict::ComparedLogMessages {
                 left: 1,
@@ -4638,6 +4686,8 @@ backends_disabled:
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            first_divergent_left_message: None,
+            first_divergent_right_message: None,
             runtime: None,
         })
         .unwrap();

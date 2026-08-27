@@ -384,7 +384,8 @@ fn derive_measurement(cell: &TrackedCell) -> MeasurementState {
         located |= !observation.first_divergent_record.is_empty()
             || !observation.first_divergent_syscall.is_empty()
             || !observation.first_divergent_scheduler_turn.is_empty()
-            || !observation.first_divergent_virtual_nanoseconds.is_empty();
+            || !observation.first_divergent_virtual_nanoseconds.is_empty()
+            || !observation.first_divergent_messages.is_empty();
     }
     if diverged {
         return if located {
@@ -457,6 +458,30 @@ struct Observation {
     /// coordinate's axis.
     #[serde(default, skip_serializing_if = "ObservedPositions::is_empty")]
     first_divergent_syscall: ObservedPositions,
+    /// First differing compared messages, stored without left/right ordering
+    /// because either execution may occupy either side on another run.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    first_divergent_messages: BTreeSet<FirstDivergentMessages>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct FirstDivergentMessages {
+    first: Option<String>,
+    second: Option<String>,
+}
+
+impl FirstDivergentMessages {
+    fn from_sides(left: Option<String>, right: Option<String>) -> Option<Self> {
+        if left.is_none() && right.is_none() {
+            return None;
+        }
+        let mut messages = [left, right];
+        messages.sort();
+        Some(Self {
+            first: messages[0].clone(),
+            second: messages[1].clone(),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -902,6 +927,10 @@ struct ResultRow {
     first_divergent_record: Option<u64>,
     #[serde(default)]
     first_divergent_syscall: Option<u64>,
+    #[serde(default)]
+    first_divergent_left_message: Option<String>,
+    #[serde(default)]
+    first_divergent_right_message: Option<String>,
 }
 
 fn default_attempt() -> u64 {
@@ -1187,6 +1216,8 @@ impl ResultRow {
                 virtual_nanoseconds: report.first_divergent_virtual_nanoseconds,
                 record: report.first_divergent_record,
                 syscall: report.first_divergent_syscall,
+                left_message: report.first_divergent_left_message.clone(),
+                right_message: report.first_divergent_right_message.clone(),
             };
             if recorded_coordinates != report_coordinates {
                 return Err(format!(
@@ -1255,12 +1286,14 @@ struct RetainedCellResults {
     candidates: Vec<ResultCandidate>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct DivergenceCoordinates {
     scheduler_turn: Option<u64>,
     virtual_nanoseconds: Option<u64>,
     record: Option<u64>,
     syscall: Option<u64>,
+    left_message: Option<String>,
+    right_message: Option<String>,
 }
 
 impl DivergenceCoordinates {
@@ -1270,14 +1303,37 @@ impl DivergenceCoordinates {
             virtual_nanoseconds: row.first_divergent_virtual_nanoseconds,
             record: row.first_divergent_record,
             syscall: row.first_divergent_syscall,
+            left_message: row.first_divergent_left_message.clone(),
+            right_message: row.first_divergent_right_message.clone(),
         }
     }
 
-    fn is_empty(self) -> bool {
+    fn is_empty(&self) -> bool {
         self.scheduler_turn.is_none()
             && self.virtual_nanoseconds.is_none()
             && self.record.is_none()
             && self.syscall.is_none()
+            && self.left_message.is_none()
+            && self.right_message.is_none()
+    }
+
+    /// The stable portion of a first-divergence report. The compared-message
+    /// pair is unordered because either execution may occupy the left side.
+    /// Prefer the syscall count; before any syscall completes, use the
+    /// scheduler turn. Record and virtual-time positions remain observations.
+    fn event_key(&self) -> Option<(Option<String>, Option<String>, Option<u64>, Option<u64>)> {
+        if self.left_message.is_none() && self.right_message.is_none() {
+            return None;
+        }
+        let mut messages = [self.left_message.clone(), self.right_message.clone()];
+        messages.sort();
+        if let Some(syscall) = self.syscall {
+            Some((messages[0].clone(), messages[1].clone(), Some(syscall), None))
+        } else {
+            self.scheduler_turn.map(|turn| {
+                (messages[0].clone(), messages[1].clone(), None, Some(turn))
+            })
+        }
     }
 }
 
@@ -2884,6 +2940,14 @@ fn apply_pressure_summary(
             .verification
             .as_ref()
             .and_then(|report| report.first_divergent_syscall);
+        let divergent_left_message = row
+            .verification
+            .as_ref()
+            .and_then(|report| report.first_divergent_left_message.clone());
+        let divergent_right_message = row
+            .verification
+            .as_ref()
+            .and_then(|report| report.first_divergent_right_message.clone());
         // ⚠️ "COMPARED AND COULD NOT LOCATE" AND "NEVER COMPARED" ARE DIFFERENT
         // FACTS, AND THEY LAND ON THE SAME STATE IF THIS IS NOT CHECKED.
         //
@@ -2919,7 +2983,9 @@ fn apply_pressure_summary(
             && (turn.is_some()
                 || virtual_nanoseconds.is_some()
                 || divergent_record.is_some()
-                || divergent_syscall.is_some())
+                || divergent_syscall.is_some()
+                || divergent_left_message.is_some()
+                || divergent_right_message.is_some())
         {
             skipped.push((
                 display_id(&row.cell),
@@ -2934,6 +3000,8 @@ fn apply_pressure_summary(
             virtual_nanoseconds,
             divergent_record,
             divergent_syscall,
+            divergent_left_message,
+            divergent_right_message,
             invocation,
         ));
     }
@@ -2964,7 +3032,7 @@ fn apply_pressure_summary(
     let prepared_len = prepared.len();
     let prepared_cells = prepared
         .iter()
-        .map(|(index, _, _, _, _, _, _)| *index)
+        .map(|(index, _, _, _, _, _, _, _, _)| *index)
         .collect::<BTreeSet<_>>()
         .len();
     for (
@@ -2974,6 +3042,8 @@ fn apply_pressure_summary(
         virtual_nanoseconds,
         divergent_record,
         divergent_syscall,
+        divergent_left_message,
+        divergent_right_message,
         invocation,
     ) in prepared
     {
@@ -3007,6 +3077,7 @@ fn apply_pressure_summary(
                     first_divergent_virtual_nanoseconds: ObservedPositions::default(),
                     first_divergent_record: ObservedPositions::default(),
                     first_divergent_syscall: ObservedPositions::default(),
+                    first_divergent_messages: BTreeSet::new(),
                 });
                 observations.last_mut().expect("observation was appended")
             }
@@ -3039,6 +3110,12 @@ fn apply_pressure_summary(
             observation
                 .first_divergent_syscall
                 .record(divergent_syscall);
+            if let Some(messages) = FirstDivergentMessages::from_sides(
+                divergent_left_message,
+                divergent_right_message,
+            ) {
+                observation.first_divergent_messages.insert(messages);
+            }
         }
         // Sort by the full key, so a tree carrying both a pressure-test and a
         // validate observation still has a stable tracked-file order.
@@ -3175,7 +3252,9 @@ fn apply_validate_results(
             let located_nothing = row.first_divergent_scheduler_turn.is_none()
                 && row.first_divergent_virtual_nanoseconds.is_none()
                 && row.first_divergent_record.is_none()
-                && row.first_divergent_syscall.is_none();
+                && row.first_divergent_syscall.is_none()
+                && row.first_divergent_left_message.is_none()
+                && row.first_divergent_right_message.is_none();
             // A PASS that located nothing still says WHAT happened: a canonical
             // comparison ran and matched. Skipping that result is what made all
             // 304 selected cells read `never-measured` despite retained
@@ -3283,6 +3362,7 @@ fn apply_validate_results(
                         first_divergent_virtual_nanoseconds: ObservedPositions::default(),
                         first_divergent_record: ObservedPositions::default(),
                         first_divergent_syscall: ObservedPositions::default(),
+                        first_divergent_messages: BTreeSet::new(),
                     });
                     observations.last_mut().expect("observation was appended")
                 }
@@ -3339,6 +3419,12 @@ fn apply_validate_results(
                 observation
                     .first_divergent_syscall
                     .record(row.first_divergent_syscall);
+                if let Some(messages) = FirstDivergentMessages::from_sides(
+                    row.first_divergent_left_message.clone(),
+                    row.first_divergent_right_message.clone(),
+                ) {
+                    observation.first_divergent_messages.insert(messages);
+                }
             }
             observations.sort_by(|left, right| {
                 left.detcore_tree
@@ -4191,6 +4277,7 @@ fn apply_series_rows(
             first_divergent_virtual_nanoseconds: ObservedPositions::default(),
             first_divergent_record: ObservedPositions::default(),
             first_divergent_syscall: ObservedPositions::default(),
+            first_divergent_messages: BTreeSet::new(),
         };
         for row in prepared.iter().filter(|row| {
             row.cell_index == *cell_index
@@ -4757,6 +4844,8 @@ fn admit_current_dbt_divergence_without_retained_logs(
         virtual_nanoseconds: report.first_divergent_virtual_nanoseconds,
         record: report.first_divergent_record,
         syscall: report.first_divergent_syscall,
+        left_message: report.first_divergent_left_message.clone(),
+        right_message: report.first_divergent_right_message.clone(),
     };
     if coordinates.is_empty() {
         return Err("DBT canonical divergence missing retained run logs has no coordinate".into());
@@ -4801,12 +4890,16 @@ fn checked_current_pressure_result(
             virtual_nanoseconds: report.first_divergent_virtual_nanoseconds,
             record: report.first_divergent_record,
             syscall: report.first_divergent_syscall,
+            left_message: report.first_divergent_left_message.clone(),
+            right_message: report.first_divergent_right_message.clone(),
         })
         .unwrap_or(DivergenceCoordinates {
             scheduler_turn: None,
             virtual_nanoseconds: None,
             record: None,
             syscall: None,
+            left_message: None,
+            right_message: None,
         });
     Ok(CurrentPressureResult {
         summary,
@@ -4935,7 +5028,7 @@ fn retained_coordinate_decision(
                 invocation.shell_command.clone(),
             ))
             .or_default()
-            .entry((result.result, result.coordinates))
+            .entry((result.result, result.coordinates.clone()))
             .or_insert(result);
     }
     if current_by_run.values().any(|values| values.len() != 1) {
@@ -4957,7 +5050,7 @@ fn retained_coordinate_decision(
     let current_coordinates = current_results
         .iter()
         .filter(|result| result.result.carries_divergence_position())
-        .map(|result| result.coordinates)
+        .map(|result| result.coordinates.clone())
         .filter(|coordinates| !coordinates.is_empty())
         .collect::<BTreeSet<_>>();
 
@@ -5051,7 +5144,29 @@ fn retained_coordinate_decision(
             ),
         };
     }
-    if current_coordinates == retained_coordinates {
+    let retained_event_keys = retained_coordinates
+        .iter()
+        .map(DivergenceCoordinates::event_key)
+        .collect::<Option<BTreeSet<_>>>();
+    let current_event_keys = current_coordinates
+        .iter()
+        .map(DivergenceCoordinates::event_key)
+        .collect::<Option<BTreeSet<_>>>();
+    let (Some(retained_event_keys), Some(current_event_keys)) =
+        (retained_event_keys, current_event_keys)
+    else {
+        return RetainedDecision {
+            state: RetainedComparisonState::Uncheckable,
+            import: ImportEvidence::Retained {
+                results: retained,
+                store_positions: false,
+            },
+            retained_coordinates,
+            current_coordinates,
+            reason: "at least one divergence lacks compared event content or both syscall and scheduler-turn identity".into(),
+        };
+    };
+    if current_event_keys == retained_event_keys {
         RetainedDecision {
             state: RetainedComparisonState::Fresh,
             import: ImportEvidence::Retained {
@@ -5061,7 +5176,7 @@ fn retained_coordinate_decision(
             retained_coordinates,
             current_coordinates,
             reason: format!(
-                "{sample_count} current run(s): {matched} matched and {diverged} diverged; every current divergence coordinate equals the retained set"
+                "{sample_count} current run(s): {matched} matched and {diverged} diverged; every current divergence event plus syscall-or-turn identity equals the retained set"
             ),
         }
     } else {
@@ -5071,7 +5186,7 @@ fn retained_coordinate_decision(
             retained_coordinates,
             current_coordinates,
             reason: format!(
-                "{sample_count} current run(s): {matched} matched and {diverged} diverged; the current divergence coordinate set differs from the retained set"
+                "{sample_count} current run(s): {matched} matched and {diverged} diverged; the current divergence event plus syscall-or-turn identity set differs from the retained set"
             ),
         }
     }
@@ -5539,6 +5654,8 @@ fn self_test() -> Result<(), String> {
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            first_divergent_left_message: None,
+            first_divergent_right_message: None,
             attempts: vec![{
                 let report = serde_json::to_string(&canonical_verdict::VerificationReport {
                     verified: true,
@@ -5566,6 +5683,8 @@ fn self_test() -> Result<(), String> {
                     first_divergent_virtual_nanoseconds: None,
                     first_divergent_record: None,
                     first_divergent_syscall: None,
+                    first_divergent_left_message: None,
+                    first_divergent_right_message: None,
                 })
                 .unwrap();
                 serde_json::json!({
@@ -5921,6 +6040,10 @@ red/`measured-and-passed` count is **0**.",
                 first_divergent_virtual_nanoseconds: virtual_nanoseconds,
                 first_divergent_record: record,
                 first_divergent_syscall: syscall,
+                first_divergent_left_message: (result != "pass")
+                    .then(|| "left event".to_owned()),
+                first_divergent_right_message: (result != "pass")
+                    .then(|| "right event".to_owned()),
                 runtime: None,
             }
         };
@@ -6196,7 +6319,9 @@ red/`measured-and-passed` count is **0**.",
             "first_divergent_scheduler_turn": if outcome == "FAIL" { Some(7) } else { None },
             "first_divergent_virtual_nanoseconds": if outcome == "FAIL" { Some(70) } else { None },
             "first_divergent_record": if outcome == "FAIL" { Some(12) } else { None },
-            "first_divergent_syscall": if outcome == "FAIL" { Some(9) } else { None }
+            "first_divergent_syscall": if outcome == "FAIL" { Some(9) } else { None },
+            "first_divergent_left_message": if outcome == "FAIL" { Some("left event") } else { None },
+            "first_divergent_right_message": if outcome == "FAIL" { Some("right event") } else { None }
         }))
         .unwrap();
         serde_json::json!({
@@ -6242,6 +6367,8 @@ red/`measured-and-passed` count is **0**.",
         first_divergent_virtual_nanoseconds: Some(70),
         first_divergent_record: Some(12),
         first_divergent_syscall: Some(9),
+        first_divergent_left_message: Some("left event".into()),
+        first_divergent_right_message: Some("right event".into()),
         attempts: vec![validate_attempt("FAIL")],
     };
 
@@ -6299,12 +6426,16 @@ red/`measured-and-passed` count is **0**.",
                 virtual_nanoseconds: report.first_divergent_virtual_nanoseconds,
                 record: report.first_divergent_record,
                 syscall: report.first_divergent_syscall,
+                left_message: report.first_divergent_left_message.clone(),
+                right_message: report.first_divergent_right_message.clone(),
             })
             .unwrap_or(DivergenceCoordinates {
                 scheduler_turn: None,
                 virtual_nanoseconds: None,
                 record: None,
                 syscall: None,
+                left_message: None,
+                right_message: None,
             });
         CurrentPressureResult {
             summary: pressure_summary("sha-1", "tree-1", vec![row]),
@@ -6344,6 +6475,8 @@ red/`measured-and-passed` count is **0**.",
         virtual_nanoseconds,
         record,
         syscall,
+        left_message: Some("left event".into()),
+        right_message: Some("right event".into()),
     };
 
     let mut mismatched_coordinates = validate_candidate(
@@ -7516,6 +7649,7 @@ red/`measured-and-passed` count is **0**.",
         first_divergent_virtual_nanoseconds: ObservedPositions::default(),
         first_divergent_record: ObservedPositions::default(),
         first_divergent_syscall: ObservedPositions::default(),
+        first_divergent_messages: BTreeSet::new(),
     };
     let with_evidence = TrackedCells {
         schema: SCHEMA,

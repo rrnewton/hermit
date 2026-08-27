@@ -75,6 +75,13 @@ pub struct VerificationReport {
     /// syscall completed.
     #[serde(default)]
     pub first_divergent_syscall: Option<u64>,
+    /// Compared message from the first run at the first differing record,
+    /// after removal of only positions recorded in the numeric fields above.
+    #[serde(default)]
+    pub first_divergent_left_message: Option<String>,
+    /// Compared message from the second run at the first differing record.
+    #[serde(default)]
+    pub first_divergent_right_message: Option<String>,
     /// Runtime totals for the two compared executions when the producer could
     /// read both run summaries.
     #[serde(default)]
@@ -357,6 +364,8 @@ mod tests {
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            first_divergent_left_message: None,
+            first_divergent_right_message: None,
             runtime: None,
         }
     }

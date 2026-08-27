@@ -814,10 +814,8 @@ fn collect_syscalls<'a>(v: &[(usize, &'a str)]) -> Vec<(usize, &'a str)> {
         .collect()
 }
 
-fn first_different_message_indices(
-    left: &[(usize, &str)],
+fn first_different_message_positions(
     compared_left: &[String],
-    right: &[(usize, &str)],
     compared_right: &[String],
 ) -> Option<(Option<usize>, Option<usize>)> {
     let common = compared_left.len().min(compared_right.len());
@@ -825,14 +823,38 @@ fn first_different_message_indices(
     if let Some(position) =
         (0..common).find(|&position| compared_left[position] != compared_right[position])
     {
-        return Some((Some(left[position].0), Some(right[position].0)));
+        return Some((Some(position), Some(position)));
     }
 
     match compared_left.len().cmp(&compared_right.len()) {
-        Ordering::Less => Some((None, Some(right[common].0))),
-        Ordering::Greater => Some((Some(left[common].0), None)),
+        Ordering::Less => Some((None, Some(common))),
+        Ordering::Greater => Some((Some(common), None)),
         Ordering::Equal => None,
     }
+}
+
+/// Keep the differing compared message while removing only the positions that
+/// are recorded in their own fields. This is diagnostic identity, not a
+/// comparison policy: it never participates in deciding whether two runs
+/// differ, and it preserves every syscall argument, result, task id, resource,
+/// and payload byte.
+fn first_divergent_message(message: &str) -> String {
+    static FINISHED_SYSCALL: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(finish syscall #)[0-9]+").unwrap());
+    static COMMIT_TURN: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(\bCOMMIT turn )[0-9][0-9_]*\b").unwrap());
+    static COMMITTED_TIME: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(\b(?:at time|on previously committed) )[0-9][0-9_]*(?:\.[0-9_]+)?(?:ns|s)?\b",
+        )
+        .unwrap()
+    });
+
+    let message = FINISHED_SYSCALL.replace_all(message, "${1}<SYSCALL>");
+    let message = COMMIT_TURN.replace_all(&message, "${1}<TURN>");
+    COMMITTED_TIME
+        .replace_all(&message, "${1}<VIRTUAL_TIME>")
+        .into_owned()
 }
 
 fn parse_underscored_u64(value: &str) -> Option<u64> {
@@ -1217,7 +1239,7 @@ fn git_diff(
 /// compare"*. Both selected lists being empty is a NO-RESULT, not a match, so
 /// the counts travel with the verdict and a parity consumer can require nonzero
 /// execution before believing a green.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogDiffSummary {
     /// True if a substantive difference was found between the two runs.
     pub diff_found: bool,
@@ -1240,6 +1262,13 @@ pub struct LogDiffSummary {
     /// divergence located at record 108 is easier to act on when you also know
     /// the guest was 37 syscalls in.
     pub first_divergent_syscall: Option<u64>,
+    /// Compared message from the first input at the first difference, after
+    /// removing only the separately recorded syscall, scheduler-turn, and
+    /// virtual-time positions. `None` when that side ended first.
+    pub first_divergent_left_message: Option<String>,
+    /// Compared message from the second input at the first difference, with
+    /// the same position-only removal as the left message.
+    pub first_divergent_right_message: Option<String>,
     /// True when the comparison was REFUSED rather than performed, so there is
     /// no verdict about whether the runs agree.
     ///
@@ -1371,7 +1400,7 @@ pub fn try_log_diff_with_records_and_filter(
 /// far as anyone has looked" are different claims, and a caller who cannot tell
 /// them apart will stop early and conclude the wrong thing. The record counts
 /// are therefore part of the result, not optional detail alongside it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrefixComparison {
     /// The verdict over the compared prefix only.
     pub summary: LogDiffSummary,
@@ -1504,6 +1533,8 @@ pub fn log_diff_summary_from_strs_with_filter(
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            first_divergent_left_message: None,
+            first_divergent_right_message: None,
             refused: true,
         });
     }
@@ -1588,8 +1619,14 @@ pub fn log_diff_summary_from_strs_with_filter(
         write_compared_logs(w, policy, &prepared_a, &prepared_b, &opts.side_labels)?;
     }
 
-    let first_different =
-        first_different_message_indices(compared_a, &prepared_a, compared_b, &prepared_b);
+    let first_different_positions =
+        first_different_message_positions(&prepared_a, &prepared_b);
+    let first_different = first_different_positions.map(|(left, right)| {
+        (
+            left.map(|position| compared_a[position].0),
+            right.map(|position| compared_b[position].0),
+        )
+    });
     let first_position_candidate = first_different.and_then(|(left_index, right_index)| {
         left_index
             .and_then(|index| commit_position_at_or_before(&all_a, index))
@@ -1642,6 +1679,16 @@ pub fn log_diff_summary_from_strs_with_filter(
         first_divergent_syscall: diff_found
             .then_some(first_divergent_syscall_candidate)
             .flatten(),
+        first_divergent_left_message: diff_found
+            .then_some(first_different_positions)
+            .flatten()
+            .and_then(|(left, _)| left)
+            .map(|position| first_divergent_message(&prepared_a[position])),
+        first_divergent_right_message: diff_found
+            .then_some(first_different_positions)
+            .flatten()
+            .and_then(|(_, right)| right)
+            .map(|position| first_divergent_message(&prepared_b[position])),
         // This path compared the logs; only the refusal above declines to.
         refused: false,
     };
@@ -1886,6 +1933,29 @@ mod test {
             found,
             Some(13),
             "bisection must name the record, not merely the prefix that contains it"
+        );
+    }
+
+    #[test]
+    fn first_divergent_messages_remove_only_separately_recorded_positions() {
+        assert_eq!(
+            super::first_divergent_message(
+                "INFO detcore: DETLOG [syscall][detcore, dtid 2] finish syscall #211: \
+                 clock_nanosleep(CLOCK_REALTIME, 0, 0x7fffffffe770, NULL) = Ok(0)"
+            ),
+            "INFO detcore: DETLOG [syscall][detcore, dtid 2] finish syscall #<SYSCALL>: \
+             clock_nanosleep(CLOCK_REALTIME, 0, 0x7fffffffe770, NULL) = Ok(0)"
+        );
+        assert_eq!(
+            super::first_divergent_message(
+                "INFO detcore::scheduler: COMMIT turn 1_248, dettid 2, on previously committed 12.345_678_901s"
+            ),
+            "INFO detcore::scheduler: COMMIT turn <TURN>, dettid 2, on previously committed <VIRTUAL_TIME>"
+        );
+        assert_ne!(
+            super::first_divergent_message("INFO detcore: inbound syscall: read(3) = ?"),
+            super::first_divergent_message("INFO detcore: inbound syscall: write(3) = ?"),
+            "different event content must remain different"
         );
     }
 
@@ -3095,11 +3165,21 @@ Jun 09 06:49:17.742  INFO detcore: [t] use 0x1111";
             diverged.first_divergent_virtual_nanoseconds,
             Some(12_345_678_901)
         );
+        assert_eq!(
+            diverged.first_divergent_left_message.as_deref(),
+            Some("INFO detcore: DETLOG count=42")
+        );
+        assert_eq!(
+            diverged.first_divergent_right_message.as_deref(),
+            Some("INFO detcore: DETLOG count=43")
+        );
 
         let matched = super::log_diff_summary_from_strs(left, left, &opts, &mut Vec::new())?;
         assert!(matched.matched_with_evidence());
         assert_eq!(matched.first_divergent_scheduler_turn, None);
         assert_eq!(matched.first_divergent_virtual_nanoseconds, None);
+        assert_eq!(matched.first_divergent_left_message, None);
+        assert_eq!(matched.first_divergent_right_message, None);
         Ok(())
     }
 

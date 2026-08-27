@@ -559,6 +559,8 @@ struct JsonReport<'a> {
     first_divergent_record: Option<usize>,
     /// How many syscalls the guest had completed when the divergence appeared.
     first_divergent_syscall: Option<u64>,
+    first_divergent_left_message: Option<String>,
+    first_divergent_right_message: Option<String>,
     first_divergent_scheduler_turn: Option<u64>,
     first_divergent_virtual_nanoseconds: Option<u64>,
 }
@@ -601,6 +603,8 @@ fn json_report<'a>(
         follow_stopped_because: None,
         first_divergent_record: summary.first_divergent_record,
         first_divergent_syscall: summary.first_divergent_syscall,
+        first_divergent_left_message: summary.first_divergent_left_message.clone(),
+        first_divergent_right_message: summary.first_divergent_right_message.clone(),
         comparison: JsonComparison {
             stream,
             record_envelope,
@@ -629,6 +633,8 @@ fn pending_json_report(
         first_divergent_virtual_nanoseconds: None,
         first_divergent_record: None,
         first_divergent_syscall: None,
+        first_divergent_left_message: None,
+        first_divergent_right_message: None,
         refused: false,
     };
     let mut report = json_report(&summary, options, no_records(), record_envelope);
@@ -953,6 +959,8 @@ mod tests {
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            first_divergent_left_message: None,
+            first_divergent_right_message: None,
             refused: false,
         };
         let records = JsonRecords {
@@ -1023,6 +1031,8 @@ mod tests {
             // A different keyspace from the record index above, deliberately:
             // nine compared records in, only three syscalls completed.
             first_divergent_syscall: Some(3),
+            first_divergent_left_message: Some("left event".to_owned()),
+            first_divergent_right_message: Some("right event".to_owned()),
             refused: false,
         };
         let value = serde_json::to_value(json_report(
@@ -1037,6 +1047,8 @@ mod tests {
         assert_eq!(value["comparison"]["stream"], "deterministic");
         assert_eq!(value["first_divergent_scheduler_turn"], 17);
         assert_eq!(value["first_divergent_virtual_nanoseconds"], 123);
+        assert_eq!(value["first_divergent_left_message"], "left event");
+        assert_eq!(value["first_divergent_right_message"], "right event");
 
         let matched = logdiff::LogDiffSummary {
             diff_found: false,
@@ -1118,6 +1130,8 @@ mod tests {
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
+            first_divergent_left_message: None,
+            first_divergent_right_message: None,
             refused: false,
         };
         write_json(
