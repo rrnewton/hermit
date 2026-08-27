@@ -3355,17 +3355,21 @@ fn import_results(
     let mut retained_rows_imported = 0usize;
     let mut current_rows_imported = 0usize;
     let mut current_rows_missing_retained_logs = Vec::new();
+    let mut current_depths = BTreeMap::new();
     for current_results in current.results.values() {
         for current_result in current_results {
-            let depth = BTreeMap::from([(
-                "hermit".to_string(),
-                repo_depth_at(root, &current_result.summary.hermit_sha).ok_or_else(|| {
-                    format!(
-                        "cannot read Hermit source depth at current SHA {}",
-                        current_result.summary.hermit_sha
-                    )
-                })?,
-            )]);
+            let current_sha = &current_result.summary.hermit_sha;
+            let hermit_depth = match current_depths.get(current_sha) {
+                Some(depth) => *depth,
+                None => {
+                    let depth = repo_depth_at(root, current_sha).ok_or_else(|| {
+                        format!("cannot read Hermit source depth at current SHA {current_sha}")
+                    })?;
+                    current_depths.insert(current_sha.clone(), depth);
+                    depth
+                }
+            };
+            let depth = BTreeMap::from([("hermit".to_string(), hermit_depth)]);
             apply_pressure_summary(
                 &mut tracked,
                 &current_result.summary,
