@@ -59,6 +59,7 @@ static NONBLOCKING_STDIN_RECV_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_NONBLOCK_THEN_APPEND_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_INITIAL_NONBLOCKING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_STATUS_ALIAS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static STDIO_UNSUPPORTED_STATUS_FLAGS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 const DBT_IO_BUFFER_MUTATOR_SOURCE: &str = r#"
@@ -6819,4 +6820,128 @@ fn the_stderr_deadline_is_spent_once_across_writes_not_restarted_by_each() {
         Some(127),
         "giving up on undeliverable diagnostics must not change the exit status"
     );
+}
+
+fn stdio_unsupported_status_flags_guest() -> &'static Path {
+    STDIO_UNSUPPORTED_STATUS_FLAGS_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root =
+            Path::new(env!("CARGO_TARGET_TMPDIR")).join("stdio-unsupported-status-flags");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create stdio unsupported status-flag guest directory");
+        let guest = build_root.join("stdio_unsupported_status_flags");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/stdio_unsupported_status_flags.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the stdio unsupported status-flag guest");
+        assert!(
+            output.status.success(),
+            "stdio unsupported status-flag guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// A status flag Detcore does not implement for inherited stdio must be REFUSED,
+/// with `EOPNOTSUPP` and with the flag left alone -- not accepted and reflected.
+///
+/// `F_SETFL` on inherited stdio is contained: the guest's request must not reach
+/// the supervisor's open file description. Containment alone is not enough,
+/// though. `O_APPEND` and `O_NONBLOCK` are contained AND implemented, so the
+/// guest still gets the behaviour it asked for. `O_ASYNC`, `O_DIRECT` and
+/// `O_NOATIME` are not implemented, and reporting success for them would leave
+/// the guest reading a state back through `F_GETFL` that nothing acts on --
+/// which is worse than refusing, because the guest would then make decisions
+/// from it.
+///
+/// ⚠️ THIS COVERS THE REFUSAL, NOT THE DECISION. The pure predicate behind it,
+/// `unsupported_contained_status_flag_change`, already has a unit test in
+/// `detcore/src/syscalls/files.rs` that names all three flags. That test passes
+/// with the `F_SETFL` refusal that USES it disabled, so it cannot detect the
+/// mechanism being removed. Measured: with `if unsupported_change != 0` made
+/// unreachable, the detcore unit test and all twelve inherited-stdio integration
+/// tests stayed green. This test is what fails in that state.
+///
+/// Both halves are asserted deliberately. A refusal returning the wrong errno is
+/// its own defect one layer down, and a check that only required "the call
+/// failed" would accept it.
+fn assert_unimplemented_status_flags_are_refused(backend: &str) {
+    let _guard = hermit_run_guard();
+    let guest = stdio_unsupported_status_flags_guest();
+
+    let directory = tempfile::tempdir().expect("failed to create a temporary directory");
+    let hermit_stdout_path = directory.path().join("hermit.out");
+    let hermit_stdout = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&hermit_stdout_path)
+        .expect("failed to open the file standing in for hermit's stdout");
+
+    // SAFETY: the descriptor is live and F_GETFL takes no third argument.
+    let before = unsafe { libc::fcntl(hermit_stdout.as_raw_fd(), libc::F_GETFL) };
+    assert!(before >= 0, "F_GETFL on the supervisor's descriptor failed");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["run", "--backend", backend, "--"])
+        .arg(guest)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(
+            hermit_stdout
+                .try_clone()
+                .expect("failed to duplicate the stdout stand-in"),
+        ))
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap_or_else(|error| {
+            panic!("failed to run the {backend} unsupported status-flag guest: {error}")
+        });
+
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    for flag in ["O_ASYNC", "O_DIRECT", "O_NOATIME"] {
+        assert!(
+            diagnostics.contains(&format!(
+                "{flag} result=-1 errno={} refused=1",
+                libc::EOPNOTSUPP
+            )),
+            "{backend}: {flag} was not refused with EOPNOTSUPP:\n{diagnostics}",
+        );
+        assert!(
+            diagnostics.contains(&format!("{flag} ")) && diagnostics.contains("unchanged=1"),
+            "{backend}: {flag} changed the guest-visible flag word:\n{diagnostics}",
+        );
+    }
+    assert!(
+        output.status.success(),
+        "{backend}: guest reported a refusal defect:\n{diagnostics}",
+    );
+
+    // SAFETY: the descriptor is still live.
+    let after = unsafe { libc::fcntl(hermit_stdout.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        after, before,
+        "{backend}: the supervisor's status flags changed across the run \
+         (0x{before:x} -> 0x{after:x}); a refused flag must not escape either",
+    );
+}
+
+#[test]
+fn run_ptrace_unimplemented_status_flags_are_refused() {
+    assert_unimplemented_status_flags_are_refused("ptrace");
+}
+
+#[test]
+fn run_kvm_unimplemented_status_flags_are_refused() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+    assert_unimplemented_status_flags_are_refused("kvm");
 }
