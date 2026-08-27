@@ -3930,7 +3930,7 @@ mod tests {
             .unwrap()
             .generate_partial_run_summary(None)
             .unwrap();
-        assert_eq!(summary.syscalls, 17);
+        assert_eq!(summary.syscalls, Some(17));
         assert!(!state.sched.lock().unwrap().next_turns.contains_key(&dettid));
         let global_time = state.global_time.lock().unwrap();
         assert_eq!(global_time.as_nanos(), global_before);
