@@ -112,6 +112,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ $do_fetch -eq 0 && $do_offline -eq 0 ]]; then
+    echo "run-split-validate: --fetch-only and --offline-only cannot be combined" >&2
+    exit 2
+fi
+
 [[ "$lane" == portable ]] || {
     echo "run-split-validate: only the portable lane has a shard map today (got '$lane')." >&2
     echo "  ci/portable-shards.json is what defines the node sets; there is no" >&2
@@ -215,25 +220,34 @@ cargo_home="$out/cargo"
 target_dir="$out/target"
 
 echo "== phase boundary: $out"
-echo "== FETCH phase   (host, WITH network): cargo fetch --locked, no build output"
-echo "== OFFLINE phase (pinned root, NO network): build then test, in one place"
-echo "     build-side: $build_node_count node(s)"
-echo "     test-side:  $test_node_count node(s) ($shard_node_count shard + $e2e_node_count manifest)"
-if [[ -n "$e2e_nodes" ]]; then
-    echo "     e2e cells:  $e2e_cell_count selected portable cell(s)"
+if [[ $do_fetch -eq 1 ]]; then
+    echo "== FETCH phase   (host, WITH network): cargo fetch --locked, no build output"
+fi
+if [[ $do_offline -eq 1 ]]; then
+    echo "== OFFLINE phase (pinned root, NO network): build then test, in one place"
+    echo "     build-side: $build_node_count node(s)"
+    echo "     test-side:  $test_node_count node(s) ($shard_node_count shard + $e2e_node_count manifest)"
+    if [[ -n "$e2e_nodes" ]]; then
+        echo "     e2e cells:  $e2e_cell_count selected portable cell(s)"
+    fi
 fi
 
 if [[ $dry -eq 1 ]]; then
-    echo
-    echo "-- fetch phase would run, on the host:"
-    for manifest in "${FETCH_MANIFESTS[@]}"; do
-        echo "   CARGO_HOME=$cargo_home cargo fetch --locked --manifest-path $manifest"
-    done
-    echo "-- offline phase would run, inside the pinned root, --network=none:"
-    echo "   ci/hermetic/assert-no-network.sh"
-    echo "   verify pinned developer tools, build dependencies and required guest commands"
-    echo "   ci/run-node.sh $lane $build_nodes"
-    echo "   ci/run-node.sh $lane $test_nodes"
+    if [[ $do_fetch -eq 1 ]]; then
+        echo
+        echo "-- fetch phase would run, on the host:"
+        for manifest in "${FETCH_MANIFESTS[@]}"; do
+            echo "   CARGO_HOME=$cargo_home cargo fetch --locked --manifest-path $manifest"
+        done
+    fi
+    if [[ $do_offline -eq 1 ]]; then
+        echo
+        echo "-- offline phase would run, inside the pinned root, --network=none:"
+        echo "   ci/hermetic/assert-no-network.sh"
+        echo "   verify pinned developer tools, build dependencies and required guest commands"
+        echo "   ci/run-node.sh $lane $build_nodes"
+        echo "   ci/run-node.sh $lane $test_nodes"
+    fi
     exit 0
 fi
 

@@ -229,6 +229,24 @@ mod tests {
 
     use super::*;
 
+    fn split_validate_dry_run(args: &[&str]) -> std::process::Output {
+        let root = git_root().unwrap_or_else(|_| {
+            Path::new(file!())
+                .canonicalize()
+                .expect("checker source path")
+                .parent()
+                .and_then(Path::parent)
+                .expect("checker lives under the repository scripts directory")
+                .to_owned()
+        });
+        Command::new(root.join("ci/hermetic/run-split-validate.sh"))
+            .args(args)
+            .arg("--dry-run")
+            .current_dir(root)
+            .output()
+            .expect("run split-validate dry-run")
+    }
+
     #[test]
     fn nested_workspace_list_is_non_empty() {
         assert!(
@@ -246,21 +264,8 @@ mod tests {
     }
 
     #[test]
-    fn hermetic_fetch_covers_root_and_nested_workspaces() {
-        let root = git_root().unwrap_or_else(|_| {
-            Path::new(file!())
-                .canonicalize()
-                .expect("checker source path")
-                .parent()
-                .and_then(Path::parent)
-                .expect("checker lives under the repository scripts directory")
-                .to_owned()
-        });
-        let output = Command::new(root.join("ci/hermetic/run-split-validate.sh"))
-            .arg("--dry-run")
-            .current_dir(root)
-            .output()
-            .expect("run split-validate dry-run");
+    fn hermetic_default_dry_run_covers_both_phases_and_nested_workspaces() {
+        let output = split_validate_dry_run(&[]);
         assert!(
             output.status.success(),
             "split-validate dry-run failed: {}",
@@ -268,7 +273,8 @@ mod tests {
         );
 
         let marker = "cargo fetch --locked --manifest-path ";
-        let actual = String::from_utf8_lossy(&output.stdout)
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let actual = stdout
             .lines()
             .filter_map(|line| {
                 line.split_once(marker)
@@ -286,6 +292,50 @@ mod tests {
             expected, actual,
             "the hermetic fetch phase must cover the root and every checked nested workspace"
         );
+        assert!(stdout.contains("-- fetch phase would run"));
+        assert!(stdout.contains("-- offline phase would run"));
+    }
+
+    #[test]
+    fn hermetic_fetch_only_dry_run_does_not_show_offline() {
+        let output = split_validate_dry_run(&["--fetch-only"]);
+        assert!(
+            output.status.success(),
+            "split-validate dry-run failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("FETCH phase"));
+        assert!(stdout.contains("-- fetch phase would run"));
+        assert!(stdout.contains("cargo fetch --locked"));
+        assert!(!stdout.contains("OFFLINE phase"));
+        assert!(!stdout.contains("-- offline phase would run"));
+    }
+
+    #[test]
+    fn hermetic_offline_dry_run_does_not_show_a_fetch() {
+        let output = split_validate_dry_run(&["--offline-only"]);
+        assert!(
+            output.status.success(),
+            "split-validate dry-run failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("OFFLINE phase"));
+        assert!(stdout.contains("-- offline phase would run"));
+        assert!(!stdout.contains("FETCH phase"));
+        assert!(!stdout.contains("-- fetch phase would run"));
+        assert!(!stdout.contains("cargo fetch --locked"));
+    }
+
+    #[test]
+    fn hermetic_dry_run_refuses_both_phase_only_flags() {
+        let output = split_validate_dry_run(&["--fetch-only", "--offline-only"]);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains("--fetch-only and --offline-only cannot be combined"));
     }
 
     #[test]
