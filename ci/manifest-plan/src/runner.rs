@@ -19,6 +19,7 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use detcore_model::summary::PathEvidence;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -946,15 +947,6 @@ pub struct AttemptResult {
     pub sabre_path_evidence: Option<String>,
     pub sabre_path_evidence_sha256: Option<String>,
     pub reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct SabrePathRecord {
-    schema: u64,
-    guest_rpc_observed: bool,
-    ptrace_fallback_sites: u64,
-    trusted_shared_object_sites: u64,
-    trusted_shared_objects: Vec<String>,
 }
 
 /// One test-harness cell observation written to `results.jsonl`.
@@ -2852,18 +2844,24 @@ fn summarize_sabre_path_evidence(attempts: &[AttemptResult]) -> Result<Option<Js
     if !is_sabre {
         return Ok(None);
     }
-    let mut executions = Vec::<SabrePathRecord>::new();
+    let mut executions = Vec::<PathEvidence>::new();
     for line in attempts
         .iter()
         .flat_map(|attempt| attempt.sabre_path_evidence.as_deref().unwrap_or("").lines())
     {
+        let value = serde_json::from_str::<JsonValue>(line)
+            .map_err(|error| format!("invalid SaBRe path-evidence record: {error}"))?;
+        if value.get("schema").and_then(JsonValue::as_u64) != Some(u64::from(PathEvidence::SCHEMA))
+        {
+            return Err(format!(
+                "invalid SaBRe path-evidence record: schema must be {}",
+                PathEvidence::SCHEMA
+            ));
+        }
         executions.push(
-            serde_json::from_str::<SabrePathRecord>(line)
+            serde_json::from_value::<PathEvidence>(value)
                 .map_err(|error| format!("invalid SaBRe path-evidence record: {error}"))?,
         );
-    }
-    if executions.iter().any(|row| row.schema != 1) {
-        return Err("invalid SaBRe path-evidence record: schema must be 1".into());
     }
     let expected = attempts
         .iter()
@@ -2876,19 +2874,31 @@ fn summarize_sabre_path_evidence(attempts: &[AttemptResult]) -> Result<Option<Js
         })
         .sum::<usize>();
     let complete = executions.len() == expected;
-    let guest_rpc_observed = complete && executions.iter().all(|row| row.guest_rpc_observed);
-    let ptrace_fallback_sites = executions
-        .iter()
-        .map(|row| row.ptrace_fallback_sites)
-        .sum::<u64>();
-    let trusted_shared_object_sites = executions
-        .iter()
-        .map(|row| row.trusted_shared_object_sites)
-        .sum::<u64>();
-    let trusted_shared_objects = executions
-        .iter()
-        .flat_map(|row| row.trusted_shared_objects.iter().cloned())
-        .collect::<BTreeSet<_>>();
+    let mut guest_rpc_observed = complete;
+    let mut ptrace_fallback_sites = 0usize;
+    let mut trusted_shared_object_sites = 0usize;
+    let mut trusted_shared_objects = BTreeSet::new();
+    for row in &executions {
+        // Keep this pattern exhaustive. Adding a producer field must stop this
+        // consumer at compile time until its meaning is handled here.
+        let PathEvidence {
+            schema,
+            guest_rpc_observed: observed,
+            ptrace_fallback_sites: fallback_sites,
+            trusted_shared_object_sites: shared_object_sites,
+            trusted_shared_objects: shared_objects,
+        } = row;
+        if *schema != PathEvidence::SCHEMA {
+            return Err(format!(
+                "invalid SaBRe path-evidence record: schema must be {}",
+                PathEvidence::SCHEMA
+            ));
+        }
+        guest_rpc_observed &= *observed;
+        ptrace_fallback_sites += *fallback_sites;
+        trusted_shared_object_sites += *shared_object_sites;
+        trusted_shared_objects.extend(shared_objects.iter().cloned());
+    }
     let eligible = complete
         && guest_rpc_observed
         && ptrace_fallback_sites == 0
@@ -5239,6 +5249,35 @@ backends_disabled:
 "#,
         );
         assert!(summarize_sabre_path_evidence(&[malformed]).is_err());
+
+        let unknown = attempt_with_sabre_evidence(
+            r#"{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[],"unexpected":0}
+{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}
+"#,
+        );
+        let error = summarize_sabre_path_evidence(&[unknown]).unwrap_err();
+        assert!(error.contains("unknown field `unexpected`"), "{error}");
+
+        let missing = attempt_with_sabre_evidence(
+            r#"{"schema":1,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}
+{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}
+"#,
+        );
+        let error = summarize_sabre_path_evidence(&[missing]).unwrap_err();
+        assert!(
+            error.contains("missing field `guest_rpc_observed`"),
+            "{error}"
+        );
+
+        let future = attempt_with_sabre_evidence(
+            r#"{"schema":2,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[],"future_field":"value"}
+{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}
+"#,
+        );
+        assert_eq!(
+            summarize_sabre_path_evidence(&[future]).unwrap_err(),
+            "invalid SaBRe path-evidence record: schema must be 1"
+        );
     }
 
     #[test]
