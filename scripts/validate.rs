@@ -8748,6 +8748,17 @@ fn retry_steps_with_satisfied_prerequisites(
         .collect()
 }
 
+fn merge_retry_skips(
+    skipped: &mut Vec<String>,
+    retry_tags: &BTreeSet<String>,
+    retry_skipped: &[String],
+) {
+    skipped.retain(|tag| !retry_tags.contains(tag));
+    skipped.extend(retry_skipped.iter().cloned());
+    skipped.sort();
+    skipped.dedup();
+}
+
 fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
     const DEFAULT_TEST_CAP_S: i64 = 15;
     const NEXTEST_TERMINATION_GRACE_S: i64 = 2;
@@ -9120,6 +9131,23 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         return Err(format!(
             "scheduler accounting: dependency-skipped required node did not force incomplete execution: complete={} ok={} skipped={:?}",
             dependency_result.complete, dependency_result.ok, dependency_result.skipped
+        ));
+    }
+
+    // A retry can cover only part of the original graph. Replacing the whole
+    // skip set with that retry's result would erase an unretried dependency
+    // skip and lose its dependency-skipped accounting.
+    let unretried_dependency_skip = "fixture.unretried_dependency_skip".to_string();
+    let retried = "fixture.retried".to_string();
+    let mut retry_merge_skips = vec![unretried_dependency_skip.clone(), retried.clone()];
+    merge_retry_skips(
+        &mut retry_merge_skips,
+        &BTreeSet::from([retried]),
+        &[],
+    );
+    if retry_merge_skips != [unretried_dependency_skip.clone()] {
+        return Err(format!(
+            "scheduler accounting: a partial retry erased a dependency skip outside its graph: {retry_merge_skips:?}"
         ));
     }
 
@@ -11178,7 +11206,7 @@ fn run_lane_with_env_retries(
             let ordinal = next_attempt_ordinal(&attempts, &tag);
             attempts.push(unreported_attempt(tag, ordinal));
         }
-        skipped = again.skipped.clone();
+        merge_retry_skips(&mut skipped, &retry_tags, &again.skipped);
         round_log_start = retry_log_start;
     }
 
