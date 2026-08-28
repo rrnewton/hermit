@@ -243,7 +243,7 @@ def parse_run_metadata(value: Mapping[str, Any]) -> QemuRunMetadata:
     info_log_sha256 = _metadata_sha256(value, "info_log_sha256")
     hermit_version = _metadata_text(value, "hermit_version")
     qemu_version = _metadata_text(value, "qemu_version")
-    qemu_binary_sha256 = _metadata_optional_text(value, "qemu_binary_sha256")
+    qemu_binary_sha256 = _metadata_optional_sha256(value, "qemu_binary_sha256")
     qemu_argv = _metadata_qemu_argv(value)
     serial_log = _metadata_text(value, "serial_log")
 
@@ -459,11 +459,15 @@ def _tool_version(command: Sequence[str]) -> str:
 def _tool_sha256(executable: str) -> str:
     path = Path(shutil.which(executable) or executable)
     if not path.is_file():
-        return "unavailable: {} is not a file".format(path)
+        raise _metadata_error(
+            "qemu_binary_sha256", "cannot hash {}: not a file".format(path)
+        )
     try:
         return hash_file(path)
     except OSError as error:
-        return "unavailable: {}".format(error)
+        raise _metadata_error(
+            "qemu_binary_sha256", "cannot hash {}: {}".format(path, error)
+        ) from error
 
 
 def _write_json(path: Path, value: Dict[str, Any]) -> None:

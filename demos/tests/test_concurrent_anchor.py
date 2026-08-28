@@ -340,21 +340,84 @@ class RunMetadataContractTest(unittest.TestCase):
 
             self.assertEqual(dc.RUN_METADATA_SCHEMA_VERSION, metadata.schema_version)
             self.assertEqual(dc.QemuRunKind.BOOT, metadata.kind)
+            self.assertEqual("b" * 64, metadata.qemu_binary_sha256)
             self.assertEqual(metadata, dc.load_anchor(run))
 
+    def test_producer_refuses_missing_qemu_binary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            info_log = run / "hermit-info.log"
+            qcow2 = run / "boot-snapshot.qcow2"
+            serial_log = run / "serial.log"
+            info_log.write_text("INFO deterministic run\n")
+            qcow2.write_bytes(b"qcow2")
+            serial_log.write_text("serial\n")
+            missing_qemu = run / "missing-qemu"
+            with mock.patch.object(
+                dc, "_tool_version", return_value="test-version"
+            ), mock.patch.dict(dc.os.environ, {"QEMU_BIN": str(missing_qemu)}):
+                with self.assertRaisesRegex(
+                    ValueError, "qemu-run-metadata-qemu_binary_sha256"
+                ):
+                    dc.save_metadata(
+                        run,
+                        qcow2,
+                        info_log,
+                        {
+                            "kind": "qemu-boot",
+                            "snapshot_name": "booted",
+                            "snapshot_date_nsec_canonicalized": True,
+                            "qemu_argv": [str(missing_qemu), "-nographic"],
+                            "serial_log": str(serial_log),
+                            "serial_sha256": dc.hash_file(serial_log),
+                        },
+                    )
+
+            self.assertFalse((run / "run-metadata.json").exists())
+
     def test_schema_two_requires_qemu_binary_identity(self):
-        record = _boot_record(Path("/tmp"))
-        del record["qemu_binary_sha256"]
-        with self.assertRaisesRegex(
-            ValueError, "qemu-run-metadata-qemu_binary_sha256"
-        ):
-            dc.parse_run_metadata(record)
+        for record in (_boot_record(Path("/tmp")), _resume_record()):
+            with self.subTest(kind=record["kind"]):
+                del record["qemu_binary_sha256"]
+                with self.assertRaisesRegex(
+                    ValueError, "qemu-run-metadata-qemu_binary_sha256"
+                ):
+                    dc.parse_run_metadata(record)
 
     def test_schema_one_retains_the_older_optional_qemu_binary(self):
         record = _resume_record(schema_version=1)
         del record["qemu_binary_sha256"]
         metadata = dc.parse_run_metadata(record)
         self.assertIsNone(metadata.qemu_binary_sha256)
+
+    def test_qemu_binary_identity_rejects_non_digest_values(self):
+        for schema_version in (1, dc.RUN_METADATA_SCHEMA_VERSION):
+            records = (_boot_record(Path("/tmp")), _resume_record(schema_version))
+            records[0]["schema_version"] = schema_version
+            for record in records:
+                for invalid in (
+                    "unavailable: qemu-system-x86_64 is not a file",
+                    "B" * 64,
+                    "b" * 63,
+                    "g" * 64,
+                ):
+                    with self.subTest(
+                        schema_version=schema_version,
+                        kind=record["kind"],
+                        invalid=invalid,
+                    ):
+                        record["qemu_binary_sha256"] = invalid
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "qemu-run-metadata-qemu_binary_sha256: must be a "
+                            "lowercase 64-hex SHA-256",
+                        ):
+                            dc.parse_run_metadata(record)
+
+    def test_schema_two_accepts_lowercase_qemu_binary_digest(self):
+        record = _resume_record()
+        metadata = dc.parse_run_metadata(record)
+        self.assertEqual("b" * 64, metadata.qemu_binary_sha256)
 
     def test_saved_resume_requires_its_snapshot_fields(self):
         record = _resume_record()
