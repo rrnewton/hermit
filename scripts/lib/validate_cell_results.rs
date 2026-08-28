@@ -149,13 +149,20 @@ fn comparison_tier(report: &Value) -> Option<&'static str> {
     {
         return None;
     }
+    // The time policy changes what a match establishes, not whether the
+    // comparison happened. `run --verify` uses virtual time and establishes
+    // repeat determinism; `record start --verify` deliberately leaves time
+    // real and establishes that replay reproduced the recording. Both can
+    // still perform the same canonical bitwise comparison. Require the field
+    // and its boolean type, then preserve its value in the retained verdict so
+    // consumers can make the stronger distinction themselves.
+    let _virtualize_time = comparison.get("virtualize_time")?.as_bool()?;
     let canonical = comparison.get("strictness")?.as_str()? == "canonical"
         && comparison.get("display_name")?.as_str()? == "BitwiseInfoV1"
         && comparison.get("compare_logs")?.as_bool()?
         && comparison.get("compare_io_buffers")?.as_bool()?
         && comparison.get("log_scope")?.as_str()? == "info"
         && comparison.get("record_envelope")?.as_str()? == "all_records_v1"
-        && comparison.get("virtualize_time")?.as_bool()?
         && !comparison.get("strip_lines")?.as_bool()?
         && comparison.get("canonicalize_addresses")?.as_bool()?
         && comparison.get("full_trace")?.as_bool()?
@@ -933,6 +940,53 @@ mod tests {
         assert_eq!(verdict["state"], "unavailable-with-reason");
         assert!(verdict.get("comparison").is_none());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn matched_record_replay_without_virtual_time_is_still_a_comparison() {
+        let mut row = result_row(
+            "validate-record-replay",
+            "1515151515151515151515151515151515151515",
+        );
+        row["mode"] = Value::String("replay".into());
+        let mut report: Value = serde_json::from_str(&report("matched", "info")).unwrap();
+        report["comparison"]["virtualize_time"] = Value::Bool(false);
+        replace_report(&mut row, &report);
+
+        let verdict = cell_verdict(&row).unwrap();
+        assert_eq!(verdict["state"], "compared-and-matched");
+        assert_eq!(verdict["comparison_tier"], "canonical-bitwise");
+        assert_eq!(verdict["comparison"]["virtualize_time"], false);
+    }
+
+    #[test]
+    fn a_comparison_that_did_not_run_stays_unavailable() {
+        let mut row = result_row(
+            "validate-no-comparison",
+            "1616161616161616161616161616161616161616",
+        );
+        row["attempts"] = Value::Array(vec![serde_json::json!({"outcome": "ERROR"})]);
+
+        let verdict = cell_verdict(&row).unwrap();
+        assert_eq!(verdict["state"], "unavailable-with-reason");
+        assert_eq!(
+            verdict["reason"],
+            "attempt 1 emitted no typed verification report"
+        );
+    }
+
+    #[test]
+    fn schema7_refuses_a_non_boolean_time_policy() {
+        let mut row = result_row(
+            "validate-invalid-time-policy",
+            "1717171717171717171717171717171717171717",
+        );
+        let mut report: Value = serde_json::from_str(&report("matched", "info")).unwrap();
+        report["comparison"]["virtualize_time"] = Value::String("false".into());
+        replace_report(&mut row, &report);
+
+        let verdict = cell_verdict(&row).unwrap();
+        assert_eq!(verdict["state"], "unavailable-with-reason");
     }
 
     #[test]
