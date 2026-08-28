@@ -169,14 +169,18 @@ function run_hermit_verify {
         # that point: a launch refusal, not a comparison outcome.
         failure="REFUSED: no --verify-json report was written (Hermit exited $status before stamping a verdict)"
     else
-        local parity counts_left counts_right verdict_name
+        local parity counts_left counts_right verdict_name infrastructure_kind infrastructure_count
         parity=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("bitwise_parity"))' "$verdict_file" 2>/dev/null || echo ERROR)
         verdict_name=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("verdict"))' "$verdict_file" 2>/dev/null || echo ERROR)
+        infrastructure_kind=$(python3 -c 'import json,sys; print((json.load(open(sys.argv[1])).get("infrastructure_error") or {}).get("kind"))' "$verdict_file" 2>/dev/null || echo ERROR)
+        infrastructure_count=$(python3 -c 'import json,sys; print((json.load(open(sys.argv[1])).get("infrastructure_error") or {}).get("count"))' "$verdict_file" 2>/dev/null || echo ERROR)
         counts_left=$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])).get("compared_log_messages") or {}; print(c.get("left",0))' "$verdict_file" 2>/dev/null || echo ERROR)
         counts_right=$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])).get("compared_log_messages") or {}; print(c.get("right",0))' "$verdict_file" 2>/dev/null || echo ERROR)
 
         if [[ $parity == ERROR || $verdict_name == ERROR ]]; then
             failure="NO-RESULT: --verify-json report is not parseable JSON"
+        elif [[ $verdict_name == infrastructure_error ]]; then
+            failure="INFRASTRUCTURE ERROR: kind=$infrastructure_kind count=$infrastructure_count"
         elif [[ $verdict_name == no_result ]]; then
             failure="NO-RESULT: verification reached no verdict (verdict=no_result)"
         elif [[ $counts_left == 0 || $counts_right == 0 ]]; then

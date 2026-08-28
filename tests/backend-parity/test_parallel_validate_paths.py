@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import select
 import subprocess
@@ -28,6 +29,33 @@ def load(name: str, filename: str):
 
 
 class BackendParityTemporaryPathTest(unittest.TestCase):
+    def test_infrastructure_receipt_keeps_its_cause_beside_the_gap_tier(self) -> None:
+        run_matrix = load("infrastructure_receipt_run_matrix", "run_matrix.py")
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "verdict.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "verified": False,
+                        "bitwise_parity": False,
+                        "verdict": "infrastructure_error",
+                        "infrastructure_error": {
+                            "kind": "skid_overshoot",
+                            "count": 2,
+                        },
+                        "comparison": None,
+                        "compared_log_messages": None,
+                    }
+                )
+            )
+            receipt = run_matrix.verify_tier_from_json(path)
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt["tier"], "gap")
+        self.assertEqual(
+            receipt["infrastructure_error"],
+            "verification recorded 2 HERMIT_SKID_OVERSHOOT report(s)",
+        )
+
     def test_old_host_tmp_overwrites_and_all_commands_accept_private_roots(self) -> None:
         run_matrix = load("parallel_run_matrix", "run_matrix.py")
         e9patch = load("parallel_e9patch_corpus", "e9patch_corpus.py")

@@ -3376,13 +3376,19 @@ fn apply_validate_results(
             // counted, reported, and NOT stored: there is no product behaviour to
             // record.
             //
-            // An `ERROR` that DID locate a position is a different row and keeps its
-            // hard refusal below. Infrastructure failed but a divergence position was
-            // reported: that is self-contradictory input, and refusing it loudly is
-            // right.
-            if located_nothing && row.outcome != "PASS" && row.outcome != "FAIL" {
-                fold.errored
-                    .push(format!("{} (outcome={})", display_id(id), row.outcome));
+            // An understood infrastructure error may retain a completed
+            // comparison and its divergence coordinates. Those coordinates
+            // remain diagnostic evidence, not product behavior: count and
+            // name the error, but do not store an observation from it.
+            if row.outcome == "ERROR"
+                || (located_nothing && row.outcome != "PASS" && row.outcome != "FAIL")
+            {
+                fold.errored.push(format!(
+                    "{} (outcome={}, reason={})",
+                    display_id(id),
+                    row.outcome,
+                    row.reason.as_deref().unwrap_or("not recorded")
+                ));
                 continue;
             }
             let result = validate_row_result(row)?;
@@ -7656,6 +7662,37 @@ red/`measured-and-passed` count is **0**.",
              gain a measurement"
                 .into(),
         );
+    }
+    let mut error_with_coordinates = coordinate_less_row(&unlocated_id, "ERROR");
+    let row = &mut error_with_coordinates.get_mut(&unlocated_id).unwrap()[0].row;
+    row.first_divergent_scheduler_turn = Some(7);
+    row.first_divergent_virtual_nanoseconds = Some(70);
+    row.first_divergent_record = Some(12);
+    row.first_divergent_syscall = Some(9);
+    row.reason = Some("verification recorded 1 HERMIT_SKID_OVERSHOOT report(s)".into());
+    let mut retained_comparison_error = TrackedCells {
+        schema: SCHEMA,
+        projection: None,
+        cells: vec![bare_cell(&unlocated_id)],
+    };
+    let retained_comparison_error_fold = apply_validate_results(
+        &mut retained_comparison_error,
+        &error_with_coordinates,
+        "sha-1",
+        "tree-1",
+        &depth_fixture,
+        true,
+        true,
+    )
+    .map_err(|e| format!("an infrastructure ERROR with retained coordinates was refused: {e}"))?;
+    if retained_comparison_error_fold.errored.len() != 1
+        || !retained_comparison_error_fold.errored[0].contains("HERMIT_SKID_OVERSHOOT")
+        || !retained_comparison_error.cells[0].observations.is_empty()
+    {
+        return Err(format!(
+            "an infrastructure ERROR with retained comparison evidence was not named and excluded from product observations: {:?}",
+            retained_comparison_error_fold.errored
+        ));
     }
     // 2. A genuinely clean run STILL reads all-green. The inverse defect -- making
     // every quiet run look suspicious -- is the one that cost real time on a false

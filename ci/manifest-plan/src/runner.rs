@@ -1846,7 +1846,11 @@ fn execute_spec_until(
                             // no-result record or otherwise unrelated, and
                             // cannot supersede the refusal classification.
                         } else if report.verdict == Verdict::InfrastructureError {
-                            if let Err(error) = report.require_canonical_comparison() {
+                            let comparison_error = report
+                                .comparison
+                                .as_ref()
+                                .and_then(|_| report.require_canonical_comparison().err());
+                            if let Some(error) = comparison_error {
                                 outcome = "ERROR".into();
                                 error_kind = Some("incomplete-verification-evidence".into());
                                 reason = Some(error);
@@ -4976,6 +4980,30 @@ backends_disabled:
                 .as_deref()
                 .is_some_and(|json| json.contains("\"comparison\":{")),
             "infrastructure error must retain the completed comparison: {result:?}"
+        );
+
+        let mut before_comparison = canonical_verification_report();
+        before_comparison.verified = false;
+        before_comparison.bitwise_parity = false;
+        before_comparison.verdict = Verdict::InfrastructureError;
+        before_comparison.infrastructure_error =
+            Some(InfrastructureError::SkidOvershoot { count: 1 });
+        before_comparison.comparison = None;
+        before_comparison.compared_log_messages = None;
+        let before_comparison = serde_json::to_string(&before_comparison).unwrap();
+        let result = attempt_from_script(
+            "ptrace",
+            "printf %s \"$1\" > \"$2\"; exit 122",
+            Some(&before_comparison),
+        );
+        assert_eq!(result.outcome, "ERROR");
+        assert_eq!(result.error_kind.as_deref(), Some("infrastructure"));
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("1 HERMIT_SKID_OVERSHOOT")),
+            "comparison-null infrastructure error must retain its cause: {result:?}"
         );
     }
 
