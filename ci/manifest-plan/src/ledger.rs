@@ -305,6 +305,41 @@ pub enum RequiredNullable<T> {
     Value(T),
 }
 
+impl ComparisonSpec {
+    /// Whether this is the complete canonical BitwiseInfoV1 comparison used by
+    /// a `canonical-bitwise` cell verdict.
+    ///
+    /// Keep this check with the shared wire type. The validation producer and
+    /// receipt readers must not maintain separate lists of comparison fields
+    /// and then disagree about whether a cell carries usable evidence.
+    pub fn is_canonical_bitwise_info_v1(
+        &self,
+        compared_log_messages: &RequiredNullable<ComparedLogCounts>,
+    ) -> bool {
+        let RequiredNullable::Value(counts) = compared_log_messages else {
+            return false;
+        };
+        self.strictness == ComparisonStrictness::Canonical
+            && self.display_name.as_deref() == Some("BitwiseInfoV1")
+            && self.compare_logs
+            && self.compare_io_buffers == Some(true)
+            && self.record_envelope.as_deref() == Some("all_records_v1")
+            && self.virtualize_time == Some(true)
+            && self.log_scope == ComparedLogScope::Info
+            && !self.strip_lines
+            && self.canonicalize_addresses
+            && self.full_trace
+            && self.exact_remainder
+            && self.stripped_prefixes == ["real-wall-clock-prefix/v1"]
+            && self.canonicalizations == ["host-address-to-first-appearance-ordinal/v1"]
+            && !self.ignore_lines
+            && !self.skip_commit
+            && !self.skip_detlog
+            && counts.left > 0
+            && counts.right > 0
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum CellVerdict {
@@ -508,8 +543,11 @@ mod tests {
             "\"compare_logs\":true,",
             "\"display_name\":\"BitwiseInfoV1\",\"compare_logs\":true,\"compare_io_buffers\":true,\"record_envelope\":\"all_records_v1\",\"virtualize_time\":true,",
         );
-        let CellVerdict::ComparedAndMatched { comparison, .. } =
-            serde_json::from_str::<CellVerdict>(&current).unwrap()
+        let CellVerdict::ComparedAndMatched {
+            comparison,
+            compared_log_messages,
+            ..
+        } = serde_json::from_str::<CellVerdict>(&current).unwrap()
         else {
             panic!("current verifier report changed verdict state");
         };
@@ -520,6 +558,16 @@ mod tests {
             Some("all_records_v1")
         );
         assert_eq!(comparison.virtualize_time, Some(true));
+        assert!(comparison.is_canonical_bitwise_info_v1(&compared_log_messages));
+        let CellVerdict::ComparedAndMatched {
+            comparison: older_comparison,
+            compared_log_messages: older_counts,
+            ..
+        } = serde_json::from_str::<CellVerdict>(compared).unwrap()
+        else {
+            panic!("older verifier report changed verdict state");
+        };
+        assert!(!older_comparison.is_canonical_bitwise_info_v1(&older_counts));
         for (state, expected) in [
             ("compared-and-diverged", "diverged"),
             ("performs-no-comparison-by-design", "by-design"),
