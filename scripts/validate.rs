@@ -2182,15 +2182,15 @@ cleared-caps refusal names {} starved step(s)",
                     .into(),
             );
         }
-        if privileged_build.cmd.contains("cargo ")
-            || !privileged_build
-                .cmd
-                .contains("verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path")
+        let expected_test_prebuild = "CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run";
+        if !privileged_build
+            .cmd
+            .contains("verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path")
+            || !privileged_build.cmd.contains(expected_test_prebuild)
             || !privileged_build.cmd.contains("tests_misc-*")
         {
             return Err(
-                "full-plan bracket: privileged build did not become an exact artifact assertion"
-                    .into(),
+                "full-plan bracket: privileged build did not assert the artifact and prebuild the exact downstream test binaries".into(),
             );
         }
         let cpuid = full
@@ -5545,7 +5545,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             .iter_mut()
             .find(|s| s.tag() == consumer)
             .ok_or_else(|| format!("fused artifact consumer disappeared: {consumer}"))?;
-        let expected_build = "CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run";
+        let expected_build = "CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run && CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run";
         if privileged_build.cmd != expected_build {
             return Err(format!(
                 "fused privileged build command drifted; re-prove that build.workspace is a superset: {}",
@@ -5580,7 +5580,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // selects, so "any one of nine" would let it silently test a STALE
         // artifact -- a check that passes while measuring the wrong thing,
         // which is worse than failing loudly. Zero binaries still fails.
-        privileged_build.cmd = "./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null || exit 1; newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"".to_string();
+        privileged_build.cmd = "./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null || exit 1; CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run || exit 1; newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"".to_string();
 
         let cpuid = steps
             .iter_mut()
