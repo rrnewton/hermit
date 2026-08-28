@@ -14,6 +14,7 @@ members = [
   "hermit-verify",
   "tests",
 ]
+exclude = ["agent-utils"]
 # Bare `cargo build`/`cargo test` (no `--workspace`) builds only these members.
 # The three third-party-dependency crates -- `detcore-dbt` and `hermit-install`
 # (pull `reverie-dbt`/DynamoRIO) and `detcore-sabre` (pulls `reverie-sabre`) --
