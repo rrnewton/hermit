@@ -13,12 +13,16 @@ use serde::Serialize;
 pub use crate::host_capability::CapabilityVerdict as HostCapabilityVerdict;
 pub use crate::host_capability::HostCapabilities;
 pub use crate::host_capability::HostCapability;
+use crate::runner::FailureClass;
+use crate::runner::ObservedResult;
 
 pub const STRESS_SERIES_SCHEMA_V1: &str = "stress-series/v1";
 pub const STRESS_SERIES_SCHEMA_V2: &str = "stress-series/v2";
-// Frozen with v2: extending the machine vocabulary must not retroactively make
-// already-written v2 rows unreadable. A new capability therefore requires a
-// new stress-series schema before producers may emit it.
+pub const STRESS_SERIES_SCHEMA_V3: &str = "stress-series/v3";
+// Frozen when introduced in v2 and retained by v3: extending the machine
+// vocabulary must not retroactively make already-written rows unreadable. A
+// new capability therefore requires a new stress-series schema before
+// producers may emit it.
 const STRESS_SERIES_V2_HOST_CAPABILITIES: [HostCapability; 2] =
     [HostCapability::CpuidFaulting, HostCapability::Kvm];
 
@@ -28,6 +32,8 @@ pub enum SeriesSchema {
     V1,
     #[serde(rename = "stress-series/v2")]
     V2,
+    #[serde(rename = "stress-series/v3")]
+    V3,
 }
 
 impl SeriesSchema {
@@ -35,6 +41,7 @@ impl SeriesSchema {
         match self {
             Self::V1 => STRESS_SERIES_SCHEMA_V1,
             Self::V2 => STRESS_SERIES_SCHEMA_V2,
+            Self::V3 => STRESS_SERIES_SCHEMA_V3,
         }
     }
 }
@@ -163,6 +170,15 @@ pub struct SeriesPayload {
     #[serde(default)]
     pub detcore_tree: Option<String>,
     pub outcome: SeriesOutcome,
+    /// The exact framework-written result. Required by `stress-series/v3`;
+    /// absent only on retained v1/v2 rows.
+    #[serde(default)]
+    pub result: Option<ObservedResult>,
+    /// Attribution for a non-pass. Required by `stress-series/v3` whenever the
+    /// exact result is not `pass`; absent only for passes and retained v1/v2
+    /// rows.
+    #[serde(default)]
+    pub failure_class: Option<FailureClass>,
     pub run_index: u64,
     #[serde(default)]
     pub attempt: Option<u64>,
@@ -231,28 +247,33 @@ impl SeriesRow {
         )
     }
 
-    /// Validate a newly written row. Historical v1 rows remain deserializable,
-    /// but no new row may omit the machine and kernel that bound its result.
+    /// Validate a newly written row. Historical v1/v2 rows remain
+    /// deserializable, but no new row may omit the framework's exact result and
+    /// attribution.
     pub fn validate_for_write(&self) -> Result<(), String> {
-        if self.schema != SeriesSchema::V2 {
+        if self.schema != SeriesSchema::V3 {
             return Err(format!(
-                "new rows must use {STRESS_SERIES_SCHEMA_V2}, got {}",
+                "new rows must use {STRESS_SERIES_SCHEMA_V3}, got {}",
                 self.schema.as_str()
             ));
         }
         self.validate_common()?;
-        self.validate_host_facts()
+        self.validate_host_facts()?;
+        self.validate_classification()
     }
 
     /// Validate a stored row before a reader uses its contents.
     ///
-    /// Retained v1 rows remain readable. Every v2 row must carry the complete
-    /// host facts that its schema promises, even when the reader does not
-    /// project the row into the scorecard.
+    /// Retained v1/v2 rows remain readable. Every v2/v3 row must carry the
+    /// complete host facts that its schema promises, and every v3 row must
+    /// carry the exact result classification.
     pub fn validate_for_read(&self) -> Result<(), String> {
         self.validate_common()?;
-        if self.schema == SeriesSchema::V2 {
+        if matches!(self.schema, SeriesSchema::V2 | SeriesSchema::V3) {
             self.validate_host_facts()?;
+        }
+        if self.schema == SeriesSchema::V3 {
+            self.validate_classification()?;
         }
         Ok(())
     }
@@ -263,13 +284,16 @@ impl SeriesRow {
     /// compare runs across the same machine name after a kernel change.
     pub fn validate_for_projection(&self) -> Result<(), String> {
         self.validate_common()?;
-        if self.schema != SeriesSchema::V2 {
+        if self.schema == SeriesSchema::V1 {
             return Err(format!(
                 "{} does not record machine_shortname, kernel_version, and host_capabilities",
                 self.schema.as_str()
             ));
         }
         self.validate_host_facts()?;
+        if self.schema == SeriesSchema::V3 {
+            self.validate_classification()?;
+        }
         if self.series.source_tree_dirty {
             return Err(
                 "source_tree_dirty is true; dirty source is not checked-in evidence".into(),
@@ -437,6 +461,62 @@ impl SeriesRow {
         }
         Ok(())
     }
+
+    fn validate_classification(&self) -> Result<(), String> {
+        let valid = matches!(
+            (
+                self.series.outcome,
+                self.series.result,
+                self.series.failure_class,
+            ),
+            (SeriesOutcome::Passed, Some(ObservedResult::Pass), None)
+                | (
+                    SeriesOutcome::Diverged,
+                    Some(
+                        ObservedResult::DeterminismFailure
+                            | ObservedResult::ParityFailure
+                            | ObservedResult::ReplayFailure
+                    ),
+                    Some(FailureClass::ProductFailure)
+                )
+                | (
+                    SeriesOutcome::Errored,
+                    Some(ObservedResult::CrashError),
+                    Some(FailureClass::ProductFailure)
+                )
+                | (
+                    SeriesOutcome::Timeout,
+                    Some(ObservedResult::Timeout),
+                    Some(FailureClass::NoResult)
+                )
+                | (
+                    SeriesOutcome::NoResult,
+                    Some(ObservedResult::Oom),
+                    Some(FailureClass::NoResult)
+                )
+                | (
+                    SeriesOutcome::Errored,
+                    None,
+                    Some(FailureClass::UnderstoodInfrastructureFailure)
+                )
+                | (
+                    SeriesOutcome::Skipped,
+                    None,
+                    Some(FailureClass::UnderstoodPrerequisiteFailure)
+                )
+                | (SeriesOutcome::NoResult, None, Some(FailureClass::NoResult))
+        );
+        if valid {
+            Ok(())
+        } else {
+            Err(format!(
+                "stress-series/v3 classification mismatch: outcome={} result={:?} failure_class={:?}",
+                self.series.outcome.as_str(),
+                self.series.result,
+                self.series.failure_class
+            ))
+        }
+    }
 }
 
 fn is_object_id(value: &str) -> bool {
@@ -479,6 +559,8 @@ mod tests {
                 tree: "a".repeat(40),
                 detcore_tree: None,
                 outcome: SeriesOutcome::Passed,
+                result: Some(ObservedResult::Pass),
+                failure_class: None,
                 run_index: 1,
                 attempt: None,
                 num_runs: 1,
@@ -512,8 +594,8 @@ mod tests {
     }
 
     #[test]
-    fn v2_requires_matching_machine_and_kernel() {
-        let mut fixture = row(SeriesSchema::V2);
+    fn v3_requires_matching_machine_and_kernel() {
+        let mut fixture = row(SeriesSchema::V3);
         fixture.validate_for_write().unwrap();
         fixture.series.kernel_version = None;
         assert_eq!(
@@ -544,8 +626,8 @@ mod tests {
     }
 
     #[test]
-    fn v2_requires_every_capability_verdict_with_evidence() {
-        let mut fixture = row(SeriesSchema::V2);
+    fn v3_requires_every_capability_verdict_with_evidence() {
+        let mut fixture = row(SeriesSchema::V3);
         fixture.series.host_capabilities = None;
         assert_eq!(
             fixture.validate_for_write().unwrap_err(),
@@ -553,7 +635,7 @@ mod tests {
         );
 
         for capability in STRESS_SERIES_V2_HOST_CAPABILITIES {
-            let mut fixture = row(SeriesSchema::V2);
+            let mut fixture = row(SeriesSchema::V3);
             fixture
                 .series
                 .host_capabilities
@@ -570,7 +652,7 @@ mod tests {
             );
         }
 
-        let mut fixture = row(SeriesSchema::V2);
+        let mut fixture = row(SeriesSchema::V3);
         fixture
             .series
             .host_capabilities
@@ -591,26 +673,28 @@ mod tests {
         legacy.series.host_capabilities = None;
         legacy.validate_for_read().unwrap();
 
-        let mut current = row(SeriesSchema::V2);
-        current.series.host_capabilities = None;
-        assert_eq!(
-            current.validate_for_read().unwrap_err(),
-            "series missing host_capabilities"
-        );
+        for schema in [SeriesSchema::V2, SeriesSchema::V3] {
+            let mut current = row(schema);
+            current.series.host_capabilities = None;
+            assert_eq!(
+                current.validate_for_read().unwrap_err(),
+                "series missing host_capabilities"
+            );
 
-        let mut current = row(SeriesSchema::V2);
-        current
-            .series
-            .host_capabilities
-            .as_mut()
-            .unwrap()
-            .remove(&HostCapability::Kvm);
-        assert!(current.validate_for_read().unwrap_err().contains("kvm"));
+            let mut current = row(schema);
+            current
+                .series
+                .host_capabilities
+                .as_mut()
+                .unwrap()
+                .remove(&HostCapability::Kvm);
+            assert!(current.validate_for_read().unwrap_err().contains("kvm"));
+        }
     }
 
     #[test]
     fn non_diverged_rows_cannot_carry_divergence_evidence() {
-        let mut fixture = row(SeriesSchema::V2);
+        let mut fixture = row(SeriesSchema::V3);
         fixture.series.coordinates = Some(SeriesCoordinates {
             first_divergent_record: Some(9),
             ..SeriesCoordinates::default()
@@ -629,11 +713,54 @@ mod tests {
         value["series"]["outcome"] = serde_json::json!("errored");
         let accepted: SeriesRow = serde_json::from_value(value.clone())
             .expect("errored remains a supported non-verdict outcome");
-        accepted.validate_for_write().unwrap();
+        accepted.validate_for_read().unwrap();
 
         value["series"]["outcome"] = serde_json::json!("error");
         let error = serde_json::from_value::<SeriesRow>(value)
             .expect_err("schema-v2 must refuse the unsupported error spelling");
         assert!(error.to_string().contains("unknown variant `error`"));
+    }
+
+    #[test]
+    fn v3_refuses_missing_or_mismatched_classification_by_name() {
+        let mut missing_result = row(SeriesSchema::V3);
+        missing_result.series.result = None;
+        for error in [
+            missing_result.validate_for_read().unwrap_err(),
+            missing_result.validate_for_write().unwrap_err(),
+        ] {
+            assert!(error.contains("result=None"));
+        }
+
+        let mut missing_class = row(SeriesSchema::V3);
+        missing_class.series.outcome = SeriesOutcome::Diverged;
+        missing_class.series.result = Some(ObservedResult::DeterminismFailure);
+        assert!(
+            missing_class
+                .validate_for_write()
+                .unwrap_err()
+                .contains("failure_class=None")
+        );
+
+        let mut wrong_result = row(SeriesSchema::V3);
+        wrong_result.series.outcome = SeriesOutcome::Diverged;
+        wrong_result.series.result = Some(ObservedResult::CrashError);
+        wrong_result.series.failure_class = Some(FailureClass::ProductFailure);
+        assert!(
+            wrong_result
+                .validate_for_write()
+                .unwrap_err()
+                .contains("result=Some(CrashError)")
+        );
+
+        let mut retained_v2 = row(SeriesSchema::V2);
+        retained_v2.series.result = None;
+        retained_v2.series.failure_class = None;
+        retained_v2.validate_for_read().unwrap();
+        retained_v2.validate_for_projection().unwrap();
+        assert_eq!(
+            retained_v2.validate_for_write().unwrap_err(),
+            "new rows must use stress-series/v3, got stress-series/v2"
+        );
     }
 }
