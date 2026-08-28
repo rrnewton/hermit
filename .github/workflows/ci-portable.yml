@@ -38,10 +38,8 @@ on:
   workflow_dispatch:
 
 concurrency:
-  # QUEUE-DEPTH-1 on main: all main pushes share one group (github.ref) and
-  # cancel-in-progress:false lets the RUNNING job finish while a newer main push
-  # supersedes only the older PENDING run. merge_group runs get a unique head_sha
-  # group. NOTHING here cancels an in-progress run.
+  # Manual runs for one ref share a group. cancel-in-progress:false lets the
+  # running diagnostic finish while GitHub supersedes only an older pending run.
   group: portable-${{ github.event.merge_group.head_sha || github.ref }}
   cancel-in-progress: false
 
@@ -183,7 +181,7 @@ jobs:
   # ---------------------------------------------------------------- plan (cheap)
   # Fail-closed integrity guard over the shard map itself. Runs UNCONDITIONALLY
   # (it has no `needs: select`) so a corrupt ci/portable-shards.json reds the
-  # required `regular` gate even on a skip/selective run. The shard MATRICES are
+  # `regular` diagnostic even on a skip/selective run. The shard MATRICES are
   # now derived by the `select` job (full or affected-test-filtered); this job no
   # longer emits them, it only verifies the map every downstream matrix is cut
   # from is internally consistent and covers the DAG.
@@ -828,7 +826,7 @@ jobs:
           compression-level: 0
 
   # These known-red exec probes stay visible and publish structured evidence,
-  # but do not taint the required portable result while SaBRe's private
+  # but do not taint the portable diagnostic result while SaBRe's private
   # coordinator socket cannot survive guest exec.
   sabre_non_gated_parity:
     name: SaBRe non-gating exec diagnostics
@@ -1017,10 +1015,10 @@ jobs:
           jq . <<< "$RESULTS"
           # A job is acceptable only if it SUCCEEDED or was intentionally
           # deselected (skipped) by affected-test selection. A `failure` or
-          # `cancelled` in ANY required job still fails closed — selection can
+          # `cancelled` in ANY selected job still fails closed — selection can
           # remove a job from the run, never mask a real failure. `select` itself
           # is in this set: if it dies it reports `failure`, not `skipped`, so a
-          # broken selection job reds the gate instead of silently skipping tests.
+          # broken selection job reds the diagnostic instead of silently skipping tests.
           jq -e 'all(.[]; .result == "success" or .result == "skipped")' <<< "$RESULTS"
 
   # ------------------------------------------------------------- cleanup
