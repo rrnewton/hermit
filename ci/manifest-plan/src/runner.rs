@@ -25,6 +25,7 @@ use serde_json::Value as JsonValue;
 use sha2::Digest;
 use sha2::Sha256;
 
+use crate::canonical_verdict::Verdict;
 pub use crate::canonical_verdict::VerificationReport;
 pub use crate::canonical_verdict::VerificationRuntime;
 use crate::ci_selection::CiDisabledReasonSpec;
@@ -1744,7 +1745,13 @@ fn execute_spec_until(
                             // this point is the invocation's pre-stamped
                             // no-result record or otherwise unrelated, and
                             // cannot supersede the refusal classification.
-                        } else if report.verdict == "no_result"
+                        } else if report.verdict == Verdict::NoResult
+                            && matches!(
+                                report.no_result_reason,
+                                Some(
+                                    crate::canonical_verdict::NoResultReason::FirstRunRejected { .. }
+                                ) | None
+                            )
                             && !output.timed_out
                             && output.status.code().is_some_and(|code| code != 0)
                         {
@@ -4596,23 +4603,40 @@ backends_disabled:
         let report = serde_json::to_string(&VerificationReport {
             verified: true,
             bitwise_parity: true,
-            verdict: "matched".into(),
+            verdict: Verdict::Matched,
+            no_result_reason: None,
             comparison: Some(crate::canonical_verdict::ComparisonReport {
-                strictness: "canonical".into(),
+                strictness: crate::canonical_verdict::LogCompareStrictness::Canonical,
+                display_name: Some("BitwiseInfoV1".into()),
                 compare_logs: true,
+                compare_io_buffers: Some(true),
+                log_scope: Some(crate::canonical_verdict::ComparedLogScope::Info),
                 record_envelope: crate::canonical_verdict::RecordEnvelopeReport::AllRecordsV1,
+                virtualize_time: Some(true),
+                strip_lines: Some(false),
+                canonicalize_addresses: Some(true),
+                full_trace: Some(true),
+                exact_remainder: Some(true),
+                stripped_prefixes: Some(vec!["real-wall-clock-prefix/v1".into()]),
+                canonicalizations: Some(vec!["host-address-to-first-appearance-ordinal/v1".into()]),
+                ignore_lines: Some(false),
+                skip_commit: Some(false),
+                skip_detlog: Some(false),
             }),
+            compared_log_messages: Some(crate::canonical_verdict::ComparedLogMessages {
+                left: 1,
+                right: 1,
+            }),
+            dbt_counted_branches: None,
+            runtime: None,
+            guest_exit_code: Some(7),
+            guest_signal: None,
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
             first_divergent_left_message: None,
             first_divergent_right_message: None,
-            runtime: None,
-            compared_log_messages: Some(crate::canonical_verdict::ComparedLogMessages {
-                left: 1,
-                right: 1,
-            }),
         })
         .unwrap();
         let spec = CellRunSpec {
@@ -4814,7 +4838,10 @@ backends_disabled:
         assert_eq!(chaos.status, Some(7));
     }
 
-    fn no_result_with_exit_status(status: i32) -> AttemptResult {
+    fn no_result_with_exit_status(
+        status: i32,
+        reason: crate::canonical_verdict::NoResultReason,
+    ) -> AttemptResult {
         let dir = std::env::temp_dir().join(format!(
             "hermit-runner-no-result-bracket-{}-{status}",
             std::process::id()
@@ -4822,21 +4849,9 @@ backends_disabled:
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let verdict = dir.join("verdict.json");
-        let report = serde_json::to_string(&VerificationReport {
-            verified: false,
-            bitwise_parity: false,
-            verdict: "no_result".into(),
-            comparison: None,
-            compared_log_messages: None,
-            first_divergent_scheduler_turn: None,
-            first_divergent_virtual_nanoseconds: None,
-            first_divergent_record: None,
-            first_divergent_syscall: None,
-            first_divergent_left_message: None,
-            first_divergent_right_message: None,
-            runtime: None,
-        })
-        .unwrap();
+        let mut report = VerificationReport::no_result();
+        report.no_result_reason = Some(reason);
+        let report = serde_json::to_string(&report).unwrap();
         let spec = CellRunSpec {
             id: CellId {
                 test: "fixture/no-result".into(),
@@ -4872,7 +4887,15 @@ backends_disabled:
 
     #[test]
     fn no_result_preserves_the_process_outcome_distinction() {
-        let failed = no_result_with_exit_status(7);
+        let failed = no_result_with_exit_status(
+            7,
+            crate::canonical_verdict::NoResultReason::FirstRunRejected {
+                exit_code: Some(7),
+                signal: None,
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+            },
+        );
         assert_eq!(failed.outcome, "FAIL");
         assert_eq!(failed.error_kind, None);
         assert_eq!(failed.status, Some(7));
@@ -4884,7 +4907,17 @@ backends_disabled:
                 .contains("before producing a terminal comparison")
         );
 
-        let unknown = no_result_with_exit_status(0);
+        let not_run =
+            no_result_with_exit_status(127, crate::canonical_verdict::NoResultReason::NotRun);
+        assert_eq!(not_run.outcome, "ERROR");
+        assert_eq!(
+            not_run.error_kind.as_deref(),
+            Some("incomplete-verification-evidence")
+        );
+        assert_eq!(not_run.status, Some(127));
+
+        let unknown =
+            no_result_with_exit_status(0, crate::canonical_verdict::NoResultReason::NotRun);
         assert_eq!(unknown.outcome, "ERROR");
         assert_eq!(
             unknown.error_kind.as_deref(),
