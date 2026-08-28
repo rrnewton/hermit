@@ -81,11 +81,16 @@ pub struct HistoryRow {
     /// partial `*-only` profile whose pass reads identically to a full green.
     #[serde(default)]
     pub full_coverage: Option<bool>,
+    /// Historical gate-record count. A scheduler record may carry
+    /// `execution = "unknown"`; this field therefore must not be presented as
+    /// a count of nodes whose child process executed. Use [`Self::executed_nodes`]
+    /// for that measurement on current rows.
     #[serde(default)]
     pub checks: Option<u64>,
     /// Explicit completed/expected outer-gate counts. `checks` is retained for
-    /// old rows; new failure evidence carries both names so completeness is
-    /// observable rather than inferred from a profile name.
+    /// old rows; `gates_run` counts entries in `gates`, including an explicit
+    /// unknown-execution row, so completeness is observable rather than inferred
+    /// from a profile name. It is not an executed-node count.
     #[serde(default)]
     pub gates_run: Option<u64>,
     #[serde(default)]
@@ -170,6 +175,21 @@ impl HistoryRow {
             .as_u64()
             .map(Some)
             .ok_or("malformed HistoryRow retry_rounds: expected a nonnegative integer")
+    }
+
+    /// Return the number of nodes for which at least one child execution
+    /// produced an exit status.
+    ///
+    /// This stays in [`Self::extra`] to preserve existing receipt bytes. Missing
+    /// means older evidence did not carry the measurement; it is not zero.
+    pub fn executed_nodes(&self) -> Result<Option<u64>, &'static str> {
+        let Some(value) = self.extra.get("executed_nodes") else {
+            return Ok(None);
+        };
+        value
+            .as_u64()
+            .map(Some)
+            .ok_or("malformed HistoryRow executed_nodes: expected a nonnegative integer")
     }
 }
 
@@ -541,6 +561,28 @@ mod tests {
         let historical: HistoryRow =
             serde_json::from_str(r#"{"schema_version":5,"env_block_retries":2}"#).unwrap();
         assert_eq!(historical.retry_rounds(), Ok(None));
+    }
+
+    #[test]
+    fn history_executed_nodes_distinguishes_absent_valid_and_malformed() {
+        let absent: HistoryRow = serde_json::from_str(r#"{"schema_version":5}"#).unwrap();
+        assert_eq!(absent.executed_nodes(), Ok(None));
+
+        let valid: HistoryRow =
+            serde_json::from_str(r#"{"schema_version":7,"executed_nodes":12}"#).unwrap();
+        assert_eq!(valid.executed_nodes(), Ok(Some(12)));
+
+        for malformed in [
+            r#"{"schema_version":7,"executed_nodes":"12"}"#,
+            r#"{"schema_version":7,"executed_nodes":-1}"#,
+            r#"{"schema_version":7,"executed_nodes":1.5}"#,
+        ] {
+            let row: HistoryRow = serde_json::from_str(malformed).unwrap();
+            assert_eq!(
+                row.executed_nodes(),
+                Err("malformed HistoryRow executed_nodes: expected a nonnegative integer")
+            );
+        }
     }
 
     #[test]
