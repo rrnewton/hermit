@@ -1148,6 +1148,7 @@ fn self_test() -> Result<(), String> {
             summary: String::new(),
             executed_tests: None,
             filtered_tests: None,
+            test_results: None,
             returncode: Some(if ok { 0 } else { 1 }),
             reason: String::new(),
             aborted: false,
@@ -6749,6 +6750,7 @@ fn summary_listing_bracket() -> Result<String, String> {
         summary: String::new(),
         executed_tests: None,
         filtered_tests: None,
+        test_results: None,
         returncode: Some(if ok { 0 } else { 1 }),
         reason: String::new(),
         aborted: false,
@@ -8465,6 +8467,9 @@ struct NodeAttempt {
     /// region carried no environmental signature. Without this bit, "banner
     /// gone" is indistinguishable from "no new evidence was captured".
     detail_observed: bool,
+    /// Terminal per-test results written by a controlled runner for this exact attempt.
+    /// `None` means no typed result file was published; an empty vector is measured zero.
+    test_results: Option<Vec<dagrun::TestResult>>,
 }
 
 fn attempt_is_no_result(attempt: &NodeAttempt) -> bool {
@@ -8544,6 +8549,7 @@ fn reported_attempt(outcome: &StepOutcome, attempt: usize) -> NodeAttempt {
         retry_detail: None,
         environmental_class: None,
         detail_observed: false,
+        test_results: outcome.test_results.clone(),
     }
 }
 
@@ -8565,6 +8571,7 @@ fn unreported_attempt(tag: String, attempt: usize) -> NodeAttempt {
         retry_detail: None,
         environmental_class: None,
         detail_observed: false,
+        test_results: None,
     }
 }
 
@@ -10031,20 +10038,84 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     // FAILURE banner ABSENT. A summary that printed both would be telling the
     // reader a green run had failed.
     {
-        let log = "[fixture.environmental] ▶ START fixture\n\
-[fixture.environmental] FAIL [ 0.100s] hermit::fixture hard_failure\n\
-[fixture.environmental] FAIL [ 0.200s] hermit::fixture recovered_on_retry\n\
-[fixture.environmental] FAIL [ 0.200s] hermit::fixture recovered_on_retry\n\
-[fixture.environmental] ▶ START fixture\n\
-[fixture.environmental] FAIL [ 0.100s] (1/2) hermit::fixture hard_failure\n\
-[fixture.environmental] PASS [ 0.200s] (2/2) hermit::fixture recovered_on_retry\n";
-        let observations = nextest_test_observations(log);
-        // Six terminal-looking lines contain only four executions: nextest's
-        // repeated failure recap in attempt 1 is not a retry.
-        if observations.len() != 4 {
+        let mut nextest_attempts = retried.attempts.clone();
+        for attempt in &mut nextest_attempts {
+            if attempt.tag != "fixture.environmental" {
+                continue;
+            }
+            attempt.test_results = Some(if attempt.attempt == 1 {
+                vec![
+                    dagrun::TestResult::new("hermit::fixture$hard_failure".into(), false, 1)
+                        .map_err(|error| format!("end-of-run summary: {error}"))?,
+                    dagrun::TestResult::new(
+                        "hermit::fixture$recovered_on_retry".into(), false, 1,
+                    )
+                    .map_err(|error| format!("end-of-run summary: {error}"))?,
+                ]
+            } else {
+                vec![
+                    dagrun::TestResult::new("hermit::fixture$hard_failure".into(), false, 1)
+                        .map_err(|error| format!("end-of-run summary: {error}"))?,
+                    dagrun::TestResult::new(
+                        "hermit::fixture$recovered_on_retry".into(), true, 1,
+                    )
+                    .map_err(|error| format!("end-of-run summary: {error}"))?,
+                ]
+            });
+        }
+        let nextest_nodes = BTreeSet::from(["fixture.environmental".to_string()]);
+        let (observations, typed_errors) =
+            nextest_test_observations(&nextest_attempts, &nextest_nodes);
+        if !typed_errors.is_empty() || observations.len() != 4 {
             return Err(format!(
-                "end-of-run summary: nextest duplicate recap was counted as an execution: {:?}",
-                observations
+                "end-of-run summary: typed nextest results were not retained exactly: observations={observations:?}, errors={typed_errors:?}"
+            ));
+        }
+        let mut missing_results = nextest_attempts.clone();
+        missing_results[0].test_results = None;
+        let (_, missing_errors) = nextest_test_observations(&missing_results, &nextest_nodes);
+        if missing_errors.len() != 1
+            || !missing_errors[0].contains("individual nextest results are UNKNOWN")
+            || !missing_errors[0].contains("fixture.environmental attempt 1")
+        {
+            return Err(format!(
+                "end-of-run summary: missing typed nextest results did not fail by node and attempt: {missing_errors:?}"
+            ));
+        }
+        let mut unknown = RunSummary::new(Verdict::Pass, 0, "self-test", missing_errors);
+        unknown.wall_s = Some(0.0);
+        unknown.nodes_executed = 1;
+        let unknown_rendered = run_summary_lines(&unknown, std::time::Instant::now()).join("\n");
+        if !unknown_rendered.contains("retries and individual test results: UNKNOWN")
+            || unknown_rendered.contains("no retries, no flaky tests")
+        {
+            return Err(format!(
+                "end-of-run summary: missing typed results became a clean zero: {unknown_rendered}"
+            ));
+        }
+
+        let mut inner_retry = nextest_attempts
+            .iter()
+            .find(|attempt| attempt.tag == "fixture.environmental" && attempt.attempt == 2)
+            .cloned()
+            .ok_or("end-of-run summary: no completed nextest attempt for retry fixture")?;
+        inner_retry.tag = "fixture.nextest_inner".into();
+        inner_retry.retry_class = None;
+        inner_retry.test_results = Some(vec![
+            dagrun::TestResult::new("hermit::fixture$inner_retry".into(), true, 2)
+                .map_err(|error| format!("end-of-run summary: {error}"))?,
+        ]);
+        let inner_nodes = BTreeSet::from([inner_retry.tag.clone()]);
+        let (inner_observations, inner_errors) =
+            nextest_test_observations(std::slice::from_ref(&inner_retry), &inner_nodes);
+        let inner_summary = test_id_summary(inner_observations, &[], &BTreeSet::new());
+        if !inner_errors.is_empty()
+            || inner_summary.recovered.len() != 1
+            || inner_summary.recovered[0].inner_retry_occurrences != 1
+            || inner_summary.retry_occurrences != 1
+        {
+            return Err(format!(
+                "end-of-run summary: a nextest pass after an inner retry was not retained as one recovered retry: errors={inner_errors:?}, summary={inner_summary:?}"
             ));
         }
         let dbt_log = "[test.dbt_parity] ▶ START DynamoRIO DBT strict backend parity matrix\n\
@@ -10062,12 +10133,14 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
                 attempt: 1,
                 id: "backend-parity/file_metadata [dbt/strict]".into(),
                 passed: true,
+                inner_attempts: 1,
             },
             TestAttemptObservation {
                 node: DBT_PARITY_NODE.into(),
                 attempt: 1,
                 id: "backend-parity/random_sources [dbt/strict]".into(),
                 passed: false,
+                inner_attempts: 1,
             },
         ];
         if dbt != expected_dbt {
@@ -10176,6 +10249,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         let mut e2e_green = RunSummary::new(Verdict::Pass, 0, "self-test", Vec::new());
         e2e_green.flaky = e2e_retry_summary.recovered.clone();
         e2e_green.retry_occurrences = e2e_retry_summary.retry_occurrences;
+        e2e_green.individual_test_results_complete = true;
         e2e_green.wall_s = Some(0.0);
         e2e_green.nodes_executed = 1;
         let e2e_rendered = run_summary_lines(&e2e_green, std::time::Instant::now()).join("\n");
@@ -10221,12 +10295,14 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
                         attempt: 1,
                         id: shared_id.into(),
                         passed: false,
+                        inner_attempts: 1,
                     },
                     TestAttemptObservation {
                         node: passing_node.into(),
                         attempt: 1,
                         id: shared_id.into(),
                         passed: true,
+                        inner_attempts: 1,
                     },
                 ],
                 &[],
@@ -10249,6 +10325,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         red.flaky = split.recovered.clone();
         red.failed_ids = split.failed.clone();
         red.retry_occurrences = split.retry_occurrences;
+        red.individual_test_results_complete = true;
         red.wall_s = Some(0.0);
         red.nodes_executed = 1;
         let red_rendered = run_summary_lines(&red, std::time::Instant::now()).join("\n");
@@ -10274,6 +10351,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         let mut green = RunSummary::new(Verdict::Pass, 0, "self-test", Vec::new());
         green.flaky = split.recovered.clone();
         green.retry_occurrences = split.retry_occurrences;
+        green.individual_test_results_complete = true;
         green.wall_s = Some(0.0);
         green.nodes_executed = 1;
         let rendered = run_summary_lines(&green, std::time::Instant::now()).join("\n");
@@ -10306,6 +10384,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         let mut clean = RunSummary::new(Verdict::Pass, 0, "self-test", Vec::new());
         clean.wall_s = Some(0.0);
         clean.nodes_executed = 3;
+        clean.individual_test_results_complete = true;
         let clean_rendered = run_summary_lines(&clean, std::time::Instant::now()).join("\n");
         if !clean_rendered.contains("no retries, no flaky tests, and no failed test ids")
             || clean_rendered.contains(SUMMARY_FLAKY_HEADING)
@@ -12885,6 +12964,8 @@ fn product_front_door_process_bracket() -> Result<(), String> {
             if nested {
                 command
                     .env(validate_runtime::ACTIVE_ENV, std::process::id().to_string())
+                    .env(E2E_MACHINE_SHORTNAME_ENV, "fixture-host")
+                    .env(E2E_KERNEL_VERSION_ENV, "fixture-kernel")
                     .env("CI_HUB_VALIDATE_LOCK_OWNER_PID", std::process::id().to_string())
                     .env(
                         "CI_HUB_VALIDATE_LOCK_OWNER_FILE",
@@ -13053,6 +13134,7 @@ fn test_node_coverage_bracket() -> Result<(), String> {
         summary: String::new(),
         executed_tests,
         filtered_tests: Some(0),
+        test_results: None,
         returncode: Some(if ok { 0 } else { 100 }),
         reason: if ok { String::new() } else { "test failure".into() },
         aborted,
@@ -13101,6 +13183,7 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         summary: String::new(),
         executed_tests,
         filtered_tests,
+        test_results: None,
         returncode: Some(if ok { 0 } else { 100 }),
         reason: if ok { String::new() } else { "test failure".into() },
         aborted: false,
@@ -13240,6 +13323,7 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         summary: String::new(),
         executed_tests: Some(1),
         filtered_tests: Some(0),
+        test_results: None,
         returncode: Some(1),
         reason: "fixture failure".into(),
         aborted: false,
@@ -13544,6 +13628,7 @@ fn possible_missing_artifact_bracket() -> Result<(), String> {
         summary: String::new(),
         executed_tests: None,
         filtered_tests: None,
+        test_results: None,
         returncode,
         reason: String::new(),
         aborted: false,
@@ -13578,6 +13663,7 @@ fn no_result_propagation_bracket() -> Result<(), String> {
         summary: String::new(),
         executed_tests: None,
         filtered_tests: None,
+        test_results: None,
         returncode: Some(returncode),
         reason: String::new(),
         aborted,
@@ -14271,6 +14357,9 @@ struct RunSummary {
     /// inner per-cell attempt rows. This is deliberately not `retried_nodes`,
     /// which includes successful peers re-run as part of a lane.
     retry_occurrences: usize,
+    /// Whether every applicable producer supplied individual typed results.
+    /// False means the summary must say UNKNOWN rather than claim a clean zero.
+    individual_test_results_complete: bool,
     wall_s: Option<f64>,
     jobs: Option<i64>,
     log: Option<PathBuf>,
@@ -14305,6 +14394,7 @@ impl RunSummary {
             failed_ids: Vec::new(),
             failed_nodes_without_test_ids: Vec::new(),
             retry_occurrences: 0,
+            individual_test_results_complete: false,
             wall_s: None,
             jobs: None,
             log: None,
@@ -14402,6 +14492,7 @@ struct TestIdRetry {
     node: String,
     id: String,
     retry_classes: Vec<RetryClass>,
+    inner_retry_occurrences: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -14410,6 +14501,8 @@ struct TestAttemptObservation {
     attempt: usize,
     id: String,
     passed: bool,
+    /// Attempts made inside the test runner before this terminal result.
+    inner_attempts: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -14492,66 +14585,54 @@ fn inner_retry_occurrences_for_test(
         .count()
 }
 
-/// Parse a nextest terminal line after the `[node]` prefix.
+/// Read terminal nextest results from the exact scheduler attempt that received them.
 ///
-/// nextest prints a failing test once when it executes and again in its failure
-/// recap. The caller deduplicates within one node attempt; this function only
-/// identifies the terminal row and returns its stable `binary$test` id.
-fn nextest_test_observation(rest: &str) -> Option<(bool, String)> {
-    let rest = rest.trim_start();
-    let (passed, after_verdict) = if let Some(rest) = rest.strip_prefix("PASS") {
-        (true, rest)
-    } else {
-        let verdicts = ["FAIL", "TIMEOUT", "LEAK", "ABORT", "SIGSEGV", "SIGABRT"];
-        if let Some(rest) = verdicts.iter().find_map(|verdict| rest.strip_prefix(verdict)) {
-            (false, rest)
-        } else {
-            let rest = rest.strip_prefix("TRY ")?;
-            let (_ordinal, rest) = rest.split_once(" FAIL")?;
-            (false, rest)
-        }
-    };
-    let after_verdict = after_verdict.trim_start();
-    let close = after_verdict.find(']')?;
-    if !after_verdict.starts_with('[') {
-        return None;
-    }
-    let mut identity = after_verdict[close + 1..].trim_start();
-    // Newer nextest versions may print `(n/N)` between the elapsed time and the
-    // binary id. It is progress, not part of the id.
-    if identity.starts_with('(') {
-        identity = identity[identity.find(')')? + 1..].trim_start();
-    }
-    let (binary, test) = identity.split_once(char::is_whitespace)?;
-    let test = test.trim();
-    if binary.is_empty() || test.is_empty() {
-        return None;
-    }
-    Some((passed, format!("{binary}${test}")))
-}
-
-fn nextest_test_observations(log: &str) -> Vec<TestAttemptObservation> {
-    let mut node_attempts: BTreeMap<String, usize> = BTreeMap::new();
-    let mut seen: BTreeSet<(String, usize, String)> = BTreeSet::new();
+/// A completed nextest step with no structured result is an error, not an empty
+/// test population. Human output remains presentation and cannot manufacture a
+/// functional test result.
+fn nextest_test_observations(
+    attempts: &[NodeAttempt],
+    nextest_nodes: &BTreeSet<String>,
+) -> (Vec<TestAttemptObservation>, Vec<String>) {
     let mut observations = Vec::new();
-    for line in log.lines() {
-        let Some(after_open) = line.strip_prefix('[') else { continue };
-        let Some((node, rest)) = after_open.split_once(']') else { continue };
-        if rest.trim_start().starts_with("▶ START") {
-            *node_attempts.entry(node.to_string()).or_default() += 1;
+    let mut errors = Vec::new();
+    for attempt in attempts {
+        if !nextest_nodes.contains(&attempt.tag)
+            || !attempt.reported
+            || attempt.execution != AttemptExecution::Completed
+        {
             continue;
         }
-        let Some((passed, id)) = nextest_test_observation(rest) else { continue };
-        let attempt = node_attempts.get(node).copied().unwrap_or(1);
-        // The first row is the actual execution. A later identical row in the
-        // same node attempt is nextest's recap, not another retry.
-        if seen.insert((node.to_string(), attempt, id.clone())) {
+        let Some(results) = &attempt.test_results else {
+            errors.push(format!(
+                "individual nextest results are UNKNOWN for node {} attempt {}: the controlled runner published no typed test-result rows",
+                attempt.tag, attempt.attempt
+            ));
+            continue;
+        };
+        for result in results {
+            let dagrun::TestResult {
+                id,
+                passed,
+                attempts: inner_attempts,
+            } = result;
+            let Ok(inner_attempts) = usize::try_from(*inner_attempts) else {
+                errors.push(format!(
+                    "individual nextest result {} for node {} has an attempt count too large for this process",
+                    id, attempt.tag
+                ));
+                continue;
+            };
             observations.push(TestAttemptObservation {
-                node: node.to_string(), attempt, id, passed,
+                node: attempt.tag.clone(),
+                attempt: attempt.attempt,
+                id: id.clone(),
+                passed: *passed,
+                inner_attempts,
             });
         }
     }
-    observations
+    (observations, errors)
 }
 
 const DBT_PARITY_NODE: &str = "test.dbt_parity";
@@ -14604,10 +14685,7 @@ fn dbt_parity_test_observations(log: &str) -> Vec<TestAttemptObservation> {
         let attempt = attempt.max(1);
         if seen.insert((attempt, id.clone())) {
             observations.push(TestAttemptObservation {
-                node: DBT_PARITY_NODE.to_string(),
-                attempt,
-                id,
-                passed,
+                node: DBT_PARITY_NODE.to_string(), attempt, id, passed, inner_attempts: 1,
             });
         }
     }
@@ -14688,6 +14766,7 @@ fn e2e_test_observations(root: &Path) -> Result<Vec<TestAttemptObservation>, Str
                 attempt,
                 id,
                 passed: outcome == "PASS",
+                inner_attempts: 1,
             });
         }
     }
@@ -14720,13 +14799,20 @@ fn test_id_summary(
     let mut recovered = Vec::new();
     let mut failed = Vec::new();
     let mut failed_nodes_with_test_ids = BTreeSet::new();
-    let mut inner_retry_occurrences = 0;
+    let mut unclassified_outer_retry_occurrences = 0;
+    let mut test_runner_retry_occurrences = 0;
     for ((node, id), observations) in by_node_and_id {
         let Some(last) = observations.last() else { continue };
-        inner_retry_occurrences += inner_retry_occurrences_for_test(&observations, attempts);
+        unclassified_outer_retry_occurrences +=
+            inner_retry_occurrences_for_test(&observations, attempts);
+        let inner_retry_occurrences = observations
+            .iter()
+            .map(|observation| observation.inner_attempts.saturating_sub(1))
+            .sum::<usize>();
+        test_runner_retry_occurrences += inner_retry_occurrences;
         let retry_classes = retry_classes_for_test(&observations, attempts);
-        let was_retried = !retry_classes.is_empty();
-        let item = TestIdRetry { node, id, retry_classes };
+        let was_retried = !retry_classes.is_empty() || inner_retry_occurrences > 0;
+        let item = TestIdRetry { node, id, retry_classes, inner_retry_occurrences };
         if last.passed {
             if was_retried {
                 recovered.push(item);
@@ -14744,12 +14830,13 @@ fn test_id_summary(
             .cloned()
             .collect(),
         retry_occurrences: attempts.iter().filter(|attempt| attempt.retry_class.is_some()).count()
-            + inner_retry_occurrences,
+            + unclassified_outer_retry_occurrences
+            + test_runner_retry_occurrences,
     }
 }
 
 fn render_test_id_retry(item: &TestIdRetry) -> String {
-    let retries = item.retry_classes.len();
+    let retries = item.retry_classes.len() + item.inner_retry_occurrences;
     let classes = if item.retry_classes.is_empty() {
         String::new()
     } else {
@@ -14839,11 +14926,17 @@ fn run_summary_lines(s: &RunSummary, started: std::time::Instant) -> Vec<String>
         ));
         lines.extend(summary_id_list(&s.failed_nodes_without_test_ids));
     }
-    if s.wall_s.is_some() && s.nodes_executed > 0 {
+    if s.wall_s.is_some() && s.nodes_executed > 0 && s.individual_test_results_complete {
         lines.push(format!(
             "   retries: {} occurrence(s) recorded from scheduler and per-cell attempts",
             s.retry_occurrences
         ));
+    }
+    if s.wall_s.is_some() && s.nodes_executed > 0 && !s.individual_test_results_complete {
+        lines.push(
+            "   retries and individual test results: UNKNOWN — one or more producers supplied no typed result"
+                .to_string(),
+        );
     }
     // ⚠️ A CLEAN RUN SAYS SO, RATHER THAN SAYING NOTHING. With both blocks above
     // conditional and no else, a run with nothing to report rendered IDENTICALLY
@@ -14859,6 +14952,7 @@ fn run_summary_lines(s: &RunSummary, started: std::time::Instant) -> Vec<String>
         && s.failed_ids.is_empty()
         && s.failed_nodes_without_test_ids.is_empty()
         && s.retry_occurrences == 0
+        && s.individual_test_results_complete
         && s.wall_s.is_some()
         && s.nodes_executed > 0
     {
@@ -16972,22 +17066,26 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         .filter(|o| outcome_is_failure(o))
         .map(|o| o.tag.clone())
         .collect();
-    let mut test_summary_errors = Vec::new();
-    let mut test_observations = match read_log_since_settled(&log_path, 0) {
-        Some(log) => {
-            let mut observations = nextest_test_observations(&log);
-            observations.extend(dbt_parity_test_observations(&log));
-            observations
-        }
+    let nextest_nodes = plan
+        .cfg
+        .steps
+        .iter()
+        .chain(plan.second.iter().flat_map(|config| config.steps.iter()))
+        .filter(|step| step.cmd.contains("run-nextest-counted.sh"))
+        .map(Step::tag)
+        .collect::<BTreeSet<_>>();
+    let (mut test_observations, mut test_summary_errors) =
+        nextest_test_observations(&attempts, &nextest_nodes);
+    match read_log_since_settled(&log_path, 0) {
+        Some(log) => test_observations.extend(dbt_parity_test_observations(&log)),
         None => {
             test_summary_errors.push(
-                "individual nextest test ids could not be read from the durable log; failed DAG \
-                 nodes are listed separately below rather than mislabeled as test ids"
+                "individual DBT test ids could not be read from the durable log; failed DAG nodes \
+                 are listed separately below rather than mislabeled as test ids"
                     .to_string(),
             );
-            Vec::new()
         }
-    };
+    }
     match e2e_test_observations(&e2e_result_root) {
         Ok(mut observations) => test_observations.append(&mut observations),
         Err(error) => test_summary_errors.push(format!(
@@ -17104,6 +17202,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                 .into(),
         ),
     }
+    let individual_test_results_complete = test_summary_errors.is_empty();
     detail.extend(test_summary_errors);
     if args.allow_local_off_the_record_run {
         detail.push(
@@ -17129,6 +17228,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     s.failed_ids = test_summary.failed;
     s.failed_nodes_without_test_ids = test_summary.failed_nodes_without_test_ids;
     s.retry_occurrences = test_summary.retry_occurrences;
+    s.individual_test_results_complete = individual_test_results_complete;
     s.nodes_skipped = skipped.len();
     s.nodes_host_inapplicable = plan.host_inapplicable.len();
     s.executed_tests = executed_tests;
@@ -17175,6 +17275,7 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
         summary: String::new(),
         executed_tests: None,
         filtered_tests: None,
+        test_results: None,
         returncode: Some(if ok { 0 } else { 1 }),
         reason: if ok { String::new() } else { "stop-test synthetic failure".into() },
         aborted: false,
