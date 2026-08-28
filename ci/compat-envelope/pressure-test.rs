@@ -56,6 +56,8 @@ use hermit_manifest_plan::runner::AttemptResult;
 use hermit_manifest_plan::runner::CELL_RESULT_SCHEMA;
 use hermit_manifest_plan::runner::CellResult;
 use hermit_manifest_plan::runner::E2E_RUN_INDEX_ENV;
+use hermit_manifest_plan::runner::FailureClass;
+use hermit_manifest_plan::runner::ObservedResult;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -825,6 +827,13 @@ fn read_result_rows(path: &Path) -> Result<Vec<CellResult>, String> {
         }
         let row: CellResult = serde_json::from_str(line)
             .map_err(|e| format!("invalid {}:{}: {e}", path.display(), index + 1))?;
+        row.validate_recorded_classification().map_err(|error| {
+            format!(
+                "invalid {}:{} result classification: {error}",
+                path.display(),
+                index + 1
+            )
+        })?;
         if row.attempt == 0 {
             return Err(format!(
                 "{}:{} has non-positive result attempt 0",
@@ -4065,6 +4074,8 @@ fn summarize(
                 row_valid,
                 reason,
                 error_kind,
+                recorded_result,
+                failure_class,
                 attempt,
                 invocation,
                 artifact_dir,
@@ -4077,6 +4088,8 @@ fn summarize(
                                 json!({
                                     "attempt": row.attempt,
                                     "outcome": row.outcome,
+                                    "result": row.result,
+                                    "failure_class": row.failure_class,
                                     "reason": row.reason,
                                     "error_kind": row.error_kind,
                                     "duration_ms": row.duration_ms,
@@ -4130,6 +4143,8 @@ fn summarize(
                                             true,
                                             row.reason.clone(),
                                             row.error_kind.clone(),
+                                            row.result,
+                                            row.failure_class,
                                             row.attempt,
                                             Some(invocation),
                                             artifact_dirs.last().cloned(),
@@ -4140,7 +4155,17 @@ fn summarize(
                                             "{} does not carry complete literal attempt invocations: {error}",
                                             result_file.display()
                                         ));
-                                        ("NO_RESULT".to_string(), false, None, None, 1, None, None)
+                                        (
+                                            "NO_RESULT".to_string(),
+                                            false,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            1,
+                                            None,
+                                            None,
+                                        )
                                     }
                                 }
                             }
@@ -4149,24 +4174,74 @@ fn summarize(
                                     "{} does not match every selected-cell observation, the terminal harness exit, or retained runner result",
                                     result_file.display()
                                 ));
-                                ("NO_RESULT".to_string(), false, None, None, 1, None, None)
+                                (
+                                    "NO_RESULT".to_string(),
+                                    false,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    1,
+                                    None,
+                                    None,
+                                )
                             }
                             Err(error) => {
                                 evidence_errors.push(error);
-                                ("NO_RESULT".to_string(), false, None, None, 1, None, None)
+                                (
+                                    "NO_RESULT".to_string(),
+                                    false,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    1,
+                                    None,
+                                    None,
+                                )
                             }
                         }
                     }
                     Err(error) => {
                         evidence_errors.push(error);
-                        ("NO_RESULT".to_string(), false, None, None, 1, None, None)
+                        (
+                            "NO_RESULT".to_string(),
+                            false,
+                            None,
+                            None,
+                            None,
+                            None,
+                            1,
+                            None,
+                            None,
+                        )
                     }
                 }
             } else if !proven_oom && !proven_timeout {
                 evidence_errors.push(format!("missing result row {}", result_file.display()));
-                ("NO_RESULT".to_string(), false, None, None, 1, None, None)
+                (
+                    "NO_RESULT".to_string(),
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    1,
+                    None,
+                    None,
+                )
             } else {
-                ("NO_RESULT".to_string(), false, None, None, 1, None, None)
+                (
+                    "NO_RESULT".to_string(),
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    1,
+                    None,
+                    None,
+                )
             };
             let verification = match artifact_dir.as_deref() {
                 Some(artifact_dir) => match read_verification_report(cell, artifact_dir) {
@@ -4237,7 +4312,7 @@ fn summarize(
             if invocation.is_none() {
                 evidence_errors.push("selected result has no complete recorded invocation".into());
             }
-            let result = classify_result(
+            let derived_result = classify_result(
                 runner,
                 harness_status,
                 &outcome,
@@ -4248,6 +4323,33 @@ fn summarize(
                 verification_logs.len() == 2,
                 evidence_errors.is_empty(),
             );
+            // Current rows take their functional result from the framework.
+            // The older pressure classifier remains only to read retained
+            // pre-field rows and to refuse disagreement; it is no longer the
+            // authority that reconstructs a current result after execution.
+            let mut result = derived_result;
+            if row_valid && evidence_errors.is_empty() {
+                if let Some(recorded_result) = recorded_result {
+                    if recorded_result.as_str() != derived_result {
+                        evidence_errors.push(format!(
+                            "framework result {} disagrees with pressure consistency check {derived_result}",
+                            recorded_result.as_str()
+                        ));
+                    } else if failure_class != recorded_result.failure_class() {
+                        evidence_errors.push(format!(
+                            "framework result {} carries failure_class {:?}, expected {:?}",
+                            recorded_result.as_str(),
+                            failure_class,
+                            recorded_result.failure_class()
+                        ));
+                    } else {
+                        result = recorded_result.as_str();
+                    }
+                }
+            }
+            if !evidence_errors.is_empty() {
+                result = "infrastructure-error";
+            }
             *by_backend
                 .entry(cell.backend.clone())
                 .or_default()
@@ -4278,6 +4380,17 @@ fn summarize(
                         &result_rows_for_history,
                         terminal.attempt,
                     ) {
+                        if let Some(recorded_result) = earlier_row.result {
+                            if earlier_row.failure_class != recorded_result.failure_class() {
+                                return Err(format!(
+                                    "earlier framework attempt {} result {} carries failure_class {:?}, expected {:?}",
+                                    earlier_row.attempt,
+                                    recorded_result.as_str(),
+                                    earlier_row.failure_class,
+                                    recorded_result.failure_class()
+                                ));
+                            }
+                        }
                         let earlier_invocation = result_row_invocation(earlier_row)?;
                         let earlier_artifact_dir = result_artifact_dir(results, earlier_row)?;
                         let earlier_verification = read_verification_report(
@@ -4295,27 +4408,40 @@ fn summarize(
                             retained_verification_logs(cell, &earlier_artifact_dir)?;
                         let earlier_normalized_ptrace_golden =
                             crate::normalized_ptrace_golden(cell, &earlier_artifact_dir)?;
+                        let expected_result = match cell.mode.as_str() {
+                            "verify" => ObservedResult::DeterminismFailure,
+                            "replay" => ObservedResult::ReplayFailure,
+                            other => {
+                                return Err(format!(
+                                    "earlier attempt {} located a divergence in unsupported mode {other}",
+                                    earlier_row.attempt
+                                ));
+                            }
+                        };
+                        let earlier_result = match earlier_row.result {
+                            Some(recorded) if recorded != expected_result => {
+                                return Err(format!(
+                                    "earlier framework attempt {} records result {}, but its retained report is a {} divergence",
+                                    earlier_row.attempt,
+                                    recorded.as_str(),
+                                    cell.mode
+                                ));
+                            }
+                            Some(recorded) => recorded,
+                            None => expected_result,
+                        };
                         rows.push(json!({
                             "cell": cell,
                             "repetition": repetition,
                             "attempt": earlier_row.attempt,
                             "harness_exit": harness_status,
                             "outcome": earlier_row.outcome,
+                            "failure_class": earlier_row.failure_class,
                             "reason": earlier_row.reason,
                             "error_kind": earlier_row.error_kind,
                             "invocation": earlier_invocation,
                             "result_row_valid": true,
-                            "result": classify_result(
-                                runner,
-                                harness_status,
-                                &earlier_row.outcome,
-                                true,
-                                earlier_row.reason.as_deref(),
-                                &cell.mode,
-                                earlier_verification.get("verdict").and_then(JsonValue::as_str),
-                                earlier_verification_logs.len() == 2,
-                                true,
-                            ),
+                            "result": earlier_result.as_str(),
                             "verification": earlier_verification,
                             "verification_logs": earlier_verification_logs,
                             "normalized_ptrace_golden": earlier_normalized_ptrace_golden,
@@ -4336,6 +4462,7 @@ fn summarize(
                 "attempt": attempt,
                 "harness_exit": harness_status,
                 "outcome": outcome,
+                "failure_class": failure_class,
                 "reason": reason,
                 "error_kind": error_kind,
                 "observations": observations,
@@ -6781,6 +6908,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         backend: Some(sample_a.backend.clone()),
         classification: "required".into(),
         outcome: "FAIL".into(),
+        result: Some(ObservedResult::DeterminismFailure),
+        failure_class: Some(FailureClass::ProductFailure),
         error_kind: None,
         timeout_seconds: 20,
         duration_ms: Some(19_000),
@@ -6820,6 +6949,8 @@ fn self_test(root: &Path) -> Result<(), String> {
     let mut second_row = result_row.clone();
     second_row.attempt = 2;
     second_row.outcome = "PASS".into();
+    second_row.result = Some(ObservedResult::Pass);
+    second_row.failure_class = None;
     second_row.duration_ms = Some(19_500);
     second_row.timeout_seconds = 20;
     second_row.artifact_dir = format!("{}-attempt-2", first_row.artifact_dir);
@@ -6839,6 +6970,8 @@ fn self_test(root: &Path) -> Result<(), String> {
     let appended = read_result_rows(&appended_results)?;
     if appended.len() != 2
         || appended[0].attempt != 1
+        || appended[0].result != Some(ObservedResult::DeterminismFailure)
+        || appended[0].failure_class != Some(FailureClass::ProductFailure)
         || appended[0].duration_ms != Some(19_000)
         || appended[0].timeout_seconds != 20
         || appended[0].first_divergent_syscall != Some(37)
@@ -6847,6 +6980,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         || appended[0].first_divergent_right_message.as_deref()
             != Some("INFO detcore: right event")
         || appended[1].attempt != 2
+        || appended[1].result != Some(ObservedResult::Pass)
+        || appended[1].failure_class.is_some()
         || appended[1].duration_ms != Some(19_500)
         || appended[1].timeout_seconds != 20
         || appended[1].first_divergent_left_message.is_some()
@@ -6881,6 +7016,28 @@ fn self_test(root: &Path) -> Result<(), String> {
     {
         return Err(format!(
             "two appended result observations were not retained independently: {appended:?}"
+        ));
+    }
+    let inconsistent_results = scratch.join("inconsistent-results.jsonl");
+    let mut inconsistent = first_row.clone();
+    inconsistent.failure_class = Some(FailureClass::NoResult);
+    fs::write(
+        &inconsistent_results,
+        format!(
+            "{}\n",
+            serde_json::to_string(&inconsistent)
+                .map_err(|e| format!("cannot encode inconsistent result fixture: {e}"))?
+        ),
+    )
+    .map_err(|e| format!("cannot write inconsistent result fixture: {e}"))?;
+    let error = read_result_rows(&inconsistent_results)
+        .expect_err("a product result with a no-result attribution must be refused");
+    if !error.contains("determinism-failure")
+        || !error.contains("ProductFailure")
+        || !error.contains("NoResult")
+    {
+        return Err(format!(
+            "classification disagreement did not fail by name: {error}"
         ));
     }
     let nested_results = scratch.join("series-layout");
@@ -7034,6 +7191,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         backend: Some(green_id.backend.clone()),
         classification: "required".into(),
         outcome: "PASS".into(),
+        result: Some(ObservedResult::Pass),
+        failure_class: None,
         error_kind: None,
         timeout_seconds: 20,
         duration_ms: Some(1_000),

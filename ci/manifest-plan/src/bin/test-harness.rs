@@ -12,6 +12,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use hermit_manifest_plan::runner::CellResult;
+use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL;
 use hermit_manifest_plan::runner::ManifestSet;
 use hermit_manifest_plan::runner::Population;
@@ -1336,6 +1337,8 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                     result.backend.as_deref().unwrap_or("native")
                 );
                 result.outcome = "ERROR".into();
+                result.result = None;
+                result.failure_class = Some(FailureClass::UnderstoodInfrastructureFailure);
                 result.error_kind = Some("result-publication".into());
                 result.reason = Some(format!(
                     "completed cell result could not be published: {error}"

@@ -29,6 +29,8 @@ use serde_json::Value as JsonValue;
 use sha2::Digest;
 use sha2::Sha256;
 use hermit_manifest_plan::canonical_verdict;
+use hermit_manifest_plan::runner::FailureClass;
+use hermit_manifest_plan::runner::ObservedResult;
 use hermit_manifest_plan::stress_series::{
     HostCapability, HostCapabilityVerdict, SeriesCoordinates, SeriesOutcome, SeriesPayload,
     SeriesProducer, SeriesRow, SeriesSchema, SourceDepth,
@@ -499,54 +501,6 @@ struct ObservedAttemptInvocation {
     env: BTreeMap<String, String>,
     cwd: String,
     shell_command: String,
-}
-
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Deserialize,
-    Eq,
-    Ord,
-    PartialEq,
-    PartialOrd,
-    Serialize
-)]
-#[serde(rename_all = "kebab-case")]
-enum ObservedResult {
-    Pass,
-    DeterminismFailure,
-    ParityFailure,
-    ReplayFailure,
-    CrashError,
-    Timeout,
-    Oom,
-}
-
-impl ObservedResult {
-    fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "pass" => Ok(Self::Pass),
-            "determinism-failure" => Ok(Self::DeterminismFailure),
-            "parity-failure" => Ok(Self::ParityFailure),
-            "replay-failure" => Ok(Self::ReplayFailure),
-            "crash-error" => Ok(Self::CrashError),
-            "timeout" => Ok(Self::Timeout),
-            "oom" => Ok(Self::Oom),
-            "infrastructure-error" => Err(
-                "pressure summary contains an infrastructure error; refusing to store it as product behavior"
-                    .into(),
-            ),
-            other => Err(format!("unknown pressure result `{other}`")),
-        }
-    }
-
-    fn carries_divergence_position(self) -> bool {
-        matches!(
-            self,
-            Self::DeterminismFailure | Self::ParityFailure | Self::ReplayFailure
-        )
-    }
 }
 
 /// How deep in a repository's history an observation was taken, so staleness is
@@ -3883,8 +3837,20 @@ fn series_provenance(producer: SeriesProducer) -> ObservationProvenance {
     }
 }
 
-fn series_result(outcome: SeriesOutcome, mode: &str) -> Option<ObservedResult> {
-    match (outcome, mode) {
+fn series_result(row: &SeriesRow, mode: &str) -> Option<ObservedResult> {
+    if row.schema == SeriesSchema::V3 {
+        return match row.series.result {
+            Some(
+                result @ (ObservedResult::Pass
+                | ObservedResult::DeterminismFailure
+                | ObservedResult::ParityFailure
+                | ObservedResult::ReplayFailure),
+            ) => Some(result),
+            Some(ObservedResult::CrashError | ObservedResult::Timeout | ObservedResult::Oom)
+            | None => None,
+        };
+    }
+    match (row.series.outcome, mode) {
         (SeriesOutcome::Passed, _) => Some(ObservedResult::Pass),
         (SeriesOutcome::Diverged, "replay") => Some(ObservedResult::ReplayFailure),
         (SeriesOutcome::Diverged, _) => Some(ObservedResult::DeterminismFailure),
@@ -3962,7 +3928,7 @@ fn apply_series_rows(
         }
         let cell_index = indices[0];
         let provenance = series_provenance(row.producer);
-        let result = match series_result(row.series.outcome, &tracked.cells[cell_index].id.mode) {
+        let result = match series_result(row, &tracked.cells[cell_index].id.mode) {
             Some(result) => result,
             None => {
                 skipped.push(format!(
@@ -7755,9 +7721,34 @@ red/`measured-and-passed` count is **0**.",
                       producer: SeriesProducer,
                       num_runs: u64,
                       detcore_tree: Option<String>,
-                      coordinate: Option<u64>| SeriesRow {
+                      coordinate: Option<u64>| -> SeriesRow {
+        let mode = cell.rsplit('/').nth(1).unwrap_or_default();
+        let (result, failure_class) = match outcome {
+            SeriesOutcome::Passed => (Some(ObservedResult::Pass), None),
+            SeriesOutcome::Diverged => (
+                Some(if mode == "replay" {
+                    ObservedResult::ReplayFailure
+                } else {
+                    ObservedResult::DeterminismFailure
+                }),
+                Some(FailureClass::ProductFailure),
+            ),
+            SeriesOutcome::NoResult => (None, Some(FailureClass::NoResult)),
+            SeriesOutcome::Timeout => (
+                Some(ObservedResult::Timeout),
+                Some(FailureClass::NoResult),
+            ),
+            SeriesOutcome::Errored => (
+                Some(ObservedResult::CrashError),
+                Some(FailureClass::ProductFailure),
+            ),
+            SeriesOutcome::Skipped => {
+                (None, Some(FailureClass::UnderstoodPrerequisiteFailure))
+            }
+        };
+        SeriesRow {
         source: "fixture-series:1".into(),
-        schema: SeriesSchema::V2,
+        schema: SeriesSchema::V3,
         event_id: format!(
             "fixture-{cell}-{}-{}",
             outcome.as_str(),
@@ -7774,6 +7765,8 @@ red/`measured-and-passed` count is **0**.",
             tree: fixture_hermit_tree.clone(),
             detcore_tree,
             outcome,
+            result,
+            failure_class,
             run_index: 1,
             attempt: None,
             num_runs,
@@ -7812,21 +7805,24 @@ red/`measured-and-passed` count is **0**.",
                 ),
             ])),
         },
+        }
     };
     let mut projected_from_series = TrackedCells {
         schema: SCHEMA,
         projection: None,
         cells: vec![boundary_cell(Vec::new(), CellStatus::Green)],
     };
+    let mut exact_failure = series_row(
+        "fixture/boundary/verify/ptrace",
+        SeriesOutcome::Diverged,
+        SeriesProducer::PressureTest,
+        3,
+        None,
+        Some(68),
+    );
+    exact_failure.series.result = Some(ObservedResult::ParityFailure);
     let projection_rows = vec![
-        series_row(
-            "fixture/boundary/verify/ptrace",
-            SeriesOutcome::Diverged,
-            SeriesProducer::PressureTest,
-            3,
-            None,
-            Some(68),
-        ),
+        exact_failure,
         series_row(
             "fixture/boundary/verify/ptrace",
             SeriesOutcome::Passed,
@@ -7843,14 +7839,25 @@ red/`measured-and-passed` count is **0**.",
             None,
             None,
         ),
+        series_row(
+            "fixture/boundary/verify/ptrace",
+            SeriesOutcome::Errored,
+            SeriesProducer::Validate,
+            6,
+            None,
+            None,
+        ),
     ];
     let projected = apply_series_rows(&root, &mut projected_from_series, &projection_rows)?;
     let projected_cell = &projected_from_series.cells[0];
     if projected.cells != 1
         || projected.rows != 2
         || projected.runs != 5
-        || projected.skipped.len() != 1
-        || !projected.skipped[0].contains("produced no comparison")
+        || projected.skipped.len() != 2
+        || !projected
+            .skipped
+            .iter()
+            .all(|line| line.contains("produced no comparison"))
     {
         return Err(format!(
             "series projection lost compressed run counts or admitted no_result: {projected:?}"
@@ -7871,10 +7878,10 @@ red/`measured-and-passed` count is **0**.",
         .ok_or("a historical row without detcore_tree did not create an observation")?;
     if projected_observation.first_divergent_scheduler_turn.positions != vec![68, 68, 68]
         || projected_observation.results
-            != BTreeSet::from([ObservedResult::Pass, ObservedResult::DeterminismFailure])
+            != BTreeSet::from([ObservedResult::Pass, ObservedResult::ParityFailure])
     {
         return Err(
-            "series projection did not expand num_runs or preserve both comparison outcomes"
+            "series projection did not expand num_runs or preserve the framework's exact result"
                 .into(),
         );
     }
