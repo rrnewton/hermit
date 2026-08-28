@@ -25,13 +25,12 @@ name: CI (GitHub-managed portable)
 # build.dbt_release alone is ~10-12 min cold on a 4-core hosted runner, so the
 # per-job target is met by a warm cargo cache, not by fragmenting the compile.
 #
-# CORRESPONDENCE (fail-closed): ci/check-shard-coverage.sh asserts the shard map
-# (ci/portable-shards.json) assigns every non-e2e portable node to exactly one
-# job; the e2e jobs are derived from the SAME audited manifest plan
-# (target/debug/test-harness plan). Node COMMANDS live only in
-# ci/dag/portable.json — shards reference nodes by key, so this fan-out cannot
-# silently diverge from the trusted DAG. The previous serial portable workflow
-# and the partial per-cell workflow were retired when this lane was promoted.
+# CORRESPONDENCE (fail-closed): ci/check-shard-coverage.sh asks validate for its
+# constructed portable-only plan and asserts that ci/portable-shards.json assigns
+# every resulting step to exactly one job. Each job passes only those step tags
+# back to validate; commands, dependencies, and resource policy stay in the
+# constructed plan. The workflow supplies artifacts for predecessors that ran in
+# earlier jobs rather than restating their behavior here.
 
 on:
   workflow_dispatch:
@@ -62,9 +61,7 @@ env:
   # library -llzma` unless its job happens to have apt-installed liblzma-dev.
   # That cost 6ce678e2e8 a red preflight and needed d9aa6066 to correct.
   # ADDING A `cargo install` STEP? Set `env: RUSTFLAGS: ""` on it, as the
-  # preflight, build-debug and dbt-parity rust-script installs below do. The
-  # strict-compat one is the exception and only because its job apt-installs
-  # liblzma-dev -- that is luck, not design, so do not copy it as a pattern.
+  # rust-script installs below do.
   RUSTFLAGS: -D warnings -C link-arg=-llzma
   RUSTDOCFLAGS: -D warnings
   DETCORE_TEST_RUST_LOG: "off"
@@ -166,7 +163,7 @@ jobs:
           build_debug=$(jq -r '.build.debug' <<<"$sel_json")
           build_release=$(jq -r 'if (.build.dbt or .build.aux) then "true" else "false" end' <<<"$sel_json")
           if [[ -n "$backends" ]]; then run_e2e=true; else run_e2e=false; fi
-          # e2e cells consume BOTH prebuilt trees, so force their builds on.
+          # E2E steps consume BOTH prebuilt trees, so force their builds on.
           if [[ "$run_e2e" == "true" ]]; then build_debug=true; build_release=true; fi
           {
             echo "decision=$decision"
@@ -330,13 +327,12 @@ jobs:
       - name: Verify rust-script resolves (build-debug)
         run: |
           if ! command -v rust-script >/dev/null; then
-            echo "::error::rust-script is not on PATH; e2e.metadata would die at exec with status 127."
+            echo "::error::rust-script is not on PATH; scripts/validate.rs would die at exec with status 127."
             exit 1
           fi
           echo "rust-script resolved: $(command -v rust-script) $(rust-script --version)"
-      # Reproduce the debug build nodes EXACTLY from portable.json (no drift):
-      # e2e.metadata, setup.nextest, build.workspace, build.manifest_guests,
-      # build.flaky_harnesses.
+      # Group the debug-build step tags; validate supplies their commands,
+      # dependencies, and resource policy from the constructed plan.
       - name: Run debug build nodes
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
@@ -360,7 +356,7 @@ jobs:
       # "error: no such command: `nextest`", failing in 0.1s having run zero
       # tests. Stage the binary this job just proved it has into the tarball so
       # the declared dependency travels on the channel that already works.
-      # Version stays single-sourced from setup.nextest in ci/dag/portable.json.
+      # Version stays single-sourced from setup.nextest in the constructed plan.
       - name: Stage cargo-nextest for the debug shards
         run: |
           set -euo pipefail
@@ -463,8 +459,8 @@ jobs:
         env:
           RUSTFLAGS: ""
         run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
-      # Reproduce EXACTLY the release build nodes from portable.json (no drift):
-      # build.dbt_release, build.sabre_release, build.liteinst_runtime_release.
+      # Group the release-build step tags; validate supplies their commands,
+      # dependencies, and resource policy from the constructed plan.
       - name: Run release build nodes (dbt + sabre + liteinst)
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
@@ -718,7 +714,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  # ------------------------------------------------------------- e2e cells
+  # ------------------------------------------------------------- e2e steps
   e2e:
     name: "e2e step: ${{ matrix.slug }}"
     needs: [select, build-debug, build-release]
