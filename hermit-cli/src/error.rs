@@ -43,6 +43,10 @@ pub enum FailureKind {
     /// `class=container-child-exit`. Two configurations of one policy reported
     /// opposite things about the same decision.
     PolicyRefusal,
+    /// A ptrace PMU timer interrupt arrived after its target. The count is
+    /// carried across the container boundary so the parent can publish the
+    /// named infrastructure error instead of leaving the pending no-result.
+    SkidOvershoot { count: u64 },
     /// The child stopped because HERMIT'S OWN `--timeout` BOUND was reached.
     ///
     /// ⚠️ THE SAME ARGUMENT A THIRD TIME, and it is not hypothetical: measured
@@ -158,7 +162,11 @@ impl From<Error> for SerializableError {
         // side can only ever fail. Detecting the refusal after the boundary
         // would mean matching on English, which is the thing `kind` exists to
         // avoid.
-        let kind = if is_policy_refusal(&err) {
+        let kind = if let Some(error) = err.downcast_ref::<crate::SkidOvershootError>() {
+            FailureKind::SkidOvershoot {
+                count: error.count(),
+            }
+        } else if is_policy_refusal(&err) {
             FailureKind::PolicyRefusal
         } else if err.downcast_ref::<crate::GuestTimedOut>().is_some() {
             FailureKind::RunTimeout
@@ -228,5 +236,25 @@ mod tests {
                 .map(ToString::to_string)
                 .collect::<Vec<String>>(),
         )
+    }
+
+    #[test]
+    fn skid_overshoot_is_serialized_as_a_policy_refusal() {
+        let refusal = SerializableError::from(Error::new(crate::SkidOvershootError::new(2)));
+        assert_eq!(refusal.kind(), FailureKind::SkidOvershoot { count: 2 });
+        assert!(refusal.error.contains("observed 2 HERMIT_SKID_OVERSHOOT"));
+
+        let contextual = SerializableError::from(
+            Error::msg("guest execution also failed").context(crate::SkidOvershootError::new(1)),
+        );
+        assert_eq!(contextual.kind(), FailureKind::SkidOvershoot { count: 1 });
+        assert!(
+            contextual
+                .error
+                .contains("observed 1 HERMIT_SKID_OVERSHOOT")
+        );
+
+        let ordinary = SerializableError::from(Error::msg("ordinary failure"));
+        assert_eq!(ordinary.kind(), FailureKind::Error);
     }
 }

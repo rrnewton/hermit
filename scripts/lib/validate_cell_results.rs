@@ -8,6 +8,7 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
+use hermit_manifest_plan::canonical_verdict::InfrastructureError;
 use hermit_manifest_plan::canonical_verdict::Verdict as VerificationVerdict;
 use hermit_manifest_plan::canonical_verdict::VerificationReport;
 use hermit_manifest_plan::ledger::CellIdentity;
@@ -136,6 +137,15 @@ fn canonical_report(
     // `VerificationReport` owns the complete current top-level report. The
     // ledger types additionally deny unknown comparison/count fields, which
     // preserves schema 7's exact shape without a second hard-coded key list.
+    let report = VerificationReport::from_current_json_value(value.clone())?;
+    if report.verdict == VerificationVerdict::InfrastructureError {
+        return Err(match report.infrastructure_error.as_ref() {
+            Some(InfrastructureError::SkidOvershoot { count }) => format!(
+                "recorded infrastructure_error: {count} HERMIT_SKID_OVERSHOOT report(s)"
+            ),
+            None => unreachable!("typed report parser requires an infrastructure error"),
+        });
+    }
     let comparison = value
         .get("comparison")
         .cloned()
@@ -149,7 +159,6 @@ fn canonical_report(
             .ok_or("incomplete cell comparison: missing `compared_log_messages`")?,
     )
     .map_err(|error| format!("incomplete cell comparison counts: {error}"))?;
-    let report = VerificationReport::from_current_json_value(value)?;
     if !comparison.is_canonical_bitwise_info_v1(&compared_log_messages) {
         return Ok(None);
     }
@@ -714,6 +723,7 @@ mod tests {
             "verified": matched,
             "verdict": verdict,
             "bitwise_parity": matched,
+            "infrastructure_error": null,
             "comparison": {
                 "strictness": "canonical",
                 "display_name": "BitwiseInfoV1",
@@ -1080,6 +1090,38 @@ mod tests {
         row["reason"] = Value::String("SaBRe interception path was incomplete".into());
         let verdict = cell_verdict(&row).unwrap();
         assert!(matches!(verdict, CellVerdict::UnavailableWithReason { .. }));
+    }
+
+    #[test]
+    fn infrastructure_error_preserves_its_cause_with_or_without_a_comparison() {
+        for retain_comparison in [true, false] {
+            let mut row = result_row(
+                "infrastructure-row",
+                "3434343434343434343434343434343434343434",
+            );
+            row["outcome"] = Value::String("ERROR".into());
+            row["reason"] = Value::String(
+                "verification recorded 2 HERMIT_SKID_OVERSHOOT report(s)".into(),
+            );
+            let mut infrastructure: Value =
+                serde_json::from_str(&report("matched", "info")).unwrap();
+            infrastructure["verified"] = Value::Bool(false);
+            infrastructure["bitwise_parity"] = Value::Bool(false);
+            infrastructure["verdict"] = Value::String("infrastructure_error".into());
+            infrastructure["infrastructure_error"] =
+                serde_json::json!({"kind": "skid_overshoot", "count": 2});
+            if !retain_comparison {
+                infrastructure["comparison"] = Value::Null;
+                infrastructure["compared_log_messages"] = Value::Null;
+            }
+            replace_report(&mut row, &infrastructure);
+
+            let CellVerdict::UnavailableWithReason { reason, .. } = cell_verdict(&row).unwrap()
+            else {
+                panic!("infrastructure error became product evidence")
+            };
+            assert!(reason.contains("2 HERMIT_SKID_OVERSHOOT"), "{reason}");
+        }
     }
 
     #[test]

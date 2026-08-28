@@ -1043,6 +1043,26 @@ def verify_tier_from_json(path: Path) -> dict[str, str] | None:
         return None
     if not isinstance(record, dict) or record.get("verdict") in (None, "no_result"):
         return None
+    infrastructure_error = ""
+    if record.get("verdict") == "infrastructure_error":
+        cause = record.get("infrastructure_error")
+        if not isinstance(cause, dict):
+            print(
+                f"run_matrix: REFUSED infrastructure_error receipt {path}: missing cause",
+                file=sys.stderr,
+            )
+            return None
+        count = cause.get("count")
+        if cause.get("kind") != "skid_overshoot" or type(count) is not int or count <= 0:
+            print(
+                f"run_matrix: REFUSED infrastructure_error receipt {path}: "
+                f"invalid cause {cause!r}",
+                file=sys.stderr,
+            )
+            return None
+        infrastructure_error = (
+            f"verification recorded {count} HERMIT_SKID_OVERSHOOT report(s)"
+        )
     comparison = record.get("comparison") or {}
     counts = record.get("compared_log_messages") or {}
     left, right = counts.get("left"), counts.get("right")
@@ -1116,6 +1136,7 @@ def verify_tier_from_json(path: Path) -> dict[str, str] | None:
         "verify_compare": strictness,
         "bitwise_parity": "1" if bitwise else "0",
         "compared_log_messages": compared,
+        "infrastructure_error": infrastructure_error,
     }
 
 
@@ -1161,6 +1182,12 @@ def run_case_verify(
         evidence[COMPARISON_TIER_COLUMN] = COMPARISON_TIER_SELF_VERIFY_ONLY
     if result is None:
         return "FAIL", "verify run timed out", time.monotonic() - started
+    if observed_evidence and observed_evidence["infrastructure_error"]:
+        return (
+            "ERROR",
+            observed_evidence["infrastructure_error"],
+            time.monotonic() - started,
+        )
     diagnostic = result.stderr.decode(errors="replace").strip()
     if result.returncode != expected_status:
         if cpuid_policy_is_blocked(backend, name, diagnostic):
@@ -1644,6 +1671,7 @@ def append_parent_scorecard(
             "PASS": "pass",
             "XPASS": "pass",
             "FAIL": "fail",
+            "ERROR": "error",
             "GAP": "gap",
             "BLOCKED": "skip",
         }[status]
@@ -1971,7 +1999,7 @@ def main() -> int:
                         "evidence": evidence,
                     }
                 )
-                if not is_gap and status == "FAIL":
+                if status == "ERROR" or (not is_gap and status == "FAIL"):
                     failures += 1
 
     if args.output:

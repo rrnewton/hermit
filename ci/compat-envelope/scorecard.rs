@@ -3251,6 +3251,20 @@ fn validate_row_result(row: &ResultRow) -> Result<ObservedResult, String> {
     }
 }
 
+fn infrastructure_error_reason(row: &ResultRow) -> Option<String> {
+    row.attempts.iter().rev().find_map(|attempt| {
+        let report = attempt.get("verification_report")?.as_str()?;
+        let report = canonical_verdict::VerificationReport::from_json_slice(report.as_bytes())
+            .ok()?;
+        match report.infrastructure_error {
+            Some(canonical_verdict::InfrastructureError::SkidOvershoot { count }) => Some(
+                format!("verification recorded {count} HERMIT_SKID_OVERSHOOT report(s)"),
+            ),
+            None => None,
+        }
+    })
+}
+
 /// What a validate fold recorded, SPLIT BY WHETHER THE ROW LOCATED ANYTHING.
 ///
 /// Two counts rather than one because the caller's summary line is the only
@@ -3376,13 +3390,19 @@ fn apply_validate_results(
             // counted, reported, and NOT stored: there is no product behaviour to
             // record.
             //
-            // An `ERROR` that DID locate a position is a different row and keeps its
-            // hard refusal below. Infrastructure failed but a divergence position was
-            // reported: that is self-contradictory input, and refusing it loudly is
-            // right.
-            if located_nothing && row.outcome != "PASS" && row.outcome != "FAIL" {
-                fold.errored
-                    .push(format!("{} (outcome={})", display_id(id), row.outcome));
+            // An understood infrastructure error may retain a completed
+            // comparison and its divergence coordinates. Those coordinates
+            // remain diagnostic evidence, not product behavior: count and
+            // name the error, but do not store an observation from it.
+            if row.outcome == "ERROR"
+                || (located_nothing && row.outcome != "PASS" && row.outcome != "FAIL")
+            {
+                fold.errored.push(format!(
+                    "{} (outcome={}, reason={})",
+                    display_id(id),
+                    row.outcome,
+                    infrastructure_error_reason(row).as_deref().unwrap_or("not recorded")
+                ));
                 continue;
             }
             let result = validate_row_result(row)?;
@@ -5669,6 +5689,7 @@ fn self_test() -> Result<(), String> {
                     bitwise_parity: true,
                     verdict: canonical_verdict::Verdict::Matched,
                     no_result_reason: None,
+                    infrastructure_error: None,
                     // `Some`: this fixture is a REACHED verdict (verified,
                     // bitwise_parity, "matched"). `None` is reserved for the
                     // documented producer no-result state.
@@ -6054,6 +6075,7 @@ red/`measured-and-passed` count is **0**.",
                     canonical_verdict::Verdict::Diverged
                 },
                 no_result_reason: None,
+                infrastructure_error: None,
                 comparison: Some(canonical_verdict::ComparisonReport {
                     strictness: canonical_verdict::LogCompareStrictness::Canonical,
                     display_name: Some("BitwiseInfoV1".into()),
@@ -7654,6 +7676,51 @@ red/`measured-and-passed` count is **0**.",
              gain a measurement"
                 .into(),
         );
+    }
+    let mut error_with_coordinates = coordinate_less_row(&unlocated_id, "ERROR");
+    let row = &mut error_with_coordinates.get_mut(&unlocated_id).unwrap()[0].row;
+    row.first_divergent_scheduler_turn = Some(7);
+    row.first_divergent_virtual_nanoseconds = Some(70);
+    row.first_divergent_record = Some(12);
+    row.first_divergent_syscall = Some(9);
+    let mut report: JsonValue =
+        serde_json::from_str(row.attempts[0]["verification_report"].as_str().unwrap()).unwrap();
+    report["verified"] = JsonValue::Bool(false);
+    report["bitwise_parity"] = JsonValue::Bool(false);
+    report["verdict"] = JsonValue::String("infrastructure_error".into());
+    report["infrastructure_error"] =
+        serde_json::json!({"kind": "skid_overshoot", "count": 1});
+    report["first_divergent_scheduler_turn"] = serde_json::json!(7);
+    report["first_divergent_virtual_nanoseconds"] = serde_json::json!(70);
+    report["first_divergent_record"] = serde_json::json!(12);
+    report["first_divergent_syscall"] = serde_json::json!(9);
+    let report = serde_json::to_string(&report).unwrap();
+    row.attempts[0]["verification_report_sha256"] =
+        JsonValue::String(format!("{:x}", Sha256::digest(report.as_bytes())));
+    row.attempts[0]["verification_report"] = JsonValue::String(report);
+    let mut retained_comparison_error = TrackedCells {
+        schema: SCHEMA,
+        projection: None,
+        cells: vec![bare_cell(&unlocated_id)],
+    };
+    let retained_comparison_error_fold = apply_validate_results(
+        &mut retained_comparison_error,
+        &error_with_coordinates,
+        "sha-1",
+        "tree-1",
+        &depth_fixture,
+        true,
+        true,
+    )
+    .map_err(|e| format!("an infrastructure ERROR with retained coordinates was refused: {e}"))?;
+    if retained_comparison_error_fold.errored.len() != 1
+        || !retained_comparison_error_fold.errored[0].contains("HERMIT_SKID_OVERSHOOT")
+        || !retained_comparison_error.cells[0].observations.is_empty()
+    {
+        return Err(format!(
+            "an infrastructure ERROR with retained comparison evidence was not named and excluded from product observations: {:?}",
+            retained_comparison_error_fold.errored
+        ));
     }
     // 2. A genuinely clean run STILL reads all-green. The inverse defect -- making
     // every quiet run look suspicious -- is the one that cost real time on a false

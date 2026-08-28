@@ -21,6 +21,7 @@ use hermit::Error;
 use hermit::FailureKind;
 use hermit::HERMIT_DEADLINE_EXIT;
 use hermit::SerializableError;
+use hermit::SkidOvershootError;
 use nix::sched::CpuSet;
 use nix::sched::sched_getaffinity;
 use nix::sys::signal::SaFlags;
@@ -803,6 +804,9 @@ pub fn classify_container_result<T>(
                 // the operator needs while claiming it was printed. Attaching it
                 // as context keeps the downcast working and the chain intact.
                 FailureKind::PolicyRefusal => error.context(PolicyRefusal),
+                FailureKind::SkidOvershoot { count } => error
+                    .context(SkidOvershootError::new(count))
+                    .context(PolicyRefusal),
                 // ⚠️ THE LIMIT IS RE-DERIVED, NOT RE-PARSED. `kind` says a
                 // deadline fired; the seconds live only in the message the
                 // child wrote, and `RunTimeoutMarker` deliberately carries no
@@ -926,6 +930,23 @@ mod tests {
         let classified = classify_container_result::<()>(Ok(Err(ordinary)))
             .expect_err("an error is not a success");
         assert!(classified.downcast_ref::<PolicyRefusal>().is_none());
+    }
+
+    #[test]
+    fn skid_overshoot_count_survives_the_container_boundary() {
+        let reported = SerializableError::from(Error::new(SkidOvershootError::new(3)));
+        assert_eq!(reported.kind(), FailureKind::SkidOvershoot { count: 3 });
+
+        let classified = classify_container_result::<()>(Ok(Err(reported)))
+            .expect_err("a skid overshoot is not a success");
+        assert!(classified.downcast_ref::<PolicyRefusal>().is_some());
+        assert_eq!(
+            classified
+                .downcast_ref::<SkidOvershootError>()
+                .expect("the parent must recover the typed cause")
+                .count(),
+            3
+        );
     }
 
     /// ⚠️ THE RECOGNITION HALF, WHICH THE END-TO-END TEST DOES NOT WITNESS.
