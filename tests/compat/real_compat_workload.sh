@@ -529,7 +529,7 @@ EOF
     # the sensitivity of the digest stays reproducible. Masked, four runs agree;
     # unmasked, four runs produced four distinct digests.
     netlink-route)
-        /usr/bin/python3 - <<'PY'
+        /usr/bin/python3 -I -B - <<'PY'
 import hashlib, os, socket, struct
 
 NETLINK_ROUTE, RTM_GETLINK, RTM_NEWLINK = 0, 18, 16
@@ -648,7 +648,7 @@ PY
     # production gate at detcore/src/syscalls/io.rs. With it, all five paths
     # return raw host inode numbers and this row exits 1.
     netlink-sock-diag)
-        /usr/bin/python3 - <<'PY'
+        /usr/bin/python3 -I -B - <<'PY'
 import ctypes, socket, struct
 
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
@@ -911,7 +911,7 @@ EOF
             -o "$WORK_DIR/libcompat.so" "$WORK_DIR/compat.o"
         /usr/bin/readelf -h "$WORK_DIR/libcompat.so" \
             | grep -q 'DYN (Shared object file)'
-        /usr/bin/python3 - "$WORK_DIR/libcompat.so" <<'PY'
+        /usr/bin/python3 -I -B - "$WORK_DIR/libcompat.so" <<'PY'
 import ctypes
 import sys
 
