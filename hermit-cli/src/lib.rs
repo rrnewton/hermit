@@ -11,6 +11,7 @@
 #![allow(clippy::uninlined_format_args)]
 
 mod backend_stats;
+pub mod canonical_verdict;
 mod chroot;
 mod consts;
 mod desync;
@@ -26,7 +27,7 @@ pub mod instruction_map;
 mod interp;
 mod metadata;
 
-pub use hermit_manifest_plan::canonical_verdict::Verdict;
+pub use canonical_verdict::Verdict;
 
 /// Whether record/replay verification hashes syscall output buffers, and
 /// therefore whether its log comparison can see buffer CONTENT at all.

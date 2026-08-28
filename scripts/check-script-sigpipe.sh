@@ -23,7 +23,7 @@
 # construction. Several of them pull workspace source across that boundary with
 # `#[path]`:
 #
-#   ci/manifest-plan/src/canonical_verdict.rs -> ci/compat-envelope/scorecard.rs
+#   hermit-cli/src/canonical_verdict.rs       -> ci/compat-envelope/scorecard.rs
 #                                                ci/compat-envelope/pressure-test.rs
 #   ci/manifest-plan/src/manifest_value.rs    -> scripts/manifest-to-commands.rs
 #                                                tests/manifest-cli.rs

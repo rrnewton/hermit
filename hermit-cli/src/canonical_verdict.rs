@@ -1,3 +1,5 @@
+//! Machine-readable verification reports shared by the Hermit producer and its consumers.
+
 use serde::Deserialize;
 use serde::Serialize;
 

@@ -67,7 +67,6 @@ pub enum SeriesOutcome {
     NoResult,
     Timeout,
     Errored,
-    Error,
     Skipped,
 }
 
@@ -79,7 +78,6 @@ impl SeriesOutcome {
             Self::NoResult => "no_result",
             Self::Timeout => "timeout",
             Self::Errored => "errored",
-            Self::Error => "error",
             Self::Skipped => "skipped",
         }
     }
@@ -623,5 +621,19 @@ mod tests {
                 .unwrap_err()
                 .contains("must not carry divergence evidence")
         );
+    }
+
+    #[test]
+    fn v2_refuses_error_and_accepts_errored() {
+        let mut value = serde_json::to_value(row(SeriesSchema::V2)).unwrap();
+        value["series"]["outcome"] = serde_json::json!("errored");
+        let accepted: SeriesRow = serde_json::from_value(value.clone())
+            .expect("errored remains a supported non-verdict outcome");
+        accepted.validate_for_write().unwrap();
+
+        value["series"]["outcome"] = serde_json::json!("error");
+        let error = serde_json::from_value::<SeriesRow>(value)
+            .expect_err("schema-v2 must refuse the unsupported error spelling");
+        assert!(error.to_string().contains("unknown variant `error`"));
     }
 }

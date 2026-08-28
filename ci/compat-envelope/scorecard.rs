@@ -14,9 +14,6 @@
 #[path = "../../scripts/lib/rust_script_prelude.rs"]
 mod rust_script_prelude;
 
-#[path = "../manifest-plan/src/canonical_verdict.rs"]
-mod canonical_verdict;
-
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::env;
@@ -31,6 +28,7 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 use sha2::Digest;
 use sha2::Sha256;
+use hermit_manifest_plan::canonical_verdict;
 use hermit_manifest_plan::stress_series::{
     HostCapability, HostCapabilityVerdict, SeriesCoordinates, SeriesOutcome, SeriesPayload,
     SeriesProducer, SeriesRow, SeriesSchema, SourceDepth,
@@ -887,7 +885,7 @@ struct ResultRow {
     /// WHERE the cell diverged, as emitted by the harness.
     ///
     /// `#[serde(default)]` for the same reason the sibling copy in
-    /// ci/manifest-plan/src/canonical_verdict.rs is tolerant: this reader
+    /// hermit-cli/src/canonical_verdict.rs is tolerant: this reader
     /// aggregates RETAINED result rows, including ones written before the field
     /// existed, so absence has to mean "older row" rather than "broken
     /// producer". The pressure test's copy is deliberately REQUIRED-nullable
@@ -3894,7 +3892,6 @@ fn series_result(outcome: SeriesOutcome, mode: &str) -> Option<ObservedResult> {
             SeriesOutcome::NoResult
             | SeriesOutcome::Timeout
             | SeriesOutcome::Errored
-            | SeriesOutcome::Error
             | SeriesOutcome::Skipped,
             _,
         ) => None,

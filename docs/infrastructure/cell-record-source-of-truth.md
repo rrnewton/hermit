@@ -165,9 +165,9 @@ axis**. One real measured divergence was record 98, syscall 37, scheduler turn
 
 On `main` the validate side does not populate any of them: the harness in
 `ci/manifest-plan/src/` mentions the coordinates only as literal `null` in a
-`canonical_verdict.rs` test string. The value is computed in
+`hermit-cli/src/canonical_verdict.rs` test string. The value is computed in
 `hermit-cli/src/bin/hermit/verify.rs` and **dropped one hop before any cell sees
-it**. #2396 landed the wiring (`runner.rs` +218, `canonical_verdict.rs` +126), so
+it**. #2396 landed the wiring (`runner.rs` +218, `hermit-cli/src/canonical_verdict.rs` +126), so
 validate CAN now emit one — it just never runs the writer.
 
 ## NOTHING SCHEDULES THE PRODUCER
@@ -595,7 +595,7 @@ missing is the store and, more importantly, anything that CALLS them:
 | Piece | State |
 |---|---|
 | `observe-results` command (the append entry point) | **landed**, #2396 — but never invoked, zero rows written |
-| validate-side wiring so a validate run can emit a divergence position at all | **landed**, #2396 (`runner.rs` +218, `canonical_verdict.rs` +126) |
+| validate-side wiring so a validate run can emit a divergence position at all | **landed**, #2396 (`runner.rs` +218, `hermit-cli/src/canonical_verdict.rs` +126) |
 | row-independent fold, so a batch of N cells equals N single-cell runs | **landed**, #2396 |
 | `samples`, `provenance`, `depth`, `last_tested` | **landed**, #2396 |
 | the append-only series store itself | **not written** |
