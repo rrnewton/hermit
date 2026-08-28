@@ -118,6 +118,16 @@ class DefaultQemuAssetsTest(unittest.TestCase):
             text = (DEMO_DIR / relative).read_text()
             self.assertIn("hermit_tmp_args(", text)
 
+    def test_qemu_controllers_disable_bytecode_writes_before_launch(self):
+        setting = 'environment["PYTHONDONTWRITEBYTECODE"] = "1"'
+        for relative in ("05-qemu-boot.py", "06-qemu-resume.py"):
+            with self.subTest(relative=relative):
+                text = (DEMO_DIR / relative).read_text()
+                environment_start = text.index("environment = os.environ.copy()")
+                launch = text.index("process = subprocess.Popen(", environment_start)
+                self.assertIn(setting, text[environment_start:launch])
+                self.assertIn("env=environment", text[launch:])
+
 
 if __name__ == "__main__":
     unittest.main()
