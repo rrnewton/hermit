@@ -291,6 +291,7 @@ pub fn node(
         cmd,
         cmdtype: CmdType::Unknown,
         manifest: None,
+        integration_test_binaries: None,
         deps,
         env: BTreeMap::new(),
         hint: ResourceHint {

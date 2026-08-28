@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Fail closed when a Hermit integration-test binary is absent from CI accounting.
 
-Cargo discovers every top-level ``hermit-cli/tests/*.rs`` file as a test binary,
-while Hermit's CI DAG runs integration tests through explicit ``--test`` tokens.
-A binary present in the former set but absent from both the DAG and the
-declarations ledger would otherwise be invisible: neither executed nor reported
-as not run.
+Cargo discovers every top-level ``hermit-cli/tests/*.rs`` file as a test binary.
+Hermit's CI DAG records the binaries a step executes in its shared typed
+``integration_test_binaries`` field. A binary present in the former set but absent
+from both the DAG and the declarations ledger would otherwise be invisible:
+neither executed nor reported as not run.
 
 The present set deliberately comes from ``git ls-files`` rather than the ledger.
 The ledger therefore cannot certify its own completeness.  Nested helper modules
@@ -15,6 +15,11 @@ excluded by the explicit path-depth check.
 ``none-recorded`` is a first-class honest-unknown state.  It means only that no
 reason for omitting the binary was recorded; it is never counted as CI coverage
 or as a reason-recorded declaration.
+
+The command parser below is not the source of registration. It verifies that a
+typed declaration matches what the in-repository command executes, so a stale
+declaration cannot claim coverage and an old DAG with no declaration cannot turn
+missing evidence into a zero or a success.
 """
 
 from __future__ import annotations
@@ -29,6 +34,12 @@ from pathlib import Path
 
 
 DEFAULT_ROOT = Path(__file__).resolve().parents[1]
+AGENT_UTILS_PY = DEFAULT_ROOT / "agent-utils/py"
+sys.path.insert(0, str(AGENT_UTILS_PY))
+
+from dagrun import DagJsonError, dag_from_json  # noqa: E402
+
+
 DECLARATIONS = Path("ci/undeclared-test-binaries.tsv")
 DAG_GLOB = "ci/dag/*.json"
 
@@ -125,7 +136,7 @@ def present_targets(root: Path) -> set[str]:
 
 
 def registered_targets(root: Path) -> set[str]:
-    """Return hermit-cli test targets named by committed CI DAG commands."""
+    """Return typed test targets whose DAG commands execute the same targets."""
     dag_paths = sorted(root.glob(DAG_GLOB))
     if not dag_paths:
         raise ValueError(f"found no DAG files matching {DAG_GLOB}")
@@ -133,18 +144,27 @@ def registered_targets(root: Path) -> set[str]:
     registered: set[str] = set()
     for path in dag_paths:
         try:
-            document = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError) as error:
+            config = dag_from_json(path.read_text())
+        except (OSError, DagJsonError) as error:
             raise ValueError(f"cannot parse {path.relative_to(root)}: {error}") from error
-        steps = document.get("steps")
-        if not isinstance(steps, list):
-            raise ValueError(f"{path.relative_to(root)} has no 'steps' list to read commands from")
-        for step in steps:
-            if not isinstance(step, dict):
+        for step in config.steps:
+            executed = executed_test_targets(step.cmd)
+            declared = step.integration_test_binaries
+            if declared is None:
+                if executed:
+                    raise ValueError(
+                        f"{path.relative_to(root)} step {step.tag} executes "
+                        f"{sorted(executed)!r} but omits integration_test_binaries"
+                    )
                 continue
-            command = step.get("cmd")
-            if isinstance(command, str):
-                registered.update(executed_test_targets(command))
+            declared_set = set(declared)
+            if declared_set != executed:
+                raise ValueError(
+                    f"{path.relative_to(root)} step {step.tag} integration_test_binaries "
+                    f"{sorted(declared_set)!r} do not match executed targets "
+                    f"{sorted(executed)!r}"
+                )
+            registered.update(declared)
     return registered
 
 
