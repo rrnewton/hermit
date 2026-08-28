@@ -3485,8 +3485,24 @@ fn apply_validate_results(
 
 fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
     let _lock = acquire_scorecard_write_lock(root)?;
-    check_observation_worktree(root)?;
     let head = git_head(root)?;
+    if !results.is_dir() {
+        return Err(format!(
+            "result directory does not exist: {}",
+            results.display()
+        ));
+    }
+    let mut files = Vec::new();
+    find_result_files(results, &mut files)?;
+    if files.is_empty() {
+        println!(
+            "compatibility scorecard: merged 0 pass, 0 located divergence, and 0 unlocated \
+             divergence validate observation(s) at {head}"
+        );
+        println!("compatibility scorecard: generated files unchanged");
+        return Ok(());
+    }
+    check_observation_worktree(root)?;
     let original = read_generated_files(root)?;
     let derived = check_tracked(root)?;
     let detcore_tree = git_rev_parse(root, "HEAD:detcore")?;
@@ -6991,6 +7007,31 @@ red/`measured-and-passed` count is **0**.",
         );
     }
 
+    let command_root = repo_root()?;
+    let command_before = read_generated_files(&command_root)?;
+    let empty_results = tempfile::tempdir()
+        .map_err(|e| format!("cannot create empty result directory fixture: {e}"))?;
+    let executable = env::current_exe()
+        .map_err(|e| format!("cannot resolve scorecard self-test executable: {e}"))?;
+    let output = Command::new(executable)
+        .args(["observe-results", "--results"])
+        .arg(empty_results.path())
+        .current_dir(&command_root)
+        .output()
+        .map_err(|e| format!("cannot run empty-result command fixture: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success()
+        || !stdout.contains("merged 0 pass, 0 located divergence, and 0 unlocated divergence")
+        || !stdout.contains("compatibility scorecard: generated files unchanged")
+        || read_generated_files(&command_root)? != command_before
+    {
+        return Err(format!(
+            "empty observe-results command did not succeed unchanged: status={} stdout={stdout:?} stderr={:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
     for (staged_clean, unrelated_clean, allowed) in
         [(true, true, true), (false, true, false), (true, false, false)]
     {
@@ -8670,7 +8711,7 @@ red/`measured-and-passed` count is **0**.",
     }
 
     println!(
-        "compatibility scorecard self-test: retained-comparison FRESH/DRIFTED/WRONG/UNCHECKABLE, provenance, distinct-evidence, result, selected-chaos, status-measurement-display, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, source-identity, writer-boundary, projection, path-independence, infrastructure-refusal, and divergence-without-a-comparison brackets pass"
+        "compatibility scorecard self-test: retained-comparison FRESH/DRIFTED/WRONG/UNCHECKABLE, provenance, distinct-evidence, result, selected-chaos, status-measurement-display, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, empty-result command, source-identity, writer-boundary, projection, path-independence, infrastructure-refusal, and divergence-without-a-comparison brackets pass"
     );
     Ok(())
 }
