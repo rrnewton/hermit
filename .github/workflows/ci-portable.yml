@@ -1007,7 +1007,7 @@ jobs:
           set -euo pipefail
           job=${NODE#e2e.}
           out="$E2E_RESULT_ROOT/portable/$job"
-          captures="ignored/e2e/runs/$E2E_RUN_ID"
+          captures="$E2E_RESULT_ROOT/runs/$E2E_RUN_ID"
           stage="ignored/parity/$SLUG/parity-v1"
           artifact="parity-v1-${{ github.run_id }}-${{ github.run_attempt }}-portable-$SLUG.tar.zst"
 
