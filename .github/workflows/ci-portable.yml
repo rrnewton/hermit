@@ -316,6 +316,11 @@ jobs:
         run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
       - name: Run preflight check nodes
         env:
+          # Let gh authenticate with this repository's read-only token. The two
+          # pinned authority checks still fail visibly because that token cannot
+          # read the private rrnewton/dev-hermit repository; no broader secret is
+          # configured or requested here.
+          GH_TOKEN: ${{ github.token }}
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
         run: ./ci/run-node.sh portable "$(jq -r '.check_nodes|join(",")' ci/portable-shards.json)"
       - name: Upload preflight check performance report
