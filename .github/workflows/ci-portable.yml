@@ -61,6 +61,10 @@ env:
   RUSTFLAGS: -D warnings -C link-arg=-llzma
   RUSTDOCFLAGS: -D warnings
   DETCORE_TEST_RUST_LOG: "off"
+  # Selected validate invocations otherwise choose a per-process temporary
+  # fixture root. Bind one workspace path so build.manifest_guests can publish
+  # its output and later selected manifest steps can consume those same files.
+  E2E_BUILD_ROOT: ${{ github.workspace }}/ignored/e2e/build
   MANIFEST_PLAN_ARTIFACT: hermit-manifest-plan-${{ github.run_id }}
   MANIFEST_PLAN_TARBALL: hermit-manifest-plan.tgz
   DEBUG_ARTIFACT: hermit-debug-${{ github.run_id }}
