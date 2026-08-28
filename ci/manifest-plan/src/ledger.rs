@@ -8,6 +8,8 @@ use serde::Deserializer;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::runner::FailureClass;
+
 /// The stable fields emitted by `validate/aggregate.py --json` and JSONL stores.
 /// Optional fields reflect honest reconstructed rows where a measurement was not
 /// available; unrecognized fields are retained for forward compatibility.
@@ -268,6 +270,27 @@ pub struct GateHistoryRow {
     pub failed_substeps: Option<Vec<String>>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+impl GateHistoryRow {
+    /// Return the producer's terminal failure attribution for this gate.
+    ///
+    /// The value stays in `extra` so retained receipt bytes do not change merely
+    /// because the shared reader learned its meaning. Missing is valid for
+    /// historical rows. An unknown present value is malformed, not absence; a
+    /// future schema therefore remains deserializable and earns no authority
+    /// until its failure class is understood.
+    pub fn failure_class(&self) -> Result<Option<FailureClass>, String> {
+        let Some(value) = self.extra.get("failure_class") else {
+            return Ok(None);
+        };
+        let Some(value) = value.as_str() else {
+            return Err("malformed GateHistoryRow failure_class: expected a string".into());
+        };
+        FailureClass::parse(value)
+            .map(Some)
+            .map_err(|error| format!("malformed GateHistoryRow failure_class: {error}"))
+    }
 }
 
 fn deserialize_present_failed_substeps<'de, D>(
@@ -583,6 +606,38 @@ mod tests {
                 Err("malformed HistoryRow executed_nodes: expected a nonnegative integer")
             );
         }
+    }
+
+    #[test]
+    fn gate_failure_class_distinguishes_absent_valid_and_malformed() {
+        let absent: GateHistoryRow = serde_json::from_str(r#"{"name":"test.fixture"}"#).unwrap();
+        assert_eq!(absent.failure_class(), Ok(None));
+
+        let valid: GateHistoryRow =
+            serde_json::from_str(r#"{"name":"test.fixture","failure_class":"product_failure"}"#)
+                .unwrap();
+        assert_eq!(
+            valid.failure_class(),
+            Ok(Some(FailureClass::ProductFailure))
+        );
+
+        let malformed_type: GateHistoryRow =
+            serde_json::from_str(r#"{"name":"test.fixture","failure_class":7}"#).unwrap();
+        assert_eq!(
+            malformed_type.failure_class(),
+            Err("malformed GateHistoryRow failure_class: expected a string".into())
+        );
+
+        let unknown: GateHistoryRow =
+            serde_json::from_str(r#"{"name":"test.fixture","failure_class":"future_failure"}"#)
+                .unwrap();
+        assert_eq!(
+            unknown.failure_class(),
+            Err(
+                "malformed GateHistoryRow failure_class: unknown failure_class `future_failure`"
+                    .into()
+            )
+        );
     }
 
     #[test]
