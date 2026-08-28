@@ -207,9 +207,9 @@ jobs:
           echo "debug shards:";   jq -r '.debug_shards[]   | "  - \(.slug): \(.nodes|join(", "))"' ci/portable-shards.json
           echo "release shards:"; jq -r '.release_shards[] | "  - \(.slug) (needs \(.needs)): \(.nodes|join(", "))"' ci/portable-shards.json
 
-  # ------------------------------------------------------- preflight (no build)
+  # ---------------------------------------------- preflight (manifest + checks)
   preflight:
-    name: Preflight (fmt + abstraction + portability)
+    name: Preflight (manifest + fmt + abstraction + portability)
     needs: select
     # Selective runs still execute preflight (fmt + abstraction + portability):
     # select-tests always pins these as always-on PREFLIGHT nodes. Only a
@@ -283,7 +283,7 @@ jobs:
   # ------------------------------------------------------------ build (debug)
   build-debug:
     name: Build debug workspace + guests once
-    needs: select
+    needs: [select, preflight]
     if: needs.select.outputs.build_debug != 'false'
     runs-on: ubuntu-latest
     # The selected debug DAG has a 1560s critical path after e2e.metadata's
@@ -311,7 +311,7 @@ jobs:
           sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
       - name: Rust components
         run: rustup component add clippy rustfmt
-      # e2e.metadata runs `test-harness validate`, which shells out to
+      # gate.manifest runs `test-harness validate`, which shells out to
       # tests/manifest-cli.rs -- one of fifteen tracked entrypoints carrying
       # `#!/usr/bin/env -S rust-script --force`. Without the interpreter that
       # exec fails 127 and run_audit reported it as "self-test failed", i.e. an
@@ -434,7 +434,7 @@ jobs:
   # carry the identical prebuilt tree, so downstream consumers are unchanged.
   build-release:
     name: Build release backends once (dbt + sabre + liteinst)
-    needs: select
+    needs: [select, preflight]
     if: needs.select.outputs.build_release != 'false'
     runs-on: ubuntu-latest
     # runtime_release -> liteinst_runtime_release is a 2100s selected-DAG path.

@@ -18,6 +18,12 @@
 # in one run-node selection preserves their declared DAG edge; assigning the
 # producer to an unrelated bucket would satisfy set coverage while leaving the
 # artifact off the consumer's execution path.
+#
+# Preflight has no earlier hosted job from which it can fetch an artifact or
+# inherit a successful predecessor result. Its selected steps must therefore be
+# closed over their dependencies in the constructed plan. This catches a map
+# that assigns every step exactly once but separates a preflight command from
+# the step that makes it runnable.
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -79,6 +85,22 @@ fi
 if [[ -n $extra ]]; then
     echo "check-shard-coverage.sh: FAIL — shard map names steps absent from the constructed portable-only plan:" >&2
     printf '  %s\n' $extra >&2
+    status=1
+fi
+
+preflight_json=$(jq -c '.preflight_nodes // []' "$shards")
+preflight_missing=$(jq -r --argjson selected "$preflight_json" '
+    [
+      .dags[].steps[]
+      | select(.tag as $tag | $selected | index($tag))
+      | .deps[]
+      | select(. as $dependency | ($selected | index($dependency)) == null)
+    ]
+    | unique[]
+' <<<"$plan_json")
+if [[ -n $preflight_missing ]]; then
+    echo "check-shard-coverage.sh: FAIL — preflight drops constructed predecessor(s) that no earlier job supplies:" >&2
+    printf '  %s\n' $preflight_missing >&2
     status=1
 fi
 
