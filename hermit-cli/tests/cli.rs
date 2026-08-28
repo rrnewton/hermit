@@ -215,6 +215,32 @@ fn write_matching_liteinst_revision(runtime: &Path) {
         .expect("failed to write LiteInst runtime revision fixture");
 }
 
+#[test]
+fn liteinst_runtime_cache_requires_the_current_revision() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create LiteInst cache fixture directory");
+    let runtime = directory.path().join("libreverie_liteinst.so");
+    assert!(!liteinst_runtime::staged_runtime_matches_current_pin(
+        &runtime
+    ));
+    fs::write(&runtime, b"fixture").expect("failed to write LiteInst cache fixture");
+    assert!(!liteinst_runtime::staged_runtime_matches_current_pin(
+        &runtime
+    ));
+    fs::write(
+        format!("{}.revision", runtime.display()),
+        "stale-revision\n",
+    )
+    .expect("failed to write stale LiteInst revision fixture");
+    assert!(!liteinst_runtime::staged_runtime_matches_current_pin(
+        &runtime
+    ));
+    write_matching_liteinst_revision(&runtime);
+    assert!(liteinst_runtime::staged_runtime_matches_current_pin(
+        &runtime
+    ));
+}
+
 fn liteinst_inert_runtime() -> &'static Path {
     LITEINST_INERT_RUNTIME.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))

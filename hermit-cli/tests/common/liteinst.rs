@@ -7,6 +7,7 @@
  */
 
 use std::ffi::OsStr;
+use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -25,6 +26,14 @@ pub(super) fn liteinst_runtime_library() -> PathBuf {
         .parent()
         .expect("Hermit test binary should have a profile directory")
         .join("libreverie_liteinst.so")
+}
+
+pub(super) fn staged_runtime_matches_current_pin(runtime: &Path) -> bool {
+    if !runtime.is_file() {
+        return false;
+    }
+    let revision = PathBuf::from(format!("{}.revision", runtime.display()));
+    fs::read_to_string(revision).is_ok_and(|staged| staged.trim() == env!("HERMIT_REVERIE_PIN"))
 }
 
 pub(super) fn ensure_liteinst_runtime() {
@@ -51,6 +60,9 @@ pub(super) fn ensure_liteinst_runtime() {
         // cache invalidation has the same source of truth as the pin gate.
         let runtime_target = target_dir.join("liteinst-runtime-build");
         let runtime = liteinst_runtime_library();
+        if staged_runtime_matches_current_pin(&runtime) {
+            return;
+        }
         let output = Command::new(repository.join("scripts/stage-liteinst-runtime.sh"))
             .current_dir(repository)
             .arg(cargo_profile)
