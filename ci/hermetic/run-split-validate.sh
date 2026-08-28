@@ -162,10 +162,12 @@ shard_node_count=$(tr ',' '\n' <<<"$shard_nodes" | wc -l)
 # run.
 e2e_nodes=""
 e2e_node_count=0
+final_node_count=0
 e2e_cell_count=0
 if [[ -z "$shards" ]]; then
     e2e_nodes=$(jq -er '.e2e_nodes | if length > 0 then join(",") else error("no e2e.manifest_* steps") end' "$MAP")
     e2e_node_count=$(tr ',' '\n' <<<"$e2e_nodes" | wc -l)
+    final_node_count=$(jq -er '.final_nodes | if length > 0 then length else error("no final steps") end' "$MAP")
     e2e_cell_count=$(jq -er '
         [.cells[] | select(.lane == "portable")] as $portable
         | if (.schema == 1 and ($portable | length) > 0)
@@ -212,7 +214,7 @@ fi
 if [[ $do_offline -eq 1 ]]; then
     echo "== OFFLINE phase (pinned root, NO network): build then test, in one place"
     echo "     build-side: $build_node_count node(s)"
-    echo "     test-side:  $test_node_count node(s) ($shard_node_count shard + $e2e_node_count manifest)"
+    echo "     test-side:  $test_node_count node(s) ($shard_node_count shard + $e2e_node_count manifest + $final_node_count final)"
     if [[ -n "$e2e_nodes" ]]; then
         echo "     e2e cells:  $e2e_cell_count selected portable cell(s)"
     fi
@@ -333,7 +335,7 @@ if [[ $do_offline -eq 1 ]]; then
 
             echo ":: build-side nodes"
             /src/ci/run-node.sh '"$lane"' '"$build_nodes"'
-            echo ":: test-side nodes ('"$shard_node_count"' shard + '"$e2e_node_count"' manifest; '"$e2e_cell_count"' selected portable cells)"
+            echo ":: test-side nodes ('"$shard_node_count"' shard + '"$e2e_node_count"' manifest + '"$final_node_count"' final; '"$e2e_cell_count"' selected portable cells)"
             exec /src/ci/run-node.sh '"$lane"' '"$test_nodes"'
         '
 fi
