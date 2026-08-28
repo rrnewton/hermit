@@ -8,33 +8,20 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
+use hermit_manifest_plan::canonical_verdict::Verdict as VerificationVerdict;
+use hermit_manifest_plan::canonical_verdict::VerificationReport;
+use hermit_manifest_plan::ledger::CellIdentity;
+use hermit_manifest_plan::ledger::CellResult as LedgerCellResult;
+use hermit_manifest_plan::ledger::CellResultsArtifact;
+use hermit_manifest_plan::ledger::CellResultsEvidence;
+use hermit_manifest_plan::ledger::CellVerdict;
+use hermit_manifest_plan::ledger::ComparedLogCounts;
+use hermit_manifest_plan::ledger::ComparisonSpec;
+use hermit_manifest_plan::ledger::ComparisonTier;
+use hermit_manifest_plan::ledger::RequiredNullable;
 use serde_json::Value;
 use sha2::Digest;
 use sha2::Sha256;
-
-const IDENTITY_KEYS: [&str; 5] = ["lane", "category", "test", "mode", "backend"];
-// Exact keys in a schema-7 compared verdict. Requiring both this length and
-// every member makes additions and omissions fail closed until the outer
-// ledger schema advances.
-const LEDGER_COMPARISON_KEYS: [&str; 16] = [
-    "strictness",
-    "display_name",
-    "compare_logs",
-    "compare_io_buffers",
-    "log_scope",
-    "record_envelope",
-    "virtualize_time",
-    "strip_lines",
-    "canonicalize_addresses",
-    "full_trace",
-    "exact_remainder",
-    "stripped_prefixes",
-    "canonicalizations",
-    "ignore_lines",
-    "skip_commit",
-    "skip_detlog",
-];
-const LEDGER_COMPARED_LOG_MESSAGE_KEYS: [&str; 2] = ["left", "right"];
 
 /// Outer ledger schema for rows carrying [`RetainedCellResults`].
 ///
@@ -43,12 +30,16 @@ const LEDGER_COMPARED_LOG_MESSAGE_KEYS: [&str; 2] = ["left", "right"];
 /// complete current comparison object; a missing or additional field is kept
 /// out of the compared-verdict projection instead of changing this shape under
 /// the same version.
+pub const CELL_RESULTS_LEDGER_SCHEMA_MIN: i64 = 6;
 pub const CELL_RESULTS_LEDGER_SCHEMA_VERSION: i64 = 7;
 
 #[derive(Debug)]
 pub struct RetainedCellResults {
     pub schema_version: i64,
     pub run_id: String,
+    /// The surrounding validation row is assembled as JSON, but this value is
+    /// always serialized from the producer-owned [`CellResultsEvidence`]
+    /// contract rather than constructed as a second untyped definition.
     pub evidence: Value,
 }
 
@@ -124,69 +115,63 @@ fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("per-cell result has no nonempty {key}"))
 }
 
-fn identity(value: &Value) -> Result<Value, String> {
-    let mut identity = serde_json::Map::new();
-    for key in IDENTITY_KEYS {
-        identity.insert(key.into(), Value::String(string(value, key)?.into()));
-    }
-    Ok(Value::Object(identity))
+fn identity(value: &Value) -> Result<CellIdentity, String> {
+    Ok(CellIdentity {
+        lane: string(value, "lane")?.into(),
+        category: string(value, "category")?.into(),
+        test: string(value, "test")?.into(),
+        mode: string(value, "mode")?.into(),
+        backend: string(value, "backend")?.into(),
+    })
 }
 
-fn comparison_tier(report: &Value) -> Option<&'static str> {
-    let comparison = report.get("comparison")?.as_object()?;
-    if comparison.len() != LEDGER_COMPARISON_KEYS.len()
-        || LEDGER_COMPARISON_KEYS
-            .iter()
-            .any(|key| !comparison.contains_key(*key))
-    {
-        return None;
-    }
-    let counts = report.get("compared_log_messages")?.as_object()?;
-    if counts.len() != LEDGER_COMPARED_LOG_MESSAGE_KEYS.len()
-        || LEDGER_COMPARED_LOG_MESSAGE_KEYS
-            .iter()
-            .any(|key| !counts.contains_key(*key))
-    {
-        return None;
-    }
-    let canonical = comparison.get("strictness")?.as_str()? == "canonical"
-        && comparison.get("display_name")?.as_str()? == "BitwiseInfoV1"
-        && comparison.get("compare_logs")?.as_bool()?
-        && comparison.get("compare_io_buffers")?.as_bool()?
-        && comparison.get("log_scope")?.as_str()? == "info"
-        && comparison.get("record_envelope")?.as_str()? == "all_records_v1"
-        && comparison.get("virtualize_time")?.as_bool()?
-        && !comparison.get("strip_lines")?.as_bool()?
-        && comparison.get("canonicalize_addresses")?.as_bool()?
-        && comparison.get("full_trace")?.as_bool()?
-        && comparison.get("exact_remainder")?.as_bool()?
-        && comparison.get("stripped_prefixes")?
-            == &serde_json::json!(["real-wall-clock-prefix/v1"])
-        && comparison.get("canonicalizations")?
-            == &serde_json::json!(["host-address-to-first-appearance-ordinal/v1"])
-        && !comparison.get("ignore_lines")?.as_bool()?
-        && !comparison.get("skip_commit")?.as_bool()?
-        && !comparison.get("skip_detlog")?.as_bool()?
-        && counts.get("left")?.as_u64()? > 0
-        && counts.get("right")?.as_u64()? > 0;
-    canonical.then_some("canonical-bitwise")
+fn identity_value(identity: &CellIdentity) -> Result<Value, String> {
+    serde_json::to_value(identity)
+        .map_err(|error| format!("cannot encode selected cell identity: {error}"))
 }
 
-fn cell_verdict(row: &Value) -> Result<Value, String> {
+fn canonical_report(
+    value: Value,
+) -> Result<Option<(VerificationReport, ComparisonSpec, ComparedLogCounts)>, String> {
+    // `VerificationReport` owns the complete current top-level report. The
+    // ledger types additionally deny unknown comparison/count fields, which
+    // preserves schema 7's exact shape without a second hard-coded key list.
+    let comparison = value
+        .get("comparison")
+        .cloned()
+        .ok_or("incomplete cell comparison: missing `comparison`")?;
+    let comparison = serde_json::from_value::<ComparisonSpec>(comparison)
+        .map_err(|error| format!("incomplete cell comparison: {error}"))?;
+    let compared_log_messages = serde_json::from_value::<RequiredNullable<ComparedLogCounts>>(
+        value
+            .get("compared_log_messages")
+            .cloned()
+            .ok_or("incomplete cell comparison: missing `compared_log_messages`")?,
+    )
+    .map_err(|error| format!("incomplete cell comparison counts: {error}"))?;
+    let report = VerificationReport::from_current_json_value(value)?;
+    if !comparison.is_canonical_bitwise_info_v1(&compared_log_messages) {
+        return Ok(None);
+    }
+    let RequiredNullable::Value(compared_log_messages) = compared_log_messages else {
+        return Ok(None);
+    };
+    Ok(Some((report, comparison, compared_log_messages)))
+}
+
+fn cell_verdict(row: &Value) -> Result<CellVerdict, String> {
     let mode = string(row, "mode")?;
     if mode == "naked" || mode == "custom" {
-        return Ok(serde_json::json!({
-            "state": "performs-no-comparison-by-design",
-            "comparison_tier": "declared-but-unverifiable",
-            "reason": format!("{mode} mode does not perform canonical two-run comparison")
-        }));
+        return Ok(CellVerdict::PerformsNoComparisonByDesign {
+            comparison_tier: ComparisonTier::DeclaredButUnverifiable,
+            reason: format!("{mode} mode does not perform canonical two-run comparison"),
+        });
     }
     let Some(attempts) = row.get("attempts").and_then(Value::as_array) else {
-        return Ok(serde_json::json!({
-            "state": "unavailable-with-reason",
-            "comparison_tier": "declared-but-unverifiable",
-            "reason": "cell emitted no typed attempts"
-        }));
+        return Ok(CellVerdict::UnavailableWithReason {
+            comparison_tier: ComparisonTier::DeclaredButUnverifiable,
+            reason: "cell emitted no typed attempts".into(),
+        });
     };
     let mut reports = Vec::new();
     let mut unavailable_reason = None;
@@ -208,84 +193,78 @@ fn cell_verdict(row: &Value) -> Result<Value, String> {
                 index + 1
             ));
         }
-        let report = serde_json::from_str::<Value>(raw).map_err(|error| {
+        let value = serde_json::from_str::<Value>(raw).map_err(|error| {
             format!(
                 "attempt {} verification report is malformed: {error}",
                 index + 1
             )
         })?;
-        if comparison_tier(&report).is_none() {
-            unavailable_reason = Some(format!(
-                "attempt {} did not compare canonical nonzero INFO evidence",
-                index + 1
-            ));
+        match canonical_report(value) {
+            Ok(Some(report)) => reports.push(report),
+            Ok(None) => {
+                unavailable_reason = Some(format!(
+                    "attempt {} did not compare canonical nonzero INFO evidence",
+                    index + 1
+                ));
+            }
+            Err(error) => unavailable_reason = Some(format!("attempt {} {error}", index + 1)),
         }
-        reports.push(report);
     }
-    let classify = |report: &Value| {
-        let matched = report.get("verified").and_then(Value::as_bool) == Some(true)
-            && report.get("verdict").and_then(Value::as_str) == Some("matched")
-            && report.get("bitwise_parity").and_then(Value::as_bool) == Some(true);
-        let diverged = report.get("verdict").and_then(Value::as_str) == Some("diverged")
-            && report.get("bitwise_parity").and_then(Value::as_bool) == Some(false);
+    let classify = |(report, _, _): &(VerificationReport, ComparisonSpec, ComparedLogCounts)| {
+        let matched = report.verified
+            && report.verdict == VerificationVerdict::Matched
+            && report.bitwise_parity;
+        let diverged = report.verdict == VerificationVerdict::Diverged && !report.bitwise_parity;
         (matched, diverged)
     };
     // A genuine canonical divergence is sticky across sibling attempts. Missing
     // or weaker evidence may prevent a clean leg, but it must never erase a red
     // leg merely because it was observed before or after that divergence.
-    if let Some(report) = reports
-        .iter()
-        .find(|report| comparison_tier(report).is_some() && classify(report).1)
+    if let Some((_, comparison, compared_log_messages)) =
+        reports.iter().find(|report| classify(report).1)
     {
-        return Ok(serde_json::json!({
-            "state": "compared-and-diverged",
-            "comparison_tier": "canonical-bitwise",
-            "comparison": report.get("comparison").cloned().ok_or("report omitted comparison")?,
-            "bitwise_parity": report.get("bitwise_parity").cloned().ok_or("report omitted bitwise_parity")?,
-            "compared_log_messages": report.get("compared_log_messages").cloned().ok_or("report omitted compared_log_messages")?
-        }));
+        return Ok(CellVerdict::ComparedAndDiverged {
+            comparison_tier: ComparisonTier::CanonicalBitwise,
+            comparison: comparison.clone(),
+            bitwise_parity: false,
+            compared_log_messages: RequiredNullable::Value(compared_log_messages.clone()),
+        });
     }
     if reports.is_empty() || unavailable_reason.is_some() {
-        return Ok(serde_json::json!({
-            "state": "unavailable-with-reason",
-            "comparison_tier": "declared-but-unverifiable",
-            "reason": unavailable_reason.unwrap_or_else(|| "cell emitted no typed verification report".into())
-        }));
+        return Ok(CellVerdict::UnavailableWithReason {
+            comparison_tier: ComparisonTier::DeclaredButUnverifiable,
+            reason: unavailable_reason
+                .unwrap_or_else(|| "cell emitted no typed verification report".into()),
+        });
     }
     if reports.iter().any(|report| !classify(report).0) {
-        return Ok(serde_json::json!({
-            "state": "unavailable-with-reason",
-            "comparison_tier": "declared-but-unverifiable",
-            "reason": "typed canonical report was neither a match nor a divergence"
-        }));
+        return Ok(CellVerdict::UnavailableWithReason {
+            comparison_tier: ComparisonTier::DeclaredButUnverifiable,
+            reason: "typed canonical report was neither a match nor a divergence".into(),
+        });
     }
     if string(row, "outcome")? != "PASS" {
-        return Ok(serde_json::json!({
-            "state": "unavailable-with-reason",
-            "comparison_tier": "declared-but-unverifiable",
-            "reason": row.get("reason").and_then(Value::as_str)
+        return Ok(CellVerdict::UnavailableWithReason {
+            comparison_tier: ComparisonTier::DeclaredButUnverifiable,
+            reason: row
+                .get("reason")
+                .and_then(Value::as_str)
                 .filter(|reason| !reason.trim().is_empty())
                 .unwrap_or("cell outcome was not PASS despite matched comparison evidence")
-        }));
+                .into(),
+        });
     }
-    let report = reports.last().expect("nonempty reports");
-    Ok(serde_json::json!({
-        "state": "compared-and-matched",
-        "comparison_tier": "canonical-bitwise",
-        "comparison": report.get("comparison").cloned().ok_or("report omitted comparison")?,
-        "bitwise_parity": report.get("bitwise_parity").cloned().ok_or("report omitted bitwise_parity")?,
-        "compared_log_messages": report.get("compared_log_messages").cloned().ok_or("report omitted compared_log_messages")?
-    }))
+    let (_, comparison, compared_log_messages) = reports.last().expect("nonempty reports");
+    Ok(CellVerdict::ComparedAndMatched {
+        comparison_tier: ComparisonTier::CanonicalBitwise,
+        comparison: comparison.clone(),
+        bitwise_parity: true,
+        compared_log_messages: RequiredNullable::Value(compared_log_messages.clone()),
+    })
 }
 
-fn sort_key(value: &Value) -> Result<(String, String, String, String, String), String> {
-    Ok((
-        string(value, "lane")?.into(),
-        string(value, "category")?.into(),
-        string(value, "test")?.into(),
-        string(value, "mode")?.into(),
-        string(value, "backend")?.into(),
-    ))
+fn sort_key(value: &Value) -> Result<CellIdentity, String> {
+    identity(value)
 }
 
 pub fn expected_plan(repo_root: &Path) -> Result<Vec<Value>, String> {
@@ -300,7 +279,7 @@ pub fn expected_plan(repo_root: &Path) -> Result<Vec<Value>, String> {
         .and_then(Value::as_array)
         .ok_or_else(|| format!("expected plan {} has no cells array", path.display()))?
         .iter()
-        .map(identity)
+        .map(|cell| identity(cell).and_then(|identity| identity_value(&identity)))
         .collect()
 }
 
@@ -320,7 +299,7 @@ fn string_set(value: &Value, key: &str) -> Result<BTreeSet<String>, String> {
 }
 
 fn enabled_cell_scope(cell: &Value) -> Result<Value, String> {
-    let mut scoped = identity(cell)?
+    let mut scoped = identity_value(&identity(cell)?)?
         .as_object()
         .cloned()
         .ok_or("cell identity was not an object")?;
@@ -375,7 +354,7 @@ fn coverage_document(
         .filter(|cell| cell.get("enabled").and_then(Value::as_bool) == Some(true))
         .map(|cell| {
             let id = identity(cell)?;
-            Ok((sort_key(&id)?, enabled_cell_scope(cell)?))
+            Ok((id, enabled_cell_scope(cell)?))
         })
         .collect::<Result<_, String>>()?;
     let selected_and_enabled = selected.keys().filter(|key| enabled.contains_key(*key)).count();
@@ -591,7 +570,7 @@ pub fn retain(
                 }
             }
             let id = identity(&row)?;
-            let key = sort_key(&id)?;
+            let key = id.clone();
             let attempt = row.get("attempt").and_then(Value::as_u64).unwrap_or(1);
             if attempt == 0 {
                 return Err("per-cell result attempt must be positive".into());
@@ -610,35 +589,46 @@ pub fn retain(
             }
     }
     let mut cells = terminal_rows
-        .into_values()
-        .map(|(_, row)| {
-            let id = identity(&row)?;
-            let mut cell = id.as_object().expect("identity object").clone();
-            cell.insert("cell_verdict".into(), cell_verdict(&row)?);
-            Ok(Value::Object(cell))
+        .into_iter()
+        .map(|(identity, (_, row))| {
+            Ok(LedgerCellResult {
+                lane: identity.lane,
+                category: identity.category,
+                test: identity.test,
+                mode: identity.mode,
+                backend: identity.backend,
+                cell_verdict: cell_verdict(&row)?,
+            })
         })
         .collect::<Result<Vec<_>, String>>()?;
     let run_id = run_id.ok_or("full validation retained zero per-cell result rows")?;
-    selected.sort_by_key(|value| sort_key(value).expect("validated identity"));
-    cells.sort_by_key(|value| sort_key(value).expect("validated identity"));
-    let mut expected = expected.to_vec();
-    expected.sort_by_key(|value| sort_key(value).expect("validated expected identity"));
+    selected.sort();
+    cells.sort_by_key(|cell| CellIdentity {
+        lane: cell.lane.clone(),
+        category: cell.category.clone(),
+        test: cell.test.clone(),
+        mode: cell.mode.clone(),
+        backend: cell.backend.clone(),
+    });
+    let mut expected = expected
+        .iter()
+        .map(identity)
+        .collect::<Result<Vec<_>, String>>()?;
+    expected.sort();
     if selected != expected {
-        let observed_keys = selected
-            .iter()
-            .map(sort_key)
-            .collect::<Result<BTreeSet<_>, _>>()?;
-        let expected_keys = expected
-            .iter()
-            .map(sort_key)
-            .collect::<Result<BTreeSet<_>, _>>()?;
+        let observed_keys = selected.iter().collect::<BTreeSet<_>>();
+        let expected_keys = expected.iter().collect::<BTreeSet<_>>();
         let missing = expected_keys.difference(&observed_keys).count();
         let extra = observed_keys.difference(&expected_keys).count();
         return Err(format!(
             "per-cell results differ from the exact planned population: {missing} missing, {extra} extra"
         ));
     }
-    let population_bytes = serde_json::to_vec(&selected)
+    let selected_values = selected
+        .iter()
+        .map(identity_value)
+        .collect::<Result<Vec<_>, String>>()?;
+    let population_bytes = serde_json::to_vec(&selected_values)
         .map_err(|error| format!("cannot encode selected cell population: {error}"))?;
     let artifact_dir = parent
         .join("ignored")
@@ -654,14 +644,14 @@ pub fn retain(
     let artifact = artifact_dir.join("cell-results.jsonl");
     let mut artifact_bytes = Vec::new();
     for cell in &cells {
-        let mut record = serde_json::Map::new();
+        let mut record = serde_json::to_value(cell)
+            .map_err(|error| format!("cannot encode retained cell row: {error}"))?
+            .as_object()
+            .cloned()
+            .ok_or("shared cell result did not serialize as an object")?;
         record.insert("run_id".into(), Value::String(run_id.clone()));
         record.insert("hermit_sha".into(), Value::String(commit.into()));
         record.insert("source_tree_dirty".into(), Value::Bool(false));
-        for key in IDENTITY_KEYS {
-            record.insert(key.into(), cell[key].clone());
-        }
-        record.insert("cell_verdict".into(), cell["cell_verdict"].clone());
         serde_json::to_writer(&mut artifact_bytes, &record)
             .map_err(|error| format!("cannot encode retained cell row: {error}"))?;
         artifact_bytes.push(b'\n');
@@ -677,24 +667,30 @@ pub fn retain(
         .map_err(|_| "retained cell artifact is outside parent root")?
         .to_string_lossy()
         .into_owned();
+    let recorded_count = u64::try_from(cells.len())
+        .map_err(|_| "retained cell count does not fit the ledger type")?;
+    let selected_count = u64::try_from(selected.len())
+        .map_err(|_| "selected cell count does not fit the ledger type")?;
+    let evidence = CellResultsEvidence {
+        run_id: run_id.clone(),
+        hermit_sha: commit.into(),
+        source_tree_dirty: false,
+        selected_count,
+        recorded_count,
+        population_sha256: hex_digest(&population_bytes),
+        artifact: CellResultsArtifact {
+            path: relative,
+            sha256: hex_digest(&artifact_bytes),
+            row_count: recorded_count,
+        },
+        selected,
+        cells,
+    };
     Ok(RetainedCellResults {
         schema_version: CELL_RESULTS_LEDGER_SCHEMA_VERSION,
-        run_id: run_id.clone(),
-        evidence: serde_json::json!({
-            "run_id": run_id,
-            "hermit_sha": commit,
-            "source_tree_dirty": false,
-            "selected_count": selected.len(),
-            "recorded_count": cells.len(),
-            "population_sha256": hex_digest(&population_bytes),
-            "artifact": {
-                "path": relative,
-                "sha256": hex_digest(&artifact_bytes),
-                "row_count": cells.len()
-            },
-            "selected": selected,
-            "cells": cells
-        }),
+        run_id,
+        evidence: serde_json::to_value(evidence)
+            .map_err(|error| format!("cannot encode cell_results evidence: {error}"))?,
     })
 }
 
@@ -736,7 +732,15 @@ mod tests {
                 "skip_commit": false,
                 "skip_detlog": false
             },
-            "compared_log_messages": {"left": 123, "right": if matched { 123 } else { 124 }}
+            "compared_log_messages": {"left": 123, "right": if matched { 123 } else { 124 }},
+            "guest_exit_code": 0,
+            "guest_signal": null,
+            "first_divergent_scheduler_turn": null,
+            "first_divergent_virtual_nanoseconds": null,
+            "first_divergent_record": null,
+            "first_divergent_syscall": null,
+            "first_divergent_left_message": null,
+            "first_divergent_right_message": null
         })
         .to_string()
     }
@@ -772,7 +776,7 @@ mod tests {
     }
 
     fn expected(row: &Value) -> Vec<Value> {
-        vec![identity(row).unwrap()]
+        vec![identity_value(&identity(row).unwrap()).unwrap()]
     }
 
     fn write_result(root: &Path, row: &Value) {
@@ -910,6 +914,26 @@ mod tests {
         let bytes = fs::read(&artifact).unwrap();
         assert_eq!(hex_digest(&bytes), retained.evidence["artifact"]["sha256"]);
         assert!(bytes.ends_with(b"\n"));
+        let artifact_row = serde_json::json!({
+            "run_id": "validate-one",
+            "hermit_sha": commit,
+            "source_tree_dirty": false,
+            "lane": "portable",
+            "category": "c-programs",
+            "test": "uname",
+            "mode": "verify",
+            "backend": "ptrace",
+            "cell_verdict": {
+                "state": "compared-and-matched",
+                "comparison_tier": "canonical-bitwise",
+                "comparison": expected_comparison,
+                "bitwise_parity": true,
+                "compared_log_messages": {"left": 123, "right": 123}
+            }
+        });
+        let mut expected_bytes = serde_json::to_vec(&artifact_row).unwrap();
+        expected_bytes.push(b'\n');
+        assert_eq!(bytes, expected_bytes, "the shared type must preserve artifact bytes");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -932,6 +956,27 @@ mod tests {
         assert_eq!(retained.schema_version, 7);
         assert_eq!(verdict["state"], "unavailable-with-reason");
         assert!(verdict.get("comparison").is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn schema7_names_a_missing_current_verification_field() {
+        let root = fixture_root();
+        let results = root.join("results");
+        let commit = "1515151515151515151515151515151515151515";
+        let mut row = result_row("validate-missing-report-field", commit);
+        let mut report: Value = serde_json::from_str(&report("matched", "info")).unwrap();
+        report.as_object_mut().unwrap().remove("first_divergent_record");
+        replace_report(&mut row, &report);
+        write_result(&results, &row);
+
+        let retained = retain(&root, &results, commit, &expected(&row)).unwrap();
+        let verdict = &retained.evidence["cells"][0]["cell_verdict"];
+        assert_eq!(verdict["state"], "unavailable-with-reason");
+        assert!(verdict["reason"]
+            .as_str()
+            .unwrap()
+            .contains("missing current producer field `first_divergent_record`"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1034,7 +1079,7 @@ mod tests {
         row["outcome"] = Value::String("FAIL".into());
         row["reason"] = Value::String("SaBRe interception path was incomplete".into());
         let verdict = cell_verdict(&row).unwrap();
-        assert_eq!(verdict["state"], "unavailable-with-reason");
+        assert!(matches!(verdict, CellVerdict::UnavailableWithReason { .. }));
     }
 
     #[test]
@@ -1044,7 +1089,7 @@ mod tests {
         let matched = report("matched", "info");
         row["attempts"] = Value::Array(vec![attempt(&diverged), attempt(&matched)]);
         let verdict = cell_verdict(&row).unwrap();
-        assert_eq!(verdict["state"], "compared-and-diverged");
+        assert!(matches!(verdict, CellVerdict::ComparedAndDiverged { .. }));
     }
 
     #[test]
@@ -1061,7 +1106,7 @@ mod tests {
             );
             row["attempts"] = Value::Array(attempts);
             let verdict = cell_verdict(&row).unwrap();
-            assert_eq!(verdict["state"], "compared-and-diverged");
+            assert!(matches!(verdict, CellVerdict::ComparedAndDiverged { .. }));
         }
     }
 
@@ -1072,7 +1117,7 @@ mod tests {
         let mut row = result_row("weaker-sibling", "9999999999999999999999999999999999999999");
         row["attempts"] = Value::Array(vec![attempt(&weaker), attempt(&diverged)]);
         let verdict = cell_verdict(&row).unwrap();
-        assert_eq!(verdict["state"], "compared-and-diverged");
+        assert!(matches!(verdict, CellVerdict::ComparedAndDiverged { .. }));
     }
 
     #[test]
@@ -1081,7 +1126,7 @@ mod tests {
         let deterministic = report("matched", "deterministic");
         row["attempts"] = Value::Array(vec![attempt(&deterministic)]);
         let verdict = cell_verdict(&row).unwrap();
-        assert_eq!(verdict["state"], "unavailable-with-reason");
+        assert!(matches!(verdict, CellVerdict::UnavailableWithReason { .. }));
     }
 
     #[test]
