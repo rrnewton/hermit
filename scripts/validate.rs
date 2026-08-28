@@ -120,6 +120,7 @@ use hermit_manifest_plan::ledger::HistoryRow;
 use hermit_manifest_plan::runner::ManifestSet;
 use hermit_manifest_plan::runner::Population;
 use hermit_manifest_plan::runner::Selection;
+use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::E2E_KERNEL_VERSION_ENV;
 use hermit_manifest_plan::runner::E2E_MACHINE_SHORTNAME_ENV;
 use hermit_manifest_plan::service_result::FinalValidateStatus;
@@ -8467,6 +8468,14 @@ struct NodeAttempt {
     /// region carried no environmental signature. Without this bit, "banner
     /// gone" is indistinguishable from "no new evidence was captured".
     detail_observed: bool,
+    /// The producer-owned attribution of this terminal attempt. This is a
+    /// closed value; `reason` and `failure_detail` remain explanatory text and
+    /// never decide the class in an outer ledger reader.
+    failure_class: Option<FailureClass>,
+    /// The exact recognized evidence value for a non-product class. Product
+    /// failures keep their existing human `reason` without manufacturing a
+    /// second description.
+    failure_detail: Option<String>,
     /// Terminal per-test results written by a controlled runner for this exact attempt.
     /// `None` means no typed result file was published; an empty vector is measured zero.
     test_results: Option<Vec<dagrun::TestResult>>,
@@ -8494,6 +8503,20 @@ fn attempt_result(attempt: &NodeAttempt) -> Option<&'static str> {
 
 fn attempt_is_failure(attempt: &NodeAttempt) -> bool {
     attempt_result(attempt) == Some("fail")
+}
+
+fn outcome_failure_class(outcome: &StepOutcome) -> Option<FailureClass> {
+    if outcome.ok || outcome.aborted {
+        None
+    } else if outcome_is_no_result(outcome)
+        || outcome.returncode.is_none()
+        || outcome_hit_its_budget(outcome)
+        || reason_is_oom(&outcome.reason)
+    {
+        Some(FailureClass::NoResult)
+    } else {
+        Some(FailureClass::ProductFailure)
+    }
 }
 
 fn terminal_attempt<'a>(outcome: &StepOutcome, attempts: &'a [NodeAttempt]) -> Option<&'a NodeAttempt> {
@@ -8535,6 +8558,7 @@ fn next_attempt_ordinal(attempts: &[NodeAttempt], tag: &str) -> usize {
 
 /// Record one attempt the scheduler REPORTED.
 fn reported_attempt(outcome: &StepOutcome, attempt: usize) -> NodeAttempt {
+    let failure_class = outcome_failure_class(outcome);
     NodeAttempt {
         tag: outcome.tag.clone(),
         attempt,
@@ -8549,6 +8573,10 @@ fn reported_attempt(outcome: &StepOutcome, attempt: usize) -> NodeAttempt {
         retry_detail: None,
         environmental_class: None,
         detail_observed: false,
+        failure_detail: (failure_class == Some(FailureClass::NoResult)
+            && !outcome.reason.is_empty())
+            .then(|| outcome.reason.clone()),
+        failure_class,
         test_results: outcome.test_results.clone(),
     }
 }
@@ -8571,6 +8599,8 @@ fn unreported_attempt(tag: String, attempt: usize) -> NodeAttempt {
         retry_detail: None,
         environmental_class: None,
         detail_observed: false,
+        failure_class: Some(FailureClass::NoResult),
+        failure_detail: Some("no completion payload was reported for this node".into()),
         test_results: None,
     }
 }
@@ -8590,10 +8620,21 @@ fn latest_reported_failure_mut<'a>(
 }
 
 /// Attach one round's detail observation to the exact reported failure it came from.
-fn stamp_attempt_detail(attempts: &mut [NodeAttempt], tag: &str, class: Option<&str>) {
+fn stamp_attempt_detail(
+    attempts: &mut [NodeAttempt],
+    tag: &str,
+    environmental_class: Option<&str>,
+    failure: Option<(FailureClass, &str)>,
+) {
     if let Some(attempt) = latest_reported_failure_mut(attempts, tag) {
         attempt.detail_observed = true;
-        attempt.environmental_class = class.map(str::to_string);
+        attempt.environmental_class = environmental_class.map(str::to_string);
+        if attempt.failure_class == Some(FailureClass::ProductFailure) {
+            if let Some((failure_class, failure_detail)) = failure {
+                attempt.failure_class = Some(failure_class);
+                attempt.failure_detail = Some(failure_detail.to_string());
+            }
+        }
     }
 }
 
@@ -11733,10 +11774,12 @@ fn run_lane_with_retries(
                 if let Some(detail) = validate_runtime::extract_node_detail(log, &outcome.tag) {
                     let class = validate_runtime::environmental_block_observation(&detail)
                         .block_class();
+                    let failure = validate_runtime::failure_class_from_detail(&detail);
                     stamp_attempt_detail(
                         &mut attempts,
                         &outcome.tag,
                         class.map(validate_runtime::EnvBlockClass::as_str),
+                        failure,
                     );
                     if let Some(class) = class {
                         environmental.insert(outcome.tag.clone(), RetryClass::from(class));
@@ -11918,7 +11961,8 @@ fn run_lane_with_retries(
             {
                 if let Some(detail) = validate_runtime::extract_node_detail(&log, &outcome.tag) {
                     let class = validate_runtime::environmental_block_class(&detail);
-                    stamp_attempt_detail(&mut attempts, &outcome.tag, class);
+                    let failure = validate_runtime::failure_class_from_detail(&detail);
+                    stamp_attempt_detail(&mut attempts, &outcome.tag, class, failure);
                     // Report exactly what was observed, without converting an
                     // environmental signature into an excuse for the terminal
                     // product failure. The attempt verdict remains RED.
@@ -12132,6 +12176,13 @@ fn outcome_hit_its_budget(outcome: &StepOutcome) -> bool {
 /// against producer output without building a whole `StepOutcome`.
 fn reason_is_budget_breach(reason: &str) -> bool {
     reason.starts_with(WALL_BUDGET_REASON_PREFIX) || reason.starts_with(CPU_BUDGET_REASON_PREFIX)
+}
+
+/// The OOM spelling is produced by dagrun's `step_failure_reason`. Keep the
+/// exact owned prefix beside the timeout predicate so a resource exhaustion is
+/// recorded as `no_result` without an outer reader interpreting prose.
+fn reason_is_oom(reason: &str) -> bool {
+    reason.starts_with("OOM-KILLED (hit inner MemoryMax;")
 }
 
 /// Pin the budget-breach predicate to the PRODUCER, not to a copy of its text.
@@ -13238,6 +13289,12 @@ fn ledger_gate(outcome: &StepOutcome) -> serde_json::Value {
         "aborted": outcome.aborted,
         "real_seconds": outcome.duration_s,
     });
+    if let Some(failure_class) = outcome_failure_class(outcome) {
+        gate["failure_class"] = serde_json::json!(failure_class);
+        if failure_class == FailureClass::NoResult && !outcome.reason.is_empty() {
+            gate["failure_detail"] = serde_json::json!(outcome.reason);
+        }
+    }
     set_gate_failure_evidence(&mut gate, outcome_is_failure(outcome));
     gate
 }
@@ -13263,7 +13320,7 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
             let environmental_refuted_shape = assessment
                 .and_then(|(_, shape)| shape)
                 .map(validate_runtime::RefutedShape::as_str);
-            serde_json::json!({
+            let mut attempt = serde_json::json!({
                 "attempt": a.attempt,
                 // `null` is UNKNOWN and stays UNKNOWN: no completion payload
                 // arrived, which is not the same as a failure and must never be
@@ -13286,7 +13343,14 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
                 "environmental_detail_observed": a.detail_observed,
                 "environmental_verdict": environmental_verdict,
                 "environmental_refuted_shape": environmental_refuted_shape,
-            })
+            });
+            if let Some(failure_class) = a.failure_class {
+                attempt["failure_class"] = serde_json::json!(failure_class);
+            }
+            if let Some(failure_detail) = &a.failure_detail {
+                attempt["failure_detail"] = serde_json::json!(failure_detail);
+            }
+            attempt
         })
         .collect();
 
@@ -13305,6 +13369,20 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
         gate["reason"] = serde_json::json!(attempt.reason);
         gate["aborted"] = serde_json::json!(attempt.aborted);
         gate["real_seconds"] = serde_json::json!(attempt.reported.then_some(attempt.duration_s));
+        if let Some(failure_class) = attempt.failure_class {
+            gate["failure_class"] = serde_json::json!(failure_class);
+        } else {
+            gate.as_object_mut()
+                .expect("ledger gate must remain a JSON object")
+                .remove("failure_class");
+        }
+        if let Some(failure_detail) = &attempt.failure_detail {
+            gate["failure_detail"] = serde_json::json!(failure_detail);
+        } else {
+            gate.as_object_mut()
+                .expect("ledger gate must remain a JSON object")
+                .remove("failure_detail");
+        }
         set_gate_failure_evidence(&mut gate, attempt_is_failure(attempt));
     }
     gate["attempts"] = serde_json::json!(node_attempts);
@@ -13331,9 +13409,10 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
     let row = ledger_gate(&failed);
     if row["failure_origin"] != "outer_gate"
         || row["failed_substeps"] != serde_json::json!([])
+        || row["failure_class"] != "product_failure"
     {
         return Err(
-            "ledger gate origin: failed outer gate did not carry a known-empty substep list"
+            "ledger gate origin: failed outer gate did not carry its typed product class and known-empty substep list"
                 .into(),
         );
     }
@@ -13342,13 +13421,17 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
     passed.returncode = Some(0);
     passed.reason.clear();
     let row = ledger_gate(&passed);
-    if !row["failure_origin"].is_null() || row.get("failed_substeps").is_some() {
+    if !row["failure_origin"].is_null()
+        || row.get("failed_substeps").is_some()
+        || row.get("failure_class").is_some()
+    {
         return Err("ledger gate origin: passing gate claimed failure evidence".into());
     }
     let mut no_result = failed.clone();
     no_result.returncode = Some(NO_RESULT_EXIT_CODE);
     let row = ledger_gate(&no_result);
     if row["result"] != "no_result"
+        || row["failure_class"] != "no_result"
         || !row["failure_origin"].is_null()
         || row.get("failed_substeps").is_some()
     {
@@ -13471,8 +13554,43 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         "completed",
         true,
     )?;
+
+    for (label, detail, want_class, want_detail) in [
+        (
+            "infrastructure",
+            "error: failed to verify the checksum for `fixture v1.0.0`",
+            FailureClass::UnderstoodInfrastructureFailure,
+            "failed to verify the checksum",
+        ),
+        (
+            "prerequisite",
+            "prepare failed for language-runtimes/lua-random.sh\nno Lua interpreter on PATH",
+            FailureClass::UnderstoodPrerequisiteFailure,
+            " on path",
+        ),
+    ] {
+        let mut classified = reported_attempt(&failed, 1);
+        let environmental = validate_runtime::environmental_block_class(detail);
+        let failure = validate_runtime::failure_class_from_detail(detail);
+        stamp_attempt_detail(
+            std::slice::from_mut(&mut classified),
+            &failed.tag,
+            environmental,
+            failure,
+        );
+        let row = ledger_gate_with_attempts(&failed, std::slice::from_ref(&classified));
+        if row["failure_class"] != want_class.as_str()
+            || row["failure_detail"] != want_detail
+            || row["attempts"][0]["failure_class"] != want_class.as_str()
+            || row["attempts"][0]["failure_detail"] != want_detail
+        {
+            return Err(format!(
+                "ledger gate failure class: {label} was not written as a closed class plus detail: {row}"
+            ));
+        }
+    }
     println!(
-        "  ledger gate origin: fallback and latest-attempt failure evidence stayed typed"
+        "  ledger gate origin: fallback, terminal attempts, and failure classes stayed typed"
     );
     Ok(())
 }
@@ -13693,6 +13811,8 @@ fn no_result_propagation_bracket() -> Result<(), String> {
     let no_result_gate = ledger_gate_with_attempts(&no_result, std::slice::from_ref(&no_result_attempt));
     if no_result_gate["result"] != "no_result"
         || no_result_gate["attempts"][0]["result"] != "no_result"
+        || no_result_gate["failure_class"] != "no_result"
+        || no_result_gate["attempts"][0]["failure_class"] != "no_result"
         || !no_result_gate["failure_origin"].is_null()
         || no_result_gate.get("failed_substeps").is_some()
     {
