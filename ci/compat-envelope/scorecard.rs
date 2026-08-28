@@ -3251,6 +3251,20 @@ fn validate_row_result(row: &ResultRow) -> Result<ObservedResult, String> {
     }
 }
 
+fn infrastructure_error_reason(row: &ResultRow) -> Option<String> {
+    row.attempts.iter().rev().find_map(|attempt| {
+        let report = attempt.get("verification_report")?.as_str()?;
+        let report = canonical_verdict::VerificationReport::from_json_slice(report.as_bytes())
+            .ok()?;
+        match report.infrastructure_error {
+            Some(canonical_verdict::InfrastructureError::SkidOvershoot { count }) => Some(
+                format!("verification recorded {count} HERMIT_SKID_OVERSHOOT report(s)"),
+            ),
+            None => None,
+        }
+    })
+}
+
 /// What a validate fold recorded, SPLIT BY WHETHER THE ROW LOCATED ANYTHING.
 ///
 /// Two counts rather than one because the caller's summary line is the only
@@ -3387,7 +3401,7 @@ fn apply_validate_results(
                     "{} (outcome={}, reason={})",
                     display_id(id),
                     row.outcome,
-                    row.reason.as_deref().unwrap_or("not recorded")
+                    infrastructure_error_reason(row).as_deref().unwrap_or("not recorded")
                 ));
                 continue;
             }
@@ -7669,7 +7683,21 @@ red/`measured-and-passed` count is **0**.",
     row.first_divergent_virtual_nanoseconds = Some(70);
     row.first_divergent_record = Some(12);
     row.first_divergent_syscall = Some(9);
-    row.reason = Some("verification recorded 1 HERMIT_SKID_OVERSHOOT report(s)".into());
+    let mut report: JsonValue =
+        serde_json::from_str(row.attempts[0]["verification_report"].as_str().unwrap()).unwrap();
+    report["verified"] = JsonValue::Bool(false);
+    report["bitwise_parity"] = JsonValue::Bool(false);
+    report["verdict"] = JsonValue::String("infrastructure_error".into());
+    report["infrastructure_error"] =
+        serde_json::json!({"kind": "skid_overshoot", "count": 1});
+    report["first_divergent_scheduler_turn"] = serde_json::json!(7);
+    report["first_divergent_virtual_nanoseconds"] = serde_json::json!(70);
+    report["first_divergent_record"] = serde_json::json!(12);
+    report["first_divergent_syscall"] = serde_json::json!(9);
+    let report = serde_json::to_string(&report).unwrap();
+    row.attempts[0]["verification_report_sha256"] =
+        JsonValue::String(format!("{:x}", Sha256::digest(report.as_bytes())));
+    row.attempts[0]["verification_report"] = JsonValue::String(report);
     let mut retained_comparison_error = TrackedCells {
         schema: SCHEMA,
         projection: None,
