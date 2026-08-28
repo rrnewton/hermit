@@ -86,7 +86,10 @@ fi
 # the tree and require a refusal, so this file is demonstrably able to fail.
 # A SYMLINK FARM, not a partial copy. `ci/` is a real copy so the wrapper can be
 # mutated; every other entry is a symlink to the real tree so the pin checker
-# still finds the Cargo metadata and reports the genuine revision.
+# still finds the Cargo metadata and reports the genuine revision. `.git` is the
+# exception: a linked checkout records a RELATIVE gitdir in that file, and a
+# symlink would make Git resolve it relative to this temporary tree. Write the
+# same gitdir as an absolute pointer so the copied worktree remains readable.
 #
 # ⚠️ Copying only ci/ makes this control pass for the WRONG REASON: the pin
 # checker finds no Cargo metadata, the wrapper refuses with "did not yield a
@@ -100,6 +103,11 @@ for entry in "$ROOT_DIR"/*; do
     name=$(basename "$entry")
     # dotglob already covers .git; ci/ is replaced by a real copy below.
     [[ $name == ci ]] && continue
+    if [[ $name == .git ]]; then
+        git_dir=$(git rev-parse --absolute-git-dir)
+        printf 'gitdir: %s\n' "$git_dir" >"$copy/.git"
+        continue
+    fi
     ln -s "$entry" "$copy/$name"
 done
 shopt -u dotglob
