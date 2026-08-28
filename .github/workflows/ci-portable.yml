@@ -219,10 +219,11 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      # run-node.sh now executes nodes THROUGH dagrun (not a jq+bash
-      # shim), so the tracked runner submodule must be present in this job too.
-      - name: Initialize dagrun submodule
-        run: git submodule update --init agent-utils
+      # The constructed preflight starts with pre.submodules, which verifies
+      # every recorded submodule without repairing it. Materialize that exact
+      # recorded set before asking the gate to inspect it.
+      - name: Initialize submodules
+        run: git submodule update --init --recursive
       # check.script_sigpipe COMPILES all fifteen tracked rust-scripts, and the
       # workflow-wide RUSTFLAGS link them with `-llzma` (Hermit's own build needs
       # it). Preflight is otherwise a lint job with no apt step, so the library
