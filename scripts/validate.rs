@@ -8491,6 +8491,31 @@ fn attempt_is_failure(attempt: &NodeAttempt) -> bool {
     attempt_result(attempt) == Some("fail")
 }
 
+fn terminal_attempt<'a>(outcome: &StepOutcome, attempts: &'a [NodeAttempt]) -> Option<&'a NodeAttempt> {
+    attempts.iter().rev().find(|attempt| attempt.tag == outcome.tag)
+}
+
+/// Nodes with at least one attempt that produced a child exit status.
+///
+/// `outcomes.len()` is the number of scheduler records, not the number of
+/// executions: spawn failures, supervisor failures, and aborted peers all
+/// deliberately produce records with `execution = unknown` so they cannot
+/// disappear. Keeping the populations separate prevents retained evidence from
+/// turning an unknown execution into a measured node.
+fn completed_node_count(outcomes: &[StepOutcome], attempts: &[NodeAttempt]) -> usize {
+    outcomes
+        .iter()
+        .filter(|outcome| {
+            let mut node_attempts = attempts.iter().filter(|attempt| attempt.tag == outcome.tag);
+            let Some(first) = node_attempts.next() else {
+                return outcome_execution(outcome) == AttemptExecution::Completed;
+            };
+            first.execution == AttemptExecution::Completed
+                || node_attempts.any(|attempt| attempt.execution == AttemptExecution::Completed)
+        })
+        .count()
+}
+
 /// This node's next attempt ordinal: one more than however many attempts of it
 /// are already recorded.
 ///
@@ -9511,6 +9536,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     if !complete.complete
         || !complete.ok
         || complete.retry_rounds != 0
+        || completed_node_count(&complete.outcomes, &complete.attempts) != 1
         || complete.outcomes.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>()
             != vec!["fixture.pass"]
     {
@@ -10757,13 +10783,25 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     if !spawn_gate["result"].is_null()
         || spawn_gate["reported"] != true
         || spawn_gate["execution"] != "unknown"
+        || completed_node_count(&spawn_unknown.outcomes, &spawn_unknown.attempts) != 1
         || !spawn_gate["failure_origin"].is_null()
         || spawn_gate.get("failed_substeps").is_some()
     {
         return Err(format!(
             "scheduler accounting: reported-but-unexecuted spawn failure acquired false failure \
-             evidence: {spawn_gate}"
+            evidence: {spawn_gate}"
         ));
+    }
+    let only_unknown_attempt = reported_attempt(spawn_outcome, 1);
+    if completed_node_count(
+        std::slice::from_ref(spawn_outcome),
+        std::slice::from_ref(&only_unknown_attempt),
+    ) != 0
+    {
+        return Err(
+            "scheduler accounting: a spawn failure with execution=unknown was counted as an executed node"
+                .into(),
+        );
     }
 
     // ROUND-LOCAL MISSING OUTCOME. In round 1 the prerequisite and environmental
@@ -13133,7 +13171,7 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
     let node_attempts_raw: Vec<&NodeAttempt> =
         attempts.iter().filter(|attempt| attempt.tag == outcome.tag).collect();
     let first = node_attempts_raw.first().copied();
-    let latest = node_attempts_raw.last().copied();
+    let latest = terminal_attempt(outcome, attempts);
     let node_attempts: Vec<serde_json::Value> = node_attempts_raw
         .iter()
         .map(|a| {
@@ -13663,7 +13701,14 @@ fn write_ledger(
 ) {
     let (coverage_schema, coverage) = ledger_schema_and_coverage(coverage);
     let ledger_schema = ledger_schema_version(coverage_schema, cell_results);
-    let gates_run = outcomes.len();
+    // `gate_records` counts typed scheduler outcomes, including an explicit
+    // UNKNOWN record for a spawn/supervisor failure. `executed_nodes` counts
+    // only terminal attempts with a collected child exit status. The two must
+    // not share one integer: retaining an unknown row is required, but calling
+    // it executed would turn missing evidence into a measurement.
+    let gate_records = outcomes.len();
+    let executed_nodes = u64::try_from(completed_node_count(outcomes, attempts))
+        .expect("executed node count fits u64");
     let failures = outcomes.iter().filter(|o| outcome_is_failure(o)).count();
     let no_results = outcomes.iter().filter(|o| outcome_is_no_result(o)).count();
     // An operator stop learned nothing new about the product. Preserve the raw
@@ -13683,7 +13728,7 @@ fn write_ledger(
     // (`executed + intentionally skipped == expected`) then has to balance.
     // With nothing withheld this is byte-identical to what it has always been.
     let gates_expected = if ctx.profile == "full" && suite_complete {
-        serde_json::json!(gates_run + host_inapplicable.len())
+        serde_json::json!(gate_records + host_inapplicable.len())
     } else {
         serde_json::Value::Null
     };
@@ -13782,7 +13827,7 @@ fn write_ledger(
         "result": result,
         "raw_result": raw_result,
         "exit_code": exit_code,
-        "checks": gates_run,
+        "checks": gate_records,
         "failures": failures,
         "dag_jobs": ctx.dag_jobs,
         // Peak CPU-ACTIVE peer validates, and HOW that was established. `null`
@@ -13820,7 +13865,7 @@ fn write_ledger(
         // a row without them is a NON-VERDICT, not a green.
         "executed_tests": ctx.executed_tests,
         "filtered_tests": ctx.filtered_tests,
-        "gates_run": gates_run,
+        "gates_run": gate_records,
         "gates_expected": gates_expected,
         "skipped_nodes": skipped.len() + intentional_skipped_nodes.len(),
         // Typed pre-spawn omissions: nodes this MACHINE provably cannot run.
@@ -13848,7 +13893,7 @@ fn write_ledger(
         // and a ~47-NODE DAG run must never be readable as a 47-TEST pass. The
         // counted receipt consumes the explicit test fields above rather than
         // treating this node count as test evidence.
-        "executed_nodes": gates_run,
+        "executed_nodes": executed_nodes,
         // Exact outer plan identity. `profile=full` does not imply the nodes in
         // quick or super, so the receipt carries the names it actually planned
         // instead of asking readers to infer a set from the profile label.
@@ -13872,6 +13917,12 @@ fn write_ledger(
     if typed.retry_rounds() != Ok(Some(ctx.retry_rounds)) {
         eprintln!(
             "validate: warning: generated ledger row has malformed HistoryRow retry_rounds"
+        );
+        return;
+    }
+    if typed.executed_nodes() != Ok(Some(executed_nodes)) {
+        eprintln!(
+            "validate: warning: generated ledger row has malformed HistoryRow executed_nodes"
         );
         return;
     }
@@ -16522,7 +16573,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             &plan.profile,
             detail,
         );
-        s.nodes_executed = outcomes.len();
+        s.nodes_executed = completed_node_count(&outcomes, &attempts);
         s.nodes_failed = outcomes.iter().filter(|o| outcome_is_failure(o)).count();
         s.nodes_skipped = skipped.len();
         s.nodes_host_inapplicable = plan.host_inapplicable.len();
@@ -17072,7 +17123,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         &plan.profile,
         detail,
     );
-    s.nodes_executed = outcomes.len();
+    s.nodes_executed = completed_node_count(&outcomes, &attempts);
     s.nodes_failed = failures;
     s.flaky = test_summary.recovered;
     s.failed_ids = test_summary.failed;
@@ -17252,7 +17303,7 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
         profile,
         detail,
     );
-    s.nodes_executed = outcomes.len();
+    s.nodes_executed = completed_node_count(&outcomes, &[]);
     s.nodes_failed = outcomes.iter().filter(|o| !o.ok).count();
     s.wall_s = Some(wall);
     s.cpu_wall = Some((wall, cpu_user, cpu_sys));
