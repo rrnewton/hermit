@@ -7,12 +7,13 @@ with explicit dependencies and resource limits, so the scheduler can run
 independent gates concurrently. On hosts with delegated cgroup v2 support, it
 can also box each node for memory limits and full process-subtree teardown.
 
-- [`portable.json`](portable.json) — drives `scripts/validate.rs`'s **`--portable-only`**
-  lane and the GitHub-managed portable `regular` job in
+- [`portable.json`](portable.json) — contributes committed data to the plan
+  constructed for `scripts/validate.rs`'s **`--portable-only`** lane and the
+  manually dispatched GitHub-managed portable `regular` diagnostic in
   [`.github/workflows/ci-portable.yml`](../../.github/workflows/ci-portable.yml).
   No PMU / CPUID interception required.
-- [`privileged.json`](privileged.json) — implements the focused capability
-  contract for the privileged job in
+- [`privileged.json`](privileged.json) — contributes the focused capability
+  contract selected by the manually dispatched privileged diagnostic in
   [`.github/workflows/ci-privileged.yml`](../../.github/workflows/ci-privileged.yml).
   Requires PMU + `/dev/kvm`.
 
@@ -24,27 +25,26 @@ ci/run-dag.sh privileged -j 2                    # PMU lane, one gate at a time
 ci/run-dag.sh portable   ascii                   # visualize instead of run
 ```
 
-## Status: active validation lanes
+## Status: active local lanes and manual hosted diagnostics
 
-`portable.json` drives the required `Regular tests (GitHub-managed portable)` job, and
-`privileged.json` drives both privileged PMU entrypoints. Existing job names and
-the merge-gate contract stay unchanged; only the internal scheduler changes (the
-former outer PMU `flock` was retired — see below). The DAG files are the
-load-bearing source of truth
-for individual gate commands; `scripts/validate.rs` delegates to them.
+`scripts/validate.rs` constructs the plan from the committed validation data.
+The hosted workflows pass selected step tags back to that plan builder; they do
+not read a lane file as an executable plan or restate a step command. The
+constructed plan is therefore the source of truth for individual gate commands,
+dependencies, and resource declarations even when the hosted workflow groups
+those steps across separate jobs.
 
 The privileged DAG is limited to the focused build, CPUID faulting, PMU skid,
-manifest validation, and KVM E2E cells so the required self-hosted smoke stays
+manifest validation, and KVM E2E cells so the manual self-hosted smoke stays
 within its 270-second workflow bound. Each sequential build/KVM segment is
 capped at 120 seconds, yielding a 240-second maximum DAG timeout path; the
 manifest audit recomputes and enforces that bound. The 139-program
 record/replay ratchet is preserved as a separate step in the long merge-group
 validation job.
 
-Closed pull requests trigger a skipped workflow in the same concurrency group,
-which cancels their queued or in-progress PMU run. The `mem_race` family and
-three nonblocking post-DAG diagnostics run in the scheduled `super` tier so a
-known host-sensitive hang cannot consume the required serialized lane.
+The `mem_race` family and three nonblocking post-DAG diagnostics run in the
+scheduled `super` tier so a known host-sensitive hang cannot consume the
+serialized capability lane.
 
 The `Validation Levels` workflow no longer launches a second copy of
 `--portable-only` for every pull request. Its quick lane remains available by
@@ -71,12 +71,42 @@ A successful PR run on 2026-07-26 provided the baseline:
 - `Validation Levels` independently repeated the same 14-minute portable suite,
   consuming another GitHub-managed portable runner.
 
-The diagnostics now run in the scheduled `super` tier. The required lane uses a 14 GiB memory budget, which the current model
+The diagnostics now run in the scheduled `super` tier. The portable plan uses a 14 GiB memory budget, which the current model
 maps to `-j 2` on the 16 GiB portable runner. Compile, lint, documentation, unit,
 and contract nodes may overlap when dependencies allow, while Hermit guest
 executions retain the
 `hermit_guest: 1` exclusion. Per-node performance reports are uploaded from
-every required run so estimates can be replaced with measurements.
+every run so estimates can be replaced with measurements.
+
+### Relationship to local validation
+
+For every step assigned by `ci/portable-shards.json`, the step command,
+dependencies inside its selected group, timeouts, CPU timeouts, and declared
+resource limits are the same values returned by the constructed local plan.
+`ci/check-shard-coverage.sh` refuses a hosted grouping unless every constructed
+portable step is assigned exactly once and the preflight group contains the
+constructed dependencies it needs.
+
+The current relationships are:
+
+- **Same:** Clippy and rustdoc refuse warnings through the constructed step
+  commands, and the hosted environment also exports `-D warnings`. Every
+  constructed nextest step uses `ci/run-nextest-counted.sh`, so zero executed
+  tests are refused in both places.
+- **Deliberately different:** local full validation runs independent steps with
+  a host-derived outer width capped at 16. Each hosted group uses outer width 1,
+  while separate GitHub jobs supply the outer parallelism. Hosted execution
+  therefore does not reproduce contention between local DAG nodes.
+- **Deliberately different:** local validation fails closed unless it establishes
+  its two-level cgroup-v2 boxing. GitHub-hosted runners do not provide the needed
+  delegated systemd user scope, so selected diagnostic runs explicitly permit an
+  unboxed execution. The constructed limits remain declared and audited but are
+  not enforced there.
+- **Deliberately different:** hosted selected runs are off the record. They do
+  not write a local validation receipt, ledger row, scorecard, or pull-request
+  label.
+- **Unknown:** none after the current command and assignment audit. A future
+  difference remains a defect until it is either removed or explained here.
 
 ## How gates map onto the DAG
 
