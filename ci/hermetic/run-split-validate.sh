@@ -133,8 +133,16 @@ FETCH_MANIFESTS=(
     exit 2
 }
 
-# The SAME jq expressions ci-portable.yml uses, so the two cannot disagree.
-build_nodes=$(jq -r '(.preflight_nodes + .build_debug_nodes + .build_dbt_nodes + .build_aux_nodes)|join(",")' "$MAP")
+# Read the same assignment fields ci-portable.yml uses. This whole-split path
+# groups the hosted preflight and check jobs with the build jobs before running
+# the remaining test, E2E, and final steps.
+build_nodes=$(jq -r '(
+    .preflight_nodes
+  + .check_nodes
+  + .build_debug_nodes
+  + .build_dbt_nodes
+  + .build_aux_nodes
+)|join(",")' "$MAP")
 
 if [[ -n "$shards" ]]; then
     shard_nodes=$(jq -r --arg sel "$shards" \
