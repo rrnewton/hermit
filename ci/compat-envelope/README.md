@@ -54,8 +54,12 @@ The path is deliberately direct:
 4. The final `scorecard.compatibility` node requires a clean, exact-HEAD PASS
    row for every selected cell and prints the table.
 5. The checked-in table and cell identities must still equal what the manifest
-   and expected plan derive. Normal validation changes no tracked scorecard
-   file.
+   and expected plan derive. After the ledger and receipt work is complete, a
+   direct top-level local validate merges its per-cell rows and rewrites
+   `SCORECARD.md` and `ci/compat-envelope/cells.json`. A ci-hub validate performs
+   that write in its isolated checkout after the receipt, then applies the same
+   results to the checkout that invoked it. The agent reviews the generated diff
+   and decides whether to commit it; validation never commits it automatically.
 6. A top-level full run retains `ignored/validate/artifacts/<run-id>/coverage.json`.
    It names the exact plan and outer nodes, every selected E2E cell, every
    enabled-but-unselected E2E cell with its recorded reason and observed
@@ -102,8 +106,9 @@ git diff -- SCORECARD.md ci/compat-envelope/cells.json
 ```
 
 Review the table delta and the exact cell identity. The update command does not
-run a test and cannot change measurement by itself. Import a canonical result
-after the run; selection alone is not evidence.
+run a test and cannot change measurement by itself. The following validate
+automatically records any canonical per-cell results after its ledger and
+receipt work; selection alone is not evidence.
 
 ## Red cells and the periodic full-matrix run
 
@@ -148,8 +153,10 @@ six COMMIT records, every divergence between two of them reports the same turn.
 
 ### Writing observations
 
-Three commands write these arrays, all explicit and opt-in. **Ordinary validation
-still changes no tracked scorecard file.**
+These scorecard commands write the arrays. `update-observations`,
+`import-results`, and `project-observations` remain explicit. `observe-results`
+is also available directly, and validation invokes it automatically for each
+completed direct top-level run.
 
 Run these commands from the Hermit repository root. In the standard
 `dev-hermit/hermit` checkout, the parent series directory is `../series`.
@@ -167,6 +174,20 @@ Because `--series-root` is resolved from the current directory, a checkout under
 
 `observe-results` walks every `results.jsonl` under `DIR`, so several runs fold
 in one invocation — which is how a validate-side range widens beyond a point.
+Local validation runs it only after ledger and receipt publication, so the
+generated-file write cannot change the tree named by an in-flight receipt.
+Nested validates do not write separately. ci-hub also applies the completed
+results from its isolated checkout to the checkout that invoked it.
+`observe-results` serializes writes for each checkout and merges onto existing
+unstaged changes to these two generated files. It refuses staged changes and
+unstaged changes to any other tracked file.
+No-result directories are an explicit unchanged success. A refused write is
+reported separately from the validation verdict and makes the local command
+nonzero; neither path commits the generated files.
+
+An off-the-record local validate still adds any clean exact-HEAD per-cell
+observations. Those observations cannot qualify a receipt, and the scorecard
+writer cannot change which cells are selected or move their green/red state.
 `import-results` walks retained history without executing a guest, keeps only
 clean schema-4 `BitwiseInfoV1` terminal comparisons from commits on `HEAD`'s
 history, and selects the newest such commit independently for every enabled

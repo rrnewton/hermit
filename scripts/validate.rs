@@ -1343,6 +1343,22 @@ fn self_test() -> Result<(), String> {
             ));
         }
     }
+    let mut writeback_failed = RunSummary::new(Verdict::Pass, 0, "self-test", Vec::new());
+    record_scorecard_writeback(&mut writeback_failed, Some(Err("fixture refusal".into())));
+    let lines = run_summary_lines(&writeback_failed, std::time::Instant::now());
+    if (writeback_failed.verdict, writeback_failed.exit_code)
+        != (Verdict::Pass, COULD_NOT_RUN_EXIT_CODE)
+        || lines.last().map(String::as_str) != Some("FINAL_VALIDATE_STATUS: COULD_NOT_RUN")
+        || !lines.iter().any(|line| line.contains("validation verdict above is unchanged"))
+    {
+        return Err(format!(
+            "summary: a required scorecard write-back failure did not preserve the validation \
+             verdict, fail the command distinctly, and remain before the final status: \
+             verdict={:?} command_exit={} lines={lines:?}",
+            writeback_failed.verdict,
+            writeback_failed.exit_code,
+        ));
+    }
     let exe = std::env::current_exe()
         .map_err(|error| format!("summary: cannot resolve self-test executable: {error}"))?;
     let output = Command::new(exe)
@@ -3982,6 +3998,56 @@ fn append_validate_series(
         String::from_utf8_lossy(&output.stdout).trim()
     );
     Ok(true)
+}
+
+/// Merge one top-level validate's completed per-cell rows into the tracked
+/// scorecard files. Nested validates leave this to their outer run.
+fn local_scorecard_writeback(
+    root: &Path,
+    result_root: &Path,
+    nested: bool,
+) -> Option<Result<(), String>> {
+    if nested {
+        return None;
+    }
+    let script = root.join("ci/compat-envelope/scorecard.rs");
+    if !script.is_file() {
+        return Some(Err(format!("{} does not exist", script.display())));
+    }
+    Some(
+        Command::new(&script)
+            .arg("observe-results")
+            .arg("--results")
+            .arg(result_root)
+            .current_dir(root)
+            .status()
+            .map_err(|error| format!("cannot run {}: {error}", script.display()))
+            .and_then(|status| {
+                status.success().then_some(()).ok_or_else(|| {
+                    format!("{} observe-results refused with {status}", script.display())
+                })
+            }),
+    )
+}
+
+fn record_scorecard_writeback(
+    summary: &mut RunSummary,
+    writeback: Option<Result<(), String>>,
+) {
+    let Some(writeback) = writeback else { return };
+    let detail = match writeback {
+        Ok(()) =>
+            "scorecard write-back completed; review the generated SCORECARD.md and ci/compat-envelope/cells.json changes before committing".into(),
+        Err(error) => {
+            if summary.exit_code == 0 {
+                summary.exit_code = COULD_NOT_RUN_EXIT_CODE;
+            }
+            format!(
+                "scorecard write-back FAILED after validation evidence was finalized: {error}; the validation verdict above is unchanged"
+            )
+        }
+    };
+    summary.detail.push(detail);
 }
 
 /// Establish the self-tee. FAIL-CLOSED: any failure exits loudly rather than
@@ -14276,16 +14342,31 @@ fn run_summary_lines(s: &RunSummary, started: std::time::Instant) -> Vec<String>
     if s.verdict == Verdict::Help {
         return Vec::new();
     }
+    let validation_exit_code = FinalValidateStatus::for_verdict(s.verdict)
+        .map(FinalValidateStatus::exit_code)
+        .unwrap_or(s.exit_code);
     let mut lines = vec![
         String::new(),
-        format!(
-            "{} validate {} (exit {}) — profile {} @ {}",
-            s.verdict.marker(),
-            s.verdict.word(),
-            s.exit_code,
-            s.profile,
-            s.commit
-        ),
+        if validation_exit_code == s.exit_code {
+            format!(
+                "{} validate {} (exit {}) — profile {} @ {}",
+                s.verdict.marker(),
+                s.verdict.word(),
+                validation_exit_code,
+                s.profile,
+                s.commit
+            )
+        } else {
+            format!(
+                "{} validate {} (validation exit {}; command exit {}) — profile {} @ {}",
+                s.verdict.marker(),
+                s.verdict.word(),
+                validation_exit_code,
+                s.exit_code,
+                s.profile,
+                s.commit
+            )
+        },
     ];
     for line in &s.detail {
         lines.push(format!("   {line}"));
@@ -14395,7 +14476,10 @@ fn run_summary_lines(s: &RunSummary, started: std::time::Instant) -> Vec<String>
         validate_runtime::cpu_wall_line(human_duration, wall, user, sys, host_cpus)
     ));
     lines.extend(s.epilogue.iter().cloned());
-    if let Some(status) = FinalValidateStatus::for_verdict(s.verdict) {
+    if let Some(mut status) = FinalValidateStatus::for_verdict(s.verdict) {
+        if status.exit_code() != s.exit_code {
+            status = FinalValidateStatus::CouldNotRun;
+        }
         // LAST by contract. A wrapper, guest, fixture or quoted diagnostic may
         // have written an earlier lookalike to the same channel; readers use the
         // last occurrence and require its value to agree with the exit code.
@@ -15965,6 +16049,11 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                 None,
             );
         }
+        // This is below the interrupted run's ledger write. Keep the checkout
+        // lock held while the generated files are replaced, so a second local
+        // validate cannot begin against the tree between those two operations.
+        let scorecard_writeback =
+            local_scorecard_writeback(&root, &e2e_result_root, nesting.nested);
         drop(run_record);
         let _ = std::fs::remove_dir_all(&tmp);
         let mut detail = vec![
@@ -15995,6 +16084,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         if !nesting.nested && !args.allow_local_off_the_record_run {
             s.ledger = Some(ledger);
         }
+        record_scorecard_writeback(&mut s, scorecard_writeback);
         return s;
     }
 
@@ -16356,6 +16446,15 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         }
     }
 
+    // This must remain below the ledger append and receipt publication. Writing
+    // the generated scorecard sooner changes the working tree while the run is
+    // still establishing whether its receipt is commit-anchored. The checkout
+    // lock remains held here, so another direct validate cannot start between
+    // receipt finalization and this write-back. ci-hub additionally writes the
+    // completed results back to the checkout that invoked the isolated run.
+    let scorecard_writeback =
+        local_scorecard_writeback(&root, &e2e_result_root, nesting.nested);
+
     // Read the individual results before removing the disposable build root: a
     // caller may deliberately place E2E_RESULT_ROOT there. The scheduler is
     // finished, and `read_log_since_settled` flushes the live tee before reading.
@@ -16529,6 +16628,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     if !nesting.nested && !args.allow_local_off_the_record_run {
         s.ledger = Some(ledger);
     }
+    record_scorecard_writeback(&mut s, scorecard_writeback);
     s
 }
 

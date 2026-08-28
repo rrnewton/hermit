@@ -5,10 +5,12 @@
 //!
 //! ```cargo
 //! [dependencies]
+//! fs2 = "0.4"
 //! hermit-manifest-plan = { path = "../manifest-plan" }
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
 //! sha2 = "0.10"
+//! tempfile = "3"
 //! ```
 
 #[path = "../../scripts/lib/rust_script_prelude.rs"]
@@ -18,16 +20,23 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitCode;
+use std::time::Duration;
+use std::time::Instant;
 
+use fs2::FileExt;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use sha2::Digest;
 use sha2::Sha256;
+use tempfile::NamedTempFile;
 use hermit_manifest_plan::canonical_verdict;
 use hermit_manifest_plan::stress_series::{
     HostCapability, HostCapabilityVerdict, SeriesCoordinates, SeriesOutcome, SeriesPayload,
@@ -57,8 +66,9 @@ Commands:
   observe-results --results DIR
       Merge the canonical comparison results from ONE validate result directory
       into the cells' checked-in observations, under the `validate` provenance
-      so they never mix with pressure-test bounds. Explicit and opt-in: ordinary
-      validation does not run this and changes no tracked file.
+      so they never mix with pressure-test bounds. Direct top-level local
+      validates run this after their ledger and receipt work; ci-hub additionally
+      runs it in the checkout that invoked validation after the isolated run.
   import-results --results DIR --current-summary FILE [--current-summary FILE ...]
       Import clean canonical comparisons retained on HEAD's history. A retained
       divergence position is imported only after current results classify it as
@@ -204,11 +214,10 @@ struct TrackedCell {
     last_tested: Option<LastTested>,
     /// Comparison evidence, keyed by `(detcore_tree, provenance)`.
     ///
-    /// ORDINARY VALIDATE STILL NEVER CHANGES THIS ARRAY. Three commands write
-    /// it, all explicit and opt-in: `update-observations` from a pressure-test
-    /// summary, `observe-results` from a validate result directory, and
-    /// `project-observations` from the parent series. None runs as part of a
-    /// normal validate, so the tracked file stays untouched by routine runs.
+    /// `update-observations`, `observe-results`, `import-results`, and
+    /// `project-observations` write it. Direct top-level local validates invoke
+    /// `observe-results` after their ledger and receipt work; ci-hub additionally
+    /// performs the same write in the checkout that invoked validation.
     ///
     /// The provenances answer different questions and are never merged --
     /// repeat commands exercise a cell at one tree and measure flakiness, while
@@ -1366,7 +1375,7 @@ fn run() -> Result<(), String> {
         }
         "check" => {
             no_more(&mut args)?;
-            let derived = check_tracked(&root)?;
+            let derived = check_tracked_with_lock(&root)?;
             println!(
                 "compatibility scorecard: tracked table and {} cells are current",
                 derived.population.len()
@@ -1534,7 +1543,7 @@ fn run() -> Result<(), String> {
         "self-test-and-check" => {
             no_more(&mut args)?;
             self_test()?;
-            let derived = check_tracked(&root)?;
+            let derived = check_tracked_with_lock(&root)?;
             println!(
                 "compatibility scorecard: tracked table and {} cells are current",
                 derived.population.len()
@@ -2387,6 +2396,119 @@ fn encoded_cells(cells: &TrackedCells) -> Result<String, String> {
     Ok(text)
 }
 
+fn wait_for_scorecard_write_lock(file: &File, path: &Path, timeout: Duration) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        match FileExt::try_lock_exclusive(file) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if started.elapsed() >= timeout {
+                    return Err(format!(
+                        "timed out after {}s waiting for scorecard write-back lock {}",
+                        timeout.as_secs(),
+                        path.display()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot acquire scorecard write-back lock {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+}
+
+fn acquire_scorecard_write_lock(root: &Path) -> Result<File, String> {
+    let output = Command::new("git")
+        .args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "scorecard-writeback.lock",
+        ])
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("cannot locate the scorecard write-back lock: {e}"))?;
+    if !output.status.success() {
+        return Err("git rev-parse failed while locating the scorecard write-back lock".into());
+    }
+    let path = PathBuf::from(
+        std::str::from_utf8(&output.stdout)
+            .map_err(|e| format!("scorecard write-back lock path is not UTF-8: {e}"))?
+            .trim(),
+    );
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&path)
+        .map_err(|e| format!("cannot open scorecard write-back lock {}: {e}", path.display()))?;
+    wait_for_scorecard_write_lock(&file, &path, Duration::from_secs(30))?;
+    Ok(file)
+}
+
+fn check_tracked_with_lock(root: &Path) -> Result<Derived, String> {
+    let _lock = acquire_scorecard_write_lock(root)?;
+    check_tracked(root)
+}
+
+fn git_diff_clean(root: &Path, args: &[&str]) -> Result<bool, String> {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .status()
+        .map_err(|e| format!("cannot inspect tracked changes: {e}"))?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err("git diff failed while checking tracked changes".into()),
+    }
+}
+
+fn observation_dirt_error(staged_clean: bool, unrelated_clean: bool) -> Option<&'static str> {
+    if !staged_clean {
+        Some("observe-results refuses staged changes")
+    } else if !unrelated_clean {
+        Some("observe-results refuses tracked changes outside the generated scorecard files")
+    } else {
+        None
+    }
+}
+
+fn check_observation_worktree(root: &Path) -> Result<(), String> {
+    let staged_clean = git_diff_clean(root, &["diff", "--cached", "--quiet", "--no-ext-diff"])?;
+    let unrelated_clean = git_diff_clean(
+        root,
+        &[
+            "diff",
+            "--quiet",
+            "--no-ext-diff",
+            "--",
+            ".",
+            ":(exclude)SCORECARD.md",
+            ":(exclude)ci/compat-envelope/cells.json",
+        ],
+    )?;
+    observation_dirt_error(staged_clean, unrelated_clean).map_or(Ok(()), |e| Err(e.into()))
+}
+
+#[derive(PartialEq)]
+struct GeneratedFiles {
+    scorecard: Vec<u8>,
+    cells: Vec<u8>,
+}
+
+fn read_generated_files(root: &Path) -> Result<GeneratedFiles, String> {
+    Ok(GeneratedFiles {
+        scorecard: fs::read(root.join(SCORECARD))
+            .map_err(|e| format!("cannot read {SCORECARD}: {e}"))?,
+        cells: fs::read(root.join(CELLS)).map_err(|e| format!("cannot read {CELLS}: {e}"))?,
+    })
+}
+
 fn check_tracked(root: &Path) -> Result<Derived, String> {
     let derived = derive(root)?;
     // ORDER MATTERS, AND IT IS THE FIX FOR A MISDIRECTING FAILURE. `tracked_from` runs FIRST
@@ -3138,10 +3260,10 @@ impl ValidateFold {
 /// Fold VALIDATE rows into the tracked observations under the `validate`
 /// provenance.
 ///
-/// This is a SEPARATE ENTRY POINT and not something ordinary validation does.
-/// `ci/compat-envelope/README.md` states that normal validation changes no
-/// tracked scorecard file, and that invariant is preserved: a run only reaches
-/// here when someone explicitly asks it to.
+/// This remains a separate entry point so callers can import a retained result
+/// directory directly. Direct top-level local validation invokes it after
+/// ledger and receipt publication; ci-hub invokes it in the checkout that
+/// requested the isolated run.
 ///
 /// WHAT THESE BOUNDS MEAN, AND WHAT THEY DO NOT. Validate runs a cell once per
 /// commit, so a validate observation at one tree is a POINT, not a
@@ -3361,19 +3483,11 @@ fn apply_validate_results(
 }
 
 fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
-    let derived = check_tracked(root)?;
-    let status = Command::new("git")
-        .args(["status", "--porcelain", "--untracked-files=no"])
-        .current_dir(root)
-        .output()
-        .map_err(|e| format!("cannot inspect working tree: {e}"))?;
-    if !status.status.success() {
-        return Err("git status failed while checking the working tree".into());
-    }
-    if !status.stdout.is_empty() {
-        return Err("observe-results requires a clean tracked working tree".into());
-    }
+    let _lock = acquire_scorecard_write_lock(root)?;
+    check_observation_worktree(root)?;
     let head = git_head(root)?;
+    let original = read_generated_files(root)?;
+    let derived = check_tracked(root)?;
     let detcore_tree = git_rev_parse(root, "HEAD:detcore")?;
     let rows = read_result_candidates(results, &head)?;
     let depth = source_depths(root)?;
@@ -3383,7 +3497,8 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
              rather than guessed. Hermit depth is recorded."
         );
     }
-    let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
+    let mut tracked: TrackedCells = serde_json::from_slice(&original.cells)
+        .map_err(|e| format!("cannot parse tracked {CELLS}: {e}"))?;
     let before = tracked.clone();
     let fold = apply_validate_results(
         &mut tracked,
@@ -3396,7 +3511,24 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
     )?;
     refresh_measurement(&mut tracked);
     enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
-    write_observation_files(root, &derived, &tracked)?;
+    let updated = generated_files(&derived, &tracked)?;
+    let changed = replace_generated_files_with(
+        root,
+        &original,
+        &updated,
+        || {
+            check_observation_worktree(root)?;
+            let current_head = git_head(root)?;
+            if current_head != head {
+                return Err(format!("HEAD moved from {head} to {current_head} during write-back"));
+            }
+            if read_generated_files(root)? != original {
+                return Err("the generated scorecard files changed during write-back".into());
+            }
+            Ok(())
+        },
+        |_| Ok(()),
+    )?;
     println!(
         "compatibility scorecard: merged {} pass, {} located divergence, and {} unlocated \
          divergence {} observation(s) at {head}",
@@ -3404,6 +3536,10 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
         fold.located,
         fold.unlocated,
         ObservationProvenance::Validate.as_str()
+    );
+    println!(
+        "compatibility scorecard: generated files {}",
+        if changed { "changed" } else { "unchanged" }
     );
     // FOUR OUTCOMES, NOT TWO. This used to print the all-green sentence
     // whenever the located count was zero, which said "expected result for an
@@ -3829,21 +3965,91 @@ fn project_observations(
 /// Keep the generated status-and-measurement section in step with an explicit
 /// observation write. Since that section is derived from `cells.json`, writing
 /// only the latter would make `check` fail immediately after a successful fold.
+fn generated_files(derived: &Derived, tracked: &TrackedCells) -> Result<GeneratedFiles, String> {
+    Ok(GeneratedFiles {
+        scorecard: format!(
+            "{}{}",
+            render_scorecard(derived),
+            render_measurement_section(tracked)
+        )
+        .into_bytes(),
+        cells: encoded_cells(tracked)?.into_bytes(),
+    })
+}
+
 fn write_observation_files(
     root: &Path,
     derived: &Derived,
     tracked: &TrackedCells,
 ) -> Result<(), String> {
-    let scorecard = format!(
-        "{}{}",
-        render_scorecard(derived),
-        render_measurement_section(tracked)
-    );
-    fs::write(root.join(SCORECARD), scorecard)
+    let generated = generated_files(derived, tracked)?;
+    fs::write(root.join(SCORECARD), generated.scorecard)
         .map_err(|e| format!("cannot write {SCORECARD}: {e}"))?;
-    fs::write(root.join(CELLS), encoded_cells(tracked)?)
+    fs::write(root.join(CELLS), generated.cells)
         .map_err(|e| format!("cannot write {CELLS}: {e}"))?;
     Ok(())
+}
+
+fn prepared_replacement(path: &Path, bytes: &[u8]) -> Result<NamedTempFile, String> {
+    let mut temporary = NamedTempFile::new_in(path.parent().ok_or("generated file has no parent")?)
+        .map_err(|e| format!("cannot prepare replacement for {}: {e}", path.display()))?;
+    temporary
+        .as_file()
+        .set_permissions(fs::metadata(path).map_err(|e| e.to_string())?.permissions())
+        .and_then(|()| temporary.write_all(bytes))
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|e| format!("cannot prepare replacement for {}: {e}", path.display()))?;
+    Ok(temporary)
+}
+
+fn replace_generated_files_with(
+    root: &Path,
+    original: &GeneratedFiles,
+    updated: &GeneratedFiles,
+    guard: impl FnOnce() -> Result<(), String>,
+    mut before_replace: impl FnMut(usize) -> Result<(), String>,
+) -> Result<bool, String> {
+    if original == updated {
+        guard()?;
+        return Ok(false);
+    }
+    let scorecard = root.join(SCORECARD);
+    let cells = root.join(CELLS);
+    let new_scorecard = prepared_replacement(&scorecard, &updated.scorecard)?;
+    let old_scorecard = prepared_replacement(&scorecard, &original.scorecard)?;
+    let new_cells = prepared_replacement(&cells, &updated.cells)?;
+    guard()?;
+    before_replace(1)?;
+    new_scorecard
+        .persist(&scorecard)
+        .map_err(|e| format!("cannot replace {SCORECARD}: {}", e.error))?;
+    let second = before_replace(2).and_then(|()| {
+        new_cells
+            .persist(&cells)
+            .map(|_| ())
+            .map_err(|e| format!("cannot replace {CELLS}: {}", e.error))
+    });
+    if let Err(error) = second {
+        return match old_scorecard.persist(&scorecard) {
+            Ok(_) => Err(format!(
+                "{error}; restored the original generated files"
+            )),
+            Err(rollback) => {
+                let rollback_error = rollback.error;
+                match rollback.file.keep() {
+                    Ok((_, path)) => Err(format!(
+                        "{error}; restoring {SCORECARD} also failed: {rollback_error}; restore it from {}",
+                        path.display()
+                    )),
+                    Err(keep) => Err(format!(
+                        "{error}; restoring {SCORECARD} also failed: {rollback_error}; preserving its rollback file also failed: {}",
+                        keep.error
+                    )),
+                }
+            }
+        };
+    }
+    Ok(true)
 }
 
 #[derive(Debug)]
@@ -6767,6 +6973,98 @@ red/`measured-and-passed` count is **0**.",
         return Err("validate observation did not record its own bounds and result".into());
     }
 
+    let first_write = encoded_cells(&observed)?;
+    apply_validate_results(
+        &mut observed,
+        &rows,
+        "sha-1",
+        "tree-1",
+        &depth_fixture,
+        true,
+        true,
+    )
+    .map_err(|e| format!("repeated validate-observation fold failed: {e}"))?;
+    if encoded_cells(&observed)? != first_write {
+        return Err(
+            "applying the same validate result twice changed the tracked observations".into(),
+        );
+    }
+
+    for (staged_clean, unrelated_clean, allowed) in
+        [(true, true, true), (false, true, false), (true, false, false)]
+    {
+        if observation_dirt_error(staged_clean, unrelated_clean).is_none() != allowed {
+            return Err("observe-results accepted forbidden tracked dirt".into());
+        }
+    }
+    let lock_root = tempfile::tempdir()
+        .map_err(|e| format!("cannot create scorecard lock fixture: {e}"))?;
+    let lock_path = lock_root.path().join("writeback.lock");
+    let held = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&lock_path)
+        .map_err(|e| format!("cannot open scorecard lock fixture: {e}"))?;
+    FileExt::lock_exclusive(&held)
+        .map_err(|e| format!("cannot hold scorecard lock fixture: {e}"))?;
+    let contender = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| format!("cannot reopen scorecard lock fixture: {e}"))?;
+    let lock_error = wait_for_scorecard_write_lock(&contender, &lock_path, Duration::ZERO)
+        .expect_err("a held scorecard lock must refuse at its bounded deadline");
+    if !lock_error.contains("timed out after 0s") {
+        return Err(format!("scorecard lock refusal lost its deadline: {lock_error}"));
+    }
+    drop(held);
+    wait_for_scorecard_write_lock(&contender, &lock_path, Duration::ZERO)?;
+
+    let pair_root = tempfile::tempdir()
+        .map_err(|e| format!("cannot create generated-file fixture: {e}"))?;
+    fs::create_dir_all(pair_root.path().join("ci/compat-envelope"))
+        .map_err(|e| format!("cannot create generated-file fixture: {e}"))?;
+    fs::write(pair_root.path().join(SCORECARD), b"old scorecard\n")
+        .and_then(|()| fs::write(pair_root.path().join(CELLS), b"old cells\n"))
+        .map_err(|e| format!("cannot write generated-file fixture: {e}"))?;
+    let original = read_generated_files(pair_root.path())?;
+    let updated = GeneratedFiles {
+        scorecard: b"new scorecard\n".to_vec(),
+        cells: b"new cells\n".to_vec(),
+    };
+    let rename_count = std::cell::Cell::new(0);
+    let error = replace_generated_files_with(
+        pair_root.path(),
+        &original,
+        &updated,
+        || Ok(()),
+        |replacement| {
+            rename_count.set(replacement);
+            if replacement == 2 {
+                Err("planted second replacement failure".into())
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .expect_err("the planted second replacement failure must refuse the write");
+    if !error.contains("restored the original generated files")
+        || read_generated_files(pair_root.path())? != original
+    {
+        return Err(format!(
+            "a second generated-file replacement failure did not preserve the original pair: {error}"
+        ));
+    }
+    if replace_generated_files_with(
+        pair_root.path(),
+        &original,
+        &original,
+        || Ok(()),
+        |_| Err("an unchanged pair must not be replaced".into()),
+    )? {
+        return Err("an unchanged generated-file pair was replaced".into());
+    }
     // ⚠️ READ THE COORDINATES BACK OUT OF STORAGE, NOT OUT OF THE STRUCT THAT
     // JUST WROTE THEM. Every assertion above this point inspects the in-memory
     // fold, and an in-memory assertion cannot see the write at all: a
