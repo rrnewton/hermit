@@ -2444,6 +2444,7 @@ fn acquire_scorecard_write_lock(root: &Path) -> Result<File, String> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&path)
         .map_err(|e| format!("cannot open scorecard write-back lock {}: {e}", path.display()))?;
     wait_for_scorecard_write_lock(&file, &path, Duration::from_secs(30))?;
@@ -7004,6 +7005,7 @@ red/`measured-and-passed` count is **0**.",
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&lock_path)
         .map_err(|e| format!("cannot open scorecard lock fixture: {e}"))?;
     FileExt::lock_exclusive(&held)
