@@ -17,7 +17,9 @@
     "pre.submodules",
     "pre.reverie_pin",
     "setup.manifest_plan",
-    "gate.manifest",
+    "gate.manifest"
+  ],
+  "check_nodes": [
     "check.skill_discovery",
     "check.exit_status_class",
     "check.shard_coverage",
