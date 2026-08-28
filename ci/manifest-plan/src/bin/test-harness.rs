@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -31,7 +30,6 @@ use hermit_manifest_plan::stress_series::HostCapabilities;
 use hermit_manifest_plan::stress_series::HostCapability;
 #[cfg(test)]
 use hermit_manifest_plan::stress_series::HostCapabilityVerdict;
-use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
 
@@ -550,43 +548,13 @@ fn audit_determinism_stress_evidence(root: &Path) {
     }
 }
 
-#[derive(Deserialize)]
-struct Dag {
-    #[serde(default)]
-    resource_caps: BTreeMap<String, u64>,
-    default_step_timeout: Option<u64>,
-    steps: Vec<DagStep>,
+fn read_dag(path: &Path) -> Result<dagrun::DagConfig, String> {
+    let text = fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    dagrun::dag_from_json(&text)
+        .map_err(|error| format!("{}: invalid DAG JSON: {error}", path.display()))
 }
 
-#[derive(Deserialize)]
-struct DagStep {
-    group: String,
-    job: String,
-    cmd: String,
-    jobs_flag: Option<String>,
-    #[serde(default)]
-    deps: Vec<String>,
-    timeout: Option<u64>,
-    #[serde(default)]
-    hint: Option<DagHint>,
-    #[serde(default)]
-    manifest: Option<DagManifest>,
-}
-
-#[derive(Deserialize)]
-struct DagHint {
-    preferred_inner_jobs: Option<u64>,
-    #[serde(default)]
-    resources: BTreeMap<String, u64>,
-}
-
-#[derive(Deserialize)]
-struct DagManifest {
-    lane: String,
-    category: String,
-}
-
-fn command_jobs(command: &str) -> Result<Option<u64>, String> {
+fn command_jobs(command: &str) -> Result<Option<i64>, String> {
     let words = command.split_whitespace().collect::<Vec<_>>();
     let mut jobs = None;
     let mut index = 0;
@@ -595,7 +563,7 @@ fn command_jobs(command: &str) -> Result<Option<u64>, String> {
             let value = words
                 .get(index + 1)
                 .ok_or_else(|| "manifest command has --jobs without a value".to_string())?
-                .parse::<u64>()
+                .parse::<i64>()
                 .ok()
                 .filter(|value| *value > 0)
                 .ok_or_else(|| "manifest command has invalid --jobs value".to_string())?;
@@ -612,10 +580,7 @@ fn command_jobs(command: &str) -> Result<Option<u64>, String> {
 fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), String> {
     for lane in ["portable", "privileged"] {
         let path = root.join(format!("ci/dag/{lane}.json"));
-        let dag: Dag = serde_json::from_slice(
-            &fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?,
-        )
-        .map_err(|e| format!("{}: invalid DAG JSON: {e}", path.display()))?;
+        let dag = read_dag(&path)?;
         if dag
             .steps
             .iter()
@@ -680,15 +645,19 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
             let manifest = step.manifest.as_ref().ok_or_else(|| {
                 format!("{}.{} lacks typed manifest identity", step.group, step.job)
             })?;
-            if manifest.lane != lane {
+            let dagrun::DagManifest {
+                lane: manifest_lane,
+                category,
+            } = manifest;
+            if manifest_lane != lane {
                 return Err(format!(
                     "{}.{} records lane {} in the {lane} DAG",
-                    step.group, step.job, manifest.lane
+                    step.group, step.job, manifest_lane
                 ));
             }
             let selector = format!(
                 "target/debug/test-harness run --lane {lane} --category {} --ci-only --allow-empty --prebuilt",
-                manifest.category
+                category
             );
             if !step.cmd.contains(&selector) {
                 return Err(format!(
@@ -697,13 +666,12 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
                 ));
             }
             if let Some(jobs) = command_jobs(&step.cmd)? {
-                let hint = step.hint.as_ref().ok_or_else(|| {
-                    format!(
-                        "{}.{} has --jobs {jobs} without a resource hint",
-                        step.group, step.job
-                    )
-                })?;
-                let demand = hint.resources.get("manifest_guest").copied().unwrap_or(0);
+                let demand = step
+                    .hint
+                    .resources
+                    .get("manifest_guest")
+                    .copied()
+                    .unwrap_or(0);
                 let cap = dag
                     .resource_caps
                     .get("manifest_guest")
@@ -711,20 +679,20 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
                     .unwrap_or(0);
                 if demand != jobs
                     || cap < jobs
-                    || hint.preferred_inner_jobs != Some(jobs)
+                    || step.hint.preferred_inner_jobs != Some(jobs)
                     || step.jobs_flag.as_deref() != Some("")
                 {
                     return Err(format!(
                         "{}.{} runs --jobs {jobs} but declares manifest_guest={demand}, cap={cap}, preferred_inner_jobs={:?}, jobs_flag={:?}",
-                        step.group, step.job, hint.preferred_inner_jobs, step.jobs_flag
+                        step.group, step.job, step.hint.preferred_inner_jobs, step.jobs_flag
                     ));
                 }
             }
-            if !actual.insert(manifest.category.clone()) {
+            if !actual.insert(category.clone()) {
                 return Err(format!(
                     "{} has duplicate manifest bucket {}",
                     path.display(),
-                    manifest.category
+                    category
                 ));
             }
         }
@@ -739,17 +707,11 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
 }
 
 fn audit_budget_ordering(root: &Path) -> Result<(), String> {
-    let portable: Dag = serde_json::from_slice(
-        &fs::read(root.join("ci/dag/portable.json")).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| format!("invalid portable DAG: {e}"))?;
-    let privileged: Dag = serde_json::from_slice(
-        &fs::read(root.join("ci/dag/privileged.json")).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| format!("invalid privileged DAG: {e}"))?;
+    let portable = read_dag(&root.join("ci/dag/portable.json"))?;
+    let privileged = read_dag(&root.join("ci/dag/privileged.json"))?;
     for (lane, dag) in [("portable", &portable), ("privileged", &privileged)] {
         for step in &dag.steps {
-            if step.timeout.or(dag.default_step_timeout).is_none() {
+            if step.timeout <= 0 {
                 return Err(format!(
                     "{lane} node {}.{} has no derivable wall budget",
                     step.group, step.job
@@ -762,19 +724,14 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
                 let jobs = value
                     .split_whitespace()
                     .next()
-                    .and_then(|value| value.parse::<u64>().ok())
+                    .and_then(|value| value.parse::<i64>().ok())
                     .ok_or_else(|| {
                         format!(
                             "{lane} node {}.{} has an invalid CARGO_BUILD_JOBS prefix",
                             step.group, step.job
                         )
                     })?;
-                if step
-                    .hint
-                    .as_ref()
-                    .and_then(|hint| hint.preferred_inner_jobs)
-                    != Some(jobs)
-                {
+                if step.hint.preferred_inner_jobs != Some(jobs) {
                     return Err(format!(
                         "{lane} node {}.{} declares CARGO_BUILD_JOBS={jobs} without matching preferred_inner_jobs",
                         step.group, step.job
@@ -813,7 +770,9 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
             let step = portable_steps
                 .get(node)
                 .ok_or_else(|| format!("portable shard names missing DAG node {node}"))?;
-            let timeout = step.timeout.or(portable.default_step_timeout).unwrap();
+            let timeout = u64::try_from(step.timeout).map_err(|_| {
+                format!("portable node {node} has invalid timeout {}", step.timeout)
+            })?;
             if timeout >= bound {
                 current.insert(format!(
                     "{node} {timeout}s >= {bound}s (job {job} timeout-minutes)"
@@ -862,7 +821,12 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
         ));
     }
     for step in &privileged.steps {
-        let timeout = step.timeout.or(privileged.default_step_timeout).unwrap();
+        let timeout = u64::try_from(step.timeout).map_err(|_| {
+            format!(
+                "privileged node {}.{} has invalid timeout {}",
+                step.group, step.job, step.timeout
+            )
+        })?;
         if timeout >= launcher_bound {
             current.insert(format!(
                 "{}.{} {timeout}s >= {launcher_bound}s (privileged launcher wrapper)",
@@ -939,7 +903,7 @@ fn audit_privileged_unboxed_guard(workflow: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn dag_critical_path(dag: &Dag) -> Result<u64, String> {
+fn dag_critical_path(dag: &dagrun::DagConfig) -> Result<u64, String> {
     let steps = dag
         .steps
         .iter()
@@ -947,8 +911,7 @@ fn dag_critical_path(dag: &Dag) -> Result<u64, String> {
         .collect::<std::collections::BTreeMap<_, _>>();
     fn visit(
         id: &str,
-        dag: &Dag,
-        steps: &std::collections::BTreeMap<String, &DagStep>,
+        steps: &std::collections::BTreeMap<String, &dagrun::Step>,
         active: &mut BTreeSet<String>,
         memo: &mut std::collections::BTreeMap<String, u64>,
     ) -> Result<u64, String> {
@@ -964,20 +927,24 @@ fn dag_critical_path(dag: &Dag) -> Result<u64, String> {
         let predecessor = step
             .deps
             .iter()
-            .map(|dependency| visit(dependency, dag, steps, active, memo))
+            .map(|dependency| visit(dependency, steps, active, memo))
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .max()
             .unwrap_or(0);
         active.remove(id);
-        let value = predecessor + step.timeout.or(dag.default_step_timeout).unwrap();
+        let timeout = u64::try_from(step.timeout)
+            .map_err(|_| format!("DAG node {id} has invalid timeout {}", step.timeout))?;
+        let value = predecessor
+            .checked_add(timeout)
+            .ok_or_else(|| format!("DAG critical path overflows at {id}"))?;
         memo.insert(id.to_string(), value);
         Ok(value)
     }
     let mut memo = std::collections::BTreeMap::new();
     let mut maximum = 0;
     for id in steps.keys() {
-        maximum = maximum.max(visit(id, dag, &steps, &mut BTreeSet::new(), &mut memo)?);
+        maximum = maximum.max(visit(id, &steps, &mut BTreeSet::new(), &mut memo)?);
     }
     Ok(maximum)
 }

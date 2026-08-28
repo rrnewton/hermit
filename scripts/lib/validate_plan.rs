@@ -288,6 +288,8 @@ pub fn node(
         desc: desc.to_string(),
         description: String::new(),
         cmd,
+        cmdtype: dagrun::model::CmdType::Unknown,
+        manifest: None,
         deps,
         env: BTreeMap::new(),
         hint: ResourceHint {

@@ -174,7 +174,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `detcore-model`; reverse-dependent closure: detcore-dbt, detcore-model, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify.",
+      "_why": "@generated: Cargo package `detcore-model`; reverse-dependent closure: detcore-dbt, detcore-model, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-manifest-plan, hermit-verify.",
       "e2e_all": true,
       "nodes": [
         "build.runtime_release",
@@ -196,6 +196,7 @@
         "e2e.manifest_util_c",
         "lint.clippy",
         "lint.rustfmt",
+        "setup.manifest_plan",
         "test.app_strict_verify",
         "test.applications_e2e",
         "test.arbitrary_binaries",

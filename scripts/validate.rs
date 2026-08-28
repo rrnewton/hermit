@@ -104,6 +104,7 @@ use std::process::ExitCode;
 use dagrun::cgroup::aggregate_slice_max_cpus;
 use dagrun::cgroup::is_in_scope;
 use dagrun::model::DagConfig;
+use dagrun::model::DagManifest;
 use dagrun::model::RunResult;
 use dagrun::model::Step;
 use dagrun::model::StepOutcome;
@@ -171,15 +172,11 @@ enum ValidationStepIdentity {
 fn validation_step_identity(step: &Step) -> ValidationStepIdentity {
     let manifest_group = step.group == "e2e" || step.group.ends_with("-e2e");
     let quick_manifest_run = step.group == "quick" && step.job == "e2e_verify";
-    let invokes_manifest_run = step.cmd.contains("target/debug/test-harness run ");
     if (step.group == "gate" && step.job == "manifest")
         || (manifest_group && step.job == "metadata")
     {
         ValidationStepIdentity::ManifestAudit
-    } else if (manifest_group && step.job.starts_with("manifest_"))
-        || quick_manifest_run
-        || invokes_manifest_run
-    {
+    } else if step.manifest.is_some() || quick_manifest_run {
         ValidationStepIdentity::ManifestRun
     } else {
         ValidationStepIdentity::Other
@@ -2128,16 +2125,12 @@ cleared-caps refusal names {} starved step(s)",
             );
         }
         for consumer in manifest_consumers {
-            let lane = if consumer.cmd.contains("--lane portable ") {
-                "portable"
-            } else if consumer.cmd.contains("--lane privileged ") {
-                "privileged"
-            } else {
-                return Err(format!(
-                    "full-plan bracket: {} manifest consumer has no exact lane selector: {}",
-                    consumer.tag(), consumer.cmd
-                ));
-            };
+            let DagManifest { lane, category: _ } = consumer.manifest.as_ref().ok_or_else(|| {
+                format!(
+                    "full-plan bracket: {} manifest consumer lacks typed manifest selection",
+                    consumer.tag()
+                )
+            })?;
             let result_path = format!(
                 "\"$E2E_RESULT_ROOT/{lane}/{}/results.jsonl\"",
                 consumer.job
@@ -2181,7 +2174,7 @@ cleared-caps refusal names {} starved step(s)",
                     consumer.tag(), consumer.cmd
                 ));
             }
-            let producer = if consumer.cmd.contains("--lane portable ") {
+            let producer = if lane == "portable" {
                 if !consumer.cmd.contains("--require-install") {
                     return Err(format!(
                         "full-plan bracket: portable consumer {} did not require the backend-resource bundle",
@@ -3308,6 +3301,8 @@ fn super_plan_bracket() -> Result<(), String> {
             desc: "inert fixture: declares no caps".into(),
             description: String::new(),
             cmd: "true".into(),
+            cmdtype: dagrun::model::CmdType::Unknown,
+            manifest: None,
             deps: vec![],
             env: BTreeMap::new(),
             hint: Default::default(),
@@ -4662,22 +4657,28 @@ fn bucket_runs_nothing(bucket: &BucketCells) -> bool {
     bucket.selected > 0 && bucket.withheld == bucket.selected
 }
 
-/// The `(lane, category)` a manifest bucket node runs, read off the node's OWN
-/// command — the thing that actually selects the cells.
+/// The `(lane, category)` a manifest bucket node declares, checked against the
+/// command that actually selects the cells.
 ///
-/// `None` when the command is not a manifest bucket run, when either output path
-/// is missing or duplicated, or when it carries any token this function does not
-/// model. THE WHITELIST IS THE POINT: `--results` and `--junit` are accepted only
-/// as one value-bearing pair because they change storage, never selection. An
-/// unmodelled or selection-affecting `--mode`, `--backend`, `--test`,
-/// `--include-occasional`, or anything else means the cell set cannot be proven
-/// equal to the bucket accounting, so the node is not a candidate and simply runs.
+/// The typed `manifest` value is the authority. `None` when that value is absent,
+/// when the command disagrees with it, when either output path is missing or
+/// duplicated, or when the command carries any token this function does not model.
+/// THE WHITELIST IS THE POINT: `--results` and `--junit` are accepted only as one
+/// value-bearing pair because they change storage, never selection. An unmodelled
+/// or selection-affecting `--mode`, `--backend`, `--test`, `--include-occasional`,
+/// or anything else means the cell set cannot be proven equal to the bucket
+/// accounting, so the node is not a candidate and simply runs.
 ///
 /// `--ci-only` is REQUIRED because the accounting is queried with `--ci-only`;
 /// a node selecting a wider population must not be matched against a narrower
 /// count.
-fn manifest_bucket_of(cmd: &str) -> Option<(String, String)> {
-    let tail = cmd.split_once("target/debug/test-harness run ")?.1;
+fn manifest_bucket_of(step: &Step) -> Option<(String, String)> {
+    let manifest = step.manifest.as_ref()?;
+    let DagManifest {
+        lane: declared_lane,
+        category: declared_category,
+    } = manifest;
+    let tail = step.cmd.split_once("target/debug/test-harness run ")?.1;
     let tokens: Vec<&str> = tail.split_whitespace().collect();
     let mut lane: Option<String> = None;
     let mut category: Option<String> = None;
@@ -4731,7 +4732,10 @@ fn manifest_bucket_of(cmd: &str) -> Option<(String, String)> {
     if !ci_only || !results || !junit {
         return None;
     }
-    Some((lane?, category?))
+    if lane.as_deref() != Some(declared_lane) || category.as_deref() != Some(declared_category) {
+        return None;
+    }
+    Some((declared_lane.clone(), declared_category.clone()))
 }
 
 
@@ -4829,7 +4833,7 @@ fn withhold_vacuous_manifest_nodes(
     let mut candidates: Vec<(String, String, String)> = Vec::new();
     for cfg in std::iter::once(&plan.cfg).chain(plan.second.iter()) {
         for step in &cfg.steps {
-            if let Some((lane, category)) = manifest_bucket_of(&step.cmd) {
+            if let Some((lane, category)) = manifest_bucket_of(step) {
                 candidates.push((step.tag(), lane, category));
             }
         }
@@ -5158,13 +5162,16 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // preflight node before filtering; otherwise `--only setup.manifest_plan`
         // creates a duplicate tag and a consumer selected with the producer keeps
         // an ambiguous edge. Every non-preflight selected node retains its lane cap.
-        let original_lane_steps = lane_steps.clone();
         validate_plan::reuse_preflight_manifest_producer(
             &mut lane_steps,
             &format!("--only lane {lane}"),
         )?;
-        let manifest_plan_consumers: BTreeSet<String> = original_lane_steps
+        let manifest_plan_consumers: BTreeSet<String> = base
+            .steps
             .iter()
+            // This does not infer a manifest lane or category. It answers the
+            // narrower build question: does this selected command invoke the
+            // binary supplied by setup.manifest_plan?
             .filter(|step| step.cmd.contains("target/debug/test-harness"))
             .map(|step| step.tag())
             .collect();
@@ -6272,6 +6279,8 @@ fn step_with_caps(
         desc: desc.into(),
         description: String::new(),
         cmd,
+        cmdtype: dagrun::model::CmdType::Unknown,
+        manifest: None,
         deps,
         env: BTreeMap::new(),
         hint: dagrun::model::ResourceHint {
@@ -6928,9 +6937,10 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
             .into());
     }
 
-    // THE NODE-TO-BUCKET BINDING, from the node's own command. A command with
-    // any selection token this function does not model must NOT be matched
-    // against the bucket accounting.
+    // THE NODE-TO-BUCKET BINDING. The typed manifest value is authoritative;
+    // the command is checked only to prove that execution selects the same
+    // population. A command with any selection token this function does not
+    // model must NOT be matched against the bucket accounting.
     let mut transformed =
         validate_plan::lane_nodes(root, "privileged", "privileged-", "gate.manifest")?;
     let withheld_tag = "privileged-e2e.manifest_backend_parity_c";
@@ -6938,7 +6948,6 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
         .iter()
         .find(|step| step.tag() == withheld_tag)
         .ok_or("node vacuity: transformed lane lost privileged backend-parity-c bucket")?
-        .cmd
         .clone();
     if manifest_bucket_of(&shipped)
         != Some(("privileged".to_string(), "backend-parity-c".to_string()))
@@ -6971,12 +6980,32 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
         "cargo test -p hermit-detcore",
     ];
     for cmd in unmodelled {
-        if manifest_bucket_of(cmd).is_some() {
+        let mut step = shipped.clone();
+        step.cmd = cmd.to_string();
+        if manifest_bucket_of(&step).is_some() {
             return Err(format!(
                 "node vacuity: {cmd:?} selects a cell population this function cannot prove \
                  equal to the bucket accounting and must NOT be a withholding candidate"
             ));
         }
+    }
+    let mut mismatched = shipped.clone();
+    mismatched.manifest = Some(DagManifest {
+        lane: "portable".into(),
+        category: "backend-parity-c".into(),
+    });
+    if manifest_bucket_of(&mismatched).is_some() {
+        return Err(
+            "node vacuity: a command and typed manifest that name different lanes must refuse"
+                .into(),
+        );
+    }
+    let mut untyped = shipped;
+    untyped.manifest = None;
+    if manifest_bucket_of(&untyped).is_some() {
+        return Err(
+            "node vacuity: command text alone must not supply manifest lane/category".into(),
+        );
     }
 
     // THE CHECKED-IN ACCOUNTING — the required plan itself carries the host
@@ -7148,6 +7177,8 @@ fn host_capability_bracket(root: &Path) -> Result<(), String> {
         desc: String::new(),
         description: String::new(),
         cmd: "true".into(),
+        cmdtype: dagrun::model::CmdType::Unknown,
+        manifest: None,
         deps,
         env: BTreeMap::new(),
         hint: dagrun::model::ResourceHint::default(),
@@ -7701,6 +7732,10 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
         step_with_caps(group, job, "fixture", cmd.into(), deps, 30, 30, 1024 * 1024)
     };
     let mut cell = step("e2e", "manifest_fixture", "echo cells", vec!["build.workspace".into()]);
+    cell.manifest = Some(DagManifest {
+        lane: "portable".into(),
+        category: "applications".into(),
+    });
     cell.env.insert("FIXTURE_VALUE".into(), "literal".into());
     let mut plan = Plan {
         cfg: validate_plan::config_from(
@@ -7858,13 +7893,23 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
             nested.cfg.steps
         ));
     }
+    let mut first = step("e2e", "manifest_first", "true", vec![]);
+    first.manifest = Some(DagManifest {
+        lane: "portable".into(),
+        category: "applications".into(),
+    });
+    let mut second = step("e2e", "manifest_second", "true", vec![]);
+    second.manifest = Some(DagManifest {
+        lane: "privileged".into(),
+        category: "applications".into(),
+    });
     let mut sequential = Plan {
         cfg: validate_plan::config_from(
-            vec![step("e2e", "manifest_first", "true", vec![])],
+            vec![first],
             "first lane",
         ),
         second: Some(validate_plan::config_from(
-            vec![step("e2e", "manifest_second", "true", vec![])],
+            vec![second],
             "second lane",
         )),
         ..Default::default()
@@ -9013,23 +9058,28 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             .iter()
             .filter(|step| validation_step_identity(step) == ValidationStepIdentity::ManifestRun)
         {
-            let category = step
-                .job
-                .strip_prefix("manifest_")
-                .ok_or_else(|| {
-                    format!(
-                        "retry bounds: manifest node {} does not identify its category",
-                        step.tag()
-                    )
-                })?
-                .replace('_', "-");
+            let DagManifest {
+                lane: manifest_lane,
+                category,
+            } = step.manifest.as_ref().ok_or_else(|| {
+                format!(
+                    "retry bounds: manifest node {} lacks typed manifest selection",
+                    step.tag()
+                )
+            })?;
+            if manifest_lane != lane {
+                return Err(format!(
+                    "retry bounds: manifest node {} records lane {} in the {lane} DAG",
+                    step.tag(), manifest_lane
+                ));
+            }
             check_manifest_selection(
                 &format!("{lane}:{}", step.tag()),
                 step.timeout,
                 Selection {
                     population: Some(Population::Required),
                     lane: Some(lane.into()),
-                    category: Some(category),
+                    category: Some(category.clone()),
                     ..Default::default()
                 },
             )?;
@@ -10209,6 +10259,10 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     let mut e2e_step = step("manifest_attempt", &e2e_cmd);
     e2e_step.group = "e2e".into();
     e2e_step.job = "manifest_attempt".into();
+    e2e_step.manifest = Some(DagManifest {
+        lane: "portable".into(),
+        category: "applications".into(),
+    });
     set_manifest_attempt(&mut e2e_step, 1);
     let e2e_retry = run_lane_with_env_retries(
         &DagConfig { steps: vec![e2e_step], ..Default::default() },
@@ -16764,6 +16818,14 @@ mod e2e_attempt_tests {
             30,
             64 * 1024 * 1024,
         );
+        assert_eq!(
+            validation_step_identity(&relabelled),
+            ValidationStepIdentity::Other
+        );
+        relabelled.manifest = Some(DagManifest {
+            lane: "portable".into(),
+            category: "applications".into(),
+        });
         assert_eq!(
             validation_step_identity(&relabelled),
             ValidationStepIdentity::ManifestRun
