@@ -46,6 +46,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use dagrun::io::dag_from_json;
+use dagrun::model::CmdType;
 use dagrun::model::DagConfig;
 use dagrun::model::ResourceHint;
 use dagrun::model::Step;
@@ -288,6 +289,7 @@ pub fn node(
         desc: desc.to_string(),
         description: String::new(),
         cmd,
+        cmdtype: CmdType::Unknown,
         deps,
         env: BTreeMap::new(),
         hint: ResourceHint {

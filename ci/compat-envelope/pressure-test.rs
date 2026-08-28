@@ -33,6 +33,7 @@ use std::time::UNIX_EPOCH;
 
 use dagrun::io::dag_from_json;
 use dagrun::io::dag_to_json;
+use dagrun::model::CmdType;
 use dagrun::model::DEFAULT_CPU_TIMEOUT_MULTIPLIER;
 use dagrun::model::DagConfig;
 use dagrun::model::ResourceHint;
@@ -2721,6 +2722,7 @@ fn write_plan_after_scorecard_check(
             desc: format!("Prepare selected-cell fixture {test}"),
             description: String::new(),
             cmd,
+            cmdtype: CmdType::Unknown,
             deps: preparation_deps,
             env: BTreeMap::new(),
             // `None` preserves the existing GLOBAL eager-exit behaviour, which is what
@@ -2900,6 +2902,7 @@ fn write_plan_after_scorecard_check(
                 },
                 description: String::new(),
                 cmd,
+                cmdtype: CmdType::Unknown,
                 deps,
                 env: BTreeMap::new(),
                 // `None` preserves the existing GLOBAL eager-exit behaviour, which is what
@@ -2939,6 +2942,7 @@ fn write_plan_after_scorecard_check(
         },
         description: String::new(),
         cmd: "true".into(),
+        cmdtype: CmdType::Unknown,
         deps: cell_tags,
         env: BTreeMap::new(),
         // `None` preserves the existing GLOBAL eager-exit behaviour, which is what
