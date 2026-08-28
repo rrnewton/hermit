@@ -2401,15 +2401,38 @@ cleared-caps refusal names {} starved step(s)",
         }
         let portable_tests = test_nodes_of(&validate_plan::lane_config(&root, "portable")?);
         let privileged_tests = test_nodes_of(&validate_plan::lane_config(&root, "privileged")?);
-        let sequential_expected = portable_tests.union(&privileged_tests).cloned().collect();
+        let mut sequential_expected = portable_tests.clone();
+        sequential_expected.extend(
+            privileged_tests
+                .iter()
+                .map(|tag| format!("privileged-{tag}")),
+        );
         let mut fused_expected = portable_tests;
-        fused_expected.extend(privileged_tests.into_iter().map(|tag| format!("privileged-{tag}")));
+        fused_expected.extend(
+            privileged_tests
+                .into_iter()
+                .map(|tag| format!("privileged-{tag}")),
+        );
         if full.planned_test_nodes != fused_expected
             || sequential.planned_test_nodes != sequential_expected
         {
             return Err(format!(
                 "full-plan bracket: fused/sequential planned-test sets differ from their lane configs: fused={:?} sequential={:?}",
                 full.planned_test_nodes, sequential.planned_test_nodes,
+            ));
+        }
+        let sequential_tags: Vec<String> = std::iter::once(&sequential.cfg)
+            .chain(sequential.second.iter())
+            .flat_map(|cfg| cfg.steps.iter().map(|step| step.tag()))
+            .collect();
+        let sequential_unique: BTreeSet<&str> =
+            sequential_tags.iter().map(String::as_str).collect();
+        if sequential_tags.len() != sequential_unique.len() {
+            return Err(format!(
+                "full-plan bracket: sequential lanes contain duplicate node identities, so \
+                 planned_node_count would collapse {} executions to {} names: {sequential_tags:?}",
+                sequential_tags.len(),
+                sequential_unique.len()
             ));
         }
         let nested_args = parse_argv(&[
@@ -5241,6 +5264,7 @@ fn test_nodes_of(cfg: &DagConfig) -> BTreeSet<String> {
 fn attach_compatibility_scorecard(
     steps: &mut Vec<dagrun::model::Step>,
     lanes: &[&str],
+    prefix: &str,
 ) -> Result<(), String> {
     let mut deps = Vec::new();
     for step in steps.iter() {
@@ -5256,7 +5280,7 @@ fn attach_compatibility_scorecard(
     }
     deps.sort();
     steps.push(step_with_caps(
-        "scorecard",
+        &format!("{prefix}scorecard"),
         "compatibility",
         "Verify fresh per-cell results and print the compatibility table",
         format!(
@@ -5719,16 +5743,25 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         a.extend(validate_plan::lane_nodes_reusing_manifest_producer(
             root, lanes[0], "", gate,
         )?);
-        let mut b = validate_plan::lane_nodes(root, lanes[1], "", gate)?;
+        // The second lane is a separate scheduler invocation, but its node
+        // identities still enter one ledger row and one coverage artifact.
+        // Use the same lane prefix as the fused plan so those serialized
+        // populations cannot collapse two executions into one set member.
+        let second_prefix = format!("{}-", lanes[1]);
+        let mut b = validate_plan::lane_nodes(root, lanes[1], &second_prefix, gate)?;
         // The second run repeats preflight-free; its nodes hang off nothing.
         for s in b.iter_mut() {
             s.deps.retain(|d| d != gate);
         }
-        attach_compatibility_scorecard(&mut a, &["portable"])?;
+        attach_compatibility_scorecard(&mut a, &["portable"], "")?;
         // The runs are sequential, so when this node runs the portable rows
         // already exist. Emit the same whole-scorecard answer as the fused
         // default rather than a second disconnected per-lane claim.
-        attach_compatibility_scorecard(&mut b, &["portable", "privileged"])?;
+        attach_compatibility_scorecard(
+            &mut b,
+            &["portable", "privileged"],
+            "privileged-",
+        )?;
         // Each lane carries ITS OWN loaded config. They genuinely differ --
         // portable default_step_timeout=600 vs privileged=120, and disjoint
         // resource_caps -- so there is no correct single merged value; running
@@ -5879,7 +5912,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // CPUID verdict about an artifact that is not the one under test.
         cpuid.cmd = "newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"; timeout 30 \"$newest\" rdrand_rdseed_is_masked --exact".to_string();
     }
-    attach_compatibility_scorecard(&mut steps, &lanes)?;
+    attach_compatibility_scorecard(&mut steps, &lanes, "")?;
     // Fusing lanes means one config for both. Their default wall timeouts differ,
     // but every shipped/synthesized node has an explicit wall timeout and the
     // fail-closed undeclared-node audit below enforces that invariant. Therefore
@@ -7325,7 +7358,7 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
     // INTEGRATION: exercise the production transformed command, checked-in
     // bucket accounting, withholding mutation, and scorecard edge handling
     // together. This catches drift between the command producer and parser.
-    attach_compatibility_scorecard(&mut transformed, &["privileged"])?;
+    attach_compatibility_scorecard(&mut transformed, &["privileged"], "")?;
     let scorecard_tag = "scorecard.compatibility";
     let before: BTreeMap<String, Vec<String>> = transformed
         .iter()
