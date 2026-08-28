@@ -177,6 +177,15 @@ fi
 
 if ((status == 0)); then
     n=$(printf '%s\n' "$assigned_unique" | grep -c . || true)
-    echo "check-shard-coverage.sh: OK — $n constructed portable-only steps each assigned to exactly one hosted job."
+    cell_count=$(jq '[.cells[] | select(.lane == "portable")] | length' ci/expected-e2e-plan.json)
+    ((cell_count > 0)) || {
+        echo "check-shard-coverage.sh: FAIL — constructed portable cell population is empty" >&2
+        exit 1
+    }
+    if [[ -n ${GITHUB_OUTPUT:-} ]]; then
+        printf 'constructed_step_count=%s\n' "$n" >>"$GITHUB_OUTPUT"
+        printf 'selected_cell_count=%s\n' "$cell_count" >>"$GITHUB_OUTPUT"
+    fi
+    echo "check-shard-coverage.sh: OK — $n constructed portable-only steps each assigned to exactly one hosted job; $cell_count selected portable cells."
 fi
 exit "$status"

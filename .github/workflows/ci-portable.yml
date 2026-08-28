@@ -207,6 +207,9 @@ jobs:
     name: Verify shard/DAG coverage
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      constructed_step_count: ${{ steps.coverage.outputs.constructed_step_count }}
+      selected_cell_count: ${{ steps.coverage.outputs.selected_cell_count }}
     steps:
       - uses: actions/checkout@v4
       - name: Initialize dagrun submodule
@@ -216,6 +219,7 @@ jobs:
           RUSTFLAGS: ""
         run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
       - name: Fail-closed shard/DAG coverage guard
+        id: coverage
         env:
           RUSTFLAGS: ""
         run: ./ci/check-shard-coverage.sh
@@ -1129,7 +1133,9 @@ jobs:
   # rule or landing path requires it. It also folds in the former reduce-e2e
   # reduction to keep the diagnostic critical path one queued stage shorter.
   regular:
-    name: Regular tests (GitHub-managed portable)
+    name: >-
+      Portable diagnostic (${{ needs.plan.outputs.constructed_step_count || 'unknown' }}
+      constructed steps; ${{ needs.plan.outputs.selected_cell_count || 'unknown' }} selected cells)
     needs:
       - select
       - plan
