@@ -440,6 +440,7 @@ fn io_accounting_commands_are_deterministic_under_strict_verify() {
 // TODO-HUMAN-REVIEW(PR-873): Review kernel pseudo-file command coverage.
 #[test]
 #[ignore = "e2e: requires hermit + mount namespaces + util-linux/procps/sysstat"]
+// TODO(#2791): Remove the portable-DAG exclusion after #2801 determinizes mountinfo.
 fn kernel_pseudofile_commands_are_deterministic_under_strict_verify() {
     let _guard = hermit_run_lock();
     let cases = [

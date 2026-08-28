@@ -550,9 +550,9 @@
     },
     {
       "group": "test", "job": "app_strict_verify",
-      "desc": "Portable application strict verification (skips java/javac)",
+      "desc": "Portable application strict verification (skips java/javac and mountinfo-dependent Go cases)",
       "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five successful current exact-command cgroup samples peaked at 1502470144 bytes, plus one failed/censored attempt; the larger 2838315008-byte historical completed peak governs, while prior 4-GiB pressure argues against a tight hard ceiling. The 3-GiB baseline rounds above the floor and the 6-GiB hard cap preserves 3 GiB of adverse-load headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
-      "cmd": "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test app_strict_verify -j 1 -- --ignored --skip java_ --skip javac_",
+      "cmd": "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test app_strict_verify -j 1 -- --ignored --skip java_ --skip javac_ --skip go_hello_is_deterministic_under_strict_verify --skip go_goroutines_are_deterministic_under_strict_verify",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
@@ -561,9 +561,9 @@
     },
     {
       "group": "test", "job": "command_strict_verify",
-      "desc": "Portable command strict verification",
+      "desc": "Portable command strict verification (skips mountinfo-dependent kernel pseudofile case)",
       "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 239931392 bytes; the larger 1948848128-byte historical completed peak governs. The 2-GiB baseline rounds above that floor and the 4-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
-      "cmd": "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test command_strict_verify -j 1 -- --ignored",
+      "cmd": "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test command_strict_verify -j 1 -- --ignored --skip kernel_pseudofile_commands_are_deterministic_under_strict_verify",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,

@@ -854,6 +854,7 @@ fn lua_is_deterministic_under_strict_verify() {
 
 #[test]
 #[ignore = "e2e: requires hermit + mount namespaces + the Go toolchain"]
+// TODO(#2791): Remove the portable-DAG exclusion after #2801 determinizes mountinfo.
 fn go_hello_is_deterministic_under_strict_verify() {
     let bin = compile_go(GO_HELLO_SRC, "hermit_go_hello");
     assert_l2_under_strict_verify(&bin, &[]);
@@ -861,6 +862,7 @@ fn go_hello_is_deterministic_under_strict_verify() {
 
 #[test]
 #[ignore = "e2e: requires hermit + mount namespaces + the Go toolchain"]
+// TODO(#2791): Remove the portable-DAG exclusion after #2801 determinizes mountinfo.
 fn go_goroutines_are_deterministic_under_strict_verify() {
     let bin = compile_go(GO_GOROUTINES_SRC, "hermit_go_goroutines");
     assert_l2_under_strict_verify(&bin, &[]);
