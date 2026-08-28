@@ -292,6 +292,9 @@ def main() -> int:
         # pruned with the run rather than accumulating in a shared location. A
         # healthy run therefore stores the log twice, about 76 MiB each.
         environment["SAFEHERMIT_LOG_ROOT"] = str(run_dir / "safehermit")
+        # The guest controller imports demo_common. Suppress CPython's bytecode
+        # write so the controller cannot mutate checkout bytes during a run.
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
         banner("Resume {} and run: {}".format(SNAPSHOT_NAME, guest_command))
         print("Restoring snapshot (timeout: {}s)...".format(TIMEOUT), flush=True)
         with info_log.open("wb") as log:
