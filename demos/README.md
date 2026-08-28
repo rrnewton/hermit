@@ -231,6 +231,11 @@ resolved QEMU asset directory; later runs compare their exact qcow2,
 serial-output, and QEMU binary hashes. INFO logs are compared byte-for-byte
 after removing only each line's leading ISO-8601 wallclock timestamp. No
 address, path, virtual time, scheduler count, or other number is normalized.
+`demo_common.py` owns the complete kind-specific `run-metadata.json` type.
+Schema 2 requires every value used by repeat comparison, so two omitted values
+cannot compare equal and report a pass. Retained schema-1 boot and resume rows
+remain readable; the three older resume rows made without a saved snapshot may
+also lack the QEMU binary digest that later schema-1 writers added.
 
 The demo-6 resume path keeps the QEMU-visible paths fixed under the resolved
 QEMU asset directory: `qmp.sock`, the `serial-pipe.in`/`serial-pipe.out` FIFO
