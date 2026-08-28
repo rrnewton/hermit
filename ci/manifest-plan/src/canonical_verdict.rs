@@ -1,7 +1,55 @@
 use serde::Deserialize;
 use serde::Serialize;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// The verification verdict, independent of the guest's exit status.
+///
+/// A guest that deterministically exits nonzero can still match, while a guest
+/// that exits zero can still diverge. Consumers must read this value rather than
+/// infer the verdict from either the process status or human-readable stderr.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// The two runs matched on every compared dimension.
+    Matched,
+    /// The two runs diverged; verification failed.
+    Diverged,
+    /// Verification stopped before it could reach a verdict.
+    NoResult,
+}
+
+impl std::fmt::Display for Verdict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Matched => "matched",
+            Self::Diverged => "diverged",
+            Self::NoResult => "no_result",
+        })
+    }
+}
+
+/// Why verification did not reach a verdict.
+///
+/// This distinction is functional evidence. `FirstRunRejected` means the guest
+/// ran and its disposition was rejected by `--verify-allow`; `NotRun` is the
+/// pre-run stamp left when the invocation died before recording a more specific
+/// result. Collapsing both into `no_result` made a completed guest refusal and a
+/// container or launcher failure indistinguishable to the result reader.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum NoResultReason {
+    /// The invocation did not replace the pre-run stamp with a more specific
+    /// outcome.
+    NotRun,
+    /// Run 1 completed and its exit status was rejected by `--verify-allow`.
+    FirstRunRejected {
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+        stdout_bytes: u64,
+        stderr_bytes: u64,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RuntimeStats {
     pub scheduler_turns: u64,
     pub virtual_nanoseconds: u64,
@@ -9,7 +57,7 @@ pub struct RuntimeStats {
     pub syscalls: Option<u64>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct VerificationRuntime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run1: Option<RuntimeStats>,
@@ -17,11 +65,121 @@ pub struct VerificationRuntime {
     pub run2: Option<RuntimeStats>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DbtCountedBranchComparison {
+    pub left: u64,
+    pub right: u64,
+}
+
+impl DbtCountedBranchComparison {
+    #[allow(dead_code)] // path-included consumers do not all construct DBT outcomes
+    pub fn matched(self) -> bool {
+        self.left == self.right
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogCompareStrictness {
+    Stripped,
+    Canonical,
+}
+
+impl std::fmt::Display for LogCompareStrictness {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Stripped => "stripped",
+            Self::Canonical => "canonical",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparedLogScope {
+    Deterministic,
+    Info,
+    FullTrace,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordEnvelopeReport {
+    AllRecordsV1,
+    DbtEvidenceTransportV1,
+    CallerDefined,
+}
+
+impl RecordEnvelopeReport {
+    pub fn is_canonical(self) -> bool {
+        matches!(self, Self::AllRecordsV1 | Self::DbtEvidenceTransportV1)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AllRecordsV1 => "all_records_v1",
+            Self::DbtEvidenceTransportV1 => "dbt_evidence_transport_v1",
+            Self::CallerDefined => "caller_defined",
+        }
+    }
+}
+
+/// The comparison fields serialized beside a verification verdict.
+///
+/// Fields added after the original report are optional here so retained reports
+/// remain readable. A current producer writes every one of them, and
+/// [`VerificationReport::from_current_json_value`] checks their presence.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ComparisonReport {
+    pub strictness: LogCompareStrictness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub compare_logs: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compare_io_buffers: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_scope: Option<ComparedLogScope>,
+    pub record_envelope: RecordEnvelopeReport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtualize_time: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strip_lines: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonicalize_addresses: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_trace: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_remainder: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stripped_prefixes: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonicalizations: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_lines: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_commit: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_detlog: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ComparedLogMessages {
+    pub left: u64,
+    pub right: u64,
+}
+
+/// The complete machine-readable report written by `--verify-json`.
+///
+/// This type is shared by the Hermit producer, the manifest runner, the
+/// compatibility pressure test, and the scorecard. The serialized field order
+/// is retained because existing report bytes are hashed as evidence.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct VerificationReport {
     pub verified: bool,
     pub bitwise_parity: bool,
-    pub verdict: String,
+    pub verdict: Verdict,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_result_reason: Option<NoResultReason>,
     /// `None` when the producer reached no verdict. This is a DOCUMENTED
     /// producer state, not a malformed report: `VerificationReport::no_result()`
     /// in hermit-cli sets it, and its doc says "`null` when no verdict was
@@ -31,6 +189,16 @@ pub struct VerificationReport {
     #[serde(deserialize_with = "present_but_nullable_comparison")]
     pub comparison: Option<ComparisonReport>,
     pub compared_log_messages: Option<ComparedLogMessages>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dbt_counted_branches: Option<DbtCountedBranchComparison>,
+    /// Runtime totals for the two compared executions when the producer could
+    /// read both run summaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<VerificationRuntime>,
+    #[serde(default)]
+    pub guest_exit_code: Option<i32>,
+    #[serde(default)]
+    pub guest_signal: Option<i32>,
     /// WHERE the divergence began, in scheduler-turn units. `None` when the
     /// logs matched, when no comparison ran, or when the report predates the
     /// field.
@@ -83,74 +251,6 @@ pub struct VerificationReport {
     /// Corresponding first differing compared message from the right execution.
     #[serde(default)]
     pub first_divergent_right_message: Option<String>,
-    /// Runtime totals for the two compared executions when the producer could
-    /// read both run summaries.
-    #[serde(default)]
-    pub runtime: Option<VerificationRuntime>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ComparisonReport {
-    pub strictness: String,
-    pub compare_logs: bool,
-    /// REQUIRED, and deliberately so: do not add `#[serde(default)]`.
-    ///
-    /// This field exists to make record selection disclosed, so that a filter
-    /// cannot remove records while the comparison still looks unfiltered.
-    /// Giving it a default would supply the disclosure on the producer's behalf
-    /// — undisclosed selection reported as if it had been stated, which is the
-    /// exact failure the envelope was introduced to prevent. There is also no
-    /// honest value to default to: `all_records_v1` would admit an unstated
-    /// selection as canonical, and `caller_defined` would label a producer that
-    /// said nothing as having said something.
-    ///
-    /// It is consumed only as an admission-gate input, by `is_canonical()` in
-    /// [`VerificationReport::require_canonical_comparison`]. A report that never
-    /// stated its envelope has not supplied admissible canonical evidence, so
-    /// refusing it is the correct answer rather than a strictness accident.
-    ///
-    /// This is NOT the same situation as `comparison` above, which is
-    /// present-but-nullable. There, `null` is a documented producer state and
-    /// treating it as malformed reported a fault against the reader. Here,
-    /// absence is not a producer state of any hermit that emits envelopes; it
-    /// means an older binary — reachable through `HERMIT_BIN` — whose record
-    /// selection is genuinely unknown. Note that the two go opposite ways for
-    /// the same underlying reason: `present_but_nullable_comparison` exists to
-    /// REMOVE serde's default leniency, not to add it.
-    ///
-    /// The refusal names this field, and
-    /// `comparison_record_envelope_is_required_and_unknown_values_are_refused`
-    /// asserts that it does, so an operator can distinguish a producer that
-    /// predates the envelope from a corrupt report.
-    pub record_envelope: RecordEnvelopeReport,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RecordEnvelopeReport {
-    AllRecordsV1,
-    DbtEvidenceTransportV1,
-    CallerDefined,
-}
-
-impl RecordEnvelopeReport {
-    fn is_canonical(self) -> bool {
-        matches!(self, Self::AllRecordsV1 | Self::DbtEvidenceTransportV1)
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::AllRecordsV1 => "all_records_v1",
-            Self::DbtEvidenceTransportV1 => "dbt_evidence_transport_v1",
-            Self::CallerDefined => "caller_defined",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ComparedLogMessages {
-    pub left: u64,
-    pub right: u64,
 }
 
 /// Accept `null` but not a MISSING field. serde maps an absent `Option` field to
@@ -167,13 +267,35 @@ where
 }
 
 impl VerificationReport {
+    #[allow(dead_code)] // path-included retained-report readers do not produce reports
+    pub fn no_result() -> Self {
+        Self {
+            verified: false,
+            bitwise_parity: false,
+            verdict: Verdict::NoResult,
+            no_result_reason: Some(NoResultReason::NotRun),
+            comparison: None,
+            compared_log_messages: None,
+            dbt_counted_branches: None,
+            runtime: None,
+            guest_exit_code: None,
+            guest_signal: None,
+            first_divergent_scheduler_turn: None,
+            first_divergent_virtual_nanoseconds: None,
+            first_divergent_record: None,
+            first_divergent_syscall: None,
+            first_divergent_left_message: None,
+            first_divergent_right_message: None,
+        }
+    }
+
     /// `null` is legal ONLY for a report that reached no verdict. The producer
     /// documents it that way ("`null` when no verdict was reached"), and the
     /// sibling consumer in ci/compat-envelope/pressure-test.rs already applies
     /// exactly this rule. A null comparison beside a "matched" verdict is a
     /// self-contradictory report and stays refused at parse.
     fn require_null_comparison_matches_verdict(self) -> Result<Self, String> {
-        if self.comparison.is_none() && self.verdict != "no_result" {
+        if self.comparison.is_none() && self.verdict != Verdict::NoResult {
             return Err(format!(
                 "incomplete verification report: comparison is null but verdict is {}; null is legal only for no_result",
                 self.verdict
@@ -198,6 +320,68 @@ impl VerificationReport {
             .require_null_comparison_matches_verdict()
     }
 
+    /// Parse a report written by the current producer and require every field
+    /// that producer promises to emit. Retained-report readers use
+    /// [`Self::from_json_value`] instead so fields added after an old run remain
+    /// honest absence rather than making the whole report unreadable.
+    #[allow(dead_code)] // path-included readers use different parse forms
+    pub fn from_current_json_value(value: serde_json::Value) -> Result<Self, String> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| "incomplete verification report: expected an object".to_string())?;
+        for field in [
+            "verified",
+            "bitwise_parity",
+            "verdict",
+            "comparison",
+            "compared_log_messages",
+            "guest_exit_code",
+            "guest_signal",
+            "first_divergent_scheduler_turn",
+            "first_divergent_virtual_nanoseconds",
+            "first_divergent_record",
+            "first_divergent_syscall",
+            "first_divergent_left_message",
+            "first_divergent_right_message",
+        ] {
+            if !object.contains_key(field) {
+                return Err(format!(
+                    "incomplete verification report: missing current producer field `{field}`"
+                ));
+            }
+        }
+        if let Some(comparison) = object
+            .get("comparison")
+            .and_then(serde_json::Value::as_object)
+        {
+            for field in [
+                "strictness",
+                "display_name",
+                "compare_logs",
+                "compare_io_buffers",
+                "log_scope",
+                "record_envelope",
+                "virtualize_time",
+                "strip_lines",
+                "canonicalize_addresses",
+                "full_trace",
+                "exact_remainder",
+                "stripped_prefixes",
+                "canonicalizations",
+                "ignore_lines",
+                "skip_commit",
+                "skip_detlog",
+            ] {
+                if !comparison.contains_key(field) {
+                    return Err(format!(
+                        "incomplete verification report: missing current comparison field `{field}`"
+                    ));
+                }
+            }
+        }
+        Self::from_json_value(value)
+    }
+
     /// Prove that the invocation actually compared the canonical INFO evidence.
     /// This is separate from whether that comparison matched: a canonical
     /// divergence is a product result, while a stripped/output-only/empty-log
@@ -214,7 +398,7 @@ impl VerificationReport {
                 self.verdict
             ));
         };
-        if comparison.strictness == "canonical"
+        if comparison.strictness == LogCompareStrictness::Canonical
             && comparison.compare_logs
             && comparison.record_envelope.is_canonical()
             && counts.is_some_and(|counts| counts.left > 0 && counts.right > 0)
@@ -237,7 +421,7 @@ impl VerificationReport {
     /// output-only fallback can report it with zero compared INFO messages.
     pub fn require_canonical_match(&self) -> Result<(), String> {
         self.require_canonical_comparison()?;
-        if self.verified && self.verdict == "matched" && self.bitwise_parity {
+        if self.verified && self.verdict == Verdict::Matched && self.bitwise_parity {
             Ok(())
         } else {
             Err(format!(
@@ -362,59 +546,81 @@ mod tests {
         assert_eq!(runtime.run2.expect("run2").scheduler_turns, 13);
     }
 
-    fn report(strictness: &str, compare_logs: bool, left: u64, right: u64) -> VerificationReport {
+    fn report(
+        strictness: LogCompareStrictness,
+        compare_logs: bool,
+        left: u64,
+        right: u64,
+    ) -> VerificationReport {
         VerificationReport {
             verified: true,
             bitwise_parity: true,
-            verdict: "matched".into(),
+            verdict: Verdict::Matched,
+            no_result_reason: None,
             comparison: Some(ComparisonReport {
-                strictness: strictness.into(),
+                strictness,
+                display_name: None,
                 compare_logs,
+                compare_io_buffers: None,
+                log_scope: None,
                 record_envelope: RecordEnvelopeReport::AllRecordsV1,
+                virtualize_time: None,
+                strip_lines: None,
+                canonicalize_addresses: None,
+                full_trace: None,
+                exact_remainder: None,
+                stripped_prefixes: None,
+                canonicalizations: None,
+                ignore_lines: None,
+                skip_commit: None,
+                skip_detlog: None,
             }),
             compared_log_messages: Some(ComparedLogMessages { left, right }),
+            dbt_counted_branches: None,
+            runtime: None,
+            guest_exit_code: None,
+            guest_signal: None,
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,
             first_divergent_left_message: None,
             first_divergent_right_message: None,
-            runtime: None,
         }
     }
 
     #[test]
     fn brackets_every_canonical_match_requirement() {
         assert!(
-            report("canonical", true, 1, 1)
+            report(LogCompareStrictness::Canonical, true, 1, 1)
                 .require_canonical_match()
                 .is_ok()
         );
-        let mut weak = report("canonical", true, 1, 1);
+        let mut weak = report(LogCompareStrictness::Canonical, true, 1, 1);
         weak.verified = false;
         assert!(weak.require_canonical_match().is_err());
-        let mut weak = report("canonical", true, 1, 1);
-        weak.verdict = "diverged".into();
+        let mut weak = report(LogCompareStrictness::Canonical, true, 1, 1);
+        weak.verdict = Verdict::Diverged;
         assert!(weak.require_canonical_match().is_err());
-        let mut weak = report("canonical", true, 1, 1);
+        let mut weak = report(LogCompareStrictness::Canonical, true, 1, 1);
         weak.bitwise_parity = false;
         assert!(weak.require_canonical_match().is_err());
         assert!(
-            report("stripped", true, 1, 1)
+            report(LogCompareStrictness::Stripped, true, 1, 1)
                 .require_canonical_match()
                 .is_err()
         );
         assert!(
-            report("canonical", false, 1, 1)
+            report(LogCompareStrictness::Canonical, false, 1, 1)
                 .require_canonical_match()
                 .is_err()
         );
         assert!(
-            report("canonical", true, 0, 1)
+            report(LogCompareStrictness::Canonical, true, 0, 1)
                 .require_canonical_match()
                 .is_err()
         );
-        let mut weak = report("canonical", true, 1, 1);
+        let mut weak = report(LogCompareStrictness::Canonical, true, 1, 1);
         weak.comparison.as_mut().unwrap().record_envelope = RecordEnvelopeReport::CallerDefined;
         assert!(weak.require_canonical_match().is_err());
     }
@@ -437,7 +643,7 @@ mod tests {
     fn a_real_no_result_report_parses_instead_of_reading_as_unreadable() {
         let parsed = VerificationReport::from_json_slice(REAL_NO_RESULT_REPORT.as_bytes())
             .expect("a documented no-result report must parse");
-        assert_eq!(parsed.verdict, "no_result");
+        assert_eq!(parsed.verdict, Verdict::NoResult);
         assert!(parsed.comparison.is_none());
     }
 
@@ -531,5 +737,103 @@ mod tests {
             "compared_log_messages": {"left": 1, "right": 1}
         });
         assert!(VerificationReport::from_json_value(malformed).is_err());
+    }
+
+    #[test]
+    fn typed_no_result_reason_round_trips_and_unknown_values_are_refused() {
+        let current = serde_json::to_value(VerificationReport::no_result()).unwrap();
+        let parsed = VerificationReport::from_current_json_value(current.clone())
+            .expect("the typed not-run reason must round-trip");
+        assert_eq!(parsed.no_result_reason, Some(NoResultReason::NotRun));
+
+        // A comparator refusal is also a current no-result outcome, but it is
+        // written without this pre-run/first-run reason. Preserve that distinct
+        // producer state rather than inventing a reason on its behalf.
+        let mut comparator_refusal = current.clone();
+        comparator_refusal
+            .as_object_mut()
+            .unwrap()
+            .remove("no_result_reason");
+        let parsed = VerificationReport::from_current_json_value(comparator_refusal)
+            .expect("a current comparator refusal may have no run reason");
+        assert_eq!(parsed.no_result_reason, None);
+
+        let mut unknown = current;
+        unknown["no_result_reason"] = serde_json::json!({"kind": "never_ran"});
+        let error = VerificationReport::from_current_json_value(unknown)
+            .expect_err("an unknown no-result reason must be refused");
+        assert!(
+            error.contains("unknown variant"),
+            "refusal must identify the unknown typed reason: {error}"
+        );
+    }
+
+    #[test]
+    fn current_comparison_requires_every_producer_field_by_name() {
+        let mut current = serde_json::json!({
+            "verified": true,
+            "bitwise_parity": true,
+            "verdict": "matched",
+            "comparison": {
+                "strictness": "canonical",
+                "display_name": "BitwiseInfoV1",
+                "compare_logs": true,
+                "compare_io_buffers": true,
+                "log_scope": "info",
+                "record_envelope": "all_records_v1",
+                "virtualize_time": true,
+                "strip_lines": false,
+                "canonicalize_addresses": true,
+                "full_trace": true,
+                "exact_remainder": true,
+                "stripped_prefixes": ["real-wall-clock-prefix/v1"],
+                "canonicalizations": ["host-address-to-first-appearance-ordinal/v1"],
+                "ignore_lines": false,
+                "skip_commit": false,
+                "skip_detlog": false
+            },
+            "compared_log_messages": {"left": 1, "right": 1},
+            "guest_exit_code": 0,
+            "guest_signal": null,
+            "first_divergent_scheduler_turn": null,
+            "first_divergent_virtual_nanoseconds": null,
+            "first_divergent_record": null,
+            "first_divergent_syscall": null,
+            "first_divergent_left_message": null,
+            "first_divergent_right_message": null
+        });
+        let parsed = VerificationReport::from_current_json_value(current.clone())
+            .expect("the complete current producer shape must parse");
+        let comparison = parsed.comparison.expect("matched report has comparison");
+        assert_eq!(comparison.compare_io_buffers, Some(true));
+        assert_eq!(comparison.log_scope, Some(ComparedLogScope::Info));
+        assert_eq!(parsed.guest_exit_code, Some(0));
+        current["comparison"]
+            .as_object_mut()
+            .unwrap()
+            .remove("compare_io_buffers");
+        let error = VerificationReport::from_current_json_value(current)
+            .expect_err("current comparison missing a producer field must be refused");
+        assert!(
+            error.contains("compare_io_buffers"),
+            "refusal must name the missing comparison field: {error}"
+        );
+    }
+
+    #[test]
+    fn unknown_verdict_is_refused_by_the_shared_type() {
+        let unknown = serde_json::json!({
+            "verified": false,
+            "bitwise_parity": false,
+            "verdict": "partly_matched",
+            "comparison": null,
+            "compared_log_messages": null
+        });
+        let error = VerificationReport::from_json_value(unknown)
+            .expect_err("an unknown verdict must not become a product failure");
+        assert!(
+            error.contains("unknown variant"),
+            "unexpected error: {error}"
+        );
     }
 }

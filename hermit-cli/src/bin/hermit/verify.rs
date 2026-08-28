@@ -20,10 +20,19 @@ use hermit::Context;
 use hermit::Error;
 use hermit::HERMIT_VERIFICATION_DIVERGENCE_EXIT;
 pub(crate) use hermit::Verdict;
+use hermit_manifest_plan::canonical_verdict::ComparedLogMessages;
+use hermit_manifest_plan::canonical_verdict::ComparedLogScope;
+use hermit_manifest_plan::canonical_verdict::ComparisonReport;
+pub(crate) use hermit_manifest_plan::canonical_verdict::DbtCountedBranchComparison;
+pub(crate) use hermit_manifest_plan::canonical_verdict::LogCompareStrictness;
+pub(crate) use hermit_manifest_plan::canonical_verdict::NoResultReason;
+use hermit_manifest_plan::canonical_verdict::RecordEnvelopeReport;
+use hermit_manifest_plan::canonical_verdict::RuntimeStats;
+pub(crate) use hermit_manifest_plan::canonical_verdict::VerificationReport;
+pub(crate) use hermit_manifest_plan::canonical_verdict::VerificationRuntime;
 use pretty_assertions::Comparison;
 use reverie::process::ExitStatus;
 use reverie::process::Output;
-use serde::Serialize;
 use tempfile::NamedTempFile;
 use tempfile::TempPath;
 use tracing::metadata::LevelFilter;
@@ -78,66 +87,6 @@ pub(crate) struct ComparisonOptions {
     pub virtualize_time: bool,
 }
 
-/// How strictly two runs' internal logs are compared — the condition a
-/// [`Verdict`] rests on.
-///
-/// A bare "matched" verdict is meaningless without this. The two modes sit at
-/// opposite ends of the available log comparisons:
-///
-/// - [`Self::Stripped`] normalizes away numeric values, addresses, tmp paths,
-///   and — most importantly — the virtual-time timestamps and syscall
-///   argument/result values that parity exists to check, so a `Matched` verdict
-///   under `Stripped` asserts only "matched after normalizing known-
-///   nondeterministic data", NOT parity. STRIPPING DESTROYS THE ABILITY TO
-///   DETECT A DIFFERENCE.
-/// - [`Self::Canonical`] is the parity mode. It strips the real wall-clock
-///   timestamp prefix only (genuinely irreproducible; done by
-///   `extract_log_messages`), canonicalizes host
-///   memory addresses to an ordinal by first appearance (1, 2, 3…), preserving
-///   identity, ordering, and aliasing while discarding only the host-specific raw
-///   pointer, and compares exactly everything else — virtual-time timestamps,
-///   syscall inputs/results, counts, sizes, flags. CANONICALIZING PRESERVES the
-///   ability to detect a difference (allocation-order and aliasing changes still
-///   diverge), which is the whole point.
-///
-/// Carrying the strictness beside the verdict is the same discipline as
-/// recording the `-j` a byte count was measured at: the value is uninterpretable
-/// without the condition that produced it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LogCompareStrictness {
-    /// `strip_lines = true`, comparing the deterministic Detcore/scheduler
-    /// message subset. Tolerant of limited nondeterminism (numbers, addresses,
-    /// tmp paths, and timestamps are normalized before diffing). NOT a parity
-    /// claim.
-    Stripped,
-    /// The parity mode (`BitwiseInfoV1`): `strip_lines = false` and
-    /// `canonicalize_addresses = true`, comparing every INFO record admitted by
-    /// the named record envelope.
-    /// Only the real wall-clock timestamp prefix is stripped and host addresses
-    /// are canonicalized to first-appearance ordinals; every other byte —
-    /// virtual-time timestamps, raw syscall argument/result values, counts,
-    /// sizes, flags — must match exactly.
-    Canonical,
-}
-
-/// Which captured messages actually participated in the log comparison.
-///
-/// This travels in the typed report so an INFO-parity consumer never has to
-/// infer the observation envelope from the requested logging verbosity. In
-/// particular, explicitly capturing DEBUG does not silently promote those
-/// diagnostics into the `BitwiseInfoV1` verdict.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ComparedLogScope {
-    /// The legacy selected DETLOG/scheduler subset used by stripped verification.
-    Deterministic,
-    /// Every INFO message, exactly; DEBUG/TRACE captures remain diagnostic.
-    Info,
-    /// Every captured message, selected only by explicit diagnostic verification.
-    FullTrace,
-}
-
 /// Versioned policy token: the only strippable datum is the real wall-clock
 /// timestamp PREFIX. Recorded in [`ComparisonSpec::stripped_prefixes`] so a
 /// consumer sees exactly which prefixes were removed, not a bare boolean.
@@ -175,7 +124,7 @@ const PARITY_CANONICALIZATIONS: &[&str] = &[CANON_ADDRESS_ORDINAL_V1];
 /// can require `strip_lines == false`, `full_trace == true`, and an INFO-or-
 /// stronger [`Self::log_scope`] directly, rather than having to know how a
 /// strictness label maps onto the diff engine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ComparisonSpec {
     /// The strictness label the comparison ran under.
     pub strictness: LogCompareStrictness,
@@ -446,7 +395,7 @@ impl ComparisonSpec {
 /// selections "match" trivially. Carrying the counts with the verdict is what
 /// lets a parity consumer require nonzero executed work, exactly as a test
 /// result must carry its executed count.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ComparedLogCounts {
     /// Messages selected for comparison from the first run.
     pub left: usize,
@@ -461,63 +410,22 @@ impl ComparedLogCounts {
     }
 }
 
-/// The typed whole-process DBT counted-branch clocks compared for one verdict.
-///
-/// This is absent for non-DBT verification and for `no_result`: neither case
-/// performed a complete two-run DBT clock comparison. Equal values document a
-/// checked invariant on a match; unequal values name the backend-specific
-/// dimension that made the verdict diverge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct DbtCountedBranchComparison {
-    /// Whole-process counted branches from run 1.
-    pub left: u64,
-    /// Whole-process counted branches from run 2.
-    pub right: u64,
-}
-
-/// Totals from one completed Hermit execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct RunRuntime {
-    pub scheduler_turns: u64,
-    pub virtual_nanoseconds: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub syscalls: Option<u64>,
-}
-
-impl From<&RunSummary> for RunRuntime {
-    fn from(summary: &RunSummary) -> Self {
-        Self {
-            scheduler_turns: summary.sched_turns,
-            virtual_nanoseconds: summary.virttime_elapsed,
-            syscalls: summary.syscalls,
-        }
+fn runtime_stats(summary: &RunSummary) -> RuntimeStats {
+    RuntimeStats {
+        scheduler_turns: summary.sched_turns,
+        virtual_nanoseconds: summary.virttime_elapsed,
+        syscalls: summary.syscalls,
     }
 }
 
-/// Runtime totals for the two executions compared by verification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct VerificationRuntime {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub run1: Option<RunRuntime>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub run2: Option<RunRuntime>,
-}
-
-impl VerificationRuntime {
-    pub fn from_summaries(run1: Option<&RunSummary>, run2: Option<&RunSummary>) -> Option<Self> {
-        (run1.is_some() || run2.is_some()).then(|| Self {
-            run1: run1.map(RunRuntime::from),
-            run2: run2.map(RunRuntime::from),
-        })
-    }
-}
-
-impl DbtCountedBranchComparison {
-    /// Whether both completed runs reported the same counted-branch clock.
-    #[cfg(feature = "dbt")]
-    pub fn matched(self) -> bool {
-        self.left == self.right
-    }
+pub(crate) fn verification_runtime_from_summaries(
+    run1: Option<&RunSummary>,
+    run2: Option<&RunSummary>,
+) -> Option<VerificationRuntime> {
+    (run1.is_some() || run2.is_some()).then(|| VerificationRuntime {
+        run1: run1.map(runtime_stats),
+        run2: run2.map(runtime_stats),
+    })
 }
 
 /// The full outcome of comparing two runs: the verification [`Verdict`] plus the
@@ -602,181 +510,91 @@ impl VerificationOutcome {
     }
 }
 
-/// Machine-readable verification report written by `--verify-json`.
-///
-/// Every field carries the condition it describes: `verified`/`verdict` is the
-/// verification result, `comparison` is the comparison that produced it, and
-/// `guest_exit_code`/`guest_signal` describe the guest's own termination. A
-/// consumer keys its decision on `verified` — but a *parity* consumer must not:
-/// `verified` under a stripped comparison, an opaque filtered subset, or an
-/// output-only fallback is not a bitwise-parity claim. Such a consumer reads
-/// [`Self::bitwise_parity`] (or checks the `comparison` fields directly), which
-/// is `true` only when the verdict rests on a full-INFO, named canonical record
-/// envelope, unstripped log comparison, and syscall output-buffer hashes.
-#[derive(Debug, Clone, Serialize)]
-pub struct VerificationReport {
-    /// True iff the two runs matched (the verdict as a boolean).
-    pub verified: bool,
-    /// True iff the runs matched *and* the comparison that certified the match
-    /// satisfies the bitwise INFO-parity contract (see
-    /// [`ComparisonSpec::is_bitwise_parity`]). A determinism / record-replay
-    /// ratchet keys on this single boolean; it can never be silently weakened to
-    /// a stripped or filtered compare, or one missing syscall output-buffer
-    /// hashes, because every such match sets it `false`.
-    pub bitwise_parity: bool,
-    /// The verdict as a stable string ("matched" / "diverged").
-    pub verdict: Verdict,
-    /// Why the verdict is [`Verdict::NoResult`]; `None` for a real verdict.
-    /// See [`NoResultReason`] for why an untyped `no_result` was not enough.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub no_result_reason: Option<NoResultReason>,
-    /// The common output/log comparison used for the verdict. Without this a
-    /// bitwise-parity consumer cannot distinguish a stripped match from a bitwise one.
-    /// Backend-specific dimensions are carried separately below. `null`
-    /// when no verdict was reached (see [`Verdict::NoResult`]).
-    pub comparison: Option<ComparisonSpec>,
-    /// How many messages in [`ComparisonSpec::log_scope`] were actually compared.
-    /// `null` means the log comparison did not run. A strict *configuration* is
-    /// not proof that the configured comparison had data, so this count is what makes
-    /// [`Self::bitwise_parity`] falsifiable.
-    pub compared_log_messages: Option<ComparedLogCounts>,
-    /// Typed whole-process DBT counted-branch clocks. Omitted for non-DBT
-    /// verification and for `no_result`; unequal values identify a branch-clock
-    /// divergence that can exist even when the canonical log comparison matched.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dbt_counted_branches: Option<DbtCountedBranchComparison>,
-    /// Runtime totals for run 1 and run 2 when available.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub runtime: Option<VerificationRuntime>,
-    /// The guest's exit code, if it exited normally.
-    pub guest_exit_code: Option<i32>,
-    /// The guest's terminating signal number, if it was killed by a signal.
-    pub guest_signal: Option<i32>,
-    /// Scheduler turn at the first log divergence, or `null` when the logs
-    /// matched or no preceding COMMIT metadata was available.
-    pub first_divergent_scheduler_turn: Option<u64>,
-    /// Virtual nanoseconds at that same point, with the same nullability rules.
-    pub first_divergent_virtual_nanoseconds: Option<u64>,
-    /// 1-based index of the first differing compared record, or `null` when the
-    /// logs matched or no comparison ran. `null` and `0` are NOT the same claim:
-    /// null is "no divergence located", while a hypothetical 0 would mean the
-    /// very first record differed. Nothing writes 0 -- the index is 1-based.
-    pub first_divergent_record: Option<usize>,
-    /// How many syscalls the guest had COMPLETED when the divergence appeared,
-    /// from detcore's own `finish syscall #N` counter. See the identically
-    /// named field on [`VerificationOutcome`].
-    pub first_divergent_syscall: Option<u64>,
-    /// First differing compared message from the left execution, with only the
-    /// separately recorded syscall number, scheduler turn, and committed time
-    /// removed.
-    pub first_divergent_left_message: Option<String>,
-    /// Corresponding first differing compared message from the right execution.
-    pub first_divergent_right_message: Option<String>,
-}
-
-/// WHY a `no_result` record is a `no_result`.
-///
-/// ⚠️ THIS EXISTS BECAUSE `no_result` COLLAPSED CAUSES THAT NEED OPPOSITE
-/// RESPONSES. [`Verdict::NoResult`]'s own doc already lists several ("a run
-/// failed to start, the first run's exit status was rejected, SaBRe captured no
-/// DETLOG, recording failed"), and the artifact recorded none of them. Measured
-/// consequence: a guest that merely exits nonzero (`/bin/false`) and a cell
-/// whose container failed produce BYTE-IDENTICAL artifacts -- 141 bytes of
-/// stderr, `verdict=no_result`, and every field null. So a DESIGNED fail-closed
-/// refusal and an ACCIDENTAL container death were indistinguishable to the
-/// harness, which is why 14 rotating e2e failures could not be diagnosed from
-/// retained evidence at all.
-///
-/// ⚠️ AND THE DISPOSITION WAS KNOWN AND DISCARDED. At the rejected-first-run
-/// site the exit status is in hand; `guest_exit_code` was still written null,
-/// because the pre-stamped record was never updated on that path. Recording the
-/// reason without the disposition would leave the same gap one level up.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum NoResultReason {
-    /// Stamped before verification runs. If this survives to the reader, the
-    /// invocation died before it reached any of the cases below -- which is
-    /// itself information, and distinct from "we did not record why".
-    NotRun,
-    /// Run 1 completed and its exit status was rejected by `--verify-allow`.
-    /// The guest ran; its disposition is recorded here rather than inferred.
-    FirstRunRejected {
-        exit_code: Option<i32>,
-        signal: Option<i32>,
-        /// Bytes the guest wrote before it stopped. Zero on BOTH streams is the
-        /// signature that could not previously be told apart from a container
-        /// that never started the guest at all.
-        stdout_bytes: usize,
-        stderr_bytes: usize,
-    },
-}
-
-impl VerificationReport {
-    /// The record stamped before verification runs: no verdict has been reached
-    /// yet, so nothing may read as verified or as parity.
-    pub fn no_result() -> Self {
-        VerificationReport {
-            verified: false,
-            bitwise_parity: false,
-            verdict: Verdict::NoResult,
-            no_result_reason: Some(NoResultReason::NotRun),
-            comparison: None,
-            compared_log_messages: None,
-            dbt_counted_branches: None,
-            runtime: None,
-            guest_exit_code: None,
-            guest_signal: None,
-            first_divergent_scheduler_turn: None,
-            first_divergent_virtual_nanoseconds: None,
-            first_divergent_record: None,
-            first_divergent_syscall: None,
-            first_divergent_left_message: None,
-            first_divergent_right_message: None,
-        }
+fn comparison_report(comparison: &ComparisonSpec) -> ComparisonReport {
+    ComparisonReport {
+        strictness: comparison.strictness,
+        display_name: Some(comparison.display_name.to_string()),
+        compare_logs: comparison.compare_logs,
+        compare_io_buffers: Some(comparison.compare_io_buffers),
+        log_scope: Some(comparison.log_scope),
+        record_envelope: match comparison.record_envelope {
+            RecordEnvelopePolicy::AllRecordsV1 => RecordEnvelopeReport::AllRecordsV1,
+            RecordEnvelopePolicy::DbtEvidenceTransportV1 => {
+                RecordEnvelopeReport::DbtEvidenceTransportV1
+            }
+            RecordEnvelopePolicy::CallerDefined => RecordEnvelopeReport::CallerDefined,
+        },
+        virtualize_time: Some(comparison.virtualize_time),
+        strip_lines: Some(comparison.strip_lines),
+        canonicalize_addresses: Some(comparison.canonicalize_addresses),
+        full_trace: Some(comparison.full_trace),
+        exact_remainder: Some(comparison.exact_remainder),
+        stripped_prefixes: Some(
+            comparison
+                .stripped_prefixes
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+        ),
+        canonicalizations: Some(
+            comparison
+                .canonicalizations
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+        ),
+        ignore_lines: Some(comparison.ignore_lines),
+        skip_commit: Some(comparison.skip_commit),
+        skip_detlog: Some(comparison.skip_detlog),
     }
 }
 
-impl From<&VerificationOutcome> for VerificationReport {
-    fn from(outcome: &VerificationOutcome) -> Self {
-        VerificationReport {
-            verified: outcome.verified(),
-            // Bitwise parity is a conjunction: the runs matched AND the
-            // comparison was strict enough for the match to *mean* bitwise
-            // identity. A `Diverged` verdict is never bitwise parity.
-            // Three-way conjunction: the runs matched, the comparison was
-            // strict enough for the match to *mean* bitwise identity, AND that
-            // comparison actually consumed log evidence. The third conjunct is
-            // not redundant: an empty-vs-empty log comparison reports "no
-            // difference" under the strictest possible spec, so without a
-            // nonzero count a run that produced no DETLOG at all would certify
-            // as bitwise parity.
-            bitwise_parity: outcome.verified()
-                && outcome.comparison.is_bitwise_parity()
-                && outcome
-                    .compared_log_messages
-                    .is_some_and(|counts| counts.is_nonzero()),
-            verdict: outcome.verdict,
-            // A verdict reached through the outcome path has no refusal to
-            // explain. The rejected-first-run path never builds an outcome, so
-            // it writes its own reason at the site where the status is in hand.
-            no_result_reason: None,
-            comparison: Some(outcome.comparison),
-            compared_log_messages: outcome.compared_log_messages,
-            dbt_counted_branches: if outcome.verdict == Verdict::NoResult {
-                None
-            } else {
-                outcome.dbt_counted_branches
-            },
-            runtime: outcome.runtime,
-            guest_exit_code: outcome.guest_status.code(),
-            guest_signal: outcome.guest_status.signal(),
-            first_divergent_scheduler_turn: outcome.first_divergent_scheduler_turn,
-            first_divergent_virtual_nanoseconds: outcome.first_divergent_virtual_nanoseconds,
-            first_divergent_record: outcome.first_divergent_record,
-            first_divergent_syscall: outcome.first_divergent_syscall,
-            first_divergent_left_message: outcome.first_divergent_left_message.clone(),
-            first_divergent_right_message: outcome.first_divergent_right_message.clone(),
-        }
+pub(crate) fn verification_report(outcome: &VerificationOutcome) -> VerificationReport {
+    VerificationReport {
+        verified: outcome.verified(),
+        // Bitwise parity is a conjunction: the runs matched AND the
+        // comparison was strict enough for the match to *mean* bitwise
+        // identity. A `Diverged` verdict is never bitwise parity.
+        // Three-way conjunction: the runs matched, the comparison was
+        // strict enough for the match to *mean* bitwise identity, AND that
+        // comparison actually consumed log evidence. The third conjunct is
+        // not redundant: an empty-vs-empty log comparison reports "no
+        // difference" under the strictest possible spec, so without a
+        // nonzero count a run that produced no DETLOG at all would certify
+        // as bitwise parity.
+        bitwise_parity: outcome.verified()
+            && outcome.comparison.is_bitwise_parity()
+            && outcome
+                .compared_log_messages
+                .is_some_and(|counts| counts.is_nonzero()),
+        verdict: outcome.verdict,
+        // A verdict reached through the outcome path has no refusal to
+        // explain. The rejected-first-run path never builds an outcome, so
+        // it writes its own reason at the site where the status is in hand.
+        no_result_reason: None,
+        comparison: Some(comparison_report(&outcome.comparison)),
+        compared_log_messages: outcome
+            .compared_log_messages
+            .map(|counts| ComparedLogMessages {
+                left: u64::try_from(counts.left).expect("compared log count fits u64"),
+                right: u64::try_from(counts.right).expect("compared log count fits u64"),
+            }),
+        dbt_counted_branches: if outcome.verdict == Verdict::NoResult {
+            None
+        } else {
+            outcome.dbt_counted_branches
+        },
+        runtime: outcome.runtime.clone(),
+        guest_exit_code: outcome.guest_status.code(),
+        guest_signal: outcome.guest_status.signal(),
+        first_divergent_scheduler_turn: outcome.first_divergent_scheduler_turn,
+        first_divergent_virtual_nanoseconds: outcome.first_divergent_virtual_nanoseconds,
+        first_divergent_record: outcome
+            .first_divergent_record
+            .map(|record| u64::try_from(record).expect("divergent record index fits u64")),
+        first_divergent_syscall: outcome.first_divergent_syscall,
+        first_divergent_left_message: outcome.first_divergent_left_message.clone(),
+        first_divergent_right_message: outcome.first_divergent_right_message.clone(),
     }
 }
 
@@ -786,7 +604,7 @@ impl From<&VerificationOutcome> for VerificationReport {
 /// true or false based on whether verification matched, regardless of what the
 /// guest exited with.
 pub fn write_verification_json(path: &Path, outcome: &VerificationOutcome) -> Result<(), Error> {
-    write_report_json(path, &VerificationReport::from(outcome))
+    write_report_json(path, &verification_report(outcome))
 }
 
 /// Publish an explicit NO-RESULT record to `path` *before* verification starts.
@@ -1568,7 +1386,7 @@ mod tests {
             outcome.compared_log_messages,
             Some(ComparedLogCounts { left: 0, right: 0 })
         );
-        let report = VerificationReport::from(&outcome);
+        let report = verification_report(&outcome);
         assert!(!report.verified);
         assert!(!report.bitwise_parity);
         assert!(
@@ -1651,7 +1469,7 @@ mod tests {
         // The guest status is preserved verbatim, carried *beside* the verdict.
         assert_eq!(outcome.guest_status, ExitStatus::Exited(3));
         // The structured report a `--verify-json` consumer would read:
-        let report = VerificationReport::from(&outcome);
+        let report = verification_report(&outcome);
         assert!(report.verified);
         assert_eq!(report.guest_exit_code, Some(3));
         assert_eq!(report.guest_signal, None);
@@ -1907,7 +1725,7 @@ mod tests {
             matched.compared_log_messages,
             Some(ComparedLogCounts { left: 1, right: 1 })
         );
-        assert!(VerificationReport::from(&matched).bitwise_parity);
+        assert!(verification_report(&matched).bitwise_parity);
 
         // Negative INFO bracket: changing the actual INFO payload must fail even
         // though DEBUG remains outside the parity envelope.
@@ -2000,9 +1818,9 @@ mod tests {
         assert!(canonical.comparison.full_trace);
         // A `--verify-json` consumer reads the strictness from the report and so
         // can refuse to treat a stripped match as parity.
-        let report = VerificationReport::from(&canonical);
+        let report = verification_report(&canonical);
         assert!(!report.verified);
-        assert!(!report.comparison.unwrap().strip_lines);
+        assert_eq!(report.comparison.unwrap().strip_lines, Some(false));
 
         assert!(path1.exists(), "divergent run-1 log must be retained");
         assert!(path2.exists(), "divergent run-2 log must be retained");
@@ -2195,7 +2013,7 @@ mod tests {
             LogCompareStrictness::Canonical,
         )
         .unwrap();
-        let report = VerificationReport::from(&outcome);
+        let report = verification_report(&outcome);
         assert_eq!(report.verdict, Verdict::Diverged);
         assert_eq!(report.first_divergent_scheduler_turn, Some(23));
         assert_eq!(
@@ -2243,7 +2061,7 @@ mod tests {
             LogCompareStrictness::Canonical,
         )
         .unwrap();
-        let report = VerificationReport::from(&outcome);
+        let report = verification_report(&outcome);
         assert_eq!(report.verdict, Verdict::Diverged);
         assert_eq!(report.first_divergent_scheduler_turn, Some(23));
         assert_eq!(
@@ -2291,7 +2109,7 @@ mod tests {
         // The spec still reports a fully-qualifying policy...
         assert!(outcome.comparison.is_bitwise_parity());
         // ...and that is exactly why the count is load-bearing.
-        let report = VerificationReport::from(&outcome);
+        let report = verification_report(&outcome);
         assert!(report.verified);
         assert!(
             !report.bitwise_parity,
@@ -2435,6 +2253,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shared_report_preserves_the_current_no_result_bytes() {
+        let encoded = serde_json::to_string(&VerificationReport::no_result()).unwrap();
+        assert_eq!(
+            encoded,
+            concat!(
+                r#"{"verified":false,"bitwise_parity":false,"verdict":"no_result","#,
+                r#""no_result_reason":{"kind":"not_run"},"comparison":null,"#,
+                r#""compared_log_messages":null,"guest_exit_code":null,"guest_signal":null,"#,
+                r#""first_divergent_scheduler_turn":null,"#,
+                r#""first_divergent_virtual_nanoseconds":null,"#,
+                r#""first_divergent_record":null,"first_divergent_syscall":null,"#,
+                r#""first_divergent_left_message":null,"first_divergent_right_message":null}"#,
+            )
+        );
+    }
+
     /// The positive side of FINDING 1: the pending stamp is not a dead end --
     /// a real verdict still publishes over it.
     #[test]
@@ -2467,7 +2302,7 @@ mod tests {
         let outcome =
             compare_with(&out, log1, &out, log2, LogCompareStrictness::Canonical).unwrap();
 
-        let json = serde_json::to_string(&VerificationReport::from(&outcome)).unwrap();
+        let json = serde_json::to_string(&verification_report(&outcome)).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["verified"], serde_json::json!(true));
         assert_eq!(parsed["verdict"], serde_json::json!("matched"));
@@ -2570,7 +2405,7 @@ mod tests {
                 "parity must not depend on the time policy: the record/replay path \
                  qualifies for parity while running with virtualize_time false"
             );
-            let json = serde_json::to_value(spec).unwrap();
+            let json = serde_json::to_value(comparison_report(&spec)).unwrap();
             assert_eq!(
                 json["virtualize_time"],
                 serde_json::json!(virtualize_time),
@@ -2696,7 +2531,7 @@ mod tests {
             first_divergent_left_message: None,
             first_divergent_right_message: None,
         };
-        assert!(!VerificationReport::from(&diverged).bitwise_parity);
+        assert!(!verification_report(&diverged).bitwise_parity);
     }
 
     #[test]
@@ -2713,10 +2548,10 @@ mod tests {
             syscalls: Some(6),
             ..Default::default()
         };
-        let runtime = VerificationRuntime::from_summaries(Some(&first), Some(&second))
+        let runtime = verification_runtime_from_summaries(Some(&first), Some(&second))
             .expect("two summaries produce runtime totals");
-        assert_eq!(runtime.run1.unwrap().scheduler_turns, 12);
-        assert_eq!(runtime.run2.unwrap().syscalls, Some(6));
+        assert_eq!(runtime.run1.as_ref().unwrap().scheduler_turns, 12);
+        assert_eq!(runtime.run2.as_ref().unwrap().syscalls, Some(6));
 
         let mut report = VerificationReport::no_result();
         report.runtime = Some(runtime);
@@ -2743,7 +2578,7 @@ mod tests {
             RecordEnvelope::dbt_evidence_transport_v1(),
         )
         .unwrap();
-        let report = VerificationReport::from(&outcome);
+        let report = verification_report(&outcome);
 
         assert_eq!(outcome.verdict, Verdict::Matched);
         assert_eq!(
@@ -2775,7 +2610,7 @@ mod tests {
             RecordEnvelope::dbt_evidence_transport_v1(),
         )
         .unwrap();
-        let report = VerificationReport::from(&outcome);
+        let report = verification_report(&outcome);
         let json = serde_json::to_value(&report).unwrap();
 
         assert_eq!(
@@ -2806,7 +2641,7 @@ mod tests {
             RecordEnvelope::caller_defined(keep_everything),
         )
         .unwrap();
-        let report = VerificationReport::from(&outcome);
+        let report = verification_report(&outcome);
         let json = serde_json::to_value(&report).unwrap();
 
         assert!(outcome.verified());
