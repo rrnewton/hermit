@@ -16,6 +16,8 @@
   "preflight_nodes": [
     "pre.submodules",
     "pre.reverie_pin",
+    "setup.manifest_plan",
+    "gate.manifest",
     "check.skill_discovery",
     "check.exit_status_class",
     "check.shard_coverage",
@@ -28,11 +30,9 @@
     "check.check_outcome_consumers",
     "check.lint_checks",
     "check.script_sigpipe",
-    "lint.rustfmt",
-    "gate.manifest"
+    "lint.rustfmt"
   ],
   "build_debug_nodes": [
-    "setup.manifest_plan",
     "e2e.audit_compile_backend_parity_c",
     "setup.nextest",
     "build.workspace",
