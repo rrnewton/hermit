@@ -1013,12 +1013,13 @@ jobs:
 
           test -s "$out/results.jsonl"
           test -s "$out/junit.xml"
-          test -d "$captures"
           mkdir -p "$stage/captures"
           cp "$out/results.jsonl" "$stage/results.jsonl"
           cp "$out/junit.xml" "$stage/junit.xml"
           cp "$out/summary.json" "$stage/summary.json"
-          cp -a "$captures/." "$stage/captures/"
+          if [[ -d "$captures" ]]; then
+            cp -a "$captures/." "$stage/captures/"
+          fi
           jq -n \
             --arg repository_sha "$GITHUB_SHA" \
             --arg lane portable \
