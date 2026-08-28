@@ -290,6 +290,7 @@ pub fn node(
         description: String::new(),
         cmd,
         cmdtype: CmdType::Unknown,
+        manifest: None,
         deps,
         env: BTreeMap::new(),
         hint: ResourceHint {
