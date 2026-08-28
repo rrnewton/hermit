@@ -50,7 +50,10 @@ The path is deliberately direct:
    durable result directory. Every row includes the validate attempt number,
    cell `duration_ms`, the `timeout_seconds` used for that attempt, literal
    argv, explicit environment, working directory, and pasteable shell command.
-   A retry adds another row; it does not replace the earlier observation.
+   The framework also writes the existing pressure `result` value and an
+   explicit `failure_class`; `error_kind` remains the narrower mechanism. A
+   retry adds another row rather than replacing the earlier observation, so a
+   change such as `determinism-failure` then `crash-error` is retained.
    `attempts[].cpu_usage_usec` records `wait4` user-plus-system CPU for that
    launched child and descendants it reaped. The row-level `cpu_usage_usec`
    adds preparation and every launched attempt with checked arithmetic; it is
