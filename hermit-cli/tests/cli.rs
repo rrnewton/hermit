@@ -209,6 +209,12 @@ fn read_terminal_dbt_verdict(path: &Path) -> serde_json::Value {
     verdict
 }
 
+fn write_matching_liteinst_revision(runtime: &Path) {
+    let revision = PathBuf::from(format!("{}.revision", runtime.display()));
+    fs::write(revision, format!("{}\n", env!("HERMIT_REVERIE_PIN")))
+        .expect("failed to write LiteInst runtime revision fixture");
+}
+
 fn liteinst_inert_runtime() -> &'static Path {
     LITEINST_INERT_RUNTIME.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -230,6 +236,7 @@ fn liteinst_inert_runtime() -> &'static Path {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
+        write_matching_liteinst_revision(&runtime);
         runtime
     })
 }
@@ -879,6 +886,7 @@ fn run_dbt_uses_the_requested_guest_environment() {
     );
 }
 
+// TODO(#2791): Remove the portable test.cli skip when DBT env-shebang defect #2805 is fixed.
 #[test]
 fn run_dbt_verifies_simple_env_shebang() {
     if dbt_unavailable("run_dbt_verifies_simple_env_shebang") {
@@ -1162,6 +1170,7 @@ fn run_ptrace_fails_closed_by_default_on_unsupported_syscall() {
 }
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review DBT normal aggregation and strict failure coverage.
+// TODO(#2791): Remove the portable test.cli skip when DBT aggregation defect #2804 is fixed.
 #[test]
 fn run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls() {
     if dbt_unavailable(
@@ -1535,6 +1544,11 @@ fn inherited_container_output_does_not_expose_capture_offset() {
 
 #[test]
 fn run_liteinst_rejects_a_non_runtime_override_before_activation_claim() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create false LiteInst runtime directory");
+    let runtime = directory.path().join("not-a-liteinst-runtime");
+    fs::copy("/bin/true", &runtime).expect("failed to copy false LiteInst runtime fixture");
+    write_matching_liteinst_revision(&runtime);
     let args = [
         "run",
         "--backend",
@@ -1544,7 +1558,7 @@ fn run_liteinst_rejects_a_non_runtime_override_before_activation_claim() {
         "/bin/true",
     ];
     let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .env("HERMIT_LITEINST_RUNTIME", "/bin/true")
+        .env("HERMIT_LITEINST_RUNTIME", &runtime)
         .args(args)
         .output()
         .expect("failed to run Hermit with a false LiteInst runtime");
@@ -1739,6 +1753,7 @@ fn run_dbt_uses_the_normalized_backend_config() {
 }
 
 // TODO-HUMAN-REVIEW(PR-1038): Review DBT queued self-signal verification.
+// TODO(#2791): Remove the portable test.cli skip when DBT queued-signal defect #1818 is fixed.
 #[test]
 fn run_dbt_verifies_queued_self_signals() {
     if dbt_unavailable("run_dbt_verifies_queued_self_signals") {
@@ -1931,6 +1946,7 @@ fn run_dbt_virtualizes_process_identities() {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1065): Review DBT self-prlimit L2 coverage.
+// TODO(#2791): Remove the portable test.cli skip when DBT self-prlimit defect #2806 is fixed.
 #[test]
 fn run_dbt_verifies_self_prlimit() {
     if dbt_unavailable("run_dbt_verifies_self_prlimit") {
@@ -1959,6 +1975,7 @@ fn run_dbt_verifies_self_prlimit() {
     );
 }
 
+// TODO(#2791): Remove the portable test.cli skip when DBT process-group defect #605 is fixed.
 #[test]
 fn run_dbt_verifies_shell_process_lifecycle() {
     if dbt_unavailable("run_dbt_verifies_shell_process_lifecycle") {

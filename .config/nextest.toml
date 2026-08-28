@@ -57,6 +57,13 @@ slow-timeout = { period = "30s", terminate-after = 1, grace-period = "2s" }
 filter = "test(/(^|::)run_timeout_fallback_fires_when_the_unwind_does_not_finish$/)"
 slow-timeout = { period = "30s", terminate-after = 1, grace-period = "2s" }
 
+# The canonical DAG builds the runtime prerequisites before this test. The
+# exact test then measured 15.758s; 90s leaves 5.7x headroom while remaining
+# inside the smallest 120s enclosing lane deadline (including 2s teardown).
+[[profile.default.overrides]]
+filter = "test(/(^|::)run_liteinst_verifies_detcore_backend$/)"
+slow-timeout = { period = "90s", terminate-after = 1, grace-period = "2s" }
+
 # This binary deliberately exercises a 15s timeout and a 20s teardown budget.
 # Once the previously unregistered binary actually ran, one of
 # its sibling tests hit the 15s default at 15.002s. Give all three tests the
