@@ -263,6 +263,10 @@ test:
           native: zstd fixes job boundaries by input offset, not by which worker claims a job, so the frame is deterministic by construction natively; this is a mechanism test, not a native-variance test
       verify:
         ci: true
+        timeout_seconds:
+          ptrace: 30
+        slow_reason:
+          ptrace: Current hermetic validation timed out at 14.621 and 14.627 seconds after reaching the second verification run; retained passing runs measured 14.612 and 21.323 seconds, so 30 seconds restores bounded headroom.
         backends_enabled:
           - ptrace
         backends_disabled:
