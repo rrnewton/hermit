@@ -1207,7 +1207,7 @@ impl ResultRow {
                     )
                 })?,
                 "FAIL"
-                    if report.verdict == "diverged"
+                    if report.verdict == canonical_verdict::Verdict::Diverged
                         && !report.verified
                         && !report.bitwise_parity => {}
                 "FAIL" => {
@@ -4754,7 +4754,10 @@ fn admit_current_dbt_divergence_without_retained_logs(
     report.require_canonical_comparison().map_err(|error| {
         format!("DBT row missing retained run logs has no canonical comparison to import: {error}")
     })?;
-    if report.verdict != "diverged" || report.verified || report.bitwise_parity {
+    if report.verdict != canonical_verdict::Verdict::Diverged
+        || report.verified
+        || report.bitwise_parity
+    {
         return Err(format!(
             "DBT row missing retained run logs is not a canonical divergence: verdict={} verified={} bitwise_parity={}",
             report.verdict, report.verified, report.bitwise_parity
@@ -5551,14 +5554,30 @@ fn self_test() -> Result<(), String> {
                 let report = serde_json::to_string(&canonical_verdict::VerificationReport {
                     verified: true,
                     bitwise_parity: true,
-                    verdict: "matched".into(),
+                    verdict: canonical_verdict::Verdict::Matched,
+                    no_result_reason: None,
                     // `Some`: this fixture is a REACHED verdict (verified,
                     // bitwise_parity, "matched"). `None` is reserved for the
                     // documented producer no-result state.
                     comparison: Some(canonical_verdict::ComparisonReport {
-                        strictness: "canonical".into(),
+                        strictness: canonical_verdict::LogCompareStrictness::Canonical,
+                        display_name: Some("BitwiseInfoV1".into()),
                         compare_logs: true,
+                        compare_io_buffers: Some(true),
+                        log_scope: Some(canonical_verdict::ComparedLogScope::Info),
                         record_envelope: canonical_verdict::RecordEnvelopeReport::AllRecordsV1,
+                        virtualize_time: Some(true),
+                        strip_lines: Some(false),
+                        canonicalize_addresses: Some(true),
+                        full_trace: Some(true),
+                        exact_remainder: Some(true),
+                        stripped_prefixes: Some(vec!["real-wall-clock-prefix/v1".into()]),
+                        canonicalizations: Some(vec![
+                            "host-address-to-first-appearance-ordinal/v1".into(),
+                        ]),
+                        ignore_lines: Some(false),
+                        skip_commit: Some(false),
+                        skip_detlog: Some(false),
                     }),
                     compared_log_messages: Some(canonical_verdict::ComparedLogMessages {
                         left: 1,
@@ -5567,6 +5586,9 @@ fn self_test() -> Result<(), String> {
                     // This fixture predates runtime totals. Keep "not recorded"
                     // distinct from a measured zero.
                     runtime: None,
+                    dbt_counted_branches: None,
+                    guest_exit_code: Some(0),
+                    guest_signal: None,
                     // A matched verdict located no divergence, so both
                     // positions are absent -- the same value a pre-field
                     // report carries.
@@ -5914,14 +5936,30 @@ red/`measured-and-passed` count is **0**.",
                 verified: result == "pass",
                 bitwise_parity: result == "pass",
                 verdict: if result == "pass" {
-                    "matched".into()
+                    canonical_verdict::Verdict::Matched
                 } else {
-                    "diverged".into()
+                    canonical_verdict::Verdict::Diverged
                 },
+                no_result_reason: None,
                 comparison: Some(canonical_verdict::ComparisonReport {
-                    strictness: "canonical".into(),
+                    strictness: canonical_verdict::LogCompareStrictness::Canonical,
+                    display_name: Some("BitwiseInfoV1".into()),
                     compare_logs: true,
+                    compare_io_buffers: Some(true),
+                    log_scope: Some(canonical_verdict::ComparedLogScope::Info),
                     record_envelope: canonical_verdict::RecordEnvelopeReport::AllRecordsV1,
+                    virtualize_time: Some(true),
+                    strip_lines: Some(false),
+                    canonicalize_addresses: Some(true),
+                    full_trace: Some(true),
+                    exact_remainder: Some(true),
+                    stripped_prefixes: Some(vec!["real-wall-clock-prefix/v1".into()]),
+                    canonicalizations: Some(vec![
+                        "host-address-to-first-appearance-ordinal/v1".into(),
+                    ]),
+                    ignore_lines: Some(false),
+                    skip_commit: Some(false),
+                    skip_detlog: Some(false),
                 }),
                 compared_log_messages: Some(canonical_verdict::ComparedLogMessages {
                     left: 100,
@@ -5934,6 +5972,9 @@ red/`measured-and-passed` count is **0**.",
                 first_divergent_left_message: None,
                 first_divergent_right_message: None,
                 runtime: None,
+                dbt_counted_branches: None,
+                guest_exit_code: Some(0),
+                guest_signal: None,
             }
         };
     let pressure_row = |result: &str, turn: Option<u64>, virtual_nanoseconds| PressureSummaryRow {
@@ -6677,7 +6718,7 @@ red/`measured-and-passed` count is **0**.",
         .as_mut()
         .and_then(|report| report.comparison.as_mut())
         .expect("fixture report has comparison")
-        .strictness = "stripped".into();
+        .strictness = canonical_verdict::LogCompareStrictness::Stripped;
     if checked_current_pressure_result(
         &dbt_tracked,
         pressure_summary("sha-1", "tree-1", vec![weak_dbt]),
