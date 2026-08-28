@@ -189,7 +189,9 @@ fn run_liteinst_with_input(
             "--env=XDG_CONFIG_HOME={}",
             xdg_config_home.display()
         ))
-        .env("HOME", home.path());
+        .arg("--env=PYTHONDONTWRITEBYTECODE=1")
+        .env("HOME", home.path())
+        .env("PYTHONDONTWRITEBYTECODE", "1");
     command.arg("--").arg(program).args(args);
     let Some(input) = input else {
         return command.output().expect("failed to run Hermit LiteInst");

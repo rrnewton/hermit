@@ -837,6 +837,7 @@ fn python_is_deterministic_under_strict_verify() {
     assert_l2_under_strict_verify(
         &python,
         &[
+            "-B",
             "-c",
             "import sys; print(sys.version); print(sum(range(10000)))",
         ],
