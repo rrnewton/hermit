@@ -2,8 +2,9 @@
 # Run local validate as TWO PHASES separated by a network boundary:
 #
 #   FETCH phase   -- on the host, WITH network, and it does nothing but
-#                    download. `cargo fetch --locked` populates a CARGO_HOME and
-#                    produces no build output at all.
+#                    download. Locked fetches for every Cargo workspace used by
+#                    the offline phase populate one CARGO_HOME and produce no
+#                    build output at all.
 #
 #   OFFLINE phase -- inside the nix-pinned root, with NO network. BUILD AND TEST
 #                    BOTH RUN HERE, against the fetched cache and the pinned
@@ -13,8 +14,9 @@
 # build and test, which left the build with network. Shrinking the network
 # window to a pure download is strictly better, and the reason is worth stating
 # precisely: `cargo fetch --locked` cannot introduce variance, because every
-# byte it writes is checked against Cargo.lock -- exact versions AND content
-# checksums for registry crates, exact revisions for git dependencies. A phase
+# byte it writes is checked against the selected Cargo.lock -- exact versions
+# AND content checksums for registry crates, exact revisions for git
+# dependencies. A phase
 # whose ENTIRE OUTPUT IS CHECKSUM-VERIFIED is a far smaller trust surface than a
 # build phase that merely happens to have network available. Nothing can enter
 # the build from the network except bytes that already matched a hash.
@@ -120,6 +122,10 @@ done
 MAP="$ROOT/ci/portable-shards.json"
 DAG="$ROOT/ci/dag/portable.json"
 EXPECTED_E2E_PLAN="$ROOT/ci/expected-e2e-plan.json"
+FETCH_MANIFESTS=(
+    Cargo.toml
+    liteinst-runtime-build/Cargo.toml
+)
 [[ -f "$MAP" ]] || { echo "run-split-validate: missing $MAP" >&2; exit 2; }
 [[ -f "$DAG" ]] || { echo "run-split-validate: missing $DAG" >&2; exit 2; }
 [[ -f "$EXPECTED_E2E_PLAN" ]] || {
@@ -220,7 +226,9 @@ fi
 if [[ $dry -eq 1 ]]; then
     echo
     echo "-- fetch phase would run, on the host:"
-    echo "   CARGO_HOME=$cargo_home cargo fetch --locked"
+    for manifest in "${FETCH_MANIFESTS[@]}"; do
+        echo "   CARGO_HOME=$cargo_home cargo fetch --locked --manifest-path $manifest"
+    done
     echo "-- offline phase would run, inside the pinned root, --network=none:"
     echo "   ci/hermetic/assert-no-network.sh"
     echo "   verify pinned developer tools, build dependencies and required guest commands"
@@ -259,11 +267,17 @@ if [[ $do_fetch -eq 1 ]]; then
         done
     fi
 
-    # --locked is the point of the phase: resolve to EXACTLY Cargo.lock or fail.
-    # A fetch that is allowed to update the lock is a fetch that can introduce a
-    # version the reviewed lock never named.
-    ( cd "$ROOT" && CARGO_HOME="$cargo_home" cargo fetch --locked )
-    echo ":::: FETCH PHASE complete -- every byte checked against Cargo.lock"
+    # --locked is the point of the phase: resolve to EXACTLY each workspace's
+    # Cargo.lock or fail. The LiteInst runtime is a separate Cargo workspace,
+    # so fetching only the repository root does not close the offline build's
+    # dependency set.
+    (
+        cd "$ROOT"
+        for manifest in "${FETCH_MANIFESTS[@]}"; do
+            CARGO_HOME="$cargo_home" cargo fetch --locked --manifest-path "$manifest"
+        done
+    )
+    echo ":::: FETCH PHASE complete -- every byte checked against its Cargo.lock"
 fi
 
 if [[ $do_offline -eq 1 ]]; then

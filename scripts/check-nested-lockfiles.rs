@@ -148,7 +148,9 @@ fn probe_workspace(root: &Path, workspace: &str) -> Result<Result<(), String>, S
     if output.status.success() {
         Ok(Ok(()))
     } else {
-        Ok(Err(String::from_utf8_lossy(&output.stderr).trim().to_string()))
+        Ok(Err(String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .to_string()))
     }
 }
 
@@ -223,6 +225,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     #[test]
@@ -238,6 +242,49 @@ mod tests {
         assert!(
             NESTED_WORKSPACES.contains(&"liteinst-runtime-build"),
             "the known nested workspace must be checked"
+        );
+    }
+
+    #[test]
+    fn hermetic_fetch_covers_root_and_nested_workspaces() {
+        let root = git_root().unwrap_or_else(|_| {
+            Path::new(file!())
+                .canonicalize()
+                .expect("checker source path")
+                .parent()
+                .and_then(Path::parent)
+                .expect("checker lives under the repository scripts directory")
+                .to_owned()
+        });
+        let output = Command::new(root.join("ci/hermetic/run-split-validate.sh"))
+            .arg("--dry-run")
+            .current_dir(root)
+            .output()
+            .expect("run split-validate dry-run");
+        assert!(
+            output.status.success(),
+            "split-validate dry-run failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let marker = "cargo fetch --locked --manifest-path ";
+        let actual = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                line.split_once(marker)
+                    .map(|(_, manifest)| manifest.to_owned())
+            })
+            .collect::<BTreeSet<_>>();
+        let expected = std::iter::once("Cargo.toml".to_owned())
+            .chain(
+                NESTED_WORKSPACES
+                    .iter()
+                    .map(|workspace| format!("{workspace}/Cargo.toml")),
+            )
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            expected, actual,
+            "the hermetic fetch phase must cover the root and every checked nested workspace"
         );
     }
 
