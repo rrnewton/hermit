@@ -1090,15 +1090,47 @@ struct SkidOvershootReport {
     enabled: bool,
 }
 
-fn take_skid_overshoot_error() -> Option<Error> {
-    let count = reverie::take_skid_overshoot_count();
-    (count > 0).then(|| {
-        anyhow!(
-            "observed {count} {} report(s); refusing the result because precise PMU timer \
+/// A ptrace-backed run observed late precise-timer delivery, so Hermit refuses
+/// to treat the completed execution as deterministic evidence.
+///
+/// This is a type rather than a message match because it crosses the container
+/// error boundary as [`error::FailureKind::PolicyRefusal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SkidOvershootError {
+    count: u64,
+}
+
+impl SkidOvershootError {
+    pub fn new(count: u64) -> Self {
+        assert!(
+            count > 0,
+            "a skid-overshoot refusal requires a positive count"
+        );
+        Self { count }
+    }
+
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+}
+
+impl std::fmt::Display for SkidOvershootError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "observed {} {} report(s); refusing the result because precise PMU timer \
              delivery passed its target and deterministic execution was not established",
+            self.count,
             reverie::SKID_OVERSHOOT_MARKER
         )
-    })
+    }
+}
+
+impl std::error::Error for SkidOvershootError {}
+
+fn take_skid_overshoot_error() -> Option<SkidOvershootError> {
+    let count = reverie::take_skid_overshoot_count();
+    (count > 0).then(|| SkidOvershootError::new(count))
 }
 
 impl SkidOvershootReport {
@@ -1119,8 +1151,21 @@ impl SkidOvershootReport {
             return result;
         };
         match result {
-            Ok(_) => Err(overshoot),
-            Err(error) => Err(error.context(overshoot.to_string())),
+            Ok(_) => Err(Error::new(overshoot)),
+            Err(error) => Err(error.context(overshoot)),
+        }
+    }
+
+    fn finish_with_count<T>(self, result: Result<T, Error>) -> Result<(T, u64), Error> {
+        if !self.enabled {
+            return result.map(|value| (value, 0));
+        }
+
+        let count = reverie::take_skid_overshoot_count();
+        match result {
+            Ok(value) => Ok((value, count)),
+            Err(error) if count > 0 => Err(error.context(SkidOvershootError::new(count))),
+            Err(error) => Err(error),
         }
     }
 }
@@ -2604,6 +2649,33 @@ pub fn run_with_output_backend_timeout(
     backend: Backend,
     timeout: Option<Duration>,
 ) -> Result<Output, Error> {
+    let (output, skid_overshoots) = run_with_output_backend_timeout_and_skid_overshoots(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        timeout,
+    )?;
+    if skid_overshoots > 0 {
+        return Err(Error::new(SkidOvershootError::new(skid_overshoots)));
+    }
+    Ok(output)
+}
+
+/// Run with captured output and return the number of precise PMU timer
+/// overshoots alongside it instead of refusing before a caller can inspect the
+/// completed output. The `--verify` path uses this to finish and publish its
+/// comparison before it refuses the overshoot-tainted result.
+#[doc(hidden)]
+pub fn run_with_output_backend_timeout_and_skid_overshoots(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    timeout: Option<Duration>,
+) -> Result<(Output, u64), Error> {
     let skid_overshoot_report = SkidOvershootReport::begin(backend.uses_ptrace_pmu_timers());
     if backend == Backend::Kvm {
         ensure_kvm_stdin_reserved()?;
@@ -2617,7 +2689,7 @@ pub fn run_with_output_backend_timeout(
         backend,
         timeout,
     );
-    skid_overshoot_report.finish(result)
+    skid_overshoot_report.finish_with_count(result)
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -3090,6 +3162,13 @@ mod tests {
         reverie::record_skid_overshoot();
         reverie::record_skid_overshoot();
         let error = success.finish(Ok::<_, Error>(7)).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<SkidOvershootError>()
+                .expect("skid refusal must remain typed")
+                .count(),
+            2
+        );
         assert!(
             error
                 .to_string()
@@ -3109,6 +3188,7 @@ mod tests {
         let error = error
             .finish(Err::<(), _>(anyhow!("guest failed")))
             .unwrap_err();
+        assert!(error.downcast_ref::<SkidOvershootError>().is_some());
         let error = format!("{error:#}");
         assert!(error.contains("guest failed"), "{error}");
         assert!(
@@ -3165,6 +3245,19 @@ mod tests {
 
         let report = SkidOvershootReport::begin(true);
         assert_eq!(report.finish(Ok::<_, Error>(7)).unwrap(), 7);
+        assert_eq!(reverie::take_skid_overshoot_count(), 0);
+    }
+
+    #[test]
+    fn skid_overshoot_count_can_cross_the_verify_boundary_with_the_output() {
+        let _lock = SKID_OVERSHOOT_TEST_LOCK.lock().unwrap();
+        let _ = reverie::take_skid_overshoot_count();
+
+        let report = SkidOvershootReport::begin(true);
+        reverie::record_skid_overshoot();
+        let (value, count) = report.finish_with_count(Ok::<_, Error>(7)).unwrap();
+        assert_eq!(value, 7);
+        assert_eq!(count, 1);
         assert_eq!(reverie::take_skid_overshoot_count(), 0);
     }
 

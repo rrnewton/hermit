@@ -17,6 +17,10 @@ pub enum Verdict {
     Diverged,
     /// Verification stopped before it could reach a verdict.
     NoResult,
+    /// Verification completed enough work to name an understood machine or
+    /// harness failure, so the receipt is neither a product verdict nor an
+    /// unknown no-result.
+    InfrastructureError,
 }
 
 impl std::fmt::Display for Verdict {
@@ -25,6 +29,7 @@ impl std::fmt::Display for Verdict {
             Self::Matched => "matched",
             Self::Diverged => "diverged",
             Self::NoResult => "no_result",
+            Self::InfrastructureError => "infrastructure_error",
         })
     }
 }
@@ -49,6 +54,15 @@ pub enum NoResultReason {
         stdout_bytes: u64,
         stderr_bytes: u64,
     },
+}
+
+/// The understood infrastructure failure recorded by verification.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum InfrastructureError {
+    /// A ptrace PMU timer interrupt arrived after its target. Both runs and
+    /// their comparison may still be retained, but the result is not admitted.
+    SkidOvershoot { count: u64 },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -182,6 +196,8 @@ pub struct VerificationReport {
     pub verdict: Verdict,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_result_reason: Option<NoResultReason>,
+    #[serde(default)]
+    pub infrastructure_error: Option<InfrastructureError>,
     /// `None` when the producer reached no verdict. This is a DOCUMENTED
     /// producer state, not a malformed report: `VerificationReport::no_result()`
     /// in hermit-cli sets it, and its doc says "`null` when no verdict was
@@ -276,6 +292,7 @@ impl VerificationReport {
             bitwise_parity: false,
             verdict: Verdict::NoResult,
             no_result_reason: Some(NoResultReason::NotRun),
+            infrastructure_error: None,
             comparison: None,
             compared_log_messages: None,
             dbt_counted_branches: None,
@@ -291,17 +308,43 @@ impl VerificationReport {
         }
     }
 
-    /// `null` is legal ONLY for a report that reached no verdict. The producer
-    /// documents it that way ("`null` when no verdict was reached"), and the
-    /// sibling consumer in ci/compat-envelope/pressure-test.rs already applies
-    /// exactly this rule. A null comparison beside a "matched" verdict is a
-    /// self-contradictory report and stays refused at parse.
-    fn require_null_comparison_matches_verdict(self) -> Result<Self, String> {
-        if self.comparison.is_none() && self.verdict != Verdict::NoResult {
+    /// `null` is legal only when no comparison completed: either the producer
+    /// reached no verdict, or it named an infrastructure error before it could
+    /// compare. A null comparison beside a product verdict is contradictory
+    /// and stays refused at parse.
+    fn require_consistent_outcome_fields(self) -> Result<Self, String> {
+        if self.comparison.is_none()
+            && !matches!(
+                self.verdict,
+                Verdict::NoResult | Verdict::InfrastructureError
+            )
+        {
             return Err(format!(
-                "incomplete verification report: comparison is null but verdict is {}; null is legal only for no_result",
+                "incomplete verification report: comparison is null but verdict is {}; null is legal only for no_result or infrastructure_error",
                 self.verdict
             ));
+        }
+        match (&self.verdict, &self.infrastructure_error) {
+            (Verdict::InfrastructureError, Some(InfrastructureError::SkidOvershoot { count }))
+                if *count > 0 => {}
+            (Verdict::InfrastructureError, Some(InfrastructureError::SkidOvershoot { .. })) => {
+                return Err(
+                    "incomplete verification report: skid_overshoot count must be positive".into(),
+                );
+            }
+            (Verdict::InfrastructureError, None) => {
+                return Err(
+                    "incomplete verification report: infrastructure_error verdict omitted infrastructure_error"
+                        .into(),
+                );
+            }
+            (_, Some(_)) => {
+                return Err(format!(
+                    "inconsistent verification report: verdict={} carries infrastructure_error",
+                    self.verdict
+                ));
+            }
+            (_, None) => {}
         }
         Ok(self)
     }
@@ -312,14 +355,14 @@ impl VerificationReport {
     pub fn from_json_slice(bytes: &[u8]) -> Result<Self, String> {
         serde_json::from_slice::<Self>(bytes)
             .map_err(|error| format!("incomplete verification report: {error}"))?
-            .require_null_comparison_matches_verdict()
+            .require_consistent_outcome_fields()
     }
 
     #[allow(dead_code)] // this file is path-included by consumers that use one parse form
     pub fn from_json_value(value: serde_json::Value) -> Result<Self, String> {
         serde_json::from_value::<Self>(value)
             .map_err(|error| format!("incomplete verification report: {error}"))?
-            .require_null_comparison_matches_verdict()
+            .require_consistent_outcome_fields()
     }
 
     /// Parse a report written by the current producer and require every field
@@ -335,6 +378,7 @@ impl VerificationReport {
             "verified",
             "bitwise_parity",
             "verdict",
+            "infrastructure_error",
             "comparison",
             "compared_log_messages",
             "guest_exit_code",
@@ -559,6 +603,7 @@ mod tests {
             bitwise_parity: true,
             verdict: Verdict::Matched,
             no_result_reason: None,
+            infrastructure_error: None,
             comparison: Some(ComparisonReport {
                 strictness,
                 display_name: None,
@@ -698,6 +743,7 @@ mod tests {
             "verified": true,
             "bitwise_parity": true,
             "verdict": "matched",
+            "infrastructure_error": null,
             "comparison": {"strictness": "canonical", "compare_logs": true},
             "compared_log_messages": {"left": 1, "right": 1}
         });
@@ -719,6 +765,7 @@ mod tests {
             "verified": true,
             "bitwise_parity": true,
             "verdict": "matched",
+            "infrastructure_error": null,
             "comparison": {
                 "strictness": "canonical",
                 "compare_logs": true,
@@ -776,6 +823,7 @@ mod tests {
             "verified": true,
             "bitwise_parity": true,
             "verdict": "matched",
+            "infrastructure_error": null,
             "comparison": {
                 "strictness": "canonical",
                 "display_name": "BitwiseInfoV1",
@@ -837,5 +885,28 @@ mod tests {
             error.contains("unknown variant"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn infrastructure_error_is_distinct_from_no_result_and_requires_a_positive_count() {
+        let mut report =
+            serde_json::to_value(report(LogCompareStrictness::Canonical, true, 1, 1)).unwrap();
+        report["verified"] = serde_json::json!(false);
+        report["bitwise_parity"] = serde_json::json!(false);
+        report["verdict"] = serde_json::json!("infrastructure_error");
+        report["infrastructure_error"] = serde_json::json!({"kind": "skid_overshoot", "count": 2});
+
+        let parsed = VerificationReport::from_json_value(report.clone()).unwrap();
+        assert_eq!(parsed.verdict, Verdict::InfrastructureError);
+        assert_eq!(
+            parsed.infrastructure_error,
+            Some(InfrastructureError::SkidOvershoot { count: 2 })
+        );
+        assert!(parsed.comparison.is_some());
+
+        report["infrastructure_error"]["count"] = serde_json::json!(0);
+        let error = VerificationReport::from_json_value(report)
+            .expect_err("zero cannot describe an observed skid overshoot");
+        assert!(error.contains("count must be positive"), "{error}");
     }
 }

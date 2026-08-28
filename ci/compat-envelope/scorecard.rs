@@ -5669,6 +5669,7 @@ fn self_test() -> Result<(), String> {
                     bitwise_parity: true,
                     verdict: canonical_verdict::Verdict::Matched,
                     no_result_reason: None,
+                    infrastructure_error: None,
                     // `Some`: this fixture is a REACHED verdict (verified,
                     // bitwise_parity, "matched"). `None` is reserved for the
                     // documented producer no-result state.
@@ -6054,6 +6055,7 @@ red/`measured-and-passed` count is **0**.",
                     canonical_verdict::Verdict::Diverged
                 },
                 no_result_reason: None,
+                infrastructure_error: None,
                 comparison: Some(canonical_verdict::ComparisonReport {
                     strictness: canonical_verdict::LogCompareStrictness::Canonical,
                     display_name: Some("BitwiseInfoV1".into()),

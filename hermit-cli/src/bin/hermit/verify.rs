@@ -23,6 +23,7 @@ use hermit::canonical_verdict::ComparedLogMessages;
 use hermit::canonical_verdict::ComparedLogScope;
 use hermit::canonical_verdict::ComparisonReport;
 pub(crate) use hermit::canonical_verdict::DbtCountedBranchComparison;
+use hermit::canonical_verdict::InfrastructureError;
 pub(crate) use hermit::canonical_verdict::LogCompareStrictness;
 pub(crate) use hermit::canonical_verdict::NoResultReason;
 use hermit::canonical_verdict::RecordEnvelopeReport;
@@ -506,6 +507,9 @@ impl VerificationOutcome {
             Verdict::NoResult => Err(Error::msg(
                 "Verification did not reach a verdict (no comparison was performed).",
             )),
+            Verdict::InfrastructureError => {
+                Err(Error::msg("Verification recorded an infrastructure error."))
+            }
         }
     }
 }
@@ -572,6 +576,7 @@ pub(crate) fn verification_report(outcome: &VerificationOutcome) -> Verification
         // explain. The rejected-first-run path never builds an outcome, so
         // it writes its own reason at the site where the status is in hand.
         no_result_reason: None,
+        infrastructure_error: None,
         comparison: Some(comparison_report(&outcome.comparison)),
         compared_log_messages: outcome
             .compared_log_messages
@@ -605,6 +610,50 @@ pub(crate) fn verification_report(outcome: &VerificationOutcome) -> Verification
 /// guest exited with.
 pub fn write_verification_json(path: &Path, outcome: &VerificationOutcome) -> Result<(), Error> {
     write_report_json(path, &verification_report(outcome))
+}
+
+/// Write a completed comparison that cannot be accepted because precise PMU
+/// timer delivery passed its target. The comparison remains available for
+/// diagnosis, while the canonical verdict makes the refusal unambiguous.
+pub fn write_skid_overshoot_verification_json(
+    path: &Path,
+    outcome: &VerificationOutcome,
+    count: u64,
+) -> Result<(), Error> {
+    assert!(
+        count > 0,
+        "a skid-overshoot report requires a positive count"
+    );
+    let mut report = verification_report(outcome);
+    report.verified = false;
+    report.bitwise_parity = false;
+    report.verdict = Verdict::InfrastructureError;
+    report.infrastructure_error = Some(InfrastructureError::SkidOvershoot { count });
+    report.dbt_counted_branches = None;
+    write_report_json(path, &report)
+}
+
+/// Write a named PMU skid infrastructure error when execution did not produce
+/// both sides of a comparison. Unlike the pending no-result stamp, this records
+/// the cause that is already known.
+pub fn write_skid_overshoot_without_comparison_json(
+    path: &Path,
+    count: u64,
+    runtime: Option<VerificationRuntime>,
+    guest_status: Option<ExitStatus>,
+) -> Result<(), Error> {
+    assert!(
+        count > 0,
+        "a skid-overshoot report requires a positive count"
+    );
+    let mut report = VerificationReport::no_result();
+    report.verdict = Verdict::InfrastructureError;
+    report.no_result_reason = None;
+    report.infrastructure_error = Some(InfrastructureError::SkidOvershoot { count });
+    report.runtime = runtime;
+    report.guest_exit_code = guest_status.as_ref().and_then(ExitStatus::code);
+    report.guest_signal = guest_status.as_ref().and_then(ExitStatus::signal);
+    write_report_json(path, &report)
 }
 
 /// Publish an explicit NO-RESULT record to `path` *before* verification starts.
@@ -1119,6 +1168,12 @@ pub fn announce_verification_outcome(
         Verdict::NoResult => eprintln!(
             ":: {}",
             "No result: the comparison was refused, so this is neither a match nor a difference."
+                .red()
+                .bold()
+        ),
+        Verdict::InfrastructureError => eprintln!(
+            ":: {}",
+            "Infrastructure error: the result is neither a match nor a product difference."
                 .red()
                 .bold()
         ),
@@ -2260,7 +2315,7 @@ mod tests {
             encoded,
             concat!(
                 r#"{"verified":false,"bitwise_parity":false,"verdict":"no_result","#,
-                r#""no_result_reason":{"kind":"not_run"},"comparison":null,"#,
+                r#""no_result_reason":{"kind":"not_run"},"infrastructure_error":null,"comparison":null,"#,
                 r#""compared_log_messages":null,"guest_exit_code":null,"guest_signal":null,"#,
                 r#""first_divergent_scheduler_turn":null,"#,
                 r#""first_divergent_virtual_nanoseconds":null,"#,
@@ -2289,6 +2344,58 @@ mod tests {
         assert_eq!(published["verdict"], serde_json::json!("matched"));
         assert_eq!(published["verified"], serde_json::json!(true));
         assert_eq!(published["bitwise_parity"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn skid_overshoot_refusal_retains_the_completed_comparison() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        let out = output(0, b"hello\n", b"");
+        let (log1, log2) = logs_with_identical_detlog();
+        let outcome =
+            compare_with(&out, log1, &out, log2, LogCompareStrictness::Canonical).unwrap();
+
+        write_skid_overshoot_verification_json(&path, &outcome, 2).unwrap();
+
+        let report = VerificationReport::from_current_json_value(
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report.verdict, Verdict::InfrastructureError);
+        assert_eq!(
+            report.infrastructure_error,
+            Some(InfrastructureError::SkidOvershoot { count: 2 })
+        );
+        assert!(!report.verified);
+        assert!(!report.bitwise_parity);
+        assert!(report.comparison.is_some());
+        assert!(report.compared_log_messages.is_some());
+        assert_eq!(report.guest_exit_code, Some(0));
+    }
+
+    #[test]
+    fn skid_overshoot_before_comparison_is_not_reported_as_no_result() {
+        let file = NamedTempFile::new().unwrap();
+        write_skid_overshoot_without_comparison_json(
+            file.path(),
+            1,
+            None,
+            Some(ExitStatus::Exited(7)),
+        )
+        .unwrap();
+
+        let report = VerificationReport::from_current_json_value(
+            serde_json::from_str(&fs::read_to_string(file.path()).unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report.verdict, Verdict::InfrastructureError);
+        assert_eq!(
+            report.infrastructure_error,
+            Some(InfrastructureError::SkidOvershoot { count: 1 })
+        );
+        assert!(report.no_result_reason.is_none());
+        assert!(report.comparison.is_none());
+        assert_eq!(report.guest_exit_code, Some(7));
     }
 
     #[test]

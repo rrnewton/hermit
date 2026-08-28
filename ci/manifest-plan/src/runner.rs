@@ -25,6 +25,7 @@ use serde_json::Value as JsonValue;
 use sha2::Digest;
 use sha2::Sha256;
 
+use crate::canonical_verdict::InfrastructureError;
 use crate::canonical_verdict::Verdict;
 pub use crate::canonical_verdict::VerificationReport;
 pub use crate::canonical_verdict::VerificationRuntime;
@@ -1844,6 +1845,23 @@ fn execute_spec_until(
                             // this point is the invocation's pre-stamped
                             // no-result record or otherwise unrelated, and
                             // cannot supersede the refusal classification.
+                        } else if report.verdict == Verdict::InfrastructureError {
+                            if let Err(error) = report.require_canonical_comparison() {
+                                outcome = "ERROR".into();
+                                error_kind = Some("incomplete-verification-evidence".into());
+                                reason = Some(error);
+                            } else {
+                                outcome = "ERROR".into();
+                                error_kind = Some("infrastructure".into());
+                                reason = Some(match report.infrastructure_error.as_ref() {
+                                    Some(InfrastructureError::SkidOvershoot { count }) => format!(
+                                        "verification recorded {count} HERMIT_SKID_OVERSHOOT report(s)"
+                                    ),
+                                    None => unreachable!(
+                                        "typed report parser requires an infrastructure error"
+                                    ),
+                                });
+                            }
                         } else if report.verdict == Verdict::NoResult
                             && matches!(
                                 report.no_result_reason,
@@ -4800,19 +4818,13 @@ backends_disabled:
         assert!(narrowed["normalized_entropy"].as_f64().unwrap() < 0.82);
     }
 
-    fn nonzero_with_canonical_receipt(mode: &str) -> AttemptResult {
-        let dir = std::env::temp_dir().join(format!(
-            "hermit-runner-status-bracket-{}-{mode}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let verdict = dir.join("verdict.json");
-        let report = serde_json::to_string(&VerificationReport {
+    fn canonical_verification_report() -> VerificationReport {
+        VerificationReport {
             verified: true,
             bitwise_parity: true,
             verdict: Verdict::Matched,
             no_result_reason: None,
+            infrastructure_error: None,
             comparison: Some(crate::canonical_verdict::ComparisonReport {
                 strictness: crate::canonical_verdict::LogCompareStrictness::Canonical,
                 display_name: Some("BitwiseInfoV1".into()),
@@ -4845,8 +4857,18 @@ backends_disabled:
             first_divergent_syscall: None,
             first_divergent_left_message: None,
             first_divergent_right_message: None,
-        })
-        .unwrap();
+        }
+    }
+
+    fn nonzero_with_canonical_receipt(mode: &str) -> AttemptResult {
+        let dir = std::env::temp_dir().join(format!(
+            "hermit-runner-status-bracket-{}-{mode}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let verdict = dir.join("verdict.json");
+        let report = serde_json::to_string(&canonical_verification_report()).unwrap();
         let spec = CellRunSpec {
             id: CellId {
                 test: "fixture/status".into(),
@@ -4921,6 +4943,40 @@ backends_disabled:
         let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
         result
+    }
+
+    #[test]
+    fn skid_overshoot_receipt_is_an_infrastructure_error_with_comparison_evidence() {
+        let mut report = canonical_verification_report();
+        report.verified = false;
+        report.bitwise_parity = false;
+        report.verdict = Verdict::InfrastructureError;
+        report.infrastructure_error = Some(InfrastructureError::SkidOvershoot { count: 2 });
+        let report = serde_json::to_string(&report).unwrap();
+
+        let result = attempt_from_script(
+            "ptrace",
+            "printf %s \"$1\" > \"$2\"; exit 122",
+            Some(&report),
+        );
+
+        assert_eq!(result.outcome, "ERROR");
+        assert_eq!(result.error_kind.as_deref(), Some("infrastructure"));
+        assert_eq!(result.status, Some(122));
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("2 HERMIT_SKID_OVERSHOOT")),
+            "infrastructure error must retain the recorded count: {result:?}"
+        );
+        assert!(
+            result
+                .verification_report
+                .as_deref()
+                .is_some_and(|json| json.contains("\"comparison\":{")),
+            "infrastructure error must retain the completed comparison: {result:?}"
+        );
     }
 
     /// A backend this runner could not start and a backend that ran but recorded

@@ -3666,6 +3666,8 @@ fn classify_result(
             && !verification_logs_retained)
     {
         "infrastructure-error"
+    } else if row_valid && verification_verdict == Some("infrastructure_error") {
+        "infrastructure-error"
     } else if row_valid && mode == "verify" && verification_verdict == Some("diverged") {
         "determinism-failure"
     } else if row_valid && mode == "replay" && verification_verdict == Some("diverged") {
@@ -3896,10 +3898,7 @@ fn read_verification_report(
         .map_err(|e| format!("incomplete canonical verification report {}: {e}", path.display()))?;
     match (canonical.verdict, canonical.verified) {
         (Verdict::Matched, true)
-        | (
-            Verdict::Diverged | Verdict::NoResult,
-            false,
-        ) => {}
+        | (Verdict::Diverged | Verdict::NoResult | Verdict::InfrastructureError, false) => {}
         (verdict, verified) => {
             return Err(format!(
                 "inconsistent verification report {}: verdict={verdict} verified={verified}",
@@ -3907,8 +3906,10 @@ fn read_verification_report(
             ));
         }
     }
-    if canonical.verdict != Verdict::NoResult
-        && canonical.comparison.is_none()
+    if !matches!(
+        canonical.verdict,
+        Verdict::NoResult | Verdict::InfrastructureError
+    ) && canonical.comparison.is_none()
     {
         return Err(format!(
             "terminal verification report {} has no comparison object",
@@ -3921,12 +3922,14 @@ fn read_verification_report(
             path.display()
         ));
     }
-    canonical.require_canonical_comparison().map_err(|error| {
-        format!(
-            "verification report {} cannot support a product verdict: {error}",
-            path.display()
-        )
-    })?;
+    if canonical.verdict != Verdict::InfrastructureError || canonical.comparison.is_some() {
+        canonical.require_canonical_comparison().map_err(|error| {
+            format!(
+                "verification report {} cannot support a product verdict: {error}",
+                path.display()
+            )
+        })?;
+    }
     if canonical.verdict == Verdict::Matched {
         canonical.require_canonical_match().map_err(|error| {
             format!(
@@ -3935,7 +3938,18 @@ fn read_verification_report(
             )
         })?;
     }
-    if canonical.verdict != Verdict::Diverged
+    if canonical.verdict == Verdict::InfrastructureError
+        && canonical.infrastructure_error.is_none()
+    {
+        return Err(format!(
+            "verification report {} names infrastructure_error without its cause",
+            path.display()
+        ));
+    }
+    if !matches!(
+        canonical.verdict,
+        Verdict::Diverged | Verdict::InfrastructureError
+    )
         && (canonical.first_divergent_scheduler_turn.is_some()
             || canonical.first_divergent_virtual_nanoseconds.is_some()
             || canonical.first_divergent_record.is_some()
@@ -6553,6 +6567,17 @@ fn self_test(root: &Path) -> Result<(), String> {
             true,
         ),
         classify_result(
+            runner_ok,
+            Some(122),
+            "ERROR",
+            true,
+            Some("verification recorded 2 HERMIT_SKID_OVERSHOOT report(s)"),
+            "verify",
+            Some("infrastructure_error"),
+            true,
+            true,
+        ),
+        classify_result(
             runner_timeout,
             Some(INCOMPLETE_ATTEMPT_STATUS),
             "NO_RESULT",
@@ -6686,6 +6711,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             "determinism-failure",
             "replay-failure",
             "crash-error",
+            "infrastructure-error",
             "timeout",
             "infrastructure-error",
             "timeout",
