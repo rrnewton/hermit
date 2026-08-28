@@ -1168,7 +1168,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: parity-v1-${{ github.run_id }}-${{ github.run_attempt }}-*
-          path: transport
+          path: ignored/transport
           merge-multiple: true
       - name: Verify completeness, checksums, and archive paths
         if: needs.select.outputs.run_e2e != 'false'
@@ -1176,7 +1176,7 @@ jobs:
           EXPECTED: ${{ needs.build-debug.outputs.e2e_count }}
         run: |
           set -euo pipefail
-          actual=$(find transport -maxdepth 1 -name '*.tar.zst' -type f | wc -l)
+          actual=$(find ignored/transport -maxdepth 1 -name '*.tar.zst' -type f | wc -l)
           [[ "$EXPECTED" =~ ^[0-9]+$ && "$actual" -eq "$EXPECTED" ]] || {
             echo "expected $EXPECTED parity archives, found $actual" >&2
             exit 1
@@ -1200,7 +1200,7 @@ jobs:
             mkdir -p "ignored/reduced/results/portable/$job"
             cp "$stage/results.jsonl" "ignored/reduced/results/portable/$job/results.jsonl"
             cp "$stage/junit.xml" "ignored/reduced/results/portable/$job/junit.xml"
-          done < <(find transport -maxdepth 1 -name '*.tar.zst' -type f -print0 | sort -z)
+          done < <(find ignored/transport -maxdepth 1 -name '*.tar.zst' -type f -print0 | sort -z)
 
           find ignored/reduced/expanded -path '*/parity-v1/results.jsonl' -type f -print0 |
             sort -z | xargs -0 cat > ignored/reduced/results.jsonl
