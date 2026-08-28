@@ -6374,7 +6374,7 @@ silent when empty)"
 fn ledger_gate_result(outcome: &StepOutcome) -> &'static str {
     if outcome.ok {
         "pass"
-    } else if outcome_is_no_result(outcome) {
+    } else if outcome.aborted || outcome_is_no_result(outcome) {
         "no_result"
     } else {
         "fail"
@@ -6410,18 +6410,94 @@ fn completed_exit_code(
     run_timed_out: bool,
     unexplained_runner_failure: bool,
 ) -> u8 {
-    if effective_failures > 0 || run_timed_out || unexplained_runner_failure {
+    if effective_failures > 0 || unexplained_runner_failure {
         1
-    } else if no_results > 0 {
+    } else if no_results > 0 || run_timed_out {
         NO_RESULT_EXIT_CODE as u8
     } else {
         0
     }
 }
 
+/// Print the super stress table without turning absent product results into
+/// product failures. `rates` must be computed from product-result outcomes
+/// only; `planned - ran` is therefore the number of selected repetitions that
+/// produced no product result and belongs to the run's incomplete accounting.
+fn print_super_stress_verdict(
+    rates: &[validate_super::ProbeRate],
+    reps: i64,
+    jobs: i64,
+    host_cpus: usize,
+) -> usize {
+    println!("\n== Super stress pass rates ==");
+    println!("Repetitions: {reps}; scheduler width: {jobs}; online CPUs: {host_cpus}");
+    let mut blocking = 0usize;
+    for rate in rates {
+        let slug = rate.probe.slug();
+        let product_failures = rate.ran.saturating_sub(rate.passed);
+        let without_product_result = rate.planned.saturating_sub(rate.ran);
+        if rate.ran == 0 {
+            println!(
+                "  NO_RESULT {slug:<24} 0/{} selected repetition(s) produced a product result",
+                rate.planned
+            );
+            continue;
+        }
+        let pct = 100 * rate.passed / rate.ran.max(1);
+        if product_failures == 0 && without_product_result == 0 {
+            println!("  ✅ {slug:<24} {}/{} (100%)", rate.passed, rate.ran);
+        } else if product_failures == 0 {
+            println!(
+                "  NO_RESULT {slug:<24} {}/{} product result(s) passed ({pct}%); {} of {} \
+                 selected repetition(s) did not produce a product result",
+                rate.passed,
+                rate.ran,
+                without_product_result,
+                rate.planned,
+            );
+        } else if rate.probe.nonblocking() {
+            println!(
+                "  ⚠️  {slug:<24} {}/{} product result(s) passed ({pct}%){} — NONBLOCKING: this \
+                 row was dead code in validate.sh (`backend_selector_supported` is undefined, so \
+                 the guard was always false) and has never been measured; reporting it, not \
+                 ratcheting it.",
+                rate.passed,
+                rate.ran,
+                if without_product_result == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        "; {without_product_result} of {} selected repetition(s) did not produce \
+                         a product result",
+                        rate.planned
+                    )
+                },
+            );
+        } else {
+            println!(
+                "  ⚠️  {slug:<24} {}/{} product result(s) passed ({pct}%){}",
+                rate.passed,
+                rate.ran,
+                if without_product_result == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        "; {without_product_result} of {} selected repetition(s) did not produce \
+                         a product result",
+                        rate.planned
+                    )
+                },
+            );
+            blocking += 1;
+        }
+    }
+    blocking
+}
+
 /// Per-node cost table, built entirely from typed `StepOutcome` fields.
 fn print_cost_table(
     outcomes: &[StepOutcome],
+    attempts: &[NodeAttempt],
     skipped: &[String],
     host_inapplicable: &[validate_plan::HostInapplicableNode],
 ) {
@@ -6431,16 +6507,15 @@ fn print_cost_table(
     let mut total = 0.0_f64;
     for o in outcomes {
         total += o.duration_s;
-        let status = if o.ok {
-            "ok"
-        } else if o.aborted {
-            "ABORTED"
-        } else if outcome_is_no_result(o) {
-            "NO_RESULT"
-        } else {
-            "FAIL"
+        let classification = node_classification(o, attempts);
+        let status = match classification {
+            NodeClassification::Pass => "ok",
+            NodeClassification::ProductFailure => "FAIL",
+            NodeClassification::UnderstoodInfrastructureFailure | NodeClassification::NoResult => {
+                "NO_RESULT"
+            }
         };
-        let detail = if !o.reason.is_empty() {
+        let mut detail = if !o.reason.is_empty() {
             o.reason.clone()
         } else if let Some(rc) = o.returncode {
             if rc < 0 {
@@ -6451,6 +6526,17 @@ fn print_cost_table(
         } else {
             String::new()
         };
+        if classification == NodeClassification::UnderstoodInfrastructureFailure {
+            let classes: BTreeSet<&str> = attempts
+                .iter()
+                .filter(|attempt| attempt.tag == o.tag)
+                .filter_map(|attempt| attempt.understood_infrastructure_class.as_deref())
+                .collect();
+            detail.push_str(&format!(
+                " [understood infrastructure failure: {}]",
+                classes.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
         println!("{:<44} {:>9.2}  {:<8} {}", o.tag, o.duration_s, status, detail);
     }
     println!("{}", "-".repeat(84));
@@ -6464,8 +6550,8 @@ fn print_cost_table(
     // like one.
     for node in host_inapplicable {
         println!(
-            "\nhost-inapplicable (NOT RUN, NOT a pass, no coverage): {} — this machine lacks {} \
-             ({})",
+            "\nunderstood prerequisite failure; host-inapplicable (NOT RUN, NOT a pass, no \
+             coverage): {} — this machine lacks {} ({})",
             node.tag,
             node.capability.value(),
             node.evidence
@@ -6665,7 +6751,11 @@ fn verdict_refusals(
 /// profile may allow a fully measured failing row, but no profile may turn a
 /// partial run into exit zero.
 fn exit_code_with_execution_completeness(exit_code: u8, execution_complete: bool) -> u8 {
-    if execution_complete { exit_code } else { exit_code.max(1) }
+    if execution_complete || exit_code != 0 {
+        exit_code
+    } else {
+        NO_RESULT_EXIT_CODE as u8
+    }
 }
 
 /// Fast exit 127 is useful missing-artifact guidance only in `--only`, whose
@@ -7845,6 +7935,11 @@ struct NodeAttempt {
     /// region. This is kept separately from `retry_class`: a classified attempt
     /// may never execute again, and that distinction is the UNCONFIRMED verdict.
     environmental_class: Option<String>,
+    /// A diagnosed non-product cause in this attempt's own evidence. This is a
+    /// superset of `environmental_class`: PMU RCB overshoot and the measured
+    /// TMPDIR mount-permission failure are infrastructure failures without being
+    /// BPF/toolchain/proxy denials.
+    understood_infrastructure_class: Option<String>,
     /// Whether this attempt's own round emitted a detail region, even if that
     /// region carried no environmental signature. Without this bit, "banner
     /// gone" is indistinguishable from "no new evidence was captured".
@@ -7875,6 +7970,119 @@ fn attempt_is_failure(attempt: &NodeAttempt) -> bool {
     attempt_result(attempt) == Some("fail")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeClassification {
+    Pass,
+    ProductFailure,
+    UnderstoodInfrastructureFailure,
+    NoResult,
+}
+
+impl NodeClassification {
+    fn result(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::ProductFailure => "fail",
+            Self::UnderstoodInfrastructureFailure | Self::NoResult => "no_result",
+        }
+    }
+
+    fn non_product_failure_bucket(self) -> Option<&'static str> {
+        match self {
+            Self::UnderstoodInfrastructureFailure => {
+                Some("understood_infrastructure_failure")
+            }
+            Self::NoResult => Some("no_result"),
+            Self::Pass | Self::ProductFailure => None,
+        }
+    }
+
+    fn is_product_result(self) -> bool {
+        matches!(self, Self::Pass | Self::ProductFailure)
+    }
+}
+
+fn attempt_classification(attempt: &NodeAttempt) -> NodeClassification {
+    if attempt_result(attempt) == Some("pass") {
+        return NodeClassification::Pass;
+    }
+    if attempt.understood_infrastructure_class.is_some() {
+        return NodeClassification::UnderstoodInfrastructureFailure;
+    }
+    if attempt.execution == AttemptExecution::Unknown
+        || attempt.ok.is_none()
+        || attempt.aborted
+        || attempt_is_no_result(attempt)
+    {
+        return NodeClassification::NoResult;
+    }
+    NodeClassification::ProductFailure
+}
+
+fn attempts_classification(attempts: &[NodeAttempt], tag: &str) -> Option<NodeClassification> {
+    let node_attempts: Vec<&NodeAttempt> =
+        attempts.iter().filter(|attempt| attempt.tag == tag).collect();
+    let latest = node_attempts.last().copied()?;
+    if attempt_classification(latest) == NodeClassification::Pass {
+        return Some(NodeClassification::Pass);
+    }
+
+    let mut saw_product_failure = false;
+    let mut saw_understood_infrastructure_failure = false;
+    let mut saw_no_result = false;
+    for attempt in node_attempts {
+        match attempt_classification(attempt) {
+            NodeClassification::Pass => {}
+            NodeClassification::ProductFailure => saw_product_failure = true,
+            NodeClassification::UnderstoodInfrastructureFailure => {
+                saw_understood_infrastructure_failure = true;
+            }
+            NodeClassification::NoResult => saw_no_result = true,
+        }
+    }
+    Some(if saw_product_failure {
+        NodeClassification::ProductFailure
+    } else if saw_no_result {
+        NodeClassification::NoResult
+    } else if saw_understood_infrastructure_failure {
+        NodeClassification::UnderstoodInfrastructureFailure
+    } else {
+        NodeClassification::NoResult
+    })
+}
+
+/// Fold every attempt into the result the validate is allowed to claim. A retry
+/// pass is green. Without one, any product failure keeps the node red; an
+/// all-infrastructure history has no product result; and any remaining unknown
+/// makes the node a genuine no-result.
+fn node_classification(outcome: &StepOutcome, attempts: &[NodeAttempt]) -> NodeClassification {
+    if let Some(classification) = attempts_classification(attempts, &outcome.tag) {
+        return classification;
+    }
+    if outcome.ok {
+        NodeClassification::Pass
+    } else if outcome.aborted || outcome_is_no_result(outcome) {
+        NodeClassification::NoResult
+    } else {
+        NodeClassification::ProductFailure
+    }
+}
+
+fn outcome_with_classification(outcome: &StepOutcome, attempts: &[NodeAttempt]) -> StepOutcome {
+    let mut classified = outcome.clone();
+    if matches!(
+        node_classification(outcome, attempts),
+        NodeClassification::UnderstoodInfrastructureFailure | NodeClassification::NoResult
+    ) {
+        classified.ok = false;
+        classified.aborted = false;
+        classified.returncode = Some(NO_RESULT_EXIT_CODE);
+        classified.executed_tests = None;
+        classified.filtered_tests = None;
+    }
+    classified
+}
+
 /// This node's next attempt ordinal: one more than however many attempts of it
 /// are already recorded.
 ///
@@ -7901,6 +8109,7 @@ fn reported_attempt(outcome: &StepOutcome, attempt: usize) -> NodeAttempt {
         execution: outcome_execution(outcome),
         retry_class: None,
         environmental_class: None,
+        understood_infrastructure_class: None,
         detail_observed: false,
     }
 }
@@ -7921,6 +8130,7 @@ fn unreported_attempt(tag: String, attempt: usize) -> NodeAttempt {
         execution: AttemptExecution::Unknown,
         retry_class: None,
         environmental_class: None,
+        understood_infrastructure_class: None,
         detail_observed: false,
     }
 }
@@ -7940,10 +8150,17 @@ fn latest_reported_failure_mut<'a>(
 }
 
 /// Attach one round's detail observation to the exact reported failure it came from.
-fn stamp_attempt_detail(attempts: &mut [NodeAttempt], tag: &str, class: Option<&str>) {
+fn stamp_attempt_detail(
+    attempts: &mut [NodeAttempt],
+    tag: &str,
+    environmental_class: Option<&str>,
+    understood_infrastructure_class: Option<&str>,
+) {
     if let Some(attempt) = latest_reported_failure_mut(attempts, tag) {
         attempt.detail_observed = true;
-        attempt.environmental_class = class.map(str::to_string);
+        attempt.environmental_class = environmental_class.map(str::to_string);
+        attempt.understood_infrastructure_class =
+            understood_infrastructure_class.map(str::to_string);
     }
 }
 
@@ -7972,23 +8189,27 @@ fn environmental_assessment(
     attempts: &[NodeAttempt],
     classified: &NodeAttempt,
 ) -> Option<(validate_runtime::EnvBlockVerdict, Option<validate_runtime::RefutedShape>)> {
-    // NO GOALPOST LOWERING: this derives evidence after execution. It does not
-    // alter retry eligibility, the terminal StepOutcome, LaneResult::ok, or
-    // failure counts. Unknown execution can only tighten completeness and refuse
-    // a receipt that lacked evidence; a label can never turn a RED into a pass.
+    // This is the historical environmental hypothesis record. The separate
+    // retry fold below decides the product result: only a later pass becomes
+    // green, while a diagnosed infrastructure failure becomes no-result rather
+    // than a product red.
     let original = classified.environmental_class.as_deref()?;
     let rerun = actual_rerun_after(attempts, classified);
     let rerun_result = rerun.and_then(|attempt| attempt.ok);
-    let verdict = validate_runtime::EnvBlockVerdict::settle(rerun_result);
-    let shape = if verdict == validate_runtime::EnvBlockVerdict::Refuted
-        && rerun.is_some_and(|attempt| attempt.detail_observed)
-    {
+    let shape = if rerun_result == Some(false) && rerun.is_some_and(|attempt| attempt.detail_observed) {
         Some(validate_runtime::RefutedShape::of(
             original,
             rerun.and_then(|attempt| attempt.environmental_class.as_deref()),
         ))
     } else {
         None
+    };
+    let verdict = match (rerun_result, shape) {
+        (Some(true), _) | (Some(false), Some(validate_runtime::RefutedShape::Persistent)) => {
+            validate_runtime::EnvBlockVerdict::Confirmed
+        }
+        (Some(false), Some(_)) => validate_runtime::EnvBlockVerdict::Refuted,
+        (Some(false), None) | (None, _) => validate_runtime::EnvBlockVerdict::Unconfirmed,
     };
     Some((verdict, shape))
 }
@@ -8285,8 +8506,8 @@ fn scheduler_not_launched_message(tags: &[String]) -> String {
 
 fn retry_notice(tag: &str, class: &str, attempt: usize) -> String {
     format!(
-        "⚠️  {tag}: RETRY-ELIGIBLE ({class}) — this attempt remains RED unless an actual \
-         re-execution passes — retrying (attempt {attempt}/{})",
+        "⚠️  {tag}: RETRY-ELIGIBLE ({class}) — this attempt's result and cause remain recorded; \
+         the final result is folded across every attempt — retrying (attempt {attempt}/{})",
         validate_runtime::MAX_ATTEMPTS_PER_CELL
     )
 }
@@ -9156,7 +9377,9 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     if environmental_gate["result"] != "pass"
         || environmental_gate["retries"] != 1
         || environmental_gate["attempts"].as_array().map(Vec::len) != Some(2)
-        || environmental_gate["attempts"][0]["result"] != "fail"
+        || environmental_gate["attempts"][0]["result"] != "no_result"
+        || environmental_gate["attempts"][0]["non_product_failure_bucket"]
+            != "understood_infrastructure_failure"
         || environmental_gate["attempts"][0]["retry_class"] != "bpfjailer-banner"
         || environmental_gate["attempts"][1]["result"] != "pass"
         || !environmental_gate["attempts"][1]["retry_class"].is_null()
@@ -9475,7 +9698,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         || stale_attempts[1].execution != AttemptExecution::Completed
         || stale_attempts[1].detail_observed
         || environmental_assessment(&stale.attempts, stale_attempts[0])
-            != Some((validate_runtime::EnvBlockVerdict::Refuted, None))
+            != Some((validate_runtime::EnvBlockVerdict::Unconfirmed, None))
     {
         return Err(format!(
             "scheduler accounting: a retry with no new detail reused stale attempt-1 evidence, \
@@ -9594,8 +9817,9 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         || environmental_assessment(&terminal.attempts, terminal_attempts[1])
             != Some((validate_runtime::EnvBlockVerdict::Unconfirmed, None))
         || terminal_line
-            != "🧱 fixture.terminal_environmental: observed environmental signature \
-                bpfjailer-banner on attempt 2; terminal hypothesis UNCONFIRMED; node remains RED."
+            != "🧱 fixture.terminal_environmental: every failed attempt was diagnosed as \
+                infrastructure; latest cause on attempt 2: bpfjailer-banner. The node has NO \
+                PRODUCT RESULT and makes validation incomplete."
         || terminal_line.contains(&forbidden_excuse)
     {
         return Err(format!(
@@ -9706,7 +9930,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         || multiple_attempts.len() != 2
         || environmental_assessment(&multiple.attempts, multiple_attempts[0])
             != Some((
-                validate_runtime::EnvBlockVerdict::Refuted,
+                validate_runtime::EnvBlockVerdict::Confirmed,
                 Some(validate_runtime::RefutedShape::Persistent),
             ))
         || environmental_assessment(&multiple.attempts, multiple_attempts[1])
@@ -9840,7 +10064,8 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         .find(|outcome| outcome.tag == "fixture.spawn_unknown")
         .ok_or("scheduler accounting: reported spawn failure disappeared")?;
     let spawn_gate = ledger_gate_with_attempts(spawn_outcome, &spawn_unknown.attempts);
-    if !spawn_gate["result"].is_null()
+    if spawn_gate["result"] != "no_result"
+        || spawn_gate["non_product_failure_bucket"] != "no_result"
         || spawn_gate["reported"] != true
         || spawn_gate["execution"] != "unknown"
         || !spawn_gate["failure_origin"].is_null()
@@ -9929,7 +10154,8 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     let missing_gate = ledger_gate_with_attempts(missing_outcome, &missing.attempts);
     let missing_first_render = retry_attempt_line(&missing.attempts, missing_attempts[0], 2);
     let missing_latest_render = retry_attempt_line(&missing.attempts, missing_attempts[1], 2);
-    if !missing_gate["result"].is_null()
+    if missing_gate["result"] != "no_result"
+        || missing_gate["non_product_failure_bucket"] != "no_result"
         || missing_gate["reported"] != false
         || missing_gate["execution"] != "unknown"
         || !missing_gate["exit_code"].is_null()
@@ -9937,10 +10163,10 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         || missing_gate["failure_origin"].is_string()
         || missing_gate.get("failed_substeps").is_some()
         || missing_gate["attempts"][1]["attempt"] != 2
-        || !missing_gate["attempts"][1]["result"].is_null()
+        || missing_gate["attempts"][1]["result"] != "no_result"
         || !missing_first_render.contains("ENVIRONMENTAL UNCONFIRMED")
         || !missing_first_render.contains("no actual re-execution completed")
-        || !missing_latest_render.contains("attempt 2/2: unknown step result")
+        || !missing_latest_render.contains("attempt 2/2: no_result")
     {
         return Err(format!(
             "scheduler accounting: JSON or human rendering reused the stale attempt-1 failure for \
@@ -10504,7 +10730,8 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     }
 }
 
-/// Run one lane, auto-retrying nodes whose failure is an ENVIRONMENTAL block.
+/// Run one lane, auto-retrying every failed node while preserving diagnosed
+/// infrastructure causes per attempt.
 ///
 /// This is `run_check_with_timeout`'s retry loop (validate.sh:2119) moved to DAG
 /// granularity. A host FS-permission denial (BPFJailer banner, or a banner-less
@@ -10520,10 +10747,10 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
 ///   the runner's `[tag] ----- detail -----` region, not a whole-log tail. A jail
 ///   banner printed by a different concurrent node cannot excuse a real red.
 /// * **Retries are bounded per cell**: one initial attempt plus exactly one
-///   retry attempt. A *persistent* breakage — a bad Reverie pin, a genuinely missing
-///   header — fails every attempt and still leaves the run RED. Its per-attempt
-///   environmental hypothesis is refuted or left unconfirmed, never silently
-///   promoted to a pass.
+///   retry attempt. A persistent product breakage — a bad Reverie pin or a
+///   genuinely missing header — remains RED. If every failed attempt instead
+///   carries a diagnosed infrastructure cause, the node has no product result
+///   and makes the validate incomplete.
 /// * **Nodes that never ran because the blocked node failed are retried only
 ///   when their prerequisites remain valid.** Every prerequisite must either
 ///   have completed successfully already or execute in the same retry. Internal
@@ -10634,7 +10861,7 @@ fn run_lane_with_env_retries(
         if round_log.as_deref().is_none_or(str::is_empty) {
             eprintln!(
                 "validate: WARNING: this scheduler invocation produced no readable new log bytes, \
-                 so {} failed node(s) cannot be classified as environmental. Earlier attempts' \
+                 so {} failed node(s) cannot be checked for understood infrastructure causes. Earlier attempts' \
                  detail is never reused. The typed grounds (bound-kill, measured instability) \
                  still apply; an unclassifiable red stays RED.",
                 failed.len()
@@ -10672,14 +10899,22 @@ fn run_lane_with_env_retries(
         // nothing is NOT retried on that ground alone: it is recorded (above)
         // and it rides along in the retry set only when one of the three
         // grounds fires for something else.
-        let mut environmental = BTreeMap::new();
+        let mut detail_retry_classes = BTreeMap::new();
         if let Some(log) = round_log.as_deref() {
             for outcome in &failed {
                 if let Some(detail) = validate_runtime::extract_node_detail(log, &outcome.tag) {
-                    let class = validate_runtime::environmental_block_class(&detail);
-                    stamp_attempt_detail(&mut attempts, &outcome.tag, class);
-                    if let Some(class) = class {
-                        environmental.insert(outcome.tag.clone(), class.to_string());
+                    let environmental_class =
+                        validate_runtime::environmental_block_class(&detail);
+                    let infrastructure_class =
+                        validate_runtime::understood_infrastructure_class(&detail);
+                    stamp_attempt_detail(
+                        &mut attempts,
+                        &outcome.tag,
+                        environmental_class,
+                        infrastructure_class,
+                    );
+                    if let Some(class) = environmental_class.or(infrastructure_class) {
+                        detail_retry_classes.insert(outcome.tag.clone(), class.to_string());
                     }
                 }
             }
@@ -10697,7 +10932,7 @@ fn run_lane_with_env_retries(
                 if !retry_attempt_available(&attempts, &o.tag) {
                     return None;
                 }
-                environmental
+                detail_retry_classes
                     .get(&o.tag)
                     .cloned()
                     .or_else(|| {
@@ -10892,12 +11127,17 @@ fn run_lane_with_env_retries(
                 .filter(|o| outcome_is_failure(o) && !latest_unreported.contains(o.tag.as_str()))
             {
                 if let Some(detail) = validate_runtime::extract_node_detail(&log, &outcome.tag) {
-                    let class = validate_runtime::environmental_block_class(&detail);
-                    stamp_attempt_detail(&mut attempts, &outcome.tag, class);
-                    // Report exactly what was observed, without converting an
-                    // environmental signature into an excuse for the terminal
-                    // product failure. The attempt verdict remains RED.
-                    if env_retries == max && class.is_some() {
+                    let environmental_class =
+                        validate_runtime::environmental_block_class(&detail);
+                    let infrastructure_class =
+                        validate_runtime::understood_infrastructure_class(&detail);
+                    stamp_attempt_detail(
+                        &mut attempts,
+                        &outcome.tag,
+                        environmental_class,
+                        infrastructure_class,
+                    );
+                    if env_retries == max && infrastructure_class.is_some() {
                         if let Some(line) =
                             terminal_environmental_observation(&attempts, &outcome.tag)
                         {
@@ -10969,7 +11209,7 @@ fn retry_attempt_line(
     row: &NodeAttempt,
     total_attempts: usize,
 ) -> String {
-    let verdict = attempt_result(row).unwrap_or("unknown step result");
+    let verdict = attempt_classification(row).result();
     let because = row
         .retry_class
         .as_deref()
@@ -10981,6 +11221,13 @@ fn retry_attempt_line(
         format!(" [{}]", row.reason.trim())
     };
     let environmental = match environmental_assessment(attempts, row) {
+        Some((
+            validate_runtime::EnvBlockVerdict::Confirmed,
+            Some(validate_runtime::RefutedShape::Persistent),
+        )) => format!(
+            " — ENVIRONMENTAL CONFIRMED ({}): the same signature persisted on re-execution",
+            row.environmental_class.as_deref().unwrap_or("unknown")
+        ),
         Some((validate_runtime::EnvBlockVerdict::Confirmed, _)) => format!(
             " — ENVIRONMENTAL CONFIRMED ({}): an actual re-execution passed",
             row.environmental_class.as_deref().unwrap_or("unknown")
@@ -11015,8 +11262,16 @@ fn retry_attempt_line(
         ),
         None => String::new(),
     };
+    let infrastructure = if row.environmental_class.is_none() {
+        row.understood_infrastructure_class
+            .as_deref()
+            .map(|class| format!(" — UNDERSTOOD INFRASTRUCTURE FAILURE ({class})"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     format!(
-        "  {} attempt {}/{}: {verdict} ({:.1}s){detail}{because}{environmental}",
+        "  {} attempt {}/{}: {verdict} ({:.1}s){detail}{because}{environmental}{infrastructure}",
         row.tag, row.attempt, total_attempts, row.duration_s
     )
 }
@@ -11025,19 +11280,31 @@ fn terminal_environmental_observation(attempts: &[NodeAttempt], tag: &str) -> Op
     let attempt = attempts
         .iter()
         .rev()
-        .find(|attempt| attempt.tag == tag && attempt.environmental_class.is_some())?;
-    let class = attempt.environmental_class.as_deref()?;
-    let verdict = environmental_assessment(attempts, attempt)?.0;
-    let verdict = match verdict {
-        validate_runtime::EnvBlockVerdict::Confirmed => "CONFIRMED",
-        validate_runtime::EnvBlockVerdict::Refuted => "REFUTED",
-        validate_runtime::EnvBlockVerdict::Unconfirmed => "UNCONFIRMED",
-    };
-    Some(format!(
-        "🧱 {tag}: observed environmental signature {class} on attempt {}; terminal hypothesis \
-         {verdict}; node remains RED.",
-        attempt.attempt
-    ))
+        .find(|attempt| attempt.tag == tag && attempt.understood_infrastructure_class.is_some())?;
+    let class = attempt.understood_infrastructure_class.as_deref()?;
+    let final_classification = attempts_classification(attempts, tag)?;
+    Some(match final_classification {
+        NodeClassification::UnderstoodInfrastructureFailure => format!(
+            "🧱 {tag}: every failed attempt was diagnosed as infrastructure; latest cause on \
+             attempt {}: {class}. The node has NO PRODUCT RESULT and makes validation incomplete.",
+            attempt.attempt
+        ),
+        NodeClassification::ProductFailure => format!(
+            "🧱 {tag}: attempt {} carried infrastructure cause {class}, but another failed \
+             attempt was a PRODUCT FAILURE; the node remains RED.",
+            attempt.attempt
+        ),
+        NodeClassification::NoResult => format!(
+            "🧱 {tag}: attempt {} carried infrastructure cause {class}, but another attempt \
+             produced NO RESULT; the node has NO PRODUCT RESULT and makes validation incomplete.",
+            attempt.attempt
+        ),
+        NodeClassification::Pass => format!(
+            "🧱 {tag}: attempt {} carried infrastructure cause {class}; a later attempt PASSED \
+             and the node is green.",
+            attempt.attempt
+        ),
+    })
 }
 
 fn print_retry_ledger(attempts: &[NodeAttempt]) {
@@ -11049,13 +11316,13 @@ fn print_retry_ledger(attempts: &[NodeAttempt]) {
         rows.len() > 1
             || rows
                 .iter()
-                .any(|row| !row.reported || row.environmental_class.is_some())
+                .any(|row| !row.reported || row.understood_infrastructure_class.is_some())
     });
     if retried.is_empty() {
         return;
     }
     println!(
-        "\nRetry and environmental verdict ledger ({} node(s)): every attempt is listed, \
+        "\nRetry and infrastructure evidence ledger ({} node(s)): every attempt is listed, \
          including the ones a later attempt superseded.",
         retried.len()
     );
@@ -12203,7 +12470,7 @@ fn ledger_gate(outcome: &StepOutcome) -> serde_json::Value {
         "aborted": outcome.aborted,
         "real_seconds": outcome.duration_s,
     });
-    set_gate_failure_evidence(&mut gate, outcome_is_failure(outcome));
+    set_gate_failure_evidence(&mut gate, ledger_gate_result(outcome) == "fail");
     gate
 }
 
@@ -12224,16 +12491,17 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
         .iter()
         .map(|a| {
             let assessment = environmental_assessment(attempts, a);
+            let classification = attempt_classification(a);
             let environmental_verdict = assessment.map(|(verdict, _)| verdict.as_str());
             let environmental_refuted_shape = assessment
                 .and_then(|(_, shape)| shape)
                 .map(validate_runtime::RefutedShape::as_str);
             serde_json::json!({
                 "attempt": a.attempt,
-                // `null` is UNKNOWN and stays UNKNOWN: no completion payload
-                // arrived, which is not the same as a failure and must never be
-                // readable as a pass.
-                "result": attempt_result(a),
+                // An unknown execution serializes as `no_result`: it is not a
+                // product failure and must never be readable as a pass.
+                "result": classification.result(),
+                "non_product_failure_bucket": classification.non_product_failure_bucket(),
                 "reported": a.reported,
                 "execution": a.execution.as_str(),
                 "exit_code": a.returncode,
@@ -12247,6 +12515,7 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
                 // a later actual execution confirmed/refuted it, or whether no
                 // such execution occurred.
                 "environmental_class": a.environmental_class,
+                "understood_infrastructure_class": a.understood_infrastructure_class,
                 "environmental_detail_observed": a.detail_observed,
                 "environmental_verdict": environmental_verdict,
                 "environmental_refuted_shape": environmental_refuted_shape,
@@ -12258,25 +12527,119 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
     // an empty ledger. Preserve their typed StepOutcome fallback; every scheduler
     // lane supplies attempts and therefore takes the exact-attempt branch.
     let mut gate = ledger_gate(outcome);
+    let classification = node_classification(outcome, attempts);
+    gate["result"] = serde_json::json!(classification.result());
+    set_gate_failure_evidence(
+        &mut gate,
+        classification == NodeClassification::ProductFailure,
+    );
     gate["reported"] = serde_json::json!(latest.map(|attempt| attempt.reported).unwrap_or(true));
     gate["execution"] = serde_json::json!(latest
         .map(|attempt| attempt.execution)
         .unwrap_or_else(|| outcome_execution(outcome))
         .as_str());
     if let Some(attempt) = latest {
-        gate["result"] = serde_json::json!(attempt_result(attempt));
         gate["exit_code"] = serde_json::json!(attempt.returncode);
         gate["reason"] = serde_json::json!(attempt.reason);
         gate["aborted"] = serde_json::json!(attempt.aborted);
         gate["real_seconds"] = serde_json::json!(attempt.reported.then_some(attempt.duration_s));
-        set_gate_failure_evidence(&mut gate, attempt_is_failure(attempt));
     }
+    gate["non_product_failure_bucket"] =
+        serde_json::json!(classification.non_product_failure_bucket());
     gate["attempts"] = serde_json::json!(node_attempts);
     gate["retries"] = serde_json::json!(node_attempts_raw.len().saturating_sub(1));
-    gate["first_attempt_result"] = serde_json::json!(first.and_then(attempt_result));
+    gate["first_attempt_result"] =
+        serde_json::json!(first.map(|attempt| attempt_classification(attempt).result()));
     gate["first_attempt_reason"] =
         serde_json::json!(first.map(|attempt| attempt.reason.as_str()));
     gate
+}
+
+#[derive(Debug, Default)]
+struct RunClassification {
+    product_result_nodes: BTreeSet<String>,
+    product_failure_nodes: BTreeSet<String>,
+    understood_infrastructure_failure_nodes: BTreeMap<String, Vec<String>>,
+    no_result_nodes: BTreeSet<String>,
+}
+
+fn classify_run(
+    outcomes: &[StepOutcome],
+    attempts: &[NodeAttempt],
+    skipped: &[String],
+    planned_tags: &BTreeSet<String>,
+    host_inapplicable: &[validate_plan::HostInapplicableNode],
+) -> RunClassification {
+    let mut classified = RunClassification::default();
+    for outcome in outcomes {
+        let node_classification = node_classification(outcome, attempts);
+        if node_classification.is_product_result() {
+            classified.product_result_nodes.insert(outcome.tag.clone());
+        }
+        match node_classification {
+            NodeClassification::Pass => {}
+            NodeClassification::ProductFailure => {
+                classified.product_failure_nodes.insert(outcome.tag.clone());
+            }
+            NodeClassification::UnderstoodInfrastructureFailure => {
+                let mut causes: Vec<String> = attempts
+                    .iter()
+                    .filter(|attempt| attempt.tag == outcome.tag)
+                    .filter_map(|attempt| attempt.understood_infrastructure_class.clone())
+                    .collect();
+                causes.sort();
+                causes.dedup();
+                classified
+                    .understood_infrastructure_failure_nodes
+                    .insert(outcome.tag.clone(), causes);
+            }
+            NodeClassification::NoResult => {
+                classified.no_result_nodes.insert(outcome.tag.clone());
+            }
+        }
+    }
+    classified.no_result_nodes.extend(skipped.iter().cloned());
+    let accounted: BTreeSet<&str> = outcomes
+        .iter()
+        .map(|outcome| outcome.tag.as_str())
+        .chain(skipped.iter().map(String::as_str))
+        .chain(host_inapplicable.iter().map(|node| node.tag.as_str()))
+        .collect();
+    classified.no_result_nodes.extend(
+        planned_tags
+            .iter()
+            .filter(|tag| !accounted.contains(tag.as_str()))
+            .cloned(),
+    );
+    classified
+}
+
+fn validation_is_complete(
+    execution_complete: bool,
+    classification: &RunClassification,
+    understood_prerequisite_failures: usize,
+) -> bool {
+    execution_complete
+        && classification
+            .understood_infrastructure_failure_nodes
+            .is_empty()
+        && classification.no_result_nodes.is_empty()
+        && understood_prerequisite_failures == 0
+}
+
+fn validation_completeness_detail(
+    validation_complete: bool,
+    product_results: usize,
+    selected: usize,
+) -> String {
+    if validation_complete {
+        format!("COMPLETE: all {selected} selected node(s) produced a product result")
+    } else {
+        format!(
+            "INCOMPLETE: {product_results} of {selected} selected node(s) produced a product \
+             result; this run produced a partial answer and is not green evidence for landing"
+        )
+    }
 }
 
 fn ledger_gate_origin_bracket() -> Result<(), String> {
@@ -12333,6 +12696,7 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
          outcome: &StepOutcome,
          attempts: &[NodeAttempt],
          expected_result: Option<&str>,
+         expected_latest_result: Option<&str>,
          expected_reported: bool,
          expected_execution: &str,
          expected_failure: bool|
@@ -12355,7 +12719,8 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
             if result != expected_result
                 || row["reported"].as_bool() != Some(expected_reported)
                 || row["execution"].as_str() != Some(expected_execution)
-                || latest.get("result").and_then(serde_json::Value::as_str) != expected_result
+                || latest.get("result").and_then(serde_json::Value::as_str)
+                    != expected_latest_result
                 || latest["reported"].as_bool() != Some(expected_reported)
                 || latest["execution"].as_str() != Some(expected_execution)
                 || !failure_evidence_matches
@@ -12375,6 +12740,7 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         &failed,
         std::slice::from_ref(&failed_attempt),
         Some("fail"),
+        Some("fail"),
         true,
         "completed",
         true,
@@ -12384,6 +12750,7 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         &passed,
         std::slice::from_ref(&passed_attempt),
         Some("pass"),
+        Some("pass"),
         true,
         "completed",
         false,
@@ -12392,7 +12759,8 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         "latest aborted attempt",
         &aborted,
         std::slice::from_ref(&aborted_attempt),
-        None,
+        Some("no_result"),
+        Some("no_result"),
         true,
         "unknown",
         false,
@@ -12406,6 +12774,7 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         &failed,
         &fail_then_pass,
         Some("pass"),
+        Some("pass"),
         true,
         "completed",
         false,
@@ -12417,10 +12786,11 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         "stale failure followed by abort",
         &failed,
         &fail_then_aborted,
-        None,
+        Some("fail"),
+        Some("no_result"),
         true,
         "unknown",
-        false,
+        true,
     )?;
     let mut failed_retry = failed_attempt;
     failed_retry.attempt = 2;
@@ -12429,6 +12799,7 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         "stale pass followed by genuine failure",
         &passed,
         &pass_then_failure,
+        Some("fail"),
         Some("fail"),
         true,
         "completed",
@@ -12702,8 +13073,8 @@ fn no_result_propagation_bracket() -> Result<(), String> {
         return Err("no-result propagation: a sibling exit 75 hid a genuine failure".into());
     }
 
-    if completed_exit_code(0, 1, true, false) != 1 {
-        return Err("no-result propagation: a run timeout was weakened to NO_RESULT".into());
+    if completed_exit_code(0, 0, true, false) != NO_RESULT_EXIT_CODE as u8 {
+        return Err("no-result propagation: a run timeout was misreported as a product failure".into());
     }
     if completed_exit_code(0, 1, false, true) != 1 {
         return Err(
@@ -12716,8 +13087,195 @@ fn no_result_propagation_bracket() -> Result<(), String> {
         return Err("no-result propagation: an aborted row acquired a completed verdict".into());
     }
 
+    // The owner's retry fold. A later pass is green. Otherwise any product
+    // failure is red; only an all-infrastructure failure history reaches the
+    // understood-infrastructure bucket; an unknown attempt makes the result a
+    // genuine no-result.
+    let infrastructure_failure = outcome("taxonomy", 1, false);
+    let mut infrastructure_1 = reported_attempt(&infrastructure_failure, 1);
+    infrastructure_1.understood_infrastructure_class = Some("PMU RCB overshoot".into());
+    infrastructure_1.detail_observed = true;
+    let mut infrastructure_2 = infrastructure_1.clone();
+    infrastructure_2.attempt = 2;
+    let all_infrastructure = [infrastructure_1.clone(), infrastructure_2.clone()];
+    if node_classification(&infrastructure_failure, &all_infrastructure)
+        != NodeClassification::UnderstoodInfrastructureFailure
+    {
+        return Err(
+            "retry taxonomy: two diagnosed infrastructure failures did not become no-result"
+                .into(),
+        );
+    }
+    let infrastructure_gate =
+        ledger_gate_with_attempts(&infrastructure_failure, &all_infrastructure);
+    if infrastructure_gate["result"] != "no_result"
+        || infrastructure_gate["non_product_failure_bucket"]
+            != "understood_infrastructure_failure"
+        || !infrastructure_gate["failure_origin"].is_null()
+        || infrastructure_gate.get("failed_substeps").is_some()
+    {
+        return Err(format!(
+            "retry taxonomy: all-infrastructure gate was serialized as product red: \
+             {infrastructure_gate}"
+        ));
+    }
+
+    let product_attempt = reported_attempt(&infrastructure_failure, 1);
+    for attempts in [
+        vec![product_attempt.clone(), infrastructure_2.clone()],
+        vec![infrastructure_1.clone(), {
+            let mut attempt = product_attempt.clone();
+            attempt.attempt = 2;
+            attempt
+        }],
+    ] {
+        if node_classification(&infrastructure_failure, &attempts)
+            != NodeClassification::ProductFailure
+        {
+            return Err(
+                "retry taxonomy: a product failure was hidden by an infrastructure failure"
+                    .into(),
+            );
+        }
+    }
+
+    let mut retry_pass = reported_attempt(&pass, 2);
+    retry_pass.tag = infrastructure_failure.tag.clone();
+    if node_classification(
+        &infrastructure_failure,
+        &[product_attempt.clone(), retry_pass],
+    ) != NodeClassification::Pass
+    {
+        return Err("retry taxonomy: a later pass did not make the cell green".into());
+    }
+
+    let unknown_retry = unreported_attempt(infrastructure_failure.tag.clone(), 2);
+    if node_classification(
+        &infrastructure_failure,
+        &[infrastructure_1, unknown_retry],
+    ) != NodeClassification::NoResult
+    {
+        return Err(
+            "retry taxonomy: an unknown retry was hidden by an earlier infrastructure diagnosis"
+                .into(),
+        );
+    }
+
+    let completed_timeout = StepOutcome {
+        reason: format!("{WALL_BUDGET_REASON_PREFIX} 15s"),
+        ..outcome("timeout", -15, false)
+    };
+    let completed_timeout_attempt = reported_attempt(&completed_timeout, 1);
+    let completed_timeout_gate = ledger_gate_with_attempts(
+        &completed_timeout,
+        std::slice::from_ref(&completed_timeout_attempt),
+    );
+    if node_classification(
+        &completed_timeout,
+        std::slice::from_ref(&completed_timeout_attempt),
+    ) != NodeClassification::ProductFailure
+        || completed_timeout_gate["result"] != "fail"
+        || completed_timeout_gate["failure_origin"] != "outer_gate"
+    {
+        return Err(
+            "retry taxonomy: a completed budget breach did not remain a product failure".into(),
+        );
+    }
+
+    let killed_before_result = unreported_attempt("killed-before-result".into(), 1);
+    let killed_outcome = outcome("killed-before-result", -15, true);
+    let killed_gate = ledger_gate_with_attempts(
+        &killed_outcome,
+        std::slice::from_ref(&killed_before_result),
+    );
+    if node_classification(
+        &killed_outcome,
+        std::slice::from_ref(&killed_before_result),
+    ) != NodeClassification::NoResult
+        || killed_gate["result"] != "no_result"
+        || !killed_gate["failure_origin"].is_null()
+        || killed_gate.get("failed_substeps").is_some()
+    {
+        return Err(
+            "retry taxonomy: an execution killed before producing a result became product red"
+                .into(),
+        );
+    }
+
+    let planned = BTreeSet::from(["pass".to_string(), "failure".to_string()]);
+    let complete_green = classify_run(
+        std::slice::from_ref(&pass),
+        std::slice::from_ref(&reported_attempt(&pass, 1)),
+        &[],
+        &BTreeSet::from(["pass".to_string()]),
+        &[],
+    );
+    let complete_failure = outcome("failure", 1, false);
+    let complete_red = classify_run(
+        &[pass.clone(), complete_failure.clone()],
+        &[reported_attempt(&pass, 1), reported_attempt(&complete_failure, 1)],
+        &[],
+        &planned,
+        &[],
+    );
+    if !validation_is_complete(true, &complete_green, 0)
+        || !validation_is_complete(true, &complete_red, 0)
+        || validation_is_complete(true, &complete_green, 1)
+        || validation_completeness_detail(true, 2, 2)
+            != "COMPLETE: all 2 selected node(s) produced a product result"
+        || validation_completeness_detail(false, 1, 2)
+            != "INCOMPLETE: 1 of 2 selected node(s) produced a product result; this run produced \
+                a partial answer and is not green evidence for landing"
+    {
+        return Err("retry taxonomy: a complete green or complete red was called incomplete".into());
+    }
+
+    // Super's rate table used to count every selected repetition in its failure
+    // denominator, even when the repetition had no product result. Exercise the
+    // real printer with all three relevant shapes: a partial all-pass probe is
+    // incomplete rather than red, a measured product failure is red, and the
+    // existing DBT nonblocking policy remains nonblocking.
+    let super_rates = [
+        validate_super::ProbeRate {
+            probe: validate_super::StressProbe::PtracePipeline,
+            passed: 1,
+            ran: 1,
+            planned: 2,
+        },
+        validate_super::ProbeRate {
+            probe: validate_super::StressProbe::PtraceStrictVerify,
+            passed: 0,
+            ran: 1,
+            planned: 2,
+        },
+        validate_super::ProbeRate {
+            probe: validate_super::StressProbe::DbtVerify,
+            passed: 0,
+            ran: 1,
+            planned: 2,
+        },
+    ];
+    if print_super_stress_verdict(&super_rates, 2, 1, 1) != 1 {
+        return Err(
+            "retry taxonomy: super stress did not separate no-result, product failure, and \
+             existing nonblocking policy"
+                .into(),
+        );
+    }
+    let complete_super_rate = [validate_super::ProbeRate {
+        probe: validate_super::StressProbe::PtracePipeline,
+        passed: 2,
+        ran: 2,
+        planned: 2,
+    }];
+    if validate_super::stress_verdict(&complete_super_rate, 2, 1, 1) != 0 {
+        return Err("retry taxonomy: complete super pass no longer passed".into());
+    }
+
     println!(
-        "  no-result propagation: 75 stayed distinct; 0 passed; 8 other exits and mixed 75+failure stayed RED"
+        "  no-result propagation: retry pass green; any product failure and completed timeout \
+         red; all-infrastructure and a kill before result no-result; super preserved the split; \
+         complete green/red stayed complete"
     );
     Ok(())
 }
@@ -12742,15 +13300,19 @@ fn write_ledger(
     wall_s: f64,
     exit_code: u8,
     log_file: &str,
-    suite_complete: bool,
+    validation_complete: bool,
     coverage: serde_json::Value,
     cell_results: Option<&validate_cell_results::RetainedCellResults>,
 ) {
     let (coverage_schema, coverage) = ledger_schema_and_coverage(coverage);
     let ledger_schema = ledger_schema_version(coverage_schema, cell_results);
     let gates_run = outcomes.len();
-    let failures = outcomes.iter().filter(|o| outcome_is_failure(o)).count();
-    let no_results = outcomes.iter().filter(|o| outcome_is_no_result(o)).count();
+    let classification =
+        classify_run(outcomes, attempts, skipped, planned_tags, host_inapplicable);
+    let failures = classification.product_failure_nodes.len();
+    let no_results = classification.understood_infrastructure_failure_nodes.len()
+        + classification.no_result_nodes.len()
+        + host_inapplicable.len();
     // An operator stop learned nothing new about the product. Preserve the raw
     // shell outcome for forensics, but do not mint a FAILED verdict unless a
     // completed gate had already established one before the stop
@@ -12762,13 +13324,12 @@ fn write_ledger(
     // one carrying `corrects: <this id>`, which is what keeps the shard
     // append-only and safe to union across machines.
     let record_id = format!("{}-{}-{}", ctx.host, epoch_now(), std::process::id());
-    // The PLANNED denominator, not the executed one. A node withheld as
-    // host-inapplicable is added back here, so withholding can never shrink the
-    // contract a green is measured against; the consumer's accounting
-    // (`executed + intentionally skipped == expected`) then has to balance.
-    // With nothing withheld this is byte-identical to what it has always been.
-    let gates_expected = if ctx.profile == "full" && suite_complete {
-        serde_json::json!(gates_run + host_inapplicable.len())
+    // The PLANNED denominator, not the executed one, and present even when the
+    // full run is incomplete. Clearing it on the run that needs it most makes a
+    // partial answer unable to say how partial it was. `validation_complete`
+    // states whether every selected node produced a product result.
+    let gates_expected = if ctx.profile == "full" {
+        serde_json::json!(planned_tags.len())
     } else {
         serde_json::Value::Null
     };
@@ -12782,6 +13343,7 @@ fn write_ledger(
             serde_json::json!({
                 "name": n.tag,
                 "reason": validate_plan::HOST_INAPPLICABLE_REASON,
+                "non_product_failure_bucket": "understood_prerequisite_failure",
                 "capability": n.capability.value(),
                 "evidence": n.evidence,
             })
@@ -12869,6 +13431,15 @@ fn write_ledger(
         "exit_code": exit_code,
         "checks": gates_run,
         "failures": failures,
+        "validation_complete": validation_complete,
+        "product_result_node_count": classification.product_result_nodes.len(),
+        "product_result_nodes": classification.product_result_nodes,
+        "understood_infrastructure_failure_nodes": classification.understood_infrastructure_failure_nodes,
+        "understood_prerequisite_failure_nodes": host_inapplicable
+            .iter()
+            .map(|node| node.tag.as_str())
+            .collect::<Vec<_>>(),
+        "no_result_nodes": classification.no_result_nodes,
         "dag_jobs": ctx.dag_jobs,
         // Peak CPU-ACTIVE peer validates, and HOW that was established. `null`
         // means UNKNOWN — a bare run with no observed peer is not proven
@@ -14930,8 +15501,24 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             run_timeout.unwrap_or(0)
         );
     }
-    print_cost_table(&outcomes, &skipped, &plan.host_inapplicable);
+    print_cost_table(&outcomes, &attempts, &skipped, &plan.host_inapplicable);
     print_retry_ledger(&attempts);
+    let run_classification = classify_run(
+        &outcomes,
+        &attempts,
+        &skipped,
+        &planned_tags,
+        &plan.host_inapplicable,
+    );
+    let verdict_outcomes: Vec<StepOutcome> = outcomes
+        .iter()
+        .map(|outcome| outcome_with_classification(outcome, &attempts))
+        .collect();
+    let validation_complete = validation_is_complete(
+        execution_complete,
+        &run_classification,
+        plan.host_inapplicable.len(),
+    );
 
     // ---- the single cleanup / evidence-commit point (validate.sh:1812) -------
     //
@@ -14965,7 +15552,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // Whole-run CPU, taken once in THIS process (a worker thread would see only
     // its own accounting, exactly as a bash subshell's `times` would).
     let (cpu_user, cpu_sys) = validate_runtime::process_cpu_seconds();
-    let (executed_tests, filtered_tests) = libtest_counts(&outcomes);
+    let (executed_tests, filtered_tests) = libtest_counts(&verdict_outcomes);
     if executed_tests.is_none() {
         eprintln!(
             "validate: WARNING: libtest counts are UNKNOWN for this run. A ledger row with \
@@ -14978,7 +15565,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // per-node coverage parser reads printable banners. Rebuild coverage from
     // dagrun's structured producer results so stdout cannot qualify a node.
     let receipt = receipt_evidence(parent.as_deref(), &root, &log_path, &commit);
-    let coverage = typed_test_node_coverage(&plan.planned_test_nodes, &outcomes);
+    let coverage = typed_test_node_coverage(&plan.planned_test_nodes, &verdict_outcomes);
 
     let behind_ahead = sh("git", &["rev-list", "--left-right", "--count", "origin/main...HEAD"])
         .unwrap_or_else(|| "0 0".into());
@@ -15084,7 +15671,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             detail,
         );
         s.nodes_executed = outcomes.len();
-        s.nodes_failed = outcomes.iter().filter(|o| outcome_is_failure(o)).count();
+        s.nodes_failed = run_classification.product_failure_nodes.len();
         s.nodes_skipped = skipped.len();
         s.nodes_host_inapplicable = plan.host_inapplicable.len();
         s.wall_s = Some(wall);
@@ -15103,7 +15690,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // able to reach PASS through an empty set of failing rows.
     let mut compat_measured: Option<usize> = None;
     if let Some(mode) = plan.compat {
-        let (passed, measured, blocking) = print_compat_summary(mode, &outcomes);
+        let (passed, measured, blocking) = print_compat_summary(mode, &verdict_outcomes);
         compat_blocking = blocking.len();
         compat_measured = Some(measured);
         let floor = match mode {
@@ -15128,8 +15715,20 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let mut super_blocking = 0usize;
     if plan.super_mode {
         let reps = validate_super::repetitions();
-        let rates = validate_super::stress_rates(&outcomes, reps);
-        super_blocking = validate_super::stress_verdict(&rates, reps, jobs, host_cpus);
+        // An infrastructure failure or no-result repetition is omitted here so
+        // the stress rate cannot relabel it as a product failure. The final
+        // incomplete summary still counts and names every omitted node.
+        let super_product_outcomes: Vec<StepOutcome> = verdict_outcomes
+            .iter()
+            .filter(|outcome| {
+                run_classification
+                    .product_result_nodes
+                    .contains(&outcome.tag)
+            })
+            .cloned()
+            .collect();
+        let rates = validate_super::stress_rates(&super_product_outcomes, reps);
+        super_blocking = print_super_stress_verdict(&rates, reps, jobs, host_cpus);
     }
 
     // Working-envelope vector: score, emit JSON, print the human summary, and
@@ -15156,13 +15755,19 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         }
     }
 
-    let failures = outcomes.iter().filter(|o| outcome_is_failure(o)).count();
-    let no_result_nodes: Vec<&str> = outcomes
-        .iter()
-        .filter(|o| outcome_is_no_result(o))
-        .map(|o| o.tag.as_str())
+    let failures = run_classification.product_failure_nodes.len();
+    let understood_infrastructure_failure_nodes: Vec<&str> = run_classification
+        .understood_infrastructure_failure_nodes
+        .keys()
+        .map(String::as_str)
         .collect();
-    let no_results = no_result_nodes.len();
+    let no_result_nodes: Vec<&str> =
+        run_classification.no_result_nodes.iter().map(String::as_str).collect();
+    let understood_prerequisite_failure_nodes: Vec<&str> =
+        plan.host_inapplicable.iter().map(|node| node.tag.as_str()).collect();
+    let no_results = understood_infrastructure_failure_nodes.len()
+        + no_result_nodes.len()
+        + understood_prerequisite_failure_nodes.len();
     // The verdict is the RATCHET, not the raw node count.
     //
     // Three profiles deliberately have a verdict narrower than "every node
@@ -15173,7 +15778,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     //     their first measurement is reported rather than ratcheted;
     //   * envelope — it is a measurement, so probe failures lower a count and
     //     only the build/preflight spine can fail it.
-    let blocking_failures = outcomes
+    let blocking_failures = verdict_outcomes
         .iter()
         .filter(|o| outcome_is_failure(o) && !plan.nonblocking.contains(&o.tag))
         .count();
@@ -15183,7 +15788,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // double-count and re-block rows policy has excused. Everything else — a
     // failed `compatprep.*`, `pre.*`, `gate.*`, `build.*` — is a node whose
     // failure can EMPTY the matrix, and no matrix ratchet can speak to that.
-    let structural_failures = outcomes
+    let structural_failures = verdict_outcomes
         .iter()
         .filter(|o| {
             outcome_is_failure(o)
@@ -15219,14 +15824,17 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     if series_error.is_some() {
         exit_code = 1;
     }
-    if !execution_complete {
+    if !validation_complete {
         eprintln!(
-            "validate: ERROR: not every required node completed with a non-aborted outcome; \
-             dependency-skipped, aborted, timed-out, and unreported work makes validation \
-             incomplete and cannot report PASS."
+            "validate: {}",
+            validation_completeness_detail(
+                false,
+                run_classification.product_result_nodes.len(),
+                planned_tags.len(),
+            ),
         );
     }
-    exit_code = exit_code_with_execution_completeness(exit_code, execution_complete);
+    exit_code = exit_code_with_execution_completeness(exit_code, validation_complete);
 
     // Completeness is not the ratchet's to decide. A ratchet narrows WHICH
     // measured rows may fail; it cannot answer whether anything was measured, so
@@ -15426,7 +16034,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             wall,
             exit_code,
             &log_path.to_string_lossy(),
-            plan.suite_complete && execution_complete,
+            validation_complete,
             coverage,
             retained_cell_results.as_ref(),
         );
@@ -15460,7 +16068,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // finished, and `read_log_since_settled` flushes the live tee before reading.
     let failed_finally: BTreeSet<String> = outcomes
         .iter()
-        .filter(|o| outcome_is_failure(o))
+        .filter(|o| run_classification.product_failure_nodes.contains(o.tag.as_str()))
         .map(|o| o.tag.clone())
         .collect();
     let mut test_summary_errors = Vec::new();
@@ -15496,21 +16104,48 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let mut detail = Vec::new();
     let excused = failures - blocking_failures;
     if exit_code == 0 {
-        detail.push(format!("every blocking gate passed ({} node(s) ran)", outcomes.len()));
-    } else if exit_code == NO_RESULT_EXIT_CODE as u8 {
         detail.push(format!(
-            "{} gate(s) could not determine their condition: {}",
-            no_results,
-            no_result_nodes.join(", ")
+            "{}; every blocking gate passed",
+            validation_completeness_detail(
+                validation_complete,
+                run_classification.product_result_nodes.len(),
+                planned_tags.len(),
+            )
+        ));
+    } else if exit_code == NO_RESULT_EXIT_CODE as u8 {
+        detail.push(validation_completeness_detail(
+            false,
+            run_classification.product_result_nodes.len(),
+            planned_tags.len(),
         ));
     } else {
-        let (_named, listing) = blocking_listing(&outcomes, &plan.nonblocking, effective_failures);
+        let (_named, listing) =
+            blocking_listing(&verdict_outcomes, &plan.nonblocking, effective_failures);
         detail.push(format!("{effective_failures} blocking failure(s){listing}"));
+        detail.push(validation_completeness_detail(
+            validation_complete,
+            run_classification.product_result_nodes.len(),
+            planned_tags.len(),
+        ));
     }
-    if exit_code != NO_RESULT_EXIT_CODE as u8 && no_results > 0 {
+    if !understood_infrastructure_failure_nodes.is_empty() {
         detail.push(format!(
-            "{} gate(s) reported NO_RESULT but did not hide the genuine failure(s): {}",
-            no_results,
+            "understood infrastructure failure: {} node(s): {}",
+            understood_infrastructure_failure_nodes.len(),
+            understood_infrastructure_failure_nodes.join(", ")
+        ));
+    }
+    if !understood_prerequisite_failure_nodes.is_empty() {
+        detail.push(format!(
+            "understood prerequisite failure: {} node(s): {}",
+            understood_prerequisite_failure_nodes.len(),
+            understood_prerequisite_failure_nodes.join(", ")
+        ));
+    }
+    if !no_result_nodes.is_empty() {
+        detail.push(format!(
+            "no result: {} node(s): {}",
+            no_result_nodes.len(),
             no_result_nodes.join(", ")
         ));
     }
@@ -15544,8 +16179,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     }
     if !execution_complete {
         detail.push(
-            "not every required node completed with a non-aborted outcome; dependency-skipped, \
-             aborted, timed-out, or unreported work made the run incomplete"
+            "dependency-skipped, aborted, timed-out, or unreported work prevented a complete answer"
                 .into(),
         );
     }
@@ -15554,9 +16188,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     if !plan.host_inapplicable.is_empty() {
         detail.push(format!(
             "{} planned node(s) were NOT RUN because this machine provably cannot run them, and \
-             are recorded as '{}': {}. This is NOT a pass and NOT coverage — whatever those nodes \
-             verify is UNVERIFIED by this run, and the ledger row carries the omission so the \
-             parent's receipt gate can refuse it.",
+             are recorded as '{}' in the understood prerequisite failure bucket: {}. This is NOT \
+             a pass and NOT coverage — whatever those nodes verify is UNVERIFIED by this run.",
             plan.host_inapplicable.len(),
             validate_plan::HOST_INAPPLICABLE_REASON,
             plan.host_inapplicable
@@ -15741,9 +16374,8 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
         executed_tests: None,
         filtered_tests: None,
     };
-    // `suite_complete: false` — a fixture that ran two synthetic gates must never
-    // publish a gates_expected obligation, which is what would make it look like
-    // a completed full profile.
+    // `validation_complete: false` — the fixture always stops before a complete
+    // validate verdict. Its selected denominator is still retained below.
     // The fixture plans exactly the synthetic gates it ran, withholds nothing,
     // and leaves nothing unaccounted.
     let planned_tags: BTreeSet<String> = outcomes.iter().map(|o| o.tag.clone()).collect();
