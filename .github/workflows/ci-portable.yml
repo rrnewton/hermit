@@ -276,6 +276,11 @@ jobs:
           echo "rust-script resolved: $(command -v rust-script) $(rust-script --version)"
       - name: Run preflight nodes
         env:
+          # The constructed check-outcome checks fetch their pinned public
+          # authority with gh api. GitHub provides the read-only token, but gh
+          # deliberately refuses to infer it unless the harness exposes it as
+          # GH_TOKEN.
+          GH_TOKEN: ${{ github.token }}
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
         run: ./ci/run-node.sh portable "$(jq -r '.preflight_nodes|join(",")' ci/portable-shards.json)"
       - name: Upload preflight node performance report
