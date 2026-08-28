@@ -2172,15 +2172,12 @@ cleared-caps refusal names {} starved step(s)",
             .iter()
             .find(|s| s.tag() == "privileged-build.privileged_tests")
             .ok_or("full-plan bracket: privileged focused build disappeared")?;
-        if !privileged_build
-            .deps
-            .iter()
-            .any(|d| d == "build.e2e_artifact")
-        {
-            return Err(
-                "full-plan bracket: privileged build can race the portable artifact producer"
-                    .into(),
-            );
+        for required in ["build.e2e_artifact", "build.liteinst_runtime_release"] {
+            if !privileged_build.deps.iter().any(|dependency| dependency == required) {
+                return Err(format!(
+                    "full-plan bracket: privileged build can start before required build barrier {required}"
+                ));
+            }
         }
         let expected_test_prebuild = "CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run";
         if !privileged_build
@@ -5552,10 +5549,12 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
                 privileged_build.cmd
             ));
         }
-        if !privileged_build.deps.iter().any(|d| d == producer) {
-            privileged_build.deps.push(producer.to_string());
-            privileged_build.deps.sort();
+        for dependency in [producer, "build.liteinst_runtime_release"] {
+            if !privileged_build.deps.iter().any(|d| d == dependency) {
+                privileged_build.deps.push(dependency.to_string());
+            }
         }
+        privileged_build.deps.sort();
         // SELECT THE NEWEST, DO NOT REQUIRE EXACTLY ONE.
         //
         // This assertion used to end `test "$count" -eq 1`, and that made the
