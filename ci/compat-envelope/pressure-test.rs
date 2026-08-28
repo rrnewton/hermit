@@ -58,6 +58,8 @@ use hermit_manifest_plan::runner::CELL_RESULT_SCHEMA;
 use hermit_manifest_plan::runner::CellResult;
 use hermit_manifest_plan::runner::cell_result_after_retries;
 use hermit_manifest_plan::runner::E2E_RUN_INDEX_ENV;
+use hermit_manifest_plan::runner::FailureClass;
+use hermit_manifest_plan::runner::ObservedResult;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -861,6 +863,13 @@ fn read_result_rows(path: &Path) -> Result<Vec<CellResult>, String> {
         }
         let row: CellResult = serde_json::from_str(line)
             .map_err(|e| format!("invalid {}:{}: {e}", path.display(), index + 1))?;
+        row.validate_recorded_classification().map_err(|error| {
+            format!(
+                "invalid {}:{} result classification: {error}",
+                path.display(),
+                index + 1
+            )
+        })?;
         if row.attempt == 0 {
             return Err(format!(
                 "{}:{} has non-positive result attempt 0",
@@ -1738,111 +1747,6 @@ fn series_run_index(dir_name: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn logical_time_nanoseconds(text: &str) -> Option<u64> {
-    let value = text.trim().replace('_', "");
-    if let Some(nanoseconds) = value.strip_suffix("ns") {
-        return nanoseconds.parse().ok();
-    }
-    let seconds = value.strip_suffix('s')?;
-    let (whole, fraction) = seconds.split_once('.').unwrap_or((seconds, ""));
-    if fraction.len() > 9
-        || !whole.bytes().all(|byte| byte.is_ascii_digit())
-        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
-    }
-    let whole = whole.parse::<u64>().ok()?;
-    let mut fraction = fraction.to_string();
-    fraction.extend(std::iter::repeat_n('0', 9 - fraction.len()));
-    whole
-        .checked_mul(1_000_000_000)?
-        .checked_add(fraction.parse::<u64>().ok()?)
-}
-
-fn runtime_from_log(path: &Path) -> Result<RuntimeStats, String> {
-    let text = fs::read_to_string(path)
-        .map_err(|error| format!("cannot read retained verification log {}: {error}", path.display()))?;
-    let scheduler_turns = text
-        .lines()
-        .rev()
-        .find_map(|line| {
-            line.split_once("Internally, the hermit scheduler ran ")
-                .and_then(|(_, rest)| rest.split_whitespace().next())
-                .and_then(|value| value.parse::<u64>().ok())
-        })
-        .ok_or_else(|| format!("{} has no scheduler-turn summary", path.display()))?;
-    let virtual_nanoseconds = text
-        .lines()
-        .rev()
-        .find_map(|line| {
-            line.split_once("Elapsed virtual global (cpu) time: ")
-                .and_then(|(_, value)| logical_time_nanoseconds(value))
-        })
-        .ok_or_else(|| format!("{} has no virtual-time summary", path.display()))?;
-    let mut per_thread = BTreeMap::<u64, u64>::new();
-    for line in text.lines() {
-        let Some((_, after_tid)) = line.split_once("[detcore, dtid ") else {
-            continue;
-        };
-        let Some((dettid, _)) = after_tid.split_once(']') else {
-            continue;
-        };
-        let Some((_, after_syscall)) = line.split_once("finish syscall #") else {
-            continue;
-        };
-        let count = after_syscall
-            .bytes()
-            .take_while(u8::is_ascii_digit)
-            .count();
-        let Some(syscalls) = after_syscall.get(..count).and_then(|value| value.parse::<u64>().ok())
-        else {
-            continue;
-        };
-        let Some(dettid) = dettid.parse::<u64>().ok() else {
-            continue;
-        };
-        per_thread
-            .entry(dettid)
-            .and_modify(|seen| *seen = (*seen).max(syscalls))
-            .or_insert(syscalls);
-    }
-    let syscalls = if per_thread.is_empty() {
-        None
-    } else {
-        Some(
-            per_thread
-            .values()
-            .try_fold(0_u64, |total, count| total.checked_add(*count))
-            .ok_or_else(|| format!("{} syscall total overflowed u64", path.display()))?,
-        )
-    };
-    Ok(RuntimeStats {
-        scheduler_turns,
-        virtual_nanoseconds,
-        syscalls,
-    })
-}
-
-fn retained_verification_runtime(
-    attempts: &[AttemptResult],
-) -> Result<Option<VerificationRuntime>, String> {
-    for attempt in attempts {
-        let mut run1 = None;
-        let mut run2 = None;
-        for line in attempt.stderr.lines() {
-            if let Some(path) = line.strip_prefix("::   run 1: ") {
-                run1 = Some(runtime_from_log(Path::new(path))?);
-            } else if let Some(path) = line.strip_prefix("::   run 2: ") {
-                run2 = Some(runtime_from_log(Path::new(path))?);
-            }
-        }
-        if run1.is_some() || run2.is_some() {
-            return Ok(Some(VerificationRuntime { run1, run2 }));
-        }
-    }
-    Ok(None)
-}
-
 /// Publish a retained campaign's per-cell results to the parent's series spool.
 ///
 /// This is the call site the store was missing. Everything it needs already
@@ -1883,7 +1787,7 @@ fn collect_series_rows(results: &Path) -> Result<Vec<(String, CellResult)>, Stri
             .ok_or_else(|| format!("{} has no result-directory name", result_file.display()))?
             .to_string_lossy()
             .into_owned();
-        for mut row in read_result_rows(&result_file)? {
+        for row in read_result_rows(&result_file)? {
             let repetition = series_run_index(&dir_name);
             if row.run_index != Some(repetition) {
                 return Err(format!(
@@ -1893,9 +1797,10 @@ fn collect_series_rows(results: &Path) -> Result<Vec<(String, CellResult)>, Stri
                     repetition,
                 ));
             }
-            if row.runtime.is_none() && row.mode == "verify" {
-                row.runtime = retained_verification_runtime(&row.attempts)?;
-            }
+            // Runtime belongs to the typed verification report written by the
+            // framework. Retained rows written before that field existed remain
+            // readable with `runtime: None`; stderr and retained log prose do not
+            // acquire measurement authority after the fact.
             let key = format!(
                 "{}/{}/{:020}/{:020}",
                 dir_name, row.test, repetition, row.attempt,
@@ -4177,6 +4082,8 @@ fn summarize(
                 row_valid,
                 reason,
                 error_kind,
+                recorded_result,
+                failure_class,
                 attempt,
                 invocation,
                 artifact_dir,
@@ -4189,6 +4096,8 @@ fn summarize(
                                 json!({
                                     "attempt": row.attempt,
                                     "outcome": row.outcome,
+                                    "result": row.result,
+                                    "failure_class": row.failure_class,
                                     "reason": row.reason,
                                     "error_kind": row.error_kind,
                                     "duration_ms": row.duration_ms,
@@ -4242,6 +4151,8 @@ fn summarize(
                                             true,
                                             row.reason.clone(),
                                             row.error_kind.clone(),
+                                            row.result,
+                                            row.failure_class,
                                             row.attempt,
                                             Some(invocation),
                                             Some(result_artifact_dir(results, row)?),
@@ -4252,7 +4163,17 @@ fn summarize(
                                             "{} does not carry complete literal attempt invocations: {error}",
                                             result_file.display()
                                         ));
-                                        ("NO_RESULT".to_string(), false, None, None, 1, None, None)
+                                        (
+                                            "NO_RESULT".to_string(),
+                                            false,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            1,
+                                            None,
+                                            None,
+                                        )
                                     }
                                 }
                             }
@@ -4261,24 +4182,74 @@ fn summarize(
                                     "{} does not match every selected-cell observation, the terminal harness exit, or retained runner result",
                                     result_file.display()
                                 ));
-                                ("NO_RESULT".to_string(), false, None, None, 1, None, None)
+                                (
+                                    "NO_RESULT".to_string(),
+                                    false,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    1,
+                                    None,
+                                    None,
+                                )
                             }
                             Err(error) => {
                                 evidence_errors.push(error);
-                                ("NO_RESULT".to_string(), false, None, None, 1, None, None)
+                                (
+                                    "NO_RESULT".to_string(),
+                                    false,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    1,
+                                    None,
+                                    None,
+                                )
                             }
                         }
                     }
                     Err(error) => {
                         evidence_errors.push(error);
-                        ("NO_RESULT".to_string(), false, None, None, 1, None, None)
+                        (
+                            "NO_RESULT".to_string(),
+                            false,
+                            None,
+                            None,
+                            None,
+                            None,
+                            1,
+                            None,
+                            None,
+                        )
                     }
                 }
             } else if !proven_oom && !proven_timeout {
                 evidence_errors.push(format!("missing result row {}", result_file.display()));
-                ("NO_RESULT".to_string(), false, None, None, 1, None, None)
+                (
+                    "NO_RESULT".to_string(),
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    1,
+                    None,
+                    None,
+                )
             } else {
-                ("NO_RESULT".to_string(), false, None, None, 1, None, None)
+                (
+                    "NO_RESULT".to_string(),
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    1,
+                    None,
+                    None,
+                )
             };
             let verification = match artifact_dir.as_deref() {
                 Some(artifact_dir) => match read_verification_report(cell, artifact_dir) {
@@ -4349,7 +4320,7 @@ fn summarize(
             if invocation.is_none() {
                 evidence_errors.push("selected result has no complete recorded invocation".into());
             }
-            let result = classify_result(
+            let derived_result = classify_result(
                 runner,
                 harness_status,
                 &outcome,
@@ -4360,6 +4331,33 @@ fn summarize(
                 verification_logs.len() == 2,
                 evidence_errors.is_empty(),
             );
+            // Current rows take their functional result from the framework.
+            // The older pressure classifier remains only to read retained
+            // pre-field rows and to refuse disagreement; it is no longer the
+            // authority that reconstructs a current result after execution.
+            let mut result = derived_result;
+            if row_valid && evidence_errors.is_empty() {
+                if let Some(recorded_result) = recorded_result {
+                    if recorded_result.as_str() != derived_result {
+                        evidence_errors.push(format!(
+                            "framework result {} disagrees with pressure consistency check {derived_result}",
+                            recorded_result.as_str()
+                        ));
+                    } else if failure_class != recorded_result.failure_class() {
+                        evidence_errors.push(format!(
+                            "framework result {} carries failure_class {:?}, expected {:?}",
+                            recorded_result.as_str(),
+                            failure_class,
+                            recorded_result.failure_class()
+                        ));
+                    } else {
+                        result = recorded_result.as_str();
+                    }
+                }
+            }
+            if !evidence_errors.is_empty() {
+                result = "infrastructure-error";
+            }
             *by_backend
                 .entry(cell.backend.clone())
                 .or_default()
@@ -4392,6 +4390,17 @@ fn summarize(
                         if earlier_row.attempt == attempt {
                             continue;
                         }
+                        if let Some(recorded_result) = earlier_row.result {
+                            if earlier_row.failure_class != recorded_result.failure_class() {
+                                return Err(format!(
+                                    "earlier framework attempt {} result {} carries failure_class {:?}, expected {:?}",
+                                    earlier_row.attempt,
+                                    recorded_result.as_str(),
+                                    earlier_row.failure_class,
+                                    recorded_result.failure_class()
+                                ));
+                            }
+                        }
                         let earlier_invocation = result_row_invocation(earlier_row)?;
                         let earlier_artifact_dir = result_artifact_dir(results, earlier_row)?;
                         let earlier_verification = read_verification_report(
@@ -4409,27 +4418,40 @@ fn summarize(
                             retained_verification_logs(cell, &earlier_artifact_dir)?;
                         let earlier_normalized_ptrace_golden =
                             crate::normalized_ptrace_golden(cell, &earlier_artifact_dir)?;
+                        let expected_result = match cell.mode.as_str() {
+                            "verify" => ObservedResult::DeterminismFailure,
+                            "replay" => ObservedResult::ReplayFailure,
+                            other => {
+                                return Err(format!(
+                                    "earlier attempt {} located a divergence in unsupported mode {other}",
+                                    earlier_row.attempt
+                                ));
+                            }
+                        };
+                        let earlier_result = match earlier_row.result {
+                            Some(recorded) if recorded != expected_result => {
+                                return Err(format!(
+                                    "earlier framework attempt {} records result {}, but its retained report is a {} divergence",
+                                    earlier_row.attempt,
+                                    recorded.as_str(),
+                                    cell.mode
+                                ));
+                            }
+                            Some(recorded) => recorded,
+                            None => expected_result,
+                        };
                         rows.push(json!({
                             "cell": cell,
                             "repetition": repetition,
                             "attempt": earlier_row.attempt,
                             "harness_exit": harness_status,
                             "outcome": earlier_row.outcome,
+                            "failure_class": earlier_row.failure_class,
                             "reason": earlier_row.reason,
                             "error_kind": earlier_row.error_kind,
                             "invocation": earlier_invocation,
                             "result_row_valid": true,
-                            "result": classify_result(
-                                runner,
-                                harness_status,
-                                &earlier_row.outcome,
-                                true,
-                                earlier_row.reason.as_deref(),
-                                &cell.mode,
-                                earlier_verification.get("verdict").and_then(JsonValue::as_str),
-                                earlier_verification_logs.len() == 2,
-                                true,
-                            ),
+                            "result": earlier_result.as_str(),
                             "verification": earlier_verification,
                             "verification_logs": earlier_verification_logs,
                             "normalized_ptrace_golden": earlier_normalized_ptrace_golden,
@@ -4450,6 +4472,7 @@ fn summarize(
                 "attempt": attempt,
                 "harness_exit": harness_status,
                 "outcome": outcome,
+                "failure_class": failure_class,
                 "reason": reason,
                 "error_kind": error_kind,
                 "observations": observations,
@@ -4931,37 +4954,6 @@ fn self_test(root: &Path) -> Result<(), String> {
         || series_run_index("a-cell-with-no-suffix") != 0
     {
         return Err("pressure repetition ordinals no longer match retained result directories".into());
-    }
-    {
-        let path = std::env::temp_dir().join(format!(
-            "pressure-runtime-summary-{}",
-            std::process::id()
-        ));
-        let summary = "Internally, the hermit scheduler ran 12 turns, recorded 0 events, replayed 0 events (0 desynced)\nElapsed virtual global (cpu) time: 34ns\n";
-        fs::write(&path, summary)
-            .map_err(|e| format!("cannot write runtime summary fixture: {e}"))?;
-        let missing = runtime_from_log(&path)?;
-        if missing.scheduler_turns != 12
-            || missing.virtual_nanoseconds != 34
-            || missing.syscalls.is_some()
-        {
-            return Err(format!(
-                "a runtime log without syscall accounting did not keep it absent: {missing:?}"
-            ));
-        }
-        fs::write(
-            &path,
-            format!("{summary}INFO [detcore, dtid 7] finish syscall #5\n"),
-        )
-        .map_err(|e| format!("cannot write counted runtime summary fixture: {e}"))?;
-        let counted = runtime_from_log(&path)?;
-        if counted.syscalls != Some(5) {
-            return Err(format!(
-                "a runtime log with syscall accounting did not retain it: {counted:?}"
-            ));
-        }
-        fs::remove_file(&path)
-            .map_err(|e| format!("cannot remove runtime summary fixture: {e}"))?;
     }
     // A divergence located by an earlier attempt remains an observation even
     // when the terminal retry passes. An attempt that located nothing does not
@@ -6986,6 +6978,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         backend: Some(sample_a.backend.clone()),
         classification: "required".into(),
         outcome: "FAIL".into(),
+        result: Some(ObservedResult::DeterminismFailure),
+        failure_class: Some(FailureClass::ProductFailure),
         error_kind: None,
         timeout_seconds: 20,
         duration_ms: Some(19_000),
@@ -7026,6 +7020,8 @@ fn self_test(root: &Path) -> Result<(), String> {
     let mut second_row = result_row.clone();
     second_row.attempt = 2;
     second_row.outcome = "PASS".into();
+    second_row.result = Some(ObservedResult::Pass);
+    second_row.failure_class = None;
     second_row.duration_ms = Some(19_500);
     second_row.timeout_seconds = 20;
     second_row.artifact_dir = format!("{}-attempt-2", first_row.artifact_dir);
@@ -7045,6 +7041,8 @@ fn self_test(root: &Path) -> Result<(), String> {
     let appended = read_result_rows(&appended_results)?;
     if appended.len() != 2
         || appended[0].attempt != 1
+        || appended[0].result != Some(ObservedResult::DeterminismFailure)
+        || appended[0].failure_class != Some(FailureClass::ProductFailure)
         || appended[0].duration_ms != Some(19_000)
         || appended[0].timeout_seconds != 20
         || appended[0].first_divergent_syscall != Some(37)
@@ -7053,6 +7051,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         || appended[0].first_divergent_right_message.as_deref()
             != Some("INFO detcore: right event")
         || appended[1].attempt != 2
+        || appended[1].result != Some(ObservedResult::Pass)
+        || appended[1].failure_class.is_some()
         || appended[1].duration_ms != Some(19_500)
         || appended[1].timeout_seconds != 20
         || appended[1].first_divergent_left_message.is_some()
@@ -7089,6 +7089,28 @@ fn self_test(root: &Path) -> Result<(), String> {
             "two appended result observations were not retained independently: {appended:?}"
         ));
     }
+    let inconsistent_results = scratch.join("inconsistent-results.jsonl");
+    let mut inconsistent = first_row.clone();
+    inconsistent.failure_class = Some(FailureClass::NoResult);
+    fs::write(
+        &inconsistent_results,
+        format!(
+            "{}\n",
+            serde_json::to_string(&inconsistent)
+                .map_err(|e| format!("cannot encode inconsistent result fixture: {e}"))?
+        ),
+    )
+    .map_err(|e| format!("cannot write inconsistent result fixture: {e}"))?;
+    let error = read_result_rows(&inconsistent_results)
+        .expect_err("a product result with a no-result attribution must be refused");
+    if !error.contains("determinism-failure")
+        || !error.contains("ProductFailure")
+        || !error.contains("NoResult")
+    {
+        return Err(format!(
+            "classification disagreement did not fail by name: {error}"
+        ));
+    }
     let nested_results = scratch.join("series-layout");
     let nested_cell = nested_results
         .join("cells")
@@ -7099,6 +7121,26 @@ fn self_test(root: &Path) -> Result<(), String> {
     nested_first.run_index = Some(4);
     let mut nested_second = second_row.clone();
     nested_second.run_index = Some(4);
+    let retained_log = scratch.join("retained-verification.log");
+    fs::write(
+        &retained_log,
+        "Internally, the hermit scheduler ran 12 turns, recorded 0 events, replayed 0 events (0 desynced)\nElapsed virtual global (cpu) time: 34ns\nINFO [detcore, dtid 7] finish syscall #5\n",
+    )
+    .map_err(|e| format!("cannot write retained verification log fixture: {e}"))?;
+    nested_first.attempts[0].stderr = format!(
+        "::   run 1: {}\n::   run 2: {}",
+        retained_log.display(),
+        retained_log.display(),
+    );
+    let typed_runtime = VerificationRuntime {
+        run1: Some(RuntimeStats {
+            scheduler_turns: 13,
+            virtual_nanoseconds: 35,
+            syscalls: Some(6),
+        }),
+        run2: None,
+    };
+    nested_second.runtime = Some(typed_runtime.clone());
     fs::write(
         nested_cell.join("results.jsonl"),
         format!(
@@ -7118,11 +7160,13 @@ fn self_test(root: &Path) -> Result<(), String> {
             != Some("INFO detcore: left event")
         || nested_rows[0].1.first_divergent_right_message.as_deref()
             != Some("INFO detcore: right event")
+        || nested_rows[0].1.runtime.is_some()
         || nested_rows[1].1.run_index != Some(4)
         || nested_rows[1].1.attempt != 2
+        || nested_rows[1].1.runtime.as_ref() != Some(&typed_runtime)
     {
         return Err(format!(
-            "pressure series writer did not retain both attempts from the ordinary nested layout: {nested_rows:?}"
+            "pressure series writer did not retain typed runtime and honest absence from the ordinary nested layout: {nested_rows:?}"
         ));
     }
     nested_second.run_index = Some(3);
@@ -7240,6 +7284,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         backend: Some(green_id.backend.clone()),
         classification: "required".into(),
         outcome: "PASS".into(),
+        result: Some(ObservedResult::Pass),
+        failure_class: None,
         error_kind: None,
         timeout_seconds: 20,
         duration_ms: Some(1_000),
