@@ -385,12 +385,16 @@ def main() -> int:
             )
         else:
             anchor = load_committed_anchor(anchor_dir)
+            if anchor is None:
+                raise RuntimeError(
+                    "published boot anchor has no readable run-metadata.json"
+                )
             # Compare while the run dir is still in place (its info_log path is
             # valid), then archive it into run-history.
             passed, report = compare_runs(anchor, current)
             final_dir = archive_result_dir(run_dir, ASSETS, "boot")
             print("Anchor already claimed by a concurrent/earlier run; comparing.")
-            print_comparison(passed, report, current["qcow2_sha256"], "Boot")
+            print_comparison(passed, report, current.qcow2_sha256, "Boot")
             result = "SUCCESS" if passed else "PARTIAL"
         print(
             "Run metadata: {}".format(
