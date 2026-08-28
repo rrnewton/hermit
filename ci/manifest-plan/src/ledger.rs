@@ -153,6 +153,24 @@ impl HistoryRow {
         }
         Ok(Some(tree))
     }
+
+    /// Return how many retry rounds the validation runner executed.
+    ///
+    /// The field deliberately remains in [`Self::extra`], like `tree`, because
+    /// moving an extension into the ordered struct fields would change the
+    /// canonical bytes and receipt digest of every retained row. Historical
+    /// `env_block_retries` rows are not treated as this value: that older name
+    /// described a narrower population, while current retries include every
+    /// retry-eligible failure.
+    pub fn retry_rounds(&self) -> Result<Option<u64>, &'static str> {
+        let Some(value) = self.extra.get("retry_rounds") else {
+            return Ok(None);
+        };
+        value
+            .as_u64()
+            .map(Some)
+            .ok_or("malformed HistoryRow retry_rounds: expected a nonnegative integer")
+    }
 }
 
 /// Per-DAG-node test-coverage obligation outcome. Current producers compute this
@@ -497,6 +515,32 @@ mod tests {
             malformed_type.tree(),
             Err("malformed HistoryRow tree: expected a string")
         );
+    }
+
+    #[test]
+    fn history_retry_rounds_distinguishes_absent_valid_and_malformed() {
+        let absent: HistoryRow = serde_json::from_str(r#"{"schema_version":5}"#).unwrap();
+        assert_eq!(absent.retry_rounds(), Ok(None));
+
+        let valid: HistoryRow =
+            serde_json::from_str(r#"{"schema_version":7,"retry_rounds":2}"#).unwrap();
+        assert_eq!(valid.retry_rounds(), Ok(Some(2)));
+
+        for malformed in [
+            r#"{"schema_version":7,"retry_rounds":"2"}"#,
+            r#"{"schema_version":7,"retry_rounds":-1}"#,
+            r#"{"schema_version":7,"retry_rounds":1.5}"#,
+        ] {
+            let row: HistoryRow = serde_json::from_str(malformed).unwrap();
+            assert_eq!(
+                row.retry_rounds(),
+                Err("malformed HistoryRow retry_rounds: expected a nonnegative integer")
+            );
+        }
+
+        let historical: HistoryRow =
+            serde_json::from_str(r#"{"schema_version":5,"env_block_retries":2}"#).unwrap();
+        assert_eq!(historical.retry_rounds(), Ok(None));
     }
 
     #[test]
