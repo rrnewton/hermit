@@ -40693,7 +40693,13 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "timeout",
+        "evidence": "13a028fcb2e84700621f414cc74e63670c72216a; issues #2807 and #2791",
+        "reason": "The pinned GCC 15 and glibc 2.42 guest timed out twice during SaBRe Run1 after the fork child died with SIGSEGV at RIP 0; ptrace passed and issue #2807 tracks requalification."
+      },
+      "green_removal_reason": "SaBRe c-programs/nanosleep-par timed out twice during Run1 at 13a028fcb2e84700621f414cc74e63670c72216a; issue #2807 tracks requalification and #2791 tracks the pinned-glibc compatibility work.",
       "last_tested": {
         "hermit_sha": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc",
         "detcore_tree": "284e94bf4ddd166180b384c212dba8ac39c3494e",

@@ -3915,7 +3915,15 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: true
+        # TODO(#2807): Re-enable SaBRe CI after the pinned-glibc fork child completes.
+        ci:
+          ptrace: true
+          sabre: false
+        ci_disabled_reason:
+          sabre:
+            result: timeout
+            evidence: "13a028fcb2e84700621f414cc74e63670c72216a; issues #2807 and #2791"
+            reason: "The pinned GCC 15 and glibc 2.42 guest timed out twice during SaBRe Run1 after the fork child died with SIGSEGV at RIP 0; ptrace passed and issue #2807 tracks requalification."
         backends_enabled:
           - ptrace
           - sabre

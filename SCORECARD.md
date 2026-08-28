@@ -13,21 +13,21 @@ Every selected `verify` cell, and every seed in a selected `chaos` cell, runs th
 | `ptrace` | 242 | 122 | 713 | 1077 |
 | `dbt` | 0 | 61 | 1016 | 1077 |
 | `kvm` | 1 | 21 | 1055 | 1077 |
-| `sabre` | 57 | 86 | 934 | 1077 |
+| `sabre` | 56 | 87 | 934 | 1077 |
 | `liteinst` | 5 | 48 | 1024 | 1077 |
 | `native` | 0 | 33 | 326 | 359 |
-| **Total** | **305** | **371** | **5068** | **5744** |
+| **Total** | **304** | **372** | **5068** | **5744** |
 
 ## Denominator, and why the percentage is not comparable across changes to it
 
-Green is **305 of 5744**, which is **5.31%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
+Green is **304 of 5744**, which is **5.29%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
 
 - backends: `ptrace`, `dbt`, `kvm`, `sabre`, `liteinst`, `native`
 - modes: `chaos`, `naked`, `replay`, `verify`
 
-⚠️ **5068 of those 5744 cells are NOT APPLICABLE** — their backend is not enabled for their mode, so they were never asked to run and cannot pass or fail. Over the 676 cells that CAN run, green is **45.12%**.
+⚠️ **5068 of those 5744 cells are NOT APPLICABLE** — their backend is not enabled for their mode, so they were never asked to run and cannot pass or fail. Over the 676 cells that CAN run, green is **44.97%**.
 
-⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same 305 green cells measured against a smaller denominator. Nothing was fixed to produce it; it is what the first figure always meant once the cells that cannot run are excluded. Quote both or neither, and never compare one against the other as though something moved.
+⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same 304 green cells measured against a smaller denominator. Nothing was fixed to produce it; it is what the first figure always meant once the cells that cannot run are excluded. Quote both or neither, and never compare one against the other as though something moved.
 
 ⚠️ **Adding or removing a backend or mode changes this denominator and therefore the percentage, without anything about the product changing.** Removing a backend whose cells are mostly red RAISES the reported figure; adding honest red cells LOWERS it. Neither is progress. Before comparing this percentage against an earlier one, diff the two lists above: if they differ, the numbers are not comparable and the difference is not a result.
 
@@ -35,11 +35,11 @@ The mode view makes the current order of work explicit: expand `verify` first, t
 
 | Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `native` | Green | Red | Not applicable | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `verify` | 236 / 359 | 0 / 359 | 1 / 359 | 57 / 359 | 5 / 359 | — | 299 | 336 | 1160 | 1795 |
+| `verify` | 236 / 359 | 0 / 359 | 1 / 359 | 56 / 359 | 5 / 359 | — | 298 | 337 | 1160 | 1795 |
 | `replay` | 1 / 359 | 0 / 359 | 0 / 359 | 0 / 359 | 0 / 359 | — | 1 | 0 | 1794 | 1795 |
 | `chaos` | 5 / 359 | 0 / 359 | 0 / 359 | 0 / 359 | 0 / 359 | — | 5 | 2 | 1788 | 1795 |
 | `naked` | — | — | — | — | — | 0 / 359 | 0 | 33 | 326 | 359 |
-| **Total** | | | | | | | **305** | **371** | **5068** | **5744** |
+| **Total** | | | | | | | **304** | **372** | **5068** | **5744** |
 
 ## Cross-backend parity
 
@@ -65,18 +65,18 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | `system-utils` | 31 / 34 | 1 / 34 | 0 / 34 | 32 | 102 |
 | `util-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |
 
-Ordinary full validation executes 308 selected regression cells: the 305 green compatibility cells above (including 5 chaos-mode race-exposure checks), and 3 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
+Ordinary full validation executes 307 selected regression cells: the 304 green compatibility cells above (including 5 chaos-mode race-exposure checks), and 3 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
 
 ## Status and measurement
 
 The table above reports status. This table reports the separate `measurement` field derived from observations stored in `ci/compat-envelope/cells.json`; it does not change status or which cells ordinary validation selects. Retained history that has not been imported is not counted here. A stored measurement does not establish that it describes current code; `show` reports whether the recorded last test still matches `HEAD:detcore`.
 
-The count table includes all **5744** tracked cells; no row is omitted. The current green/`never-measured` count is **1**, and the current red/`measured-and-passed` count is **1**. These values use the same counts printed in the table below.
+The count table includes all **5744** tracked cells; no row is omitted. The current green/`never-measured` count is **1**, and the current red/`measured-and-passed` count is **2**. These values use the same counts printed in the table below.
 
 | Status | `never-measured` | `measured-and-passed` | `measured-no-verdict` | `diverged-unlocated` | `diverged` | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `green` | 1 | 301 | 0 | 3 | 0 | 305 |
-| `red` | 362 | 1 | 0 | 0 | 8 | 371 |
+| `green` | 1 | 300 | 0 | 3 | 0 | 304 |
+| `red` | 362 | 2 | 0 | 0 | 8 | 372 |
 | `not-applicable` | 5067 | 0 | 0 | 0 | 1 | 5068 |
 | **Total** | **5430** | **302** | **0** | **3** | **9** | **5744** |
 
@@ -237,7 +237,7 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `c-programs/name-to-handle-regular-eopnotsupp` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/name-to-handle-regular-eopnotsupp` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/nanosleep-par` | `verify` | `ptrace` | `green` | `measured-and-passed` |
-| `c-programs/nanosleep-par` | `verify` | `sabre` | `green` | `measured-and-passed` |
+| `c-programs/nanosleep-par` | `verify` | `sabre` | `red` | `measured-and-passed` |
 | `c-programs/netns-cookie-tcp4` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/netns-cookie-tcp4` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/netns-cookie-tcp6` | `verify` | `ptrace` | `green` | `measured-and-passed` |
