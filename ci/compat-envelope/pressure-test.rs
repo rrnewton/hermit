@@ -980,81 +980,6 @@ struct InvocationAttempt {
     shell_command: String,
 }
 
-/// A coordinate that must be PRESENT and may be NULL.
-///
-/// ⚠️ NOT `#[serde(transparent)]`, and that is the entire point. Transparent
-/// made this newtype inherit `Option`'s implicit-optional rule, so a MISSING key
-/// deserialised to `None` and the "required" half of required-nullable never
-/// held. Measured 2026-08-25 against the real struct: with transparent, a report
-/// with ALL FOUR coordinate keys deleted parsed successfully, while a plain
-/// non-Option field (`verdict`) was correctly rejected -- so the guarantee the
-/// doc comments below claim has never been enforced.
-///
-/// Without transparent the newtype still deserialises from the bare inner value,
-/// so `null` and `7` both work and no report format changes; only ABSENCE is now
-/// refused, which is what these fields were added to catch.
-#[derive(Debug, Deserialize)]
-struct RequiredNullableU64(Option<u64>);
-
-#[derive(Debug, Deserialize)]
-struct RequiredNullableString(Option<String>);
-
-#[derive(Debug, Deserialize)]
-struct VerificationEvidence {
-    verified: bool,
-    bitwise_parity: bool,
-    verdict: String,
-    comparison: JsonValue,
-    compared_log_messages: JsonValue,
-    first_divergent_scheduler_turn: RequiredNullableU64,
-    first_divergent_virtual_nanoseconds: RequiredNullableU64,
-    /// REQUIRED-nullable, unlike the scorecard's tolerant `#[serde(default)]`
-    /// copy, and the asymmetry is deliberate. This test sets `E2E_RESULT_ROOT`
-    /// itself, so it only ever reads reports it just produced: requiring the key
-    /// catches a producer that silently stops emitting it. The scorecard
-    /// aggregates RETAINED reports, including ones written before this field
-    /// existed, so there absence has to mean "older report" rather than "broken
-    /// producer".
-    ///
-    /// NEVER READ, AND THAT IS THE POINT -- so `#[allow(dead_code)]` rather than
-    /// deletion. The assertion this field makes happens at DESERIALIZATION: a
-    /// report missing the key fails to parse. Removing the field to satisfy
-    /// dead_code would delete the check while leaving the doc above claiming it
-    /// exists, which is the failure mode this whole test guards against.
-    #[allow(dead_code)]
-    first_divergent_record: RequiredNullableU64,
-    /// The FOURTH coordinate, required-nullable for the same reason as its
-    /// three siblings above: this test sets `E2E_RESULT_ROOT` itself, so it only
-    /// ever reads reports it just produced, and requiring the key catches a
-    /// producer that silently stops emitting it.
-    ///
-    /// It was the one coordinate this struct did not require, while
-    /// `detcore/src/logdiff.rs` has emitted all four since the field was added.
-    /// That asymmetry mattered: the scorecard's series projection takes ALL FOUR
-    /// COORDINATES OR NONE -- a subset leaves one observation holding
-    /// series-derived bounds beside pre-series ones with nothing saying which is
-    /// which -- so a producer that could not see the fourth could never satisfy
-    /// the consumer.
-    ///
-    /// Measured 2026-08-25 against reports from the run at 0d8e3ab9db06: a
-    /// `matched` cell carries all four keys as null, and a `diverged` cell
-    /// carries all four populated (language-runtimes/python-dict-hash-iteration:
-    /// turn 196, record 7495, syscall 1074). The key is always present because
-    /// the report struct sets no `skip_serializing_if`, so requiring it here
-    /// cannot reject a well-formed report.
-    ///
-    /// NEVER READ, deliberately, exactly as above: the assertion happens at
-    /// DESERIALIZATION.
-    #[allow(dead_code)]
-    first_divergent_syscall: RequiredNullableU64,
-    /// Required-nullable for the same reason as the four numeric fields: this
-    /// reader sees reports produced by the current invocation, so a missing key
-    /// means the producer stopped writing evidence rather than that the report
-    /// predates the field.
-    first_divergent_left_message: RequiredNullableString,
-    first_divergent_right_message: RequiredNullableString,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct RunMetadata {
     schema: u64,
@@ -4040,12 +3965,14 @@ fn read_verification_report(
         .map_err(|e| format!("cannot read verification report {}: {e}", path.display()))?;
     let report: JsonValue = serde_json::from_str(&text)
         .map_err(|e| format!("invalid verification report {}: {e}", path.display()))?;
-    let evidence: VerificationEvidence = serde_json::from_value(report.clone())
-        .map_err(|e| format!("incomplete verification report {}: {e}", path.display()))?;
-    let canonical = canonical_verdict::VerificationReport::from_json_value(report.clone())
+    let canonical = canonical_verdict::VerificationReport::from_current_json_value(report.clone())
         .map_err(|e| format!("incomplete canonical verification report {}: {e}", path.display()))?;
-    match (evidence.verdict.as_str(), evidence.verified) {
-        ("matched", true) | ("diverged" | "no_result", false) => {}
+    match (canonical.verdict, canonical.verified) {
+        (canonical_verdict::Verdict::Matched, true)
+        | (
+            canonical_verdict::Verdict::Diverged | canonical_verdict::Verdict::NoResult,
+            false,
+        ) => {}
         (verdict, verified) => {
             return Err(format!(
                 "inconsistent verification report {}: verdict={verdict} verified={verified}",
@@ -4053,29 +3980,15 @@ fn read_verification_report(
             ));
         }
     }
-    if evidence.verdict != "no_result" && !evidence.comparison.is_object() {
+    if canonical.verdict != canonical_verdict::Verdict::NoResult
+        && canonical.comparison.is_none()
+    {
         return Err(format!(
             "terminal verification report {} has no comparison object",
             path.display()
         ));
     }
-    if !evidence.compared_log_messages.is_null() {
-        let counts = evidence.compared_log_messages.as_object().ok_or_else(|| {
-            format!(
-                "verification report {} has invalid compared_log_messages",
-                path.display()
-            )
-        })?;
-        for side in ["left", "right"] {
-            if counts.get(side).and_then(JsonValue::as_u64).is_none() {
-                return Err(format!(
-                    "verification report {} has no numeric {side} message count",
-                    path.display()
-                ));
-            }
-        }
-    }
-    if evidence.bitwise_parity && evidence.verdict != "matched" {
+    if canonical.bitwise_parity && canonical.verdict != canonical_verdict::Verdict::Matched {
         return Err(format!(
             "verification report {} claims bitwise parity without a match",
             path.display()
@@ -4087,7 +4000,7 @@ fn read_verification_report(
             path.display()
         )
     })?;
-    if evidence.verdict == "matched" {
+    if canonical.verdict == canonical_verdict::Verdict::Matched {
         canonical.require_canonical_match().map_err(|error| {
             format!(
                 "verification report {} cannot support a green result: {error}",
@@ -4095,11 +4008,13 @@ fn read_verification_report(
             )
         })?;
     }
-    if evidence.verdict != "diverged"
-        && (evidence.first_divergent_scheduler_turn.0.is_some()
-            || evidence.first_divergent_virtual_nanoseconds.0.is_some()
-            || evidence.first_divergent_left_message.0.is_some()
-            || evidence.first_divergent_right_message.0.is_some())
+    if canonical.verdict != canonical_verdict::Verdict::Diverged
+        && (canonical.first_divergent_scheduler_turn.is_some()
+            || canonical.first_divergent_virtual_nanoseconds.is_some()
+            || canonical.first_divergent_record.is_some()
+            || canonical.first_divergent_syscall.is_some()
+            || canonical.first_divergent_left_message.is_some()
+            || canonical.first_divergent_right_message.is_some())
     {
         return Err(format!(
             "verification report {} records divergence evidence without a divergent verdict",

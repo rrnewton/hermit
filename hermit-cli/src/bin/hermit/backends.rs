@@ -1693,7 +1693,7 @@ mod tests {
 
         let (outcome, failure) = finalize_dbt_verification(outcome, comparison, None).unwrap();
         assert!(failure.is_none());
-        let report = super::super::verify::VerificationReport::from(&outcome);
+        let report = super::super::verify::verification_report(&outcome);
 
         assert_eq!(outcome.verdict, Verdict::Matched);
         assert_eq!(report.dbt_counted_branches, Some(comparison));

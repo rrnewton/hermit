@@ -26,46 +26,7 @@ pub mod instruction_map;
 mod interp;
 mod metadata;
 
-/// The verification verdict: did the two runs match?
-///
-/// This is deliberately distinct from the guest's exit status. The process exit
-/// code of a `--verify` run historically encodes *the guest's* exit status (so
-/// `record start --verify -- prog` behaves like `prog` for the common exit-0
-/// case), which conflates two independent facts: "did the two runs match" and
-/// "what did the guest exit with". A guest that deterministically exits nonzero
-/// (e.g. `/bin/false`) makes a *passing* verification exit nonzero; symmetrically
-/// a guest that exits zero while its runs diverge could only be told apart from a
-/// match by scraping the human-readable banner. The `hermit` binary serializes
-/// this value in its `--verify-json` report so consumers do not need either
-/// inference.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    serde::Deserialize,
-    serde::Serialize
-)]
-#[serde(rename_all = "snake_case")]
-pub enum Verdict {
-    /// The two runs matched on every compared dimension (stdout, stderr, exit
-    /// status, and — unless disabled — the internal DETLOG event stream) and
-    /// every completed backend-specific invariant such as the DBT branch clock.
-    Matched,
-    /// The two runs diverged; verification failed.
-    Diverged,
-    /// Verification did not reach a verdict: the invocation aborted before the
-    /// two runs could be compared (a run failed to start, the first run's exit
-    /// status was rejected, SaBRe captured no DETLOG, recording failed, ...).
-    ///
-    /// This is NOT a synonym for [`Verdict::Diverged`]. It exists so the
-    /// `--verify-json` artifact always describes *this* invocation: without an
-    /// explicit no-result state, an early abort would leave whatever the file
-    /// previously contained -- including an older `{verified: true}` -- readable
-    /// as though it described the run that just failed.
-    NoResult,
-}
+pub use hermit_manifest_plan::canonical_verdict::Verdict;
 
 /// Whether record/replay verification hashes syscall output buffers, and
 /// therefore whether its log comparison can see buffer CONTENT at all.
