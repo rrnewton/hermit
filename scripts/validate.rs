@@ -122,6 +122,7 @@ use hermit_manifest_plan::ledger::HistoryRow;
 use hermit_manifest_plan::runner::ManifestSet;
 use hermit_manifest_plan::runner::Population;
 use hermit_manifest_plan::runner::Selection;
+use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::E2E_KERNEL_VERSION_ENV;
 use hermit_manifest_plan::runner::E2E_MACHINE_SHORTNAME_ENV;
 use hermit_manifest_plan::service_result::FinalValidateStatus;
@@ -1166,12 +1167,17 @@ fn self_test() -> Result<(), String> {
             row("unlisted_fails", false),
             row("plain_passes", true),
         ];
-        let (_, _, blocking) = compat_summary_with_tables(
+        let (passed, measured, blocking, nonblocking) = compat_summary_with_tables(
             CompatMode::PortableStrict,
             &outcomes,
             &planted_known,
             &planted_diag,
         );
+        if (passed, measured) != (2, 5) {
+            return Err(format!(
+                "compatibility measurement: completed fixture population reported {passed}/{measured}, want 2/5"
+            ));
+        }
         // THE LOAD-BEARING ASSERTION: a listed failure is still in the blocking set. If a future
         // change makes PortableStrict exempt listed rows the way Strict does, this fails.
         if !blocking.iter().any(|l| l == "listed_fails") {
@@ -1192,12 +1198,44 @@ fn self_test() -> Result<(), String> {
                  blocking={blocking:?}"
             ));
         }
+        if nonblocking != BTreeSet::from(["compat.bounded_diag".to_string()]) {
+            return Err(format!(
+                "PortableStrict nonblocking failures did not come from the same typed disposition as the verdict: {nonblocking:?}"
+            ));
+        }
         if blocking.iter().any(|l| l == "listed_passes" || l == "plain_passes") {
             return Err(format!("a PASSING row was reported as blocking: blocking={blocking:?}"));
         }
+
+        // A scheduler record is not evidence that the program ran. Spawn and
+        // supervisor failures have no child exit status, while an aborted row
+        // was stopped before producing a verdict. Neither may change the
+        // measured denominator or gain a compatibility failure classification.
+        let mut unknown = row("unknown_execution", false);
+        unknown.returncode = None;
+        let mut aborted = row("aborted_execution", false);
+        aborted.aborted = true;
+        let mut with_unknown = outcomes.clone();
+        with_unknown.extend([unknown, aborted]);
+        let (unknown_passed, unknown_measured, unknown_blocking, unknown_nonblocking) =
+            compat_summary_with_tables(
+                CompatMode::PortableStrict,
+                &with_unknown,
+                &planted_known,
+                &planted_diag,
+            );
+        if (unknown_passed, unknown_measured) != (passed, measured)
+            || unknown_blocking != blocking
+            || unknown_nonblocking != nonblocking
+        {
+            return Err(format!(
+                "compatibility measurement: unknown_execution or aborted_execution changed the \
+                 measured population: base={passed}/{measured} {blocking:?}, with unknown={unknown_passed}/{unknown_measured} {unknown_blocking:?}"
+            ));
+        }
         // And the same planted table under Strict must exempt the listed failure, so the
         // bracket also pins that the two modes still differ.
-        let (_, _, strict_blocking) = compat_summary_with_tables(
+        let (_, _, strict_blocking, strict_nonblocking) = compat_summary_with_tables(
             CompatMode::Strict,
             &outcomes,
             &planted_known,
@@ -1206,6 +1244,11 @@ fn self_test() -> Result<(), String> {
         if strict_blocking.iter().any(|l| l == "listed_fails") {
             return Err(format!(
                 "Strict lost its historical exemption for a listed row: {strict_blocking:?}"
+            ));
+        }
+        if strict_nonblocking != BTreeSet::from(["compat.listed_fails".to_string()]) {
+            return Err(format!(
+                "Strict nonblocking failures did not retain exactly its listed exemption: {strict_nonblocking:?}"
             ));
         }
     }
@@ -2462,15 +2505,38 @@ cleared-caps refusal names {} starved step(s)",
         }
         let portable_tests = test_nodes_of(&validate_plan::lane_config(&root, "portable")?);
         let privileged_tests = test_nodes_of(&validate_plan::lane_config(&root, "privileged")?);
-        let sequential_expected = portable_tests.union(&privileged_tests).cloned().collect();
+        let mut sequential_expected = portable_tests.clone();
+        sequential_expected.extend(
+            privileged_tests
+                .iter()
+                .map(|tag| format!("privileged-{tag}")),
+        );
         let mut fused_expected = portable_tests;
-        fused_expected.extend(privileged_tests.into_iter().map(|tag| format!("privileged-{tag}")));
+        fused_expected.extend(
+            privileged_tests
+                .into_iter()
+                .map(|tag| format!("privileged-{tag}")),
+        );
         if full.planned_test_nodes != fused_expected
             || sequential.planned_test_nodes != sequential_expected
         {
             return Err(format!(
                 "full-plan bracket: fused/sequential planned-test sets differ from their lane configs: fused={:?} sequential={:?}",
                 full.planned_test_nodes, sequential.planned_test_nodes,
+            ));
+        }
+        let sequential_tags: Vec<String> = std::iter::once(&sequential.cfg)
+            .chain(sequential.second.iter())
+            .flat_map(|cfg| cfg.steps.iter().map(|step| step.tag()))
+            .collect();
+        let sequential_unique: BTreeSet<&str> =
+            sequential_tags.iter().map(String::as_str).collect();
+        if sequential_tags.len() != sequential_unique.len() {
+            return Err(format!(
+                "full-plan bracket: sequential lanes contain duplicate node identities, so \
+                 planned_node_count would collapse {} executions to {} names: {sequential_tags:?}",
+                sequential_tags.len(),
+                sequential_unique.len()
             ));
         }
         let nested_args = parse_argv(&[
@@ -2631,7 +2697,7 @@ fn manifest_producer_edge_bracket(cfg: &DagConfig) -> Result<String, String> {
                 gate_ran = validate_plan::shell_quote(&gate_ran.to_string_lossy()),
             ),
         )?;
-        let positive_result = run_lane_with_env_retries(
+        let positive_result = run_lane_with_retries(
             &positive,
             2,
             true,
@@ -2676,7 +2742,7 @@ fn manifest_producer_edge_bracket(cfg: &DagConfig) -> Result<String, String> {
                 validate_plan::shell_quote(&gate_ran.to_string_lossy())
             ),
         )?;
-        let negative_result = run_lane_with_env_retries(
+        let negative_result = run_lane_with_retries(
             &negative,
             2,
             true,
@@ -5521,6 +5587,7 @@ fn assert_fused_shared_integration_test_resources(
 fn attach_compatibility_scorecard(
     steps: &mut Vec<dagrun::model::Step>,
     lanes: &[&str],
+    prefix: &str,
 ) -> Result<(), String> {
     let mut deps = Vec::new();
     for step in steps.iter() {
@@ -5536,7 +5603,7 @@ fn attach_compatibility_scorecard(
     }
     deps.sort();
     steps.push(step_with_caps(
-        "scorecard",
+        &format!("{prefix}scorecard"),
         "compatibility",
         "Verify fresh per-cell results and print the compatibility table",
         format!(
@@ -5999,16 +6066,25 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         a.extend(validate_plan::lane_nodes_reusing_manifest_producer(
             root, lanes[0], "", gate,
         )?);
-        let mut b = validate_plan::lane_nodes(root, lanes[1], "", gate)?;
+        // The second lane is a separate scheduler invocation, but its node
+        // identities still enter one ledger row and one coverage artifact.
+        // Use the same lane prefix as the fused plan so those serialized
+        // populations cannot collapse two executions into one set member.
+        let second_prefix = format!("{}-", lanes[1]);
+        let mut b = validate_plan::lane_nodes(root, lanes[1], &second_prefix, gate)?;
         // The second run repeats preflight-free; its nodes hang off nothing.
         for s in b.iter_mut() {
             s.deps.retain(|d| d != gate);
         }
-        attach_compatibility_scorecard(&mut a, &["portable"])?;
+        attach_compatibility_scorecard(&mut a, &["portable"], "")?;
         // The runs are sequential, so when this node runs the portable rows
         // already exist. Emit the same whole-scorecard answer as the fused
         // default rather than a second disconnected per-lane claim.
-        attach_compatibility_scorecard(&mut b, &["portable", "privileged"])?;
+        attach_compatibility_scorecard(
+            &mut b,
+            &["portable", "privileged"],
+            "privileged-",
+        )?;
         // Each lane carries ITS OWN loaded config. They genuinely differ --
         // portable default_step_timeout=600 vs privileged=120, and disjoint
         // resource_caps -- so there is no correct single merged value; running
@@ -6160,7 +6236,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // CPUID verdict about an artifact that is not the one under test.
         cpuid.cmd = "newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"; timeout 30 \"$newest\" rdrand_rdseed_is_masked --exact".to_string();
     }
-    attach_compatibility_scorecard(&mut steps, &lanes)?;
+    attach_compatibility_scorecard(&mut steps, &lanes, "")?;
     // Fusing lanes means one config for both. Their default wall timeouts differ,
     // but every shipped/synthesized node has an explicit wall timeout and the
     // fail-closed undeclared-node audit below enforces that invariant. Therefore
@@ -6848,6 +6924,27 @@ fn outcome_is_failure(outcome: &StepOutcome) -> bool {
     !outcome.ok && !outcome.aborted && !outcome_is_no_result(outcome)
 }
 
+/// Count the failures represented by the final verdict.
+///
+/// Compatibility rows have their own policy classification, so only their
+/// separately counted blocking rows plus failures outside the matrix belong in
+/// the total. Every other profile already counts its failed DAG nodes in
+/// `blocking_failure_nodes`. In particular, the super stress table groups those
+/// same failed repetition nodes by probe for display; adding that grouped count
+/// here would count one failure once as a node and again as a probe.
+fn effective_failure_count(
+    compat: Option<CompatMode>,
+    blocking_failure_nodes: usize,
+    compat_blocking: usize,
+    compat_structural_failures: usize,
+) -> usize {
+    if compat.is_some() {
+        compat_blocking + compat_structural_failures
+    } else {
+        blocking_failure_nodes
+    }
+}
+
 /// The blocking-failure headline: the count and the names, from ONE collection.
 ///
 /// ⚠️ THIS EXISTS BECAUSE THE COUNT AND THE LIST DISAGREED IN PRODUCTION. On the
@@ -6889,8 +6986,9 @@ fn blocking_listing<'a>(
     // ⚠️ A HEADLINE LARGER THAN ITS OWN LIST MEANS SOMETHING BLOCKING IS
     // UNCOUNTABLE FROM THIS SET, and that is how a timed-out node vanished from
     // this run. `effective_failures` legitimately exceeds `named` for the compat
-    // and super profiles, which add their own blocking rows — so this does not
-    // refuse, it SAYS SO. Silence was the only unacceptable option.
+    // profile, which adds blocking program rows that are not independently
+    // listed here — so this does not refuse, it SAYS SO. Silence was the only
+    // unacceptable option.
     if effective_failures > named.len() {
         listing.push_str(&format!(
             " ⚠️ {} counted blocking node(s) are NOT NAMEABLE from the failure set; \
@@ -6981,6 +7079,24 @@ fn summary_listing_bracket() -> Result<String, String> {
         aborted: false,
     };
     let none: BTreeSet<String> = BTreeSet::new();
+
+    // A failed super stress repetition is already one failed DAG node. The
+    // grouped per-probe table may also report one failing probe, but that is a
+    // second view of the same failure and must not increase the headline.
+    if effective_failure_count(None, 1, 1, 1) != 1 {
+        return Err(
+            "failure count: one super stress repetition was counted once as a node and again as a probe"
+                .into(),
+        );
+    }
+    // Compatibility is deliberately different: its policy owns the matrix
+    // rows, while only failures outside that matrix are added.
+    if effective_failure_count(Some(CompatMode::Strict), 99, 2, 1) != 3 {
+        return Err(
+            "failure count: compatibility matrix and structural failure populations were not kept separate"
+                .into(),
+        );
+    }
 
     // 1. Every failure is named when the set is small.
     let small: Vec<StepOutcome> = (0..3).map(|i| row(&format!("n{i}"), false)).collect();
@@ -7192,7 +7308,10 @@ fn print_cost_table(
 
 /// Per-program compatibility summary, built from typed node outcomes rather than
 /// a scraped TSV. Reproduces `print_compatibility_summary`'s category table.
-fn print_compat_summary(mode: CompatMode, outcomes: &[StepOutcome]) -> (usize, usize, Vec<String>) {
+fn print_compat_summary(
+    mode: CompatMode,
+    outcomes: &[StepOutcome],
+) -> (usize, usize, Vec<String>, BTreeSet<String>) {
     compat_summary_with_tables(
         mode,
         outcomes,
@@ -7213,14 +7332,21 @@ fn compat_summary_with_tables(
     outcomes: &[StepOutcome],
     known: &BTreeMap<&'static str, &'static str>,
     diag: &BTreeMap<&'static str, &'static str>,
-) -> (usize, usize, Vec<String>) {
+) -> (usize, usize, Vec<String>, BTreeSet<String>) {
     let mut per_cat: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
     let mut passed = 0usize;
     let mut measured = 0usize;
     let mut blocking_failures: Vec<String> = Vec::new();
+    let mut nonblocking_failure_tags: BTreeSet<String> = BTreeSet::new();
     let mut measured_labels: BTreeSet<String> = BTreeSet::new();
     for o in outcomes {
         let Some(label) = o.tag.strip_prefix("compat.") else { continue };
+        if outcome_execution(o) == AttemptExecution::Unknown {
+            println!(
+                "  NO_RESULT {label} produced no completed child execution; excluded from the measured denominator"
+            );
+            continue;
+        }
         if outcome_is_no_result(o) {
             println!(
                 "  NO_RESULT {label} could not determine its condition; excluded from the measured denominator"
@@ -7287,6 +7413,8 @@ fn compat_summary_with_tables(
         }
         if disposition.is_blocking() {
             blocking_failures.push(label.to_string());
+        } else if !o.ok {
+            nonblocking_failure_tags.insert(o.tag.clone());
         }
     }
     // AUDIT: a listed row the selected corpus never measured. Such a row is silently carried
@@ -7331,7 +7459,7 @@ fn compat_summary_with_tables(
             println!("  - {label}: {why}");
         }
     }
-    (passed, measured, blocking_failures)
+    (passed, measured, blocking_failures, nonblocking_failure_tags)
 }
 
 /// Conditions that must FAIL a run whatever the ratchet's own arithmetic says,
@@ -7583,7 +7711,7 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
     // INTEGRATION: exercise the production transformed command, checked-in
     // bucket accounting, withholding mutation, and scorecard edge handling
     // together. This catches drift between the command producer and parser.
-    attach_compatibility_scorecard(&mut transformed, &["privileged"])?;
+    attach_compatibility_scorecard(&mut transformed, &["privileged"], "")?;
     let scorecard_tag = "scorecard.compatibility";
     let before: BTreeMap<String, Vec<String>> = transformed
         .iter()
@@ -8609,6 +8737,55 @@ impl AttemptExecution {
     }
 }
 
+/// The closed reason a failed node was granted another attempt.
+///
+/// Human detail is stored separately on the same attempt. Keeping the class as
+/// an enum prevents a changing timeout, exit status, or registry sample from
+/// turning one retry category into many unrelated strings in the ledger.
+///
+/// This is `gates[].attempts[].retry_class`, not the parent
+/// `ci-hub/validate/retry_class.py` run-level value (`permanent`, `transient`,
+/// or `no-result`). They answer different questions and share only the field
+/// name.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum RetryClass {
+    AlwaysEligible,
+    BoundKillUnderContention,
+    MeasuredUnstable,
+    BpfjailerBanner,
+    ProxyEgress,
+    ThirdPartyBuild,
+    ToolchainEperm,
+    VcsFsDenial,
+}
+
+impl RetryClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AlwaysEligible => "always-eligible",
+            Self::BoundKillUnderContention => "bound-kill under contention",
+            Self::MeasuredUnstable => "measured-unstable",
+            Self::BpfjailerBanner => "bpfjailer-banner",
+            Self::ProxyEgress => "proxy-egress",
+            Self::ThirdPartyBuild => "third-party-build",
+            Self::ToolchainEperm => "toolchain-eperm",
+            Self::VcsFsDenial => "vcs-fs-denial",
+        }
+    }
+}
+
+impl From<validate_runtime::EnvBlockClass> for RetryClass {
+    fn from(value: validate_runtime::EnvBlockClass) -> Self {
+        match value {
+            validate_runtime::EnvBlockClass::BpfjailerBanner => Self::BpfjailerBanner,
+            validate_runtime::EnvBlockClass::ProxyEgress => Self::ProxyEgress,
+            validate_runtime::EnvBlockClass::ThirdPartyBuild => Self::ThirdPartyBuild,
+            validate_runtime::EnvBlockClass::ToolchainEperm => Self::ToolchainEperm,
+            validate_runtime::EnvBlockClass::VcsFsDenial => Self::VcsFsDenial,
+        }
+    }
+}
+
 /// Typed execution state for a scheduler outcome.
 ///
 /// `reported && !aborted` is insufficient: spawn failures and supervisor
@@ -8644,10 +8821,14 @@ struct NodeAttempt {
     aborted: bool,
     /// Whether a child actually executed through a collected exit status.
     execution: AttemptExecution,
-    /// Why this attempt's failure was judged retry-eligible, in the same words
-    /// the retry line prints. `None` when it was not retried — because it
-    /// passed, because nothing classified it, or because the budget ran out.
-    retry_class: Option<String>,
+    /// Why this attempt's failure was judged retry-eligible. `None` when it was
+    /// not retried — because it passed, because nothing classified it, or
+    /// because the budget ran out.
+    retry_class: Option<RetryClass>,
+    /// Evidence behind the class when it is not already the attempt's `reason`.
+    /// Currently this records the measured pass/fail sample for
+    /// `measured-unstable`; it never changes the grouping key.
+    retry_detail: Option<String>,
     /// The environmental signature found in this failed attempt's own detail
     /// region. This is kept separately from `retry_class`: a classified attempt
     /// may never execute again, and that distinction is the UNCONFIRMED verdict.
@@ -8656,6 +8837,14 @@ struct NodeAttempt {
     /// region carried no environmental signature. Without this bit, "banner
     /// gone" is indistinguishable from "no new evidence was captured".
     detail_observed: bool,
+    /// The producer-owned attribution of this terminal attempt. This is a
+    /// closed value; `reason` and `failure_detail` remain explanatory text and
+    /// never decide the class in an outer ledger reader.
+    failure_class: Option<FailureClass>,
+    /// The exact recognized evidence value for a non-product class. Product
+    /// failures keep their existing human `reason` without manufacturing a
+    /// second description.
+    failure_detail: Option<String>,
     /// Terminal per-test results written by a controlled runner for this exact attempt.
     /// `None` means no typed result file was published; an empty vector is measured zero.
     test_results: Option<Vec<dagrun::TestResult>>,
@@ -8685,6 +8874,45 @@ fn attempt_is_failure(attempt: &NodeAttempt) -> bool {
     attempt_result(attempt) == Some("fail")
 }
 
+fn outcome_failure_class(outcome: &StepOutcome) -> Option<FailureClass> {
+    if outcome.ok || outcome.aborted {
+        None
+    } else if outcome_is_no_result(outcome)
+        || outcome.returncode.is_none()
+        || outcome_hit_its_budget(outcome)
+        || reason_is_oom(&outcome.reason)
+    {
+        Some(FailureClass::NoResult)
+    } else {
+        Some(FailureClass::ProductFailure)
+    }
+}
+
+fn terminal_attempt<'a>(outcome: &StepOutcome, attempts: &'a [NodeAttempt]) -> Option<&'a NodeAttempt> {
+    attempts.iter().rev().find(|attempt| attempt.tag == outcome.tag)
+}
+
+/// Nodes with at least one attempt that produced a child exit status.
+///
+/// `outcomes.len()` is the number of scheduler records, not the number of
+/// executions: spawn failures, supervisor failures, and aborted peers all
+/// deliberately produce records with `execution = unknown` so they cannot
+/// disappear. Keeping the populations separate prevents retained evidence from
+/// turning an unknown execution into a measured node.
+fn completed_node_count(outcomes: &[StepOutcome], attempts: &[NodeAttempt]) -> usize {
+    outcomes
+        .iter()
+        .filter(|outcome| {
+            let mut node_attempts = attempts.iter().filter(|attempt| attempt.tag == outcome.tag);
+            let Some(first) = node_attempts.next() else {
+                return outcome_execution(outcome) == AttemptExecution::Completed;
+            };
+            first.execution == AttemptExecution::Completed
+                || node_attempts.any(|attempt| attempt.execution == AttemptExecution::Completed)
+        })
+        .count()
+}
+
 /// This node's next attempt ordinal: one more than however many attempts of it
 /// are already recorded.
 ///
@@ -8699,6 +8927,7 @@ fn next_attempt_ordinal(attempts: &[NodeAttempt], tag: &str) -> usize {
 
 /// Record one attempt the scheduler REPORTED.
 fn reported_attempt(outcome: &StepOutcome, attempt: usize) -> NodeAttempt {
+    let failure_class = outcome_failure_class(outcome);
     NodeAttempt {
         tag: outcome.tag.clone(),
         attempt,
@@ -8710,8 +8939,13 @@ fn reported_attempt(outcome: &StepOutcome, attempt: usize) -> NodeAttempt {
         aborted: outcome.aborted,
         execution: outcome_execution(outcome),
         retry_class: None,
+        retry_detail: None,
         environmental_class: None,
         detail_observed: false,
+        failure_detail: (failure_class == Some(FailureClass::NoResult)
+            && !outcome.reason.is_empty())
+            .then(|| outcome.reason.clone()),
+        failure_class,
         test_results: outcome.test_results.clone(),
     }
 }
@@ -8731,8 +8965,11 @@ fn unreported_attempt(tag: String, attempt: usize) -> NodeAttempt {
         aborted: false,
         execution: AttemptExecution::Unknown,
         retry_class: None,
+        retry_detail: None,
         environmental_class: None,
         detail_observed: false,
+        failure_class: Some(FailureClass::NoResult),
+        failure_detail: Some("no completion payload was reported for this node".into()),
         test_results: None,
     }
 }
@@ -8752,10 +8989,21 @@ fn latest_reported_failure_mut<'a>(
 }
 
 /// Attach one round's detail observation to the exact reported failure it came from.
-fn stamp_attempt_detail(attempts: &mut [NodeAttempt], tag: &str, class: Option<&str>) {
+fn stamp_attempt_detail(
+    attempts: &mut [NodeAttempt],
+    tag: &str,
+    environmental_class: Option<&str>,
+    failure: Option<(FailureClass, &str)>,
+) {
     if let Some(attempt) = latest_reported_failure_mut(attempts, tag) {
         attempt.detail_observed = true;
-        attempt.environmental_class = class.map(str::to_string);
+        attempt.environmental_class = environmental_class.map(str::to_string);
+        if attempt.failure_class == Some(FailureClass::ProductFailure) {
+            if let Some((failure_class, failure_detail)) = failure {
+                attempt.failure_class = Some(failure_class);
+                attempt.failure_detail = Some(failure_detail.to_string());
+            }
+        }
     }
 }
 
@@ -8825,7 +9073,7 @@ struct LaneResult {
     /// How many retry ROUNDS this lane needed; recorded in the ledger so a green
     /// that only survived because the host was retried is never mistaken for a
     /// green that passed first time.
-    env_retries: usize,
+    retry_rounds: usize,
     /// The whole-invocation deadline expired during this lane.
     run_timed_out: bool,
 }
@@ -9095,12 +9343,35 @@ fn scheduler_not_launched_message(tags: &[String]) -> String {
     )
 }
 
-fn retry_notice(tag: &str, class: &str, attempt: usize) -> String {
+fn retry_notice(
+    tag: &str,
+    class: RetryClass,
+    detail: Option<&str>,
+    attempt: usize,
+) -> String {
+    let detail = detail.map(|value| format!(": {value}")).unwrap_or_default();
     format!(
-        "⚠️  {tag}: RETRY-ELIGIBLE ({class}) — this attempt remains RED unless an actual \
+        "⚠️  {tag}: RETRY-ELIGIBLE ({}{detail}) — this attempt remains RED unless an actual \
          re-execution passes — retrying (attempt {attempt}/{})",
+        class.as_str(),
         validate_runtime::MAX_ATTEMPTS_PER_CELL
     )
+}
+
+fn retry_classification(
+    environmental: Option<RetryClass>,
+    hit_budget: bool,
+    measured_unstable_detail: Option<String>,
+) -> (RetryClass, Option<String>) {
+    if let Some(class) = environmental {
+        (class, None)
+    } else if hit_budget {
+        (RetryClass::BoundKillUnderContention, None)
+    } else if let Some(detail) = measured_unstable_detail {
+        (RetryClass::MeasuredUnstable, Some(detail))
+    } else {
+        (RetryClass::AlwaysEligible, None)
+    }
 }
 
 #[cfg(test)]
@@ -9152,7 +9423,13 @@ mod scheduler_explanation_tests {
     fn retry_notice_has_one_retry_and_never_advertises_a_third_attempt() {
         assert_eq!(validate_runtime::RETRIES_PER_CELL, 1);
         assert_eq!(validate_runtime::MAX_ATTEMPTS_PER_CELL, 2);
-        assert!(retry_notice("test.liteinst_strict", "fixture", 2).ends_with("attempt 2/2)"));
+        assert!(retry_notice(
+            "test.liteinst_strict",
+            RetryClass::AlwaysEligible,
+            None,
+            2,
+        )
+        .ends_with("attempt 2/2)"));
 
         let tag = "test.liteinst_strict";
         let cfg = DagConfig {
@@ -9172,6 +9449,27 @@ mod scheduler_explanation_tests {
         assert!(retry_attempt_available(&cfg, &attempts, tag));
         attempts.push(unreported_attempt(tag.into(), 2));
         assert!(!retry_attempt_available(&cfg, &attempts, tag));
+    }
+
+    #[test]
+    fn retry_classification_keeps_measured_detail_out_of_the_class() {
+        let detail = "9 pass / 1 fail, measured 2026-08-24".to_string();
+        assert_eq!(
+            retry_classification(None, false, Some(detail.clone())),
+            (RetryClass::MeasuredUnstable, Some(detail))
+        );
+        assert_eq!(
+            retry_classification(None, true, Some("ignored by precedence".into())),
+            (RetryClass::BoundKillUnderContention, None)
+        );
+        assert_eq!(
+            retry_classification(Some(RetryClass::ProxyEgress), true, None),
+            (RetryClass::ProxyEgress, None)
+        );
+        assert_eq!(
+            retry_classification(None, false, None),
+            (RetryClass::AlwaysEligible, None)
+        );
     }
 
     #[test]
@@ -9758,7 +10056,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         steps: vec![step("pass", "true"), intentional_skip.clone()],
         ..Default::default()
     };
-    let complete = run_lane_with_env_retries(
+    let complete = run_lane_with_retries(
         &complete_cfg,
         1,
         true,
@@ -9772,7 +10070,8 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     );
     if !complete.complete
         || !complete.ok
-        || complete.env_retries != 0
+        || complete.retry_rounds != 0
+        || completed_node_count(&complete.outcomes, &complete.attempts) != 1
         || complete.outcomes.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>()
             != vec!["fixture.pass"]
     {
@@ -9780,7 +10079,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             "scheduler accounting: complete plan plus intentional skip was not accepted: complete={} ok={} retries={} outcomes={:?}",
             complete.complete,
             complete.ok,
-            complete.env_retries,
+            complete.retry_rounds,
             complete.outcomes.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>()
         ));
     }
@@ -9811,7 +10110,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     // Default eager-exit: with one worker both independent peers remain runnable but
     // never launched, so the lane is a red that is ALSO incomplete, and the
     // completeness axis must refuse to let it exit 0.
-    let failed = run_lane_with_env_retries(
+    let failed = run_lane_with_retries(
         &failed_cfg,
         1,
         false,
@@ -9824,7 +10123,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         false,
     );
     // ⚠️ THIS BRACKET WAS RE-POINTED, NOT WEAKENED (owner directive 2026-08-26).
-    // It used to require `env_retries == 0` -- an unclassified failure got no
+    // It used to require `retry_rounds == 0` -- an unclassified failure got no
     // retry, because retry was opt-in. Every cell is now ALWAYS eligible, so this
     // failure is retried exactly once here, bounded by the `max` of 1 passed
     // above. The retry count assertion therefore flipped from 0 to 1.
@@ -9836,7 +10135,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     // policy that swallowed a real failure.
     if failed.complete
         || failed.ok
-        || failed.env_retries != 1
+        || failed.retry_rounds != 1
         || failed.outcomes.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>()
             != vec!["fixture.fail"]
         || exit_code_with_execution_completeness(0, failed.complete) == 0
@@ -9845,7 +10144,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             "scheduler accounting: an always-eligible unclassified failure must be retried once at max=1 and REMAIN an incomplete red: complete={} ok={} retries={} outcomes={:?}",
             failed.complete,
             failed.ok,
-            failed.env_retries,
+            failed.retry_rounds,
             failed.outcomes.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>()
         ));
     }
@@ -9853,7 +10152,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     // Same failure under keep-going: still an unretried red, and still not green,
     // but now every peer is measured, so the lane is completely accounted for. The
     // failure verdict must not soften just because coverage got wider.
-    let kept = run_lane_with_env_retries(
+    let kept = run_lane_with_retries(
         &failed_cfg,
         1,
         true,
@@ -9873,12 +10172,12 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     // retry that softened the verdict or lost a peer still fails here.
     if !kept.complete
         || kept.ok
-        || kept.env_retries != 1
+        || kept.retry_rounds != 1
         || kept_tags != vec!["fixture.fail", "fixture.pending_a", "fixture.pending_b"]
     {
         return Err(format!(
             "scheduler accounting: keep-going did not measure every independent peer while keeping the failure red: complete={} ok={} retries={} outcomes={kept_tags:?}",
-            kept.complete, kept.ok, kept.env_retries
+            kept.complete, kept.ok, kept.retry_rounds
         ));
     }
 
@@ -9904,7 +10203,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         ],
         ..Default::default()
     };
-    let dependency_result = run_lane_with_env_retries(
+    let dependency_result = run_lane_with_retries(
         &dependency_cfg,
         1,
         true,
@@ -9964,7 +10263,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         ],
         ..Default::default()
     };
-    let aborted_result = run_lane_with_env_retries(
+    let aborted_result = run_lane_with_retries(
         &aborted_cfg,
         2,
         false,
@@ -10042,7 +10341,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             "scheduler accounting: plan family assignment changed an explicit family or failed to scope an ordinary node by its tag: {scoped_families:?}"
         ));
     }
-    let scoped = run_lane_with_env_retries(
+    let scoped = run_lane_with_retries(
         &scoped_plan.cfg,
         3,
         false,
@@ -10099,7 +10398,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         steps: vec![step("allowed_failure", "exit 1"), intentional_skip],
         ..Default::default()
     };
-    let allowed = run_lane_with_env_retries(
+    let allowed = run_lane_with_retries(
         &allowed_cfg,
         1,
         true,
@@ -10118,12 +10417,12 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     // to hold and which retry must not blur.
     if !allowed.complete
         || allowed.ok
-        || allowed.env_retries != 1
+        || allowed.retry_rounds != 1
         || exit_code_with_execution_completeness(0, allowed.complete) != 0
     {
         return Err(format!(
             "scheduler accounting: complete allowed failure was not kept distinct from incomplete execution: complete={} ok={} retries={}",
-            allowed.complete, allowed.ok, allowed.env_retries
+            allowed.complete, allowed.ok, allowed.retry_rounds
         ));
     }
 
@@ -10163,7 +10462,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         ],
         ..Default::default()
     };
-    let retried = run_lane_with_env_retries(
+    let retried = run_lane_with_retries(
         &environmental_cfg,
         1,
         true,
@@ -10186,7 +10485,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     .collect();
     if !retried.complete
         || !retried.ok
-        || retried.env_retries != 1
+        || retried.retry_rounds != 1
         || retried_tags != expected_tags
         || !retried.skipped.is_empty()
         || !edge_ready.is_file()
@@ -10195,7 +10494,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             "scheduler accounting: environmental retry did not run every peer with its edge preserved: complete={} ok={} retries={} outcomes={retried_tags:?} skipped={:?} edge_ready={}",
             retried.complete,
             retried.ok,
-            retried.env_retries,
+            retried.retry_rounds,
             retried.skipped,
             edge_ready.is_file()
         ));
@@ -10221,7 +10520,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         .any(|a| a.attempt == 2 && a.ok == Some(true));
     let names_its_ground = environmental_attempts
         .iter()
-        .any(|a| a.attempt == 1 && a.retry_class.as_deref() == Some("bpfjailer-banner"));
+        .any(|a| a.attempt == 1 && a.retry_class == Some(RetryClass::BpfjailerBanner));
     if environmental_attempts.len() != 2
         || !first_failed
         || !second_passed
@@ -10232,7 +10531,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
              passed first time — the retry erased the flake. attempts={:?}",
             environmental_attempts
                 .iter()
-                .map(|a| (a.attempt, a.ok, a.reported, a.retry_class.clone()))
+                .map(|a| (a.attempt, a.ok, a.reported, a.retry_class))
                 .collect::<Vec<_>>()
         ));
     }
@@ -10413,12 +10712,14 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             unreported_attempt(DBT_PARITY_NODE.into(), 1),
             unreported_attempt(DBT_PARITY_NODE.into(), 2),
         ];
-        dbt_attempts[0].retry_class = Some("self-test retry".into());
+        dbt_attempts[0].retry_class = Some(RetryClass::AlwaysEligible);
+        dbt_attempts[0].retry_detail = Some("self-test retry".into());
         let dbt_retry_summary = test_id_summary(dbt_retry, &dbt_attempts, &BTreeSet::new());
         if dbt_retry_summary.recovered.len() != 1
             || dbt_retry_summary.recovered[0].id
                 != "backend-parity/virtual_clock [dbt/strict]"
-            || dbt_retry_summary.recovered[0].retry_classes != ["self-test retry"]
+            || dbt_retry_summary.recovered[0].retry_classes
+                != [RetryClass::AlwaysEligible]
         {
             return Err(format!(
                 "end-of-run summary: DBT parity fail-then-pass was not retained as recovered: \
@@ -10465,7 +10766,8 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         let e2e_retry_summary = test_id_summary(e2e, &[], &BTreeSet::new());
         if e2e_retry_summary.recovered.len() != 1
             || e2e_retry_summary.recovered[0].id != "applications/example [ptrace/verify]"
-            || e2e_retry_summary.recovered[0].retry_classes != ["always-eligible"]
+            || e2e_retry_summary.recovered[0].retry_classes
+                != [RetryClass::AlwaysEligible]
             || e2e_retry_summary.retry_occurrences != 1
         {
             return Err(format!(
@@ -10479,7 +10781,9 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         e2e_green.wall_s = Some(0.0);
         e2e_green.nodes_executed = 1;
         let e2e_rendered = run_summary_lines(&e2e_green, std::time::Instant::now()).join("\n");
-        if !e2e_rendered.contains("applications/example [ptrace/verify]  (1 retry")
+        if !e2e_rendered.contains(
+            "applications/example [ptrace/verify] (node e2e.manifest_applications)  (1 retry",
+        )
             || !e2e_rendered
                 .contains("retries: 1 occurrence(s) recorded from scheduler and per-cell attempts")
         {
@@ -10492,10 +10796,10 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         let split = test_id_summary(observations, &retried.attempts, &failed_nodes);
         if split.recovered.len() != 1
             || split.recovered[0].id != "hermit::fixture$recovered_on_retry"
-            || split.recovered[0].retry_classes != ["bpfjailer-banner"]
+            || split.recovered[0].retry_classes != [RetryClass::BpfjailerBanner]
             || split.failed.len() != 1
             || split.failed[0].id != "hermit::fixture$hard_failure"
-            || split.failed[0].retry_classes != ["bpfjailer-banner"]
+            || split.failed[0].retry_classes != [RetryClass::BpfjailerBanner]
             || !split.failed_nodes_without_test_ids.is_empty()
             || split.retry_occurrences != 1
         {
@@ -10555,8 +10859,12 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         if !red_rendered.contains(SUMMARY_FLAKY_HEADING)
             || !red_rendered.contains("1 test id(s) recovered")
             || !red_rendered.contains("1 test id(s) failed and did NOT recover")
-            || !red_rendered.contains("hermit::fixture$recovered_on_retry  (1 retry")
-            || !red_rendered.contains("hermit::fixture$hard_failure  (1 retry")
+            || !red_rendered.contains(
+                "hermit::fixture$recovered_on_retry (node fixture.environmental)  (1 retry",
+            )
+            || !red_rendered.contains(
+                "hermit::fixture$hard_failure (node fixture.environmental)  (1 retry",
+            )
             || !red_rendered.contains(
                 "retries: 1 occurrence(s) recorded from scheduler and per-cell attempts",
             )
@@ -10674,7 +10982,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         first = validate_plan::shell_quote(&stale_first.to_string_lossy()),
         log = validate_plan::shell_quote(&stale_log.to_string_lossy()),
     );
-    let stale = run_lane_with_env_retries(
+    let stale = run_lane_with_retries(
         &DagConfig { steps: vec![step("stale_log", &stale_cmd)], ..Default::default() },
         1,
         true,
@@ -10729,7 +11037,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
          '[fixture.partial_detail] Enforcer: FS, Reason: FILE_OPEN' > {log}; exit 1",
         log = validate_plan::shell_quote(&partial_log.to_string_lossy()),
     );
-    let partial = run_lane_with_env_retries(
+    let partial = run_lane_with_retries(
         &DagConfig { steps: vec![step("partial_detail", &partial_cmd)], ..Default::default() },
         1,
         true,
@@ -10752,7 +11060,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     // `environmental_class` none are unchanged.
     if partial.ok
         || !partial.complete
-        || partial.env_retries != 1
+        || partial.retry_rounds != 1
         || partial_attempt.detail_observed
         || partial_attempt.environmental_class.is_some()
     {
@@ -10761,7 +11069,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
              complete={} retries={} detail_observed={} class={:?}",
             partial.ok,
             partial.complete,
-            partial.env_retries,
+            partial.retry_rounds,
             partial_attempt.detail_observed,
             partial_attempt.environmental_class
         ));
@@ -10785,7 +11093,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         first = validate_plan::shell_quote(&terminal_first.to_string_lossy()),
         log = validate_plan::shell_quote(&terminal_log.to_string_lossy()),
     );
-    let terminal = run_lane_with_env_retries(
+    let terminal = run_lane_with_retries(
         &DagConfig {
             steps: vec![step("terminal_environmental", &terminal_cmd)],
             ..Default::default()
@@ -10848,7 +11156,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         first = validate_plan::shell_quote(&coincident_first.to_string_lossy()),
         log = validate_plan::shell_quote(&coincident_log.to_string_lossy()),
     );
-    let coincident = run_lane_with_env_retries(
+    let coincident = run_lane_with_retries(
         &DagConfig { steps: vec![step("coincident", &coincident_cmd)], ..Default::default() },
         1,
         true,
@@ -10907,7 +11215,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         second = validate_plan::shell_quote(&multi_second.to_string_lossy()),
         log = validate_plan::shell_quote(&multi_log.to_string_lossy()),
     );
-    let multiple = run_lane_with_env_retries(
+    let multiple = run_lane_with_retries(
         &DagConfig { steps: vec![step("multiple", &multi_cmd)], ..Default::default() },
         1,
         true,
@@ -10979,7 +11287,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         lane: "portable".into(),
         category: "applications".into(),
     });
-    let e2e_retry = run_lane_with_env_retries(
+    let e2e_retry = run_lane_with_retries(
         &DagConfig { steps: vec![e2e_step], ..Default::default() },
         1,
         true,
@@ -11002,7 +11310,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         .first()
         .and_then(|attempt| attempt.test_results.as_ref());
     if e2e_retry.ok
-        || e2e_retry.env_retries != 0
+        || e2e_retry.retry_rounds != 0
         || e2e_node_attempts.len() != 1
         || e2e_results
             != Some(&vec![
@@ -11014,7 +11322,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         return Err(format!(
             "scheduler accounting: manifest framework retry did not preserve the 2/1/1 proof: \
              ok={} retries={} node_attempts={} results={e2e_results:?} rows={recorded_attempts:?}",
-            e2e_retry.ok, e2e_retry.env_retries, e2e_node_attempts.len()
+            e2e_retry.ok, e2e_retry.retry_rounds, e2e_node_attempts.len()
         ));
     }
 
@@ -11028,7 +11336,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         validate_plan::shell_quote(&structured_counts),
         validate_plan::shell_quote(&ordinary_attempts.to_string_lossy()),
     );
-    let ordinary_retry = run_lane_with_env_retries(
+    let ordinary_retry = run_lane_with_retries(
         &DagConfig { steps: vec![step("ordinary_structured", &ordinary_cmd)], ..Default::default() },
         1,
         true,
@@ -11048,7 +11356,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     let ordinary_runs = std::fs::read_to_string(&ordinary_attempts)
         .map_err(|e| format!("scheduler accounting: cannot read ordinary retry fixture: {e}"))?;
     if ordinary_retry.ok
-        || ordinary_retry.env_retries != 1
+        || ordinary_retry.retry_rounds != 1
         || ordinary_node_attempts.len() != 2
         || ordinary_node_attempts.iter().any(|attempt| {
             attempt.test_results.as_ref().is_none_or(|results| {
@@ -11063,7 +11371,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             "scheduler accounting: ordinary-node control did not rerun its passing peer: \
              ok={} retries={} node_attempts={} rows={ordinary_runs:?}",
             ordinary_retry.ok,
-            ordinary_retry.env_retries,
+            ordinary_retry.retry_rounds,
             ordinary_node_attempts.len()
         ));
     }
@@ -11096,7 +11404,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     spawn_step
         .env
         .insert("PATH".into(), fake_bin.to_string_lossy().into_owned());
-    let spawn_unknown = run_lane_with_env_retries(
+    let spawn_unknown = run_lane_with_retries(
         &DagConfig { steps: vec![spawn_step], ..Default::default() },
         1,
         true,
@@ -11149,13 +11457,25 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     if !spawn_gate["result"].is_null()
         || spawn_gate["reported"] != true
         || spawn_gate["execution"] != "unknown"
+        || completed_node_count(&spawn_unknown.outcomes, &spawn_unknown.attempts) != 1
         || !spawn_gate["failure_origin"].is_null()
         || spawn_gate.get("failed_substeps").is_some()
     {
         return Err(format!(
             "scheduler accounting: reported-but-unexecuted spawn failure acquired false failure \
-             evidence: {spawn_gate}"
+            evidence: {spawn_gate}"
         ));
+    }
+    let only_unknown_attempt = reported_attempt(spawn_outcome, 1);
+    if completed_node_count(
+        std::slice::from_ref(spawn_outcome),
+        std::slice::from_ref(&only_unknown_attempt),
+    ) != 0
+    {
+        return Err(
+            "scheduler accounting: a spawn failure with execution=unknown was counted as an executed node"
+                .into(),
+        );
     }
 
     // ROUND-LOCAL MISSING OUTCOME. In round 1 the prerequisite and environmental
@@ -11187,7 +11507,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         ..Default::default()
     };
     missing_cfg.resource_caps.insert("serial".into(), 1);
-    let missing = run_lane_with_env_retries(
+    let missing = run_lane_with_retries(
         &missing_cfg,
         2,
         false,
@@ -11327,7 +11647,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         ..Default::default()
     };
     multi_missing_cfg.resource_caps.insert("serial".into(), 1);
-    let multi_missing = run_lane_with_env_retries(
+    let multi_missing = run_lane_with_retries(
         &multi_missing_cfg,
         2,
         false,
@@ -11361,7 +11681,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         .collect();
     if multi_missing.complete
         || multi_missing.ok
-        || multi_missing.env_retries != 1
+        || multi_missing.retry_rounds != 1
         || multi_missing_attempts.len() != 2
         || multi_missing_attempts[0].execution != AttemptExecution::Completed
         || multi_missing_attempts[1].execution != AttemptExecution::Unknown
@@ -11386,7 +11706,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
              prerequisite={:?} prerequisite_dependent={:?}",
             multi_missing.complete,
             multi_missing.ok,
-            multi_missing.env_retries,
+            multi_missing.retry_rounds,
             multi_missing_attempts
                 .iter()
                 .map(|attempt| (attempt.attempt, attempt.reported, attempt.execution, attempt.ok))
@@ -11425,7 +11745,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     ];
     let retry_set = retry_candidate_tags(
         &retry_set_cfg,
-        &[(available.to_string(), "always-eligible".to_string())],
+        &[(available.to_string(), RetryClass::AlwaysEligible, None)],
         &[capped.to_string()],
         &BTreeMap::new(),
         &BTreeSet::new(),
@@ -11465,7 +11785,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         )],
         ..Default::default()
     };
-    let bound = run_lane_with_env_retries(
+    let bound = run_lane_with_retries(
         &bound_cfg,
         1,
         true,
@@ -11485,10 +11805,9 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     let bound_ground = bound_attempts
         .iter()
         .find(|a| a.attempt == 1)
-        .and_then(|a| a.retry_class.clone())
-        .unwrap_or_default();
+        .and_then(|a| a.retry_class);
     if !bound.ok
-        || bound.env_retries != 1
+        || bound.retry_rounds != 1
         || bound_attempts.len() != 2
         || bound_attempts[0].ok != Some(false)
         || bound_attempts[1].ok != Some(true)
@@ -11496,14 +11815,14 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         // after the message was removed from this class, so it could not have
         // caught the defect it looks like it covers, and would not catch the
         // message coming back.
-        || bound_ground != "bound-kill under contention"
+        || bound_ground != Some(RetryClass::BoundKillUnderContention)
     {
         return Err(format!(
             "scheduler accounting: a node killed by its own wall budget was not retried on the \
              bound-kill ground, or the timed-out attempt was not preserved: ok={} retries={} \
              attempts={:?} ground={bound_ground:?}",
             bound.ok,
-            bound.env_retries,
+            bound.retry_rounds,
             bound_attempts.iter().map(|a| (a.attempt, a.ok)).collect::<Vec<_>>()
         ));
     }
@@ -11518,7 +11837,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
 [fixture.plain_red] ----- end detail -----\n",
     )
     .map_err(|e| format!("scheduler accounting: cannot write the ordinary-only log: {e}"))?;
-    let ordinary_only = run_lane_with_env_retries(
+    let ordinary_only = run_lane_with_retries(
         &DagConfig { steps: vec![step("plain_red", "exit 1")], ..Default::default() },
         1,
         true,
@@ -11544,12 +11863,12 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     //
     // The verdict is the invariant: retrying a genuine red twice
     // must return the same red. The cost is policy; the verdict is not.
-    if ordinary_only.ok || ordinary_only.env_retries != 1 || ordinary_only.attempts.len() != 2 {
+    if ordinary_only.ok || ordinary_only.retry_rounds != 1 || ordinary_only.attempts.len() != 2 {
         return Err(format!(
             "scheduler accounting: an always-eligible failure must spend its per-cell \
              allowance and STILL be red: ok={} retries={} attempts={}",
             ordinary_only.ok,
-            ordinary_only.env_retries,
+            ordinary_only.retry_rounds,
             ordinary_only.attempts.len()
         ));
     }
@@ -11565,16 +11884,41 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     // answer the only question it exists for. The text is not lost -- `reason`
     // sits beside it on the same attempt row and is published with it.
     let blanket_attempt = ordinary_only.attempts.iter().find(|a| a.attempt == 1);
-    let blanket = blanket_attempt.and_then(|a| a.retry_class.clone()).unwrap_or_default();
+    let blanket = blanket_attempt.and_then(|a| a.retry_class);
     let blanket_reason =
         blanket_attempt.map(|a| a.reason.trim().to_string()).unwrap_or_default();
-    if blanket != "always-eligible"
-        || (!blanket_reason.is_empty() && blanket.contains(&blanket_reason))
+    if blanket != Some(RetryClass::AlwaysEligible)
+        || blanket_attempt.is_some_and(|attempt| attempt.retry_detail.is_some())
     {
         return Err(format!(
             "scheduler accounting: the blanket retry ground must publish the bare category \
              \"always-eligible\" and must never embed the attempt's own failure message, or \
-             `retry_class` cannot be grouped: retry_class={blanket:?} reason={blanket_reason:?}"
+             `retry_class` cannot be grouped: retry_class={blanket:?} retry_detail={:?} \
+             reason={blanket_reason:?}",
+            blanket_attempt.and_then(|attempt| attempt.retry_detail.as_deref())
+        ));
+    }
+
+    let mut measured_attempt = blanket_attempt
+        .cloned()
+        .ok_or("scheduler accounting: measured-instability fixture lost attempt 1")?;
+    measured_attempt.retry_class = Some(RetryClass::MeasuredUnstable);
+    measured_attempt.retry_detail =
+        Some("9 pass / 1 fail, measured 2026-08-24".to_string());
+    let measured_outcome = ordinary_only
+        .outcomes
+        .iter()
+        .find(|outcome| outcome.tag == "fixture.plain_red")
+        .ok_or("scheduler accounting: measured-instability fixture lost its outcome")?;
+    let measured_gate =
+        ledger_gate_with_attempts(measured_outcome, std::slice::from_ref(&measured_attempt));
+    if measured_gate["attempts"][0]["retry_class"] != "measured-unstable"
+        || measured_gate["attempts"][0]["retry_detail"]
+            != "9 pass / 1 fail, measured 2026-08-24"
+    {
+        return Err(format!(
+            "scheduler accounting: measured instability did not keep its class and detail in \
+             separate ledger fields: {measured_gate}"
         ));
     }
 
@@ -11606,7 +11950,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         ],
         ..Default::default()
     };
-    let twins = run_lane_with_env_retries(
+    let twins = run_lane_with_retries(
         &twin_cfg,
         2,
         true,
@@ -11672,8 +12016,8 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         ));
     }
     // The same registry must match a DAG node whose tag carries its group.
-    if validate_runtime::measured_unstable_class(&admitted, "test.real_flake").is_none()
-        || validate_runtime::measured_unstable_class(&admitted, "test.structural_no_result")
+    if validate_runtime::measured_unstable_detail(&admitted, "test.real_flake").is_none()
+        || validate_runtime::measured_unstable_detail(&admitted, "test.structural_no_result")
             .is_some()
     {
         return Err(
@@ -11731,7 +12075,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         ],
         ..Default::default()
     };
-    let mixed = run_lane_with_env_retries(
+    let mixed = run_lane_with_retries(
         &mixed_cfg,
         2,
         true,
@@ -11760,7 +12104,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     // unsatisfied ordinary dependency into its dependents, still holds and its
     // clauses below are untouched.
     if mixed.complete
-        || mixed.env_retries != 1
+        || mixed.retry_rounds != 1
         || ordinary_attempt_count != 2
         || mixed_by_tag
             .get("fixture.ordinary_failure")
@@ -11779,7 +12123,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             "scheduler accounting: environmental retry crossed an unsatisfied ordinary dependency: complete={} ok={} retries={} ordinary_attempts={ordinary_attempt_count} environmental_passed={} dependent_ran={} transitive_dependent_ran={} outcomes={:?}",
             mixed.complete,
             mixed.ok,
-            mixed.env_retries,
+            mixed.retry_rounds,
             mixed_environmental_passed.is_file(),
             unsafe_dependent_ran.exists(),
             unsafe_transitive_dependent_ran.exists(),
@@ -11840,7 +12184,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
 ///   have completed successfully already or execute in the same retry. Internal
 ///   dependency edges are preserved, and removing an unsafe prerequisite also
 ///   removes its dependents before anything runs.
-fn run_lane_with_env_retries(
+fn run_lane_with_retries(
     cfg: &DagConfig,
     jobs: i64,
     keep_going: bool,
@@ -11868,7 +12212,7 @@ fn run_lane_with_env_retries(
             attempts: Vec::new(),
             complete: false,
             ok: false,
-            env_retries: 0,
+            retry_rounds: 0,
             run_timed_out: true,
         };
     }
@@ -11907,7 +12251,7 @@ fn run_lane_with_env_retries(
     let mut by_tag: BTreeMap<String, StepOutcome> =
         first.outcomes.iter().map(|o| (o.tag.clone(), o.clone())).collect();
     let mut skipped = first.skipped.clone();
-    let mut env_retries = 0usize;
+    let mut retry_rounds = 0usize;
     // Attempt 1 for everything the first pass reported, recorded BEFORE any
     // retry can replace it in `by_tag`. This is the row that used to vanish.
     let mut attempts: Vec<NodeAttempt> = order
@@ -11923,7 +12267,7 @@ fn run_lane_with_env_retries(
     let mut latest_unreported: BTreeSet<String> = first_unreported.iter().cloned().collect();
     attempts.extend(first_unreported.into_iter().map(|tag| unreported_attempt(tag, 1)));
 
-    while env_retries < max {
+    while retry_rounds < max {
         let failed: Vec<&StepOutcome> = by_tag
             .values()
             .filter(|o| outcome_is_failure(o) && !latest_unreported.contains(o.tag.as_str()))
@@ -11983,15 +12327,22 @@ fn run_lane_with_env_retries(
         if let Some(log) = round_log.as_deref() {
             for outcome in &failed {
                 if let Some(detail) = validate_runtime::extract_node_detail(log, &outcome.tag) {
-                    let class = validate_runtime::environmental_block_class(&detail);
-                    stamp_attempt_detail(&mut attempts, &outcome.tag, class);
+                    let class = validate_runtime::environmental_block_observation(&detail)
+                        .block_class();
+                    let failure = validate_runtime::failure_class_from_detail(&detail);
+                    stamp_attempt_detail(
+                        &mut attempts,
+                        &outcome.tag,
+                        class.map(validate_runtime::EnvBlockClass::as_str),
+                        failure,
+                    );
                     if let Some(class) = class {
-                        environmental.insert(outcome.tag.clone(), class.to_string());
+                        environmental.insert(outcome.tag.clone(), RetryClass::from(class));
                     }
                 }
             }
         }
-        let blocked: Vec<(String, String)> = failed
+        let blocked: Vec<(String, RetryClass, Option<String>)> = failed
             .iter()
             .filter_map(|o| {
                 // ⚠️ THE BUDGET IS PER CELL. Owner ruling 2026-08-26. This cell has
@@ -12004,65 +12355,19 @@ fn run_lane_with_env_retries(
                 if !retry_attempt_available(cfg, &attempts, &o.tag) {
                     return None;
                 }
-                environmental
-                    .get(&o.tag)
-                    .cloned()
-                    .or_else(|| {
-                        // ⚠️ A CATEGORY, NOT A MESSAGE. This arm used to append
-                        // `o.reason` and so produced a near-unique value per
-                        // failure; see the block under the always-eligible arm
-                        // below for why that empties the field of its purpose.
-                        // The message is not lost: it is already on the same
-                        // attempt row, in `reason`, one key away.
-                        outcome_hit_its_budget(o).then(|| "bound-kill under contention".to_string())
-                    })
-                    .or_else(|| validate_runtime::measured_unstable_class(unstable, &o.tag))
-                    // ALWAYS-ELIGIBLE FALLBACK (owner directive 2026-08-26): every
-                    // cell is eligible for retry, not just one that earned it.
-                    //
-                    // ⚠️ THE OPT-IN GROUND HAD NEVER FIRED. Measured across all 106
-                    // recorded runs carrying `retried_nodes`: 12 had a retry and all
-                    // 12 were granted environmentally. `measured_unstable_class` --
-                    // the registry ground directly above -- has granted zero, and its
-                    // registry holds one cell measured 22 days ago. A cell earned a
-                    // retry by having already been retried.
-                    //
-                    // The three grounds above are KEPT AND TRIED FIRST, deliberately:
-                    // each names a specific cause, and that name is what reaches the
-                    // ledger as `retry_class`. Falling straight to the blanket class
-                    // would erase the distinction between "BPF-jailed", "bound-kill
-                    // under contention" and "no idea", which is the signal a
-                    // multi-week flakiness timeline is built from.
-                    //
-                    // The two SAFETY refusals still bound this and are not bypassed:
-                    // a failure whose prerequisite did not complete is dropped by
-                    // `retry_steps_with_satisfied_prerequisites` below, and the whole
-                    // loop is bounded by `max` rounds.
-                    //
-                    // ⚠️ THIS IS A CATEGORY AND IT MUST NOT CARRY THE MESSAGE.
-                    // Owner ruling 2026-08-27, granting the eligibility above on
-                    // condition that the field stay groupable.
-                    //
-                    // Both this arm and the bound-kill arm above used to append
-                    // `o.reason`. That reads as more information and is less:
-                    // the paragraph above says this field is "the signal a
-                    // multi-week flakiness timeline is built from", and a
-                    // timeline is built by GROUPING. Interpolating a per-failure
-                    // message makes every group hold one row, so the field is
-                    // populated, non-null, and answers nothing -- while looking
-                    // entirely reasonable in any single row you inspect.
-                    //
-                    // This arm is the catch-all, so it takes every failure the
-                    // three named grounds did not match. Left as free text it
-                    // would become the dominant value AND the least analysable
-                    // one, which inverts the purpose of granting the retry.
-                    //
-                    // NOTHING IS LOST. The failure text is already published on
-                    // the same attempt object as `reason` (see NodeAttempt and
-                    // the envelope writer): one field for a human reading a row,
-                    // one for a machine counting rows.
-                    .or_else(|| Some("always-eligible".to_string()))
-                    .map(|class| (o.tag.clone(), class))
+                let measured_detail =
+                    validate_runtime::measured_unstable_detail(unstable, &o.tag);
+                let classification = retry_classification(
+                    environmental.get(&o.tag).copied(),
+                    outcome_hit_its_budget(o),
+                    measured_detail,
+                );
+                // The class is a grouping key, never a message. The failed
+                // attempt's own text remains in `reason`; measured-instability
+                // provenance is the separate `retry_detail`. The fallback is
+                // always-eligible by the owner ruling, after the three more
+                // specific grounds above have had priority.
+                Some((o.tag.clone(), classification.0, classification.1))
             })
             .collect();
         if blocked.is_empty() {
@@ -12086,7 +12391,7 @@ fn run_lane_with_env_retries(
         );
         let steps = retry_steps_with_satisfied_prerequisites(cfg, &by_tag, keep);
         let retry_tags: BTreeSet<String> = steps.iter().map(|step| step.tag()).collect();
-        if !blocked.iter().any(|(tag, _)| retry_tags.contains(tag)) {
+        if !blocked.iter().any(|(tag, _, _)| retry_tags.contains(tag)) {
             eprintln!(
                 "validate: retry-eligible failure has no safe retry because a prerequisite did \
                  not complete successfully and is not part of the retry; NOT retrying."
@@ -12098,23 +12403,34 @@ fn run_lane_with_env_retries(
         if remaining_budget_s(deadline) == Some(0) {
             eprintln!(
                 "validate: whole-run budget exhausted; NOT starting retry round {}.",
-                env_retries + 1
+                retry_rounds + 1
             );
             run_timed_out = true;
             break;
         }
-        env_retries += 1;
-        for (tag, class) in blocked.iter().filter(|(tag, _)| retry_tags.contains(tag)) {
+        retry_rounds += 1;
+        for (tag, class, detail) in
+            blocked.iter().filter(|(tag, _, _)| retry_tags.contains(tag))
+        {
             // This says WHY the retry scheduler accepted the prior failure. The
             // later attempt's typed execution state independently decides
             // whether that scheduled retry actually confirmed/refuted anything.
             if let Some(previous) = latest_reported_failure_mut(&mut attempts, tag) {
-                previous.retry_class = Some(class.clone());
+                previous.retry_class = Some(*class);
+                previous.retry_detail = detail.clone();
             }
-            println!("{}", retry_notice(tag, class, next_attempt_ordinal(&attempts, tag)));
+            println!(
+                "{}",
+                retry_notice(
+                    tag,
+                    *class,
+                    detail.as_deref(),
+                    next_attempt_ordinal(&attempts, tag),
+                )
+            );
         }
         let mut retry_cfg = cfg.clone();
-        retry_cfg.description = format!("{} — retry round {env_retries}", cfg.description);
+        retry_cfg.description = format!("{} — retry round {retry_rounds}", cfg.description);
         retry_cfg.steps = steps;
         // Everything before this byte belongs to an earlier scheduler
         // invocation. The retry may emit no detail at all; that must stay
@@ -12196,11 +12512,12 @@ fn run_lane_with_env_retries(
             {
                 if let Some(detail) = validate_runtime::extract_node_detail(&log, &outcome.tag) {
                     let class = validate_runtime::environmental_block_class(&detail);
-                    stamp_attempt_detail(&mut attempts, &outcome.tag, class);
+                    let failure = validate_runtime::failure_class_from_detail(&detail);
+                    stamp_attempt_detail(&mut attempts, &outcome.tag, class, failure);
                     // Report exactly what was observed, without converting an
                     // environmental signature into an excuse for the terminal
                     // product failure. The attempt verdict remains RED.
-                    if env_retries == max && class.is_some() {
+                    if retry_rounds == max && class.is_some() {
                         if let Some(line) =
                             terminal_environmental_observation(&attempts, &outcome.tag)
                         {
@@ -12257,7 +12574,7 @@ fn run_lane_with_env_retries(
             .iter()
             .all(|outcome| outcome_execution(outcome) == AttemptExecution::Completed);
     let ok = outcomes.iter().all(|o| o.ok || o.aborted);
-    LaneResult { outcomes, skipped, attempts, complete, ok, env_retries, run_timed_out }
+    LaneResult { outcomes, skipped, attempts, complete, ok, retry_rounds, run_timed_out }
 }
 
 /// Print every node that took more than one attempt, and every attempt that
@@ -12275,8 +12592,14 @@ fn retry_attempt_line(
     let verdict = attempt_result(row).unwrap_or("unknown step result");
     let because = row
         .retry_class
-        .as_deref()
-        .map(|class| format!(" — retried because: {class}"))
+        .map(|class| {
+            let detail = row
+                .retry_detail
+                .as_deref()
+                .map(|value| format!(": {value}"))
+                .unwrap_or_default();
+            format!(" — retried because: {}{detail}", class.as_str())
+        })
         .unwrap_or_default();
     let detail = if row.reason.is_empty() {
         String::new()
@@ -12404,6 +12727,13 @@ fn outcome_hit_its_budget(outcome: &StepOutcome) -> bool {
 /// against producer output without building a whole `StepOutcome`.
 fn reason_is_budget_breach(reason: &str) -> bool {
     reason.starts_with(WALL_BUDGET_REASON_PREFIX) || reason.starts_with(CPU_BUDGET_REASON_PREFIX)
+}
+
+/// The OOM spelling is produced by dagrun's `step_failure_reason`. Keep the
+/// exact owned prefix beside the timeout predicate so a resource exhaustion is
+/// recorded as `no_result` without an outer reader interpreting prose.
+fn reason_is_oom(reason: &str) -> bool {
+    reason.starts_with("OOM-KILLED (hit inner MemoryMax;")
 }
 
 /// Pin the budget-breach predicate to the PRODUCER, not to a copy of its text.
@@ -12542,8 +12872,8 @@ struct LedgerCtx {
     /// the summary line.
     cpu_user: f64,
     cpu_sys: f64,
-    /// Retry ROUNDS spent on environmental blocks; `0` for a clean first pass.
-    env_block_retries: i64,
+    /// Retry ROUNDS executed for retry-eligible failures; `0` for a clean first pass.
+    retry_rounds: u64,
     /// Whether THIS run observed the `pre.reverie_pin` gate pass. Recorded on the
     /// row itself so a reader never has to infer from a bare `pass` that the
     /// archival pin was proved current; the receipt verifier keys on it.
@@ -13694,6 +14024,12 @@ fn ledger_gate(outcome: &StepOutcome) -> serde_json::Value {
         "aborted": outcome.aborted,
         "real_seconds": outcome.duration_s,
     });
+    if let Some(failure_class) = outcome_failure_class(outcome) {
+        gate["failure_class"] = serde_json::json!(failure_class);
+        if failure_class == FailureClass::NoResult && !outcome.reason.is_empty() {
+            gate["failure_detail"] = serde_json::json!(outcome.reason);
+        }
+    }
     set_gate_failure_evidence(&mut gate, outcome_is_failure(outcome));
     gate
 }
@@ -13710,7 +14046,7 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
     let node_attempts_raw: Vec<&NodeAttempt> =
         attempts.iter().filter(|attempt| attempt.tag == outcome.tag).collect();
     let first = node_attempts_raw.first().copied();
-    let latest = node_attempts_raw.last().copied();
+    let latest = terminal_attempt(outcome, attempts);
     let node_attempts: Vec<serde_json::Value> = node_attempts_raw
         .iter()
         .map(|a| {
@@ -13719,7 +14055,7 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
             let environmental_refuted_shape = assessment
                 .and_then(|(_, shape)| shape)
                 .map(validate_runtime::RefutedShape::as_str);
-            serde_json::json!({
+            let mut attempt = serde_json::json!({
                 "attempt": a.attempt,
                 // `null` is UNKNOWN and stays UNKNOWN: no completion payload
                 // arrived, which is not the same as a failure and must never be
@@ -13733,7 +14069,8 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
                 "real_seconds": a.reported.then_some(a.duration_s),
                 // Why this attempt was given another go. `null` on the last
                 // attempt of every node, since nothing followed it.
-                "retry_class": a.retry_class,
+                "retry_class": a.retry_class.map(RetryClass::as_str),
+                "retry_detail": a.retry_detail,
                 // Classification is only a hypothesis. These fields say whether
                 // a later actual execution confirmed/refuted it, or whether no
                 // such execution occurred.
@@ -13741,7 +14078,14 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
                 "environmental_detail_observed": a.detail_observed,
                 "environmental_verdict": environmental_verdict,
                 "environmental_refuted_shape": environmental_refuted_shape,
-            })
+            });
+            if let Some(failure_class) = a.failure_class {
+                attempt["failure_class"] = serde_json::json!(failure_class);
+            }
+            if let Some(failure_detail) = &a.failure_detail {
+                attempt["failure_detail"] = serde_json::json!(failure_detail);
+            }
+            attempt
         })
         .collect();
 
@@ -13760,6 +14104,20 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
         gate["reason"] = serde_json::json!(attempt.reason);
         gate["aborted"] = serde_json::json!(attempt.aborted);
         gate["real_seconds"] = serde_json::json!(attempt.reported.then_some(attempt.duration_s));
+        if let Some(failure_class) = attempt.failure_class {
+            gate["failure_class"] = serde_json::json!(failure_class);
+        } else {
+            gate.as_object_mut()
+                .expect("ledger gate must remain a JSON object")
+                .remove("failure_class");
+        }
+        if let Some(failure_detail) = &attempt.failure_detail {
+            gate["failure_detail"] = serde_json::json!(failure_detail);
+        } else {
+            gate.as_object_mut()
+                .expect("ledger gate must remain a JSON object")
+                .remove("failure_detail");
+        }
         set_gate_failure_evidence(&mut gate, attempt_is_failure(attempt));
     }
     gate["attempts"] = serde_json::json!(node_attempts);
@@ -13790,9 +14148,10 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
     let row = ledger_gate(&failed);
     if row["failure_origin"] != "outer_gate"
         || row["failed_substeps"] != serde_json::json!([])
+        || row["failure_class"] != "product_failure"
     {
         return Err(
-            "ledger gate origin: failed outer gate did not carry a known-empty substep list"
+            "ledger gate origin: failed outer gate did not carry its typed product class and known-empty substep list"
                 .into(),
         );
     }
@@ -13801,13 +14160,17 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
     passed.returncode = Some(0);
     passed.reason.clear();
     let row = ledger_gate(&passed);
-    if !row["failure_origin"].is_null() || row.get("failed_substeps").is_some() {
+    if !row["failure_origin"].is_null()
+        || row.get("failed_substeps").is_some()
+        || row.get("failure_class").is_some()
+    {
         return Err("ledger gate origin: passing gate claimed failure evidence".into());
     }
     let mut no_result = failed.clone();
     no_result.returncode = Some(NO_RESULT_EXIT_CODE);
     let row = ledger_gate(&no_result);
     if row["result"] != "no_result"
+        || row["failure_class"] != "no_result"
         || !row["failure_origin"].is_null()
         || row.get("failed_substeps").is_some()
     {
@@ -13930,8 +14293,43 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         "completed",
         true,
     )?;
+
+    for (label, detail, want_class, want_detail) in [
+        (
+            "infrastructure",
+            "error: failed to verify the checksum for `fixture v1.0.0`",
+            FailureClass::UnderstoodInfrastructureFailure,
+            "failed to verify the checksum",
+        ),
+        (
+            "prerequisite",
+            "prepare failed for language-runtimes/lua-random.sh\nno Lua interpreter on PATH",
+            FailureClass::UnderstoodPrerequisiteFailure,
+            " on path",
+        ),
+    ] {
+        let mut classified = reported_attempt(&failed, 1);
+        let environmental = validate_runtime::environmental_block_class(detail);
+        let failure = validate_runtime::failure_class_from_detail(detail);
+        stamp_attempt_detail(
+            std::slice::from_mut(&mut classified),
+            &failed.tag,
+            environmental,
+            failure,
+        );
+        let row = ledger_gate_with_attempts(&failed, std::slice::from_ref(&classified));
+        if row["failure_class"] != want_class.as_str()
+            || row["failure_detail"] != want_detail
+            || row["attempts"][0]["failure_class"] != want_class.as_str()
+            || row["attempts"][0]["failure_detail"] != want_detail
+        {
+            return Err(format!(
+                "ledger gate failure class: {label} was not written as a closed class plus detail: {row}"
+            ));
+        }
+    }
     println!(
-        "  ledger gate origin: fallback and latest-attempt failure evidence stayed typed"
+        "  ledger gate origin: fallback, terminal attempts, and failure classes stayed typed"
     );
     Ok(())
 }
@@ -14345,6 +14743,8 @@ fn no_result_propagation_bracket() -> Result<(), String> {
     let no_result_gate = ledger_gate_with_attempts(&no_result, std::slice::from_ref(&no_result_attempt));
     if no_result_gate["result"] != "no_result"
         || no_result_gate["attempts"][0]["result"] != "no_result"
+        || no_result_gate["failure_class"] != "no_result"
+        || no_result_gate["attempts"][0]["failure_class"] != "no_result"
         || !no_result_gate["failure_origin"].is_null()
         || no_result_gate.get("failed_substeps").is_some()
     {
@@ -14439,7 +14839,14 @@ fn write_ledger(
 ) {
     let (coverage_schema, coverage) = ledger_schema_and_coverage(coverage);
     let ledger_schema = ledger_schema_version(coverage_schema, cell_results);
-    let gates_run = outcomes.len();
+    // `gate_records` counts typed scheduler outcomes, including an explicit
+    // UNKNOWN record for a spawn/supervisor failure. `executed_nodes` counts
+    // only terminal attempts with a collected child exit status. The two must
+    // not share one integer: retaining an unknown row is required, but calling
+    // it executed would turn missing evidence into a measurement.
+    let gate_records = outcomes.len();
+    let executed_nodes = u64::try_from(completed_node_count(outcomes, attempts))
+        .expect("executed node count fits u64");
     let failures = outcomes.iter().filter(|o| outcome_is_failure(o)).count();
     let no_results = outcomes.iter().filter(|o| outcome_is_no_result(o)).count();
     // An operator stop learned nothing new about the product. Preserve the raw
@@ -14459,7 +14866,7 @@ fn write_ledger(
     // (`executed + intentionally skipped == expected`) then has to balance.
     // With nothing withheld this is byte-identical to what it has always been.
     let gates_expected = if ctx.profile == "full" && suite_complete {
-        serde_json::json!(gates_run + host_inapplicable.len())
+        serde_json::json!(gate_records + host_inapplicable.len())
     } else {
         serde_json::Value::Null
     };
@@ -14558,7 +14965,7 @@ fn write_ledger(
         "result": result,
         "raw_result": raw_result,
         "exit_code": exit_code,
-        "checks": gates_run,
+        "checks": gate_records,
         "failures": failures,
         "dag_jobs": ctx.dag_jobs,
         // Peak CPU-ACTIVE peer validates, and HOW that was established. `null`
@@ -14574,13 +14981,15 @@ fn write_ledger(
         // one; the pair can.
         "user_seconds": ctx.cpu_user,
         "sys_seconds": ctx.cpu_sys,
-        // Retry ROUNDS spent on environmental blocks. A green that only survived
-        // because the host was retried must be distinguishable from a first-pass
-        // green.
-        "env_block_retries": ctx.env_block_retries,
+        // Retry ROUNDS spent on retry-eligible failures. This is not the
+        // historical `env_block_retries` population: bound kills, measured
+        // instability, and always-eligible failures can all start a round now.
+        // A green that needed one must remain distinguishable from a first-pass
+        // green without calling every retry an environmental block.
+        "retry_rounds": ctx.retry_rounds,
         // WHICH nodes were retried, not merely how many rounds the lane spent.
-        // `env_block_retries` alone cannot answer "what flaked?", so a per-node
-        // rate was not computable from any row written before this field.
+        // A round count alone cannot answer "what flaked?", so a per-node rate
+        // was not computable from any row written before this field.
         "retried_nodes": retried_nodes,
         // Nodes that produced no completion payload on some attempt. Separate
         // from a failure on purpose: the run learned nothing about these, and
@@ -14595,7 +15004,7 @@ fn write_ledger(
         "executed_tests": ctx.executed_tests,
         "passed_tests": ctx.passed_tests,
         "filtered_tests": ctx.filtered_tests,
-        "gates_run": gates_run,
+        "gates_run": gate_records,
         "gates_expected": gates_expected,
         "skipped_nodes": skipped.len() + intentional_skipped_nodes.len(),
         // Typed pre-spawn omissions: nodes this MACHINE provably cannot run.
@@ -14623,7 +15032,7 @@ fn write_ledger(
         // and a ~47-NODE DAG run must never be readable as a 47-TEST pass. The
         // counted receipt consumes the explicit test fields above rather than
         // treating this node count as test evidence.
-        "executed_nodes": gates_run,
+        "executed_nodes": executed_nodes,
         // Exact outer plan identity. `profile=full` does not imply the nodes in
         // quick or super, so the receipt carries the names it actually planned
         // instead of asking readers to infer a set from the profile label.
@@ -14635,9 +15044,24 @@ fn write_ledger(
         "cell_results": cell_results.map(|results| &results.evidence),
         "gates": gates,
     });
-    if let Err(error) = serde_json::from_value::<HistoryRow>(record.clone()) {
+    let typed = match serde_json::from_value::<HistoryRow>(record.clone()) {
+        Ok(typed) => typed,
+        Err(error) => {
+            eprintln!(
+                "validate: warning: generated ledger row does not match the shared HistoryRow: {error}"
+            );
+            return;
+        }
+    };
+    if typed.retry_rounds() != Ok(Some(ctx.retry_rounds)) {
         eprintln!(
-            "validate: warning: generated ledger row does not match the shared HistoryRow: {error}"
+            "validate: warning: generated ledger row has malformed HistoryRow retry_rounds"
+        );
+        return;
+    }
+    if typed.executed_nodes() != Ok(Some(executed_nodes)) {
+        eprintln!(
+            "validate: warning: generated ledger row has malformed HistoryRow executed_nodes"
         );
         return;
     }
@@ -15114,13 +15538,14 @@ fn is_manifest_run_tag(cfg: &DagConfig, tag: &str) -> bool {
 
 fn retry_candidate_tags(
     cfg: &DagConfig,
-    blocked: &[(String, String)],
+    blocked: &[(String, RetryClass, Option<String>)],
     skipped: &[String],
     by_tag: &BTreeMap<String, StepOutcome>,
     latest_unreported: &BTreeSet<String>,
     attempts: &[NodeAttempt],
 ) -> BTreeSet<String> {
-    let mut keep: BTreeSet<String> = blocked.iter().map(|(tag, _)| tag.clone()).collect();
+    let mut keep: BTreeSet<String> =
+        blocked.iter().map(|(tag, _, _)| tag.clone()).collect();
     keep.extend(skipped.iter().cloned());
     keep.extend(by_tag.values().filter(|outcome| outcome.aborted).map(|outcome| outcome.tag.clone()));
     keep.extend(unreported_non_intentional_steps(cfg, by_tag, skipped));
@@ -15142,7 +15567,7 @@ const SUMMARY_FLAKY_HEADING: &str =
 struct TestIdRetry {
     node: String,
     id: String,
-    retry_classes: Vec<String>,
+    retry_classes: Vec<RetryClass>,
     inner_retry_occurrences: usize,
 }
 
@@ -15186,11 +15611,12 @@ fn summary_id_list(ids: &[String]) -> Vec<String> {
 /// else did. A retry count built from that field is roughly 5x too high, and it
 /// looks entirely reasonable, which is why nothing would catch it. `retry_class`
 /// is set only on an attempt for which a retry was actually GRANTED, per node,
-/// and carries the reason in the words the retry line printed.
+/// and carries the closed class the retry line printed. Changing evidence is
+/// retained separately on the attempt as `retry_detail`.
 fn retry_classes_for_test(
     observations: &[TestAttemptObservation],
     attempts: &[NodeAttempt],
-) -> Vec<String> {
+) -> Vec<RetryClass> {
     observations
         .iter()
         .filter(|observation| !observation.passed)
@@ -15200,14 +15626,14 @@ fn retry_classes_for_test(
                 .find(|attempt| {
                     attempt.tag == observation.node && attempt.attempt == observation.attempt
                 })
-                .and_then(|attempt| attempt.retry_class.clone());
+                .and_then(|attempt| attempt.retry_class);
             outer_class.or_else(|| {
                 observations
                     .iter()
                     .any(|later| {
                         later.node == observation.node && later.attempt > observation.attempt
                     })
-                    .then(|| "always-eligible".to_string())
+                    .then_some(RetryClass::AlwaysEligible)
             })
         })
         .collect()
@@ -15432,8 +15858,12 @@ fn test_id_summary(
     failed_nodes: &BTreeSet<String>,
 ) -> TestIdSummary {
     observations.sort_by(|left, right| {
-        (&left.id, left.attempt, &left.node).cmp(&(&right.id, right.attempt, &right.node))
+        (&left.node, &left.id, left.attempt).cmp(&(&right.node, &right.id, right.attempt))
     });
+    // A test id is only unique inside the DAG node that executed it. Grouping
+    // solely by id lets a passing peer node replace a failing node's terminal
+    // observation (or vice versa) according to lexical node order. Keep the
+    // producer's complete identity through classification and rendering.
     let mut by_node_and_id: BTreeMap<(String, String), Vec<TestAttemptObservation>> =
         BTreeMap::new();
     for observation in observations {
@@ -15486,11 +15916,19 @@ fn render_test_id_retry(item: &TestIdRetry) -> String {
     let classes = if item.retry_classes.is_empty() {
         String::new()
     } else {
-        format!(": {}", item.retry_classes.join("; "))
+        format!(
+            ": {}",
+            item.retry_classes
+                .iter()
+                .map(|class| class.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
     };
     format!(
-        "{}  ({retries} retr{}{})",
+        "{} (node {})  ({retries} retr{}{})",
         item.id,
+        item.node,
         if retries == 1 { "y" } else { "ies" },
         classes
     )
@@ -17105,7 +17543,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let mut attempts: Vec<NodeAttempt> = Vec::new();
     let mut ok = true;
     let mut execution_complete = true;
-    let mut env_retries = 0usize;
+    let mut retry_rounds = 0usize;
 
     // Read once per invocation, so both lanes apply the same policy and the run
     // can name the registry it used. An unreachable registry is an empty map,
@@ -17127,7 +17565,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // from the same allowance rather than each receiving a fresh 600 seconds.
     let deadline = deadline_ns;
     let lane = |cfg: &DagConfig| -> LaneResult {
-        run_lane_with_env_retries(
+        run_lane_with_retries(
             cfg,
             jobs,
             keep_going,
@@ -17148,7 +17586,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     attempts.extend(r.attempts.iter().cloned());
     ok = ok && r.ok;
     execution_complete = execution_complete && r.complete;
-    env_retries += r.env_retries;
+    retry_rounds += r.retry_rounds;
     run_timed_out = run_timed_out || r.run_timed_out;
 
     if let Some(second) = &plan.second {
@@ -17161,7 +17599,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         attempts.extend(r2.attempts.iter().cloned());
         ok = ok && r2.ok;
         execution_complete = execution_complete && r2.complete;
-        env_retries += r2.env_retries;
+        retry_rounds += r2.retry_rounds;
         run_timed_out = run_timed_out || r2.run_timed_out;
     }
 
@@ -17277,7 +17715,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         interruption: interruption.clone(),
         cpu_user,
         cpu_sys,
-        env_block_retries: env_retries as i64,
+        retry_rounds: u64::try_from(retry_rounds).expect("retry round count fits u64"),
         executed_tests,
         passed_tests,
         filtered_tests,
@@ -17343,10 +17781,11 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             &plan.profile,
             detail,
         );
-        s.nodes_executed = outcomes.len();
+        s.nodes_executed = completed_node_count(&outcomes, &attempts);
         s.nodes_failed = outcomes.iter().filter(|o| outcome_is_failure(o)).count();
         s.nodes_skipped = skipped.len();
         s.nodes_host_inapplicable = plan.host_inapplicable.len();
+        s.executed_tests = executed_tests;
         s.selection_mode = Some(plan.selection_mode.into());
         s.wall_s = Some(wall);
         s.jobs = Some(jobs);
@@ -17361,12 +17800,14 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
 
     // Compatibility ratchet, evaluated from typed outcomes.
     let mut compat_blocking = 0usize;
+    let mut compat_nonblocking = BTreeSet::new();
     // Carried to the verdict: a compat profile that measured nothing must not be
     // able to reach PASS through an empty set of failing rows.
     let mut compat_measured: Option<usize> = None;
     if let Some(mode) = plan.compat {
-        let (passed, measured, blocking) = print_compat_summary(mode, &outcomes);
+        let (passed, measured, blocking, nonblocking) = print_compat_summary(mode, &outcomes);
         compat_blocking = blocking.len();
+        compat_nonblocking = nonblocking;
         compat_measured = Some(measured);
         let floor = match mode {
             CompatMode::Sabre => Some(validate_corpus::SABRE_COMPAT_EXPECTED),
@@ -17387,11 +17828,13 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     }
 
     // Super stress pass rates, from typed outcomes rather than a scraped report.
-    let mut super_blocking = 0usize;
     if plan.super_mode {
         let reps = validate_super::repetitions();
         let rates = validate_super::stress_rates(&outcomes, reps);
-        super_blocking = validate_super::stress_verdict(&rates, reps, jobs, host_cpus);
+        // This is a per-PROBE display summary. The failed repetition nodes are
+        // already in `blocking_failures`, so the grouped count must not be added
+        // to the final node count.
+        validate_super::stress_verdict(&rates, reps, jobs, host_cpus);
     }
 
     // Working-envelope vector: score, emit JSON, print the human summary, and
@@ -17453,13 +17896,17 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                 && !plan.nonblocking.contains(&o.tag)
         })
         .count();
-    let effective_failures = if plan.compat.is_some() {
-        compat_blocking + structural_failures
-    } else if plan.super_mode {
-        blocking_failures + super_blocking
-    } else {
-        blocking_failures
-    };
+    let effective_failures = effective_failure_count(
+        plan.compat,
+        blocking_failures,
+        compat_blocking,
+        structural_failures,
+    );
+    let summary_nonblocking: BTreeSet<String> = plan
+        .nonblocking
+        .union(&compat_nonblocking)
+        .cloned()
+        .collect();
     // `ok` from the runner reflects every node, including the nonblocking ones,
     // so it is only authoritative when nothing is excused. A known exit 75
     // fully explains why the runner returned non-ok; any other unexplained
@@ -17771,7 +18218,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // The completed-run summary. Names the excused rows explicitly, so a green
     // verdict that ignored some failures can never read as "everything passed".
     let mut detail = Vec::new();
-    let excused = failures - blocking_failures;
+    let excused = failures.saturating_sub(effective_failures);
     if exit_code == 0 {
         detail.push(format!("every blocking gate passed ({} node(s) ran)", outcomes.len()));
     } else if exit_code == NO_RESULT_EXIT_CODE as u8 {
@@ -17781,7 +18228,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             no_result_nodes.join(", ")
         ));
     } else {
-        let (_named, listing) = blocking_listing(&outcomes, &plan.nonblocking, effective_failures);
+        let (_named, listing) =
+            blocking_listing(&outcomes, &summary_nonblocking, effective_failures);
         detail.push(format!("{effective_failures} blocking failure(s){listing}"));
     }
     if exit_code != NO_RESULT_EXIT_CODE as u8 && no_results > 0 {
@@ -17853,9 +18301,9 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                 .into(),
         );
     }
-    if env_retries > 0 {
+    if retry_rounds > 0 {
         detail.push(format!(
-            "{env_retries} retry round(s) were spent on retry-eligible failures; the per-attempt \
+            "{retry_rounds} retry round(s) were spent on retry-eligible failures; the per-attempt \
              ledger says whether each environmental classification was confirmed, refuted, or \
              left unconfirmed. This verdict did NOT pass on the first attempt"
         ));
@@ -17892,7 +18340,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         &plan.profile,
         detail,
     );
-    s.nodes_executed = outcomes.len();
+    s.nodes_executed = completed_node_count(&outcomes, &attempts);
     s.nodes_failed = failures;
     s.flaky = test_summary.recovered;
     s.failed_ids = test_summary.failed;
@@ -18031,7 +18479,7 @@ fn stop_test_seam(
         interruption: interruption.clone(),
         cpu_user,
         cpu_sys,
-        env_block_retries: 0,
+        retry_rounds: 0,
         executed_tests: None,
         passed_tests: None,
         filtered_tests: None,
@@ -18094,7 +18542,7 @@ fn stop_test_seam(
         profile,
         detail,
     );
-    s.nodes_executed = outcomes.len();
+    s.nodes_executed = completed_node_count(&outcomes, &[]);
     s.nodes_failed = outcomes.iter().filter(|o| !o.ok).count();
     s.wall_s = Some(wall);
     s.cpu_wall = Some((wall, cpu_user, cpu_sys));
@@ -18203,6 +18651,18 @@ mod e2e_attempt_tests {
             ),
             &ordinary_tag,
             "reported failure/blocked",
+        );
+        assert_eq!(
+            validation_step_identity(&relabelled),
+            ValidationStepIdentity::Other
+        );
+        relabelled.manifest = Some(DagManifest {
+            lane: "portable".into(),
+            category: "applications".into(),
+        });
+        assert_eq!(
+            validation_step_identity(&relabelled),
+            ValidationStepIdentity::ManifestRun
         );
 
         assert_only_ordinary(

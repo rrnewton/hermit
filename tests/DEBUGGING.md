@@ -697,7 +697,9 @@ For a new run, classify each exact `BINARY$TEST` ID by all of its attempt
 verdicts. Do not use the last verdict, and do not count nextest's repeated
 failure recap as another attempt. Retry occurrence counts come from non-null
 `attempts[].retry_class`, not `retried_nodes`, because `retried_nodes` includes
-peer nodes rerun with a failing node.
+peer nodes rerun with a failing node. Treat `retry_class` as the grouping key;
+changing evidence such as a measured pass/fail sample is in the adjacent
+`retry_detail` field.
 
 When a current full validate can pass `pre.reverie_pin`, replace the focused
 28-ID result with a full-population classification. Preserve the host, kernel,
