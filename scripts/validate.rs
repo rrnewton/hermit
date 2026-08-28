@@ -10026,7 +10026,9 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         e2e_green.wall_s = Some(0.0);
         e2e_green.nodes_executed = 1;
         let e2e_rendered = run_summary_lines(&e2e_green, std::time::Instant::now()).join("\n");
-        if !e2e_rendered.contains("applications/example [ptrace/verify]  (1 retry")
+        if !e2e_rendered.contains(
+            "applications/example [ptrace/verify] (node e2e.manifest_applications)  (1 retry",
+        )
             || !e2e_rendered
                 .contains("retries: 1 occurrence(s) recorded from scheduler and per-cell attempts")
         {
@@ -10053,6 +10055,43 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             ));
         }
 
+        // One test id can be emitted by more than one DAG node. The node is
+        // part of the producer's identity, so a passing peer must never erase a
+        // failing node merely because its tag sorts later. Exercise both lexical
+        // orders: the old id-only grouping failed one of these two cases.
+        for (failing_node, passing_node) in [("a.fail", "z.pass"), ("z.fail", "a.pass")] {
+            let shared_id = "shared::binary$same_test";
+            let peer_summary = test_id_summary(
+                vec![
+                    TestAttemptObservation {
+                        node: failing_node.into(),
+                        attempt: 1,
+                        id: shared_id.into(),
+                        passed: false,
+                    },
+                    TestAttemptObservation {
+                        node: passing_node.into(),
+                        attempt: 1,
+                        id: shared_id.into(),
+                        passed: true,
+                    },
+                ],
+                &[],
+                &BTreeSet::from([failing_node.to_string()]),
+            );
+            if peer_summary.failed.len() != 1
+                || peer_summary.failed[0].node != failing_node
+                || peer_summary.failed[0].id != shared_id
+                || !peer_summary.recovered.is_empty()
+                || !peer_summary.failed_nodes_without_test_ids.is_empty()
+            {
+                return Err(format!(
+                    "end-of-run summary: test id {shared_id} from peer node {passing_node} changed \
+                     the terminal result for failing node {failing_node}: {peer_summary:?}"
+                ));
+            }
+        }
+
         let mut red = RunSummary::new(Verdict::Fail, 1, "self-test", Vec::new());
         red.flaky = split.recovered.clone();
         red.failed_ids = split.failed.clone();
@@ -10063,8 +10102,12 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         if !red_rendered.contains(SUMMARY_FLAKY_HEADING)
             || !red_rendered.contains("1 test id(s) recovered")
             || !red_rendered.contains("1 test id(s) failed and did NOT recover")
-            || !red_rendered.contains("hermit::fixture$recovered_on_retry  (1 retry")
-            || !red_rendered.contains("hermit::fixture$hard_failure  (1 retry")
+            || !red_rendered.contains(
+                "hermit::fixture$recovered_on_retry (node fixture.environmental)  (1 retry",
+            )
+            || !red_rendered.contains(
+                "hermit::fixture$hard_failure (node fixture.environmental)  (1 retry",
+            )
             || !red_rendered.contains(
                 "retries: 1 occurrence(s) recorded from scheduler and per-cell attempts",
             )
@@ -14167,6 +14210,7 @@ const SUMMARY_FLAKY_HEADING: &str =
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TestIdRetry {
+    node: String,
     id: String,
     retry_classes: Vec<RetryClass>,
 }
@@ -14470,22 +14514,30 @@ fn test_id_summary(
     failed_nodes: &BTreeSet<String>,
 ) -> TestIdSummary {
     observations.sort_by(|left, right| {
-        (&left.id, left.attempt, &left.node).cmp(&(&right.id, right.attempt, &right.node))
+        (&left.node, &left.id, left.attempt).cmp(&(&right.node, &right.id, right.attempt))
     });
-    let mut by_id: BTreeMap<String, Vec<TestAttemptObservation>> = BTreeMap::new();
+    // A test id is only unique inside the DAG node that executed it. Grouping
+    // solely by id lets a passing peer node replace a failing node's terminal
+    // observation (or vice versa) according to lexical node order. Keep the
+    // producer's complete identity through classification and rendering.
+    let mut by_node_and_id: BTreeMap<(String, String), Vec<TestAttemptObservation>> =
+        BTreeMap::new();
     for observation in observations {
-        by_id.entry(observation.id.clone()).or_default().push(observation);
+        by_node_and_id
+            .entry((observation.node.clone(), observation.id.clone()))
+            .or_default()
+            .push(observation);
     }
     let mut recovered = Vec::new();
     let mut failed = Vec::new();
     let mut failed_nodes_with_test_ids = BTreeSet::new();
     let mut inner_retry_occurrences = 0;
-    for (id, observations) in by_id {
+    for ((node, id), observations) in by_node_and_id {
         let Some(last) = observations.last() else { continue };
         inner_retry_occurrences += inner_retry_occurrences_for_test(&observations, attempts);
         let retry_classes = retry_classes_for_test(&observations, attempts);
         let was_retried = !retry_classes.is_empty();
-        let item = TestIdRetry { id, retry_classes };
+        let item = TestIdRetry { node, id, retry_classes };
         if last.passed {
             if was_retried {
                 recovered.push(item);
@@ -14522,8 +14574,9 @@ fn render_test_id_retry(item: &TestIdRetry) -> String {
         )
     };
     format!(
-        "{}  ({retries} retr{}{})",
+        "{} (node {})  ({retries} retr{}{})",
         item.id,
+        item.node,
         if retries == 1 { "y" } else { "ies" },
         classes
     )
