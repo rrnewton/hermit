@@ -558,14 +558,41 @@ mod tests {
         }
     }
 
+    /// ⚠️ THIS PIN CHANGED SHAPE WHEN THE BEHAVIOUR IT NAMED WAS REMOVED, AND IT
+    /// WAS MADE STRICTER RATHER THAN DELETED.
+    ///
+    /// It used to require `hermit-cli/tests/liteinst_advanced.rs` to contain the
+    /// literal `Some(HERMIT_INTERNAL_FAILURE_EXIT)`, because the LiteInst clone
+    /// boundary made that file assert a hermit-internal failure and the number
+    /// had been written as a bare literal. Reverie now follows `clone`,
+    /// `clone3` and `fork` under the LiteInst hybrid, so those tests assert the
+    /// guest's own success instead and the file has no hermit exit class left to
+    /// name. The old assertion pinned a premise that no longer holds.
+    ///
+    /// What the pin was buying survives here, and is TIGHTER than the
+    /// repository-wide scan below rather than a relaxation of it: that scan
+    /// refuses an UNDECLARED colliding integer, so a declaration comment would
+    /// let `Some(125)` back into this file. This refuses the literal outright,
+    /// declared or not, which is exactly the stricter rule the file-specific pin
+    /// existed to apply. Naming the constant still satisfies it, because the
+    /// constant is not a literal.
+    ///
+    /// ⚠️ AND THIS TEST IS WHY THAT MATTERS. It is a consumer of the LiteInst
+    /// clone boundary that names the file BY PATH and the contract BY A STRING,
+    /// not by any identifier in it. An enumeration of the boundary's consumers
+    /// done by searching for the test and helper NAMES being renamed found nine
+    /// places and missed this one; the gate caught it. Search for the behaviour,
+    /// not only the symbol.
     #[test]
-    fn liteinst_clone_boundary_names_the_hermit_exit_class() {
+    fn liteinst_advanced_spells_no_reserved_exit_code_as_a_literal() {
         let file = "hermit-cli/tests/liteinst_advanced.rs";
         let body = include_str!("../hermit-cli/tests/liteinst_advanced.rs");
-        assert!(
-            body.contains("Some(HERMIT_INTERNAL_FAILURE_EXIT)"),
-            "the measured LiteInst clone-boundary failure must use Hermit's named exit constant"
-        );
+        for (value, meaning) in COLLIDING {
+            assert!(
+                !body.contains(&format!("Some({value})")),
+                "{file} writes Some({value}) as a literal -- {meaning}"
+            );
+        }
         assert!(
             scan_text(file, &body).is_empty(),
             "LiteInst advanced tests contain an undeclared colliding exit status"

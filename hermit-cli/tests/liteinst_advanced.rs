@@ -24,7 +24,6 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
-
 static LITEINST_ADVANCED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_COMPAT_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
