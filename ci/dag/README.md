@@ -93,10 +93,12 @@ The current relationships are:
   commands, and the hosted environment also exports `-D warnings`. Every
   constructed nextest step uses `ci/run-nextest-counted.sh`, so zero executed
   tests are refused in both places.
-- **Deliberately different:** local full validation runs independent steps with
-  a host-derived outer width capped at 16. Each hosted group uses outer width 1,
-  while separate GitHub jobs supply the outer parallelism. Hosted execution
-  therefore does not reproduce contention between local DAG nodes.
+- **Same policy, different host capacity:** local full validation and hosted
+  selected runs both use `validate`'s host-derived outer width (`host_cpus/8`,
+  floored at 2 and capped at 16) unless an operator supplies an explicit
+  override. The measured 316-CPU development host therefore selects 16 while a
+  typical 4-CPU GitHub runner selects 2; that difference follows from the same
+  committed policy rather than a second hosted default.
 - **Deliberately different:** local validation fails closed unless it establishes
   its two-level cgroup-v2 boxing. GitHub-hosted runners do not provide the needed
   delegated systemd user scope, so selected diagnostic runs explicitly permit an
