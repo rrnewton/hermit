@@ -264,9 +264,9 @@ test:
       verify:
         ci: true
         timeout_seconds:
-          ptrace: 30
+          ptrace: 60
         slow_reason:
-          ptrace: Current hermetic validation timed out at 14.621 and 14.627 seconds after reaching the second verification run; retained passing runs measured 14.612 and 21.323 seconds, so 30 seconds restores bounded headroom.
+          ptrace: Full validation run 1538 hit the 30-second bound twice at 29.523 and 29.642 seconds; the second attempt had already compared 164,894 INFO messages with no substantive differences but was terminated before publishing the verdict. The prior full-run pass took 29.315 seconds, so 60 seconds restores measured headroom without weakening canonical comparison.
         backends_enabled:
           - ptrace
         backends_disabled:
