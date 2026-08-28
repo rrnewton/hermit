@@ -680,6 +680,71 @@ fn git_dirs_are_primary(dir: &str, common: &str) -> bool {
     dir == common
 }
 
+/// Resolve the primary checkout that owns `root` for the self-test below.
+///
+/// Most linked worktrees have a common directory spelled `<primary>/.git`, so
+/// its parent is the primary checkout. A submodule initialized inside a linked
+/// outer worktree is different: its common directory lives below the outer
+/// repository's Git metadata, and `core.worktree` points back to the submodule
+/// checkout. A validation worktree created from that submodule inherits the
+/// same common directory. Read the configured worktree when one exists instead
+/// of treating a Git metadata parent as a checkout.
+fn primary_checkout_for_self_test(root: &Path) -> Result<PathBuf, String> {
+    let dir = git(root, &["rev-parse", "--absolute-git-dir"])?;
+    let common = git(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    if git_dirs_are_primary(&dir, &common) {
+        return root.canonicalize().map_err(|e| {
+            format!(
+                "cannot canonicalize primary checkout {}: {e}",
+                root.display()
+            )
+        });
+    }
+
+    let configured_worktree = Command::new("git")
+        .current_dir(root)
+        .args(["config", "--path", "--get", "core.worktree"])
+        .output()
+        .map_err(|e| format!("could not read core.worktree: {e}"))?;
+    let common = PathBuf::from(common);
+    let candidate = match configured_worktree.status.code() {
+        Some(0) => {
+            let configured = PathBuf::from(
+                String::from_utf8_lossy(&configured_worktree.stdout)
+                    .trim()
+                    .to_string(),
+            );
+            if configured.is_absolute() {
+                configured
+            } else {
+                common.join(configured)
+            }
+        }
+        Some(1) => common.parent().map(Path::to_path_buf).ok_or_else(|| {
+            format!(
+                "common Git directory {} has no parent from which to resolve the primary checkout",
+                common.display()
+            )
+        })?,
+        _ => {
+            return Err(format!(
+                "git config --path --get core.worktree exited {:?}: {}",
+                configured_worktree.status.code(),
+                String::from_utf8_lossy(&configured_worktree.stderr).trim()
+            ));
+        }
+    };
+    candidate.canonicalize().map_err(|e| {
+        format!(
+            "cannot canonicalize resolved primary checkout {}: {e}",
+            candidate.display()
+        )
+    })
+}
+
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     let out = Command::new("git")
         .current_dir(root)
@@ -1307,43 +1372,26 @@ fn self_test() -> i32 {
             bad.push("the shared-primary guard must NOT reject unequal worktree directories".into());
         }
 
-        // Exercise the checkout we are actually running from. A nested submodule
-        // checkout may have an absolute git-dir equal to its common-dir even when
-        // that directory lives under the OUTER repository's `.git/worktrees/`.
-        // Therefore `common.parent()` is not unconditionally a worktree path: in
-        // that layout it is merely a Git metadata directory. Compare Git's two
-        // answers first, then inspect a derived primary worktree only when Git says
-        // the current checkout is linked.
+        // Exercise the checkout we are actually running from and the primary
+        // checkout that owns it. This covers a canonical checkout, an ordinary
+        // linked worktree, a submodule inside an outer linked worktree, and a
+        // validation worktree created from that submodule.
         let here = repo_root();
-        let dir = git(&here, &["rev-parse", "--absolute-git-dir"]);
-        let common = git(
-            &here,
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        );
-        if let (Ok(dir), Ok(common)) = (dir, common) {
-            let current_is_primary = git_dirs_are_primary(&dir, &common);
-            if is_primary_checkout(&here) != current_is_primary {
-                bad.push("the shared-primary guard must agree with Git for this checkout".into());
-            }
-            if !current_is_primary {
-                // For an ordinary linked worktree, `<primary>/.git` is the common
-                // directory and its parent is the primary checkout. Do not take
-                // this branch for a nested submodule whose own git-dir IS its
-                // common-dir even though both live under an outer worktree.
-                if let Some(primary) = Path::new(&common).parent() {
-                    if !is_primary_checkout(primary) {
-                        bad.push(
-                            "the shared-primary guard must RECOGNISE the primary checkout".into(),
-                        );
-                    }
-                    if is_primary_checkout(&here) {
-                        bad.push(
-                            "control: the shared-primary guard must NOT fire in a linked worktree"
-                                .into(),
-                        );
-                    }
+        match primary_checkout_for_self_test(&here) {
+            Ok(primary) => {
+                if !is_primary_checkout(&primary) {
+                    bad.push("the shared-primary guard must RECOGNISE the primary checkout".into());
+                }
+                if here != primary && is_primary_checkout(&here) {
+                    bad.push(
+                        "control: the shared-primary guard must NOT fire in a linked worktree"
+                            .into(),
+                    );
                 }
             }
+            Err(error) => bad.push(format!(
+                "the self-test must resolve the primary checkout: {error}"
+            )),
         }
         // ⚠️ AND FAIL SAFE: an unreadable repository must READ AS the primary, so a
         // broken git refuses rather than silently disarming the guard.
@@ -1741,6 +1789,55 @@ esac
         }
     }
 
+    struct CheckoutFixture {
+        root: PathBuf,
+    }
+
+    impl CheckoutFixture {
+        fn new(label: &str) -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before Unix epoch")
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "bisect-probe-{label}-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&root).expect("create checkout fixture root");
+            Self { root }
+        }
+
+        fn git(&self, root: &Path, args: &[&str]) -> String {
+            git(root, args).unwrap_or_else(|error| {
+                panic!(
+                    "git {} in {} failed: {error}",
+                    args.join(" "),
+                    root.display()
+                )
+            })
+        }
+
+        fn init_repository(&self, root: &Path) {
+            fs::create_dir_all(root).expect("create fixture repository");
+            self.git(root, &["init", "-q"]);
+            self.git(
+                root,
+                &["config", "user.email", "bisect-probe@example.invalid"],
+            );
+            self.git(root, &["config", "user.name", "bisect-probe test"]);
+            self.git(root, &["config", "core.hooksPath", "/dev/null"]);
+            fs::write(root.join("seed"), "seed\n").expect("write fixture seed");
+            self.git(root, &["add", "seed"]);
+            self.git(root, &["commit", "-q", "-m", "seed"]);
+        }
+    }
+
+    impl Drop for CheckoutFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
     fn ids(list: &[&str]) -> BTreeSet<String> {
         list.iter().map(|s| s.to_string()).collect()
     }
@@ -1897,6 +1994,94 @@ esac
             "/repo/.git/worktrees/review",
             "/repo/.git"
         ));
+    }
+
+    #[test]
+    fn primary_checkout_resolution_handles_a_linked_worktree_from_a_nested_submodule() {
+        let fixture = CheckoutFixture::new("nested-submodule-worktree");
+        let source = fixture.root.join("source");
+        fixture.init_repository(&source);
+
+        let outer = fixture.root.join("outer");
+        fixture.init_repository(&outer);
+        fixture.git(
+            &outer,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--quiet",
+                source.to_str().expect("source path is UTF-8"),
+                "hermit",
+            ],
+        );
+        fixture.git(&outer, &["commit", "-q", "-am", "add submodule"]);
+
+        let outer_worktree = fixture.root.join("outer-worktree");
+        fixture.git(
+            &outer,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                outer_worktree
+                    .to_str()
+                    .expect("outer worktree path is UTF-8"),
+                "HEAD",
+            ],
+        );
+        fixture.git(
+            &outer_worktree,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+                "--checkout",
+                "hermit",
+            ],
+        );
+
+        let nested = outer_worktree.join("hermit");
+        let validation = fixture.root.join("validation-worktree");
+        fixture.git(
+            &nested,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                validation
+                    .to_str()
+                    .expect("validation worktree path is UTF-8"),
+                "HEAD",
+            ],
+        );
+
+        let canonical_source = source.canonicalize().expect("canonicalize source checkout");
+        let canonical_nested = nested
+            .canonicalize()
+            .expect("canonicalize nested submodule checkout");
+        assert!(is_primary_checkout(&canonical_source));
+        assert_eq!(
+            primary_checkout_for_self_test(&canonical_source).expect("resolve source checkout"),
+            canonical_source
+        );
+        assert!(is_primary_checkout(&canonical_nested));
+        assert_eq!(
+            primary_checkout_for_self_test(&canonical_nested)
+                .expect("resolve nested submodule checkout"),
+            canonical_nested
+        );
+        assert!(!is_primary_checkout(&validation));
+        assert_eq!(
+            primary_checkout_for_self_test(&validation)
+                .expect("resolve nested submodule primary checkout"),
+            canonical_nested
+        );
     }
 
     #[test]
