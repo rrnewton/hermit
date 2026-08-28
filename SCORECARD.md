@@ -71,14 +71,14 @@ Ordinary full validation executes 307 selected regression cells: the 304 green c
 
 The table above reports status. This table reports the separate `measurement` field derived from observations stored in `ci/compat-envelope/cells.json`; it does not change status or which cells ordinary validation selects. Retained history that has not been imported is not counted here. A stored measurement does not establish that it describes current code; `show` reports whether the recorded last test still matches `HEAD:detcore`.
 
-The count table includes all **5744** tracked cells; no row is omitted. The current green/`never-measured` count is **1**, and the current red/`measured-and-passed` count is **2**. These values use the same counts printed in the table below.
+The count table includes all **5744** tracked cells; no row is omitted. The current green/`never-measured` count is **0**, and the current red/`measured-and-passed` count is **2**. These values use the same counts printed in the table below.
 
 | Status | `never-measured` | `measured-and-passed` | `measured-no-verdict` | `diverged-unlocated` | `diverged` | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `green` | 1 | 300 | 0 | 3 | 0 | 304 |
+| `green` | 0 | 301 | 0 | 3 | 0 | 304 |
 | `red` | 362 | 2 | 0 | 0 | 8 | 372 |
 | `not-applicable` | 5067 | 0 | 0 | 0 | 1 | 5068 |
-| **Total** | **5430** | **302** | **0** | **3** | **9** | **5744** |
+| **Total** | **5429** | **303** | **0** | **3** | **9** | **5744** |
 
 Cells whose stored `measurement` is not `never-measured` are shown individually so status and measurement remain visible together.
 
@@ -96,6 +96,7 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `backend-parity-c/close-range-fds` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/copy-file-range-refusal` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/cwd-roundtrip` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `backend-parity-c/environment-and-workdir` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/epoll-pwait2` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/epoll-readiness` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/event-delivery-ordering` | `verify` | `ptrace` | `green` | `measured-and-passed` |
