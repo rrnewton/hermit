@@ -3372,6 +3372,7 @@ fn super_plan_bracket() -> Result<(), String> {
             cmd: "true".into(),
             cmdtype: CmdType::Unknown,
             manifest: None,
+            integration_test_binaries: None,
             deps: vec![],
             env: BTreeMap::new(),
             hint: Default::default(),
@@ -6489,6 +6490,7 @@ fn step_with_caps(
         cmd,
         cmdtype: CmdType::Unknown,
         manifest: None,
+        integration_test_binaries: None,
         deps,
         env: BTreeMap::new(),
         hint: dagrun::model::ResourceHint {
@@ -7387,6 +7389,7 @@ fn host_capability_bracket(root: &Path) -> Result<(), String> {
         cmd: "true".into(),
         cmdtype: CmdType::Unknown,
         manifest: None,
+        integration_test_binaries: None,
         deps,
         env: BTreeMap::new(),
         hint: dagrun::model::ResourceHint::default(),

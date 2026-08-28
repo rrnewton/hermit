@@ -28,7 +28,9 @@ class RegistrationAuditTest(unittest.TestCase):
         # Nested helpers are tracked source, but not top-level Cargo test targets.
         (self.root / "hermit-cli/tests/common/mod.rs").write_text("pub fn helper() {}\n")
         (self.root / "ci/dag/portable.json").write_text(
-            '{"steps":[{"cmd":"cargo test -p hermit --test registered"}]}\n'
+            '{"steps":[{"group":"test","job":"registered",'
+            '"cmd":"cargo test -p hermit --test registered",'
+            '"integration_test_binaries":["registered"]}]}\n'
         )
         (self.root / "ci/undeclared-test-binaries.tsv").write_text(
             "unknown\tnone-recorded\tNo omission reason was recorded.\n"
@@ -109,50 +111,75 @@ class RegistrationAuditTest(unittest.TestCase):
     # a command that never runs.
     # ------------------------------------------------------------------
 
-    def _plant_probe_with_dag_command(self, command: str) -> subprocess.CompletedProcess[str]:
+    def _plant_probe_with_dag_command(
+        self, command: str, *, declared: list[str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
         probe = self.root / "hermit-cli/tests/zz_probe.rs"
         probe.write_text("#[test]\nfn probe() {}\n")
+        probe_step: dict[str, object] = {
+            "group": "test",
+            "job": "probe",
+            "cmd": command,
+        }
+        if declared is not None:
+            probe_step["integration_test_binaries"] = declared
         (self.root / "ci/dag/portable.json").write_text(
-            '{"steps":[{"cmd":"cargo test -p hermit --test registered"},'
-            f'{{"cmd":{command!r}}}]}}\n'.replace("'", '"')
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "group": "test",
+                            "job": "registered",
+                            "cmd": "cargo test -p hermit --test registered",
+                            "integration_test_binaries": ["registered"],
+                        },
+                        probe_step,
+                    ]
+                }
+            )
+            + "\n"
         )
         subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
         return self.audit()
 
     def test_echoed_invocation_does_not_register_a_binary(self) -> None:
         result = self._plant_probe_with_dag_command(
-            "echo cargo test -p hermit --test zz_probe"
+            "echo cargo test -p hermit --test zz_probe", declared=["zz_probe"]
         )
         self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertIn("zz_probe", result.stderr)
+        self.assertIn("integration_test_binaries", result.stderr)
 
     def test_no_run_invocation_does_not_register_a_binary(self) -> None:
         result = self._plant_probe_with_dag_command(
-            "cargo test -p hermit --test zz_probe --no-run"
+            "cargo test -p hermit --test zz_probe --no-run", declared=["zz_probe"]
         )
         self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertIn("zz_probe", result.stderr)
+        self.assertIn("integration_test_binaries", result.stderr)
 
     def test_nextest_run_registers_a_binary(self) -> None:
         result = self._plant_probe_with_dag_command(
             "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh "
-            "./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --test zz_probe -j 1"
+            "./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --test zz_probe -j 1",
+            declared=["zz_probe"],
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("ci-registered=2", result.stdout)
 
     def test_nextest_no_run_does_not_register_a_binary(self) -> None:
         result = self._plant_probe_with_dag_command(
-            "cargo nextest run -p hermit --test zz_probe --no-run"
+            "cargo nextest run -p hermit --test zz_probe --no-run",
+            declared=["zz_probe"],
         )
         self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertIn("zz_probe", result.stderr)
+        self.assertIn("integration_test_binaries", result.stderr)
 
     def test_invocation_named_only_in_a_description_does_not_register(self) -> None:
         probe = self.root / "hermit-cli/tests/zz_probe.rs"
         probe.write_text("#[test]\nfn probe() {}\n")
         (self.root / "ci/dag/portable.json").write_text(
-            '{"steps":[{"cmd":"cargo test -p hermit --test registered",'
+            '{"steps":[{"group":"test","job":"registered",'
+            '"cmd":"cargo test -p hermit --test registered",'
+            '"integration_test_binaries":["registered"],'
             '"desc":"unlike cargo test -p hermit --test zz_probe, which we skip"}]}\n'
         )
         subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
@@ -166,10 +193,27 @@ class RegistrationAuditTest(unittest.TestCase):
         """The positive leg: the tightening must not reject Hermit's real shapes."""
         result = self._plant_probe_with_dag_command(
             "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh "
-            "cargo test -p hermit --features third-party-backends --test zz_probe"
+            "cargo test -p hermit --features third-party-backends --test zz_probe",
+            declared=["zz_probe"],
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("ci-registered=2", result.stdout)
+
+    def test_executed_target_without_typed_declaration_is_refused_by_name(self) -> None:
+        result = self._plant_probe_with_dag_command(
+            "cargo test -p hermit --test zz_probe"
+        )
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("step test.probe", result.stderr)
+        self.assertIn("omits integration_test_binaries", result.stderr)
+
+    def test_command_and_typed_declaration_must_name_the_same_targets(self) -> None:
+        result = self._plant_probe_with_dag_command(
+            "cargo test -p hermit --test zz_probe", declared=["registered"]
+        )
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("step test.probe integration_test_binaries", result.stderr)
+        self.assertIn("do not match executed targets ['zz_probe']", result.stderr)
 
 
 if __name__ == "__main__":

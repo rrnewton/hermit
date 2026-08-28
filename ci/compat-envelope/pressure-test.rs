@@ -2733,6 +2733,7 @@ fn write_plan_after_scorecard_check(
             cmd,
             cmdtype: CmdType::Unknown,
             manifest: None,
+            integration_test_binaries: None,
             deps: preparation_deps,
             env: BTreeMap::new(),
             // `None` preserves the existing GLOBAL eager-exit behaviour, which is what
@@ -2914,6 +2915,7 @@ fn write_plan_after_scorecard_check(
                 cmd,
                 cmdtype: CmdType::Unknown,
                 manifest: None,
+                integration_test_binaries: None,
                 deps,
                 env: BTreeMap::new(),
                 // `None` preserves the existing GLOBAL eager-exit behaviour, which is what
@@ -2955,6 +2957,7 @@ fn write_plan_after_scorecard_check(
         cmd: "true".into(),
         cmdtype: CmdType::Unknown,
         manifest: None,
+        integration_test_binaries: None,
         deps: cell_tags,
         env: BTreeMap::new(),
         // `None` preserves the existing GLOBAL eager-exit behaviour, which is what
