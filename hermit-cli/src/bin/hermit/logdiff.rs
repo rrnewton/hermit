@@ -14,6 +14,7 @@ use std::time::Instant;
 
 use clap::Parser;
 use detcore::logdiff;
+use hermit::HERMIT_VERIFICATION_DIVERGENCE_EXIT;
 use reverie::process::ExitStatus;
 use serde::Serialize;
 use tempfile::NamedTempFile;
@@ -263,7 +264,7 @@ impl LogDiffCLIOpts {
             return ExitStatus::Exited(2);
         }
         if summary.diff_found {
-            ExitStatus::Exited(1)
+            ExitStatus::Exited(HERMIT_VERIFICATION_DIVERGENCE_EXIT)
         } else if summary.matched_with_evidence() {
             ExitStatus::Exited(0)
         } else {
@@ -361,7 +362,7 @@ impl LogDiffCLIOpts {
                     records,
                     JsonVerdict::Diverged,
                     "diverged",
-                    ExitStatus::Exited(1),
+                    ExitStatus::Exited(HERMIT_VERIFICATION_DIVERGENCE_EXIT),
                 );
             }
 
@@ -869,7 +870,10 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(
-            matches!(status, ExitStatus::Exited(1)),
+            matches!(
+                status,
+                ExitStatus::Exited(HERMIT_VERIFICATION_DIVERGENCE_EXIT)
+            ),
             "divergence must exit 1, got {status:?}"
         );
 

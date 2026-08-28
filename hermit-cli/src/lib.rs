@@ -56,6 +56,13 @@ pub const RECORD_REPLAY_HASHES_IO_BUFFERS: bool = true;
 /// the record/replay path is a fixed decision, so only it gets a constant.
 pub const RECORD_REPLAY_VIRTUALIZES_TIME: bool = false;
 
+/// Exit status for a completed comparison that found a divergence.
+///
+/// This is the conventional `diff` result: zero means equal and one means
+/// different. The verification JSON distinguishes it from a guest that exits
+/// one of its own accord.
+pub const HERMIT_VERIFICATION_DIVERGENCE_EXIT: i32 = 1;
+
 /// Exit status for a failure of HERMIT ITSELF, as distinct from the guest's.
 ///
 /// ⚠️ EVERY CLI ERROR USED TO BE `Exited(1)`, WHICH IS THE SINGLE MOST COMMON
@@ -176,10 +183,11 @@ pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
 // must not invent its own reading of it.
 //
 //   0          success.
-//   1 ..= 121  THE GUEST'S OWN STATUS, passed through untouched. `1` is the
-//              commonest of these, which is why hermit must never use it.
-//              (The range stops at 121 because 122 is reserved below; a guest
-//              may still CHOOSE any value, see the caveat at the end.)
+//   1          HERMIT_VERIFICATION_DIVERGENCE_EXIT, matching `diff`; also a
+//              legal guest status. Read the verification JSON to distinguish.
+//   2 ..= 121  THE GUEST'S OWN STATUS, passed through untouched. (The range
+//              stops at 121 because 122 is reserved below; a guest may still
+//              CHOOSE any value, see the caveat at the end.)
 //   122        HERMIT_POLICY_REFUSAL_EXIT -- hermit REFUSED the run under a
 //              fail-closed policy. Hermit WORKED; the run was stopped on
 //              purpose and the reason was printed. Distinct from 125 because
@@ -279,6 +287,10 @@ pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
 // silently inverted. `tests/cli.rs` also asserts `!status.success()` beside the
 // code for that reason; this pin is the second of the two locks.
 const _: () = assert!(
+    HERMIT_VERIFICATION_DIVERGENCE_EXIT == 1,
+    "1 is the established diff-style result for a completed comparison that diverged"
+);
+const _: () = assert!(
     HERMIT_INTERNAL_FAILURE_EXIT == 125,
     "125 is the GNU wrapper-failed convention; 1 is the commonest guest status and 0 is success"
 );
@@ -291,7 +303,8 @@ const _: () = assert!(
     "126 is the GNU found-but-not-executable convention and must stay distinct from 125 and 127"
 );
 const _: () = assert!(
-    HERMIT_INTERNAL_FAILURE_EXIT != 0
+    HERMIT_VERIFICATION_DIVERGENCE_EXIT != 0
+        && HERMIT_INTERNAL_FAILURE_EXIT != 0
         && GUEST_PROGRAM_NOT_FOUND_EXIT != 0
         && GUEST_PROGRAM_NOT_EXECUTABLE_EXIT != 0,
     "a failure code of 0 would invert every assert_eq!(code, Some(CONST)) into demanding success"

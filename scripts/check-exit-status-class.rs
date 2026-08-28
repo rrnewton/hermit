@@ -72,7 +72,7 @@
 //! colliding set is the values hermit's own reporting can produce, plus the one it
 //! USED to produce before hermit#2558:
 //!
-//!   1    the pre-#2558 hermit failure code -- AMBIGUOUS, and the entire family
+//!   1    HERMIT_VERIFICATION_DIVERGENCE_EXIT, or the guest's own status
 //!   125  HERMIT_INTERNAL_FAILURE_EXIT -- should be the constant, not a literal
 //!   126  GuestProgramFault: found, not executable
 //!   127  GuestProgramFault: not found
@@ -90,7 +90,7 @@ use std::process::Command;
 const COLLIDING: [(u32, &str); 8] = [
     (
         1,
-        "pre-#2558 hermit failure code: guest exit OR stale hermit code",
+        "HERMIT_VERIFICATION_DIVERGENCE_EXIT, or the guest's own status",
     ),
     (125, "HERMIT_INTERNAL_FAILURE_EXIT: use the constant"),
     (126, "GuestProgramFault: found but not executable"),
@@ -421,7 +421,7 @@ mod tests {
     // ---- each contested value is caught -------------------------------------
 
     #[test]
-    fn catches_bare_one_the_pre_2558_hermit_code() {
+    fn catches_bare_one_without_an_exit_class() {
         assert_eq!(count("assert_eq!(output.status.code(), Some(1));"), 1);
     }
 

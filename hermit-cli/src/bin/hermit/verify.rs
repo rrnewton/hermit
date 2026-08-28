@@ -18,6 +18,7 @@ use detcore::logdiff::LogComparisonMode;
 use detcore_model::summary::RunSummary;
 use hermit::Context;
 use hermit::Error;
+use hermit::HERMIT_VERIFICATION_DIVERGENCE_EXIT;
 use pretty_assertions::Comparison;
 use reverie::process::ExitStatus;
 use reverie::process::Output;
@@ -544,6 +545,7 @@ impl VerificationRuntime {
 
 impl DbtCountedBranchComparison {
     /// Whether both completed runs reported the same counted-branch clock.
+    #[cfg(feature = "dbt")]
     pub fn matched(self) -> bool {
         self.left == self.right
     }
@@ -570,9 +572,6 @@ pub struct VerificationOutcome {
     pub dbt_counted_branches: Option<DbtCountedBranchComparison>,
     /// Runtime totals for the two compared executions when their summaries were readable.
     pub runtime: Option<VerificationRuntime>,
-    /// Reader-facing names of the two compared sides, retained so terminal
-    /// diagnostics do not assume that every comparison was two fresh runs.
-    pub compared_labels: ComparisonSideLabels,
     /// Scheduler turn at the first log divergence, when a preceding COMMIT
     /// identified the turn.
     pub first_divergent_scheduler_turn: Option<u64>,
@@ -615,23 +614,14 @@ impl VerificationOutcome {
     }
 
     /// Collapse the outcome to the historical process-exit convention: a match
-    /// propagates the guest exit status; a divergence is an error (nonzero
-    /// exit). Callers that need to separate the verdict from the guest exit
-    /// code must read [`Self::verdict`] / [`Self::verified`] (or the
-    /// `--verify-json` report) *before* calling this.
+    /// propagates the guest exit status, a divergence exits one, and a refused
+    /// comparison remains an error. Callers that need to separate the verdict
+    /// from the guest exit code must read [`Self::verdict`] / [`Self::verified`]
+    /// (or the `--verify-json` report) *before* calling this.
     pub fn into_exit_status(self) -> Result<ExitStatus, Error> {
         match self.verdict {
             Verdict::Matched => Ok(self.guest_status),
-            Verdict::Diverged => match self.dbt_counted_branches {
-                Some(branches) if !branches.matched() => Err(Error::msg(format!(
-                    "DBT verification failed: counted-branch clocks differed between runs ({} != {}); logs retained",
-                    branches.left, branches.right
-                ))),
-                _ => Err(Error::msg(format!(
-                    "Verification found a mismatch between {} and {} (logs retained).",
-                    self.compared_labels.left, self.compared_labels.right,
-                ))),
-            },
+            Verdict::Diverged => Ok(ExitStatus::Exited(HERMIT_VERIFICATION_DIVERGENCE_EXIT)),
             // Reached when the comparator refused (a truncated log) and nothing
             // else was observed to differ. Still an error, so the historical
             // nonzero process exit is unchanged -- but it must not be reported
@@ -1227,7 +1217,6 @@ fn compare_two_runs_with_unsupported_scan(
             compared_log_messages,
             dbt_counted_branches: None,
             runtime: None,
-            compared_labels: compared_labels.clone(),
             first_divergent_scheduler_turn,
             first_divergent_virtual_nanoseconds,
             first_divergent_record,
@@ -1243,7 +1232,6 @@ fn compare_two_runs_with_unsupported_scan(
             compared_log_messages,
             dbt_counted_branches: None,
             runtime: None,
-            compared_labels: compared_labels.clone(),
             first_divergent_scheduler_turn,
             first_divergent_virtual_nanoseconds,
             first_divergent_record,
@@ -1708,65 +1696,6 @@ mod tests {
         assert_eq!(outcome.into_exit_status().unwrap(), ExitStatus::Exited(3));
     }
 
-    fn diverged_message(label1: &'static str, label2: &'static str) -> String {
-        let left = output(0, b"left-output", b"");
-        let right = output(0, b"right-output", b"");
-        let (left_log, right_log) = empty_logs();
-        let left_path = left_log.to_path_buf();
-        let right_path = right_log.to_path_buf();
-
-        let outcome = compare_two_runs(
-            ComparedRun {
-                output: &left,
-                log: left_log,
-                label: label1,
-            },
-            ComparedRun {
-                output: &right,
-                log: right_log,
-                label: label2,
-            },
-            ComparisonOptions {
-                verbose: false,
-                strictness: LogCompareStrictness::Stripped,
-                compare_logs: false,
-                diagnostic_full_trace: false,
-                compare_io_buffers: false,
-                keep_logs: false,
-                record_envelope: RecordEnvelope::all_records_v1(),
-                virtualize_time: true,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(
-            outcome.compared_labels,
-            ComparisonSideLabels::new(label1, label2)
-        );
-        assert!(left_path.exists(), "a divergence must retain the left log");
-        assert!(
-            right_path.exists(),
-            "a divergence must retain the right log"
-        );
-        fs::remove_file(left_path).unwrap();
-        fs::remove_file(right_path).unwrap();
-        outcome.into_exit_status().unwrap_err().to_string()
-    }
-
-    #[test]
-    fn divergence_terminal_message_names_the_sides_it_compared() {
-        let record = diverged_message("the recording", "the replay");
-        assert!(
-            record.contains("between the recording and the replay"),
-            "{record}"
-        );
-        assert!(!record.contains("run 1") && !record.contains("run 2"));
-
-        let run = diverged_message("run 1", "run 2");
-        assert!(run.contains("between run 1 and run 2"), "{run}");
-        assert!(!run.contains("recording") && !run.contains("replay"));
-    }
-
     #[test]
     fn production_comparison_callers_bind_truthful_side_labels() {
         for (name, source, left, right) in [
@@ -1862,9 +1791,10 @@ mod tests {
             let outcome = compare(&baseline, log1, &mismatch, log2).unwrap();
             assert_eq!(outcome.verdict, Verdict::Diverged);
             assert!(!outcome.verified());
-            // Collapsing a divergence to the legacy exit convention is an error
-            // (nonzero process exit), preserving the historical behavior.
-            assert!(outcome.into_exit_status().is_err());
+            assert_eq!(
+                outcome.into_exit_status().unwrap(),
+                ExitStatus::Exited(HERMIT_VERIFICATION_DIVERGENCE_EXIT)
+            );
 
             let _ = fs::remove_file(path1);
             let _ = fs::remove_file(path2);
@@ -2790,7 +2720,6 @@ mod tests {
             compared_log_messages: Some(ComparedLogCounts { left: 9, right: 9 }),
             dbt_counted_branches: None,
             runtime: None,
-            compared_labels: ComparisonSideLabels::default(),
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,

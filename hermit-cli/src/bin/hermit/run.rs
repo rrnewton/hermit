@@ -3876,7 +3876,7 @@ impl RunOpts {
         }
         announce_verification_outcome(&outcome, success_message, failure_message);
 
-        // On divergence, still return the error (nonzero process exit) and skip
+        // On divergence, still return the nonzero status and skip
         // the backend banner — but EMIT THE GUEST'S OUTPUT FIRST when both runs
         // agreed on it.
         //

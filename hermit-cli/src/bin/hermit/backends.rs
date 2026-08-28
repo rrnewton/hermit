@@ -1512,7 +1512,6 @@ mod tests {
             compared_log_messages: Some(ComparedLogCounts { left: 4, right: 4 }),
             dbt_counted_branches: None,
             runtime: None,
-            compared_labels: detcore::logdiff::ComparisonSideLabels::default(),
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
@@ -1676,9 +1675,10 @@ mod tests {
                 outcome.compared_log_messages,
                 Some(ComparedLogCounts { left: 4, right: 4 })
             );
-            let error = outcome.into_exit_status().unwrap_err().to_string();
-            assert!(error.contains("counted-branch clocks differed"), "{error}");
-            assert!(!error.contains("outputs"), "{error}");
+            assert_eq!(
+                outcome.into_exit_status().unwrap(),
+                ExitStatus::Exited(hermit::HERMIT_VERIFICATION_DIVERGENCE_EXIT)
+            );
         }
     }
 
