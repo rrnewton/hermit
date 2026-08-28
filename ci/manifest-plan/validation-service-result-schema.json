@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "fields": [
+    "schema_version",
+    "commit",
+    "profile",
+    "final_validate_status",
+    "exit_code",
+    "executed_nodes",
+    "executed_tests"
+  ],
+  "outcomes": {
+    "PASSED": {
+      "exit_code": 0,
+      "state": "completed",
+      "result": "success"
+    },
+    "FAILED": {
+      "exit_code": 1,
+      "state": "completed",
+      "result": "failure"
+    },
+    "COULD_NOT_RUN": {
+      "exit_code": 75,
+      "state": "completed",
+      "result": "no-result"
+    }
+  }
+}

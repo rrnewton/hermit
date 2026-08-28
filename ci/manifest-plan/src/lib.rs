@@ -5,5 +5,6 @@ pub mod host_capability;
 pub mod ledger;
 pub mod manifest_value;
 pub mod runner;
+pub mod service_result;
 pub mod stress_series;
 pub mod timeouts;
