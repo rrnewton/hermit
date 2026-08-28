@@ -44,6 +44,7 @@
     "build.runtime_release"
   ],
   "build_aux_nodes": [
+    "build.e2e_artifact",
     "build.liteinst_runtime_release"
   ],
   "e2e_nodes": [
@@ -64,6 +65,9 @@
   "final_nodes": [
     "scorecard.compatibility"
   ],
+  "strict_compat_nodes": [
+    "test.strict_compat"
+  ],
   "debug_shards": [
     {
       "slug": "unit",
@@ -83,7 +87,6 @@
     {
       "slug": "integration",
       "nodes": [
-        "build.e2e_artifact",
         "test.hermit_integration",
         "test.cli",
         "test.arbitrary_binaries",
@@ -117,12 +120,6 @@
       "nodes": [
         "doc.doctests",
         "doc.rustdoc"
-      ]
-    },
-    {
-      "slug": "strict-compat",
-      "nodes": [
-        "test.strict_compat"
       ]
     }
   ],

@@ -13,22 +13,14 @@
 #   union(preflight, builds, test shards, e2e, final)
 #     == { steps returned by scripts/validate.rs portable-only --show-plan-json }
 #
-# The immutable E2E artifact is deliberately assigned to the integration shard
-# beside test.applications_e2e. Keeping the producer and its protected consumer
-# in one run-node selection preserves their declared DAG edge; assigning the
-# producer to an unrelated bucket would satisfy set coverage while leaving the
-# artifact off the consumer's execution path.
+# The immutable E2E artifact and the LiteInst producer are deliberately assigned
+# to one completed-build job after the debug and release producers. Keeping that
+# internal edge preserves the constructed ordering while later test jobs fetch
+# the resulting artifact instead of rerunning its command.
 #
-# Preflight has no earlier hosted job from which it can fetch an artifact or
-# inherit a successful predecessor result. Its selected steps must therefore be
-# closed over their dependencies in the constructed plan. This catches a map
-# that assigns every step exactly once but separates a preflight command from
-# the step that makes it runnable.
-#
-# The later check job may use either a predecessor in its own selection or one
-# that the successful preflight job already supplied. Refuse any other omitted
-# dependency so splitting the jobs cannot turn a command into a vacuous red or
-# green.
+# Every hosted group must also preserve each constructed predecessor either in
+# the same selected group or in an earlier job whose artifacts/results it uses.
+# Exact set coverage alone cannot catch an edge that was reversed or dropped.
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -60,6 +52,7 @@ mapfile -t assigned < <(
       + (.build_debug_nodes // [])
       + (.build_dbt_nodes // [])
       + (.build_aux_nodes // [])
+      + (.strict_compat_nodes // [])
       + (.e2e_nodes // [])
       + (.final_nodes // [])
       + ([ (.debug_shards // [])[]   | .nodes[] ])
@@ -94,25 +87,10 @@ if [[ -n $extra ]]; then
     status=1
 fi
 
-preflight_json=$(jq -c '.preflight_nodes // []' "$shards")
-preflight_missing=$(jq -r --argjson selected "$preflight_json" '
-    [
-      .dags[].steps[]
-      | select(.tag as $tag | $selected | index($tag))
-      | .deps[]
-      | select(. as $dependency | ($selected | index($dependency)) == null)
-    ]
-    | unique[]
-' <<<"$plan_json")
-if [[ -n $preflight_missing ]]; then
-    echo "check-shard-coverage.sh: FAIL — preflight drops constructed predecessor(s) that no earlier job supplies:" >&2
-    printf '  %s\n' $preflight_missing >&2
-    status=1
-fi
-
-check_json=$(jq -c '.check_nodes // []' "$shards")
-check_supplied_json=$(jq -c '(.preflight_nodes // []) + (.check_nodes // [])' "$shards")
-check_missing=$(jq -r --argjson selected "$check_json" --argjson supplied "$check_supplied_json" '
+dependency_misses() {
+    local selected_json=$1
+    local supplied_json=$2
+    jq -r --argjson selected "$selected_json" --argjson supplied "$supplied_json" '
     [
       .dags[].steps[]
       | select(.tag as $tag | $selected | index($tag))
@@ -120,20 +98,80 @@ check_missing=$(jq -r --argjson selected "$check_json" --argjson supplied "$chec
       | select(. as $dependency | ($supplied | index($dependency)) == null)
     ]
     | unique[]
-' <<<"$plan_json")
-if [[ -n $check_missing ]]; then
-    echo "check-shard-coverage.sh: FAIL — check job drops constructed predecessor(s) not supplied by preflight:" >&2
-    printf '  %s\n' $check_missing >&2
-    status=1
-fi
+' <<<"$plan_json"
+}
+
+check_dependencies() {
+    local label=$1 selected_json=$2 supplied_json=$3 missing
+    missing=$(dependency_misses "$selected_json" "$supplied_json")
+    if [[ -n $missing ]]; then
+        echo "check-shard-coverage.sh: FAIL — $label drops constructed predecessor(s) that no earlier job supplies:" >&2
+        printf '  %s\n' $missing >&2
+        status=1
+    fi
+}
+
+preflight_json=$(jq -c '.preflight_nodes // []' "$shards")
+check_json=$(jq -c '.check_nodes // []' "$shards")
+build_debug_json=$(jq -c '.build_debug_nodes // []' "$shards")
+build_dbt_json=$(jq -c '.build_dbt_nodes // []' "$shards")
+build_aux_json=$(jq -c '.build_aux_nodes // []' "$shards")
+strict_compat_json=$(jq -c '.strict_compat_nodes // []' "$shards")
+through_preflight=$(jq -cn --argjson preflight "$preflight_json" '$preflight')
+through_checks=$(jq -cn --argjson preflight "$preflight_json" --argjson checks "$check_json" '$preflight + $checks')
+through_debug=$(jq -cn --argjson preflight "$preflight_json" --argjson debug "$build_debug_json" '$preflight + $debug')
+through_release=$(jq -cn --argjson preflight "$preflight_json" --argjson release "$build_dbt_json" '$preflight + $release')
+through_builds=$(jq -cn \
+    --argjson preflight "$preflight_json" \
+    --argjson debug "$build_debug_json" \
+    --argjson release "$build_dbt_json" \
+    --argjson aux "$build_aux_json" \
+    '$preflight + $debug + $release + $aux')
+
+check_dependencies "preflight" "$preflight_json" "$through_preflight"
+check_dependencies "check job" "$check_json" "$through_checks"
+check_dependencies "debug build job" "$build_debug_json" "$through_debug"
+check_dependencies "release build job" "$build_dbt_json" "$through_release"
+check_dependencies "completed build job" "$build_aux_json" "$through_builds"
+
+debug_test_json=$(jq -c '[.debug_shards[].nodes[]]' "$shards")
+strict_compat_supplied=$(jq -cn \
+    --argjson prior "$through_builds" \
+    --argjson tests "$debug_test_json" \
+    --argjson selected "$strict_compat_json" \
+    '$prior + $tests + $selected')
+check_dependencies "strict compatibility job" "$strict_compat_json" "$strict_compat_supplied"
+
+while IFS= read -r shard; do
+    slug=$(jq -r '.slug' <<<"$shard")
+    nodes=$(jq -c '.nodes' <<<"$shard")
+    supplied=$(jq -cn --argjson prior "$through_builds" --argjson selected "$nodes" '$prior + $selected')
+    check_dependencies "debug shard $slug" "$nodes" "$supplied"
+done < <(jq -c '.debug_shards[]' "$shards")
+
+while IFS= read -r shard; do
+    slug=$(jq -r '.slug' <<<"$shard")
+    nodes=$(jq -c '.nodes' <<<"$shard")
+    supplied=$(jq -cn --argjson prior "$through_builds" --argjson selected "$nodes" '$prior + $selected')
+    check_dependencies "release shard $slug" "$nodes" "$supplied"
+done < <(jq -c '.release_shards[]' "$shards")
+
+while IFS= read -r node; do
+    selected=$(jq -cn --arg node "$node" '[$node]')
+    supplied=$(jq -cn --argjson prior "$through_builds" --argjson selected "$selected" '$prior + $selected')
+    check_dependencies "E2E job $node" "$selected" "$supplied"
+done < <(jq -r '.e2e_nodes[]' "$shards")
+
+final_json=$(jq -c '.final_nodes // []' "$shards")
+all_supplied_json=$(printf '%s\n' "${assigned[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')
+check_dependencies "final job" "$final_json" "$all_supplied_json"
 
 if ! jq -e '
-    [.debug_shards[] | select(.slug == "integration") | .nodes] as $integration
-    | ($integration | length) == 1
-      and ($integration[0] | index("build.e2e_artifact") != null)
-      and ($integration[0] | index("test.applications_e2e") != null)
+    (.build_aux_nodes // []) as $completed_build
+    | ($completed_build | index("build.e2e_artifact") != null)
+      and ($completed_build | index("build.liteinst_runtime_release") != null)
 ' "$shards" >/dev/null; then
-    echo "check-shard-coverage.sh: FAIL — integration job must run build.e2e_artifact with test.applications_e2e" >&2
+    echo "check-shard-coverage.sh: FAIL — completed build job must preserve build.e2e_artifact -> build.liteinst_runtime_release" >&2
     status=1
 fi
 
