@@ -1,6 +1,6 @@
 {
   "_comment": [
-    "Job-assignment map for the parallel portable fan-out (ci-portable-parallel.yml).",
+    "Job-assignment map for the parallel portable fan-out (ci-portable.yml).",
     "Every step in validate's constructed portable-only plan is assigned to exactly one",
     "hosted job here. ci/check-shard-coverage.sh asks validate for that plan and fails",
     "closed if this map drifts, so lane merging, deduplication, or edge changes cannot",
