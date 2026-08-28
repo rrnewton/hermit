@@ -439,10 +439,9 @@ struct Observation {
     /// numbers are not comparable to each other in any way.
     ///
     /// A repository whose depth could not be resolved is ABSENT from the map
-    /// rather than present with a zero or a guess. Hermit is always resolvable
-    /// because the tool runs inside it; reverie is only resolvable when a
-    /// checkout is reachable, which is a property of the workspace layout
-    /// rather than of the measurement.
+    /// rather than present with a zero or a guess. Hermit is always resolved at
+    /// the recorded Hermit SHA. Reverie is resolved at the pin in that exact
+    /// revision's Cargo.lock when a checkout containing the pin is reachable.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     depth: BTreeMap<String, SourceDepth>,
     hermit_shas: BTreeSet<String>,
@@ -813,7 +812,7 @@ impl<'de> Deserialize<'de> for ObservedPositions {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct PressureSummary {
     schema: u64,
     hermit_sha: String,
@@ -822,7 +821,7 @@ struct PressureSummary {
     rows: Vec<PressureSummaryRow>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct PressureSummaryRow {
     cell: CellId,
     /// Which repeat of this cell the row describes.
@@ -852,7 +851,7 @@ struct PressureSummaryRow {
     invocation: Option<PressureInvocation>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct PressureInvocation {
     run_id: String,
     argv: Vec<String>,
@@ -1101,6 +1100,17 @@ impl ResultRow {
                 self.outcome
             ));
         }
+        // `run --verify` and chaos compare independent executions and therefore
+        // require virtual time. `record start --verify` compares one recording
+        // with its replay; that path deliberately leaves time real and reports
+        // `virtualize_time: false`. Require the producer's exact policy for each
+        // mode instead of either weakening the field or rejecting every replay
+        // result the selected plan can produce.
+        let expected_virtualize_time = match self.mode.as_str() {
+            "replay" => false,
+            "verify" | "chaos" => true,
+            _ => unreachable!("comparison-producing modes checked above"),
+        };
         let mut left_counts = BTreeSet::new();
         let mut right_counts = BTreeSet::new();
         for (index, attempt) in self.attempts.iter().enumerate() {
@@ -1174,7 +1184,7 @@ impl ResultRow {
                 && comparison
                     .get("virtualize_time")
                     .and_then(JsonValue::as_bool)
-                    == Some(true);
+                    == Some(expected_virtualize_time);
             if !exact_bitwise_info {
                 return Err(format!(
                     "attempt {} did not use the exact BitwiseInfoV1 INFO comparison",
@@ -2612,12 +2622,6 @@ fn update_tracked(
     Ok(())
 }
 
-/// Resolve `git rev-list` depths for one repository, or `None` if it is not a
-/// resolvable git checkout.
-fn repo_depth(root: &Path) -> Option<SourceDepth> {
-    repo_depth_at(root, "HEAD")
-}
-
 fn repo_depth_at(root: &Path, revision: &str) -> Option<SourceDepth> {
     let count = |args: &[&str]| -> Option<u64> {
         let out = Command::new("git")
@@ -2640,35 +2644,67 @@ fn repo_depth_at(root: &Path, revision: &str) -> Option<SourceDepth> {
     })
 }
 
+/// Read the unique full Reverie pin from one recorded Hermit revision.
+fn reverie_pin_at(root: &Path, hermit_revision: &str) -> Option<String> {
+    let output = Command::new("git")
+        .args(["show", &format!("{hermit_revision}:Cargo.lock")])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut pins = BTreeSet::new();
+    for line in String::from_utf8(output.stdout).ok()?.lines() {
+        if !line.contains("github.com/") || !line.contains("/reverie.git") {
+            continue;
+        }
+        let start = line.find("?rev=")? + "?rev=".len();
+        let pin: String = line[start..]
+            .chars()
+            .take_while(|character| character.is_ascii_hexdigit())
+            .collect();
+        if pin.len() != 40 {
+            return None;
+        }
+        pins.insert(pin);
+    }
+    (pins.len() == 1).then(|| pins.into_iter().next().expect("one pin exists"))
+}
+
 /// Depths for every repository whose history is part of what was measured.
 ///
-/// Hermit is mandatory -- the tool runs inside it, so a failure there is a
-/// genuine fault rather than a layout difference. Reverie is best-effort: it is
-/// a pinned git dependency, not a checkout hermit owns, so whether a clone is
-/// reachable depends on the surrounding workspace. When it is not, the key is
-/// OMITTED and the caller says so, rather than a zero being recorded as if it
-/// were a measurement.
-fn source_depths(root: &Path) -> Result<BTreeMap<String, SourceDepth>, String> {
+/// Every depth is keyed to recorded source identity, never to a checkout's
+/// mutable HEAD. Hermit is mandatory. Reverie is best-effort because the pin is
+/// recorded in Hermit's Cargo.lock but its commit graph is only available when
+/// a surrounding checkout contains that pin. When either is unavailable, the
+/// key is OMITTED rather than a current checkout depth being substituted.
+fn source_depths(
+    root: &Path,
+    hermit_revision: &str,
+) -> Result<BTreeMap<String, SourceDepth>, String> {
     let mut depths = BTreeMap::new();
-    let hermit = repo_depth(root)
-        .ok_or("cannot read hermit git depth; this tool runs inside that repository")?;
+    let hermit = repo_depth_at(root, hermit_revision).ok_or_else(|| {
+        format!("cannot read Hermit source depth at recorded SHA {hermit_revision}")
+    })?;
     depths.insert("hermit".to_string(), hermit);
     // Sibling first, then the dev-hermit parent layout where hermit checkouts
     // live under worktrees/<slot>/hermit and reverie sits at the top level.
-    // Best-effort by design: the absence of a reverie clone is a property of
-    // the workspace, not a fault, so it is reported and omitted rather than
-    // guessed at.
-    for candidate in [
-        "../reverie",
-        "../../reverie",
-        "../../../reverie",
-        "../../../../reverie",
-    ] {
-        let path = root.join(candidate);
-        if path.join(".git").exists() {
-            if let Some(depth) = repo_depth(&path) {
-                depths.insert("reverie".to_string(), depth);
-                break;
+    // Best-effort by design: an unavailable recorded pin or commit graph is
+    // reported and omitted rather than replaced with a different revision.
+    if let Some(pin) = reverie_pin_at(root, hermit_revision) {
+        for candidate in [
+            "../reverie",
+            "../../reverie",
+            "../../../reverie",
+            "../../../../reverie",
+        ] {
+            let path = root.join(candidate);
+            if path.join(".git").exists() {
+                if let Some(depth) = repo_depth_at(&path, &pin) {
+                    depths.insert("reverie".to_string(), depth);
+                    break;
+                }
             }
         }
     }
@@ -3507,11 +3543,11 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
     let derived = check_tracked(root)?;
     let detcore_tree = git_rev_parse(root, "HEAD:detcore")?;
     let rows = read_result_candidates(results, &head)?;
-    let depth = source_depths(root)?;
+    let depth = source_depths(root, &head)?;
     if !depth.contains_key("reverie") {
         println!(
-            "  note: no reverie checkout reachable, so reverie depth is OMITTED \
-             rather than guessed. Hermit depth is recorded."
+            "  note: no Reverie depth was resolved from the recorded Hermit revision, so \
+             Reverie depth is OMITTED rather than guessed. Hermit depth is recorded."
         );
     }
     let mut tracked: TrackedCells = serde_json::from_slice(&original.cells)
@@ -3887,11 +3923,11 @@ fn update_observations(root: &Path, summary_path: &Path) -> Result<(), String> {
     let summary: PressureSummary = read_json(summary_path)?;
     let head = git_head(root)?;
     let detcore_tree = git_rev_parse(root, "HEAD:detcore")?;
-    let depth = source_depths(root)?;
+    let depth = source_depths(root, &summary.hermit_sha)?;
     if !depth.contains_key("reverie") {
         println!(
-            "  note: no reverie checkout reachable, so reverie depth is OMITTED \
-             rather than guessed. Hermit depth is recorded."
+            "  note: no Reverie depth was resolved from the recorded Hermit revision, so \
+             Reverie depth is OMITTED rather than guessed. Hermit depth is recorded."
         );
     }
     let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
@@ -7013,7 +7049,7 @@ red/`measured-and-passed` count is **0**.",
         .map_err(|e| format!("cannot create empty result directory fixture: {e}"))?;
     let executable = env::current_exe()
         .map_err(|e| format!("cannot resolve scorecard self-test executable: {e}"))?;
-    let output = Command::new(executable)
+    let output = Command::new(&executable)
         .args(["observe-results", "--results"])
         .arg(empty_results.path())
         .current_dir(&command_root)
@@ -7030,6 +7066,206 @@ red/`measured-and-passed` count is **0**.",
             output.status,
             String::from_utf8_lossy(&output.stderr)
         ));
+    }
+
+    // Exercise the actual result-ingest commands in a clean clone. Replay
+    // compares one recording with its replay and deliberately reports real
+    // time; verify compares independent executions and still requires virtual
+    // time.
+    let result_command_fixture = tempfile::tempdir()
+        .map_err(|e| format!("cannot create result-command fixture: {e}"))?;
+    let result_command_root = result_command_fixture.path().join("repo");
+    let clone = Command::new("git")
+        .args(["clone", "--quiet", "--shared"])
+        .arg(&command_root)
+        .arg(&result_command_root)
+        .output()
+        .map_err(|e| format!("cannot clone result-command fixture: {e}"))?;
+    if !clone.status.success() {
+        return Err(format!(
+            "cannot clone result-command fixture: {}",
+            String::from_utf8_lossy(&clone.stderr).trim()
+        ));
+    }
+    let git_ok = |repo: &Path, args: &[&str]| -> Result<(), String> {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .map_err(|e| format!("cannot run git {}: {e}", args.join(" ")))?;
+        status
+            .success()
+            .then_some(())
+            .ok_or_else(|| format!("git {} failed", args.join(" ")))
+    };
+
+    // Give the clone an unrelated sibling Reverie history. Its HEAD is not the
+    // pin recorded by this Hermit revision, so it must be omitted rather than
+    // substituted. Advancing it after the first write must not change metadata
+    // derived from the same result row.
+    let reverie_root = result_command_fixture.path().join("reverie");
+    fs::create_dir(&reverie_root).map_err(|e| e.to_string())?;
+    git_ok(&reverie_root, &["init", "--quiet"])?;
+    fs::write(reverie_root.join("fixture"), "recorded\n").map_err(|e| e.to_string())?;
+    git_ok(&reverie_root, &["add", "fixture"])?;
+    let commit = |message: &str| {
+        git_ok(
+            &reverie_root,
+            &[
+                "-c",
+                "user.email=scorecard@example.invalid",
+                "-c",
+                "user.name=Scorecard Self-Test",
+                "commit",
+                "--quiet",
+                "-am",
+                message,
+            ],
+        )
+    };
+    commit("recorded")?;
+    let result_command_before = read_generated_files(&result_command_root)?;
+    let fixture_head = git_head(&result_command_root)?;
+    let fixture_detcore_tree = git_rev_parse(&result_command_root, "HEAD:detcore")?;
+    let replay_id = CellId {
+        lane: "portable".into(),
+        category: "system-utils".into(),
+        test: "system-utils/record-getpid".into(),
+        mode: "replay".into(),
+        backend: "ptrace".into(),
+    };
+    let verify_id = CellId {
+        mode: "verify".into(),
+        ..replay_id.clone()
+    };
+    let result_root = result_command_root.join("results");
+    fs::create_dir_all(&result_root)
+        .map_err(|e| format!("cannot create result-command result directory: {e}"))?;
+    let result_path = result_root.join("results.jsonl");
+    let mut replay_row = candidate("PASS").row;
+    replay_row.run_id = "result-command-replay".into();
+    replay_row.hermit_sha = fixture_head.clone();
+    replay_row.test = replay_id.test.clone();
+    replay_row.category = replay_id.category.clone();
+    replay_row.lane = replay_id.lane.clone();
+    replay_row.mode = replay_id.mode.clone();
+    replay_row.backend = Some(replay_id.backend.clone());
+    replay_row.argv = vec!["hermit".into(), "record".into(), "start".into()];
+    replay_row.effective_args = replay_row.argv.iter().skip(1).cloned().collect();
+    replay_row.shell_command =
+        literal_shell_command(&replay_row.cwd, &replay_row.env, &replay_row.argv);
+    replay_row.attempts = vec![validate_attempt("PASS")];
+    replay_row.attempts[0]["argv"] = serde_json::to_value(&replay_row.argv).unwrap();
+    replay_row.attempts[0]["shell_command"] = JsonValue::String(replay_row.shell_command.clone());
+    let mut report: JsonValue = serde_json::from_str(
+        replay_row.attempts[0]["verification_report"].as_str().unwrap(),
+    )
+    .unwrap();
+    report["comparison"]["virtualize_time"] = serde_json::json!(false);
+    let report = serde_json::to_string(&report).unwrap();
+    replay_row.attempts[0]["verification_report_sha256"] =
+        JsonValue::String(format!("{:x}", Sha256::digest(report.as_bytes())));
+    replay_row.attempts[0]["verification_report"] = JsonValue::String(report);
+    let write_result_row = |row: &ResultRow| -> Result<(), String> {
+        let mut encoded = serde_json::to_vec(row).map_err(|e| e.to_string())?;
+        encoded.push(b'\n');
+        fs::write(&result_path, encoded).map_err(|e| e.to_string())
+    };
+    let run_result_command = |command: &str, summary: Option<&Path>| {
+        let mut child = Command::new(&executable);
+        child
+            .args([command, "--results"])
+            .arg(&result_root)
+            .current_dir(&result_command_root);
+        if let Some(summary) = summary {
+            child.arg("--current-summary").arg(summary);
+        }
+        child.output().map_err(|e| e.to_string())
+    };
+    let has_current_replay = |cells: &TrackedCells| {
+        cells.cells.iter().any(|cell| {
+            cell.id == replay_id
+                && cell.observations.iter().any(|observation| {
+                    observation.canonical_comparisons.iter().any(|comparison| {
+                        comparison.hermit_sha == fixture_head
+                            && comparison.result == ObservedResult::Pass
+                    })
+                })
+        })
+    };
+    let restore_generated = || -> Result<(), String> {
+        fs::write(
+            result_command_root.join(SCORECARD),
+            &result_command_before.scorecard,
+        )
+        .and_then(|()| fs::write(result_command_root.join(CELLS), &result_command_before.cells))
+        .map_err(|e| e.to_string())
+    };
+
+    write_result_row(&replay_row)?;
+    let observe_output = run_result_command("observe-results", None)?;
+    if !observe_output.status.success()
+        || !has_current_replay(&read_json(&result_command_root.join(CELLS))?)
+    {
+        return Err(format!(
+            "observe-results did not admit canonical replay evidence with real time: {:?}",
+            String::from_utf8_lossy(&observe_output.stderr)
+        ));
+    }
+    let first_observe = read_generated_files(&result_command_root)?;
+    fs::write(reverie_root.join("fixture"), "advanced\n").map_err(|e| e.to_string())?;
+    commit("advance sibling")?;
+    let repeated = run_result_command("observe-results", None)?;
+    if !repeated.status.success()
+        || !String::from_utf8_lossy(&repeated.stdout)
+            .contains("compatibility scorecard: generated files unchanged")
+        || read_generated_files(&result_command_root)? != first_observe
+    {
+        return Err(
+            "identical observe-results input changed after the sibling Reverie HEAD advanced"
+                .into(),
+        );
+    }
+    restore_generated()?;
+
+    let mut current_row = pressure_row("pass", None, None);
+    current_row.cell = verify_id.clone();
+    current_row.verification = None;
+    let current_summary = result_command_root.join("current-summary.json");
+    fs::write(
+        &current_summary,
+        serde_json::to_vec(&PressureSummary {
+            schema: PRESSURE_SUMMARY_SCHEMA,
+            hermit_sha: fixture_head.clone(),
+            detcore_tree: fixture_detcore_tree,
+            source_tree_dirty: false,
+            rows: vec![current_row],
+        })
+        .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let imported = run_result_command("import-results", Some(&current_summary))?;
+    if !imported.status.success()
+        || !has_current_replay(&read_json(&result_command_root.join(CELLS))?)
+    {
+        return Err(format!(
+            "import-results did not admit canonical replay evidence with real time: {:?}",
+            String::from_utf8_lossy(&imported.stderr)
+        ));
+    }
+    restore_generated()?;
+
+    let mut verify_row = replay_row;
+    verify_row.run_id = "result-command-verify".into();
+    verify_row.mode = verify_id.mode;
+    write_result_row(&verify_row)?;
+    let refused = run_result_command("observe-results", None)?;
+    if refused.status.success()
+        || !String::from_utf8_lossy(&refused.stderr)
+            .contains("attempt 1 did not use the exact BitwiseInfoV1 INFO comparison")
+        || read_generated_files(&result_command_root)? != result_command_before
+    {
+        return Err("observe-results did not refuse verify evidence with real time unchanged".into());
     }
 
     for (staged_clean, unrelated_clean, allowed) in
