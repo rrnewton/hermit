@@ -1011,7 +1011,9 @@ jobs:
           stage="ignored/parity/$SLUG/parity-v1"
           artifact="parity-v1-${{ github.run_id }}-${{ github.run_attempt }}-portable-$SLUG.tar.zst"
 
-          test -s "$out/results.jsonl"
+          # A constructed --allow-empty bucket writes an empty results file;
+          # the final scorecard still verifies the complete selected population.
+          test -f "$out/results.jsonl"
           test -s "$out/junit.xml"
           mkdir -p "$stage/captures"
           cp "$out/results.jsonl" "$stage/results.jsonl"
