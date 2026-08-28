@@ -2028,14 +2028,6 @@ cleared-caps refusal names {} starved step(s)",
                 return Err(format!("full-plan bracket: fused plan lost {required}"));
             }
         }
-        let canonical_test_tags = test_nodes_of(&validate_plan::lane_config(&root, "portable")?);
-        let fused_test_tags = test_nodes_of(&full.cfg);
-        if fused_test_tags != canonical_test_tags {
-            return Err(format!(
-                "full-plan bracket: fused tags changed the receipt coverage denominator: \
-                 canonical={canonical_test_tags:?}, fused={fused_test_tags:?}"
-            ));
-        }
         let portable_build = full
             .cfg
             .steps
@@ -2281,8 +2273,22 @@ cleared-caps refusal names {} starved step(s)",
             "--no-label-pr".into(),
         ])
         .map_err(|rc| format!("full-plan bracket: sequential diagnostic refused rc={rc}"))?;
-        if build_plan(&root, &sequential_args, &tmp)?.second.is_none() {
+        let sequential = build_plan(&root, &sequential_args, &tmp)?;
+        if sequential.second.is_none() {
             return Err("full-plan bracket: --sequential-lanes did not preserve the fallback".into());
+        }
+        let portable_tests = test_nodes_of(&validate_plan::lane_config(&root, "portable")?);
+        let privileged_tests = test_nodes_of(&validate_plan::lane_config(&root, "privileged")?);
+        let sequential_expected = portable_tests.union(&privileged_tests).cloned().collect();
+        let mut fused_expected = portable_tests;
+        fused_expected.extend(privileged_tests.into_iter().map(|tag| format!("privileged-{tag}")));
+        if full.planned_test_nodes != fused_expected
+            || sequential.planned_test_nodes != sequential_expected
+        {
+            return Err(format!(
+                "full-plan bracket: fused/sequential planned-test sets differ from their lane configs: fused={:?} sequential={:?}",
+                full.planned_test_nodes, sequential.planned_test_nodes,
+            ));
         }
         let nested_args = parse_argv(&[
             "--portable-strict-compat-only".into(),
@@ -4950,8 +4956,8 @@ fn classify_withheld_dependents(
 fn test_nodes_of(cfg: &DagConfig) -> BTreeSet<String> {
     cfg.steps
         .iter()
+        .filter(|s| s.group == "test" || s.group.ends_with("-test") || s.group.ends_with(":test"))
         .map(|s| s.tag())
-        .filter(|t| t.starts_with("test.") || t.contains(":test."))
         .collect()
 }
 
