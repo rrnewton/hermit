@@ -1,8 +1,10 @@
 name: CI (GitHub-managed portable)
 
-# Authoritative full-lane parallel fan-out of the portable CI DAG.
+# Manually dispatched diagnostic fan-out of the constructed portable plan.
+# Local full validation remains the landing authority; this workflow reports
+# additional evidence and a hosted red does not block a qualifying local green.
 #
-# WHY: the authoritative `regular` job in ci-portable.yml runs the entire 46-node
+# WHY: the former serial `regular` job ran the entire 46-node
 # portable DAG on ONE ubuntu-latest runner with outer concurrency 1 (serial
 # nodes). Its measured wall (dag-perf-regular @c7531a83) is ~32 min: total
 # node-work 1918s ~= wall 1920s, i.e. the ~2.7x core usage is entirely WITHIN
@@ -896,10 +898,10 @@ jobs:
           retention-days: 14
 
   # ------------------------------------- gate + reduce per-cell transport evidence
-  # Stable required-check name. This job fails closed over the complete parallel
-  # graph and is the only portable result merge-gate needs to query. It also
-  # folds in the former reduce-e2e reduction to keep the gate critical path one
-  # queued stage shorter.
+  # Stable diagnostic name. This job fails closed over the complete parallel
+  # graph so a green summary cannot hide a missing selected shard. No branch
+  # rule or landing path requires it. It also folds in the former reduce-e2e
+  # reduction to keep the diagnostic critical path one queued stage shorter.
   regular:
     name: Regular tests (GitHub-managed portable)
     needs:
