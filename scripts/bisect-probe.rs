@@ -1307,33 +1307,41 @@ fn self_test() -> i32 {
             bad.push("the shared-primary guard must NOT reject unequal worktree directories".into());
         }
 
-        // The primary of this repository, whatever machine this is running on.
+        // Exercise the checkout we are actually running from. A nested submodule
+        // checkout may have an absolute git-dir equal to its common-dir even when
+        // that directory lives under the OUTER repository's `.git/worktrees/`.
+        // Therefore `common.parent()` is not unconditionally a worktree path: in
+        // that layout it is merely a Git metadata directory. Compare Git's two
+        // answers first, then inspect a derived primary worktree only when Git says
+        // the current checkout is linked.
         let here = repo_root();
-        let common = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&here)
-            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim().to_string()));
-        if let Some(common) = common {
-            // `<primary>/.git` -> `<primary>`.
-            if let Some(primary) = common.parent() {
-                if !is_primary_checkout(primary) {
-                    bad.push(
-                        "the shared-primary guard must RECOGNISE the primary checkout".into(),
-                    );
-                }
-                // ⚠️ THE CONTROL, and it is the half the literal path failed. This
-                // file is being tested FROM a linked worktree in CI as often as not,
-                // so a guard that only ever answers "yes" would satisfy the case
-                // above and still be useless.
-                if here != primary && is_primary_checkout(&here) {
-                    bad.push(
-                        "control: the shared-primary guard must NOT fire in a linked worktree"
-                            .into(),
-                    );
+        let dir = git(&here, &["rev-parse", "--absolute-git-dir"]);
+        let common = git(
+            &here,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        );
+        if let (Ok(dir), Ok(common)) = (dir, common) {
+            let current_is_primary = git_dirs_are_primary(&dir, &common);
+            if is_primary_checkout(&here) != current_is_primary {
+                bad.push("the shared-primary guard must agree with Git for this checkout".into());
+            }
+            if !current_is_primary {
+                // For an ordinary linked worktree, `<primary>/.git` is the common
+                // directory and its parent is the primary checkout. Do not take
+                // this branch for a nested submodule whose own git-dir IS its
+                // common-dir even though both live under an outer worktree.
+                if let Some(primary) = Path::new(&common).parent() {
+                    if !is_primary_checkout(primary) {
+                        bad.push(
+                            "the shared-primary guard must RECOGNISE the primary checkout".into(),
+                        );
+                    }
+                    if is_primary_checkout(&here) {
+                        bad.push(
+                            "control: the shared-primary guard must NOT fire in a linked worktree"
+                                .into(),
+                        );
+                    }
                 }
             }
         }
