@@ -2,25 +2,25 @@
 
 set -uo pipefail
 
-function write_structured_test_counts {
-    local executed=$1 filtered=$2 path=${DAGRUN_TEST_COUNTS_PATH:-} tmp
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+readonly SCRIPT_DIR
+readonly RESULT_WRITER="$SCRIPT_DIR/nextest-test-results.rs"
+
+function write_structured_test_results {
+    local events=$1 executed=$2 filtered=$3 path=${DAGRUN_TEST_COUNTS_PATH:-}
     [[ -n $path ]] || return 0
-    tmp="${path}.tmp.$$"
-    umask 077
-    if ! printf '{"schema":1,"executed_tests":%s,"filtered_tests":%s}\n' \
-        "$executed" "$filtered" >"$tmp"; then
-        printf 'run-nextest-counted: cannot write structured test counts to %s\n' "$tmp" >&2
+    if [[ -z $events ]]; then
+        printf 'run-nextest-counted: structured test results require nextest events\n' >&2
         return 2
     fi
-    if ! mv -f -- "$tmp" "$path"; then
-        rm -f -- "$tmp"
-        printf 'run-nextest-counted: cannot publish structured test counts to %s\n' "$path" >&2
+    if ! "$RESULT_WRITER" "$events" "$executed" "$filtered" "$path"; then
+        printf 'run-nextest-counted: cannot publish structured test results to %s\n' "$path" >&2
         return 2
     fi
 }
 
 function emit_libtest_count {
-    local log=$1 status=${2:-0} line finished='' initial='' passed=0 failed=0
+    local log=$1 status=${2:-0} events=${3:-} line finished='' initial='' passed=0 failed=0
     local exec_failed=0 timed_out=0 skipped=0 summary='' categories='' completed=0 executed=0
     local matches=0
     local header_re='Summary.*\][[:space:]]+([0-9]+)(/([0-9]+))?[[:space:]]+tests?[[:space:]]+run:[[:space:]]*(.*)$'
@@ -83,7 +83,7 @@ function emit_libtest_count {
     # clients consume this exact file instead. A command that merely prints a
     # libtest-looking banner therefore cannot manufacture an executed-test
     # count.
-    write_structured_test_counts "$executed" "$skipped" || return $?
+    write_structured_test_results "$events" "$executed" "$skipped" || return $?
 
     # Preserve the canonical libtest spelling for human-facing logs and older
     # dagrun clients that have not required the structured count file.
@@ -104,15 +104,26 @@ function emit_libtest_count {
 }
 
 function run_nextest {
-    local summary_log=$1 status count_status=0
-    shift
+    local summary_log=$1 events_log=$2 status count_status=0 stderr_fd tee_pid tee_status=0
+    shift 2
 
     set +e
-    cargo nextest run --color never "$@" 2>&1 | tee "$summary_log"
-    status=${PIPESTATUS[0]}
+    exec {stderr_fd}> >(tee "$summary_log" >&2)
+    tee_pid=$!
+    NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --color never \
+        --message-format libtest-json-plus --message-format-version 0.1 \
+        "$@" >"$events_log" 2>&$stderr_fd
+    status=$?
+    exec {stderr_fd}>&-
+    wait "$tee_pid" || tee_status=$?
     set -e
 
-    emit_libtest_count "$summary_log" "$status" || count_status=$?
+    if ((tee_status != 0)); then
+        printf 'run-nextest-counted: cannot retain nextest human report (tee exited %s)\n' \
+            "$tee_status" >&2
+        return 2
+    fi
+    emit_libtest_count "$summary_log" "$status" "$events_log" || count_status=$?
     if ((status != 0)); then
         return "$status"
     fi
@@ -130,11 +141,58 @@ function self_test {
     [[ $got == "$expected" ]] || return 1
 
     rm -f "$scratch/counts.json"
+    printf 'Summary [   0.300s] 2 tests run: 2 passed, 7 skipped\n' \
+        >"$scratch/structured-summary"
+    printf '%s\n' \
+        '{"type":"suite","event":"started","test_count":2,"nextest":{"crate":"suite","test_binary":"suite","kind":"lib"}}' \
+        '{"type":"test","event":"started","name":"suite::suite$passes"}' \
+        '{"type":"test","event":"ok","name":"suite::suite$passes","exec_time":0.1}' \
+        '{"type":"test","event":"started","name":"suite::suite$recovers"}' \
+        '{"type":"test","event":"ok","name":"suite::suite$recovers#2","exec_time":0.2}' \
+        '{"type":"suite","event":"ok","passed":2,"failed":0,"ignored":0,"measured":0,"filtered_out":7,"exec_time":0.3,"nextest":{"crate":"suite","test_binary":"suite","kind":"lib"}}' \
+        >"$scratch/events.jsonl"
     got=$(DAGRUN_TEST_COUNTS_PATH="$scratch/counts.json" \
-        emit_libtest_count "$scratch/with-skips" 0)
+        emit_libtest_count "$scratch/structured-summary" 0 "$scratch/events.jsonl")
+    expected=$'running 2 tests\ntest result: ok. 2 passed; 0 failed; 0 ignored; 7 filtered out'
     [[ $got == "$expected" ]] || return 1
-    [[ $(<"$scratch/counts.json") == \
-        '{"schema":1,"executed_tests":8,"filtered_tests":7}' ]] || return 1
+    python3 - "$scratch/counts.json" <<'PYEOF' || return 1
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    report = json.load(source)
+    assert report == {
+    "schema": 2,
+    "executed_tests": 2,
+    "filtered_tests": 7,
+    "results": [
+        {"id": "suite$passes", "result": "pass", "attempts": 1},
+        {"id": "suite$recovers", "result": "pass", "attempts": 2},
+    ],
+    }
+PYEOF
+
+    printf 'Summary [   0.200s] 1 test run: 0 passed, 1 failed, 3 skipped\n' \
+        >"$scratch/structured-failed-summary"
+    printf '%s\n' \
+        '{"type":"suite","event":"started","test_count":1,"nextest":{"crate":"suite","test_binary":"suite","kind":"lib"}}' \
+        '{"type":"test","event":"started","name":"suite::suite$fails"}' \
+        '{"type":"test","event":"failed","name":"suite::suite$fails","exec_time":0.2}' \
+        '{"type":"suite","event":"failed","passed":0,"failed":1,"ignored":0,"measured":0,"filtered_out":3,"exec_time":0.2,"nextest":{"crate":"suite","test_binary":"suite","kind":"lib"}}' \
+        >"$scratch/failed-events.jsonl"
+    DAGRUN_TEST_COUNTS_PATH="$scratch/failed-counts.json" \
+        emit_libtest_count "$scratch/structured-failed-summary" 100 \
+        "$scratch/failed-events.jsonl" >/dev/null || return 1
+    python3 - "$scratch/failed-counts.json" <<'PYEOF' || return 1
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    report = json.load(source)
+assert report["results"] == [
+    {"id": "suite$fails", "result": "fail", "attempts": 1},
+]
+PYEOF
 
     printf 'Summary [   0.003s] 1 test run: 1 passed\n' >"$scratch/no-skips"
     got=$(emit_libtest_count "$scratch/no-skips" 0)
@@ -168,17 +226,31 @@ function self_test {
     # Exercise the real wrapper path, not only its parser: a failed nextest run
     # must emit the count and still return nextest's original nonzero status.
     function cargo {
-        printf 'Summary [   0.010s] 12 tests run: 0 passed, 12 exec failed, 0 skipped\n'
+        printf '%s\n' \
+            '{"type":"suite","event":"started","test_count":0,"nextest":{"crate":"suite","test_binary":"suite","kind":"lib"}}' \
+            '{"type":"suite","event":"failed","passed":0,"failed":0,"ignored":0,"measured":0,"filtered_out":0,"exec_time":0.0,"nextest":{"crate":"suite","test_binary":"suite","kind":"lib"}}'
+        printf 'Summary [   0.010s] 12 tests run: 0 passed, 12 exec failed, 0 skipped\n' >&2
         return 100
     }
     set +e
-    got=$(run_nextest "$scratch/wrapper")
+    got=$(run_nextest "$scratch/wrapper" "$scratch/wrapper-events")
     status=$?
     set -e
     unset -f cargo
     [[ $status == 100 ]] || return 1
     [[ $got == *$'running 0 tests\ntest result: FAILED. nextest: 0 passed, 12 exec failed, 0 skipped; 0 filtered out' ]] || return 1
     [[ $got != *'test result: ok.'* ]] || return 1
+
+    printf '%s\n' \
+        '{"type":"test","event":"future","name":"suite::suite$case"}' \
+        >"$scratch/unknown-event.jsonl"
+    status=0
+    DAGRUN_TEST_COUNTS_PATH="$scratch/refused.json" \
+        emit_libtest_count "$scratch/with-skips" 0 "$scratch/unknown-event.jsonl" \
+        >/dev/null 2>"$scratch/refusal" || status=$?
+    [[ $status == 2 ]] || return 1
+    grep -q 'unsupported test event "future"' "$scratch/refusal" || return 1
+    [[ ! -e $scratch/refused.json ]] || return 1
 
     status=0
     printf 'not a nextest summary\n' >"$scratch/missing"
@@ -220,7 +292,7 @@ function self_test {
     [[ $status == 2 ]] || return 1
     export -n -f emit_libtest_count
 
-    printf 'run-nextest-counted: self-test PASS (7 positive, 7 refusal)\n'
+    printf 'run-nextest-counted: self-test PASS (8 positive, 7 refusal)\n'
 }
 
 if [[ ${1:-} == --self-test ]]; then
@@ -229,5 +301,6 @@ if [[ ${1:-} == --self-test ]]; then
 fi
 
 summary_log=$(mktemp)
-trap 'rm -f "$summary_log"' EXIT
-run_nextest "$summary_log" "$@"
+events_log=$(mktemp)
+trap 'rm -f "$summary_log" "$events_log"' EXIT
+run_nextest "$summary_log" "$events_log" "$@"
