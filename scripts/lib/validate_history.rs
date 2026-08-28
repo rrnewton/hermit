@@ -203,18 +203,27 @@ fn failure_row_blocks_pass_cache(row: &serde_json::Value, key: &CacheKey<'_>) ->
     if !conditions_are_solo {
         return false;
     }
-    let typed_cell_divergence = row
-        .get("cell_results")
-        .and_then(|value| value.get("cells"))
-        .and_then(|value| value.as_array())
-        .is_some_and(|cells| {
-            cells.iter().any(|cell| {
-                cell.get("cell_verdict")
-                    .and_then(|verdict| verdict.get("state"))
-                    .and_then(|state| state.as_str())
-                    == Some("compared-and-diverged")
-            })
-        });
+    // Read the outer version before interpreting the nested shape. A newer
+    // schema may retain familiar field names with different meaning; accepting
+    // one recognizable state before checking the version would grant an
+    // unsupported row failure authority.
+    let typed_cell_divergence = i(row, "schema_version").is_some_and(|schema| {
+        (crate::validate_cell_results::CELL_RESULTS_LEDGER_SCHEMA_MIN
+            ..=crate::validate_cell_results::CELL_RESULTS_LEDGER_SCHEMA_VERSION)
+            .contains(&schema)
+            && row
+                .get("cell_results")
+                .and_then(|value| value.get("cells"))
+                .and_then(|value| value.as_array())
+                .is_some_and(|cells| {
+                    cells.iter().any(|cell| {
+                        cell.get("cell_verdict")
+                            .and_then(|verdict| verdict.get("state"))
+                            .and_then(|state| state.as_str())
+                            == Some("compared-and-diverged")
+                    })
+                })
+    });
     if typed_cell_divergence {
         return true;
     }
@@ -538,6 +547,7 @@ pub fn self_test() -> Result<String, String> {
 
     // A FAIL lookup must not require the pass conditions (a fail is noted, not reused).
     let failing = base(serde_json::json!({
+        "schema_version": crate::validate_cell_results::CELL_RESULTS_LEDGER_SCHEMA_VERSION,
         "result": "fail", "failures": 3, "producer": "hermit-validate-rs",
         "dag_jobs": 4, "concurrent_validates": 0,
         "gates_expected": 1, "gates_run": 1,
@@ -547,6 +557,20 @@ pub fn self_test() -> Result<String, String> {
     }));
     if cache_lookup(std::slice::from_ref(&failing), "fail", &key).is_none() {
         return Err("cache: a prior FAIL record must be findable so it can be reported".into());
+    }
+
+    // The outer version is authoritative. A future shape that happens to keep
+    // today's nested state spelling remains readable but cannot poison a pass
+    // cache until this reader explicitly supports that schema.
+    let mut newer_failing = failing.clone();
+    newer_failing["schema_version"] = serde_json::json!(
+        crate::validate_cell_results::CELL_RESULTS_LEDGER_SCHEMA_VERSION + 1
+    );
+    if cache_lookup(&[newer_failing, rs_pass.clone()], "pass", &key).is_none() {
+        return Err(
+            "cache: an unsupported newer cell-results schema must not gain failure authority"
+                .into(),
+        );
     }
 
     // The two historical orderings are both refused: fail-then-pass and

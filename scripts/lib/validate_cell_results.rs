@@ -30,6 +30,7 @@ use sha2::Sha256;
 /// complete current comparison object; a missing or additional field is kept
 /// out of the compared-verdict projection instead of changing this shape under
 /// the same version.
+pub const CELL_RESULTS_LEDGER_SCHEMA_MIN: i64 = 6;
 pub const CELL_RESULTS_LEDGER_SCHEMA_VERSION: i64 = 7;
 
 #[derive(Debug)]
