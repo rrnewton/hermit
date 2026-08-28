@@ -6374,10 +6374,7 @@ silent when empty)"
 fn ledger_gate_result(outcome: &StepOutcome) -> &'static str {
     if outcome.ok {
         "pass"
-    } else if outcome.aborted
-        || outcome_is_no_result(outcome)
-        || reason_is_budget_breach(&outcome.reason)
-    {
+    } else if outcome.aborted || outcome_is_no_result(outcome) {
         "no_result"
     } else {
         "fail"
@@ -8016,7 +8013,6 @@ fn attempt_classification(attempt: &NodeAttempt) -> NodeClassification {
         || attempt.ok.is_none()
         || attempt.aborted
         || attempt_is_no_result(attempt)
-        || reason_is_budget_breach(&attempt.reason)
     {
         return NodeClassification::NoResult;
     }
@@ -8065,10 +8061,7 @@ fn node_classification(outcome: &StepOutcome, attempts: &[NodeAttempt]) -> NodeC
     }
     if outcome.ok {
         NodeClassification::Pass
-    } else if outcome.aborted
-        || outcome_is_no_result(outcome)
-        || reason_is_budget_breach(&outcome.reason)
-    {
+    } else if outcome.aborted || outcome_is_no_result(outcome) {
         NodeClassification::NoResult
     } else {
         NodeClassification::ProductFailure
@@ -13168,15 +13161,45 @@ fn no_result_propagation_bracket() -> Result<(), String> {
         );
     }
 
-    let timeout = StepOutcome {
+    let completed_timeout = StepOutcome {
         reason: format!("{WALL_BUDGET_REASON_PREFIX} 15s"),
         ..outcome("timeout", -15, false)
     };
-    let timeout_attempt = reported_attempt(&timeout, 1);
-    if node_classification(&timeout, std::slice::from_ref(&timeout_attempt))
-        != NodeClassification::NoResult
+    let completed_timeout_attempt = reported_attempt(&completed_timeout, 1);
+    let completed_timeout_gate = ledger_gate_with_attempts(
+        &completed_timeout,
+        std::slice::from_ref(&completed_timeout_attempt),
+    );
+    if node_classification(
+        &completed_timeout,
+        std::slice::from_ref(&completed_timeout_attempt),
+    ) != NodeClassification::ProductFailure
+        || completed_timeout_gate["result"] != "fail"
+        || completed_timeout_gate["failure_origin"] != "outer_gate"
     {
-        return Err("retry taxonomy: an undiagnosed timeout became a product failure".into());
+        return Err(
+            "retry taxonomy: a completed budget breach did not remain a product failure".into(),
+        );
+    }
+
+    let killed_before_result = unreported_attempt("killed-before-result".into(), 1);
+    let killed_outcome = outcome("killed-before-result", -15, true);
+    let killed_gate = ledger_gate_with_attempts(
+        &killed_outcome,
+        std::slice::from_ref(&killed_before_result),
+    );
+    if node_classification(
+        &killed_outcome,
+        std::slice::from_ref(&killed_before_result),
+    ) != NodeClassification::NoResult
+        || killed_gate["result"] != "no_result"
+        || !killed_gate["failure_origin"].is_null()
+        || killed_gate.get("failed_substeps").is_some()
+    {
+        return Err(
+            "retry taxonomy: an execution killed before producing a result became product red"
+                .into(),
+        );
     }
 
     let planned = BTreeSet::from(["pass".to_string(), "failure".to_string()]);
@@ -13250,8 +13273,9 @@ fn no_result_propagation_bracket() -> Result<(), String> {
     }
 
     println!(
-        "  no-result propagation: retry pass green; any product failure red; all-infrastructure \
-         and timeout no-result; super preserved the split; complete green/red stayed complete"
+        "  no-result propagation: retry pass green; any product failure and completed timeout \
+         red; all-infrastructure and a kill before result no-result; super preserved the split; \
+         complete green/red stayed complete"
     );
     Ok(())
 }
