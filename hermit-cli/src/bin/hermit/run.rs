@@ -3913,6 +3913,17 @@ impl RunOpts {
         };
         let failure_message = "Failure: nondeterministic.";
         let summary2 = read_verify_summary(summary2_path);
+        let skid_overshoots = skid_overshoots_run1.saturating_add(skid_overshoots_run2);
+        if skid_overshoots > 0
+            && let Some(path) = &self.verify_json
+        {
+            write_skid_overshoot_without_comparison_json(
+                path,
+                skid_overshoots,
+                verification_runtime_from_summaries(summary1.as_ref(), summary2.as_ref()),
+                Some(out1.status),
+            )?;
+        }
         let mut outcome = compare_two_runs(
             ComparedRun {
                 output: &out1,
@@ -3936,7 +3947,6 @@ impl RunOpts {
         // outcome to the historical exit-code convention. The verdict is recorded
         // whether or not the runs matched, and independent of the guest's own
         // exit status.
-        let skid_overshoots = skid_overshoots_run1.saturating_add(skid_overshoots_run2);
         if let Some(path) = &self.verify_json {
             if skid_overshoots > 0 {
                 write_skid_overshoot_verification_json(path, &outcome, skid_overshoots)?;
