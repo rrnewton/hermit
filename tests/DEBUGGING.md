@@ -526,6 +526,14 @@ stated explicitly.
   It remained after the `/proc/maps` fix in
   https://github.com/rrnewton/hermit/pull/2693. It is a backend-mechanism test,
   not a compatibility-corpus cell.
+- **Renamed 2026-08-28, and the behaviour it asserted is gone.** This test is now
+  `liteinst_fork_runs_without_hanging`. Reverie stopped refusing `clone`/`clone3`/`fork`
+  under the LiteInst hybrid, so the assertion was updated from "the run is refused" to
+  "the guest runs and prints `fork-ok`". The observations above are kept as written
+  because they record what was measured at the time, under the old name and the old
+  contract; they are not a claim about the current test. See
+  https://github.com/rrnewton/reverie/pull/447 and
+  https://github.com/rrnewton/hermit/pull/2816.
 
 ### `hermit::liteinst_advanced$liteinst_thread_clone_fails_closed_without_sigsys`
 
@@ -539,6 +547,14 @@ stated explicitly.
 - Findings: same matched-runtime fail-closed boundary as the preceding test,
   without the missing-revision staging explanation. It is also a
   backend-mechanism test rather than a compatibility-corpus cell.
+- **Renamed 2026-08-28, and the behaviour it asserted is gone.** This test is now
+  `liteinst_thread_clone_runs_without_sigsys`. Reverie stopped refusing `clone`/`clone3`/`fork`
+  under the LiteInst hybrid, so the assertion was updated from "the run is refused" to
+  "the guest runs and prints `threads-ok`". The observations above are kept as written
+  because they record what was measured at the time, under the old name and the old
+  contract; they are not a claim about the current test. See
+  https://github.com/rrnewton/reverie/pull/447 and
+  https://github.com/rrnewton/hermit/pull/2816.
 
 ### `hermit::sabre_examples$sabre_non_racy_examples_verify_current_envelope`
 

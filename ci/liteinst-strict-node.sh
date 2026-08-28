@@ -10,9 +10,13 @@
 #
 # WHY THIS EXISTS. `hermit-cli/tests/common/liteinst.rs` asserts on the staged
 # runtime from inside a `#[test]`, and a panic in a test is a FAILURE. So "the
-# LiteInst runtime is not staged" (a SETUP condition -- fix your checkout) and
-# "the clone boundary is not enforced" (a product defect -- the thing these tests
-# exist to catch) produce the SAME red on this node. Measured on the owner's run
+# LiteInst runtime is not staged" (a SETUP condition -- fix your checkout) and a
+# real product defect -- the thing these tests exist to catch -- produce the SAME
+# red on this node. That second case used to be spelled "the clone boundary is
+# not enforced". Since Reverie began following threads and child processes it is
+# the opposite: a boundary REAPPEARING, which is what
+# `liteinst_thread_clone_runs_without_sigsys` and `liteinst_fork_runs_without_hanging`
+# now catch by requiring the guest to run. Measured on the owner's run
 # at 4e168f2aa5b9: 23 tests ran, 1 passed, 22 FAILED, and every one of the 22
 # carried the same setup refusal -- "the staged LiteInst runtime ... records no
 # Reverie revision". The node was counted as one of nine blocking product
