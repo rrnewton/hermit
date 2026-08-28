@@ -73,6 +73,8 @@ fn assert_l2(case: &ProgramCase) {
             "--verify",
             "--panic-on-unsupported-syscalls",
             "--base-env=minimal",
+            "--mount=type=tmpfs,target=/test",
+            "--workdir=/test",
             "--",
         ])
         .arg(&program)
@@ -108,6 +110,8 @@ fn read_self_schedstat() -> Vec<u8> {
         "--strict",
         "--panic-on-unsupported-syscalls",
         "--base-env=minimal",
+        "--mount=type=tmpfs,target=/test",
+        "--workdir=/test",
         "--",
         "/bin/cat",
         "/proc/self/schedstat",
