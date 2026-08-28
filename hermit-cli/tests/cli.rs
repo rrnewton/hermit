@@ -2790,6 +2790,7 @@ fn run_kvm_f_getfl_and_reads_standard_input() {
     assert_eq!(stdout(&output), "fcntl-stdin-ok\n");
 }
 
+// TODO(#2809): Restore this to test.cli_kvm after KVM --verify replays stdin faithfully.
 #[test]
 fn run_kvm_verify_f_getfl_with_isolated_standard_input() {
     if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/perl").exists() {
@@ -2816,6 +2817,7 @@ fn run_kvm_verify_f_getfl_with_isolated_standard_input() {
     assert!(stderr(&output).contains(":: Success: deterministic. Determinism verified."));
 }
 
+// TODO(#2809): Restore this to test.cli_kvm after KVM --verify replays stdin faithfully.
 #[test]
 fn run_kvm_verify_isolates_standard_input() {
     if !Path::new("/dev/kvm").exists() {
@@ -2885,6 +2887,7 @@ fn run_kvm_preserves_closed_standard_input() {
     );
 }
 
+// TODO(#2809): Restore this to test.cli_kvm after KVM --verify replays stdin faithfully.
 #[test]
 fn run_kvm_verify_does_not_write_to_standard_input() {
     if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/perl").exists() {
