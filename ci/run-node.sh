@@ -5,20 +5,21 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 #
-# run-node.sh — run one or more named DAG nodes from ci/dag/<lane>.json THROUGH
-# the tracked dagrun, WITHOUT running their dependencies.
+# run-node.sh — run named steps from validate's constructed plan without their
+# externally supplied dependencies.
 #
 # WHY (single-engine invariant): the parallel GitHub fan-out (ci-portable.yml)
 # shards the portable lane across many small jobs. Each shard must execute an
-# exact subset of the DAG against a prebuilt tree / restored cache produced by an
-# upstream build job. Historically this shim RE-IMPLEMENTED node execution in
+# exact subset of the plan against a prebuilt tree / restored cache produced by
+# an upstream build job. Historically this shim loaded ci/dag/<lane>.json itself,
+# missing validate's plan construction. It also RE-IMPLEMENTED node execution in
 # jq+bash (extract each node's `.cmd`, `bash -c` it) because the pinned runner
 # predated its `run --only` node selector. That made GitHub Actions a SECOND
 # execution engine that diverged from the runner: it ignored each node's
 # jobs_flag, timeout, cpu_timeout, and cgroup boxing. This rewrite kills that
-# divergence — every node now runs through the SAME `dagrun run`
-# entrypoint that scripts/validate.rs and run-dag.sh use, so ci/dag/<lane>.json is the
-# single source of truth for both the command AND its resource policy.
+# divergence. Hosted execution now asks scripts/validate.rs to construct the
+# ordinary plan and retain the requested tags. The raw-lane path below remains
+# only for the explicitly edited, local-only command mode.
 #
 # REQUIRES the pinned agent-utils runner to support `run --only` (added upstream
 # in the same commit as the tracked common/bin engine resolver and
@@ -118,6 +119,29 @@ if (($# > 0)); then
         exit 2
     fi
     append=("$@")
+fi
+
+if ((${#append[@]} == 0)); then
+    case "$lane" in
+        portable) profile=(portable-only) ;;
+        privileged) profile=(--privileged-only) ;;
+        *)
+            echo "run-node.sh: unknown lane '$lane' (expected portable or privileged)" >&2
+            exit 2
+            ;;
+    esac
+    jobs=${RUN_NODE_JOBS:-1}
+    extra=(--allow-local-off-the-record-run --selected "$sel" \
+        --ignore-selected-deps --no-label-pr -j "$jobs" --verbose)
+    if [[ -n ${GITHUB_ACTIONS:-} || -n ${CI:-} ]]; then
+        extra+=(--allow-cgroup-failure \
+            --skip-inner-dirty-working-tree-and-rebase-freshness-checks)
+    fi
+    if [[ -n ${RUN_NODE_PRINT_ONLY:-} ]]; then
+        extra+=(--show-plan)
+    fi
+    echo "run-node.sh: lane=$lane nodes=$sel -j$jobs via validate's constructed plan" >&2
+    exec ./scripts/validate.rs "${profile[@]}" "${extra[@]}"
 fi
 
 dag="$ROOT_DIR/ci/dag/${lane}.json"

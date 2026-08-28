@@ -351,6 +351,9 @@ struct Args {
     reuse_parent_manifest_gate: bool,
     self_test: bool,
     show_plan: bool,
+    show_plan_json: bool,
+    selected: Option<String>,
+    ignore_selected_deps: bool,
 }
 
 const SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION: &str =
@@ -421,6 +424,9 @@ fn usage() -> &'static str {
      \x20 --sequential-lanes  Diagnostic fallback: run full lanes back to back.\n\
      \x20 --show-plan      Print the outer boxed DAG nodes, caps, and dependencies and exit.\n\
      \x20                  It does not enumerate Rust test IDs or E2E cells.\n\
+     \x20 --show-plan-json Print the constructed plan before environment wrapping as JSON.\n\
+     \x20 --selected <group.job>[,...]  Keep these steps from the constructed plan.\n\
+     \x20 --ignore-selected-deps       Omit predecessors supplied by an external harness.\n\
      \x20 --self-test      Run inert policy/data brackets plus one bounded disposable\n\
      \x20                  nested-cgroup check, then exit.\n\
      \x20 -h, --help       Show this help and exit.\n\
@@ -526,10 +532,14 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         reuse_parent_manifest_gate: false,
         self_test: false,
         show_plan: false,
+        show_plan_json: false,
+        selected: None,
+        ignore_selected_deps: false,
     };
     let mut shallow = false;
     let mut selective = false;
     let mut show_plan = false;
+    let mut show_plan_json = false;
     let mut envelope = false;
     let mut envelope_baseline: Option<PathBuf> = None;
 
@@ -589,6 +599,21 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
                 }
             }
             "--show-plan" => show_plan = true,
+            "--show-plan-json" => {
+                show_plan = true;
+                show_plan_json = true;
+            }
+            "--selected" => {
+                i += 1;
+                match argv.get(i) {
+                    Some(v) if !v.is_empty() => args.selected = Some(v.clone()),
+                    _ => {
+                        eprintln!("validate: --selected needs <group.job>[,<group.job>...]");
+                        return Err(2);
+                    }
+                }
+            }
+            "--ignore-selected-deps" => args.ignore_selected_deps = true,
             "--selective" | "--since-green" => selective = true,
             "--shallow-select" => {
                 selective = true;
@@ -699,9 +724,21 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         return Err(2);
     }
     args.show_plan = show_plan;
+    args.show_plan_json = show_plan_json;
     args.focused = focused.pop();
     if args.allow_local_off_the_record_run {
         args.label_pr = false;
+    }
+    if args.ignore_selected_deps && args.selected.is_none() {
+        eprintln!("validate: --ignore-selected-deps requires --selected");
+        return Err(2);
+    }
+    if args.selected.is_some() && !args.allow_local_off_the_record_run && !args.show_plan {
+        eprintln!(
+            "validate: --selected is partial execution and requires \
+             --allow-local-off-the-record-run; it cannot publish validation evidence"
+        );
+        return Err(2);
     }
     if args.reuse_parent_manifest_gate
         && (!matches!(args.focused, Some(Focused::PortableStrictCompat))
@@ -4259,6 +4296,9 @@ fn local_off_the_record_refusal(args: &Args, dirty: bool) -> Option<String> {
     if !args.allow_local_off_the_record_run {
         return None;
     }
+    if args.show_plan {
+        return None;
+    }
     if dirty {
         return Some(format!(
             "validate: REFUSED — {ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION} still requires a clean, \
@@ -4266,7 +4306,7 @@ fn local_off_the_record_refusal(args: &Args, dirty: bool) -> Option<String> {
              then retry the narrowed command."
         ));
     }
-    if args.focused.is_none() && args.level != Level::Quick {
+    if args.focused.is_none() && args.level != Level::Quick && args.selected.is_none() {
         return Some(format!(
             "validate: REFUSED — {ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION} is only for quick or \
              focused iterative testing. A full-cost validate belongs in ci-hub.\n\
@@ -4483,6 +4523,92 @@ impl Default for Plan {
             cell_evidence_expected: None,
         }
     }
+}
+
+/// Keep a subgraph of the plan that validate has already constructed.
+///
+/// This deliberately knows nothing about lane files, lane fusion, deduplication,
+/// or the predecessor edges those transformations add. It sees only the
+/// `DagConfig` returned by plan construction. With dependencies
+/// enabled it closes over predecessors; with `--ignore-selected-deps` it keeps
+/// only edges whose endpoints are both selected because an external harness is
+/// responsible for supplying the omitted predecessors' artifacts.
+fn select_constructed_steps(
+    plan: &mut Plan,
+    selected: &str,
+    ignore_selected_deps: bool,
+) -> Result<(), String> {
+    if plan.second.is_some() {
+        return Err(
+            "--selected requires one constructed DAG; use the merged full plan or one lane"
+                .into(),
+        );
+    }
+    let requested: BTreeSet<String> = selected
+        .split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_string)
+        .collect();
+    if requested.is_empty() {
+        return Err("--selected needs at least one group.job tag".into());
+    }
+    let dependencies: BTreeMap<String, Vec<String>> = plan
+        .cfg
+        .steps
+        .iter()
+        .map(|step| (step.tag(), step.deps.clone()))
+        .collect();
+    let available: BTreeSet<String> = dependencies.keys().cloned().collect();
+    let unknown: Vec<String> = requested.difference(&available).cloned().collect();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "--selected named step(s) absent from the constructed {} plan: {}. Selectable tags: {}",
+            plan.profile,
+            unknown.join(", "),
+            available.iter().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    let mut keep = requested;
+    if !ignore_selected_deps {
+        let mut pending: Vec<String> = keep.iter().cloned().collect();
+        while let Some(tag) = pending.pop() {
+            for dependency in dependencies.get(&tag).into_iter().flatten() {
+                if available.contains(dependency) && keep.insert(dependency.clone()) {
+                    pending.push(dependency.clone());
+                }
+            }
+        }
+    }
+    let before = plan.cfg.steps.len();
+    let mut pruned_edges = 0usize;
+    plan.cfg.steps.retain_mut(|step| {
+        if !keep.contains(&step.tag()) {
+            return false;
+        }
+        let before = step.deps.len();
+        step.deps.retain(|dependency| keep.contains(dependency));
+        pruned_edges += before - step.deps.len();
+        true
+    });
+    plan.planned_test_nodes.retain(|tag| keep.contains(tag));
+    plan.nonblocking.retain(|tag| keep.contains(tag));
+    plan.selection_mode = "selected";
+    plan.suite_complete = false;
+    plan.cacheable = false;
+    eprintln!(
+        "validate: selected {}/{} constructed step(s); omitted {} predecessor edge(s){}",
+        plan.cfg.steps.len(),
+        before,
+        pruned_edges,
+        if ignore_selected_deps {
+            " because their artifacts are supplied externally"
+        } else {
+            ""
+        }
+    );
+    Ok(())
 }
 
 /// Withhold every planned node this MACHINE provably cannot run, and say so.
@@ -14763,7 +14889,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     //
     // The boxing re-exec is the SAME logical run, not a nested one. Only the
     // process that survives the re-exec should claim the marker.
-    if nesting.nested && args.focused.is_none() {
+    if nesting.nested && args.focused.is_none() && !args.show_plan {
         let outer = nesting.outer_pid.unwrap_or(-1);
         eprintln!(
             "validate: refusing to re-enter a full validation level from inside validate (outer \
@@ -15092,18 +15218,37 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         }
     };
 
+    // Ask the plan constructor for a subgraph before execution-environment
+    // wrapping adds host-specific setup. This is the stable boundary shared by
+    // local and hosted execution: both start with the same constructed commands,
+    // caps, and edges; the hosted harness supplies omitted predecessors.
+    if let Some(selected) = &args.selected {
+        if let Err(error) =
+            select_constructed_steps(&mut plan, selected, args.ignore_selected_deps)
+        {
+            return RunSummary::refused(
+                2,
+                &plan.profile,
+                "constructed-plan selection",
+                vec![error],
+            );
+        }
+    }
+
     // The public environment variable is the per-cell gate, not proof that the
     // validate driver itself is already inside the pinned root. Only the exact
     // internal strict-compat payload established above may suppress another
     // wrapper; otherwise an operator-supplied variable could bypass the base
     // image for an entire top-level validation.
-    if let Err(error) = apply_pinned_root(&mut plan, &root, internal_pinned_payload) {
-        return RunSummary::refused(
-            3,
-            &plan.profile,
-            "pinned-root plan construction",
-            vec![error],
-        );
+    if args.selected.is_none() && !args.show_plan_json {
+        if let Err(error) = apply_pinned_root(&mut plan, &root, internal_pinned_payload) {
+            return RunSummary::refused(
+                3,
+                &plan.profile,
+                "pinned-root plan construction",
+                vec![error],
+            );
+        }
     }
 
     assign_fail_fast_families(&mut plan);
@@ -15265,6 +15410,33 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         let mut all: Vec<&DagConfig> = vec![&plan.cfg];
         if let Some(s) = &plan.second {
             all.push(s);
+        }
+        if args.show_plan_json {
+            let dags = all
+                .iter()
+                .map(|cfg| {
+                    serde_json::json!({
+                        "description": cfg.description,
+                        "steps": cfg.steps.iter().map(|step| serde_json::json!({
+                            "tag": step.tag(),
+                            "deps": step.deps,
+                        })).collect::<Vec<_>>(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "profile": plan.profile,
+                    "selection_mode": plan.selection_mode,
+                    "dags": dags,
+                }))
+                .expect("constructed plan is serializable")
+            );
+            return RunSummary::new(Verdict::PlanOnly, 0, &plan.profile, vec![
+                "--show-plan-json: constructed outer steps printed".into(),
+                "nothing was executed and no ledger row was written".into(),
+            ]);
         }
         println!("profile: {}  selection: {}", plan.profile, plan.selection_mode);
         for (i, cfg) in all.iter().enumerate() {

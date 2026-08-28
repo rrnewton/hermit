@@ -181,37 +181,6 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "selection: decision=$decision debug_shards=$run_dbg release_shards=$run_rel e2e=$run_e2e backends=[$backends] build_debug=$build_debug build_release=$build_release" >&2
 
-  # The Reverie pin is a forward-only pointer into its linear main history.
-  # An off-history or regressing pin cannot produce validation evidence.
-  reverie-pin:
-    name: Reverie pin is an ancestor and advances monotonically
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-      # MONOTONICITY NEEDS A BASE, and a bare checkout@v4 is depth 1 with no
-      # origin/main -- so the monotonicity clause would have been INERT in the
-      # very job that exists to enforce it. The checker now refuses rather than
-      # skipping when the base is unresolvable, which turns that silent hole
-      # into a loud one; this fetch is what makes the job answerable. Fetching
-      # just main is far cheaper than fetch-depth: 0.
-      - name: Fetch the monotonicity base (origin/main)
-        run: git fetch --no-tags --quiet origin main:refs/remotes/origin/main
-      - name: Require an ancestor of Reverie main that never regresses
-        run: |
-          set -euo pipefail
-          ./ci/run-reverie-pin-check.sh --self-test
-          ./ci/run-reverie-pin-check.sh
-      - name: Reject a stale nested-workspace Cargo.lock before the opaque --locked build failure
-        run: |
-          set -euo pipefail
-          nested_checker="$RUNNER_TEMP/check-nested-lockfiles"
-          nested_checker_tests="$RUNNER_TEMP/check-nested-lockfiles-tests"
-          RUSTUP_TOOLCHAIN=stable rustc --edition=2021 --test scripts/check-nested-lockfiles.rs -o "$nested_checker_tests"
-          "$nested_checker_tests"
-          RUSTUP_TOOLCHAIN=stable rustc --edition=2021 scripts/check-nested-lockfiles.rs -o "$nested_checker"
-          "$nested_checker"
-
   # ---------------------------------------------------------------- plan (cheap)
   # Fail-closed integrity guard over the shard map itself. Runs UNCONDITIONALLY
   # (it has no `needs: select`) so a corrupt ci/portable-shards.json reds the
@@ -222,9 +191,15 @@ jobs:
   plan:
     name: Verify shard/DAG coverage
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - name: Initialize dagrun submodule
+        run: git submodule update --init agent-utils
+      - name: Install rust-script
+        env:
+          RUSTFLAGS: ""
+        run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
       - name: Fail-closed shard/DAG coverage guard
         run: ./ci/check-shard-coverage.sh
       - name: List audited shards (informational)
@@ -405,57 +380,19 @@ jobs:
           test -n "$runtime"
           test -f "$runtime"
           install -Dm755 "$runtime" target/debug/deps/libdetcore_dbt.so
-      - name: Enumerate portable (mode x manifest block x backend) e2e cells
+      - name: Enumerate constructed portable E2E steps
         id: cells
-        env:
-          # Space-separated backend allowlist from the selection job. "ALL" (or a
-          # full run) means no filtering; an empty string means no e2e cells were
-          # selected (e.g. a scoped change that touches only unit shards).
-          CELL_BACKENDS: ${{ needs.select.outputs.cell_backends }}
         run: |
           set -euo pipefail
-          # Single-dash default: an EMPTY CELL_BACKENDS is the deliberate "no e2e
-          # cells selected" signal and must stay empty; only a genuinely UNSET
-          # variable (which select never produces) falls back to the full set.
-          backends="${CELL_BACKENDS-ALL}"
-          if [[ -z "$backends" ]]; then
-            # No e2e cells selected: emit an empty matrix. The e2e job and the
-            # regular gate's folded-in reduction are gated off (run_e2e=false)
-            # and never consume it.
-            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
-            echo "count=0" >> "$GITHUB_OUTPUT"
-            echo "No e2e cells selected; emitting empty cell matrix." >&2
-            exit 0
-          fi
-          plan=$(target/debug/test-harness plan --lane portable --ci-only --format json)
-          matrix=$(jq -c '
-            [ .[] | {
-                category,
-                mode,
-                backend: (.backend // "naked")
-              }
-            ]
-            | unique
-            | sort_by(.category, .mode, .backend)
-            | { include: map(. + {
-                slug: (.category + "__" + .mode + "__" + .backend)
-              }) }
-          ' <<<"$plan")
-          if [[ "$backends" != "ALL" ]]; then
-            # Keep only cells whose backend is in the selected allowlist. "naked"
-            # (mode-only, no backend) cells stay whenever any backend is selected,
-            # because they exercise shared harness/CLI paths a scoped change hits.
-            matrix=$(jq -c --arg b "$backends" '
-              ($b | split(" ")) as $keep
-              | { include: [ .include[] | select((.backend == "naked") or (.backend as $x | $keep | index($x))) ] }
-            ' <<<"$matrix")
-          fi
+          matrix=$(jq -c '{include: [.e2e_nodes[] | {
+            node: ., slug: (sub("^e2e\\.manifest_"; ""))
+          }]}' ci/portable-shards.json)
           count=$(jq '.include | length' <<<"$matrix")
-          [[ "$count" -gt 0 ]] || { echo "empty portable cell matrix after backend filter ($backends)" >&2; exit 1; }
+          [[ "$count" -gt 0 ]] || { echo "constructed portable E2E step matrix is empty" >&2; exit 1; }
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "count=$count" >> "$GITHUB_OUTPUT"
-          echo "Fanning out $count portable e2e cells (backends=$backends):" >&2
-          jq -r '.include[] | "  - \(.mode) x \(.category) x \(.backend)"' <<<"$matrix" >&2
+          echo "Fanning out $count constructed portable E2E steps:" >&2
+          jq -r '.include[] | "  - \(.node)"' <<<"$matrix" >&2
       - name: Pack debug prebuilt tree
         run: |
           set -euo pipefail
@@ -520,6 +457,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang cmake file g++ gcc git jq libelf-dev libunwind-dev liblzma-dev make pkg-config python3-full zlib1g-dev zstd
+      - name: Install rust-script
+        env:
+          RUSTFLAGS: ""
+        run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
       # Reproduce EXACTLY the release build nodes from portable.json (no drift):
       # build.dbt_release, build.sabre_release, build.liteinst_runtime_release.
       - name: Run release build nodes (dbt + sabre + liteinst)
@@ -601,11 +542,8 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
-      # The strict-compat node runs `scripts/validate.rs` directly through
-      # `#!/usr/bin/env rust-script`. No
-      # runner image ships that interpreter, and no workflow installed it, so
-      # the exec fails with status 127 before any test runs -- a step that dies
-      # in 0.1s having measured nothing, which reads like a product failure.
+      # run-node.sh enters every shard through scripts/validate.rs, whose
+      # interpreter is rust-script. No runner image ships it.
       #
       # Compiling the driver instead of installing the interpreter is not an
       # option here: validate.rs carries an embedded `//! ```cargo` manifest and
@@ -617,15 +555,15 @@ jobs:
       # list rust-script in its supported-tool manifest, so it would silently
       # take an unverified fallback path. A pinned `cargo install` is slower but
       # its failure mode is legible, which is the whole point of this fix.
-      - name: Install rust-script (strict-compat shard)
-        if: matrix.slug == 'strict-compat'
+      - name: Install rust-script
+        env:
+          RUSTFLAGS: ""
         run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
       # Fail with a diagnostic naming the interpreter rather than letting the
       # shard die at exec. `env` reports the missing program on stderr and the
       # shell exits 127, but neither string contains "error", so the standard
       # log triage grep misses it entirely.
-      - name: Verify rust-script resolves (strict-compat shard)
-        if: matrix.slug == 'strict-compat'
+      - name: Verify rust-script resolves
         run: |
           if ! command -v rust-script >/dev/null; then
             echo "::error::rust-script is not on PATH; scripts/validate.rs would die at exec with status 127."
@@ -728,17 +666,9 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
-      # check.dbt_runtime_abi runs scripts/check-dbt-runtime-abi.rs, which carries
-      # `#!/usr/bin/env -S rust-script --force`. No runner image ships that
-      # interpreter (see the strict-compat shard's note), so without this the node
-      # would die at exec with status 127 having compared no symbols -- the exact
-      # failure this shard's node exists to make legible, reproduced one level up.
-      # Gated to dbt-parity because it is the only release shard that runs a
-      # rust-script node, and a ~1-min `cargo install` on sabre and liteinst would
-      # buy them nothing. Same RUST_SCRIPT_VERSION pin as the other three jobs so
-      # one interpreter resolves every shebang in this workflow.
-      - name: Install rust-script (dbt-parity shard)
-        if: matrix.slug == 'dbt-parity'
+      # run-node.sh enters every release shard through scripts/validate.rs, and
+      # check.dbt_runtime_abi also uses rust-script directly.
+      - name: Install rust-script
         # RUSTFLAGS is cleared for the same reason as the preflight and
         # build-debug installs (d9aa6066): the workflow-level
         # `-C link-arg=-llzma` describes Hermit's own build and breaks a tool
@@ -749,8 +679,7 @@ jobs:
         env:
           RUSTFLAGS: ""
         run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
-      - name: Verify rust-script resolves (dbt-parity shard)
-        if: matrix.slug == 'dbt-parity'
+      - name: Verify rust-script resolves
         run: |
           if ! command -v rust-script >/dev/null; then
             echo "::error::rust-script is not on PATH; check.dbt_runtime_abi would die at exec with status 127."
@@ -789,7 +718,7 @@ jobs:
 
   # ------------------------------------------------------------- e2e cells
   e2e:
-    name: "e2e: ${{ matrix.slug }}"
+    name: "e2e step: ${{ matrix.slug }}"
     needs: [select, build-debug, build-release]
     if: needs.select.outputs.run_e2e != 'false'
     runs-on: ubuntu-latest
@@ -798,7 +727,8 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.build-debug.outputs.e2e_matrix) }}
     env:
-      E2E_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.slug }}
+      E2E_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+      E2E_RESULT_ROOT: ignored/e2e/${{ matrix.slug }}
     steps:
       - uses: actions/checkout@v4
       - name: Initialize dagrun submodule
@@ -807,6 +737,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
+      - name: Install rust-script
+        env:
+          RUSTFLAGS: ""
+        run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
       - name: Enable unprivileged user and mount namespaces
         run: |
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
@@ -832,30 +766,22 @@ jobs:
           test -x target/release/hermit
       - name: Publish verified immutable Hermit E2E artifact
         run: ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path target/install_pkg
-      - name: Run cell (${{ matrix.mode }} x ${{ matrix.category }} x ${{ matrix.backend }})
-        run: |
-          set -euo pipefail
-          out="ignored/e2e/portable/${{ matrix.slug }}"
-          args=(target/debug/test-harness run --lane portable --category "${{ matrix.category }}" \
-            --mode "${{ matrix.mode }}")
-          if [[ "${{ matrix.backend }}" == "naked" ]]; then
-            :
-          else
-            args+=(--backend "${{ matrix.backend }}")
-          fi
-          ./ci/run-with-hermit-e2e-artifact.sh --require-install "${args[@]}" \
-            --ci-only --allow-empty --prebuilt \
-            --results "$out/results.jsonl" --junit "$out/junit.xml"
+      - name: Run constructed step (${{ matrix.node }})
+        env:
+          RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
+        run: ./ci/run-node.sh portable "${{ matrix.node }}"
       - name: Pack deterministic parity transport archive
         if: always()
         env:
           SLUG: ${{ matrix.slug }}
+          NODE: ${{ matrix.node }}
         run: |
           set -euo pipefail
-          out="ignored/e2e/portable/$SLUG"
+          job=${NODE#e2e.}
+          out="$E2E_RESULT_ROOT/portable/$job"
           captures="ignored/e2e/runs/$E2E_RUN_ID"
           stage="ignored/parity/$SLUG/parity-v1"
-          artifact="parity-v1-${{ github.run_id }}-${{ github.run_attempt }}-portable-${{ matrix.mode }}-${{ matrix.category }}-${{ matrix.backend }}.tar.zst"
+          artifact="parity-v1-${{ github.run_id }}-${{ github.run_attempt }}-portable-$SLUG.tar.zst"
 
           test -s "$out/results.jsonl"
           test -s "$out/junit.xml"
@@ -868,12 +794,10 @@ jobs:
           jq -n \
             --arg repository_sha "$GITHUB_SHA" \
             --arg lane portable \
-            --arg mode "${{ matrix.mode }}" \
-            --arg block "${{ matrix.category }}" \
-            --arg backend "${{ matrix.backend }}" \
+            --arg step "$NODE" \
             --arg run_key "${{ github.run_id }}-${{ github.run_attempt }}" \
             '{schema:1, repository_sha:$repository_sha, run_key:$run_key,
-              lane:$lane, mode:$mode, manifest_block:$block, backend:$backend}' \
+              lane:$lane, step:$step}' \
             > "$stage/index.json"
           touch "$stage/complete"
           tar --sort=name --mtime='UTC 1970-01-01' \
@@ -884,10 +808,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: parity-v1-${{ github.run_id }}-${{ github.run_attempt }}-portable-${{ matrix.mode }}-${{ matrix.category }}-${{ matrix.backend }}
+          name: parity-v1-${{ github.run_id }}-${{ github.run_attempt }}-portable-${{ matrix.slug }}
           path: |
-            parity-v1-${{ github.run_id }}-${{ github.run_attempt }}-portable-${{ matrix.mode }}-${{ matrix.category }}-${{ matrix.backend }}.tar.zst
-            parity-v1-${{ github.run_id }}-${{ github.run_attempt }}-portable-${{ matrix.mode }}-${{ matrix.category }}-${{ matrix.backend }}.tar.zst.sha256
+            parity-v1-${{ github.run_id }}-${{ github.run_attempt }}-portable-${{ matrix.slug }}.tar.zst
+            parity-v1-${{ github.run_id }}-${{ github.run_attempt }}-portable-${{ matrix.slug }}.tar.zst.sha256
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
@@ -976,7 +900,6 @@ jobs:
     name: Regular tests (GitHub-managed portable)
     needs:
       - select
-      - reverie-pin
       - plan
       - preflight
       - build-debug
@@ -990,6 +913,13 @@ jobs:
     # itself 5m-capped) plus the gate jq.
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@v4
+      - name: Initialize dagrun submodule
+        run: git submodule update --init agent-utils
+      - name: Install rust-script
+        env:
+          RUSTFLAGS: ""
+        run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
       # Folded in from the former standalone `reduce-e2e` job so the portable
       # gate critical path is one queued stage shorter (select -> build -> e2e
       # -> reduce-e2e -> regular  becomes  select -> build -> e2e -> regular).
@@ -1017,7 +947,7 @@ jobs:
             exit 1
           }
 
-          mkdir -p reduced/expanded
+          mkdir -p ignored/reduced/expanded ignored/reduced/results/portable
           while IFS= read -r -d '' archive; do
             (cd "$(dirname "$archive")" && \
               sha256sum -c "$(basename "$archive.sha256")")
@@ -1026,32 +956,44 @@ jobs:
               exit 1
             fi
             slug=$(basename "$archive" .tar.zst)
-            mkdir -p "reduced/expanded/$slug"
-            tar --zstd -xf "$archive" -C "reduced/expanded/$slug"
-            test -f "reduced/expanded/$slug/parity-v1/complete"
+            mkdir -p "ignored/reduced/expanded/$slug"
+            tar --zstd -xf "$archive" -C "ignored/reduced/expanded/$slug"
+            stage="ignored/reduced/expanded/$slug/parity-v1"
+            test -f "$stage/complete"
+            step=$(jq -er '.step | select(startswith("e2e.manifest_"))' "$stage/index.json")
+            job=${step#e2e.}
+            mkdir -p "ignored/reduced/results/portable/$job"
+            cp "$stage/results.jsonl" "ignored/reduced/results/portable/$job/results.jsonl"
+            cp "$stage/junit.xml" "ignored/reduced/results/portable/$job/junit.xml"
           done < <(find transport -maxdepth 1 -name '*.tar.zst' -type f -print0 | sort -z)
 
-          find reduced/expanded -path '*/parity-v1/results.jsonl' -type f -print0 |
-            sort -z | xargs -0 cat > reduced/results.jsonl
+          find ignored/reduced/expanded -path '*/parity-v1/results.jsonl' -type f -print0 |
+            sort -z | xargs -0 cat > ignored/reduced/results.jsonl
           jq -s '{schema:1, cells:length,
             passed:(map(select(.outcome=="PASS"))|length),
             failed:(map(select(.outcome=="FAIL"))|length),
             errors:(map(select(.outcome=="ERROR"))|length)}' \
-            reduced/results.jsonl > reduced/summary.json
+            ignored/reduced/results.jsonl > ignored/reduced/summary.json
           while IFS= read -r -d '' junit; do
             slug=$(basename "$(dirname "$(dirname "$junit")")")
-            cp "$junit" "reduced/$slug.junit.xml"
-          done < <(find reduced/expanded -path '*/parity-v1/junit.xml' \
+            cp "$junit" "ignored/reduced/$slug.junit.xml"
+          done < <(find ignored/reduced/expanded -path '*/parity-v1/junit.xml' \
             -type f -print0 | sort -z)
+      - name: Run constructed final result step
+        if: needs.select.outputs.run_e2e != 'false'
+        env:
+          E2E_RESULT_ROOT: ${{ github.workspace }}/ignored/reduced/results
+          RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
+        run: ./ci/run-node.sh portable "$(jq -r '.final_nodes|join(",")' ci/portable-shards.json)"
       - name: Upload reduced e2e diagnostics
         if: always() && needs.select.outputs.run_e2e != 'false'
         uses: actions/upload-artifact@v4
         with:
           name: e2e-results-portable-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            reduced/results.jsonl
-            reduced/summary.json
-            reduced/*.junit.xml
+            ignored/reduced/results.jsonl
+            ignored/reduced/summary.json
+            ignored/reduced/*.junit.xml
           if-no-files-found: error
           retention-days: 14
       - name: Require every portable DAG job to succeed or be deselected

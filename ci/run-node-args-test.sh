@@ -106,22 +106,24 @@ fi
 # A guard file whose cases are all one node cannot see that, so the real
 # selection is read from ci/portable-shards.json rather than written down here.
 #
-# The runner is stubbed to /bin/true, so this still executes NO node: the scratch
-# write happens before find_runner, which is exactly the part under test.
+# RUN_NODE_PRINT_ONLY asks the constructed-plan path to print the selected plan,
+# so this still executes no node.
 long_sel=$(python3 -c '
 import json
 print(",".join(json.load(open("ci/portable-shards.json"))["preflight_nodes"]))')
 if [[ -z $long_sel ]]; then
     fail "could not read preflight_nodes from ci/portable-shards.json"
 else
-    long_output=$(run_local env DAGRUN_BIN=/bin/true "$RUN_NODE" "$LANE" "$long_sel" 2>&1)
+    long_output=$(run_local env RUN_NODE_PRINT_ONLY=1 \
+        VALIDATE_SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS=1 \
+        "$RUN_NODE" "$LANE" "$long_sel" 2>&1)
     long_status=$?
     if ((long_status != 0)); then
         fail "the real ${#long_sel}-byte preflight selection was refused: exit $long_status.
   This is the selection ci-portable.yml passes, so a failure here reddens the whole job.
   Output: $long_output"
     else
-        printf 'run-node-args-test: ok — a %d-byte CI selection writes its scratch DAG\n' \
+        printf 'run-node-args-test: ok — a %d-byte CI selection reaches the constructed plan\n' \
             "${#long_sel}"
     fi
 fi

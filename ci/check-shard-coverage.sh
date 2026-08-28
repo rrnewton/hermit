@@ -6,17 +6,12 @@
 # LICENSE file in the root directory of this source tree.
 #
 # check-shard-coverage.sh — fail-closed correspondence guard for the parallel
-# portable fan-out. Asserts that ci/portable-shards.json assigns EVERY portable
-# DAG node to exactly one job, with no overlap and no unknown node names:
+# portable fan-out. Asserts that ci/portable-shards.json assigns EVERY step in
+# validate's constructed portable-only plan to exactly one job, with no overlap
+# and no unknown step names:
 #
-#   union(preflight, build_debug, build_dbt, build_aux, debug_shards, release_shards)
-#     ==  { portable.json nodes } minus { e2e.manifest_* }
-#
-# The 13 e2e.manifest_* nodes are intentionally excluded here: they are covered by
-# the audited e2e (category x backend) matrix (target/debug/test-harness plan), exactly
-# as the pre-existing ci-portable-fanout.yml already validates. This guard makes
-# it impossible for the parallel workflow to silently cover a different set than
-# the trusted portable DAG.
+#   union(preflight, builds, test shards, e2e, final)
+#     == { steps returned by scripts/validate.rs portable-only --show-plan-json }
 #
 # The immutable E2E artifact is deliberately assigned to the integration shard
 # beside test.applications_e2e. Keeping the producer and its protected consumer
@@ -28,17 +23,23 @@ set -euo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-dag="ci/dag/portable.json"
 shards="ci/portable-shards.json"
 command -v jq >/dev/null 2>&1 || { echo "check-shard-coverage.sh: jq is required" >&2; exit 2; }
-[[ -f $dag ]] || { echo "check-shard-coverage.sh: missing $dag" >&2; exit 2; }
 [[ -f $shards ]] || { echo "check-shard-coverage.sh: missing $shards" >&2; exit 2; }
 
-# All portable nodes except the e2e.manifest_* cells (covered by the e2e matrix).
-mapfile -t expected < <(
-    jq -r '.steps[] | "\(.group).\(.job)"
-           | select(startswith("e2e.manifest_") | not)' "$dag" | sort -u
-)
+# Ask the same plan constructor the runner uses. The command is inert, may run
+# inside validate, and emits its JSON as the first stdout line.
+plan_out=$(mktemp)
+trap 'rm -f "$plan_out"' EXIT
+./scripts/validate.rs portable-only --show-plan-json \
+    --skip-inner-dirty-working-tree-and-rebase-freshness-checks >"$plan_out"
+plan_json=$(sed -n '1p' "$plan_out")
+jq -e '.profile == "portable-only" and .selection_mode == "full"' \
+    <<<"$plan_json" >/dev/null || {
+    echo "check-shard-coverage.sh: validate did not return the full portable-only plan" >&2
+    exit 2
+}
+mapfile -t expected < <(jq -r '.dags[].steps[].tag' <<<"$plan_json" | sort -u)
 
 # Every node assigned by the shard map, across all job buckets.
 mapfile -t assigned < <(
@@ -47,6 +48,8 @@ mapfile -t assigned < <(
       + (.build_debug_nodes // [])
       + (.build_dbt_nodes // [])
       + (.build_aux_nodes // [])
+      + (.e2e_nodes // [])
+      + (.final_nodes // [])
       + ([ (.debug_shards // [])[]   | .nodes[] ])
       + ([ (.release_shards // [])[] | .nodes[] ])
         | .[]
@@ -74,7 +77,7 @@ if [[ -n $missing ]]; then
     status=1
 fi
 if [[ -n $extra ]]; then
-    echo "check-shard-coverage.sh: FAIL — shard map names nodes absent from portable.json (or e2e.manifest_*):" >&2
+    echo "check-shard-coverage.sh: FAIL — shard map names steps absent from the constructed portable-only plan:" >&2
     printf '  %s\n' $extra >&2
     status=1
 fi
@@ -91,6 +94,6 @@ fi
 
 if ((status == 0)); then
     n=$(printf '%s\n' "$assigned_unique" | grep -c . || true)
-    echo "check-shard-coverage.sh: OK — $n non-e2e portable nodes each assigned to exactly one job; e2e.manifest_* covered by the e2e matrix."
+    echo "check-shard-coverage.sh: OK — $n constructed portable-only steps each assigned to exactly one hosted job."
 fi
 exit "$status"
