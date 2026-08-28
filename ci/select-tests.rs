@@ -539,10 +539,10 @@ fn derive_run_plan(sel: &Selection, shards: &Shards, plan: &Plan) -> RunPlan {
         }
     };
 
-    // Which release-build artifacts do the selected release shards / cells need?
+    // Which release-build artifacts do the selected shards / cells need?
     let mut build_dbt = false;
     let mut build_aux = false;
-    for s in &shards.release {
+    for s in shards.debug.iter().chain(&shards.release) {
         if shard_slugs.contains(&s.slug) {
             match s.needs.as_str() {
                 "dbt" => build_dbt = true,
@@ -751,7 +751,6 @@ fn main() {
     let dag = Dag::load(&root.join("ci/dag/portable.json"));
     let shards = Shards::load(&root.join("ci/portable-shards.json"));
     let plan = Plan::load(&root.join("ci/expected-e2e-plan.json"));
-
     // LOCAL mode: delta vs the last-known-green baseline (dirty tree + commits
     // since baseline). With NO trustworthy baseline we must run everything.
     if since_green {
@@ -997,6 +996,26 @@ fn self_test() {
     let dag = Dag::load(&root.join("ci/dag/portable.json"));
     let shards = Shards::load(&root.join("ci/portable-shards.json"));
     let plan = Plan::load(&root.join("ci/expected-e2e-plan.json"));
+    let strict_compat = fp
+        .groups
+        .get("strict_compat")
+        .cloned()
+        .unwrap_or_default();
+    check(
+        "strict compatibility group is the complete flattened matrix",
+        strict_compat.len() == 190
+            && strict_compat
+                .iter()
+                .filter(|node| node.starts_with("compat."))
+                .count()
+                == 189
+            && strict_compat
+                .iter()
+                .any(|node| node == "compatprep.fixtures")
+            && strict_compat
+                .iter()
+                .all(|node| dag.all_nodes.contains(node)),
+    );
 
     let docs = select(&fp, &dag, &["ai_docs/x.md".into(), "docs/y.md".into(), "README.md".into()]);
     check("docs-only ⇒ skip", docs.decision == Decision::Skip && docs.nodes.is_empty());
@@ -1026,14 +1045,22 @@ fn self_test() {
     check("dbt-only runs dbt_parity", dbt.nodes.contains("test.dbt_parity"));
     check("dbt-only pulls build.runtime_release", dbt.nodes.contains("build.runtime_release"));
     check("dbt-only pulls build.workspace (dep)", dbt.nodes.contains("build.workspace"));
-    check("dbt-only skips strict_compat", !dbt.nodes.contains("test.strict_compat"));
+    check(
+        "dbt-only skips strict compatibility",
+        !dbt.nodes.iter().any(|node| {
+            node == "compatprep.fixtures" || node.starts_with("compat.")
+        }),
+    );
     check("dbt-only skips language_runtimes", !dbt.nodes.contains("e2e.manifest_language_runtimes"));
     check("dbt-only is a strict subset", dbt.nodes.len() < dag.all_nodes.len());
     check("dbt-only includes preflight", dbt.nodes.contains("lint.rustfmt"));
 
     let core = select(&fp, &dag, &["detcore/src/scheduler.rs".into()]);
     check("detcore core ⇒ selective", core.decision == Decision::Selective);
-    check("detcore core runs strict_compat", core.nodes.contains("test.strict_compat"));
+    check(
+        "detcore core runs strict compatibility",
+        !strict_compat.is_empty() && strict_compat.iter().all(|node| core.nodes.contains(node)),
+    );
     check("detcore core runs detcore_unit", core.nodes.contains("test.detcore_unit"));
 
     let unknown = select(&fp, &dag, &["some/brand/new/area/file.py".into()]);
@@ -1061,6 +1088,22 @@ fn self_test() {
     check("full ⇒ all shards", rp_full.shards.len() == total_shards);
     check("full ⇒ all cells", rp_full.cells.len() == total_cells);
     check("full ⇒ all builds", rp_full.build_debug && rp_full.build_dbt && rp_full.build_aux);
+
+    let strict_only = Selection {
+        decision: Decision::Selective,
+        nodes: BTreeSet::from(["compat.echo".to_string()]),
+        e2e_all: false,
+        e2e_backends: BTreeSet::new(),
+        reasons: Vec::new(),
+    };
+    let rp_strict = derive_run_plan(&strict_only, &shards, &plan);
+    check(
+        "strict compatibility shard requires the release artifact",
+        rp_strict.shards == ["strict-compat"]
+            && rp_strict.build_debug
+            && rp_strict.build_dbt
+            && !rp_strict.build_aux,
+    );
 
     // DBT is a Cargo dependency of hermit. Package-level reverse-dependency
     // closure therefore includes Hermit's other third-party-backend test

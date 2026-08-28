@@ -7,7 +7,9 @@
     "Keep ci_irrelevant deliberately narrow: it is the only classification that can",
     "skip CI. Unmatched paths still force the complete suite. Package Rust sources,",
     "manifests, reverse dependencies, and Cargo-command DAG nodes are generated.",
-    "package_paths adds package-local fixtures/resources that Cargo metadata cannot name."
+    "package_paths adds package-local fixtures/resources that Cargo metadata cannot name.",
+    "groups keeps a reviewed multi-node check as one policy reference; every member is",
+    "validated against ci/dag/portable.json before the generated file is written."
   ],
   "version": 1,
   "force_full": [
@@ -39,10 +41,18 @@
     ".github/**"
   ],
   "package_paths": {
-    "hermit-detcore": ["detcore/**"],
-    "hermetic_infra_hermit_flaky-tests": ["flaky-tests/**"],
-    "hermit": ["hermit-cli/**"],
-    "hermit-install": ["hermit-install/**"]
+    "hermit-detcore": [
+      "detcore/**"
+    ],
+    "hermetic_infra_hermit_flaky-tests": [
+      "flaky-tests/**"
+    ],
+    "hermit": [
+      "hermit-cli/**"
+    ],
+    "hermit-install": [
+      "hermit-install/**"
+    ]
   },
   "package_rules": [
     {
@@ -72,13 +82,15 @@
         "test.applications_e2e",
         "test.dbt_parity",
         "test.envelope_levels",
-        "test.strict_compat"
+        "@strict_compat"
       ],
       "e2e_all": true
     },
     {
       "_why": "hermit-install stages runtime resources used by every Hermit and backend test path.",
-      "packages": ["hermit-install"],
+      "packages": [
+        "hermit-install"
+      ],
       "nodes": [
         "e2e.manifest_applications",
         "e2e.manifest_backend_parity_c",
@@ -107,13 +119,15 @@
         "test.liteinst_strict",
         "test.rr_suite_contract",
         "test.sabre_examples",
-        "test.strict_compat"
+        "@strict_compat"
       ],
       "e2e_all": true
     },
     {
       "_why": "The shared guest crate and fixtures are consumed by Hermit integration tests and every manifest backend.",
-      "packages": ["hermetic_infra_hermit_tests"],
+      "packages": [
+        "hermetic_infra_hermit_tests"
+      ],
       "nodes": [
         "e2e.manifest_applications",
         "e2e.manifest_backend_parity_c",
@@ -143,19 +157,34 @@
     },
     {
       "_why": "The DBT plugin has a backend-private release/parity harness and DBT cells.",
-      "packages": ["detcore-dbt"],
-      "nodes": ["e2e.manifest_backend_parity_c", "test.dbt_parity"],
-      "e2e_backends": ["dbt"]
+      "packages": [
+        "detcore-dbt"
+      ],
+      "nodes": [
+        "e2e.manifest_backend_parity_c",
+        "test.dbt_parity"
+      ],
+      "e2e_backends": [
+        "dbt"
+      ]
     },
     {
       "_why": "The SaBRe plugin has a backend-private release/examples harness and SaBRe cells.",
-      "packages": ["detcore-sabre"],
-      "nodes": ["test.sabre_examples"],
-      "e2e_backends": ["sabre"]
+      "packages": [
+        "detcore-sabre"
+      ],
+      "nodes": [
+        "test.sabre_examples"
+      ],
+      "e2e_backends": [
+        "sabre"
+      ]
     },
     {
       "_why": "Flaky guest binaries feed the chaos and determinism-stress manifest buckets.",
-      "packages": ["hermetic_infra_hermit_flaky-tests"],
+      "packages": [
+        "hermetic_infra_hermit_flaky-tests"
+      ],
       "nodes": [
         "build.workspace",
         "e2e.manifest_chaos_c",
@@ -168,9 +197,18 @@
   "path_footprints": [
     {
       "_why": "Backend-parity fixtures and driver contract suites are outside Cargo targets.",
-      "paths": ["tests/backend-parity/**"],
-      "nodes": ["check.backend_parity_mutation", "check.backend_parity_suites", "e2e.manifest_backend_parity_c", "test.dbt_parity"],
-      "e2e_backends": ["dbt"]
+      "paths": [
+        "tests/backend-parity/**"
+      ],
+      "nodes": [
+        "check.backend_parity_mutation",
+        "check.backend_parity_suites",
+        "e2e.manifest_backend_parity_c",
+        "test.dbt_parity"
+      ],
+      "e2e_backends": [
+        "dbt"
+      ]
     },
     {
       "_why": "Shared non-Cargo guest fixtures are consumed by the manifest and Hermit integration harnesses.",
@@ -222,9 +260,15 @@
     },
     {
       "_why": "LiteInst runtime staging is outside Cargo's workspace graph.",
-      "paths": ["scripts/stage-liteinst-runtime.sh"],
-      "nodes": ["test.liteinst_strict"],
-      "e2e_backends": ["liteinst"]
+      "paths": [
+        "scripts/stage-liteinst-runtime.sh"
+      ],
+      "nodes": [
+        "test.liteinst_strict"
+      ],
+      "e2e_backends": [
+        "liteinst"
+      ]
     },
     {
       "_why": "Standalone checks map to their own portable DAG node.",
@@ -235,22 +279,230 @@
         "CLAUDE.md",
         "scripts/check-skill-discovery.rs"
       ],
-      "nodes": ["check.skill_discovery"]
+      "nodes": [
+        "check.skill_discovery"
+      ]
     },
     {
       "_why": "Standalone checks map to their own portable DAG node.",
-      "paths": ["scripts/check-detcore-backend-abstraction.sh"],
-      "nodes": ["check.backend_abstraction"]
+      "paths": [
+        "scripts/check-detcore-backend-abstraction.sh"
+      ],
+      "nodes": [
+        "check.backend_abstraction"
+      ]
     },
     {
       "_why": "Standalone checks map to their own portable DAG node.",
-      "paths": ["scripts/check-portable-paths.sh"],
-      "nodes": ["check.portability_paths"]
+      "paths": [
+        "scripts/check-portable-paths.sh"
+      ],
+      "nodes": [
+        "check.portability_paths"
+      ]
     },
     {
       "_why": "Standalone checks map to their own portable DAG node.",
-      "paths": ["scripts/check-dagrun-naming.sh"],
-      "nodes": ["check.dagrun_naming"]
+      "paths": [
+        "scripts/check-dagrun-naming.sh"
+      ],
+      "nodes": [
+        "check.dagrun_naming"
+      ]
     }
-  ]
+  ],
+  "groups": {
+    "strict_compat": [
+      "compatprep.fixtures",
+      "compat.echo",
+      "compat.true",
+      "compat.pwd",
+      "compat.seq",
+      "compat.cat",
+      "compat.wc",
+      "compat.head",
+      "compat.base64",
+      "compat.base32",
+      "compat.id",
+      "compat.lua",
+      "compat.perl",
+      "compat.bc",
+      "compat.tcl",
+      "compat.dc",
+      "compat.awk",
+      "compat.sqlite3",
+      "compat.jq",
+      "compat.xmllint",
+      "compat.bash",
+      "compat.shell-build",
+      "compat.cargo",
+      "compat.clang",
+      "compat.ruby",
+      "compat.python3",
+      "compat.curl",
+      "compat.git",
+      "compat.cmake",
+      "compat.pkg-config",
+      "compat.m4",
+      "compat.gcc",
+      "compat.g++",
+      "compat.make",
+      "compat.ar",
+      "compat.as",
+      "compat.ld",
+      "compat.nm",
+      "compat.objcopy",
+      "compat.objdump",
+      "compat.ranlib",
+      "compat.readelf",
+      "compat.size",
+      "compat.strip",
+      "compat.addr2line",
+      "compat.c++filt",
+      "compat.elfedit",
+      "compat.gprof",
+      "compat.cpp",
+      "compat.gcov",
+      "compat.bzip2",
+      "compat.gzip",
+      "compat.xz",
+      "compat.zstd",
+      "compat.gzip-roundtrip",
+      "compat.bzip2-roundtrip",
+      "compat.xz-roundtrip",
+      "compat.zstd-roundtrip",
+      "compat.tar-roundtrip",
+      "compat.cpio-roundtrip",
+      "compat.wget-localhost",
+      "compat.curl-localhost",
+      "compat.zip-unzip",
+      "compat.openssl",
+      "compat.sort",
+      "compat.uniq",
+      "compat.tr",
+      "compat.cut",
+      "compat.tee",
+      "compat.paste",
+      "compat.comm",
+      "compat.join",
+      "compat.find",
+      "compat.stat",
+      "compat.file",
+      "compat.basename",
+      "compat.dirname",
+      "compat.env",
+      "compat.printenv",
+      "compat.uname",
+      "compat.factor",
+      "compat.expr",
+      "compat.dd",
+      "compat.df",
+      "compat.du",
+      "compat.hostname",
+      "compat.ip",
+      "compat.ss",
+      "compat.netlink-route",
+      "compat.netlink-sock-diag",
+      "compat.lscpu",
+      "compat.lsof",
+      "compat.whoami",
+      "compat.groups",
+      "compat.tty",
+      "compat.nproc",
+      "compat.arch",
+      "compat.realpath",
+      "compat.readlink",
+      "compat.mktemp",
+      "compat.sha256sum",
+      "compat.sha1sum",
+      "compat.md5sum",
+      "compat.sha224sum",
+      "compat.sha384sum",
+      "compat.sha512sum",
+      "compat.wc-lines",
+      "compat.nl",
+      "compat.expand",
+      "compat.unexpand",
+      "compat.test",
+      "compat.bracket",
+      "compat.printf",
+      "compat.pr",
+      "compat.ls",
+      "compat.xargs",
+      "compat.time",
+      "compat.iconv",
+      "compat.sleep",
+      "compat.stdbuf",
+      "compat.nohup",
+      "compat.nice",
+      "compat.ionice",
+      "compat.taskset",
+      "compat.chrt",
+      "compat.flock",
+      "compat.logger",
+      "compat.getopt",
+      "compat.column",
+      "compat.hexdump",
+      "compat.xxd",
+      "compat.strings",
+      "compat.od",
+      "compat.sum",
+      "compat.cksum",
+      "compat.b2sum",
+      "compat.tsort",
+      "compat.ptx",
+      "compat.pinky",
+      "compat.logname",
+      "compat.users",
+      "compat.uptime",
+      "compat.iostat",
+      "compat.vmstat-disk",
+      "compat.pidstat-disk",
+      "compat.findmnt",
+      "compat.sysctl-random-uuid",
+      "compat.sar-resource-tables",
+      "compat.lsirq",
+      "compat.mpstat-softirqs",
+      "compat.lsmod",
+      "compat.numastat",
+      "compat.numactl-hardware",
+      "compat.ps",
+      "compat.vmstat",
+      "compat.top",
+      "compat.kill",
+      "compat.pgrep",
+      "compat.pkill",
+      "compat.diff",
+      "compat.patch",
+      "compat.grep",
+      "compat.egrep",
+      "compat.fgrep",
+      "compat.sed",
+      "compat.tar",
+      "compat.cp",
+      "compat.mv",
+      "compat.rm",
+      "compat.mkdir",
+      "compat.rmdir",
+      "compat.touch",
+      "compat.chmod",
+      "compat.chown",
+      "compat.ln",
+      "compat.date",
+      "compat.cal",
+      "compat.yes",
+      "compat.tac",
+      "compat.rev",
+      "compat.fold",
+      "compat.fmt",
+      "compat.shuf",
+      "compat.numfmt",
+      "compat.csplit",
+      "compat.split",
+      "compat.install",
+      "compat.mkfifo",
+      "compat.cmp",
+      "compat.free"
+    ]
+  }
 }

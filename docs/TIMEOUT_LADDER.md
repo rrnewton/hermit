@@ -14,9 +14,10 @@ rung can never fire: it is dead configuration that reads as protection, and it
 presents as an intermittently killed test rather than as the configuration error
 it is.
 
-`ci/validate-timeout-layers-test.sh` already calls the nested wall-time limits a
-**ladder** and fails closed on a wrong one; this is the same idea widened to
-every rung, including the ones that script does not cover.
+`ci/validate-timeout-layers-test.sh` proves a named dagrun step timeout and the
+outer scope timeout with live sleepers, and audits the direct portable strict
+probe bounds. This is the same idea widened to every rung, including the ones
+that script does not cover.
 
 All values measured 2026-08-26 against `rrnewton/hermit` `main`
 `f77d7c44067a12ba11e75b5a85864ce0bc23e8f4`. Re-measure before quoting them; the
@@ -36,14 +37,15 @@ agreeing with each other.
 | nextest `slow-timeout` | **one cargo test process**, which may invoke hermit zero or many times | `.config/nextest.toml`: 15s default, two named 30s overrides | `SIGTERM` to the test binary, 2s grace, then `SIGKILL` | wrapper exit 100, test named by nextest |
 | manifest cell `timeout_seconds` | **one manifest cell** | `tests/e2e/manifests/*.yaml`, per cell | `timeout --kill-after=10s Ns` around the cell command | exit 124 |
 | dagrun step `timeout` | **one DAG node**, i.e. a whole batch of cells or tests | `ci/dag/{portable,privileged}.json` | dagrun stops the step | node failure |
-| validate's nested limits | the validate run and its scope | `VALIDATE_GATE_TIMEOUT_SECONDS`, `HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS`, the scope, the node | see `ci/validate-timeout-layers-test.sh` | ladder `480 < 600 < 660 < 720` |
+| portable strict compatibility node | one direct `compat.*` probe in the outer DAG | `ci/dag/portable.json` | dagrun stops the named probe | 60s normally; 20s for the three declared portable diagnostics |
 | `safehermit --sh-deadline` | **the whole wrapped process tree** | `bin/safehermit`, default 3600s | `systemd-run --user RuntimeMaxSec`, a **cgroup kill** | exit 124, `safehermit: bound.wall=` |
 
 Distribution of the values actually deployed today:
 
 - manifest `timeout_seconds`: 90s ×310, 60s ×25, 120s ×22, 600s ×1.
-- dagrun step `timeout`: 600s ×15, 900s ×15, 120s ×11, 180s ×6, 60s ×6, 720s ×5,
-  1200s ×4, 300s ×3, 2400s ×1, 40s ×1, 30s ×1.
+- dagrun step `timeout`: 60s ×193, 600s ×15, 900s ×15, 120s ×12, 180s ×6,
+  720s ×4, 1200s ×4, 300s ×3, 20s ×3, 2400s ×1, 420s ×1, 40s ×1,
+  30s ×1.
 
 ## Gentle first, hard as fallback
 
@@ -156,9 +158,9 @@ run is stopped by the outer rung instead, hard and unnamed. The symptom is a
 test that looks intermittently killed for no stated reason, which is why this
 belongs in a configuration check and not in a debugging session.
 
-`ci/validate-timeout-layers-test.sh` enforces this for the four validate rungs
-by pinning the exact ladder and failing closed. Nothing enforces it across the
-manifest, nextest and native rungs yet.
+`ci/validate-timeout-layers-test.sh` enforces the direct compatibility-probe
+bounds and separately exercises the dagrun-step and outer-scope rungs. Nothing
+enforces the invariant across the manifest, nextest and native rungs yet.
 
 ## Reading a "global default" for the manifest
 

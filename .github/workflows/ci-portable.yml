@@ -62,9 +62,7 @@ env:
   # library -llzma` unless its job happens to have apt-installed liblzma-dev.
   # That cost 6ce678e2e8 a red preflight and needed d9aa6066 to correct.
   # ADDING A `cargo install` STEP? Set `env: RUSTFLAGS: ""` on it, as the
-  # preflight, build-debug and dbt-parity rust-script installs below do. The
-  # strict-compat one is the exception and only because its job apt-installs
-  # liblzma-dev -- that is luck, not design, so do not copy it as a pattern.
+  # preflight, build-debug and dbt-parity rust-script installs below do.
   RUSTFLAGS: -D warnings -C link-arg=-llzma
   RUSTDOCFLAGS: -D warnings
   DETCORE_TEST_RUST_LOG: "off"
@@ -270,7 +268,7 @@ jobs:
         run: rustup component add clippy rustfmt
       # check.script_sigpipe compiles every tracked rust-script entrypoint, and
       # scripts/check-script-sigpipe.sh refuses without the interpreter. No
-      # runner image ships it (see the strict-compat shard's note below), so the
+      # runner image ships it, so the
       # node died at `command -v rust-script` having measured nothing. Pinned to
       # the same RUST_SCRIPT_VERSION as that shard so every job in this workflow
       # resolves `#!/usr/bin/env rust-script` with one interpreter.
@@ -278,9 +276,8 @@ jobs:
       # build. rust-script does not link lzma, and preflight has no Dependencies
       # step installing liblzma-dev, so inheriting that flag fails the install at
       # `rust-lld: unable to find library -llzma` -- measured on run 32513921209.
-      # The strict-compat shard gets away with it only because its job installs
-      # liblzma-dev first. Clearing RUSTFLAGS for the tool build is the narrower
-      # fix than adding an apt step to a 10-minute lint job.
+      # Clearing RUSTFLAGS for the tool build is the narrower fix than adding
+      # an apt step to a 10-minute lint job.
       - name: Install rust-script (preflight)
         env:
           RUSTFLAGS: ""
@@ -567,7 +564,8 @@ jobs:
     name: "test: ${{ matrix.slug }}"
     needs: [select, build-debug, build-release]
     # build-release is legitimately SKIPPED when the selected debug shards need no
-    # DBT runtime (build.dbt=false). A bare custom `if` would still inherit the
+    # release-backed input (build.dbt=false). DBT consumers need the runtime;
+    # strict-compat needs target/ci/hermit-strict. A bare custom `if` would still inherit the
     # implicit success() over every need and skip this job; the explicit status
     # checks let it run when build-release was skipped, while still skipping (and
     # letting `regular` fail closed) if build-debug or a to-be-run build-release
@@ -601,37 +599,6 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
-      # The strict-compat node runs `scripts/validate.rs` directly through
-      # `#!/usr/bin/env rust-script`. No
-      # runner image ships that interpreter, and no workflow installed it, so
-      # the exec fails with status 127 before any test runs -- a step that dies
-      # in 0.1s having measured nothing, which reads like a product failure.
-      #
-      # Compiling the driver instead of installing the interpreter is not an
-      # option here: validate.rs carries an embedded `//! ```cargo` manifest and
-      # depends on `dagrun` from the agent-utils submodule, so plain
-      # `rustc` cannot build it the way the check.skill_discovery node builds its
-      # std-only script.
-      #
-      # `taiki-e/install-action` is used above for cargo-nextest but does NOT
-      # list rust-script in its supported-tool manifest, so it would silently
-      # take an unverified fallback path. A pinned `cargo install` is slower but
-      # its failure mode is legible, which is the whole point of this fix.
-      - name: Install rust-script (strict-compat shard)
-        if: matrix.slug == 'strict-compat'
-        run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
-      # Fail with a diagnostic naming the interpreter rather than letting the
-      # shard die at exec. `env` reports the missing program on stderr and the
-      # shell exits 127, but neither string contains "error", so the standard
-      # log triage grep misses it entirely.
-      - name: Verify rust-script resolves (strict-compat shard)
-        if: matrix.slug == 'strict-compat'
-        run: |
-          if ! command -v rust-script >/dev/null; then
-            echo "::error::rust-script is not on PATH; scripts/validate.rs would die at exec with status 127."
-            exit 1
-          fi
-          echo "rust-script resolved: $(command -v rust-script) $(rust-script --version)"
       - name: Enable unprivileged user and mount namespaces
         run: |
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
@@ -689,6 +656,10 @@ jobs:
       - name: Run shard nodes (${{ matrix.slug }})
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
+          # The former test.strict_compat wrapper started a 16-wide inner
+          # scheduler. Its 189 direct outer nodes keep that width here; every
+          # other shard retains run-node.sh's serial default.
+          RUN_NODE_JOBS: ${{ matrix.slug == 'strict-compat' && '16' || '1' }}
         run: ./ci/run-node.sh portable "${{ matrix.nodes }}"
       - name: Upload debug shard node performance report
         if: always()
@@ -730,7 +701,7 @@ jobs:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
       # check.dbt_runtime_abi runs scripts/check-dbt-runtime-abi.rs, which carries
       # `#!/usr/bin/env -S rust-script --force`. No runner image ships that
-      # interpreter (see the strict-compat shard's note), so without this the node
+      # interpreter, so without this the node
       # would die at exec with status 127 having compared no symbols -- the exact
       # failure this shard's node exists to make legible, reproduced one level up.
       # Gated to dbt-parity because it is the only release shard that runs a

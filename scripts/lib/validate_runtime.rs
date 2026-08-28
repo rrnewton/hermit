@@ -797,11 +797,10 @@ pub fn identity_in_ancestry(want: i32, want_start_ticks: u64) -> bool {
 
 /// Decide whether this invocation is a NESTED payload of an outer validate.
 ///
-/// `ci/dag/portable.json`'s `test.strict_compat` node runs
-/// `./scripts/validate.rs --portable-strict-compat-only`, so re-entry is a designed path,
-/// not an accident. What must never happen is a full driver inside a full driver:
-/// that pays the entire preamble twice, appends a SECOND ledger row, and can
-/// publish a SECOND receipt for one logical run.
+/// Focused payloads may be invoked by an explicitly nested internal path. What
+/// must never happen is a full driver inside a full driver: that pays the entire
+/// preamble twice, appends a SECOND ledger row, and can publish a SECOND receipt
+/// for one logical run.
 ///
 /// **The env var alone is a proxy.** A marker can outlive its writer - exported
 /// into an operator's shell, or inherited by a detached unit - and a stale marker

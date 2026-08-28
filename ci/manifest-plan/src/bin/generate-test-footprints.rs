@@ -351,6 +351,7 @@ fn load_rules(
     policy: &Value,
     packages: &BTreeMap<String, Package>,
     nodes: &BTreeSet<String>,
+    groups: &BTreeMap<String, Vec<String>>,
 ) -> BTreeMap<String, Rule> {
     let mut rules: BTreeMap<String, Rule> = BTreeMap::new();
     for (index, raw_rule) in policy["package_rules"]
@@ -362,7 +363,11 @@ fn load_rules(
         let location = format!("{POLICY}: package_rules[{index}]");
         let rule_nodes = strings(raw_rule, "nodes", &location);
         for node in &rule_nodes {
-            if !nodes.contains(node) {
+            let valid = node
+                .strip_prefix('@')
+                .is_some_and(|group| groups.contains_key(group))
+                || nodes.contains(node);
+            if !valid {
                 die(format!("{location}: unknown portable DAG node `{node}`"));
             }
         }
@@ -390,7 +395,48 @@ fn load_rules(
     rules
 }
 
-fn validate_path_footprints(policy: &Value, nodes: &BTreeSet<String>) {
+fn load_groups(policy: &Value, nodes: &BTreeSet<String>) -> BTreeMap<String, Vec<String>> {
+    let Some(raw_groups) = policy.get("groups").and_then(Value::as_object) else {
+        return BTreeMap::new();
+    };
+    raw_groups
+        .iter()
+        .map(|(name, value)| {
+            let location = format!("{POLICY}: groups.{name}");
+            let members = value
+                .as_array()
+                .unwrap_or_else(|| die(format!("{location} must be an array")))
+                .iter()
+                .map(|member| {
+                    member
+                        .as_str()
+                        .filter(|member| !member.is_empty())
+                        .unwrap_or_else(|| {
+                            die(format!("{location} entries must be non-empty strings"))
+                        })
+                        .to_owned()
+                })
+                .collect::<Vec<_>>();
+            if members.is_empty() {
+                die(format!(
+                    "{location} must name at least one portable DAG node"
+                ));
+            }
+            for member in &members {
+                if !nodes.contains(member) {
+                    die(format!("{location}: unknown portable DAG node `{member}`"));
+                }
+            }
+            (name.clone(), members)
+        })
+        .collect()
+}
+
+fn validate_path_footprints(
+    policy: &Value,
+    nodes: &BTreeSet<String>,
+    groups: &BTreeMap<String, Vec<String>>,
+) {
     for (index, footprint) in policy["path_footprints"]
         .as_array()
         .unwrap_or_else(|| die(format!("{POLICY}: `path_footprints` must be an array")))
@@ -400,7 +446,11 @@ fn validate_path_footprints(policy: &Value, nodes: &BTreeSet<String>) {
         let location = format!("{POLICY}: path_footprints[{index}]");
         let _ = strings(footprint, "paths", &location);
         for node in strings(footprint, "nodes", &location) {
-            if !nodes.contains(&node) {
+            let valid = node
+                .strip_prefix('@')
+                .is_some_and(|group| groups.contains_key(group))
+                || nodes.contains(&node);
+            if !valid {
                 die(format!("{location}: unknown portable DAG node `{node}`"));
             }
         }
@@ -456,9 +506,10 @@ fn generated_footprints(root: &Path) -> Value {
     let dag = read_json(&root.join(DAG));
     let (packages, defaults) = load_packages(root, &metadata);
     let (all_nodes, dag_targets) = load_dag_targets(&dag, &packages, &defaults);
-    let rules = load_rules(&policy, &packages, &all_nodes);
+    let groups = load_groups(&policy, &all_nodes);
+    let rules = load_rules(&policy, &packages, &all_nodes, &groups);
     let package_paths = load_package_paths(&policy, &packages);
-    validate_path_footprints(&policy, &all_nodes);
+    validate_path_footprints(&policy, &all_nodes, &groups);
 
     let mut package_footprints = Vec::new();
     let mut by_root: Vec<&Package> = packages.values().collect();
@@ -534,13 +585,14 @@ fn generated_footprints(root: &Path) -> Value {
             "Cargo metadata supplies package roots and local dependency edges. For each owning",
             "package, the generator computes its reverse-dependency closure, then selects every",
             "portable DAG Cargo command whose package set intersects that closure. Non-Cargo",
-            "harness edges and fail-safe path policy come from ci/test-footprints-policy.json.",
+            "harness edges, named node groups, and fail-safe path policy come from",
+            "ci/test-footprints-policy.json.",
             "",
             "Safety is unchanged: force_full and unknown paths run everything. CI is skipped",
             "only when every changed path is explicitly ci_irrelevant and no footprint matches."
         ],
         "version": 2,
-        "groups": {},
+        "groups": groups,
         "force_full": policy["force_full"].clone(),
         "ci_irrelevant": policy["ci_irrelevant"].clone(),
         "footprints": package_footprints

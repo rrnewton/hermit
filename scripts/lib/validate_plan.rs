@@ -36,11 +36,10 @@
 //! So: every node built here declares `timeout`, `cpu_timeout`, and a memory
 //! hint, and [`undeclared_nodes`] is the fail-closed audit that keeps it true.
 //!
-//! Note also that `ci/dag/{portable,privileged}.json` declare memory hints on
-//! 47/47 and 8/8 nodes respectively, but `cpu_timeout` on **0/55** — so the
-//! per-step CPU-time guard is currently inert for every shipped lane node. This
-//! module supplies a profile-level `default_step_cpu_timeout` so those nodes get
-//! a load-immune budget without editing 55 JSON rows.
+//! Note also that every shipped lane node declares a memory hint, while the
+//! older portable and privileged nodes still inherit their CPU-time guard from
+//! this module's profile-level `default_step_cpu_timeout`. The direct
+//! compatibility probes declare their shorter CPU bound individually.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -75,8 +74,8 @@ pub const MANIFEST_PLAN_BUILD_COMMAND: &str = "cargo build -p hermit-manifest-pl
 const MANIFEST_PLAN_BUILD_TIMEOUT_S: i64 = 180;
 const MANIFEST_PLAN_BUILD_MEM_BYTES: i64 = 2 * 1024 * 1024 * 1024;
 
-/// Per-lane-node CPU budget applied as the DAG-level default, closing the
-/// measured 0/55 `cpu_timeout` gap. Generous relative to the wall timeout because
+/// Per-lane-node CPU budget applied as the DAG-level default for nodes that do
+/// not declare one. Generous relative to the wall timeout because
 /// the build spine legitimately burns many CPU-minutes; it exists to stop an
 /// unbounded spin, not to police normal cost.
 const LANE_DEFAULT_CPU_TIMEOUT_S: i64 = 7200;
@@ -94,6 +93,17 @@ const COMPAT_E9PATCH_LARGE_TIMEOUT_S: i64 = 180;
 const COMPAT_CPU_TIMEOUT_S: i64 = 120;
 /// Memory ceiling for a compatibility probe.
 const COMPAT_MEM_BYTES: i64 = 4 * 1024 * 1024 * 1024;
+
+/// Portable strict compatibility used to run as one outer node containing a
+/// second 16-wide scheduler.  The flattened graph keeps that same maximum
+/// overlap while letting the outer scheduler see every probe.
+pub const PORTABLE_STRICT_COMPAT_CONCURRENCY: i64 = 16;
+pub const PORTABLE_STRICT_COMPAT_RESOURCE: &str = "hermit_guest";
+pub const PORTABLE_STRICT_COMPAT_FIXTURES: &str = "target/real-compat-fixtures";
+pub const PORTABLE_STRICT_COMPAT_TMP: &str = "target/validation/strict-compat";
+pub const PORTABLE_STRICT_COMPAT_SHELL_BUILD: &str =
+    "target/validation/strict-compat/shell-build";
+pub const PORTABLE_STRICT_COMPAT_HERMIT: &str = "target/ci/hermit-strict";
 
 /// Which compatibility corpus a focused mode runs, and how it is labelled.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -493,10 +503,45 @@ pub fn lane_nodes(
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let cfg = dag_from_json(&text).map_err(|e| format!("invalid DAG {}: {e}", path.display()))?;
+    let portable_compat_commands = if lane == "portable" {
+        Some(
+            portable_strict_compat_probe_nodes(root)?
+                .into_iter()
+                .map(|step| (step.tag(), step.cmd))
+                .collect::<BTreeMap<_, _>>(),
+        )
+    } else {
+        None
+    };
     let retag = |g: &str| if prefix.is_empty() { g.to_string() } else { format!("{prefix}{g}") };
+    let mut seen_portable_compat = std::collections::BTreeSet::new();
     let mut out = Vec::with_capacity(cfg.steps.len());
     for s in &cfg.steps {
         let mut step = s.clone();
+        if let Some(commands) = &portable_compat_commands {
+            if s.group == "compat" {
+                let command = commands.get(&s.tag()).ok_or_else(|| {
+                    format!(
+                        "portable DAG contains compatibility node {} absent from ci/compat/corpus-strict.json",
+                        s.tag()
+                    )
+                })?;
+                let stored = portable_strict_compat_stored_command(&s.job, command);
+                if s.cmd != stored {
+                    return Err(format!(
+                        "portable strict compatibility command drifted for {}: expected {:?}, got {:?}",
+                        s.tag(), stored, s.cmd
+                    ));
+                }
+                // The standalone lane treats the three declared portable
+                // diagnostics as warnings, matching the former focused
+                // validator.  This validator consumes typed outcomes itself,
+                // so run the underlying command and let the compatibility
+                // disposition decide whether its failure blocks.
+                step.cmd = command.clone();
+                seen_portable_compat.insert(s.tag());
+            }
+        }
         // All buckets in one validate share E2E_RUN_ID, so the harness defaults
         // would make concurrent processes append unrelated bucket rows to one
         // file. Keep one run identity while isolating storage by lane and bucket.
@@ -527,6 +572,20 @@ pub fn lane_nodes(
             step.hint.hard_mem_max_bytes = Some(8 * 1024 * 1024 * 1024);
         }
         out.push(step);
+    }
+    if let Some(commands) = &portable_compat_commands {
+        let missing = commands
+            .keys()
+            .filter(|tag| !seen_portable_compat.contains(*tag))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(format!(
+                "portable DAG is missing {} compatibility node(s) derived from ci/compat/corpus-strict.json: {}",
+                missing.len(),
+                missing.join(", ")
+            ));
+        }
     }
     Ok(out)
 }
@@ -952,6 +1011,44 @@ pub fn compat_nodes(
     compat_nodes_for(root, mode, hermit_bin, nsswitch, paths, gate_dep, None, None)
 }
 
+/// The portable strict probes as they appear in the shipped outer DAG.
+///
+/// Stable relative paths keep the committed DAG checkout-independent.  The
+/// corpus remains the source of the argv; the self-test compares these generated
+/// steps with every committed `compat.*` row so the reviewed list cannot drift.
+pub fn portable_strict_compat_probe_nodes(root: &Path) -> Result<Vec<Step>, String> {
+    let paths = CorpusPaths {
+        root_dir: ".",
+        real_compat_fixtures: PORTABLE_STRICT_COMPAT_FIXTURES,
+        validation_tmp_dir: PORTABLE_STRICT_COMPAT_TMP,
+        shell_build_dir: PORTABLE_STRICT_COMPAT_SHELL_BUILD,
+    };
+    compat_nodes(
+        root,
+        CompatMode::PortableStrict,
+        PORTABLE_STRICT_COMPAT_HERMIT,
+        "",
+        &paths,
+        Some("compatprep.fixtures"),
+    )
+}
+
+/// Standalone `dagrun` consumers do not own the compatibility disposition
+/// table, so the three already-declared portable diagnostics must preserve the
+/// former focused validator's nonblocking result.  The validator replaces this
+/// wrapper with the direct command above and judges the typed failure itself.
+pub fn portable_strict_compat_stored_command(label: &str, command: &str) -> String {
+    let diagnostics = validate_corpus::portable_diagnostic();
+    let Some(reason) = diagnostics.get(label) else {
+        return command.to_string();
+    };
+    format!(
+        "status=0; {command} || status=$?; if [ \"$status\" -ne 0 ]; then printf 'WARN portable strict compatibility diagnostic %s failed (nonblocking), exit %s: %s\\n' {} \"$status\" {} >&2; fi; exit 0",
+        shell_quote(label),
+        shell_quote(reason),
+    )
+}
+
 /// [`compat_nodes`] with two extra knobs used by the `super` suite's
 /// `run_portable_slow_strict_diagnostics` port (validate.sh:4603).
 ///
@@ -1003,7 +1100,7 @@ pub fn compat_nodes_for(
         argv.extend(mode.run_args(&row.label, nsswitch));
         argv.extend(row.argv.iter().cloned());
         let wall = wall_override.unwrap_or_else(|| mode.timeout_for(&row.label));
-        out.push(node(
+        let mut step = node(
             "compat",
             &sanitize_job(&row.label),
             &format!("{} compatibility: {}", mode.display_name(), row.label),
@@ -1012,7 +1109,13 @@ pub fn compat_nodes_for(
             wall,
             COMPAT_CPU_TIMEOUT_S.max(wall),
             COMPAT_MEM_BYTES,
-        ));
+        );
+        if mode == CompatMode::PortableStrict {
+            step.hint
+                .resources
+                .insert(PORTABLE_STRICT_COMPAT_RESOURCE.to_string(), 1);
+        }
+        out.push(step);
     }
     if out.is_empty() {
         return Err(format!("compatibility mode {mode:?} selected zero probes"));
@@ -1085,10 +1188,10 @@ pub fn lane_config(root: &Path, lane: &str) -> Result<DagConfig, String> {
 /// It used to be `DagConfig { steps, ..Default::default() }`, which loaded a DAG
 /// file, kept its steps, and threw its configuration away. That is not a
 /// hypothetical: it hung a full validate for 14 minutes at 0% CPU.
-/// `ci/dag/portable.json` declares `resource_caps {hermit_guest: 1,
-/// manifest_guest: 8}`; dropping them left `res_free` evaluating
-/// `unwrap_or(0) >= 1` for the 18 steps demanding `hermit_guest` and the 13
-/// demanding `manifest_guest`, so none could ever be admitted. The scheduler's
+/// `ci/dag/portable.json` declares both `hermit_guest` and `manifest_guest`
+/// capacities; dropping them left `res_free` evaluating
+/// `unwrap_or(0) >= demand` for every step using either resource, so none could
+/// ever be admitted. The scheduler's
 /// only exit is `running.is_empty() && done + skipped >= steps.len()`, so with
 /// work neither runnable nor accounted it slept at 50 ms forever -- no error, no
 /// exit, 21 of ~58 nodes done.
@@ -1105,9 +1208,9 @@ pub fn config_from_base(base: &DagConfig, steps: Vec<Step>, description: &str) -
     let mut cfg = base.clone();
     cfg.steps = steps;
     cfg.description = description.to_string();
-    // The one DELIBERATE divergence: shipped lane nodes declare cpu_timeout on
-    // 0 of 55, so supply a load-immune default. A node's own cpu_timeout still
-    // wins via effective_cpu_timeout. Recorded here so the audit can exempt it.
+    // The one DELIBERATE divergence: older shipped lane nodes omit cpu_timeout,
+    // so supply a load-immune default. A node's own cpu_timeout still wins via
+    // effective_cpu_timeout. Recorded here so the audit can exempt it.
     cfg.default_step_cpu_timeout = LANE_DEFAULT_CPU_TIMEOUT_S;
     cfg
 }
