@@ -1699,111 +1699,6 @@ fn series_run_index(dir_name: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn logical_time_nanoseconds(text: &str) -> Option<u64> {
-    let value = text.trim().replace('_', "");
-    if let Some(nanoseconds) = value.strip_suffix("ns") {
-        return nanoseconds.parse().ok();
-    }
-    let seconds = value.strip_suffix('s')?;
-    let (whole, fraction) = seconds.split_once('.').unwrap_or((seconds, ""));
-    if fraction.len() > 9
-        || !whole.bytes().all(|byte| byte.is_ascii_digit())
-        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
-    }
-    let whole = whole.parse::<u64>().ok()?;
-    let mut fraction = fraction.to_string();
-    fraction.extend(std::iter::repeat_n('0', 9 - fraction.len()));
-    whole
-        .checked_mul(1_000_000_000)?
-        .checked_add(fraction.parse::<u64>().ok()?)
-}
-
-fn runtime_from_log(path: &Path) -> Result<RuntimeStats, String> {
-    let text = fs::read_to_string(path)
-        .map_err(|error| format!("cannot read retained verification log {}: {error}", path.display()))?;
-    let scheduler_turns = text
-        .lines()
-        .rev()
-        .find_map(|line| {
-            line.split_once("Internally, the hermit scheduler ran ")
-                .and_then(|(_, rest)| rest.split_whitespace().next())
-                .and_then(|value| value.parse::<u64>().ok())
-        })
-        .ok_or_else(|| format!("{} has no scheduler-turn summary", path.display()))?;
-    let virtual_nanoseconds = text
-        .lines()
-        .rev()
-        .find_map(|line| {
-            line.split_once("Elapsed virtual global (cpu) time: ")
-                .and_then(|(_, value)| logical_time_nanoseconds(value))
-        })
-        .ok_or_else(|| format!("{} has no virtual-time summary", path.display()))?;
-    let mut per_thread = BTreeMap::<u64, u64>::new();
-    for line in text.lines() {
-        let Some((_, after_tid)) = line.split_once("[detcore, dtid ") else {
-            continue;
-        };
-        let Some((dettid, _)) = after_tid.split_once(']') else {
-            continue;
-        };
-        let Some((_, after_syscall)) = line.split_once("finish syscall #") else {
-            continue;
-        };
-        let count = after_syscall
-            .bytes()
-            .take_while(u8::is_ascii_digit)
-            .count();
-        let Some(syscalls) = after_syscall.get(..count).and_then(|value| value.parse::<u64>().ok())
-        else {
-            continue;
-        };
-        let Some(dettid) = dettid.parse::<u64>().ok() else {
-            continue;
-        };
-        per_thread
-            .entry(dettid)
-            .and_modify(|seen| *seen = (*seen).max(syscalls))
-            .or_insert(syscalls);
-    }
-    let syscalls = if per_thread.is_empty() {
-        None
-    } else {
-        Some(
-            per_thread
-            .values()
-            .try_fold(0_u64, |total, count| total.checked_add(*count))
-            .ok_or_else(|| format!("{} syscall total overflowed u64", path.display()))?,
-        )
-    };
-    Ok(RuntimeStats {
-        scheduler_turns,
-        virtual_nanoseconds,
-        syscalls,
-    })
-}
-
-fn retained_verification_runtime(
-    attempts: &[AttemptResult],
-) -> Result<Option<VerificationRuntime>, String> {
-    for attempt in attempts {
-        let mut run1 = None;
-        let mut run2 = None;
-        for line in attempt.stderr.lines() {
-            if let Some(path) = line.strip_prefix("::   run 1: ") {
-                run1 = Some(runtime_from_log(Path::new(path))?);
-            } else if let Some(path) = line.strip_prefix("::   run 2: ") {
-                run2 = Some(runtime_from_log(Path::new(path))?);
-            }
-        }
-        if run1.is_some() || run2.is_some() {
-            return Ok(Some(VerificationRuntime { run1, run2 }));
-        }
-    }
-    Ok(None)
-}
-
 /// Publish a retained campaign's per-cell results to the parent's series spool.
 ///
 /// This is the call site the store was missing. Everything it needs already
@@ -1844,7 +1739,7 @@ fn collect_series_rows(results: &Path) -> Result<Vec<(String, CellResult)>, Stri
             .ok_or_else(|| format!("{} has no result-directory name", result_file.display()))?
             .to_string_lossy()
             .into_owned();
-        for mut row in read_result_rows(&result_file)? {
+        for row in read_result_rows(&result_file)? {
             let repetition = series_run_index(&dir_name);
             if row.run_index != Some(repetition) {
                 return Err(format!(
@@ -1854,9 +1749,10 @@ fn collect_series_rows(results: &Path) -> Result<Vec<(String, CellResult)>, Stri
                     repetition,
                 ));
             }
-            if row.runtime.is_none() && row.mode == "verify" {
-                row.runtime = retained_verification_runtime(&row.attempts)?;
-            }
+            // Runtime belongs to the typed verification report written by the
+            // framework. Retained rows written before that field existed remain
+            // readable with `runtime: None`; stderr and retained log prose do not
+            // acquire measurement authority after the fact.
             let key = format!(
                 "{}/{}/{:020}/{:020}",
                 dir_name, row.test, repetition, row.attempt,
@@ -4965,37 +4861,6 @@ fn self_test(root: &Path) -> Result<(), String> {
     {
         return Err("pressure repetition ordinals no longer match retained result directories".into());
     }
-    {
-        let path = std::env::temp_dir().join(format!(
-            "pressure-runtime-summary-{}",
-            std::process::id()
-        ));
-        let summary = "Internally, the hermit scheduler ran 12 turns, recorded 0 events, replayed 0 events (0 desynced)\nElapsed virtual global (cpu) time: 34ns\n";
-        fs::write(&path, summary)
-            .map_err(|e| format!("cannot write runtime summary fixture: {e}"))?;
-        let missing = runtime_from_log(&path)?;
-        if missing.scheduler_turns != 12
-            || missing.virtual_nanoseconds != 34
-            || missing.syscalls.is_some()
-        {
-            return Err(format!(
-                "a runtime log without syscall accounting did not keep it absent: {missing:?}"
-            ));
-        }
-        fs::write(
-            &path,
-            format!("{summary}INFO [detcore, dtid 7] finish syscall #5\n"),
-        )
-        .map_err(|e| format!("cannot write counted runtime summary fixture: {e}"))?;
-        let counted = runtime_from_log(&path)?;
-        if counted.syscalls != Some(5) {
-            return Err(format!(
-                "a runtime log with syscall accounting did not retain it: {counted:?}"
-            ));
-        }
-        fs::remove_file(&path)
-            .map_err(|e| format!("cannot remove runtime summary fixture: {e}"))?;
-    }
     // A divergence located by an earlier attempt remains an observation even
     // when the terminal retry passes. An attempt that located nothing does not
     // manufacture a divergence observation.
@@ -7060,6 +6925,26 @@ fn self_test(root: &Path) -> Result<(), String> {
     nested_first.run_index = Some(4);
     let mut nested_second = second_row.clone();
     nested_second.run_index = Some(4);
+    let retained_log = scratch.join("retained-verification.log");
+    fs::write(
+        &retained_log,
+        "Internally, the hermit scheduler ran 12 turns, recorded 0 events, replayed 0 events (0 desynced)\nElapsed virtual global (cpu) time: 34ns\nINFO [detcore, dtid 7] finish syscall #5\n",
+    )
+    .map_err(|e| format!("cannot write retained verification log fixture: {e}"))?;
+    nested_first.attempts[0].stderr = format!(
+        "::   run 1: {}\n::   run 2: {}",
+        retained_log.display(),
+        retained_log.display(),
+    );
+    let typed_runtime = VerificationRuntime {
+        run1: Some(RuntimeStats {
+            scheduler_turns: 13,
+            virtual_nanoseconds: 35,
+            syscalls: Some(6),
+        }),
+        run2: None,
+    };
+    nested_second.runtime = Some(typed_runtime.clone());
     fs::write(
         nested_cell.join("results.jsonl"),
         format!(
@@ -7079,11 +6964,13 @@ fn self_test(root: &Path) -> Result<(), String> {
             != Some("INFO detcore: left event")
         || nested_rows[0].1.first_divergent_right_message.as_deref()
             != Some("INFO detcore: right event")
+        || nested_rows[0].1.runtime.is_some()
         || nested_rows[1].1.run_index != Some(4)
         || nested_rows[1].1.attempt != 2
+        || nested_rows[1].1.runtime.as_ref() != Some(&typed_runtime)
     {
         return Err(format!(
-            "pressure series writer did not retain both attempts from the ordinary nested layout: {nested_rows:?}"
+            "pressure series writer did not retain typed runtime and honest absence from the ordinary nested layout: {nested_rows:?}"
         ));
     }
     nested_second.run_index = Some(3);
