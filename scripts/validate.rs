@@ -103,6 +103,7 @@ use std::process::Command;
 use std::process::ExitCode;
 use dagrun::cgroup::aggregate_slice_max_cpus;
 use dagrun::cgroup::is_in_scope;
+use dagrun::model::CmdType;
 use dagrun::model::DagConfig;
 use dagrun::model::RunResult;
 use dagrun::model::Step;
@@ -3332,6 +3333,7 @@ fn super_plan_bracket() -> Result<(), String> {
             desc: "inert fixture: declares no caps".into(),
             description: String::new(),
             cmd: "true".into(),
+            cmdtype: CmdType::Unknown,
             deps: vec![],
             env: BTreeMap::new(),
             hint: Default::default(),
@@ -6435,6 +6437,7 @@ fn step_with_caps(
         desc: desc.into(),
         description: String::new(),
         cmd,
+        cmdtype: CmdType::Unknown,
         deps,
         env: BTreeMap::new(),
         hint: dagrun::model::ResourceHint {
@@ -7311,6 +7314,7 @@ fn host_capability_bracket(root: &Path) -> Result<(), String> {
         desc: String::new(),
         description: String::new(),
         cmd: "true".into(),
+        cmdtype: CmdType::Unknown,
         deps,
         env: BTreeMap::new(),
         hint: dagrun::model::ResourceHint::default(),
