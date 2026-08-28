@@ -368,7 +368,7 @@ def main() -> int:
             print_comparison(
                 passed,
                 report,
-                current.get("qcow2_sha256"),
+                current.qcow2_sha256,
                 "Resume",
             )
             result = "SUCCESS" if passed else "PARTIAL"
