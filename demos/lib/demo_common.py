@@ -20,7 +20,9 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, TypedDict, cast
 
 
 WALLCLOCK_RE = re.compile(
@@ -48,6 +50,310 @@ FILE_INODE_RE = re.compile(r"FileContents\(\d+\)")
 # Guest-observable determinism is asserted independently via the qcow2 / serial /
 # guest-output SHAs; see compare_runs.
 USER_ADDR_RE = re.compile(r"0x7f[0-9a-f]{6,}")
+RUN_METADATA_SCHEMA_VERSION = 2
+
+
+class QemuRunKind(str, Enum):
+    BOOT = "qemu-boot"
+    RESUME = "qemu-resume"
+
+
+class QemuRunMetadataRecord(TypedDict, total=False):
+    schema_version: int
+    created_at: str
+    kind: str
+    info_log: str
+    info_log_sha256: str
+    hermit_version: str
+    qemu_version: str
+    qemu_binary_sha256: str
+    qemu_argv: List[str]
+    serial_log: str
+    serial_sha256: str
+    qcow2_path: str
+    qcow2_sha256: str
+    qcow2_size: int
+    snapshot_name: str
+    snapshot_date_nsec_canonicalized: bool
+    command: str
+    command_sha256: str
+    guest_output: str
+    guest_output_sha256: str
+    snapshot_saved: bool
+
+
+@dataclass(frozen=True)
+class QemuRunMetadata:
+    schema_version: int
+    kind: QemuRunKind
+    created_at: str
+    info_log: str
+    info_log_sha256: str
+    hermit_version: str
+    qemu_version: str
+    qemu_binary_sha256: Optional[str]
+    qemu_argv: Tuple[str, ...]
+    serial_log: str
+    serial_sha256: Optional[str]
+    qcow2_path: Optional[str]
+    qcow2_sha256: Optional[str]
+    qcow2_size: Optional[int]
+    snapshot_name: Optional[str]
+    snapshot_date_nsec_canonicalized: Optional[bool]
+    command: Optional[str]
+    command_sha256: Optional[str]
+    guest_output: Optional[str]
+    guest_output_sha256: Optional[str]
+    snapshot_saved: Optional[bool]
+    raw: QemuRunMetadataRecord
+
+    def with_info_log(self, path: Path) -> "QemuRunMetadata":
+        value = dict(self.raw)
+        value["info_log"] = str(Path(path).resolve())
+        return parse_run_metadata(value)
+
+
+COMMON_METADATA_FIELDS = frozenset(
+    {
+        "schema_version",
+        "created_at",
+        "kind",
+        "info_log",
+        "info_log_sha256",
+        "hermit_version",
+        "qemu_version",
+        "qemu_binary_sha256",
+        "qemu_argv",
+        "serial_log",
+    }
+)
+BOOT_METADATA_FIELDS = COMMON_METADATA_FIELDS | frozenset(
+    {
+        "serial_sha256",
+        "qcow2_path",
+        "qcow2_sha256",
+        "qcow2_size",
+        "snapshot_name",
+        "snapshot_date_nsec_canonicalized",
+    }
+)
+RESUME_METADATA_FIELDS = COMMON_METADATA_FIELDS | frozenset(
+    {
+        "command",
+        "command_sha256",
+        "guest_output",
+        "guest_output_sha256",
+        "snapshot_saved",
+        "qcow2_path",
+        "qcow2_sha256",
+        "qcow2_size",
+        "snapshot_date_nsec_canonicalized",
+    }
+)
+METADATA_FIELDS_BY_KIND = {
+    QemuRunKind.BOOT: BOOT_METADATA_FIELDS,
+    QemuRunKind.RESUME: RESUME_METADATA_FIELDS,
+}
+
+
+def _metadata_error(field: str, detail: str) -> ValueError:
+    return ValueError("qemu-run-metadata-{}: {}".format(field, detail))
+
+
+def _metadata_text(value: Mapping[str, Any], field: str) -> str:
+    raw = value.get(field)
+    if not isinstance(raw, str) or not raw.strip():
+        raise _metadata_error(field, "must be a nonempty string")
+    return raw
+
+
+def _metadata_sha256(value: Mapping[str, Any], field: str) -> str:
+    raw = _metadata_text(value, field)
+    if len(raw) != 64 or any(character not in "0123456789abcdef" for character in raw):
+        raise _metadata_error(field, "must be a lowercase 64-hex SHA-256")
+    return raw
+
+
+def _metadata_optional_text(value: Mapping[str, Any], field: str) -> Optional[str]:
+    if field not in value:
+        return None
+    return _metadata_text(value, field)
+
+
+def _metadata_optional_sha256(value: Mapping[str, Any], field: str) -> Optional[str]:
+    if field not in value:
+        return None
+    return _metadata_sha256(value, field)
+
+
+def _metadata_qemu_argv(value: Mapping[str, Any]) -> Tuple[str, ...]:
+    raw = value.get("qemu_argv")
+    if (
+        not isinstance(raw, list)
+        or not raw
+        or any(not isinstance(argument, str) or not argument for argument in raw)
+    ):
+        raise _metadata_error("qemu_argv", "must be a nonempty list of strings")
+    return tuple(raw)
+
+
+def _metadata_optional_size(value: Mapping[str, Any]) -> Optional[int]:
+    if "qcow2_size" not in value:
+        return None
+    raw = value.get("qcow2_size")
+    if not isinstance(raw, int) or isinstance(raw, bool) or raw < 0:
+        raise _metadata_error("qcow2_size", "must be a nonnegative integer")
+    return raw
+
+
+def parse_run_metadata(value: Mapping[str, Any]) -> QemuRunMetadata:
+    """Read the version before requiring its complete kind-specific shape."""
+    schema_version = value.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version not in (1, RUN_METADATA_SCHEMA_VERSION)
+    ):
+        raise _metadata_error(
+            "schema_version", "unsupported value {!r}".format(schema_version)
+        )
+    try:
+        kind = QemuRunKind(_metadata_text(value, "kind"))
+    except ValueError as error:
+        if str(error).startswith("qemu-run-metadata-"):
+            raise
+        raise _metadata_error(
+            "kind", "unsupported value {!r}".format(value.get("kind"))
+        )
+
+    allowed = METADATA_FIELDS_BY_KIND.get(kind)
+    if allowed is None:
+        raise _metadata_error(
+            "kind", "has no field contract for {!r}".format(kind.value)
+        )
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise _metadata_error(
+            "field",
+            "unknown field(s) for kind {!r}: {}".format(kind.value, ", ".join(unknown)),
+        )
+
+    created_at = _metadata_text(value, "created_at")
+    info_log = _metadata_text(value, "info_log")
+    info_log_sha256 = _metadata_sha256(value, "info_log_sha256")
+    hermit_version = _metadata_text(value, "hermit_version")
+    qemu_version = _metadata_text(value, "qemu_version")
+    qemu_binary_sha256 = _metadata_optional_text(value, "qemu_binary_sha256")
+    qemu_argv = _metadata_qemu_argv(value)
+    serial_log = _metadata_text(value, "serial_log")
+
+    serial_sha256 = _metadata_optional_sha256(value, "serial_sha256")
+    qcow2_path = _metadata_optional_text(value, "qcow2_path")
+    qcow2_sha256 = _metadata_optional_sha256(value, "qcow2_sha256")
+    qcow2_size = _metadata_optional_size(value)
+    snapshot_name = _metadata_optional_text(value, "snapshot_name")
+    canonicalized = value.get("snapshot_date_nsec_canonicalized")
+    if canonicalized is not None and not isinstance(canonicalized, bool):
+        raise _metadata_error("snapshot_date_nsec_canonicalized", "must be a boolean")
+    command = _metadata_optional_text(value, "command")
+    command_sha256 = _metadata_optional_sha256(value, "command_sha256")
+    guest_output = _metadata_optional_text(value, "guest_output")
+    guest_output_sha256 = _metadata_optional_sha256(value, "guest_output_sha256")
+    snapshot_saved = value.get("snapshot_saved")
+    if snapshot_saved is not None and not isinstance(snapshot_saved, bool):
+        raise _metadata_error("snapshot_saved", "must be a boolean")
+
+    if kind is QemuRunKind.BOOT:
+        if qemu_binary_sha256 is None:
+            raise _metadata_error("qemu_binary_sha256", "is required for qemu-boot")
+        for field, parsed in (
+            ("serial_sha256", serial_sha256),
+            ("qcow2_path", qcow2_path),
+            ("qcow2_sha256", qcow2_sha256),
+            ("qcow2_size", qcow2_size),
+            ("snapshot_name", snapshot_name),
+        ):
+            if parsed is None:
+                raise _metadata_error(field, "is required for qemu-boot")
+        if canonicalized is not True:
+            raise _metadata_error(
+                "snapshot_date_nsec_canonicalized", "must be true for qemu-boot"
+            )
+    elif kind is QemuRunKind.RESUME:
+        for field, parsed in (
+            ("command", command),
+            ("command_sha256", command_sha256),
+            ("guest_output", guest_output),
+            ("guest_output_sha256", guest_output_sha256),
+        ):
+            if parsed is None:
+                raise _metadata_error(field, "is required for qemu-resume")
+        if snapshot_saved is None:
+            raise _metadata_error("snapshot_saved", "is required for qemu-resume")
+        if qemu_binary_sha256 is None and not (
+            schema_version == 1 and snapshot_saved is False
+        ):
+            raise _metadata_error(
+                "qemu_binary_sha256",
+                "is required except on schema-1 rows without a saved snapshot",
+            )
+        snapshot_fields = {
+            "qcow2_path": qcow2_path,
+            "qcow2_sha256": qcow2_sha256,
+            "qcow2_size": qcow2_size,
+            "snapshot_date_nsec_canonicalized": canonicalized,
+        }
+        if snapshot_saved:
+            for field, parsed in snapshot_fields.items():
+                if parsed is None:
+                    raise _metadata_error(
+                        field, "is required when snapshot_saved is true"
+                    )
+            if canonicalized is not True:
+                raise _metadata_error(
+                    "snapshot_date_nsec_canonicalized",
+                    "must be true when snapshot_saved is true",
+                )
+        else:
+            present = sorted(
+                field for field, parsed in snapshot_fields.items() if parsed is not None
+            )
+            if present:
+                raise _metadata_error(
+                    "snapshot_saved",
+                    "is false but snapshot field(s) are present: {}".format(
+                        ", ".join(present)
+                    ),
+                )
+    else:
+        raise _metadata_error(
+            "kind", "has no value contract for {!r}".format(kind.value)
+        )
+
+    return QemuRunMetadata(
+        schema_version=schema_version,
+        kind=kind,
+        created_at=created_at,
+        info_log=info_log,
+        info_log_sha256=info_log_sha256,
+        hermit_version=hermit_version,
+        qemu_version=qemu_version,
+        qemu_binary_sha256=qemu_binary_sha256,
+        qemu_argv=qemu_argv,
+        serial_log=serial_log,
+        serial_sha256=serial_sha256,
+        qcow2_path=qcow2_path,
+        qcow2_sha256=qcow2_sha256,
+        qcow2_size=qcow2_size,
+        snapshot_name=snapshot_name,
+        snapshot_date_nsec_canonicalized=canonicalized,
+        command=command,
+        command_sha256=command_sha256,
+        guest_output=guest_output,
+        guest_output_sha256=guest_output_sha256,
+        snapshot_saved=snapshot_saved,
+        raw=cast(QemuRunMetadataRecord, dict(value)),
+    )
 
 
 def _under_host_tmp(root: Path) -> bool:
@@ -173,14 +479,14 @@ def save_metadata(
     qcow2_path: Optional[Path],
     info_log: Path,
     extra: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+) -> QemuRunMetadata:
     """Save machine-readable metadata for one run and return it."""
     run_dir = Path(run_dir)
     info_log = Path(info_log)
     run_dir.mkdir(parents=True, exist_ok=True)
     qemu = os.environ.get("QEMU_BIN", "qemu-system-x86_64")
     metadata: Dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": RUN_METADATA_SCHEMA_VERSION,
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "info_log": str(info_log.resolve()),
         "info_log_sha256": hash_file(info_log),
@@ -200,23 +506,30 @@ def save_metadata(
             }
         )
     if extra:
+        overlap = sorted(set(metadata) & set(extra))
+        if overlap:
+            raise _metadata_error(
+                "field",
+                "extra fields replace common field(s): {}".format(", ".join(overlap)),
+            )
         metadata.update(extra)
-    _write_json(run_dir / "run-metadata.json", metadata)
-    return metadata
+    typed = parse_run_metadata(metadata)
+    _write_json(run_dir / "run-metadata.json", dict(typed.raw))
+    return typed
 
 
-def load_anchor(run_dir: Path) -> Optional[Dict[str, Any]]:
+def load_anchor(run_dir: Path) -> Optional[QemuRunMetadata]:
     """Load the first-run metadata anchor, if present."""
     anchor_path = Path(run_dir) / "run-metadata.json"
     if not anchor_path.is_file():
         return None
-    return json.loads(anchor_path.read_text())
+    return parse_run_metadata(json.loads(anchor_path.read_text()))
 
 
-def save_anchor(run_dir: Path, metadata: Dict[str, Any]) -> Path:
+def save_anchor(run_dir: Path, metadata: QemuRunMetadata) -> Path:
     """Persist a metadata object as the first-run anchor."""
     anchor_path = Path(run_dir) / "run-metadata.json"
-    _write_json(anchor_path, metadata)
+    _write_json(anchor_path, dict(metadata.raw))
     return anchor_path
 
 
@@ -336,7 +649,7 @@ def publish_anchor(work_dir: Path, anchor_dir: Path) -> bool:
         raise
 
 
-def load_committed_anchor(anchor_dir: Path) -> Optional[Dict[str, Any]]:
+def load_committed_anchor(anchor_dir: Path) -> Optional[QemuRunMetadata]:
     """Load the committed anchor metadata, resolving its bundled INFO log path.
 
     Returns ``None`` when no anchor exists yet. The anchor's Hermit INFO log is
@@ -348,10 +661,10 @@ def load_committed_anchor(anchor_dir: Path) -> Optional[Dict[str, Any]]:
     anchor_meta = anchor_dir / "run-metadata.json"
     if not anchor_meta.is_file():
         return None
-    metadata = json.loads(anchor_meta.read_text())
+    metadata = parse_run_metadata(json.loads(anchor_meta.read_text()))
     bundled_log = anchor_dir / "hermit-info.log"
     if bundled_log.is_file():
-        metadata["info_log"] = str(bundled_log.resolve())
+        metadata = metadata.with_info_log(bundled_log)
     return metadata
 
 
@@ -431,34 +744,49 @@ def hermit_log_diff(log1: Path, log2: Path) -> str:
 
 
 def compare_runs(
-    anchor: Dict[str, Any], current: Dict[str, Any]
+    anchor: QemuRunMetadata, current: QemuRunMetadata
 ) -> Tuple[bool, List[str]]:
     """Compare exact artifacts and timestamp-stripped logs."""
     passed = True
     report: List[str] = []
-    if anchor.get("qemu_argv") == current.get("qemu_argv"):
+    if anchor.kind is not current.kind:
+        passed = False
+        report.append(
+            "WARN: run kind differs from first run: first={} current={}".format(
+                anchor.kind.value, current.kind.value
+            )
+        )
+    if anchor.qemu_argv == current.qemu_argv:
         report.append("PASS: QEMU argv matches first run")
     else:
         passed = False
         report.append(
             "WARN: QEMU argv differs from first run; executable path or arguments changed"
         )
-    for field, label in (
-        ("qemu_version", "QEMU version"),
-        ("qemu_binary_sha256", "QEMU binary SHA-256"),
-        ("qcow2_sha256", "qcow2 SHA-256"),
-        ("serial_sha256", "serial output SHA-256"),
-        ("guest_output_sha256", "guest output SHA-256"),
+    for anchor_value, current_value, label in (
+        (anchor.qemu_version, current.qemu_version, "QEMU version"),
+        (
+            anchor.qemu_binary_sha256,
+            current.qemu_binary_sha256,
+            "QEMU binary SHA-256",
+        ),
+        (anchor.qcow2_sha256, current.qcow2_sha256, "qcow2 SHA-256"),
+        (anchor.serial_sha256, current.serial_sha256, "serial output SHA-256"),
+        (
+            anchor.guest_output_sha256,
+            current.guest_output_sha256,
+            "guest output SHA-256",
+        ),
     ):
-        if field not in anchor and field not in current:
+        if anchor_value is None and current_value is None:
             continue
-        if anchor.get(field) == current.get(field):
-            report.append("PASS: {} matches ({})".format(label, current.get(field)))
+        if anchor_value == current_value:
+            report.append("PASS: {} matches ({})".format(label, current_value))
         else:
             passed = False
             report.append(
                 "WARN: {} differs from first run: first={} current={}".format(
-                    label, anchor.get(field), current.get(field)
+                    label, anchor_value, current_value
                 )
             )
 
@@ -468,8 +796,8 @@ def compare_runs(
     # difference that begins during Python startup can propagate into virtual
     # clock values and the QEMU execution; its origin does not make the later
     # guest-visible log evidence optional.
-    anchor_log = anchor.get("info_log")
-    current_log = current.get("info_log")
+    anchor_log = anchor.info_log
+    current_log = current.info_log
     if (
         anchor_log
         and current_log

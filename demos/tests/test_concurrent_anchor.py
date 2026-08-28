@@ -19,6 +19,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 DEMO_DIR = Path(__file__).resolve().parent.parent
 LIB_DIR = DEMO_DIR / "lib"
@@ -28,6 +29,48 @@ import demo_common as dc  # noqa: E402
 
 
 BASE_LOG = "line-a\nline-b\nline-c\n"
+
+
+def _boot_record(work, idx=0, qcow2_sha="d" * 64, info_log=None):
+    info_log = work / "hermit-info.log" if info_log is None else Path(info_log)
+    return {
+        "schema_version": dc.RUN_METADATA_SCHEMA_VERSION,
+        "kind": "qemu-boot",
+        "created_at": str(idx),
+        "info_log": str(info_log.resolve()),
+        "info_log_sha256": "a" * 64,
+        "hermit_version": "hermit-test",
+        "qemu_version": "qemu-test",
+        "qemu_binary_sha256": "b" * 64,
+        "qemu_argv": ["qemu-system-x86_64", "-nographic"],
+        "serial_log": str((work / "serial.log").resolve()),
+        "serial_sha256": "c" * 64,
+        "qcow2_path": str((work / "boot-snapshot.qcow2").resolve()),
+        "qcow2_sha256": qcow2_sha,
+        "qcow2_size": 1,
+        "snapshot_name": "booted",
+        "snapshot_date_nsec_canonicalized": True,
+    }
+
+
+def _resume_record(schema_version=dc.RUN_METADATA_SCHEMA_VERSION):
+    return {
+        "schema_version": schema_version,
+        "kind": "qemu-resume",
+        "created_at": "2026-08-28T07:00:00Z",
+        "info_log": "/tmp/info.log",
+        "info_log_sha256": "a" * 64,
+        "hermit_version": "hermit-test",
+        "qemu_version": "qemu-test",
+        "qemu_binary_sha256": "b" * 64,
+        "qemu_argv": ["qemu-system-x86_64", "-nographic"],
+        "serial_log": "/tmp/serial.log",
+        "command": "uname -a",
+        "command_sha256": "c" * 64,
+        "guest_output": "/tmp/output.log",
+        "guest_output_sha256": "d" * 64,
+        "snapshot_saved": False,
+    }
 
 
 def _build_and_publish(assets_str, lib_str, barrier, queue, idx, divergent):
@@ -45,15 +88,8 @@ def _build_and_publish(assets_str, lib_str, barrier, queue, idx, divergent):
     qcow2_sha = "cafe{:060d}".format(idx) if divergent else "d" * 64
     log_text = BASE_LOG + ("extra-{}\n".format(idx) if divergent else "")
     (work / "hermit-info.log").write_text(log_text)
-    metadata = {
-        "kind": "qemu-boot",
-        "worker_idx": idx,
-        "qemu_argv": ["qemu-system-x86_64", "-nographic"],
-        "qcow2_sha256": qcow2_sha,
-        "serial_sha256": "s" * 64,
-        "info_log": str((work / "hermit-info.log").resolve()),
-    }
-    worker_dc._write_json(work / "run-metadata.json", metadata)
+    metadata = worker_dc.parse_run_metadata(_boot_record(work, idx, qcow2_sha))
+    worker_dc._write_json(work / "run-metadata.json", dict(metadata.raw))
 
     barrier.wait()  # release every worker into the rename race simultaneously
     won = worker_dc.publish_anchor(work, anchor_dir)
@@ -64,7 +100,7 @@ def _build_and_publish(assets_str, lib_str, barrier, queue, idx, divergent):
         # Compare while the working dir (and its info_log) is still in place.
         passed, _report = worker_dc.compare_runs(anchor, metadata)
         outcome["passed"] = passed
-        outcome["anchor_worker_idx"] = anchor.get("worker_idx")
+        outcome["anchor_worker_idx"] = int(anchor.created_at)
         worker_dc.archive_result_dir(work, assets, "boot")
     queue.put(outcome)
 
@@ -106,7 +142,7 @@ class ConcurrentAnchorTest(unittest.TestCase):
 
         # The committed anchor is complete and belongs to the sole winner.
         committed = dc.load_committed_anchor(anchor_dir)
-        self.assertEqual(committed["worker_idx"], winners[0]["idx"])
+        self.assertEqual(int(committed.created_at), winners[0]["idx"])
 
         # Every loser saw the winner's anchor (not a partial, not its own).
         for loser in losers:
@@ -154,30 +190,34 @@ class ConcurrentAnchorTest(unittest.TestCase):
             anchor_dir = assets / "boot-anchor"
 
             first = dc.make_temp_result_dir(assets, "boot")
-            (first / "run-metadata.json").write_text('{"worker_idx": 1}\n')
+            (first / "hermit-info.log").write_text(BASE_LOG)
+            dc._write_json(first / "run-metadata.json", _boot_record(first, 1))
             self.assertTrue(dc.publish_anchor(first, anchor_dir))
 
             second = dc.make_temp_result_dir(assets, "boot")
-            (second / "run-metadata.json").write_text('{"worker_idx": 2}\n')
+            (second / "hermit-info.log").write_text(BASE_LOG)
+            dc._write_json(second / "run-metadata.json", _boot_record(second, 2))
             self.assertFalse(dc.publish_anchor(second, anchor_dir))
 
             # The first winner's content was not clobbered by the second claim.
             committed = dc.load_committed_anchor(anchor_dir)
-            self.assertEqual(committed["worker_idx"], 1)
+            self.assertEqual(int(committed.created_at), 1)
             # The loser's dir is untouched (caller decides how to archive it).
             self.assertTrue((second / "run-metadata.json").is_file())
 
 
 class InfoLogAdmissionTest(unittest.TestCase):
     def _metadata(self, log_path):
-        return {
-            "qemu_argv": ["qemu-system-x86_64", "-nographic"],
-            "qemu_version": "qemu-test",
-            "qemu_binary_sha256": "b" * 64,
-            "qcow2_sha256": "q" * 64,
-            "serial_sha256": "s" * 64,
-            "info_log": str(log_path),
-        }
+        return dc.parse_run_metadata(
+            _boot_record(Path(log_path).parent, 0, info_log=log_path)
+        )
+
+    def test_missing_qemu_argv_fails_by_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            record = _boot_record(Path(tmp))
+            del record["qemu_argv"]
+            with self.assertRaisesRegex(ValueError, "qemu-run-metadata-qemu_argv"):
+                dc.parse_run_metadata(record)
 
     def test_documented_launcher_fields_are_normalized(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -266,6 +306,73 @@ class InfoLogAdmissionTest(unittest.TestCase):
                     for line in report
                 )
             )
+
+
+class RunMetadataContractTest(unittest.TestCase):
+    def test_every_kind_has_an_explicit_field_contract(self):
+        self.assertEqual(set(dc.QemuRunKind), set(dc.METADATA_FIELDS_BY_KIND))
+
+    def test_producer_writes_the_complete_current_type(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            info_log = run / "hermit-info.log"
+            qcow2 = run / "boot-snapshot.qcow2"
+            serial_log = run / "serial.log"
+            info_log.write_text("INFO deterministic run\n")
+            qcow2.write_bytes(b"qcow2")
+            serial_log.write_text("serial\n")
+            with mock.patch.object(
+                dc, "_tool_version", return_value="test-version"
+            ), mock.patch.object(dc, "_tool_sha256", return_value="b" * 64):
+                metadata = dc.save_metadata(
+                    run,
+                    qcow2,
+                    info_log,
+                    {
+                        "kind": "qemu-boot",
+                        "snapshot_name": "booted",
+                        "snapshot_date_nsec_canonicalized": True,
+                        "qemu_argv": ["qemu-system-x86_64", "-nographic"],
+                        "serial_log": str(serial_log),
+                        "serial_sha256": dc.hash_file(serial_log),
+                    },
+                )
+
+            self.assertEqual(dc.RUN_METADATA_SCHEMA_VERSION, metadata.schema_version)
+            self.assertEqual(dc.QemuRunKind.BOOT, metadata.kind)
+            self.assertEqual(metadata, dc.load_anchor(run))
+
+    def test_schema_two_requires_qemu_binary_identity(self):
+        record = _boot_record(Path("/tmp"))
+        del record["qemu_binary_sha256"]
+        with self.assertRaisesRegex(
+            ValueError, "qemu-run-metadata-qemu_binary_sha256"
+        ):
+            dc.parse_run_metadata(record)
+
+    def test_schema_one_retains_the_older_optional_qemu_binary(self):
+        record = _resume_record(schema_version=1)
+        del record["qemu_binary_sha256"]
+        metadata = dc.parse_run_metadata(record)
+        self.assertIsNone(metadata.qemu_binary_sha256)
+
+    def test_saved_resume_requires_its_snapshot_fields(self):
+        record = _resume_record()
+        record["snapshot_saved"] = True
+        with self.assertRaisesRegex(ValueError, "qemu-run-metadata-qcow2_path"):
+            dc.parse_run_metadata(record)
+
+    def test_new_kind_fails_by_name(self):
+        record = _boot_record(Path("/tmp"))
+        record["kind"] = "qemu-future"
+        with self.assertRaisesRegex(ValueError, "qemu-run-metadata-kind"):
+            dc.parse_run_metadata(record)
+
+    def test_new_field_fails_by_name(self):
+        record = _boot_record(Path("/tmp"))
+        record["future_field"] = True
+        with self.assertRaisesRegex(ValueError, "qemu-run-metadata-field"):
+            dc.parse_run_metadata(record)
 
 
 if __name__ == "__main__":
