@@ -367,6 +367,7 @@ pub fn self_test() -> Result<String, String> {
         summary: String::new(),
         executed_tests: None,
         filtered_tests: None,
+        test_results: None,
         returncode: Some(0),
         reason: String::new(),
         aborted,

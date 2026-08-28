@@ -590,6 +590,7 @@ pub fn self_test(root: &Path) -> Result<String, String> {
         summary: String::new(),
         executed_tests: None,
         filtered_tests: None,
+        test_results: None,
         returncode: Some(if ok { 0 } else { 1 }),
         reason: String::new(),
         aborted: false,
