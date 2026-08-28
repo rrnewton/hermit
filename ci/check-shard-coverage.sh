@@ -24,6 +24,11 @@
 # closed over their dependencies in the constructed plan. This catches a map
 # that assigns every step exactly once but separates a preflight command from
 # the step that makes it runnable.
+#
+# The later check job may use either a predecessor in its own selection or one
+# that the successful preflight job already supplied. Refuse any other omitted
+# dependency so splitting the jobs cannot turn a command into a vacuous red or
+# green.
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -51,6 +56,7 @@ mapfile -t expected < <(jq -r '.dags[].steps[].tag' <<<"$plan_json" | sort -u)
 mapfile -t assigned < <(
     jq -r '
         (.preflight_nodes // [])
+      + (.check_nodes // [])
       + (.build_debug_nodes // [])
       + (.build_dbt_nodes // [])
       + (.build_aux_nodes // [])
@@ -101,6 +107,23 @@ preflight_missing=$(jq -r --argjson selected "$preflight_json" '
 if [[ -n $preflight_missing ]]; then
     echo "check-shard-coverage.sh: FAIL — preflight drops constructed predecessor(s) that no earlier job supplies:" >&2
     printf '  %s\n' $preflight_missing >&2
+    status=1
+fi
+
+check_json=$(jq -c '.check_nodes // []' "$shards")
+check_supplied_json=$(jq -c '(.preflight_nodes // []) + (.check_nodes // [])' "$shards")
+check_missing=$(jq -r --argjson selected "$check_json" --argjson supplied "$check_supplied_json" '
+    [
+      .dags[].steps[]
+      | select(.tag as $tag | $selected | index($tag))
+      | .deps[]
+      | select(. as $dependency | ($supplied | index($dependency)) == null)
+    ]
+    | unique[]
+' <<<"$plan_json")
+if [[ -n $check_missing ]]; then
+    echo "check-shard-coverage.sh: FAIL — check job drops constructed predecessor(s) not supplied by preflight:" >&2
+    printf '  %s\n' $check_missing >&2
     status=1
 fi
 

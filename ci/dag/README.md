@@ -105,6 +105,12 @@ The current relationships are:
 - **Deliberately different:** hosted selected runs are off the record. They do
   not write a local validation receipt, ledger row, scorecard, or pull-request
   label.
+- **Deliberately different:** `check.lint_checks` and
+  `check.check_outcome_consumers` load their pinned authority from the private
+  parent repository. The repository-scoped hosted token cannot read that other
+  repository, and no cross-repository read secret is configured, so those two
+  checks remain visible as red diagnostics. They run unchanged locally, and
+  their hosted job does not prevent the remaining selected steps from running.
 - **Unknown:** none after the current command and assignment audit. A future
   difference remains a defect until it is either removed or explained here.
 

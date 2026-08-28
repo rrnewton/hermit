@@ -207,9 +207,9 @@ jobs:
           echo "debug shards:";   jq -r '.debug_shards[]   | "  - \(.slug): \(.nodes|join(", "))"' ci/portable-shards.json
           echo "release shards:"; jq -r '.release_shards[] | "  - \(.slug) (needs \(.needs)): \(.nodes|join(", "))"' ci/portable-shards.json
 
-  # ---------------------------------------------- preflight (manifest + checks)
+  # --------------------------------------------------- constructed preflight
   preflight:
-    name: Preflight (manifest + fmt + abstraction + portability)
+    name: Preflight (submodules + pin + manifest)
     needs: select
     # Selective runs still execute preflight (fmt + abstraction + portability):
     # select-tests always pins these as always-on PREFLIGHT nodes. Only a
@@ -274,11 +274,6 @@ jobs:
           echo "rust-script resolved: $(command -v rust-script) $(rust-script --version)"
       - name: Run preflight nodes
         env:
-          # The constructed check-outcome checks fetch their pinned public
-          # authority with gh api. GitHub provides the read-only token, but gh
-          # deliberately refuses to infer it unless the harness exposes it as
-          # GH_TOKEN.
-          GH_TOKEN: ${{ github.token }}
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
         run: ./ci/run-node.sh portable "$(jq -r '.preflight_nodes|join(",")' ci/portable-shards.json)"
       - name: Upload preflight node performance report
@@ -286,6 +281,42 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: run-node-perf-preflight
+          path: ${{ runner.temp }}/run-node-perf
+          if-no-files-found: warn
+          retention-days: 14
+
+  # The remaining constructed checks depend on gate.manifest as an ordering
+  # edge, not on a build artifact. Run them after preflight in a separate job so
+  # one diagnostic failure cannot prevent build and test jobs from measuring.
+  checks:
+    name: Preflight checks (fmt + abstraction + portability)
+    needs: [select, preflight]
+    if: needs.select.outputs.decision != 'skip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize submodules
+        run: git submodule update --init --recursive
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liblzma-dev
+      - name: Rust components
+        run: rustup component add clippy rustfmt
+      - name: Install rust-script (checks)
+        env:
+          RUSTFLAGS: ""
+        run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
+      - name: Run preflight check nodes
+        env:
+          RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
+        run: ./ci/run-node.sh portable "$(jq -r '.check_nodes|join(",")' ci/portable-shards.json)"
+      - name: Upload preflight check performance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-node-perf-checks
           path: ${{ runner.temp }}/run-node-perf
           if-no-files-found: warn
           retention-days: 14
@@ -911,6 +942,7 @@ jobs:
       - select
       - plan
       - preflight
+      - checks
       - build-debug
       - build-release
       - test-debug
