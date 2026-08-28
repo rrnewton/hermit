@@ -50,7 +50,10 @@ The path is deliberately direct:
    durable result directory. Every row includes the validate attempt number,
    cell `duration_ms`, the `timeout_seconds` used for that attempt, literal
    argv, explicit environment, working directory, and pasteable shell command.
-   A retry adds another row; it does not replace the earlier observation.
+   The framework also writes the existing pressure `result` value and an
+   explicit `failure_class`; `error_kind` remains the narrower mechanism. A
+   retry adds another row with its own values, so a change such as
+   `determinism-failure` then `crash-error` is retained rather than overwritten.
 4. The final `scorecard.compatibility` node requires a clean, exact-HEAD PASS
    row for every selected cell and prints the table.
 5. The checked-in table and cell identities must still equal what the manifest

@@ -31,6 +31,7 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 use sha2::Digest;
 use sha2::Sha256;
+use hermit_manifest_plan::runner::ObservedResult;
 use hermit_manifest_plan::stress_series::{
     HostCapability, HostCapabilityVerdict, SeriesCoordinates, SeriesOutcome, SeriesPayload,
     SeriesProducer, SeriesRow, SeriesSchema, SourceDepth,
@@ -501,54 +502,6 @@ struct ObservedAttemptInvocation {
     env: BTreeMap<String, String>,
     cwd: String,
     shell_command: String,
-}
-
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Deserialize,
-    Eq,
-    Ord,
-    PartialEq,
-    PartialOrd,
-    Serialize
-)]
-#[serde(rename_all = "kebab-case")]
-enum ObservedResult {
-    Pass,
-    DeterminismFailure,
-    ParityFailure,
-    ReplayFailure,
-    CrashError,
-    Timeout,
-    Oom,
-}
-
-impl ObservedResult {
-    fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "pass" => Ok(Self::Pass),
-            "determinism-failure" => Ok(Self::DeterminismFailure),
-            "parity-failure" => Ok(Self::ParityFailure),
-            "replay-failure" => Ok(Self::ReplayFailure),
-            "crash-error" => Ok(Self::CrashError),
-            "timeout" => Ok(Self::Timeout),
-            "oom" => Ok(Self::Oom),
-            "infrastructure-error" => Err(
-                "pressure summary contains an infrastructure error; refusing to store it as product behavior"
-                    .into(),
-            ),
-            other => Err(format!("unknown pressure result `{other}`")),
-        }
-    }
-
-    fn carries_divergence_position(self) -> bool {
-        matches!(
-            self,
-            Self::DeterminismFailure | Self::ParityFailure | Self::ReplayFailure
-        )
-    }
 }
 
 /// How deep in a repository's history an observation was taken, so staleness is

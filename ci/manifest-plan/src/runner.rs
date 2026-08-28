@@ -804,6 +804,98 @@ pub struct CellRunSpec {
     fixed_workdir_source: PathBuf,
 }
 
+/// The existing pressure-test result vocabulary for one executed cell.
+///
+/// This is separate from [`FailureClass`]: two product failures can have
+/// different results (`determinism-failure` and `crash-error`), while both are
+/// still product failures. Keeping both values on the framework-written row
+/// preserves that per-attempt distinction without asking pressure-test to
+/// reconstruct it from process status and retained report files.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Eq,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum ObservedResult {
+    Pass,
+    DeterminismFailure,
+    ParityFailure,
+    ReplayFailure,
+    CrashError,
+    Timeout,
+    Oom,
+}
+
+impl ObservedResult {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "pass" => Ok(Self::Pass),
+            "determinism-failure" => Ok(Self::DeterminismFailure),
+            "parity-failure" => Ok(Self::ParityFailure),
+            "replay-failure" => Ok(Self::ReplayFailure),
+            "crash-error" => Ok(Self::CrashError),
+            "timeout" => Ok(Self::Timeout),
+            "oom" => Ok(Self::Oom),
+            "infrastructure-error" => Err(
+                "pressure summary contains an infrastructure error; refusing to store it as product behavior"
+                    .into(),
+            ),
+            other => Err(format!("unknown pressure result `{other}`")),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::DeterminismFailure => "determinism-failure",
+            Self::ParityFailure => "parity-failure",
+            Self::ReplayFailure => "replay-failure",
+            Self::CrashError => "crash-error",
+            Self::Timeout => "timeout",
+            Self::Oom => "oom",
+        }
+    }
+
+    pub fn carries_divergence_position(self) -> bool {
+        matches!(
+            self,
+            Self::DeterminismFailure | Self::ParityFailure | Self::ReplayFailure
+        )
+    }
+
+    pub fn failure_class(self) -> Option<FailureClass> {
+        match self {
+            Self::Pass => None,
+            Self::DeterminismFailure
+            | Self::ParityFailure
+            | Self::ReplayFailure
+            | Self::CrashError => Some(FailureClass::ProductFailure),
+            Self::Timeout | Self::Oom => Some(FailureClass::NoResult),
+        }
+    }
+}
+
+/// Attribution for a non-passing cell result.
+///
+/// These are the owner's four existing failure classes. `None` is reserved for
+/// a pass or a retained row written before this field existed; every current
+/// non-pass written by the framework carries one of these values.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureClass {
+    ProductFailure,
+    UnderstoodInfrastructureFailure,
+    UnderstoodPrerequisiteFailure,
+    NoResult,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AttemptResult {
     pub index: String,
@@ -930,6 +1022,16 @@ pub struct CellResult {
     pub backend: Option<String>,
     pub classification: String,
     pub outcome: String,
+    /// What this cell attempt observed, using the same closed vocabulary that
+    /// pressure summaries and the scorecard consume. `None` means either an
+    /// infrastructure result or a retained row written before this field.
+    #[serde(default)]
+    pub result: Option<ObservedResult>,
+    /// Who the non-pass is attributed to. This is deliberately separate from
+    /// `error_kind`, which retains the more specific mechanism such as
+    /// `backend-unavailable` or `incomplete-verification-evidence`.
+    #[serde(default)]
+    pub failure_class: Option<FailureClass>,
     pub error_kind: Option<String>,
     /// The cell wall-clock bound used for this observation.
     #[serde(default)]
@@ -987,6 +1089,76 @@ pub struct CellResult {
     /// `backend`, and `attempt` becomes a second definition that goes stale
     /// silently, and a path that points at nothing is worse than no path at all.
     pub artifact_dir: String,
+}
+
+impl CellResult {
+    /// Check the classification fields written by the current framework.
+    ///
+    /// Both fields remain optional in the deserializer because schema 4 also
+    /// names retained rows written before they existed. Current publication is
+    /// stricter: every result is recorded, and every non-pass is attributed.
+    pub fn require_current_classification(&self) -> Result<(), String> {
+        match self.outcome.as_str() {
+            "PASS" => {
+                if self.result != Some(ObservedResult::Pass) || self.failure_class.is_some() {
+                    return Err(format!(
+                        "PASS result must carry result=pass and no failure_class, got result={:?} failure_class={:?}",
+                        self.result, self.failure_class
+                    ));
+                }
+            }
+            "HOST-INAPPLICABLE" => {
+                if self.result.is_some()
+                    || self.failure_class != Some(FailureClass::UnderstoodPrerequisiteFailure)
+                {
+                    return Err(format!(
+                        "HOST-INAPPLICABLE result must carry understood_prerequisite_failure and no observed result, got result={:?} failure_class={:?}",
+                        self.result, self.failure_class
+                    ));
+                }
+            }
+            "FAIL" | "ERROR" => {
+                let failure_class = self.failure_class.ok_or_else(|| {
+                    format!(
+                        "{} result has no failure_class; current non-passes must be attributed",
+                        self.outcome
+                    )
+                })?;
+                if let Some(result) = self.result {
+                    let expected = result.failure_class().ok_or_else(|| {
+                        format!(
+                            "{} result cannot carry the passing result {:?}",
+                            self.outcome, result
+                        )
+                    })?;
+                    if failure_class != expected {
+                        return Err(format!(
+                            "observed result {} requires failure_class {:?}, got {:?}",
+                            result.as_str(),
+                            expected,
+                            failure_class
+                        ));
+                    }
+                } else if failure_class == FailureClass::ProductFailure {
+                    return Err(
+                        "product_failure has no observed result; the product failure kind was lost"
+                            .into(),
+                    );
+                }
+            }
+            other => return Err(format!("unknown cell outcome {other:?}")),
+        }
+        Ok(())
+    }
+
+    /// Retained schema-4 rows predate these fields. Accept that exact legacy
+    /// absence, but validate any row that carries either half of the contract.
+    pub fn validate_recorded_classification(&self) -> Result<(), String> {
+        if self.result.is_none() && self.failure_class.is_none() {
+            return Ok(());
+        }
+        self.require_current_classification()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2105,6 +2277,66 @@ fn cell_artifact_dir(context: &RunContext, cell: &SelectedCell) -> PathBuf {
         .join(slug)
 }
 
+fn verification_verdict(attempt: &AttemptResult) -> Option<Verdict> {
+    let report = attempt.verification_report.as_deref()?;
+    VerificationReport::from_json_slice(report.as_bytes())
+        .ok()
+        .map(|report| report.verdict)
+}
+
+fn observed_result(
+    mode: &str,
+    outcome: &str,
+    attempts: &[AttemptResult],
+) -> Option<ObservedResult> {
+    if outcome == "PASS" {
+        return Some(ObservedResult::Pass);
+    }
+    if attempts.iter().any(|attempt| attempt.timed_out) {
+        return Some(ObservedResult::Timeout);
+    }
+    if mode == "verify"
+        && attempts
+            .iter()
+            .any(|attempt| verification_verdict(attempt) == Some(Verdict::Diverged))
+    {
+        return Some(ObservedResult::DeterminismFailure);
+    }
+    if mode == "replay"
+        && attempts
+            .iter()
+            .any(|attempt| verification_verdict(attempt) == Some(Verdict::Diverged))
+    {
+        return Some(ObservedResult::ReplayFailure);
+    }
+    (outcome == "FAIL").then_some(ObservedResult::CrashError)
+}
+
+fn failure_class(
+    outcome: &str,
+    result: Option<ObservedResult>,
+    error_kind: Option<&str>,
+) -> Option<FailureClass> {
+    if outcome == "PASS" {
+        return None;
+    }
+    if let Some(result) = result {
+        if let Some(failure_class) = result.failure_class() {
+            return Some(failure_class);
+        }
+    }
+    match error_kind {
+        Some("guest-launch-refused" | "backend-unavailable") => {
+            Some(FailureClass::UnderstoodPrerequisiteFailure)
+        }
+        None if outcome == "HOST-INAPPLICABLE" => Some(FailureClass::UnderstoodPrerequisiteFailure),
+        Some("infrastructure" | "result-publication") => {
+            Some(FailureClass::UnderstoodInfrastructureFailure)
+        }
+        _ => Some(FailureClass::NoResult),
+    }
+}
+
 pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult, String> {
     let dir = cell_artifact_dir(context, cell);
     let started = Instant::now();
@@ -2326,8 +2558,11 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         .map(|bytes| hex_digest(&bytes));
     if binary_before.is_some() && binary_before != binary_sha {
         outcome = "ERROR".into();
+        error_kind = Some("infrastructure".into());
         reason = Some("Hermit binary changed while the cell was executing".into());
     }
+    let result = observed_result(&cell.id.mode, &outcome, &attempts);
+    let failure_class = failure_class(&outcome, result, error_kind.as_deref());
     Ok(CellResult {
         artifact_dir: dir.display().to_string(),
         schema: CELL_RESULT_SCHEMA,
@@ -2353,6 +2588,8 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         // must be able to admit their evidence under the same identity.
         classification: if cell.enabled { "required" } else { "disabled" }.into(),
         outcome,
+        result,
+        failure_class,
         error_kind,
         timeout_seconds: cell.timeout_seconds,
         duration_ms: Some(started.elapsed().as_millis()),
@@ -2425,6 +2662,8 @@ pub fn infrastructure_error_result(
         backend: cell.id.backend.clone(),
         classification: if cell.enabled { "required" } else { "disabled" }.into(),
         outcome: "ERROR".into(),
+        result: None,
+        failure_class: Some(FailureClass::UnderstoodInfrastructureFailure),
         error_kind: Some("infrastructure".into()),
         timeout_seconds: cell.timeout_seconds,
         duration_ms: None,
@@ -2489,6 +2728,8 @@ pub fn host_inapplicable_result(
         backend: cell.id.backend.clone(),
         classification: if cell.enabled { "required" } else { "disabled" }.into(),
         outcome: "HOST-INAPPLICABLE".into(),
+        result: None,
+        failure_class: Some(FailureClass::UnderstoodPrerequisiteFailure),
         error_kind: None,
         timeout_seconds: cell.timeout_seconds,
         duration_ms: None,
@@ -2687,6 +2928,7 @@ pub fn prepare_result_path(path: &Path) -> Result<(), String> {
 }
 
 pub fn append_result(path: &Path, result: &CellResult) -> Result<(), String> {
+    result.require_current_classification()?;
     // A missing prerequisite means the cell did not execute. Keep the typed
     // value for the harness summary and JUnit skip, but do not publish a cell
     // row that downstream readers could count as an observation. The validate
@@ -3563,6 +3805,8 @@ mod tests {
         assert_eq!(result.attempts.len(), 2);
         assert!(!result.attempts[0].timed_out);
         assert!(result.attempts[1].timed_out);
+        assert_eq!(result.result, Some(ObservedResult::Timeout));
+        assert_eq!(result.failure_class, Some(FailureClass::NoResult));
         assert_eq!(
             result.attempts[1].reason.as_deref(),
             Some("cell exceeded 1 s")
@@ -3625,6 +3869,11 @@ mod tests {
             "NOT RUN, NOT a pass, no coverage: planted absence".into(),
         );
         assert_eq!(result.outcome, "HOST-INAPPLICABLE");
+        assert_eq!(result.result, None);
+        assert_eq!(
+            result.failure_class,
+            Some(FailureClass::UnderstoodPrerequisiteFailure)
+        );
         assert!(result.attempts.is_empty());
         assert!(result.binary_sha256.is_none());
         assert_eq!(result.error_kind, None);
@@ -3706,6 +3955,8 @@ mod tests {
         prepare_result_path(&path).unwrap();
         let mut first = infrastructure_error_result(&context, &cell, "forced failure".into());
         first.outcome = "FAIL".into();
+        first.result = Some(ObservedResult::DeterminismFailure);
+        first.failure_class = Some(FailureClass::ProductFailure);
         first.error_kind = None;
         assert_eq!(first.duration_ms, None);
         first.duration_ms = Some(111);
@@ -3724,6 +3975,8 @@ mod tests {
         context.attempt = 2;
         let mut second = infrastructure_error_result(&context, &cell, "forced retry".into());
         second.outcome = "PASS".into();
+        second.result = Some(ObservedResult::Pass);
+        second.failure_class = None;
         second.error_kind = None;
         second.duration_ms = Some(222);
         append_result(&path, &second).unwrap();
@@ -3738,6 +3991,8 @@ mod tests {
         assert_eq!(rows[0]["duration_ms"], 111);
         assert_eq!(rows[0]["timeout_seconds"], 15);
         assert_eq!(rows[0]["outcome"], "FAIL");
+        assert_eq!(rows[0]["result"], "determinism-failure");
+        assert_eq!(rows[0]["failure_class"], "product_failure");
         assert_eq!(rows[0]["first_divergent_record"], 93);
         assert_eq!(rows[0]["first_divergent_syscall"], 37);
         assert_eq!(rows[0]["first_divergent_scheduler_turn"], 68);
@@ -3754,6 +4009,8 @@ mod tests {
         assert_eq!(rows[1]["duration_ms"], 222);
         assert_eq!(rows[1]["timeout_seconds"], 15);
         assert_eq!(rows[1]["outcome"], "PASS");
+        assert_eq!(rows[1]["result"], "pass");
+        assert_eq!(rows[1]["failure_class"], JsonValue::Null);
         assert!(rows[1]["first_divergent_left_message"].is_null());
         assert!(rows[1]["first_divergent_right_message"].is_null());
         assert_ne!(rows[0]["artifact_dir"], rows[1]["artifact_dir"]);
@@ -3763,6 +4020,47 @@ mod tests {
                 .unwrap()
                 .ends_with("-attempt-2")
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retry_preserves_changed_product_result_and_attribution() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-retry-result-class-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("results.jsonl");
+        prepare_result_path(&path).unwrap();
+
+        let mut first = cell_result_that_located_nothing();
+        first.attempt = 1;
+        first.outcome = "FAIL".into();
+        first.result = Some(ObservedResult::DeterminismFailure);
+        first.failure_class = Some(FailureClass::ProductFailure);
+        first.error_kind = None;
+        first.artifact_dir = "/repo/artifacts-attempt-1".into();
+        append_result(&path, &first).unwrap();
+
+        let mut second = first.clone();
+        second.attempt = 2;
+        second.result = Some(ObservedResult::CrashError);
+        second.artifact_dir = "/repo/artifacts-attempt-2".into();
+        append_result(&path, &second).unwrap();
+
+        let rows = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<CellResult>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].result, Some(ObservedResult::DeterminismFailure));
+        assert_eq!(rows[1].result, Some(ObservedResult::CrashError));
+        assert_eq!(rows[0].failure_class, Some(FailureClass::ProductFailure));
+        assert_eq!(rows[1].failure_class, Some(FailureClass::ProductFailure));
+        assert_eq!(rows[0].error_kind, None);
+        assert_eq!(rows[1].error_kind, None);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4617,6 +4915,8 @@ backends_disabled:
             backend: Some("ptrace".into()),
             classification: "required".into(),
             outcome: "PASS".into(),
+            result: Some(ObservedResult::Pass),
+            failure_class: None,
             error_kind: None,
             timeout_seconds: 1,
             duration_ms: Some(1),
@@ -4758,6 +5058,73 @@ backends_disabled:
             sabre_path_evidence_sha256: Some("b".into()),
             reason: None,
         }
+    }
+
+    #[test]
+    fn current_cell_result_carries_result_and_failure_class() {
+        let passed = serde_json::to_value(cell_result_that_located_nothing()).unwrap();
+        assert_eq!(passed["result"], "pass");
+        assert_eq!(passed["failure_class"], JsonValue::Null);
+
+        let mut failed = cell_result_that_located_nothing();
+        failed.outcome = "FAIL".into();
+        failed.result = Some(ObservedResult::DeterminismFailure);
+        failed.failure_class = Some(FailureClass::ProductFailure);
+        let failed = serde_json::to_value(failed).unwrap();
+        assert_eq!(failed["result"], "determinism-failure");
+        assert_eq!(failed["failure_class"], "product_failure");
+
+        let mut missing = cell_result_that_located_nothing();
+        missing.outcome = "FAIL".into();
+        missing.result = Some(ObservedResult::DeterminismFailure);
+        missing.failure_class = None;
+        assert_eq!(
+            missing.require_current_classification().unwrap_err(),
+            "FAIL result has no failure_class; current non-passes must be attributed"
+        );
+
+        let mut legacy = cell_result_that_located_nothing();
+        legacy.outcome = "FAIL".into();
+        legacy.result = None;
+        legacy.failure_class = None;
+        legacy
+            .validate_recorded_classification()
+            .expect("retained pre-field schema-4 row remains readable");
+        assert!(legacy.require_current_classification().is_err());
+    }
+
+    #[test]
+    fn framework_classifies_divergence_and_crash_before_pressure_reads_them() {
+        let mut divergence = attempt_with_sabre_evidence("");
+        divergence.outcome = "FAIL".into();
+        divergence.verification_report = Some(
+            r#"{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical","compare_logs":true,"record_envelope":"all_records_v1"},"compared_log_messages":{"left":1,"right":1},"first_divergent_scheduler_turn":4,"first_divergent_virtual_nanoseconds":7,"first_divergent_record":9,"first_divergent_syscall":2,"first_divergent_left_message":"left","first_divergent_right_message":"right"}"#
+                .into(),
+        );
+        let divergence_result = observed_result(
+            "verify",
+            &divergence.outcome,
+            std::slice::from_ref(&divergence),
+        );
+        assert_eq!(divergence_result, Some(ObservedResult::DeterminismFailure));
+        assert_eq!(
+            failure_class(
+                &divergence.outcome,
+                divergence_result,
+                divergence.error_kind.as_deref()
+            ),
+            Some(FailureClass::ProductFailure)
+        );
+
+        let mut crash = attempt_with_sabre_evidence("");
+        crash.outcome = "FAIL".into();
+        crash.status = Some(1);
+        let crash_result = observed_result("verify", &crash.outcome, std::slice::from_ref(&crash));
+        assert_eq!(crash_result, Some(ObservedResult::CrashError));
+        assert_eq!(
+            failure_class(&crash.outcome, crash_result, crash.error_kind.as_deref()),
+            Some(FailureClass::ProductFailure)
+        );
     }
 
     #[test]
@@ -4948,6 +5315,26 @@ backends_disabled:
         assert_eq!(unavailable.outcome, "ERROR");
         assert_eq!(silent.outcome, "ERROR");
         assert_eq!(
+            failure_class(
+                &unavailable.outcome,
+                observed_result(
+                    "verify",
+                    &unavailable.outcome,
+                    std::slice::from_ref(&unavailable)
+                ),
+                unavailable.error_kind.as_deref()
+            ),
+            Some(FailureClass::UnderstoodPrerequisiteFailure)
+        );
+        assert_eq!(
+            failure_class(
+                &silent.outcome,
+                observed_result("verify", &silent.outcome, std::slice::from_ref(&silent)),
+                silent.error_kind.as_deref()
+            ),
+            Some(FailureClass::NoResult)
+        );
+        assert_eq!(
             unavailable.error_kind.as_deref(),
             Some("backend-unavailable"),
             "an unrunnable backend must carry its own kind: {:?}",
@@ -4997,6 +5384,20 @@ backends_disabled:
 
         for result in [wrong_backend, guest_output] {
             assert_eq!(result.outcome, "FAIL", "unexpected result: {result:?}");
+            assert_eq!(
+                observed_result("verify", &result.outcome, std::slice::from_ref(&result)),
+                Some(ObservedResult::CrashError),
+                "ordinary product failure must carry its observed result: {result:?}"
+            );
+            assert_eq!(
+                failure_class(
+                    &result.outcome,
+                    Some(ObservedResult::CrashError),
+                    result.error_kind.as_deref()
+                ),
+                Some(FailureClass::ProductFailure),
+                "ordinary product failure must be product-attributed: {result:?}"
+            );
             assert_eq!(result.error_kind, None, "unexpected result: {result:?}");
             assert!(
                 result
@@ -5105,6 +5506,18 @@ backends_disabled:
             },
         );
         assert_eq!(failed.outcome, "FAIL");
+        assert_eq!(
+            observed_result("verify", &failed.outcome, std::slice::from_ref(&failed)),
+            Some(ObservedResult::CrashError)
+        );
+        assert_eq!(
+            failure_class(
+                &failed.outcome,
+                Some(ObservedResult::CrashError),
+                failed.error_kind.as_deref()
+            ),
+            Some(FailureClass::ProductFailure)
+        );
         assert_eq!(failed.error_kind, None);
         assert_eq!(failed.status, Some(7));
         assert!(
@@ -5119,6 +5532,10 @@ backends_disabled:
             no_result_with_exit_status(127, crate::canonical_verdict::NoResultReason::NotRun);
         assert_eq!(not_run.outcome, "ERROR");
         assert_eq!(
+            failure_class(&not_run.outcome, None, not_run.error_kind.as_deref()),
+            Some(FailureClass::NoResult)
+        );
+        assert_eq!(
             not_run.error_kind.as_deref(),
             Some("incomplete-verification-evidence")
         );
@@ -5127,6 +5544,10 @@ backends_disabled:
         let unknown =
             no_result_with_exit_status(0, crate::canonical_verdict::NoResultReason::NotRun);
         assert_eq!(unknown.outcome, "ERROR");
+        assert_eq!(
+            failure_class(&unknown.outcome, None, unknown.error_kind.as_deref()),
+            Some(FailureClass::NoResult)
+        );
         assert_eq!(
             unknown.error_kind.as_deref(),
             Some("incomplete-verification-evidence")
