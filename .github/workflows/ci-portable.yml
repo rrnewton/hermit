@@ -219,6 +219,11 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          # gate.manifest runs the scorecard self-test, whose comparison control
+          # reads HEAD^. A depth-one checkout makes that committed check
+          # unanswerable even though its selected command is otherwise unchanged.
+          fetch-depth: 2
       # The constructed preflight starts with pre.submodules, which verifies
       # every recorded submodule without repairing it. Materialize that exact
       # recorded set before asking the gate to inspect it.
