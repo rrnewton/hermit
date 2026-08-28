@@ -174,14 +174,14 @@ pub fn measured_unstable_nodes(parent: Option<&Path>) -> BTreeMap<String, String
             .unwrap_or("unknown date");
         out.insert(
             name.to_string(),
-            format!("measured-unstable {passes} pass / {fails} fail, measured {measured_at}"),
+            format!("{passes} pass / {fails} fail, measured {measured_at}"),
         );
     }
     out
 }
 
-/// The registry's reason for retrying `tag`, or `None` when it names no such node.
-pub fn measured_unstable_class(
+/// The registry's measured detail for `tag`, or `None` when it names no such node.
+pub fn measured_unstable_detail(
     registry: &BTreeMap<String, String>,
     tag: &str,
 ) -> Option<String> {
@@ -191,6 +191,32 @@ pub fn measured_unstable_class(
     // `group.job` -> `job`, so a registry written in cell names still matches.
     let job = tag.split_once('.').map(|(_, job)| job)?;
     registry.get(job).cloned()
+}
+
+/// The closed environmental-block values emitted by this classifier.
+///
+/// Consumers that turn an environmental observation into a retry decision use
+/// this enum rather than matching the rendered string. Adding a classifier arm
+/// therefore requires every typed consumer to handle the new value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvBlockClass {
+    BpfjailerBanner,
+    ProxyEgress,
+    ThirdPartyBuild,
+    ToolchainEperm,
+    VcsFsDenial,
+}
+
+impl EnvBlockClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BpfjailerBanner => "bpfjailer-banner",
+            Self::ProxyEgress => "proxy-egress",
+            Self::ThirdPartyBuild => "third-party-build",
+            Self::ToolchainEperm => "toolchain-eperm",
+            Self::VcsFsDenial => "vcs-fs-denial",
+        }
+    }
 }
 
 /// Phrases that mean "the kernel/sandbox said no", in lowercase.
@@ -369,7 +395,7 @@ fn diagnostic_blocks(lower: &str) -> Vec<Vec<&str>> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvBlockObservation {
     /// A denial FIRED, and this names its form.
-    Denied(&'static str),
+    Denied(EnvBlockClass),
     /// Evidence was present and carried no denial. A product failure here is real.
     NoDenial,
     /// There was nothing to evaluate. NOT a statement that no denial occurred.
@@ -377,14 +403,18 @@ pub enum EnvBlockObservation {
 }
 
 impl EnvBlockObservation {
-    /// The legacy two-state view, for callers that genuinely only ask "was it
-    /// blocked". `NotEvaluated` maps to `None` — correct for that question, and
-    /// the reason the three-state form exists for callers asking anything else.
-    pub fn class(self) -> Option<&'static str> {
+    pub fn block_class(self) -> Option<EnvBlockClass> {
         match self {
             Self::Denied(class) => Some(class),
             Self::NoDenial | Self::NothingObserved => None,
         }
+    }
+
+    /// The legacy two-state view, for callers that genuinely only ask "was it
+    /// blocked". `NotEvaluated` maps to `None` — correct for that question, and
+    /// the reason the three-state form exists for callers asking anything else.
+    pub fn class(self) -> Option<&'static str> {
+        self.block_class().map(EnvBlockClass::as_str)
     }
 }
 
@@ -423,14 +453,14 @@ pub fn environmental_block_observation(output: &str) -> EnvBlockObservation {
         || lower.contains("enforcer: net, reason:")
         || lower.contains("bpfjailer")
     {
-        return EnvBlockObservation::Denied("bpfjailer-banner");
+        return EnvBlockObservation::Denied(EnvBlockClass::BpfjailerBanner);
     }
     // Form 4 (checked before the per-line scan because it is a whole-region
     // signature): the vendored third-party build script.
     if (lower.contains("failed to run custom build command for") && lower.contains("reverie-dbi"))
         || (lower.contains("panicked at") && lower.contains("reverie-dbi/build.rs"))
     {
-        return EnvBlockObservation::Denied("third-party-build");
+        return EnvBlockObservation::Denied(EnvBlockClass::ThirdPartyBuild);
     }
     let mut vcs_hit = false;
     for line in lower.lines() {
@@ -445,13 +475,13 @@ pub fn environmental_block_observation(output: &str) -> EnvBlockObservation {
                 "failed to connect to fwdproxy",
             ],
         ) {
-            return EnvBlockObservation::Denied("proxy-egress");
+            return EnvBlockObservation::Denied(EnvBlockClass::ProxyEgress);
         }
         // Form 2a: legacy same-line toolchain denial. The conjunction remains
         // same-line so generic product prose cannot borrow a denial from a later
         // indented line in its block.
         if has_denial(line) && has_toolchain_phrase(line) {
-            return EnvBlockObservation::Denied("toolchain-eperm");
+            return EnvBlockObservation::Denied(EnvBlockClass::ToolchainEperm);
         }
         // Form 5 (NEW): a banner-less git FS denial. Requires BOTH a git-fatal
         // shape and a denial on the same line, so a guest test that merely prints
@@ -484,10 +514,10 @@ pub fn environmental_block_observation(output: &str) -> EnvBlockObservation {
                 .iter()
                 .any(|line| has_cross_line_toolchain_phrase(line))
     }) {
-        return EnvBlockObservation::Denied("toolchain-eperm");
+        return EnvBlockObservation::Denied(EnvBlockClass::ToolchainEperm);
     }
     if vcs_hit {
-        return EnvBlockObservation::Denied("vcs-fs-denial");
+        return EnvBlockObservation::Denied(EnvBlockClass::VcsFsDenial);
     }
     EnvBlockObservation::NoDenial
 }
@@ -1528,7 +1558,7 @@ pub fn self_test() -> Result<String, String> {
     // gets absorbed, so it is asserted here rather than left to callers.
     for (want, label, text) in [
         (
-            EnvBlockObservation::Denied("bpfjailer-banner"),
+            EnvBlockObservation::Denied(EnvBlockClass::BpfjailerBanner),
             "a denial that FIRED",
             "An action was blocked on this server based on a security policy!",
         ),

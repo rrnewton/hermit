@@ -7953,6 +7953,55 @@ impl AttemptExecution {
     }
 }
 
+/// The closed reason a failed node was granted another attempt.
+///
+/// Human detail is stored separately on the same attempt. Keeping the class as
+/// an enum prevents a changing timeout, exit status, or registry sample from
+/// turning one retry category into many unrelated strings in the ledger.
+///
+/// This is `gates[].attempts[].retry_class`, not the parent
+/// `ci-hub/validate/retry_class.py` run-level value (`permanent`, `transient`,
+/// or `no-result`). They answer different questions and share only the field
+/// name.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum RetryClass {
+    AlwaysEligible,
+    BoundKillUnderContention,
+    MeasuredUnstable,
+    BpfjailerBanner,
+    ProxyEgress,
+    ThirdPartyBuild,
+    ToolchainEperm,
+    VcsFsDenial,
+}
+
+impl RetryClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AlwaysEligible => "always-eligible",
+            Self::BoundKillUnderContention => "bound-kill under contention",
+            Self::MeasuredUnstable => "measured-unstable",
+            Self::BpfjailerBanner => "bpfjailer-banner",
+            Self::ProxyEgress => "proxy-egress",
+            Self::ThirdPartyBuild => "third-party-build",
+            Self::ToolchainEperm => "toolchain-eperm",
+            Self::VcsFsDenial => "vcs-fs-denial",
+        }
+    }
+}
+
+impl From<validate_runtime::EnvBlockClass> for RetryClass {
+    fn from(value: validate_runtime::EnvBlockClass) -> Self {
+        match value {
+            validate_runtime::EnvBlockClass::BpfjailerBanner => Self::BpfjailerBanner,
+            validate_runtime::EnvBlockClass::ProxyEgress => Self::ProxyEgress,
+            validate_runtime::EnvBlockClass::ThirdPartyBuild => Self::ThirdPartyBuild,
+            validate_runtime::EnvBlockClass::ToolchainEperm => Self::ToolchainEperm,
+            validate_runtime::EnvBlockClass::VcsFsDenial => Self::VcsFsDenial,
+        }
+    }
+}
+
 /// Typed execution state for a scheduler outcome.
 ///
 /// `reported && !aborted` is insufficient: spawn failures and supervisor
@@ -7988,10 +8037,14 @@ struct NodeAttempt {
     aborted: bool,
     /// Whether a child actually executed through a collected exit status.
     execution: AttemptExecution,
-    /// Why this attempt's failure was judged retry-eligible, in the same words
-    /// the retry line prints. `None` when it was not retried — because it
-    /// passed, because nothing classified it, or because the budget ran out.
-    retry_class: Option<String>,
+    /// Why this attempt's failure was judged retry-eligible. `None` when it was
+    /// not retried — because it passed, because nothing classified it, or
+    /// because the budget ran out.
+    retry_class: Option<RetryClass>,
+    /// Evidence behind the class when it is not already the attempt's `reason`.
+    /// Currently this records the measured pass/fail sample for
+    /// `measured-unstable`; it never changes the grouping key.
+    retry_detail: Option<String>,
     /// The environmental signature found in this failed attempt's own detail
     /// region. This is kept separately from `retry_class`: a classified attempt
     /// may never execute again, and that distinction is the UNCONFIRMED verdict.
@@ -8051,6 +8104,7 @@ fn reported_attempt(outcome: &StepOutcome, attempt: usize) -> NodeAttempt {
         aborted: outcome.aborted,
         execution: outcome_execution(outcome),
         retry_class: None,
+        retry_detail: None,
         environmental_class: None,
         detail_observed: false,
     }
@@ -8071,6 +8125,7 @@ fn unreported_attempt(tag: String, attempt: usize) -> NodeAttempt {
         aborted: false,
         execution: AttemptExecution::Unknown,
         retry_class: None,
+        retry_detail: None,
         environmental_class: None,
         detail_observed: false,
     }
@@ -8434,12 +8489,35 @@ fn scheduler_not_launched_message(tags: &[String]) -> String {
     )
 }
 
-fn retry_notice(tag: &str, class: &str, attempt: usize) -> String {
+fn retry_notice(
+    tag: &str,
+    class: RetryClass,
+    detail: Option<&str>,
+    attempt: usize,
+) -> String {
+    let detail = detail.map(|value| format!(": {value}")).unwrap_or_default();
     format!(
-        "⚠️  {tag}: RETRY-ELIGIBLE ({class}) — this attempt remains RED unless an actual \
+        "⚠️  {tag}: RETRY-ELIGIBLE ({}{detail}) — this attempt remains RED unless an actual \
          re-execution passes — retrying (attempt {attempt}/{})",
+        class.as_str(),
         validate_runtime::MAX_ATTEMPTS_PER_CELL
     )
+}
+
+fn retry_classification(
+    environmental: Option<RetryClass>,
+    hit_budget: bool,
+    measured_unstable_detail: Option<String>,
+) -> (RetryClass, Option<String>) {
+    if let Some(class) = environmental {
+        (class, None)
+    } else if hit_budget {
+        (RetryClass::BoundKillUnderContention, None)
+    } else if let Some(detail) = measured_unstable_detail {
+        (RetryClass::MeasuredUnstable, Some(detail))
+    } else {
+        (RetryClass::AlwaysEligible, None)
+    }
 }
 
 #[cfg(test)]
@@ -8491,7 +8569,13 @@ mod scheduler_explanation_tests {
     fn retry_notice_has_one_retry_and_never_advertises_a_third_attempt() {
         assert_eq!(validate_runtime::RETRIES_PER_CELL, 1);
         assert_eq!(validate_runtime::MAX_ATTEMPTS_PER_CELL, 2);
-        assert!(retry_notice("test.liteinst_strict", "fixture", 2).ends_with("attempt 2/2)"));
+        assert!(retry_notice(
+            "test.liteinst_strict",
+            RetryClass::AlwaysEligible,
+            None,
+            2,
+        )
+        .ends_with("attempt 2/2)"));
 
         let tag = "test.liteinst_strict";
         let cfg = DagConfig {
@@ -8511,6 +8595,27 @@ mod scheduler_explanation_tests {
         assert!(retry_attempt_available(&cfg, &attempts, tag));
         attempts.push(unreported_attempt(tag.into(), 2));
         assert!(!retry_attempt_available(&cfg, &attempts, tag));
+    }
+
+    #[test]
+    fn retry_classification_keeps_measured_detail_out_of_the_class() {
+        let detail = "9 pass / 1 fail, measured 2026-08-24".to_string();
+        assert_eq!(
+            retry_classification(None, false, Some(detail.clone())),
+            (RetryClass::MeasuredUnstable, Some(detail))
+        );
+        assert_eq!(
+            retry_classification(None, true, Some("ignored by precedence".into())),
+            (RetryClass::BoundKillUnderContention, None)
+        );
+        assert_eq!(
+            retry_classification(Some(RetryClass::ProxyEgress), true, None),
+            (RetryClass::ProxyEgress, None)
+        );
+        assert_eq!(
+            retry_classification(None, false, None),
+            (RetryClass::AlwaysEligible, None)
+        );
     }
 
     #[test]
@@ -9437,7 +9542,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         .any(|a| a.attempt == 2 && a.ok == Some(true));
     let names_its_ground = environmental_attempts
         .iter()
-        .any(|a| a.attempt == 1 && a.retry_class.as_deref() == Some("bpfjailer-banner"));
+        .any(|a| a.attempt == 1 && a.retry_class == Some(RetryClass::BpfjailerBanner));
     if environmental_attempts.len() != 2
         || !first_failed
         || !second_passed
@@ -9448,7 +9553,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
              passed first time — the retry erased the flake. attempts={:?}",
             environmental_attempts
                 .iter()
-                .map(|a| (a.attempt, a.ok, a.reported, a.retry_class.clone()))
+                .map(|a| (a.attempt, a.ok, a.reported, a.retry_class))
                 .collect::<Vec<_>>()
         ));
     }
@@ -9563,12 +9668,14 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             unreported_attempt(DBT_PARITY_NODE.into(), 1),
             unreported_attempt(DBT_PARITY_NODE.into(), 2),
         ];
-        dbt_attempts[0].retry_class = Some("self-test retry".into());
+        dbt_attempts[0].retry_class = Some(RetryClass::AlwaysEligible);
+        dbt_attempts[0].retry_detail = Some("self-test retry".into());
         let dbt_retry_summary = test_id_summary(dbt_retry, &dbt_attempts, &BTreeSet::new());
         if dbt_retry_summary.recovered.len() != 1
             || dbt_retry_summary.recovered[0].id
                 != "backend-parity/virtual_clock [dbt/strict]"
-            || dbt_retry_summary.recovered[0].retry_classes != ["self-test retry"]
+            || dbt_retry_summary.recovered[0].retry_classes
+                != [RetryClass::AlwaysEligible]
         {
             return Err(format!(
                 "end-of-run summary: DBT parity fail-then-pass was not retained as recovered: \
@@ -9615,7 +9722,8 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         let e2e_retry_summary = test_id_summary(e2e, &[], &BTreeSet::new());
         if e2e_retry_summary.recovered.len() != 1
             || e2e_retry_summary.recovered[0].id != "applications/example [ptrace/verify]"
-            || e2e_retry_summary.recovered[0].retry_classes != ["always-eligible"]
+            || e2e_retry_summary.recovered[0].retry_classes
+                != [RetryClass::AlwaysEligible]
             || e2e_retry_summary.retry_occurrences != 1
         {
             return Err(format!(
@@ -9641,10 +9749,10 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         let split = test_id_summary(observations, &retried.attempts, &failed_nodes);
         if split.recovered.len() != 1
             || split.recovered[0].id != "hermit::fixture$recovered_on_retry"
-            || split.recovered[0].retry_classes != ["bpfjailer-banner"]
+            || split.recovered[0].retry_classes != [RetryClass::BpfjailerBanner]
             || split.failed.len() != 1
             || split.failed[0].id != "hermit::fixture$hard_failure"
-            || split.failed[0].retry_classes != ["bpfjailer-banner"]
+            || split.failed[0].retry_classes != [RetryClass::BpfjailerBanner]
             || !split.failed_nodes_without_test_ids.is_empty()
             || split.retry_occurrences != 1
         {
@@ -10461,7 +10569,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     ];
     let retry_set = retry_candidate_tags(
         &retry_set_cfg,
-        &[(available.to_string(), "always-eligible".to_string())],
+        &[(available.to_string(), RetryClass::AlwaysEligible, None)],
         &[capped.to_string()],
         &BTreeMap::new(),
         &BTreeSet::new(),
@@ -10521,8 +10629,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     let bound_ground = bound_attempts
         .iter()
         .find(|a| a.attempt == 1)
-        .and_then(|a| a.retry_class.clone())
-        .unwrap_or_default();
+        .and_then(|a| a.retry_class);
     if !bound.ok
         || bound.env_retries != 1
         || bound_attempts.len() != 2
@@ -10532,7 +10639,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         // after the message was removed from this class, so it could not have
         // caught the defect it looks like it covers, and would not catch the
         // message coming back.
-        || bound_ground != "bound-kill under contention"
+        || bound_ground != Some(RetryClass::BoundKillUnderContention)
     {
         return Err(format!(
             "scheduler accounting: a node killed by its own wall budget was not retried on the \
@@ -10601,16 +10708,41 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     // answer the only question it exists for. The text is not lost -- `reason`
     // sits beside it on the same attempt row and is published with it.
     let blanket_attempt = ordinary_only.attempts.iter().find(|a| a.attempt == 1);
-    let blanket = blanket_attempt.and_then(|a| a.retry_class.clone()).unwrap_or_default();
+    let blanket = blanket_attempt.and_then(|a| a.retry_class);
     let blanket_reason =
         blanket_attempt.map(|a| a.reason.trim().to_string()).unwrap_or_default();
-    if blanket != "always-eligible"
-        || (!blanket_reason.is_empty() && blanket.contains(&blanket_reason))
+    if blanket != Some(RetryClass::AlwaysEligible)
+        || blanket_attempt.is_some_and(|attempt| attempt.retry_detail.is_some())
     {
         return Err(format!(
             "scheduler accounting: the blanket retry ground must publish the bare category \
              \"always-eligible\" and must never embed the attempt's own failure message, or \
-             `retry_class` cannot be grouped: retry_class={blanket:?} reason={blanket_reason:?}"
+             `retry_class` cannot be grouped: retry_class={blanket:?} retry_detail={:?} \
+             reason={blanket_reason:?}",
+            blanket_attempt.and_then(|attempt| attempt.retry_detail.as_deref())
+        ));
+    }
+
+    let mut measured_attempt = blanket_attempt
+        .cloned()
+        .ok_or("scheduler accounting: measured-instability fixture lost attempt 1")?;
+    measured_attempt.retry_class = Some(RetryClass::MeasuredUnstable);
+    measured_attempt.retry_detail =
+        Some("9 pass / 1 fail, measured 2026-08-24".to_string());
+    let measured_outcome = ordinary_only
+        .outcomes
+        .iter()
+        .find(|outcome| outcome.tag == "fixture.plain_red")
+        .ok_or("scheduler accounting: measured-instability fixture lost its outcome")?;
+    let measured_gate =
+        ledger_gate_with_attempts(measured_outcome, std::slice::from_ref(&measured_attempt));
+    if measured_gate["attempts"][0]["retry_class"] != "measured-unstable"
+        || measured_gate["attempts"][0]["retry_detail"]
+            != "9 pass / 1 fail, measured 2026-08-24"
+    {
+        return Err(format!(
+            "scheduler accounting: measured instability did not keep its class and detail in \
+             separate ledger fields: {measured_gate}"
         ));
     }
 
@@ -10708,8 +10840,8 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         ));
     }
     // The same registry must match a DAG node whose tag carries its group.
-    if validate_runtime::measured_unstable_class(&admitted, "test.real_flake").is_none()
-        || validate_runtime::measured_unstable_class(&admitted, "test.structural_no_result")
+    if validate_runtime::measured_unstable_detail(&admitted, "test.real_flake").is_none()
+        || validate_runtime::measured_unstable_detail(&admitted, "test.structural_no_result")
             .is_some()
     {
         return Err(
@@ -11018,15 +11150,20 @@ fn run_lane_with_env_retries(
         if let Some(log) = round_log.as_deref() {
             for outcome in &failed {
                 if let Some(detail) = validate_runtime::extract_node_detail(log, &outcome.tag) {
-                    let class = validate_runtime::environmental_block_class(&detail);
-                    stamp_attempt_detail(&mut attempts, &outcome.tag, class);
+                    let class = validate_runtime::environmental_block_observation(&detail)
+                        .block_class();
+                    stamp_attempt_detail(
+                        &mut attempts,
+                        &outcome.tag,
+                        class.map(validate_runtime::EnvBlockClass::as_str),
+                    );
                     if let Some(class) = class {
-                        environmental.insert(outcome.tag.clone(), class.to_string());
+                        environmental.insert(outcome.tag.clone(), RetryClass::from(class));
                     }
                 }
             }
         }
-        let blocked: Vec<(String, String)> = failed
+        let blocked: Vec<(String, RetryClass, Option<String>)> = failed
             .iter()
             .filter_map(|o| {
                 // ⚠️ THE BUDGET IS PER CELL. Owner ruling 2026-08-26. This cell has
@@ -11039,65 +11176,19 @@ fn run_lane_with_env_retries(
                 if !retry_attempt_available(cfg, &attempts, &o.tag) {
                     return None;
                 }
-                environmental
-                    .get(&o.tag)
-                    .cloned()
-                    .or_else(|| {
-                        // ⚠️ A CATEGORY, NOT A MESSAGE. This arm used to append
-                        // `o.reason` and so produced a near-unique value per
-                        // failure; see the block under the always-eligible arm
-                        // below for why that empties the field of its purpose.
-                        // The message is not lost: it is already on the same
-                        // attempt row, in `reason`, one key away.
-                        outcome_hit_its_budget(o).then(|| "bound-kill under contention".to_string())
-                    })
-                    .or_else(|| validate_runtime::measured_unstable_class(unstable, &o.tag))
-                    // ALWAYS-ELIGIBLE FALLBACK (owner directive 2026-08-26): every
-                    // cell is eligible for retry, not just one that earned it.
-                    //
-                    // ⚠️ THE OPT-IN GROUND HAD NEVER FIRED. Measured across all 106
-                    // recorded runs carrying `retried_nodes`: 12 had a retry and all
-                    // 12 were granted environmentally. `measured_unstable_class` --
-                    // the registry ground directly above -- has granted zero, and its
-                    // registry holds one cell measured 22 days ago. A cell earned a
-                    // retry by having already been retried.
-                    //
-                    // The three grounds above are KEPT AND TRIED FIRST, deliberately:
-                    // each names a specific cause, and that name is what reaches the
-                    // ledger as `retry_class`. Falling straight to the blanket class
-                    // would erase the distinction between "BPF-jailed", "bound-kill
-                    // under contention" and "no idea", which is the signal a
-                    // multi-week flakiness timeline is built from.
-                    //
-                    // The two SAFETY refusals still bound this and are not bypassed:
-                    // a failure whose prerequisite did not complete is dropped by
-                    // `retry_steps_with_satisfied_prerequisites` below, and the whole
-                    // loop is bounded by `max` rounds.
-                    //
-                    // ⚠️ THIS IS A CATEGORY AND IT MUST NOT CARRY THE MESSAGE.
-                    // Owner ruling 2026-08-27, granting the eligibility above on
-                    // condition that the field stay groupable.
-                    //
-                    // Both this arm and the bound-kill arm above used to append
-                    // `o.reason`. That reads as more information and is less:
-                    // the paragraph above says this field is "the signal a
-                    // multi-week flakiness timeline is built from", and a
-                    // timeline is built by GROUPING. Interpolating a per-failure
-                    // message makes every group hold one row, so the field is
-                    // populated, non-null, and answers nothing -- while looking
-                    // entirely reasonable in any single row you inspect.
-                    //
-                    // This arm is the catch-all, so it takes every failure the
-                    // three named grounds did not match. Left as free text it
-                    // would become the dominant value AND the least analysable
-                    // one, which inverts the purpose of granting the retry.
-                    //
-                    // NOTHING IS LOST. The failure text is already published on
-                    // the same attempt object as `reason` (see NodeAttempt and
-                    // the envelope writer): one field for a human reading a row,
-                    // one for a machine counting rows.
-                    .or_else(|| Some("always-eligible".to_string()))
-                    .map(|class| (o.tag.clone(), class))
+                let measured_detail =
+                    validate_runtime::measured_unstable_detail(unstable, &o.tag);
+                let classification = retry_classification(
+                    environmental.get(&o.tag).copied(),
+                    outcome_hit_its_budget(o),
+                    measured_detail,
+                );
+                // The class is a grouping key, never a message. The failed
+                // attempt's own text remains in `reason`; measured-instability
+                // provenance is the separate `retry_detail`. The fallback is
+                // always-eligible by the owner ruling, after the three more
+                // specific grounds above have had priority.
+                Some((o.tag.clone(), classification.0, classification.1))
             })
             .collect();
         if blocked.is_empty() {
@@ -11121,7 +11212,7 @@ fn run_lane_with_env_retries(
         );
         let steps = retry_steps_with_satisfied_prerequisites(cfg, &by_tag, keep);
         let retry_tags: BTreeSet<String> = steps.iter().map(|step| step.tag()).collect();
-        if !blocked.iter().any(|(tag, _)| retry_tags.contains(tag)) {
+        if !blocked.iter().any(|(tag, _, _)| retry_tags.contains(tag)) {
             eprintln!(
                 "validate: retry-eligible failure has no safe retry because a prerequisite did \
                  not complete successfully and is not part of the retry; NOT retrying."
@@ -11139,14 +11230,25 @@ fn run_lane_with_env_retries(
             break;
         }
         env_retries += 1;
-        for (tag, class) in blocked.iter().filter(|(tag, _)| retry_tags.contains(tag)) {
+        for (tag, class, detail) in
+            blocked.iter().filter(|(tag, _, _)| retry_tags.contains(tag))
+        {
             // This says WHY the retry scheduler accepted the prior failure. The
             // later attempt's typed execution state independently decides
             // whether that scheduled retry actually confirmed/refuted anything.
             if let Some(previous) = latest_reported_failure_mut(&mut attempts, tag) {
-                previous.retry_class = Some(class.clone());
+                previous.retry_class = Some(*class);
+                previous.retry_detail = detail.clone();
             }
-            println!("{}", retry_notice(tag, class, next_attempt_ordinal(&attempts, tag)));
+            println!(
+                "{}",
+                retry_notice(
+                    tag,
+                    *class,
+                    detail.as_deref(),
+                    next_attempt_ordinal(&attempts, tag),
+                )
+            );
         }
         let mut retry_cfg = cfg.clone();
         retry_cfg.description = format!("{} — retry round {env_retries}", cfg.description);
@@ -11314,8 +11416,14 @@ fn retry_attempt_line(
     let verdict = attempt_result(row).unwrap_or("unknown step result");
     let because = row
         .retry_class
-        .as_deref()
-        .map(|class| format!(" — retried because: {class}"))
+        .map(|class| {
+            let detail = row
+                .retry_detail
+                .as_deref()
+                .map(|value| format!(": {value}"))
+                .unwrap_or_default();
+            format!(" — retried because: {}{detail}", class.as_str())
+        })
         .unwrap_or_default();
     let detail = if row.reason.is_empty() {
         String::new()
@@ -12584,7 +12692,8 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
                 "real_seconds": a.reported.then_some(a.duration_s),
                 // Why this attempt was given another go. `null` on the last
                 // attempt of every node, since nothing followed it.
-                "retry_class": a.retry_class,
+                "retry_class": a.retry_class.map(RetryClass::as_str),
+                "retry_detail": a.retry_detail,
                 // Classification is only a hypothesis. These fields say whether
                 // a later actual execution confirmed/refuted it, or whether no
                 // such execution occurred.
@@ -13768,13 +13877,14 @@ fn retain_cells_with_retry_attempt_available(
 
 fn retry_candidate_tags(
     cfg: &DagConfig,
-    blocked: &[(String, String)],
+    blocked: &[(String, RetryClass, Option<String>)],
     skipped: &[String],
     by_tag: &BTreeMap<String, StepOutcome>,
     latest_unreported: &BTreeSet<String>,
     attempts: &[NodeAttempt],
 ) -> BTreeSet<String> {
-    let mut keep: BTreeSet<String> = blocked.iter().map(|(tag, _)| tag.clone()).collect();
+    let mut keep: BTreeSet<String> =
+        blocked.iter().map(|(tag, _, _)| tag.clone()).collect();
     keep.extend(skipped.iter().cloned());
     keep.extend(by_tag.values().filter(|outcome| outcome.aborted).map(|outcome| outcome.tag.clone()));
     keep.extend(unreported_non_intentional_steps(cfg, by_tag, skipped));
@@ -13789,7 +13899,7 @@ const SUMMARY_FLAKY_HEADING: &str =
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TestIdRetry {
     id: String,
-    retry_classes: Vec<String>,
+    retry_classes: Vec<RetryClass>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -13830,11 +13940,12 @@ fn summary_id_list(ids: &[String]) -> Vec<String> {
 /// else did. A retry count built from that field is roughly 5x too high, and it
 /// looks entirely reasonable, which is why nothing would catch it. `retry_class`
 /// is set only on an attempt for which a retry was actually GRANTED, per node,
-/// and carries the reason in the words the retry line printed.
+/// and carries the closed class the retry line printed. Changing evidence is
+/// retained separately on the attempt as `retry_detail`.
 fn retry_classes_for_test(
     observations: &[TestAttemptObservation],
     attempts: &[NodeAttempt],
-) -> Vec<String> {
+) -> Vec<RetryClass> {
     observations
         .iter()
         .filter(|observation| !observation.passed)
@@ -13844,14 +13955,14 @@ fn retry_classes_for_test(
                 .find(|attempt| {
                     attempt.tag == observation.node && attempt.attempt == observation.attempt
                 })
-                .and_then(|attempt| attempt.retry_class.clone());
+                .and_then(|attempt| attempt.retry_class);
             outer_class.or_else(|| {
                 observations
                     .iter()
                     .any(|later| {
                         later.node == observation.node && later.attempt > observation.attempt
                     })
-                    .then(|| "always-eligible".to_string())
+                    .then_some(RetryClass::AlwaysEligible)
             })
         })
         .collect()
@@ -14132,7 +14243,14 @@ fn render_test_id_retry(item: &TestIdRetry) -> String {
     let classes = if item.retry_classes.is_empty() {
         String::new()
     } else {
-        format!(": {}", item.retry_classes.join("; "))
+        format!(
+            ": {}",
+            item.retry_classes
+                .iter()
+                .map(|class| class.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
     };
     format!(
         "{}  ({retries} retr{}{})",
