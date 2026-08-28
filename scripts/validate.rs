@@ -1159,12 +1159,17 @@ fn self_test() -> Result<(), String> {
             row("unlisted_fails", false),
             row("plain_passes", true),
         ];
-        let (_, _, blocking) = compat_summary_with_tables(
+        let (passed, measured, blocking) = compat_summary_with_tables(
             CompatMode::PortableStrict,
             &outcomes,
             &planted_known,
             &planted_diag,
         );
+        if (passed, measured) != (2, 5) {
+            return Err(format!(
+                "compatibility measurement: completed fixture population reported {passed}/{measured}, want 2/5"
+            ));
+        }
         // THE LOAD-BEARING ASSERTION: a listed failure is still in the blocking set. If a future
         // change makes PortableStrict exempt listed rows the way Strict does, this fails.
         if !blocking.iter().any(|l| l == "listed_fails") {
@@ -1187,6 +1192,31 @@ fn self_test() -> Result<(), String> {
         }
         if blocking.iter().any(|l| l == "listed_passes" || l == "plain_passes") {
             return Err(format!("a PASSING row was reported as blocking: blocking={blocking:?}"));
+        }
+
+        // A scheduler record is not evidence that the program ran. Spawn and
+        // supervisor failures have no child exit status, while an aborted row
+        // was stopped before producing a verdict. Neither may change the
+        // measured denominator or gain a compatibility failure classification.
+        let mut unknown = row("unknown_execution", false);
+        unknown.returncode = None;
+        let mut aborted = row("aborted_execution", false);
+        aborted.aborted = true;
+        let mut with_unknown = outcomes.clone();
+        with_unknown.extend([unknown, aborted]);
+        let (unknown_passed, unknown_measured, unknown_blocking) = compat_summary_with_tables(
+            CompatMode::PortableStrict,
+            &with_unknown,
+            &planted_known,
+            &planted_diag,
+        );
+        if (unknown_passed, unknown_measured) != (passed, measured)
+            || unknown_blocking != blocking
+        {
+            return Err(format!(
+                "compatibility measurement: unknown_execution or aborted_execution changed the \
+                 measured population: base={passed}/{measured} {blocking:?}, with unknown={unknown_passed}/{unknown_measured} {unknown_blocking:?}"
+            ));
         }
         // And the same planted table under Strict must exempt the listed failure, so the
         // bracket also pins that the two modes still differ.
@@ -6937,6 +6967,12 @@ fn compat_summary_with_tables(
     let mut measured_labels: BTreeSet<String> = BTreeSet::new();
     for o in outcomes {
         let Some(label) = o.tag.strip_prefix("compat.") else { continue };
+        if outcome_execution(o) == AttemptExecution::Unknown {
+            println!(
+                "  NO_RESULT {label} produced no completed child execution; excluded from the measured denominator"
+            );
+            continue;
+        }
         if outcome_is_no_result(o) {
             println!(
                 "  NO_RESULT {label} could not determine its condition; excluded from the measured denominator"
