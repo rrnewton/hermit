@@ -1159,7 +1159,7 @@ fn self_test() -> Result<(), String> {
             row("unlisted_fails", false),
             row("plain_passes", true),
         ];
-        let (passed, measured, blocking) = compat_summary_with_tables(
+        let (passed, measured, blocking, nonblocking) = compat_summary_with_tables(
             CompatMode::PortableStrict,
             &outcomes,
             &planted_known,
@@ -1190,6 +1190,11 @@ fn self_test() -> Result<(), String> {
                  blocking={blocking:?}"
             ));
         }
+        if nonblocking != BTreeSet::from(["compat.bounded_diag".to_string()]) {
+            return Err(format!(
+                "PortableStrict nonblocking failures did not come from the same typed disposition as the verdict: {nonblocking:?}"
+            ));
+        }
         if blocking.iter().any(|l| l == "listed_passes" || l == "plain_passes") {
             return Err(format!("a PASSING row was reported as blocking: blocking={blocking:?}"));
         }
@@ -1204,14 +1209,16 @@ fn self_test() -> Result<(), String> {
         aborted.aborted = true;
         let mut with_unknown = outcomes.clone();
         with_unknown.extend([unknown, aborted]);
-        let (unknown_passed, unknown_measured, unknown_blocking) = compat_summary_with_tables(
-            CompatMode::PortableStrict,
-            &with_unknown,
-            &planted_known,
-            &planted_diag,
-        );
+        let (unknown_passed, unknown_measured, unknown_blocking, unknown_nonblocking) =
+            compat_summary_with_tables(
+                CompatMode::PortableStrict,
+                &with_unknown,
+                &planted_known,
+                &planted_diag,
+            );
         if (unknown_passed, unknown_measured) != (passed, measured)
             || unknown_blocking != blocking
+            || unknown_nonblocking != nonblocking
         {
             return Err(format!(
                 "compatibility measurement: unknown_execution or aborted_execution changed the \
@@ -1220,7 +1227,7 @@ fn self_test() -> Result<(), String> {
         }
         // And the same planted table under Strict must exempt the listed failure, so the
         // bracket also pins that the two modes still differ.
-        let (_, _, strict_blocking) = compat_summary_with_tables(
+        let (_, _, strict_blocking, strict_nonblocking) = compat_summary_with_tables(
             CompatMode::Strict,
             &outcomes,
             &planted_known,
@@ -1229,6 +1236,11 @@ fn self_test() -> Result<(), String> {
         if strict_blocking.iter().any(|l| l == "listed_fails") {
             return Err(format!(
                 "Strict lost its historical exemption for a listed row: {strict_blocking:?}"
+            ));
+        }
+        if strict_nonblocking != BTreeSet::from(["compat.listed_fails".to_string()]) {
+            return Err(format!(
+                "Strict nonblocking failures did not retain exactly its listed exemption: {strict_nonblocking:?}"
             ));
         }
     }
@@ -6971,7 +6983,10 @@ fn print_cost_table(
 
 /// Per-program compatibility summary, built from typed node outcomes rather than
 /// a scraped TSV. Reproduces `print_compatibility_summary`'s category table.
-fn print_compat_summary(mode: CompatMode, outcomes: &[StepOutcome]) -> (usize, usize, Vec<String>) {
+fn print_compat_summary(
+    mode: CompatMode,
+    outcomes: &[StepOutcome],
+) -> (usize, usize, Vec<String>, BTreeSet<String>) {
     compat_summary_with_tables(
         mode,
         outcomes,
@@ -6992,11 +7007,12 @@ fn compat_summary_with_tables(
     outcomes: &[StepOutcome],
     known: &BTreeMap<&'static str, &'static str>,
     diag: &BTreeMap<&'static str, &'static str>,
-) -> (usize, usize, Vec<String>) {
+) -> (usize, usize, Vec<String>, BTreeSet<String>) {
     let mut per_cat: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
     let mut passed = 0usize;
     let mut measured = 0usize;
     let mut blocking_failures: Vec<String> = Vec::new();
+    let mut nonblocking_failure_tags: BTreeSet<String> = BTreeSet::new();
     let mut measured_labels: BTreeSet<String> = BTreeSet::new();
     for o in outcomes {
         let Some(label) = o.tag.strip_prefix("compat.") else { continue };
@@ -7072,6 +7088,8 @@ fn compat_summary_with_tables(
         }
         if disposition.is_blocking() {
             blocking_failures.push(label.to_string());
+        } else if !o.ok {
+            nonblocking_failure_tags.insert(o.tag.clone());
         }
     }
     // AUDIT: a listed row the selected corpus never measured. Such a row is silently carried
@@ -7116,7 +7134,7 @@ fn compat_summary_with_tables(
             println!("  - {label}: {why}");
         }
     }
-    (passed, measured, blocking_failures)
+    (passed, measured, blocking_failures, nonblocking_failure_tags)
 }
 
 /// Conditions that must FAIL a run whatever the ratchet's own arithmetic says,
@@ -16522,12 +16540,14 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
 
     // Compatibility ratchet, evaluated from typed outcomes.
     let mut compat_blocking = 0usize;
+    let mut compat_nonblocking = BTreeSet::new();
     // Carried to the verdict: a compat profile that measured nothing must not be
     // able to reach PASS through an empty set of failing rows.
     let mut compat_measured: Option<usize> = None;
     if let Some(mode) = plan.compat {
-        let (passed, measured, blocking) = print_compat_summary(mode, &outcomes);
+        let (passed, measured, blocking, nonblocking) = print_compat_summary(mode, &outcomes);
         compat_blocking = blocking.len();
+        compat_nonblocking = nonblocking;
         compat_measured = Some(measured);
         let floor = match mode {
             CompatMode::Sabre => Some(validate_corpus::SABRE_COMPAT_EXPECTED),
@@ -16622,6 +16642,11 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         compat_blocking,
         structural_failures,
     );
+    let summary_nonblocking: BTreeSet<String> = plan
+        .nonblocking
+        .union(&compat_nonblocking)
+        .cloned()
+        .collect();
     // `ok` from the runner reflects every node, including the nonblocking ones,
     // so it is only authoritative when nothing is excused. A known exit 75
     // fully explains why the runner returned non-ok; any other unexplained
@@ -16927,7 +16952,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // The completed-run summary. Names the excused rows explicitly, so a green
     // verdict that ignored some failures can never read as "everything passed".
     let mut detail = Vec::new();
-    let excused = failures - blocking_failures;
+    let excused = failures.saturating_sub(effective_failures);
     if exit_code == 0 {
         detail.push(format!("every blocking gate passed ({} node(s) ran)", outcomes.len()));
     } else if exit_code == NO_RESULT_EXIT_CODE as u8 {
@@ -16937,7 +16962,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             no_result_nodes.join(", ")
         ));
     } else {
-        let (_named, listing) = blocking_listing(&outcomes, &plan.nonblocking, effective_failures);
+        let (_named, listing) =
+            blocking_listing(&outcomes, &summary_nonblocking, effective_failures);
         detail.push(format!("{effective_failures} blocking failure(s){listing}"));
     }
     if exit_code != NO_RESULT_EXIT_CODE as u8 && no_results > 0 {
