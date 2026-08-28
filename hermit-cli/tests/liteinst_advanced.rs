@@ -24,8 +24,6 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
-use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
-
 static LITEINST_ADVANCED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_COMPAT_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
@@ -774,7 +772,29 @@ fn liteinst_strict_verify_python_random_example() {
     );
 }
 
-fn assert_clone_boundary(mode: &str) {
+/// Runs one task-creating guest mode under LiteInst and requires it to finish.
+///
+/// ⚠️ THIS REPLACED A REFUSAL ASSERTION AND IS STRICTLY STRONGER THAN IT WAS.
+/// Until Reverie removed the clone boundary, `handle_new_task` returned
+/// `ENOTSUPP` for every `clone`/`clone3`/`fork`/`vfork`, and this helper
+/// asserted that refusal. The refusal is gone for `clone`/`clone3`/`fork`, so
+/// the old assertion had to be updated rather than deleted: it now requires the
+/// guest to RUN, which the refusal could never satisfy, and it still refuses to
+/// accept a silent reintroduction of the boundary.
+///
+/// `marker` is the guest's own end-of-mode line, printed only after the created
+/// task has been created, run and reaped (see `tests/c/liteinst_advanced.c`), so
+/// a regression that skips the task cannot satisfy this by exiting zero. The
+/// negative assertions carry the two failure shapes the old test existed for:
+/// `ENOTSUPP` is the removed boundary coming back, and `Bad system call` is the
+/// SIGSYS the seccomp filter must never deliver to the guest.
+///
+/// The ten-second child deadline is deliberately unchanged. `--verify` is
+/// deliberately NOT added here: the same measurement that justified this update
+/// timed `threads` under `--verify --verify-strict` at 3.32/3.37/3.47/3.71 and
+/// one 14.03 seconds on a loaded host, so folding it in would either flake
+/// against this bound or require widening it.
+fn assert_multi_task_mode(mode: &str, marker: &str) {
     liteinst_runtime::ensure_liteinst_runtime();
     let mut child = Command::new(liteinst_runtime::hermit_binary())
         .args([
@@ -790,7 +810,7 @@ fn assert_clone_boundary(mode: &str) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("failed to start Hermit LiteInst clone-boundary guest");
+        .expect("failed to start Hermit LiteInst multi-task guest");
     let deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {
         if let Some(status) = child.try_wait().expect("failed to poll Hermit LiteInst") {
@@ -799,25 +819,28 @@ fn assert_clone_boundary(mode: &str) {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("Hermit LiteInst hung while rejecting {mode}");
+            panic!("Hermit LiteInst hung running {mode}");
         }
         thread::sleep(Duration::from_millis(10));
     };
     let output = child
         .wait_with_output()
-        .expect("failed to collect Hermit LiteInst clone-boundary output");
+        .expect("failed to collect Hermit LiteInst multi-task output");
     assert_eq!(output.status, status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         status.code(),
-        Some(HERMIT_INTERNAL_FAILURE_EXIT),
-        "status={:?}\nstdout={}\nstderr={}",
+        Some(0),
+        "status={:?}\nstdout={stdout}\nstderr={stderr}",
         output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("ENOTSUPP (Operation is not supported)"),
+        stdout.contains(marker),
+        "guest did not reach the end of {mode}\nstdout={stdout}\nstderr={stderr}",
+    );
+    assert!(
+        !stderr.contains("ENOTSUPP (Operation is not supported)"),
         "{stderr}"
     );
     assert!(!stderr.contains("Bad system call"), "{stderr}");
@@ -871,13 +894,13 @@ fn liteinst_preload_is_inert_without_host_runtime_selector() {
 }
 
 #[test]
-fn liteinst_thread_clone_fails_closed_without_sigsys() {
-    assert_clone_boundary("threads");
+fn liteinst_thread_clone_runs_without_sigsys() {
+    assert_multi_task_mode("threads", "threads-ok");
 }
 
 #[test]
-fn liteinst_fork_fails_closed_without_hanging() {
-    assert_clone_boundary("fork");
+fn liteinst_fork_runs_without_hanging() {
+    assert_multi_task_mode("fork", "fork-ok");
 }
 
 #[test]

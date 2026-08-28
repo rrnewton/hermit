@@ -142,10 +142,13 @@ comparison to selected Detcore scheduler messages. A successful result is a
 useful diagnostic, but it is not strict determinism. Strict verification requires
 `--verify-strict --verify-json REPORT.json`, `bitwise_parity: true`, and nonzero
 compared-message counts.
-Current support is limited to single-threaded, single-process guests. Thread
-clone, `fork`, and `vfork` fail closed with `EOPNOTSUPP`; `exec` is also
-unsupported because runtime rebootstrap after image replacement is not yet
-implemented. RCB preemption and CPUID/RDTSC interception use the ptrace host
+Guests may create threads and child processes: `clone`, `clone3` and `fork` run
+under the ordinary ptrace lifecycle. Hook installation is single-task only,
+though -- the patch helper runs on a process-global stack and the installer is
+not re-entrant across tasks -- so the hook set freezes at the first
+task-creating syscall while the tasks themselves keep running. `vfork` still
+fails closed with `EOPNOTSUPP`, and `exec` is also unsupported, because neither
+can preserve the preload runtime after the address space is replaced. RCB preemption and CPUID/RDTSC interception use the ptrace host
 and retain its PMU and CPU capability requirements.
 The default Hermit namespace path is supported; `--no-namespace` remains an
 explicit option for trusted guests. The in-guest patch runtime is experimental

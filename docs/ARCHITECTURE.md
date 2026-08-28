@@ -69,7 +69,7 @@ determinism curve:
 | Backend | Mechanism | Status | Trade-off |
 | --- | --- | --- | --- |
 | **ptrace** | seccomp-BPF `SECCOMP_RET_TRACE` + `PTRACE`, out-of-process tracer | Production; the only in-tree backend (`reverie-ptrace`) | Complete and strongly deterministic; per-event context-switch cost |
-| **LiteInst + ptrace** | Online hot-site patching with a ptrace-owned Tool and in-guest patch/helper DSO | Experimental hybrid | Keeps ptrace lifecycle/PMU correctness while replacing eligible repeated syscall traps; dynamic single-process/single-thread scope |
+| **LiteInst + ptrace** | Online hot-site patching with a ptrace-owned Tool and in-guest patch/helper DSO | Experimental hybrid | Keeps ptrace lifecycle/PMU correctness while replacing eligible repeated syscall traps; dynamically linked scope, and hook installation is single-task only |
 | **DBT** (SaBRe / DynamoRIO style) | In-process binary rewriting / function hooking of syscall sites | Experimental / research | Low overhead; today it is a syscall-boundary interceptor, **not** a deterministic backend |
 | **KVM / SVM** | Run the guest inside a hardware VM and trap via VM-exits | Exploratory | Can trap instructions ptrace cannot (see CPUID below); heaviest isolation and integration cost |
 | **e9patch + ptrace** | Cached offline main-ELF rewriting followed by the ptrace Detcore runtime | Experimental hybrid | Exact coverage of e9tool-recovered candidate sites; raw random/TSX instructions remain unsupported even when mapped |
@@ -85,9 +85,14 @@ the initial exec, including PMU scheduling and CPUID/RDTSC handling. A preload
 DSO contains only LiteInst patch/helper state. The first eligible syscall site
 is validated by the tracer and may be patched; later invocations enter the
 trampoline but preserve the same ptrace-owned lifecycle. The current scope is
-dynamically linked, single-process, and single-threaded. Fork/thread creation
-fails closed, and exec remains unsupported until the replacement image can
-rebootstrap and revalidate the runtime.
+dynamically linked. Threads and child processes run under the ordinary ptrace
+lifecycle, but **hook installation is single-task only**: the patch helper runs
+on a process-global stack and the installer is not re-entrant across tasks, so
+the hook set freezes at the first `clone`/`clone3`/`fork`/`vfork`. A
+task-creating syscall site is never patched, because the kernel starts the new
+task at the instruction after the `syscall` and that address must still be an
+instruction boundary. A `vfork` child and an exec after start both still fail
+closed, because neither can preserve the preload runtime.
 
 **e9patch hybrid.** The `e9patch` backend loads the cached instruction map for
 the main executable and invokes `e9tool -O0` with an exact file-offset matcher.

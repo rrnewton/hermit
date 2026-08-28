@@ -171,8 +171,16 @@ fi
 #     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
 #     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
 # so the measured key and conservative threshold carry unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 1f226acd5bd0a942279e2acbf22c7e75c6527af7 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 1f226acd5bd0a942279e2acbf22c7e75c6527af7 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO af42d9cf (2026-08-28): the same three inputs are byte-identical
+# from 1f226acd, checked by tree object rather than by reading the diff:
+#     reverie-dbt/vendor/dynamorio  a3c41e5d3630 -> a3c41e5d3630
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+#     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
+# The intervening Reverie commits are the LiteInst task-creation change (#447)
+# and a documentation commit (#511); neither can affect the elapsed time of a
+# DynamoRIO content-key miss. Carry, not recalibration.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != af42d9cf7ae604777cd88c5cca5b319460c986e8 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie af42d9cf7ae604777cd88c5cca5b319460c986e8 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
