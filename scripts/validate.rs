@@ -6529,6 +6529,27 @@ fn outcome_is_failure(outcome: &StepOutcome) -> bool {
     !outcome.ok && !outcome.aborted && !outcome_is_no_result(outcome)
 }
 
+/// Count the failures represented by the final verdict.
+///
+/// Compatibility rows have their own policy classification, so only their
+/// separately counted blocking rows plus failures outside the matrix belong in
+/// the total. Every other profile already counts its failed DAG nodes in
+/// `blocking_failure_nodes`. In particular, the super stress table groups those
+/// same failed repetition nodes by probe for display; adding that grouped count
+/// here would count one failure once as a node and again as a probe.
+fn effective_failure_count(
+    compat: Option<CompatMode>,
+    blocking_failure_nodes: usize,
+    compat_blocking: usize,
+    compat_structural_failures: usize,
+) -> usize {
+    if compat.is_some() {
+        compat_blocking + compat_structural_failures
+    } else {
+        blocking_failure_nodes
+    }
+}
+
 /// The blocking-failure headline: the count and the names, from ONE collection.
 ///
 /// ⚠️ THIS EXISTS BECAUSE THE COUNT AND THE LIST DISAGREED IN PRODUCTION. On the
@@ -6570,8 +6591,9 @@ fn blocking_listing<'a>(
     // ⚠️ A HEADLINE LARGER THAN ITS OWN LIST MEANS SOMETHING BLOCKING IS
     // UNCOUNTABLE FROM THIS SET, and that is how a timed-out node vanished from
     // this run. `effective_failures` legitimately exceeds `named` for the compat
-    // and super profiles, which add their own blocking rows — so this does not
-    // refuse, it SAYS SO. Silence was the only unacceptable option.
+    // profile, which adds blocking program rows that are not independently
+    // listed here — so this does not refuse, it SAYS SO. Silence was the only
+    // unacceptable option.
     if effective_failures > named.len() {
         listing.push_str(&format!(
             " ⚠️ {} counted blocking node(s) are NOT NAMEABLE from the failure set; \
@@ -6657,6 +6679,24 @@ fn summary_listing_bracket() -> Result<String, String> {
         aborted: false,
     };
     let none: BTreeSet<String> = BTreeSet::new();
+
+    // A failed super stress repetition is already one failed DAG node. The
+    // grouped per-probe table may also report one failing probe, but that is a
+    // second view of the same failure and must not increase the headline.
+    if effective_failure_count(None, 1, 1, 1) != 1 {
+        return Err(
+            "failure count: one super stress repetition was counted once as a node and again as a probe"
+                .into(),
+        );
+    }
+    // Compatibility is deliberately different: its policy owns the matrix
+    // rows, while only failures outside that matrix are added.
+    if effective_failure_count(Some(CompatMode::Strict), 99, 2, 1) != 3 {
+        return Err(
+            "failure count: compatibility matrix and structural failure populations were not kept separate"
+                .into(),
+        );
+    }
 
     // 1. Every failure is named when the set is small.
     let small: Vec<StepOutcome> = (0..3).map(|i| row(&format!("n{i}"), false)).collect();
@@ -16439,11 +16479,13 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     }
 
     // Super stress pass rates, from typed outcomes rather than a scraped report.
-    let mut super_blocking = 0usize;
     if plan.super_mode {
         let reps = validate_super::repetitions();
         let rates = validate_super::stress_rates(&outcomes, reps);
-        super_blocking = validate_super::stress_verdict(&rates, reps, jobs, host_cpus);
+        // This is a per-PROBE display summary. The failed repetition nodes are
+        // already in `blocking_failures`, so the grouped count must not be added
+        // to the final node count.
+        validate_super::stress_verdict(&rates, reps, jobs, host_cpus);
     }
 
     // Working-envelope vector: score, emit JSON, print the human summary, and
@@ -16505,13 +16547,12 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                 && !plan.nonblocking.contains(&o.tag)
         })
         .count();
-    let effective_failures = if plan.compat.is_some() {
-        compat_blocking + structural_failures
-    } else if plan.super_mode {
-        blocking_failures + super_blocking
-    } else {
-        blocking_failures
-    };
+    let effective_failures = effective_failure_count(
+        plan.compat,
+        blocking_failures,
+        compat_blocking,
+        structural_failures,
+    );
     // `ok` from the runner reflects every node, including the nonblocking ones,
     // so it is only authoritative when nothing is excused. A known exit 75
     // fully explains why the runner returned non-ok; any other unexplained
