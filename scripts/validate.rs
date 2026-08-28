@@ -1895,6 +1895,8 @@ fn self_test() -> Result<(), String> {
     // Completeness is what a self-certifying driver is least able to check about
     // itself, so its refusal predicate is bracketed here rather than assumed.
     verdict_refusal_bracket()?;
+    pin_gate_receipt_bracket()?;
+    scorecard_writeback_scope_bracket()?;
     host_capability_bracket(&root)?;
     coverage_schema_bracket()?;
     cell_results_schema_bracket()?;
@@ -4003,13 +4005,19 @@ fn append_validate_series(
 }
 
 /// Merge one top-level validate's completed per-cell rows into the tracked
-/// scorecard files. Nested validates leave this to their outer run.
+/// scorecard files. Nested and off-the-record validates leave the tracked view
+/// untouched; only a receipt-producing top-level run owns that projection.
+fn should_write_scorecard(nested: bool, off_the_record: bool) -> bool {
+    !nested && !off_the_record
+}
+
 fn local_scorecard_writeback(
     root: &Path,
     result_root: &Path,
     nested: bool,
+    off_the_record: bool,
 ) -> Option<Result<(), String>> {
-    if nested {
+    if !should_write_scorecard(nested, off_the_record) {
         return None;
     }
     let script = root.join("ci/compat-envelope/scorecard.rs");
@@ -7027,6 +7035,16 @@ fn exit_code_with_execution_completeness(exit_code: u8, execution_complete: bool
     if execution_complete { exit_code } else { exit_code.max(1) }
 }
 
+/// A missing pin gate invalidates a passing receipt, not an explicitly
+/// off-the-record selected run. Selected hosted jobs inherit the exact commit
+/// and a successful preflight through the external workflow dependency, and
+/// they are already forbidden from writing a ledger row or publishing a
+/// receipt. Turning a completed selected step into failure here would discard
+/// its result without strengthening any evidence claim.
+fn pin_gate_blocks_pass(exit_code: u8, pin_gate_passed: bool, off_the_record: bool) -> bool {
+    exit_code == 0 && !pin_gate_passed && !off_the_record
+}
+
 /// Fast exit 127 is useful missing-artifact guidance only in `--only`, whose
 /// documented contract deliberately drops build dependencies. It is never a
 /// verdict override and is not inferred for full or other focused profiles.
@@ -7561,6 +7579,43 @@ fn verdict_refusal_bracket() -> Result<(), String> {
     println!(
         "  verdict refusals: 3 positive(s) fire (0-measured+spine, 0-executed, spine-with-full-matrix), \
          2 negative(s) inert (complete run, unknown counts)"
+    );
+    Ok(())
+}
+
+/// Both sides of [`pin_gate_blocks_pass`], using only planted booleans.
+fn pin_gate_receipt_bracket() -> Result<(), String> {
+    if !pin_gate_blocks_pass(0, false, false) {
+        return Err("pin gate: a receipt-producing pass without the gate was accepted".into());
+    }
+    for (exit_code, pin_gate_passed, off_the_record, label) in [
+        (0, true, false, "receipt-producing pass with gate"),
+        (1, false, false, "existing failure without gate"),
+        (0, false, true, "off-the-record selected pass without gate"),
+    ] {
+        if pin_gate_blocks_pass(exit_code, pin_gate_passed, off_the_record) {
+            return Err(format!("pin gate: {label} was incorrectly refused"));
+        }
+    }
+    println!(
+        "  pin gate: receipt-producing pass requires the observed gate; off-the-record selected pass does not claim a receipt"
+    );
+    Ok(())
+}
+
+fn scorecard_writeback_scope_bracket() -> Result<(), String> {
+    if !should_write_scorecard(false, false)
+        || should_write_scorecard(true, false)
+        || should_write_scorecard(false, true)
+        || should_write_scorecard(true, true)
+    {
+        return Err(
+            "scorecard write-back: only a receipt-producing top-level run may update the tracked projection"
+                .into(),
+        );
+    }
+    println!(
+        "  scorecard write-back: receipt-producing top-level run only; nested and off-the-record runs inert"
     );
     Ok(())
 }
@@ -16619,8 +16674,12 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         // This is below the interrupted run's ledger write. Keep the checkout
         // lock held while the generated files are replaced, so a second local
         // validate cannot begin against the tree between those two operations.
-        let scorecard_writeback =
-            local_scorecard_writeback(&root, &e2e_result_root, nesting.nested);
+        let scorecard_writeback = local_scorecard_writeback(
+            &root,
+            &e2e_result_root,
+            nesting.nested,
+            args.allow_local_off_the_record_run,
+        );
         drop(run_record);
         let _ = std::fs::remove_dir_all(&tmp);
         let mut detail = vec![
@@ -16803,14 +16862,21 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
 
     // Receipt production is itself an enforcement path (validate.sh:1846).
     //
-    // Every profile plans `pre.reverie_pin` and every lane node depends on it, so
-    // in principle a green cannot happen without it. This asserts that anyway: if
-    // a future fast path, cache branch, or early return ever bypasses the pin
-    // gate, it must not emit PASS merely because the tests it did select happened
-    // to pass. The archival pin is not a testing exemption, and "the DAG makes it
-    // impossible" is a structural argument, not an observation of this run.
+    // Every receipt-producing profile plans `pre.reverie_pin` and every lane
+    // node depends on it, so in principle a green receipt cannot happen without
+    // it. This asserts that anyway: if a future fast path, cache branch, or early
+    // return ever bypasses the pin gate, it must not emit PASS merely because the
+    // tests it did select happened to pass. An off-the-record selected subgraph
+    // is the explicit exception: it cannot write a ledger row or receipt, and
+    // the external workflow already depends on the preflight result. The
+    // archival pin is not a testing exemption, and "the DAG makes it impossible"
+    // is a structural argument, not an observation of a receipt-producing run.
     let mut pin_gate_bypassed = false;
-    if exit_code == 0 && !pin_gate_passed {
+    if pin_gate_blocks_pass(
+        exit_code,
+        pin_gate_passed,
+        args.allow_local_off_the_record_run,
+    ) {
         eprintln!(
             "validate: ERROR: this path produced a PASS without a passing {PIN_GATE_TAG} gate; \
              refusing a passing receipt."
@@ -17010,8 +17076,12 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // lock remains held here, so another direct validate cannot start between
     // receipt finalization and this write-back. ci-hub additionally writes the
     // completed results back to the checkout that invoked the isolated run.
-    let scorecard_writeback =
-        local_scorecard_writeback(&root, &e2e_result_root, nesting.nested);
+    let scorecard_writeback = local_scorecard_writeback(
+        &root,
+        &e2e_result_root,
+        nesting.nested,
+        args.allow_local_off_the_record_run,
+    );
 
     // Read the individual results before removing the disposable build root: a
     // caller may deliberately place E2E_RESULT_ROOT there. The scheduler is
