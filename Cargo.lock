@@ -955,6 +955,7 @@ dependencies = [
  "fbinit",
  "goblin",
  "hermit-detcore",
+ "hermit-manifest-plan",
  "hermit-resources",
  "iced-x86",
  "libc",
