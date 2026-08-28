@@ -1359,6 +1359,21 @@ fn self_test() -> Result<(), String> {
             writeback_failed.exit_code,
         ));
     }
+    let writeback_result_dir = tempfile::tempdir()
+        .map_err(|error| format!("summary: cannot create write-back result fixture: {error}"))?;
+    let writeback_result_path = writeback_result_dir.path().join("result.json");
+    write_validation_service_result(&writeback_result_path, &writeback_failed)?;
+    let writeback_result = ValidationServiceResult::from_json_slice(
+        &std::fs::read(&writeback_result_path)
+            .map_err(|error| format!("summary: cannot read write-back result: {error}"))?,
+    )?;
+    if writeback_result.final_validate_status != FinalValidateStatus::CouldNotRun
+        || writeback_result.exit_code != i32::from(COULD_NOT_RUN_EXIT_CODE)
+    {
+        return Err(format!(
+            "summary: scorecard write-back refusal did not carry the final command status into the service result: {writeback_result:?}"
+        ));
+    }
     let service_result_dir = tempfile::tempdir()
         .map_err(|error| format!("summary: cannot create service-result fixture: {error}"))?;
     let service_result_path = service_result_dir.path().join("result.json");
@@ -14519,8 +14534,9 @@ fn run_summary_lines(s: &RunSummary, started: std::time::Instant) -> Vec<String>
     if s.verdict == Verdict::Help {
         return Vec::new();
     }
-    let validation_exit_code = FinalValidateStatus::for_verdict(s.verdict)
+    let validation_exit_code = final_validate_status(s.verdict)
         .map(FinalValidateStatus::exit_code)
+        .and_then(|code| u8::try_from(code).ok())
         .unwrap_or(s.exit_code);
     let mut lines = vec![
         String::new(),
@@ -14654,7 +14670,7 @@ fn run_summary_lines(s: &RunSummary, started: std::time::Instant) -> Vec<String>
     ));
     lines.extend(s.epilogue.iter().cloned());
     if let Some(mut status) = final_validate_status(s.verdict) {
-        if status.exit_code() != s.exit_code {
+        if status.exit_code() != i32::from(s.exit_code) {
             status = FinalValidateStatus::CouldNotRun;
         }
         // LAST by contract. A wrapper, guest, fixture or quoted diagnostic may
