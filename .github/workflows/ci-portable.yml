@@ -201,6 +201,8 @@ jobs:
           RUSTFLAGS: ""
         run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
       - name: Fail-closed shard/DAG coverage guard
+        env:
+          RUSTFLAGS: ""
         run: ./ci/check-shard-coverage.sh
       - name: List audited shards (informational)
         run: |
@@ -984,6 +986,7 @@ jobs:
         env:
           E2E_RESULT_ROOT: ${{ github.workspace }}/ignored/reduced/results
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
+          RUSTFLAGS: ""
         run: ./ci/run-node.sh portable "$(jq -r '.final_nodes|join(",")' ci/portable-shards.json)"
       - name: Upload reduced e2e diagnostics
         if: always() && needs.select.outputs.run_e2e != 'false'
