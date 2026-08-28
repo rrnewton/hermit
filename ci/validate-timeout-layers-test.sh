@@ -5,17 +5,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# Live, on-demand bracket for validate's nested wall-time limits. This is not a
+# Live, on-demand bracket for validation wall-time limits. This is not a
 # default portable test: it deliberately requires a working systemd --user
 # manager and cgroup-v2 delegation so a configuration-only pass is impossible.
 #
-# This checks the FOUR validate rungs. The full ladder has more rungs than these
-# -- hermit's own `run --timeout`, the nextest per-test cap, the manifest cell
-# `timeout_seconds`, the dagrun step timeout, and safehermit's cgroup deadline --
-# and they do NOT bound the same quantity. Before changing any timeout anywhere,
-# read docs/TIMEOUT_LADDER.md: it says what each rung bounds, why the exit code
-# cannot tell you which one fired, and the strict-inequality invariant that makes
-# an inner bound dead configuration when it is set too high.
+# The portable strict matrix is now flat: each compatibility probe carries its
+# own dagrun step timeout instead of sitting inside a second validate run. This
+# script audits those deployed bounds, then proves both a named step timeout and
+# the outer systemd scope timeout with live sleepers.
 
 set -euo pipefail
 
@@ -31,16 +28,19 @@ fi
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/validate-timeout-layers.XXXXXX")
 trap 'rm -rf -- "$scratch"' EXIT
 
-cmd=$(jq -r '.steps[] | select(.group == "test" and .job == "strict_compat") | .cmd' \
+probe_count=$(jq '[.steps[] | select(.group == "compat")] | length' ci/dag/portable.json)
+probe_bounds=$(jq -r '[.steps[] | select(.group == "compat") | .timeout] | [min,max] | @tsv' \
     ci/dag/portable.json)
-gate_s=$(sed -n 's/.*VALIDATE_GATE_TIMEOUT_SECONDS=\([0-9][0-9]*\).*/\1/p' <<<"$cmd")
-run_s=$(sed -n 's/.*HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS=\([0-9][0-9]*\).*/\1/p' <<<"$cmd")
-node_s=$(jq -r '.steps[] | select(.group == "test" and .job == "strict_compat") | .timeout' \
+probe_cpu=$(jq -r '[.steps[] | select(.group == "compat") | .cpu_timeout] | unique | @tsv' \
     ci/dag/portable.json)
-scope_s=$((run_s + (run_s / 10 > 60 ? run_s / 10 : 60)))
-if ((gate_s != 480 || run_s != 600 || scope_s != 660 || node_s != 720)); then
-    printf 'validate-timeout-layers: wrong deployed ladder: %s < %s < %s < %s\n' \
-        "$gate_s" "$run_s" "$scope_s" "$node_s" >&2
+prep_bound=$(jq -r '.steps[] | select(.group == "compatprep" and .job == "fixtures") | [.timeout,.cpu_timeout] | @tsv' \
+    ci/dag/portable.json)
+nested_count=$(jq '[.steps[] | select(.cmd | contains("scripts/validate.rs --portable-strict-compat-only"))] | length' \
+    ci/dag/portable.json)
+if [[ $probe_count != 189 || $probe_bounds != $'20\t60' || $probe_cpu != 120 \
+      || $prep_bound != $'420\t420' || $nested_count != 0 ]]; then
+    printf 'validate-timeout-layers: flattened strict-compat bounds drifted: probes=%s wall=%q cpu=%q prep=%q nested=%s\n' \
+        "$probe_count" "$probe_bounds" "$probe_cpu" "$prep_bound" "$nested_count" >&2
     exit 1
 fi
 
@@ -144,5 +144,4 @@ outer_message='Finished with result: timeout'
 printf 'VALIDATE-TIMEOUT-LAYERS negative-inner=1 message=%q\n' "$inner_message"
 printf 'VALIDATE-TIMEOUT-LAYERS negative-outer=1 message=%q\n' "$outer_message"
 printf 'VALIDATE-TIMEOUT-LAYERS positive=1 healthy-control=PASS\n'
-printf 'VALIDATE-TIMEOUT-LAYERS deployed=%ss<%ss<%ss<%ss (gate<run<scope<node)\n' \
-    "$gate_s" "$run_s" "$scope_s" "$node_s"
+printf 'VALIDATE-TIMEOUT-LAYERS deployed=189 direct compat probes wall=20..60s cpu=120s prep=420s nested=0\n'

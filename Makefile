@@ -98,7 +98,7 @@ validate-plan: ## Print the boxed DAG plan (nodes, wall/CPU/memory caps, deps) w
 validate-self-test: ## Run the validate driver's inert policy/quoting/corpus brackets
 	./scripts/validate.rs --self-test
 
-validate-timeout-layers-test: ## Live bracket for step/scope timeouts (requires systemd --user + cgroup v2)
+validate-timeout-layers-test: ## Audit direct compatibility bounds and live step/scope timeouts (requires systemd --user + cgroup v2)
 	./ci/validate-timeout-layers-test.sh
 
 check-skill-discovery: ## Verify Claude and stock Codex discover the same product skills

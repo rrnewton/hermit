@@ -36,10 +36,8 @@
 //! # CLI
 //!
 //! Most of the flag surface preserves the former driver's CLI because in-tree
-//! callers depend on it — notably
-//! `ci/dag/portable.json`'s `test.strict_compat` node, which invokes
-//! `./scripts/validate.rs --portable-strict-compat-only`, plus
-//! `.github/workflows/validation-levels.yml`, three `Makefile` targets, and
+//! callers depend on it — notably `.github/workflows/validation-levels.yml`,
+//! three `Makefile` targets, and
 //! `hermit-cli/tests/{analyze,rr_suite}.rs`. The inner dirty-tree and rebase-
 //! freshness escape names its limited scope explicitly; its in-tree callers are
 //! updated with it.
@@ -94,7 +92,6 @@ mod validate_super; // Normalizes and audits extracted Cargo tests/synthetic arg
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::ffi::OsStr;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -336,7 +333,6 @@ struct Args {
     skip_inner_dirty_working_tree_and_rebase_freshness_checks: bool,
     ignore_cache: bool,
     label_pr: bool,
-    no_label_pr_explicit: bool,
     verbosity: i64,
     jobs: Option<i64>,
     keep_going: bool,
@@ -344,7 +340,6 @@ struct Args {
     /// Wall budget for the whole validate invocation, across lanes and retries.
     run_timeout: Option<i64>,
     merge_lanes: bool,
-    reuse_parent_manifest_gate: bool,
     self_test: bool,
     show_plan: bool,
 }
@@ -512,14 +507,12 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         ),
         ignore_cache: env_flag("VALIDATE_IGNORE_CACHE", "1"),
         label_pr: !env_flag("VALIDATE_LABEL_PR", "0"),
-        no_label_pr_explicit: false,
         verbosity,
         jobs: None,
         keep_going: false,
         allow_cgroup_failure: false,
         run_timeout: None,
         merge_lanes: true,
-        reuse_parent_manifest_gate: false,
         self_test: false,
         show_plan: false,
     };
@@ -601,11 +594,9 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
             "--ignore-cache" => args.ignore_cache = true,
             "--label-pr" => {
                 args.label_pr = true;
-                args.no_label_pr_explicit = false;
             }
             "--no-label-pr" => {
                 args.label_pr = false;
-                args.no_label_pr_explicit = true;
             }
             "--verbose" => args.verbosity = 2,
             "--verbosity" => {
@@ -620,11 +611,6 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
             }
             "--merge-lanes" => args.merge_lanes = true,
             "--sequential-lanes" => args.merge_lanes = false,
-            // Internal nested-payload optimization. The outer full DAG has
-            // already run the exact same manifest command and structurally
-            // gates this node on it. The nested payload still reruns submodule
-            // and Reverie-pin checks, so `reverie_pin_current` remains observed.
-            "--reuse-parent-manifest-gate" => args.reuse_parent_manifest_gate = true,
             "--self-test" => args.self_test = true,
             "-k" | "--keep-going" => args.keep_going = true,
             "--allow-cgroup-failure" => args.allow_cgroup_failure = true,
@@ -699,16 +685,6 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
     if args.allow_local_off_the_record_run {
         args.label_pr = false;
     }
-    if args.reuse_parent_manifest_gate
-        && (!matches!(args.focused, Some(Focused::PortableStrictCompat))
-            || !args.no_label_pr_explicit)
-    {
-        eprintln!(
-            "validate: --reuse-parent-manifest-gate is internal to the no-label \
-             portable-strict payload of the full DAG"
-        );
-        return Err(2);
-    }
     // `--privileged-only` and `--portable-only` are spelled as focused flags but
     // one of them is a LEVEL in validate.sh. Preserve that: --portable-only sets
     // the level, --privileged-only stays focused (validate.sh:169,189).
@@ -733,14 +709,6 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
 /// suite, so it accepts only the unfocused `full` level.
 fn force_full_policy_allows(force_full: bool, level: Level, focused: Option<&str>) -> bool {
     !force_full || (level == Level::Full && focused.is_none())
-}
-
-fn pinned_root_nested_payload(args: &Args, workdir: Option<&OsStr>) -> bool {
-    args.reuse_parent_manifest_gate
-        && matches!(args.focused, Some(Focused::PortableStrictCompat))
-        && !args.label_pr
-        && args.no_label_pr_explicit
-        && workdir == Some(OsStr::new("/test"))
 }
 
 /// The environment marker only routes an invocation that already parsed the
@@ -1037,6 +1005,7 @@ fn strict_flag_missing_from(argv: &[String]) -> bool {
 fn self_test() -> Result<(), String> {
     inner_freshness_skip_cli_bracket()?;
     run_owned_cache_bracket()?;
+    println!("  {}", portable_strict_compat_dag_bracket()?);
 
     // ---- known-fail-closed disposition, as a pure decision table ----
     //
@@ -1668,58 +1637,6 @@ fn self_test() -> Result<(), String> {
             return Err(format!("force-full: focused mode {m} must be refused"));
         }
     }
-    let exact_payload = vec![
-        "--portable-strict-compat-only".to_string(),
-        "--reuse-parent-manifest-gate".to_string(),
-        "--no-label-pr".to_string(),
-    ];
-    let mut payload = parse_argv(&exact_payload).map_err(|code| {
-        format!("pinned-root nested payload: exact internal argv was refused with exit {code}")
-    })?;
-    if !pinned_root_nested_payload(&payload, Some(OsStr::new("/test"))) {
-        return Err("pinned-root nested payload: the exact internal form was not recognized".into());
-    }
-    for missing in ["workdir", "reuse", "focused", "no-label"] {
-        let saved_reuse = payload.reuse_parent_manifest_gate;
-        let saved_focused = payload.focused.clone();
-        let saved_label = payload.label_pr;
-        let saved_explicit = payload.no_label_pr_explicit;
-        let workdir = match missing {
-            "workdir" => None,
-            "reuse" => {
-                payload.reuse_parent_manifest_gate = false;
-                Some(OsStr::new("/test"))
-            }
-            "focused" => {
-                payload.focused = Some(Focused::StrictCompat);
-                Some(OsStr::new("/test"))
-            }
-            "no-label" => {
-                payload.no_label_pr_explicit = false;
-                Some(OsStr::new("/test"))
-            }
-            _ => unreachable!(),
-        };
-        if pinned_root_nested_payload(&payload, workdir) {
-            return Err(format!(
-                "pinned-root nested payload: dropping required condition {missing} still selected the nested path"
-            ));
-        }
-        payload.reuse_parent_manifest_gate = saved_reuse;
-        payload.focused = saved_focused;
-        payload.label_pr = saved_label;
-        payload.no_label_pr_explicit = saved_explicit;
-    }
-    if parse_argv(&[
-        "--portable-strict-compat-only".into(),
-        "--reuse-parent-manifest-gate".into(),
-    ])
-    .is_ok()
-    {
-        return Err(
-            "pinned-root nested payload: the parser accepted reuse without --no-label-pr".into(),
-        );
-    }
     // Shell quoting: a corpus argv element must survive round-tripping through
     // `bash -c` byte-for-byte. A silent mangling here would change what the guest
     // runs while every count still looked right.
@@ -2023,10 +1940,27 @@ cleared-caps refusal names {} starved step(s)",
                 "full-plan bracket: pin authority was not deduped to the observed preflight: {pin_nodes:?}"
             ));
         }
-        for required in ["test.strict_compat", "privileged-cpuid.faulting"] {
+        for required in ["compat.echo", "privileged-cpuid.faulting"] {
             if !full.cfg.steps.iter().any(|s| s.tag() == required) {
                 return Err(format!("full-plan bracket: fused plan lost {required}"));
             }
+        }
+        if full
+            .cfg
+            .steps
+            .iter()
+            .any(|step| step.cmd.contains("scripts/validate.rs --portable-strict-compat-only"))
+        {
+            return Err(
+                "full-plan bracket: portable strict compatibility still starts a nested validator"
+                    .into(),
+            );
+        }
+        if full.compat != Some(CompatMode::PortableStrict) {
+            return Err(
+                "full-plan bracket: flattened portable compatibility lost its typed verdict"
+                    .into(),
+            );
         }
         let portable_build = full
             .cfg
@@ -2290,40 +2224,215 @@ cleared-caps refusal names {} starved step(s)",
                 full.planned_test_nodes, sequential.planned_test_nodes,
             ));
         }
-        let nested_args = parse_argv(&[
-            "--portable-strict-compat-only".into(),
-            "--reuse-parent-manifest-gate".into(),
-            "--no-label-pr".into(),
-        ])
-        .map_err(|rc| format!("full-plan bracket: nested positive form refused rc={rc}"))?;
-        let nested = build_plan(&root, &nested_args, &tmp)?;
-        if nested.cfg.steps.iter().any(|s| s.tag() == "gate.manifest")
-            || !nested.cfg.steps.iter().any(|s| s.tag() == PIN_GATE_TAG)
-        {
-            return Err(
-                "full-plan bracket: nested reuse did not remove only manifest while retaining the pin gate"
-                    .into(),
-            );
-        }
-        if parse_argv(&[
-            "--portable-strict-compat-only".into(),
-            "--reuse-parent-manifest-gate".into(),
-            // Make the rejected form explicit: frozen validation sets
-            // VALIDATE_LABEL_PR=0 for the outer run, and a self-test must not
-            // inherit that setting into the case meant to exercise labeling.
-            "--label-pr".into(),
-        ])
-        .is_ok()
-        {
-            return Err("full-plan bracket: nested reuse accepted a label-capable invocation".into());
-        }
         println!(
-            "  full plan: {} fused node(s), 1 manifest-plan producer -> 1 exact-tree manifest audit + 1 pin authority; sequential fallback + nested no-label reuse bracketed",
+            "  full plan: {} fused node(s), 1 manifest-plan producer -> 1 exact-tree manifest audit + 1 pin authority; sequential fallback bracketed",
             full.cfg.steps.len()
         );
     }
 
     Ok(())
+}
+
+/// Prove that the reviewed portable DAG contains the exact corpus-derived
+/// compatibility rows, and that loading it for validate restores typed failures
+/// for the three diagnostics whose standalone lane result remains nonblocking.
+fn portable_strict_compat_dag_bracket() -> Result<String, String> {
+    let root = repo_root();
+    let shipped = validate_plan::lane_config(&root, "portable")?;
+    let expected_cap = validate_plan::PORTABLE_STRICT_COMPAT_CONCURRENCY;
+    if shipped
+        .resource_caps
+        .get(validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE)
+        != Some(&expected_cap)
+    {
+        return Err(format!(
+            "portable strict compatibility: {} capacity is {:?}, expected {expected_cap}",
+            validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE,
+            shipped
+                .resource_caps
+                .get(validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE)
+        ));
+    }
+    if shipped
+        .steps
+        .iter()
+        .any(|step| step.tag() == "test.strict_compat")
+    {
+        return Err(
+            "portable strict compatibility: nested test.strict_compat wrapper still exists"
+                .into(),
+        );
+    }
+    if shipped
+        .steps
+        .iter()
+        .any(|step| step.cmd.contains("--allow-unwise-nest-dagruns"))
+    {
+        return Err(
+            "portable strict compatibility: temporary nested-dagrun override still exists"
+                .into(),
+        );
+    }
+
+    let prep = shipped
+        .steps
+        .iter()
+        .find(|step| step.tag() == "compatprep.fixtures")
+        .ok_or("portable strict compatibility: compatprep.fixtures is missing")?;
+    let expected_prep_deps = [
+        "build.runtime_release",
+        "lint.clippy",
+        "doc.doctests",
+        "doc.rustdoc",
+        "test.regular_crates",
+        "test.hermit_unit",
+        "test.detcore_unit",
+        "test.rr_suite_contract",
+    ]
+    .map(str::to_string);
+    if prep.cmd
+        != format!(
+            "./tests/compat/prepare_real_compat_fixtures.sh {}",
+            validate_plan::PORTABLE_STRICT_COMPAT_FIXTURES
+        )
+        || prep.deps != expected_prep_deps
+        || prep.timeout != COMPAT_DIAGNOSTIC_WALL_S
+        || prep.cpu_timeout != COMPAT_DIAGNOSTIC_WALL_S
+    {
+        return Err(format!(
+            "portable strict compatibility: fixture preparation drifted: cmd={:?} deps={:?} wall={} cpu={}",
+            prep.cmd, prep.deps, prep.timeout, prep.cpu_timeout
+        ));
+    }
+
+    let expected = validate_plan::portable_strict_compat_probe_nodes(&root)?;
+    let expected_count = validate_corpus::STRICT_COMPAT_TOTAL
+        - validate_corpus::portable_super_only().len();
+    if expected.len() != expected_count {
+        return Err(format!(
+            "portable strict compatibility: generated {} probes, expected {expected_count}",
+            expected.len()
+        ));
+    }
+    let shipped_by_tag = shipped
+        .steps
+        .iter()
+        .filter(|step| step.group == "compat")
+        .map(|step| (step.tag(), step))
+        .collect::<BTreeMap<_, _>>();
+    if shipped_by_tag.len() != expected_count {
+        return Err(format!(
+            "portable strict compatibility: committed DAG contains {} compat.* nodes, expected {expected_count}",
+            shipped_by_tag.len()
+        ));
+    }
+    for generated in &expected {
+        let tag = generated.tag();
+        let actual = shipped_by_tag.get(&tag).ok_or_else(|| {
+            format!(
+                "portable strict compatibility: committed DAG is missing {}",
+                tag
+            )
+        })?;
+        let stored = validate_plan::portable_strict_compat_stored_command(
+            &generated.job,
+            &generated.cmd,
+        );
+        if actual.cmd != stored
+            || actual.desc != generated.desc
+            || actual.deps != generated.deps
+            || actual.timeout != generated.timeout
+            || actual.cpu_timeout != generated.cpu_timeout
+            || actual.hint.resources != generated.hint.resources
+            || actual.hint.rss_baseline_bytes != generated.hint.rss_baseline_bytes
+            || actual.hint.hard_mem_max_bytes != generated.hint.hard_mem_max_bytes
+            || actual.hint.classification != generated.hint.classification
+            || actual.fail_fast_family.as_deref() != Some(tag.as_str())
+        {
+            return Err(format!(
+                "portable strict compatibility: committed node {} differs from the corpus-derived node",
+                tag
+            ));
+        }
+    }
+
+    let ordinary_guest_demands = shipped
+        .steps
+        .iter()
+        .filter(|step| step.group != "compat")
+        .filter_map(|step| {
+            step.hint
+                .resources
+                .get(validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE)
+        })
+        .collect::<Vec<_>>();
+    if ordinary_guest_demands.is_empty()
+        || ordinary_guest_demands
+            .iter()
+            .any(|demand| **demand != expected_cap)
+        || expected.iter().any(|step| {
+            step.hint
+                .resources
+                .get(validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE)
+                != Some(&1)
+        })
+    {
+        return Err(
+            "portable strict compatibility: weighted hermit_guest demands no longer preserve the former 16-wide exclusive phase"
+                .into(),
+        );
+    }
+
+    let loaded = validate_plan::lane_nodes(&root, "portable", "", "gate.manifest")?;
+    for label in validate_corpus::portable_diagnostic().keys() {
+        let tag = format!("compat.{label}");
+        let generated = expected
+            .iter()
+            .find(|step| step.tag() == tag)
+            .ok_or_else(|| format!("portable strict compatibility: generated {tag} is missing"))?;
+        let actual = loaded
+            .iter()
+            .find(|step| step.tag() == tag)
+            .ok_or_else(|| format!("portable strict compatibility: loaded {tag} is missing"))?;
+        if actual.cmd != generated.cmd {
+            return Err(format!(
+                "portable strict compatibility: validate did not restore typed failure for {tag}"
+            ));
+        }
+    }
+
+    let warned = Command::new("bash")
+        .arg("-c")
+        .arg(validate_plan::portable_strict_compat_stored_command(
+            "top", "false",
+        ))
+        .output()
+        .map_err(|error| format!("portable strict compatibility: cannot run warning bracket: {error}"))?;
+    if !warned.status.success()
+        || !String::from_utf8_lossy(&warned.stderr).contains("failed (nonblocking)")
+    {
+        return Err(
+            "portable strict compatibility: standalone diagnostic did not remain a visible nonblocking warning"
+                .into(),
+        );
+    }
+    let blocking = Command::new("bash")
+        .arg("-c")
+        .arg(validate_plan::portable_strict_compat_stored_command(
+            "echo", "false",
+        ))
+        .status()
+        .map_err(|error| format!("portable strict compatibility: cannot run blocking bracket: {error}"))?;
+    if blocking.success() {
+        return Err(
+            "portable strict compatibility: an ordinary failing probe was weakened to success"
+                .into(),
+        );
+    }
+
+    Ok(format!(
+        "portable strict compatibility: {expected_count} committed compat.* nodes, 16-wide outer scheduling, no nested validator or override"
+    ))
 }
 
 /// Assert that the public option names only the two inner checks it skips.
@@ -3379,7 +3488,6 @@ fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
         "test.applications_e2e".to_string(),
         "test.dbt_parity".to_string(),
         "test.envelope_levels".to_string(),
-        "test.strict_compat".to_string(),
     ]);
     if non_nextest_test_nodes != expected_non_nextest {
         return Err(format!(
@@ -5038,21 +5146,9 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             shell_build_dir: &shell_build.to_string_lossy(),
         };
         let mut steps = pre;
-        let compat_gate = if args.reuse_parent_manifest_gate {
-            // The outer node is reachable only after its real gate.manifest
-            // passed. Avoid rerunning that ~75 s exact-tree audit inside the
-            // nested payload, but retain the cheap, independently observed
-            // submodule and pin gates.
-            steps.retain(|s| {
-                s.tag() != gate && s.tag() != validate_plan::MANIFEST_PLAN_PRODUCER_TAG
-            });
-            PIN_GATE_TAG
-        } else {
-            gate
-        };
         // The corpus needs a release Hermit and the functional fixtures; both are
         // DAG nodes so they are boxed and timed like everything else.
-        steps.push(build_release_hermit_node(compat_gate, &hermit_bin));
+        steps.push(build_release_hermit_node(gate, &hermit_bin));
         steps.push(prepare_fixtures_node("compatprep.fixtures", &fixtures));
         if mode == CompatMode::E9patch {
             steps.push(nsswitch_fixture_node(&nsswitch));
@@ -5066,7 +5162,13 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             Some("compatprep.fixtures"),
         )?);
         let profile = args.focused.as_ref().unwrap().profile();
-        let cfg = validate_plan::config_from(steps, &format!("compatibility matrix: {mode:?}"));
+        let mut cfg = validate_plan::config_from(steps, &format!("compatibility matrix: {mode:?}"));
+        if mode == CompatMode::PortableStrict {
+            cfg.resource_caps.insert(
+                validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE.to_string(),
+                validate_plan::PORTABLE_STRICT_COMPAT_CONCURRENCY,
+            );
+        }
         return Ok(Plan {
             planned_test_nodes: test_nodes_of(&cfg),
             cfg,
@@ -5241,12 +5343,18 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             );
         }
         let cfg = validate_plan::config_from_base(&base, steps, "selected DAG node(s)");
+        let compat = cfg
+            .steps
+            .iter()
+            .any(|step| step.group == "compat")
+            .then_some(CompatMode::PortableStrict);
         return Ok(Plan {
             planned_test_nodes: test_nodes_of(&cfg),
             cfg,
             second: None,
             profile: args.focused.as_ref().unwrap().profile(),
             selection_mode: "only",
+            compat,
             ..Default::default()
         });
     }
@@ -5477,6 +5585,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             // Validation is also the live compatibility measurement. Reusing
             // an older tree-keyed receipt would print no fresh per-cell table.
             cacheable: false,
+            compat: Some(CompatMode::PortableStrict),
             ..Default::default()
         });
     }
@@ -5636,6 +5745,9 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // Every ordinary lane validation must produce fresh per-cell results;
         // a cache hit is valid landing evidence but is not a new measurement.
         cacheable: false,
+        compat: lanes
+            .contains(&"portable")
+            .then_some(CompatMode::PortableStrict),
         ..Default::default()
     })
 }
@@ -5755,7 +5867,11 @@ fn super_plan(
             }
         }
     }
-    let cfg = validate_plan::config_from(steps, "super stress + diagnostic suite");
+    let mut cfg = validate_plan::config_from(steps, "super stress + diagnostic suite");
+    cfg.resource_caps.insert(
+        validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE.to_string(),
+        validate_plan::PORTABLE_STRICT_COMPAT_CONCURRENCY,
+    );
     Ok(Plan {
         planned_test_nodes: test_nodes_of(&cfg),
         cfg,
@@ -5919,6 +6035,7 @@ fn selective_plan(
     // particular, the selector may return setup.manifest_plan as part of a
     // dependency-closed result; it is replaced by the preflight producer only
     // after unknown-tag validation below.
+    let base = validate_plan::lane_config(root, "portable")?;
     let all = validate_plan::lane_nodes(root, "portable", "", gate)?;
     let total = all.len();
     let decision = match &baseline {
@@ -5928,12 +6045,20 @@ fn selective_plan(
     let steps = apply_selective_decision(all, total, decision)?;
     let mut nodes = pre;
     nodes.extend(steps);
-    let cfg = validate_plan::config_from(nodes, "selective portable subset");
+    let cfg = validate_plan::config_from_base(&base, nodes, "selective portable subset");
+    validate_plan::assert_config_carried(&base, &cfg)
+        .map_err(|error| format!("selective portable DAG config was not carried: {error}"))?;
+    let compat = cfg
+        .steps
+        .iter()
+        .any(|step| step.group == "compat")
+        .then_some(CompatMode::PortableStrict);
     Ok(Plan {
         planned_test_nodes: test_nodes_of(&cfg),
         cfg,
         profile: "selective".into(),
         selection_mode: "selective",
+        compat,
         ..Default::default()
     })
 }
@@ -7680,7 +7805,7 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
                 // the host. gate.manifest is named explicitly because it is the one
                 // measured to fail in the container.
                 step("gate", "manifest", "target/debug/test-harness validate", vec![]),
-                step("test", "strict_compat", "./scripts/validate.rs --portable-strict-compat-only", vec![]),
+                step("test", "host_only_fixture", "printf host-only", vec![]),
                 step("lint", "clippy", "cargo clippy --workspace", vec![]),
                 step("test", "hermit_integration", "./ci/run-nextest-counted.sh -p hermit", vec![]),
                 // A producer whose output the cells execute: wrapped by the rule.
@@ -7712,7 +7837,7 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
     // grown back past the scheduled cells and that failure returns with it.
     for tag in [
         "gate.manifest",
-        "test.strict_compat",
+        "test.host_only_fixture",
         "lint.clippy",
         "test.hermit_integration",
         "pre.submodules",
@@ -14647,39 +14772,19 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
 
     // ---- re-entrancy (validate.sh:460) ---------------------------------------
     //
-    // `ci/dag/portable.json`'s `test.strict_compat` node runs
-    // `./scripts/validate.rs --portable-strict-compat-only`, so re-entry is a DESIGNED
-    // path. What must never happen is a full driver inside a full driver: it pays
+    // Focused modes remain valid top-level entrypoints. What must never happen is
+    // a full driver inside a full driver: it pays
     // the whole preamble twice, appends a SECOND ledger row, and can publish a
     // SECOND receipt for one logical run. A nested FOCUSED invocation is a
     // PAYLOAD — the outer run owns the ledger, receipt, cache, lock and
     // concurrency accounting; a nested non-focused level is refused outright.
-    let observed_nesting = validate_runtime::detect_nesting();
-    let internal_pinned_payload = pinned_root_nested_payload(
-        &args,
-        std::env::var_os("HERMIT_E2E_EMPTY_WORKDIR").as_deref(),
-    );
-    let nesting = if !observed_nesting.nested && internal_pinned_payload {
-        validate_runtime::Nesting {
-            nested: true,
-            outer_pid: None,
-            stale_marker: observed_nesting.stale_marker,
-        }
-    } else {
-        observed_nesting
-    };
+    let nesting = validate_runtime::detect_nesting();
     if let Some(stale) = nesting.stale_marker {
         eprintln!(
             "validate: ignoring a STALE {} marker naming pid {stale}: that pid is not an ancestor \
              of this process, so this is a TOP-LEVEL run. (Treating the bare env var as proof of \
              nesting would refuse every legitimate full run in a shell that once exported it.)",
             validate_runtime::ACTIVE_ENV
-        );
-    }
-    if internal_pinned_payload && nesting.outer_pid.is_none() {
-        eprintln!(
-            "validate: exact no-label portable-strict payload is already inside the pinned root; \
-             the outer validation owns its lock, cache, ledger, receipt, and accounting."
         );
     }
     // The marker is claimed LATER, after the cgroup re-exec -- see the call site
@@ -15013,12 +15118,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         }
     };
 
-    // The public environment variable is the per-cell gate, not proof that the
-    // validate driver itself is already inside the pinned root. Only the exact
-    // internal strict-compat payload established above may suppress another
-    // wrapper; otherwise an operator-supplied variable could bypass the base
-    // image for an entire top-level validation.
-    if let Err(error) = apply_pinned_root(&mut plan, &root, internal_pinned_payload) {
+    if let Err(error) = apply_pinned_root(&mut plan, &root, false) {
         return RunSummary::refused(
             3,
             &plan.profile,
@@ -15029,9 +15129,9 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
 
     assign_fail_fast_families(&mut plan);
 
-    // Nested validate payloads are ordinary DAG children. Carry the selected
-    // level through the plan so `--verbosity 5` does not become level 1 at the
-    // nested strict-compat boundary (and default level 1 stays bounded there).
+    // Nested focused payloads are ordinary DAG children. Carry the selected
+    // level through the plan so `--verbosity 5` does not become level 1 at an
+    // internal payload boundary (and default level 1 stays bounded there).
     propagate_verbosity(&mut plan, args.verbosity);
 
     // A node this machine provably cannot run is withheld here, BEFORE anything
@@ -15911,11 +16011,11 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         pin_gate_bypassed = true;
     }
 
-    // The full plan runs portable strict compatibility as one outer `test.*`
-    // node whose payload is this focused validate. Publish the nested measured
-    // program count to the scheduler-owned path so the outer receipt can prove
-    // that node executed work. The value comes from the typed compatibility
-    // outcomes, never from the nested process's printable summary.
+    // A focused compatibility payload may still be used by an explicitly
+    // nested internal path. Publish its measured program count to the
+    // scheduler-owned path so the outer receipt can prove that node executed
+    // work. Ordinary portable/full plans carry the probes directly and do not
+    // enter this branch.
     if nesting.nested {
         let nested_counts = compat_measured
             .and_then(|count| i64::try_from(count).ok())

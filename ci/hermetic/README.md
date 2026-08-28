@@ -246,9 +246,8 @@ renamed — which it was, mid-flight, while this branch was open. Grep for the
 
 That refusal is correct: resource boxing is the runner's primary purpose and it
 declines to pretend. The canonical path avoids this topology rather than
-weakening the host-owned cgroup. Its nested strict-compatibility payload uses
-the existing explicit inner-cgroup opt-out while the outer DAG step remains
-boxed and supplies the scheduler deadline.
+weakening the host-owned cgroup. Portable strict compatibility now runs as
+direct nodes in the outer DAG; it no longer needs an inner-cgroup opt-out.
 
 Existing evidence proves the boundary and toolchain components end to end:
 `assert-no-network.sh` passes inside the container, `cargo metadata` and a real

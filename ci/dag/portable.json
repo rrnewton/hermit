@@ -1,5 +1,5 @@
 {
-  "resource_caps": {"hermit_guest": 1, "manifest_guest": 8},
+  "resource_caps": {"hermit_guest": 16, "manifest_guest": 8},
   "mem_cap_factor": 1.25,
   "mem_cap_floor_bytes": 8589934592,
   "outer_mem_safety_factor": 1.0,
@@ -173,7 +173,7 @@
     {
       "group": "build", "job": "runtime_release",
       "desc": "Build release Hermit and all runtime backend artifacts in one Cargo invocation",
-      "description": "ONE-FAT-BUILD 2026-08-04: this is the dependency-driven exception to the debug fat build. DBT, SaBRe, and LiteInst tests require target/release/hermit and release plugins, while ordinary tests consume debug targets. One release Cargo invocation now sees hermit, detcore-dbt, detcore-sabre, and hermit-install together; the former serial dbt_release+sabre_release invocations are gone. preferred_inner_jobs=32 is measured on a cold empty target at hermit@846baeca: 185.423s, cgroup-recorded peak=9006452736 bytes. The copied binary lets the strict-compat DAG node use the Rust driver's explicit-prebuilt contract rather than rebuilding the same release profile.",
+      "description": "ONE-FAT-BUILD 2026-08-04: this is the dependency-driven exception to the debug fat build. DBT, SaBRe, and LiteInst tests require target/release/hermit and release plugins, while ordinary tests consume debug targets. One release Cargo invocation now sees hermit, detcore-dbt, detcore-sabre, and hermit-install together; the former serial dbt_release+sabre_release invocations are gone. preferred_inner_jobs=32 is measured on a cold empty target at hermit@846baeca: 185.423s, cgroup-recorded peak=9006452736 bytes. The copied binary lets the direct strict-compat DAG probes reuse the Rust driver's explicit-prebuilt contract rather than rebuilding the same release profile.",
       "cmd": "HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-runtime ./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p hermit --features third-party-backends -p detcore-dbt -p detcore-sabre -p hermit-install && mkdir -p target/ci && install -m 755 target/release/hermit target/ci/hermit-strict && sha256sum target/install_pkg/rsrcs/sabre && cat target/install_pkg/rsrcs/sabre.revision",
       "deps": ["e2e.metadata"],
       "timeout": 1200,
@@ -241,7 +241,7 @@
       "jobs_flag": "",
       "deps": ["build.e2e_artifact", "build.manifest_guests", "e2e.metadata"],
       "timeout": 600,
-      "hint": {"resources": {"hermit_guest": 1, "manifest_guest": 8}, "est_duration_s": 180,
+      "hint": {"resources": {"hermit_guest": 16, "manifest_guest": 8}, "est_duration_s": 180,
                "rss_baseline_bytes": 4294967296, "hard_mem_max_bytes": 6442450944,
                "classification": "latency-bound", "preferred_inner_jobs": 8}
     },
@@ -275,7 +275,7 @@
       "jobs_flag": "",
       "deps": ["build.e2e_artifact", "build.manifest_guests", "e2e.metadata"],
       "timeout": 600,
-      "hint": {"resources": {"hermit_guest": 1, "manifest_guest": 8}, "est_duration_s": 300,
+      "hint": {"resources": {"hermit_guest": 16, "manifest_guest": 8}, "est_duration_s": 300,
                "rss_baseline_bytes": 4294967296, "hard_mem_max_bytes": 6442450944,
                "classification": "latency-bound", "preferred_inner_jobs": 8}
     },
@@ -386,7 +386,7 @@
       "cmd": "./ci/run-with-hermit-e2e-artifact.sh --require-install ./tests/e2e/lib/applications/run_all.sh",
       "deps": ["build.e2e_artifact"],
       "timeout": 300,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 30,
+      "hint": {"resources": {"hermit_guest": 16}, "est_duration_s": 30,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
                "classification": "latency-bound"}
     },
@@ -446,7 +446,7 @@
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
       "jobs_flag": "",
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+      "hint": {"resources": {"hermit_guest": 16}, "est_duration_s": 120,
                "rss_baseline_bytes": 5368709120, "hard_mem_max_bytes": 7516192768,
                "classification": "cpu-bound", "preferred_inner_jobs": 8}
     },
@@ -469,7 +469,7 @@
       "cmd": "./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore --test tests_misc -j 1 -- --skip has_rdrand_without_detcore --skip rdrand_rdseed_is_masked --skip ordinary_clone_child_starts_before_parent_resumes --skip ordinary_clone_parent_mode_can_resume_before_child --skip network_syscalls_are_deterministic_across_five_runs",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 720,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
+      "hint": {"resources": {"hermit_guest": 16}, "est_duration_s": 90,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "cpu-bound"}
     },
@@ -480,7 +480,7 @@
       "cmd": "./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore --test tests_parallelism -j 4 -- --skip detcore",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 720,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+      "hint": {"resources": {"hermit_guest": 16}, "est_duration_s": 120,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "cpu-bound"}
     },
@@ -491,7 +491,7 @@
       "cmd": "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test chown_virtual_root_identity --test clock_determinism --test clock_discipline_determinism --test container_init_deadline --test cpufreq_avg_determinism --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test zero_copy_pipe_fallback -j 1",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 1200,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 300,
+      "hint": {"resources": {"hermit_guest": 16}, "est_duration_s": 300,
                "rss_baseline_bytes": 6442450944, "hard_mem_max_bytes": 8589934592,
                "classification": "latency-bound"}
     },
@@ -502,7 +502,7 @@
       "cmd": "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test arbitrary_binaries -j 1 -- --skip record_replay_stable_arbitrary_binaries",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+      "hint": {"resources": {"hermit_guest": 16}, "est_duration_s": 120,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
     },
@@ -513,7 +513,7 @@
       "cmd": "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbt_strict_returns_with_blocked_stdin_source --skip run_dbt_verifies_pipe_backpressure --skip run_dbt_keeps_diagnostics_out_of_guest_stderr --skip run_dbt_recovers_after_failed_exec --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 150,
+      "hint": {"resources": {"hermit_guest": 16}, "est_duration_s": 150,
                "rss_baseline_bytes": 4294967296, "hard_mem_max_bytes": 6442450944,
                "classification": "latency-bound"}
     },
@@ -523,7 +523,7 @@
       "cmd": "HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit ./ci/liteinst-strict-node.sh -- ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test liteinst_advanced -j 1",
       "deps": ["build.e2e_artifact", "build.liteinst_runtime_release", "setup.nextest"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+      "hint": {"resources": {"hermit_guest": 16}, "est_duration_s": 120,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
                "classification": "latency-bound"}
     },
@@ -533,7 +533,7 @@
       "cmd": "HERMIT_SABRE_TEST_BINARY=$PWD/target/release/hermit HERMIT_SABRE_BINARY=$PWD/target/install_pkg/rsrcs/sabre ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test sabre_examples -j 1",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
+      "hint": {"resources": {"hermit_guest": 16}, "est_duration_s": 90,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
                "classification": "latency-bound"}
     },
@@ -544,7 +544,7 @@
       "cmd": "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test hermit_modes -j 1 -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 150,
+      "hint": {"resources": {"hermit_guest": 16}, "est_duration_s": 150,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
     },
@@ -555,7 +555,7 @@
       "cmd": "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test app_strict_verify -j 1 -- --ignored --skip java_ --skip javac_",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
+      "hint": {"resources": {"hermit_guest": 16}, "est_duration_s": 180,
                "rss_baseline_bytes": 3221225472, "hard_mem_max_bytes": 6442450944,
                "classification": "latency-bound"}
     },
@@ -566,7 +566,7 @@
       "cmd": "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test command_strict_verify -j 1 -- --ignored",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
+      "hint": {"resources": {"hermit_guest": 16}, "est_duration_s": 180,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
     },
@@ -577,7 +577,7 @@
       "cmd": "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test epoll_determinism --test rcx_canonicalization -j 1 -- --ignored",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 720,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
+      "hint": {"resources": {"hermit_guest": 16}, "est_duration_s": 90,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
     },
@@ -600,7 +600,7 @@
       "cmd": "python3 tests/backend-parity/run_matrix.py --hermit target/release/hermit --backend dbt --strict --require-backend --no-parent-scorecard",
       "deps": ["build.runtime_release", "check.dbt_runtime_abi"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
+      "hint": {"resources": {"hermit_guest": 16}, "est_duration_s": 180,
                "rss_baseline_bytes": 536870912, "hard_mem_max_bytes": 2147483648,
                "classification": "latency-bound"}
     },
@@ -611,21 +611,3813 @@
       "cmd": "set -e; HERMIT=target/debug/hermit; ARGS='run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled'; REPS=${L4_REPS:-20}; EXECUTED=0; publish_counts() { local status=$? count_status; trap - EXIT; set +e; ./ci/write-structured-test-counts.sh \"$EXECUTED\" 0; count_status=$?; if ((status == 0 && count_status != 0)); then status=$count_status; fi; exit \"$status\"; }; trap publish_counts EXIT; run_probe() { local id=\"$1\"; local c=\"$2\"; EXECUTED=$((EXECUTED + 1)); printf '##TEST-START %s\\n' \"$id\" >&2; timeout 30s $HERMIT $ARGS --strict -- $c </dev/null >&2; timeout 30s $HERMIT $ARGS --strict --verify -- $c </dev/null >&2; timeout 30s $HERMIT $ARGS --strict --verify --detlog-heap --detlog-stack -- $c </dev/null >&2; local i; for ((i=0;i<REPS;i++)); do timeout 30s $HERMIT $ARGS --strict --verify -- $c </dev/null >&2; done; printf '##TEST-END %s PASS\\n' \"$id\" >&2; }; run_probe true '/bin/true'; run_probe echo '/bin/echo hermit-envelope'; run_probe date '/bin/date -u +%Y'",
       "deps": ["build.workspace"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+      "hint": {"resources": {"hermit_guest": 16}, "est_duration_s": 120,
                "rss_baseline_bytes": 134217728, "hard_mem_max_bytes": 1073741824,
                "classification": "latency-bound"}
     },
     {
-      "group": "test", "job": "strict_compat",
-      "desc": "Portable strict compatibility envelope (one scheduler epoch: 420s prep < 480s gate < 600s run < 660s owned local scope when available < 720s node < 900s job; timeout preserves named probe evidence)",
-      "cmd": "acf=(); if [ -n \"${GITHUB_ACTIONS:-}\" ] || [ -n \"${CI:-}\" ]; then acf=(--allow-cgroup-failure); fi; VALIDATE_GATE_TIMEOUT_SECONDS=480 HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS=600 DAGRUN_LOG_DIR=\"${RUN_NODE_PERF_DIR:-$PWD/ignored/ci/perf/strict-compat}/logs\" STRICT_COMPAT_HERMIT_BIN=$PWD/target/ci/hermit-strict ./scripts/validate.rs --portable-strict-compat-only --reuse-parent-manifest-gate --no-label-pr --verbose \"${acf[@]}\"",
-      "deps": ["build.runtime_release", "lint.clippy", "doc.doctests", "doc.rustdoc",
-               "test.regular_crates",
-               "test.hermit_unit", "test.detcore_unit", "test.rr_suite_contract"],
-      "timeout": 720,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 600,
-               "rss_baseline_bytes": 12884901888, "hard_mem_max_bytes": 25769803776,
-               "classification": "latency-bound"}
+      "group": "compatprep",
+      "job": "fixtures",
+      "desc": "Functional compatibility fixtures for the flattened portable strict matrix",
+      "description": "The 189 portable strict probes are direct outer DAG nodes. This preparation step preserves the former test.strict_compat ordering barrier without starting a second scheduler.",
+      "cmd": "./tests/compat/prepare_real_compat_fixtures.sh target/real-compat-fixtures",
+      "deps": [
+        "build.runtime_release",
+        "lint.clippy",
+        "doc.doctests",
+        "doc.rustdoc",
+        "test.regular_crates",
+        "test.hermit_unit",
+        "test.detcore_unit",
+        "test.rr_suite_contract"
+      ],
+      "timeout": 420,
+      "cpu_timeout": 420,
+      "hint": {
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "echo",
+      "fail_fast_family": "compat.echo",
+      "desc": "legacy below-L2 stripped verify compatibility: echo",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /bin/echo hermit-compat </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "true",
+      "fail_fast_family": "compat.true",
+      "desc": "legacy below-L2 stripped verify compatibility: true",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/true </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "pwd",
+      "fail_fast_family": "compat.pwd",
+      "desc": "legacy below-L2 stripped verify compatibility: pwd",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/pwd </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "seq",
+      "fail_fast_family": "compat.seq",
+      "desc": "legacy below-L2 stripped verify compatibility: seq",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh seq </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "cat",
+      "fail_fast_family": "compat.cat",
+      "desc": "legacy below-L2 stripped verify compatibility: cat",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /bin/cat README.md </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "wc",
+      "fail_fast_family": "compat.wc",
+      "desc": "legacy below-L2 stripped verify compatibility: wc",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/wc -c README.md </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "head",
+      "fail_fast_family": "compat.head",
+      "desc": "legacy below-L2 stripped verify compatibility: head",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/head -n 3 README.md </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "base64",
+      "fail_fast_family": "compat.base64",
+      "desc": "legacy below-L2 stripped verify compatibility: base64",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/base64 README.md </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "base32",
+      "fail_fast_family": "compat.base32",
+      "desc": "legacy below-L2 stripped verify compatibility: base32",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/base32 README.md </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "id",
+      "fail_fast_family": "compat.id",
+      "desc": "legacy below-L2 stripped verify compatibility: id",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/id -u </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "lua",
+      "fail_fast_family": "compat.lua",
+      "desc": "legacy below-L2 stripped verify compatibility: lua",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; out=$(\"$1\" -e \"$2\"); test \"$out\" = \"$3\"; printf \"lua-fib=%s\\n\" \"$out\"' bash /usr/bin/lua 'local a,b=0,1; for i=1,30 do a,b=b,a+b end; print(a)' 832040 </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "perl",
+      "fail_fast_family": "compat.perl",
+      "desc": "legacy below-L2 stripped verify compatibility: perl",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; out=$(\"$1\" -e \"$2\"); test \"$out\" = \"$3\"; printf \"perl-prime-sum=%s\\n\" \"$out\"' bash /usr/bin/perl 'my $sum=0; OUTER: for my $n (2..100) { for my $d (2..int(sqrt($n))) { next OUTER if $n % $d == 0 } $sum += $n } print \"$sum\\n\"' 1060 </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "bc",
+      "fail_fast_family": "compat.bc",
+      "desc": "legacy below-L2 stripped verify compatibility: bc",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; out=$(printf \"%s\\n\" \"$2\" | BC_LINE_LENGTH=200 \"$1\" -q); test \"$out\" = \"$3\"; printf \"bc-math=%s\\n\" \"$out\"' bash /usr/bin/bc 'define f(n) { auto r,i; r=1; for(i=2;i<=n;i++) r*=i; return(r) }; scale=50; print f(20), \" \", sqrt(2), \"\\n\"' '2432902008176640000 1.41421356237309504880168872420969807856967187537694' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "tcl",
+      "fail_fast_family": "compat.tcl",
+      "desc": "legacy below-L2 stripped verify compatibility: tcl",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; out=$(printf \"%s\\n\" \"$2\" | \"$1\"); test \"$out\" = \"$3\"; printf \"tcl-squares=%s\\n\" \"$out\"' bash /usr/bin/tclsh 'set sum 0; for {set i 1} {$i <= 100} {incr i} {set sum [expr {$sum + $i*$i}]}; puts $sum' 338350 </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "dc",
+      "fail_fast_family": "compat.dc",
+      "desc": "legacy below-L2 stripped verify compatibility: dc",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; out=$(printf \"%s\\n\" \"$2\" | \"$1\"); test \"$out\" = \"$3\"; printf \"dc-math=%s\\n\" \"$out\"' bash /usr/bin/dc '2 100 ^ 1 - n [ ]P 4 13 497 | p' '1267650600228229401496703205375 445' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "awk",
+      "fail_fast_family": "compat.awk",
+      "desc": "legacy below-L2 stripped verify compatibility: awk",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; printf \"alpha 2\\nbeta 3\\nalpha 5\\n\" | awk \"\\$1 == \\\"alpha\\\" { sum += \\$2 } END { print sum }\" | diff -u <(printf \"7\\n\") -; printf \"awk-ok\\n\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "sqlite3",
+      "fail_fast_family": "compat.sqlite3",
+      "desc": "legacy below-L2 stripped verify compatibility: sqlite3",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh sqlite3 </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "jq",
+      "fail_fast_family": "compat.jq",
+      "desc": "legacy below-L2 stripped verify compatibility: jq",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh jq </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "xmllint",
+      "fail_fast_family": "compat.xmllint",
+      "desc": "legacy below-L2 stripped verify compatibility: xmllint",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh xmllint </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "bash",
+      "fail_fast_family": "compat.bash",
+      "desc": "legacy below-L2 stripped verify compatibility: bash",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'for i in 1 2 3; do echo \"$i\"; done' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "shell-build",
+      "fail_fast_family": "compat.shell-build",
+      "desc": "legacy below-L2 stripped verify compatibility: shell-build",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash ./tests/compat/complex_shell_workload.sh target/validation/strict-compat/shell-build </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "cargo",
+      "fail_fast_family": "compat.cargo",
+      "desc": "legacy below-L2 stripped verify compatibility: cargo",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh cargo </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "clang",
+      "fail_fast_family": "compat.clang",
+      "desc": "legacy below-L2 stripped verify compatibility: clang",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh clang </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "ruby",
+      "fail_fast_family": "compat.ruby",
+      "desc": "legacy below-L2 stripped verify compatibility: ruby",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/ruby --disable-gems -e 'values = (1..5).map { |value| value * value }; raise \"unexpected squares\" unless values == [1, 4, 9, 16, 25]; puts values.join(\",\")' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "python3",
+      "fail_fast_family": "compat.python3",
+      "desc": "legacy below-L2 stripped verify compatibility: python3",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/python3 -c 'print(42)' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "curl",
+      "fail_fast_family": "compat.curl",
+      "desc": "legacy below-L2 stripped verify compatibility: curl",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/curl --fail --silent --show-error file:///etc/hostname </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "git",
+      "fail_fast_family": "compat.git",
+      "desc": "legacy below-L2 stripped verify compatibility: git",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh git </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "cmake",
+      "fail_fast_family": "compat.cmake",
+      "desc": "legacy below-L2 stripped verify compatibility: cmake",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh cmake </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "pkg-config",
+      "fail_fast_family": "compat.pkg-config",
+      "desc": "legacy below-L2 stripped verify compatibility: pkg-config",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh pkg-config </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "m4",
+      "fail_fast_family": "compat.m4",
+      "desc": "legacy below-L2 stripped verify compatibility: m4",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh m4 </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "gcc",
+      "fail_fast_family": "compat.gcc",
+      "desc": "legacy below-L2 stripped verify compatibility: gcc",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh gcc </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "g++",
+      "fail_fast_family": "compat.g++",
+      "desc": "legacy below-L2 stripped verify compatibility: g++",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh g++ </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "make",
+      "fail_fast_family": "compat.make",
+      "desc": "legacy below-L2 stripped verify compatibility: make",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh make </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "ar",
+      "fail_fast_family": "compat.ar",
+      "desc": "legacy below-L2 stripped verify compatibility: ar",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh ar </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "as",
+      "fail_fast_family": "compat.as",
+      "desc": "legacy below-L2 stripped verify compatibility: as",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh as </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "ld",
+      "fail_fast_family": "compat.ld",
+      "desc": "legacy below-L2 stripped verify compatibility: ld",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh ld </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "nm",
+      "fail_fast_family": "compat.nm",
+      "desc": "legacy below-L2 stripped verify compatibility: nm",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh nm </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "objcopy",
+      "fail_fast_family": "compat.objcopy",
+      "desc": "legacy below-L2 stripped verify compatibility: objcopy",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh objcopy </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "objdump",
+      "fail_fast_family": "compat.objdump",
+      "desc": "legacy below-L2 stripped verify compatibility: objdump",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh objdump </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "ranlib",
+      "fail_fast_family": "compat.ranlib",
+      "desc": "legacy below-L2 stripped verify compatibility: ranlib",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh ranlib </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "readelf",
+      "fail_fast_family": "compat.readelf",
+      "desc": "legacy below-L2 stripped verify compatibility: readelf",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh readelf </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "size",
+      "fail_fast_family": "compat.size",
+      "desc": "legacy below-L2 stripped verify compatibility: size",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh size </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "strip",
+      "fail_fast_family": "compat.strip",
+      "desc": "legacy below-L2 stripped verify compatibility: strip",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh strip </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "addr2line",
+      "fail_fast_family": "compat.addr2line",
+      "desc": "legacy below-L2 stripped verify compatibility: addr2line",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh addr2line </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "c++filt",
+      "fail_fast_family": "compat.c++filt",
+      "desc": "legacy below-L2 stripped verify compatibility: c++filt",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh c++filt </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "elfedit",
+      "fail_fast_family": "compat.elfedit",
+      "desc": "legacy below-L2 stripped verify compatibility: elfedit",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh elfedit </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "gprof",
+      "fail_fast_family": "compat.gprof",
+      "desc": "legacy below-L2 stripped verify compatibility: gprof",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh gprof </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "cpp",
+      "fail_fast_family": "compat.cpp",
+      "desc": "legacy below-L2 stripped verify compatibility: cpp",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh cpp </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "gcov",
+      "fail_fast_family": "compat.gcov",
+      "desc": "legacy below-L2 stripped verify compatibility: gcov",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh gcov </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "bzip2",
+      "fail_fast_family": "compat.bzip2",
+      "desc": "legacy below-L2 stripped verify compatibility: bzip2",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'bzip2 -c README.md | sha256sum' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "gzip",
+      "fail_fast_family": "compat.gzip",
+      "desc": "legacy below-L2 stripped verify compatibility: gzip",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'gzip -cn README.md | sha256sum' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "xz",
+      "fail_fast_family": "compat.xz",
+      "desc": "legacy below-L2 stripped verify compatibility: xz",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'xz -c README.md | sha256sum' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "zstd",
+      "fail_fast_family": "compat.zstd",
+      "desc": "legacy below-L2 stripped verify compatibility: zstd",
+      "cmd": "status=0; target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'zstd -q -c README.md | sha256sum' </dev/null || status=$?; if [ \"$status\" -ne 0 ]; then printf 'WARN portable strict compatibility diagnostic %s failed (nonblocking), exit %s: %s\\n' zstd \"$status\" 'timed out on the GitHub-managed portable no-PMU runner' >&2; fi; exit 0",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 20,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "gzip-roundtrip",
+      "fail_fast_family": "compat.gzip-roundtrip",
+      "desc": "legacy below-L2 stripped verify compatibility: gzip-roundtrip",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh gzip-roundtrip </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "bzip2-roundtrip",
+      "fail_fast_family": "compat.bzip2-roundtrip",
+      "desc": "legacy below-L2 stripped verify compatibility: bzip2-roundtrip",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh bzip2-roundtrip </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "xz-roundtrip",
+      "fail_fast_family": "compat.xz-roundtrip",
+      "desc": "legacy below-L2 stripped verify compatibility: xz-roundtrip",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh xz-roundtrip </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "zstd-roundtrip",
+      "fail_fast_family": "compat.zstd-roundtrip",
+      "desc": "legacy below-L2 stripped verify compatibility: zstd-roundtrip",
+      "cmd": "status=0; target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh zstd-roundtrip </dev/null || status=$?; if [ \"$status\" -ne 0 ]; then printf 'WARN portable strict compatibility diagnostic %s failed (nonblocking), exit %s: %s\\n' zstd-roundtrip \"$status\" 'timed out on the GitHub-managed portable no-PMU runner' >&2; fi; exit 0",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 20,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "tar-roundtrip",
+      "fail_fast_family": "compat.tar-roundtrip",
+      "desc": "legacy below-L2 stripped verify compatibility: tar-roundtrip",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh tar-roundtrip </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "cpio-roundtrip",
+      "fail_fast_family": "compat.cpio-roundtrip",
+      "desc": "legacy below-L2 stripped verify compatibility: cpio-roundtrip",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh cpio-roundtrip </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "wget-localhost",
+      "fail_fast_family": "compat.wget-localhost",
+      "desc": "legacy below-L2 stripped verify compatibility: wget-localhost",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh wget-localhost </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "curl-localhost",
+      "fail_fast_family": "compat.curl-localhost",
+      "desc": "legacy below-L2 stripped verify compatibility: curl-localhost",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh curl-localhost </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "zip-unzip",
+      "fail_fast_family": "compat.zip-unzip",
+      "desc": "legacy below-L2 stripped verify compatibility: zip-unzip",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; rm -rf /tmp/hermit-compat-zip; mkdir /tmp/hermit-compat-zip; printf \"archive-data\\n\" >/tmp/hermit-compat-zip/input; touch -t 200001010000 /tmp/hermit-compat-zip/input; (cd /tmp/hermit-compat-zip && zip -q archive.zip input); unzip -Z1 /tmp/hermit-compat-zip/archive.zip; unzip -p /tmp/hermit-compat-zip/archive.zip input; rm -rf /tmp/hermit-compat-zip' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "openssl",
+      "fail_fast_family": "compat.openssl",
+      "desc": "legacy below-L2 stripped verify compatibility: openssl",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- openssl dgst -sha256 /etc/hostname </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "sort",
+      "fail_fast_family": "compat.sort",
+      "desc": "legacy below-L2 stripped verify compatibility: sort",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'printf \"beta\\nalpha\\nalpha\\n\" | sort' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "uniq",
+      "fail_fast_family": "compat.uniq",
+      "desc": "legacy below-L2 stripped verify compatibility: uniq",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; printf \"alpha\\nalpha\\nbeta\\nbeta\\ngamma\\n\" | uniq -d | diff -u <(printf \"alpha\\nbeta\\n\") -; printf \"uniq-ok\\n\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "tr",
+      "fail_fast_family": "compat.tr",
+      "desc": "legacy below-L2 stripped verify compatibility: tr",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'printf \"Hermit\\n\" | tr \"[:upper:]\" \"[:lower:]\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "cut",
+      "fail_fast_family": "compat.cut",
+      "desc": "legacy below-L2 stripped verify compatibility: cut",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; printf \"one:two:three\\nfour:five:six\\n\" | cut -d: -f2 | diff -u <(printf \"two\\nfive\\n\") -; printf \"cut-ok\\n\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "tee",
+      "fail_fast_family": "compat.tee",
+      "desc": "legacy below-L2 stripped verify compatibility: tee",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'printf \"tee-through-hermit\\n\" | tee /dev/null' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "paste",
+      "fail_fast_family": "compat.paste",
+      "desc": "legacy below-L2 stripped verify compatibility: paste",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; paste -d: <(printf \"alpha\\nbeta\\n\") <(printf \"1\\n2\\n\") | diff -u <(printf \"alpha:1\\nbeta:2\\n\") -; printf \"paste-ok\\n\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "comm",
+      "fail_fast_family": "compat.comm",
+      "desc": "legacy below-L2 stripped verify compatibility: comm",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; comm -12 <(printf \"alpha\\nbeta\\n\") <(printf \"beta\\ngamma\\n\") | diff -u <(printf \"beta\\n\") -; printf \"comm-ok\\n\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "join",
+      "fail_fast_family": "compat.join",
+      "desc": "legacy below-L2 stripped verify compatibility: join",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; join <(printf \"1 alpha\\n2 beta\\n\") <(printf \"1 one\\n2 two\\n\") | diff -u <(printf \"1 alpha one\\n2 beta two\\n\") -; printf \"join-ok\\n\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "find",
+      "fail_fast_family": "compat.find",
+      "desc": "legacy below-L2 stripped verify compatibility: find",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh find </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "stat",
+      "fail_fast_family": "compat.stat",
+      "desc": "legacy below-L2 stripped verify compatibility: stat",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- stat -c '%n %s %f' /etc/hostname </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "file",
+      "fail_fast_family": "compat.file",
+      "desc": "legacy below-L2 stripped verify compatibility: file",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- file /bin/sh </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "basename",
+      "fail_fast_family": "compat.basename",
+      "desc": "legacy below-L2 stripped verify compatibility: basename",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/basename /usr/local/bin/hermit </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "dirname",
+      "fail_fast_family": "compat.dirname",
+      "desc": "legacy below-L2 stripped verify compatibility: dirname",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/dirname /usr/local/bin/hermit </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "env",
+      "fail_fast_family": "compat.env",
+      "desc": "legacy below-L2 stripped verify compatibility: env",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh env </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "printenv",
+      "fail_fast_family": "compat.printenv",
+      "desc": "legacy below-L2 stripped verify compatibility: printenv",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/env -i HERMIT_COMPAT=printenv /usr/bin/printenv HERMIT_COMPAT </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "uname",
+      "fail_fast_family": "compat.uname",
+      "desc": "legacy below-L2 stripped verify compatibility: uname",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/uname -sr </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "factor",
+      "fail_fast_family": "compat.factor",
+      "desc": "legacy below-L2 stripped verify compatibility: factor",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh factor </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "expr",
+      "fail_fast_family": "compat.expr",
+      "desc": "legacy below-L2 stripped verify compatibility: expr",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- expr 2 + 2 </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "dd",
+      "fail_fast_family": "compat.dd",
+      "desc": "legacy below-L2 stripped verify compatibility: dd",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'printf \"hermit-dd\\n\" | dd bs=1 count=10 status=none' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "df",
+      "fail_fast_family": "compat.df",
+      "desc": "legacy below-L2 stripped verify compatibility: df",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/df -P / </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "du",
+      "fail_fast_family": "compat.du",
+      "desc": "legacy below-L2 stripped verify compatibility: du",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/du -sk README.md </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "hostname",
+      "fail_fast_family": "compat.hostname",
+      "desc": "legacy below-L2 stripped verify compatibility: hostname",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/hostname </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "ip",
+      "fail_fast_family": "compat.ip",
+      "desc": "legacy below-L2 stripped verify compatibility: ip",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh ip </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "ss",
+      "fail_fast_family": "compat.ss",
+      "desc": "legacy below-L2 stripped verify compatibility: ss",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh ss </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "netlink-route",
+      "fail_fast_family": "compat.netlink-route",
+      "desc": "legacy below-L2 stripped verify compatibility: netlink-route",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh netlink-route </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "netlink-sock-diag",
+      "fail_fast_family": "compat.netlink-sock-diag",
+      "desc": "legacy below-L2 stripped verify compatibility: netlink-sock-diag",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh netlink-sock-diag </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "lscpu",
+      "fail_fast_family": "compat.lscpu",
+      "desc": "legacy below-L2 stripped verify compatibility: lscpu",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh lscpu </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "lsof",
+      "fail_fast_family": "compat.lsof",
+      "desc": "legacy below-L2 stripped verify compatibility: lsof",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh lsof </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "whoami",
+      "fail_fast_family": "compat.whoami",
+      "desc": "legacy below-L2 stripped verify compatibility: whoami",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/whoami </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "groups",
+      "fail_fast_family": "compat.groups",
+      "desc": "legacy below-L2 stripped verify compatibility: groups",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/groups </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "tty",
+      "fail_fast_family": "compat.tty",
+      "desc": "legacy below-L2 stripped verify compatibility: tty",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'output=$(tty 2>&1); status=$?; printf \"%s\\n\" \"$output\"; test \"$status\" -eq 1' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "nproc",
+      "fail_fast_family": "compat.nproc",
+      "desc": "legacy below-L2 stripped verify compatibility: nproc",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/nproc </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "arch",
+      "fail_fast_family": "compat.arch",
+      "desc": "legacy below-L2 stripped verify compatibility: arch",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/arch </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "realpath",
+      "fail_fast_family": "compat.realpath",
+      "desc": "legacy below-L2 stripped verify compatibility: realpath",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/realpath README.md </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "readlink",
+      "fail_fast_family": "compat.readlink",
+      "desc": "legacy below-L2 stripped verify compatibility: readlink",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/readlink -f README.md </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "mktemp",
+      "fail_fast_family": "compat.mktemp",
+      "desc": "legacy below-L2 stripped verify compatibility: mktemp",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; d=$(mktemp -d /tmp/hermit-compat.XXXXXX); test -d \"$d\"; rmdir \"$d\"; printf \"mktemp-ok\\n\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "sha256sum",
+      "fail_fast_family": "compat.sha256sum",
+      "desc": "legacy below-L2 stripped verify compatibility: sha256sum",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/sha256sum README.md </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "sha1sum",
+      "fail_fast_family": "compat.sha1sum",
+      "desc": "legacy below-L2 stripped verify compatibility: sha1sum",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/sha1sum README.md </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "md5sum",
+      "fail_fast_family": "compat.md5sum",
+      "desc": "legacy below-L2 stripped verify compatibility: md5sum",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/md5sum README.md </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "sha224sum",
+      "fail_fast_family": "compat.sha224sum",
+      "desc": "legacy below-L2 stripped verify compatibility: sha224sum",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/sha224sum README.md </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "sha384sum",
+      "fail_fast_family": "compat.sha384sum",
+      "desc": "legacy below-L2 stripped verify compatibility: sha384sum",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/sha384sum README.md </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "sha512sum",
+      "fail_fast_family": "compat.sha512sum",
+      "desc": "legacy below-L2 stripped verify compatibility: sha512sum",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/sha512sum README.md </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "wc-lines",
+      "fail_fast_family": "compat.wc-lines",
+      "desc": "legacy below-L2 stripped verify compatibility: wc-lines",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/wc -l README.md </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "nl",
+      "fail_fast_family": "compat.nl",
+      "desc": "legacy below-L2 stripped verify compatibility: nl",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'printf \"alpha\\nbeta\\n\" | nl -ba' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "expand",
+      "fail_fast_family": "compat.expand",
+      "desc": "legacy below-L2 stripped verify compatibility: expand",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'printf \"a\\tb\\n\" | expand -t 4' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "unexpand",
+      "fail_fast_family": "compat.unexpand",
+      "desc": "legacy below-L2 stripped verify compatibility: unexpand",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'printf \"a   b\\n\" | unexpand -a -t 4' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "test",
+      "fail_fast_family": "compat.test",
+      "desc": "legacy below-L2 stripped verify compatibility: test",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/test 42 -eq 42 </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "bracket",
+      "fail_fast_family": "compat.bracket",
+      "desc": "legacy below-L2 stripped verify compatibility: bracket",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- '/usr/bin/[' 42 -eq 42 ']' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "printf",
+      "fail_fast_family": "compat.printf",
+      "desc": "legacy below-L2 stripped verify compatibility: printf",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/printf '%s=%d\\n' hermit 42 </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "pr",
+      "fail_fast_family": "compat.pr",
+      "desc": "legacy below-L2 stripped verify compatibility: pr",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/pr -t README.md </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "ls",
+      "fail_fast_family": "compat.ls",
+      "desc": "legacy below-L2 stripped verify compatibility: ls",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/ls -1 README.md </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "xargs",
+      "fail_fast_family": "compat.xargs",
+      "desc": "legacy below-L2 stripped verify compatibility: xargs",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh xargs </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "time",
+      "fail_fast_family": "compat.time",
+      "desc": "legacy below-L2 stripped verify compatibility: time",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh time </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "iconv",
+      "fail_fast_family": "compat.iconv",
+      "desc": "legacy below-L2 stripped verify compatibility: iconv",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'printf \"hermit\\n\" | /usr/bin/iconv -f UTF-8 -t UTF-8' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "sleep",
+      "fail_fast_family": "compat.sleep",
+      "desc": "legacy below-L2 stripped verify compatibility: sleep",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/sleep 0 </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "stdbuf",
+      "fail_fast_family": "compat.stdbuf",
+      "desc": "legacy below-L2 stripped verify compatibility: stdbuf",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/stdbuf -o0 /usr/bin/printf 'stdbuf-ok\\n' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "nohup",
+      "fail_fast_family": "compat.nohup",
+      "desc": "legacy below-L2 stripped verify compatibility: nohup",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/nohup /bin/echo nohup-ok </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "nice",
+      "fail_fast_family": "compat.nice",
+      "desc": "legacy below-L2 stripped verify compatibility: nice",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/nice -n 1 /bin/echo nice-ok </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "ionice",
+      "fail_fast_family": "compat.ionice",
+      "desc": "legacy below-L2 stripped verify compatibility: ionice",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/ionice -c 3 /bin/echo ionice-ok </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "taskset",
+      "fail_fast_family": "compat.taskset",
+      "desc": "legacy below-L2 stripped verify compatibility: taskset",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; taskset -p $$ >/dev/null; printf \"taskset-ok\\n\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "chrt",
+      "fail_fast_family": "compat.chrt",
+      "desc": "legacy below-L2 stripped verify compatibility: chrt",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; chrt -p $$ >/dev/null; printf \"chrt-ok\\n\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "flock",
+      "fail_fast_family": "compat.flock",
+      "desc": "legacy below-L2 stripped verify compatibility: flock",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; f=$(mktemp); flock -x \"$f\" -c \"printf \\\"flock-ok\\\\n\\\"\"; rm -f \"$f\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "logger",
+      "fail_fast_family": "compat.logger",
+      "desc": "legacy below-L2 stripped verify compatibility: logger",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; output=$(/usr/bin/logger --stderr --no-act -t hermit-compat logger-ok 2>&1); [[ $output == *\"hermit-compat: logger-ok\" ]]; printf \"logger-ok\\n\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "getopt",
+      "fail_fast_family": "compat.getopt",
+      "desc": "legacy below-L2 stripped verify compatibility: getopt",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/getopt -o ab: -- -a -b value </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "column",
+      "fail_fast_family": "compat.column",
+      "desc": "legacy below-L2 stripped verify compatibility: column",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; printf \"alpha:1\\nbeta:22\\n\" | column -t -s :' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "hexdump",
+      "fail_fast_family": "compat.hexdump",
+      "desc": "legacy below-L2 stripped verify compatibility: hexdump",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; printf \"Hermit\\n\" | hexdump -C' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "xxd",
+      "fail_fast_family": "compat.xxd",
+      "desc": "legacy below-L2 stripped verify compatibility: xxd",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; printf \"Hermit\\n\" | xxd' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "strings",
+      "fail_fast_family": "compat.strings",
+      "desc": "legacy below-L2 stripped verify compatibility: strings",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; printf \"\\0Hermit\\0\" | strings -n 5' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "od",
+      "fail_fast_family": "compat.od",
+      "desc": "legacy below-L2 stripped verify compatibility: od",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; printf \"Hermit\\n\" | od -An -tx1' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "sum",
+      "fail_fast_family": "compat.sum",
+      "desc": "legacy below-L2 stripped verify compatibility: sum",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/sum README.md </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "cksum",
+      "fail_fast_family": "compat.cksum",
+      "desc": "legacy below-L2 stripped verify compatibility: cksum",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/cksum README.md </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "b2sum",
+      "fail_fast_family": "compat.b2sum",
+      "desc": "legacy below-L2 stripped verify compatibility: b2sum",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/b2sum README.md </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "tsort",
+      "fail_fast_family": "compat.tsort",
+      "desc": "legacy below-L2 stripped verify compatibility: tsort",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; printf \"alpha beta\\nbeta gamma\\n\" | tsort' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "ptx",
+      "fail_fast_family": "compat.ptx",
+      "desc": "legacy below-L2 stripped verify compatibility: ptx",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; printf \"alpha beta\\n\" | ptx -f' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "pinky",
+      "fail_fast_family": "compat.pinky",
+      "desc": "legacy below-L2 stripped verify compatibility: pinky",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/pinky -l root </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "logname",
+      "fail_fast_family": "compat.logname",
+      "desc": "legacy below-L2 stripped verify compatibility: logname",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'if output=$(/usr/bin/logname 2>/dev/null); then test -n \"$output\"; printf \"logname:login-present\\n\"; else printf \"logname:no-login-record\\n\"; fi' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "users",
+      "fail_fast_family": "compat.users",
+      "desc": "legacy below-L2 stripped verify compatibility: users",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/users </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "uptime",
+      "fail_fast_family": "compat.uptime",
+      "desc": "legacy below-L2 stripped verify compatibility: uptime",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/uptime -p </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "iostat",
+      "fail_fast_family": "compat.iostat",
+      "desc": "legacy below-L2 stripped verify compatibility: iostat",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/iostat -d -x 1 1 </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "vmstat-disk",
+      "fail_fast_family": "compat.vmstat-disk",
+      "desc": "legacy below-L2 stripped verify compatibility: vmstat-disk",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/vmstat -d 1 2 </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "pidstat-disk",
+      "fail_fast_family": "compat.pidstat-disk",
+      "desc": "legacy below-L2 stripped verify compatibility: pidstat-disk",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/pidstat -d -p 1 1 1 </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "findmnt",
+      "fail_fast_family": "compat.findmnt",
+      "desc": "legacy below-L2 stripped verify compatibility: findmnt",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/findmnt --fstab --tab-file ./ci/compat/findmnt.fixture --nocanonicalize --list --output TARGET,SOURCE,FSTYPE,OPTIONS </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "sysctl-random-uuid",
+      "fail_fast_family": "compat.sysctl-random-uuid",
+      "desc": "legacy below-L2 stripped verify compatibility: sysctl-random-uuid",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/sbin/sysctl kernel.random.uuid </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "sar-resource-tables",
+      "fail_fast_family": "compat.sar-resource-tables",
+      "desc": "legacy below-L2 stripped verify compatibility: sar-resource-tables",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/sar -v 1 1 </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "lsirq",
+      "fail_fast_family": "compat.lsirq",
+      "desc": "legacy below-L2 stripped verify compatibility: lsirq",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/lsirq --noheadings --output IRQ,TOTAL,NAME </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "mpstat-softirqs",
+      "fail_fast_family": "compat.mpstat-softirqs",
+      "desc": "legacy below-L2 stripped verify compatibility: mpstat-softirqs",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/mpstat -I SCPU 1 1 </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "lsmod",
+      "fail_fast_family": "compat.lsmod",
+      "desc": "legacy below-L2 stripped verify compatibility: lsmod",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/sbin/lsmod </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "numastat",
+      "fail_fast_family": "compat.numastat",
+      "desc": "legacy below-L2 stripped verify compatibility: numastat",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/numastat </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "numactl-hardware",
+      "fail_fast_family": "compat.numactl-hardware",
+      "desc": "legacy below-L2 stripped verify compatibility: numactl-hardware",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/numactl --hardware </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "ps",
+      "fail_fast_family": "compat.ps",
+      "desc": "legacy below-L2 stripped verify compatibility: ps",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/ps aux </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "vmstat",
+      "fail_fast_family": "compat.vmstat",
+      "desc": "legacy below-L2 stripped verify compatibility: vmstat",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/vmstat -s </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "top",
+      "fail_fast_family": "compat.top",
+      "desc": "legacy below-L2 stripped verify compatibility: top",
+      "cmd": "status=0; target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/env HOME=target/validation/strict-compat/top-home XDG_CONFIG_HOME=target/validation/strict-compat/top-home/.config /bin/bash -c 'set -euo pipefail; LC_ALL=C /usr/bin/top -b -n 1 -p $$ -w 80 >/dev/null; printf \"top-ok\\n\"' </dev/null || status=$?; if [ \"$status\" -ne 0 ]; then printf 'WARN portable strict compatibility diagnostic %s failed (nonblocking), exit %s: %s\\n' top \"$status\" 'live process-table reads differ on the GitHub-managed portable runner' >&2; fi; exit 0",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 20,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "kill",
+      "fail_fast_family": "compat.kill",
+      "desc": "legacy below-L2 stripped verify compatibility: kill",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/kill -0 1 </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "pgrep",
+      "fail_fast_family": "compat.pgrep",
+      "desc": "legacy below-L2 stripped verify compatibility: pgrep",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; /usr/bin/pgrep -x bash | /usr/bin/grep -qx \"$$\"; printf \"pgrep-ok\\n\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "pkill",
+      "fail_fast_family": "compat.pkill",
+      "desc": "legacy below-L2 stripped verify compatibility: pkill",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; /usr/bin/pkill -0 -x bash; printf \"pkill-ok\\n\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "diff",
+      "fail_fast_family": "compat.diff",
+      "desc": "legacy below-L2 stripped verify compatibility: diff",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; d=$(mktemp -d); printf \"alpha\\nbeta\\n\" >\"$d/a\"; cp \"$d/a\" \"$d/b\"; diff -u \"$d/a\" \"$d/b\"; rm -rf \"$d\"; printf \"diff-ok\\n\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "patch",
+      "fail_fast_family": "compat.patch",
+      "desc": "legacy below-L2 stripped verify compatibility: patch",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; d=$(mktemp -d); printf \"old\\n\" >\"$d/file\"; printf \"%s\\n\" \"--- file\" \"+++ file\" \"@@ -1 +1 @@\" \"-old\" \"+new\" | (cd \"$d\" && patch -s file); cat \"$d/file\"; rm -rf \"$d\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "grep",
+      "fail_fast_family": "compat.grep",
+      "desc": "legacy below-L2 stripped verify compatibility: grep",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; printf \"alpha\\nbeta\\ngamma\\nalpha\\n\" | grep -nx alpha | diff -u <(printf \"1:alpha\\n4:alpha\\n\") -; printf \"grep-ok\\n\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "egrep",
+      "fail_fast_family": "compat.egrep",
+      "desc": "legacy below-L2 stripped verify compatibility: egrep",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; printf \"alpha\\nbeta\\ngamma\\n\" | egrep \"^(alpha|gamma)$\" | diff -u <(printf \"alpha\\ngamma\\n\") -; printf \"egrep-ok\\n\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "fgrep",
+      "fail_fast_family": "compat.fgrep",
+      "desc": "legacy below-L2 stripped verify compatibility: fgrep",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; printf \"alpha.beta\\nalphaXbeta\\n\" | fgrep \"alpha.beta\" | diff -u <(printf \"alpha.beta\\n\") -; printf \"fgrep-ok\\n\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "sed",
+      "fail_fast_family": "compat.sed",
+      "desc": "legacy below-L2 stripped verify compatibility: sed",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; printf \"alpha:12\\nbeta:3\\n\" | sed -E \"s/^([a-z]+):([0-9]+)$/\\\\2-\\\\1/\" | diff -u <(printf \"12-alpha\\n3-beta\\n\") -; printf \"sed-ok\\n\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "tar",
+      "fail_fast_family": "compat.tar",
+      "desc": "legacy below-L2 stripped verify compatibility: tar",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; d=$(mktemp -d); printf \"archive-data\\n\" >\"$d/input\"; touch -t 200001010000 \"$d/input\"; tar -cf \"$d/archive.tar\" -C \"$d\" input; tar -tf \"$d/archive.tar\"; rm -rf \"$d\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "cp",
+      "fail_fast_family": "compat.cp",
+      "desc": "legacy below-L2 stripped verify compatibility: cp",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; d=$(mktemp -d); printf \"copy-data\\n\" >\"$d/source\"; cp \"$d/source\" \"$d/copy\"; cmp \"$d/source\" \"$d/copy\"; cat \"$d/copy\"; rm -rf \"$d\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "mv",
+      "fail_fast_family": "compat.mv",
+      "desc": "legacy below-L2 stripped verify compatibility: mv",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; d=$(mktemp -d); printf \"move-data\\n\" >\"$d/source\"; mv \"$d/source\" \"$d/moved\"; test ! -e \"$d/source\"; cat \"$d/moved\"; rm -rf \"$d\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "rm",
+      "fail_fast_family": "compat.rm",
+      "desc": "legacy below-L2 stripped verify compatibility: rm",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; d=$(mktemp -d); printf \"remove-data\\n\" >\"$d/file\"; rm \"$d/file\"; test ! -e \"$d/file\"; rmdir \"$d\"; printf \"rm-ok\\n\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "mkdir",
+      "fail_fast_family": "compat.mkdir",
+      "desc": "legacy below-L2 stripped verify compatibility: mkdir",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; d=$(mktemp -d); mkdir -p \"$d/a/b\"; test -d \"$d/a/b\"; printf \"mkdir-ok\\n\"; rm -rf \"$d\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "rmdir",
+      "fail_fast_family": "compat.rmdir",
+      "desc": "legacy below-L2 stripped verify compatibility: rmdir",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; d=$(mktemp -d); rmdir \"$d\"; test ! -e \"$d\"; printf \"rmdir-ok\\n\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "touch",
+      "fail_fast_family": "compat.touch",
+      "desc": "legacy below-L2 stripped verify compatibility: touch",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; f=$(mktemp); touch -t 200001010000 \"$f\"; stat -c \"%Y %s\" \"$f\"; rm -f \"$f\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "chmod",
+      "fail_fast_family": "compat.chmod",
+      "desc": "legacy below-L2 stripped verify compatibility: chmod",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; f=$(mktemp); printf \"mode\\n\" >\"$f\"; chmod 640 \"$f\"; stat -c \"%a\" \"$f\"; rm -f \"$f\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "chown",
+      "fail_fast_family": "compat.chown",
+      "desc": "legacy below-L2 stripped verify compatibility: chown",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; f=$(mktemp); printf \"owner\\n\" >\"$f\"; chown --reference=README.md \"$f\"; stat -c \"%u:%g\" \"$f\"; rm -f \"$f\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "ln",
+      "fail_fast_family": "compat.ln",
+      "desc": "legacy below-L2 stripped verify compatibility: ln",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; d=$(mktemp -d); printf \"link-data\\n\" >\"$d/source\"; ln \"$d/source\" \"$d/hard\"; ln -s source \"$d/sym\"; stat -c \"%h\" \"$d/source\"; cat \"$d/hard\" \"$d/sym\"; rm -rf \"$d\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "date",
+      "fail_fast_family": "compat.date",
+      "desc": "legacy below-L2 stripped verify compatibility: date",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "cal",
+      "fail_fast_family": "compat.cal",
+      "desc": "legacy below-L2 stripped verify compatibility: cal",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/cal 1 2000 </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "yes",
+      "fail_fast_family": "compat.yes",
+      "desc": "legacy below-L2 stripped verify compatibility: yes",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -eu; yes hermit | head -n 3' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "tac",
+      "fail_fast_family": "compat.tac",
+      "desc": "legacy below-L2 stripped verify compatibility: tac",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; printf \"first\\nsecond\\nthird\\n\" | tac' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "rev",
+      "fail_fast_family": "compat.rev",
+      "desc": "legacy below-L2 stripped verify compatibility: rev",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; printf \"Hermit\\ndeterminism\\n\" | rev' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "fold",
+      "fail_fast_family": "compat.fold",
+      "desc": "legacy below-L2 stripped verify compatibility: fold",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; printf \"abcdefghijklmnopqrstuvwxyz\\n\" | fold -w 8' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "fmt",
+      "fail_fast_family": "compat.fmt",
+      "desc": "legacy below-L2 stripped verify compatibility: fmt",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; printf \"Hermit formats this deterministic paragraph into narrow lines for validation.\\n\" | fmt -w 24' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "shuf",
+      "fail_fast_family": "compat.shuf",
+      "desc": "legacy below-L2 stripped verify compatibility: shuf",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=target/real-compat-fixtures bash ./tests/compat/real_compat_workload.sh shuf </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "numfmt",
+      "fail_fast_family": "compat.numfmt",
+      "desc": "legacy below-L2 stripped verify compatibility: numfmt",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/numfmt --to=iec 1048576 </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "csplit",
+      "fail_fast_family": "compat.csplit",
+      "desc": "legacy below-L2 stripped verify compatibility: csplit",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; d=$(mktemp -d); printf \"alpha\\nbeta\\ngamma\\n\" >\"$d/input\"; (cd \"$d\" && csplit -s input \"/^beta$/\" && cat xx00 xx01); rm -rf \"$d\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "split",
+      "fail_fast_family": "compat.split",
+      "desc": "legacy below-L2 stripped verify compatibility: split",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; d=$(mktemp -d); printf \"one\\ntwo\\nthree\\nfour\\n\" >\"$d/input\"; split -l 2 \"$d/input\" \"$d/part-\"; cat \"$d\"/part-*; rm -rf \"$d\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "install",
+      "fail_fast_family": "compat.install",
+      "desc": "legacy below-L2 stripped verify compatibility: install",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; d=$(mktemp -d); install -m 640 README.md \"$d/copied\"; stat -c \"%a %s\" \"$d/copied\"; rm -rf \"$d\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "mkfifo",
+      "fail_fast_family": "compat.mkfifo",
+      "desc": "legacy below-L2 stripped verify compatibility: mkfifo",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; p=$(mktemp -u); mkfifo \"$p\"; stat -c \"%F\" \"$p\"; rm -f \"$p\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "cmp",
+      "fail_fast_family": "compat.cmp",
+      "desc": "legacy below-L2 stripped verify compatibility: cmp",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; d=$(mktemp -d); printf \"same\\n\" >\"$d/a\"; printf \"same\\n\" >\"$d/b\"; cmp -s \"$d/a\" \"$d/b\"; printf \"cmp-ok\\n\"; rm -rf \"$d\"' </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
+    },
+    {
+      "group": "compat",
+      "job": "free",
+      "fail_fast_family": "compat.free",
+      "desc": "legacy below-L2 stripped verify compatibility: free",
+      "cmd": "target/ci/hermit-strict run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --env TMPDIR=/tmp -- /usr/bin/free -m </dev/null",
+      "deps": [
+        "compatprep.fixtures"
+      ],
+      "timeout": 60,
+      "cpu_timeout": 120,
+      "hint": {
+        "resources": {
+          "hermit_guest": 1
+        },
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light"
+      }
     }
   ]
 }

@@ -128,19 +128,25 @@ Node `cmd`s are the **verbatim** commands `scripts/validate.rs` runs, with three
 deliberate exceptions, chosen to avoid duplicating script logic that has many
 moving parts:
 
-- **Composite envelope gates reuse `scripts/validate.rs`'s own standalone entrypoints**
-  so there is one source of truth: `test.strict_compat` runs
-  `./scripts/validate.rs --portable-strict-compat-only`, and (privileged) `rr.compat_baseline`
-  runs `./scripts/validate.rs --rr-compat-only`. The privileged selector builds release;
-  portable strict compatibility reuses `STRICT_COMPAT_HERMIT_BIN` from the
-  preceding workspace build. Without that override, the strict flag builds
-  release as before.
+- **Portable strict compatibility is part of the outer DAG.**
+  `compatprep.fixtures` and the `compat.*` rows are the committed expansion of
+  `ci/compat/corpus-strict.json`; they reuse `target/ci/hermit-strict` from
+  `build.runtime_release`. `scripts/validate.rs --self-test` compares the
+  committed rows with the corpus-derived commands and refuses drift. The
+  standalone `--portable-strict-compat-only` entrypoint remains available for
+  focused runs, but no shipped DAG node starts a second validator or scheduler.
+  The privileged `rr.compat_baseline` composite continues to run
+  `./scripts/validate.rs --rr-compat-only`.
 - **The DBT stderr-isolation CLI case is a separate 120-second node** so a
   backend hang fails quickly without consuming the aggregate CLI budget. The
   aggregate node skips that case, so the test set remains unchanged.
 - **Portable strict compatibility starts after every non-guest Cargo node** so
   its `shell-build` run1/run2 comparison cannot observe concurrent target or
-  cache mutation. Those short nodes still run in parallel before the barrier.
+  cache mutation. Those short nodes still run in parallel before
+  `compatprep.fixtures`. The existing `hermit_guest` capacity is weighted: an
+  ordinary guest node consumes all 16 units, while each `compat.*` probe consumes
+  one, preserving the former 16-wide inner schedule without allowing unrelated
+  guest work to overlap it.
 - **Hermit integration targets use one Cargo invocation** with repeated
   `--test` selectors (`test.hermit_integration` and `hw.integration`). Cargo
   plans and links the selected targets together, then executes their separate

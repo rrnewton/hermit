@@ -24,7 +24,6 @@ env:
   RUSTFLAGS: -D warnings -C link-arg=-llzma
   RUSTDOCFLAGS: -D warnings
   DETCORE_TEST_RUST_LOG: "off"
-  STRICT_COMPAT_HERMIT_BIN: ${{ github.workspace }}/target/debug/hermit
 
 jobs:
   dag-portable:
