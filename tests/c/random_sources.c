@@ -41,7 +41,16 @@ static int fill_getrandom(uint8_t buffer[BYTES]) {
   return getrandom(buffer, BYTES, 0) == BYTES ? 0 : -1;
 }
 
+static ssize_t raw_getrandom(void* buffer, size_t length, unsigned long flags) {
+  return syscall(SYS_getrandom, buffer, length, flags);
+}
+
 static int check_getrandom_flags(void) {
+  /*
+   * Check Linux syscall semantics directly. glibc 2.42 may satisfy getrandom
+   * through __vdso_getrandom, whose return behavior can differ from the syscall.
+   * Normal libc sampling and explicit vDSO coverage remain below.
+   */
   static const unsigned int valid_flags[] = {
       GRND_NONBLOCK,
       GRND_RANDOM,
@@ -51,43 +60,41 @@ static int check_getrandom_flags(void) {
 
   for (size_t index = 0; index < sizeof(valid_flags) / sizeof(valid_flags[0]);
        index++) {
-    if (getrandom(buffer, sizeof(buffer), valid_flags[index]) !=
+    if (raw_getrandom(buffer, sizeof(buffer), valid_flags[index]) !=
         (ssize_t)sizeof(buffer)) {
       return -1;
     }
   }
 
-  if (syscall(SYS_getrandom, buffer, sizeof(buffer), 1ULL << 32) !=
+  if (raw_getrandom(buffer, sizeof(buffer), 1ULL << 32) !=
       (ssize_t)sizeof(buffer)) {
     return -1;
   }
 
   errno = 0;
-  if (getrandom(buffer, sizeof(buffer), 0x80000000u) != -1 ||
+  if (raw_getrandom(buffer, sizeof(buffer), 0x80000000u) != -1 ||
       errno != EINVAL) {
     return -1;
   }
 
   errno = 0;
-  if (syscall(
-          SYS_getrandom,
-          buffer,
-          sizeof(buffer),
-          (1ULL << 32) | 0x80000000ULL) != -1 ||
+  if (raw_getrandom(
+          buffer, sizeof(buffer), (1ULL << 32) | 0x80000000ULL) != -1 ||
       errno != EINVAL) {
     return -1;
   }
 
 #ifdef GRND_INSECURE
   errno = 0;
-  if (getrandom(buffer, sizeof(buffer), GRND_RANDOM | GRND_INSECURE) != -1 ||
+  if (raw_getrandom(buffer, sizeof(buffer),
+                    GRND_RANDOM | GRND_INSECURE) != -1 ||
       errno != EINVAL) {
     return -1;
   }
 #endif
 
   errno = 0;
-  if (syscall(SYS_getrandom, NULL, 0, 0) != 0 || errno != 0) {
+  if (raw_getrandom(NULL, 0, 0) != 0 || errno != 0) {
     return -1;
   }
 
