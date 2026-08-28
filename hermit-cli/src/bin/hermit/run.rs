@@ -66,13 +66,13 @@ use super::verify::ComparisonOptions;
 use super::verify::LogCompareStrictness;
 use super::verify::NoResultReason;
 use super::verify::VerificationReport;
-use super::verify::VerificationRuntime;
 use super::verify::announce_verification_outcome;
 use super::verify::compare_two_runs;
 use super::verify::retain_verification_logs;
 use super::verify::temp_log_files_in;
 use super::verify::validate_log_level;
 use super::verify::verification_log_level;
+use super::verify::verification_runtime_from_summaries;
 use super::verify::write_pending_verification_json;
 use super::verify::write_report_json;
 use super::verify::write_verification_json;
@@ -3724,13 +3724,15 @@ impl RunOpts {
                 report.no_result_reason = Some(NoResultReason::FirstRunRejected {
                     exit_code: out1.status.code(),
                     signal: out1.status.signal(),
-                    stdout_bytes: out1.stdout.len(),
-                    stderr_bytes: out1.stderr.len(),
+                    stdout_bytes: u64::try_from(out1.stdout.len())
+                        .expect("guest stdout length fits u64"),
+                    stderr_bytes: u64::try_from(out1.stderr.len())
+                        .expect("guest stderr length fits u64"),
                 });
                 report.guest_exit_code = out1.status.code();
                 report.guest_signal = out1.status.signal();
                 let summary1 = read_verify_summary(summary1_file.path());
-                report.runtime = VerificationRuntime::from_summaries(summary1.as_ref(), None);
+                report.runtime = verification_runtime_from_summaries(summary1.as_ref(), None);
                 if let Err(error) = write_report_json(path, &report) {
                     eprintln!(
                         "WARNING: could not record the rejected first run in {}: {}",
@@ -3865,7 +3867,7 @@ impl RunOpts {
             },
             comparison_options,
         )?;
-        outcome.runtime = VerificationRuntime::from_summaries(summary1.as_ref(), summary2.as_ref());
+        outcome.runtime = verification_runtime_from_summaries(summary1.as_ref(), summary2.as_ref());
 
         // Emit the machine-readable verdict (if requested) before collapsing the
         // outcome to the historical exit-code convention. The verdict is recorded
