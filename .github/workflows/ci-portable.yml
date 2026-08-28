@@ -296,6 +296,12 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          # make lint-checks contains history-aware pin and record-floor checks.
+          # Give those unchanged commands the same reachable history they use
+          # locally instead of discovering another shallow-checkout difference
+          # after the private authority becomes available.
+          fetch-depth: 0
       - name: Initialize submodules
         run: git submodule update --init --recursive
       - name: Dependencies
