@@ -142,6 +142,11 @@ pub fn known_failclosed() -> BTreeMap<&'static str, &'static str> {
 /// probe is given a shortened 20s budget.
 pub fn portable_diagnostic() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
+        // TODO(#2801): remove once mountinfo source paths are deterministic.
+        (
+            "df",
+            "tracked in #2801: mountinfo exposes Hermit's host-TMPDIR backing paths",
+        ),
         ("top", "live process-table reads differ on the GitHub-managed portable runner"),
         ("zstd", "timed out on the GitHub-managed portable no-PMU runner"),
         ("zstd-roundtrip", "timed out on the GitHub-managed portable no-PMU runner"),
