@@ -522,6 +522,121 @@ pub fn environmental_block_observation(output: &str) -> EnvBlockObservation {
     EnvBlockObservation::NoDenial
 }
 
+/// Infrastructure signatures emitted by tools below the validation runner.
+///
+/// They are inspected only inside the exact failed node's captured detail
+/// region. The runner records the resulting
+/// [`hermit_manifest_plan::runner::FailureClass`] directly; an outer ledger
+/// consumer must not reopen the aggregate log and infer the class again.
+const INFRASTRUCTURE_FAILURE_SIGNATURES: &[&str] = &[
+    "in archive is not an object",
+    "archive has no index",
+    "malformed archive",
+    "file format not recognized",
+    "bad file descriptor while reading archive",
+    "failed to verify the checksum",
+    "is different than the directory",
+    "does not match the source",
+    "corrupted",
+    "undefined reference to `dynamorio::",
+    ": failed to run command",
+];
+
+const PREREQUISITE_FAILURE_SIGNATURES: &[&str] = &[
+    ": command not found",
+    "unable to locate package",
+    "has no installation candidate",
+    "no match for argument",
+    "executable file not found in $path",
+];
+
+const PREPARE_FAILURE_PREFIXES: &[&str] = &[
+    "prepare failed for ",
+    "c program compilation failed for ",
+    "rust program compilation failed for ",
+];
+
+const PREPARE_PROGRESS_PREFIXES: &[&str] = &["built ", "skip ", "prebuilt "];
+
+const PREREQUISITE_PREPARE_SIGNATURES: &[&str] = &[
+    "not found",
+    "no such file or directory",
+    "command not found",
+    " on path",
+];
+
+/// Classify one failed node's exact captured detail region.
+///
+/// `None` means the detail carried no recognized non-product evidence. The
+/// caller keeps the completed nonzero execution as `product_failure`; absence
+/// of a match is never converted into infrastructure or prerequisite success.
+/// The optional string is the closed evidence value written beside the class.
+pub fn failure_class_from_detail(
+    output: &str,
+) -> Option<(hermit_manifest_plan::runner::FailureClass, &'static str)> {
+    if let EnvBlockObservation::Denied(class) = environmental_block_observation(output) {
+        return Some((
+            hermit_manifest_plan::runner::FailureClass::UnderstoodInfrastructureFailure,
+            class.as_str(),
+        ));
+    }
+
+    let lower = output.to_ascii_lowercase();
+    if let Some(signature) = INFRASTRUCTURE_FAILURE_SIGNATURES
+        .iter()
+        .copied()
+        .find(|signature| lower.contains(signature))
+    {
+        return Some((
+            hermit_manifest_plan::runner::FailureClass::UnderstoodInfrastructureFailure,
+            signature,
+        ));
+    }
+    if let Some(signature) = PREREQUISITE_FAILURE_SIGNATURES
+        .iter()
+        .copied()
+        .find(|signature| lower.contains(signature))
+    {
+        return Some((
+            hermit_manifest_plan::runner::FailureClass::UnderstoodPrerequisiteFailure,
+            signature,
+        ));
+    }
+
+    let lines: Vec<&str> = lower.lines().map(str::trim).collect();
+    for (index, line) in lines.iter().enumerate() {
+        if !PREPARE_FAILURE_PREFIXES
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+        {
+            continue;
+        }
+        let Some(reason) = lines.get(index + 1) else {
+            continue;
+        };
+        if PREPARE_FAILURE_PREFIXES
+            .iter()
+            .any(|prefix| reason.starts_with(prefix))
+            || PREPARE_PROGRESS_PREFIXES
+                .iter()
+                .any(|prefix| reason.starts_with(prefix))
+        {
+            continue;
+        }
+        if let Some(signature) = PREREQUISITE_PREPARE_SIGNATURES
+            .iter()
+            .copied()
+            .find(|signature| reason.contains(signature))
+        {
+            return Some((
+                hermit_manifest_plan::runner::FailureClass::UnderstoodPrerequisiteFailure,
+                signature,
+            ));
+        }
+    }
+    None
+}
+
 /// What an actual re-execution established about an environmental classification.
 ///
 /// Classification binds a host/sandbox signature to one failed node attempt. It
@@ -1585,6 +1700,47 @@ pub fn self_test() -> Result<String, String> {
     // use it.
     if environmental_block_class("   ").is_some() || environmental_block_class("plain failure").is_some() {
         return Err("three-state: the legacy view must report neither non-denial as a class".into());
+    }
+
+    // The current writer records the owner's four failure classes directly.
+    // These brackets cover both non-product classes and prove that weak prose
+    // remains product evidence unless it occurs in the harness's preparation
+    // failure shape.
+    use hermit_manifest_plan::runner::FailureClass;
+    for (text, want_class, want_detail) in [
+        (
+            "error: failed to verify the checksum for `crate v1.0.0`",
+            FailureClass::UnderstoodInfrastructureFailure,
+            "failed to verify the checksum",
+        ),
+        (
+            "tool: command not found",
+            FailureClass::UnderstoodPrerequisiteFailure,
+            ": command not found",
+        ),
+        (
+            "prepare failed for language-runtimes/lua-random.sh\nno Lua interpreter on PATH",
+            FailureClass::UnderstoodPrerequisiteFailure,
+            " on path",
+        ),
+    ] {
+        if failure_class_from_detail(text) != Some((want_class, want_detail)) {
+            return Err(format!(
+                "failure class: expected {want_class:?}/{want_detail:?} for {text:?}, got {:?}",
+                failure_class_from_detail(text)
+            ));
+        }
+    }
+    for text in [
+        "assertion failed: expected key not found",
+        "error[E0432]: unresolved import `detcore::sched`",
+        "",
+    ] {
+        if failure_class_from_detail(text).is_some() {
+            return Err(format!(
+                "failure class: product or absent evidence was reclassified: {text:?}"
+            ));
+        }
     }
 
     // ---- environmental classification: qualifying cases must be ACCEPTED ----

@@ -897,6 +897,27 @@ pub enum FailureClass {
     NoResult,
 }
 
+impl FailureClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProductFailure => "product_failure",
+            Self::UnderstoodInfrastructureFailure => "understood_infrastructure_failure",
+            Self::UnderstoodPrerequisiteFailure => "understood_prerequisite_failure",
+            Self::NoResult => "no_result",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "product_failure" => Ok(Self::ProductFailure),
+            "understood_infrastructure_failure" => Ok(Self::UnderstoodInfrastructureFailure),
+            "understood_prerequisite_failure" => Ok(Self::UnderstoodPrerequisiteFailure),
+            "no_result" => Ok(Self::NoResult),
+            other => Err(format!("unknown failure_class `{other}`")),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AttemptResult {
     pub index: String,
@@ -3402,6 +3423,31 @@ fn execute_observed_until(
 mod tests {
     use super::*;
     use crate::ci_selection::BackendCiDisabledReason;
+
+    #[test]
+    fn failure_class_schema_matches_serialized_enum() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../failure-class-schema.json")).unwrap();
+        assert_eq!(schema["schema"], 1);
+        let classes = [
+            FailureClass::ProductFailure,
+            FailureClass::UnderstoodInfrastructureFailure,
+            FailureClass::UnderstoodPrerequisiteFailure,
+            FailureClass::NoResult,
+        ];
+        let serialized = classes
+            .iter()
+            .map(|class| serde_json::to_value(class).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(schema["values"], serde_json::Value::Array(serialized));
+        for class in classes {
+            assert_eq!(FailureClass::parse(class.as_str()), Ok(class));
+        }
+        assert_eq!(
+            FailureClass::parse("future_failure"),
+            Err("unknown failure_class `future_failure`".into())
+        );
+    }
     use crate::ci_selection::CiDisabledResult;
 
     fn recipe(ci: bool) -> TestRecipe {
