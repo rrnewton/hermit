@@ -38,14 +38,11 @@
 # WHERE THE NODE SETS COME FROM -- and why they are not invented here.
 #
 # The build/test partition already exists in ci/portable-shards.json, and GitHub
-# CI already runs it as separate jobs: `build-debug` and `build-release` execute
-# the build-side node sets and publish a prebuilt tree, then the shard jobs
-# execute their own node sets against it. This script reads THE SAME KEYS with
-# THE SAME jq expressions as .github/workflows/ci-portable.yml. The
-# e2e.manifest_* nodes are intentionally outside that shard map; a full run
-# appends them directly from ci/dag/portable.json, in DAG order. Their selected
-# portable-cell count comes from ci/expected-e2e-plan.json. Nothing is duplicated
-# here, so node or cell additions cannot silently fall out of this path.
+# CI already runs it as separate jobs: build jobs publish a prebuilt tree, then
+# test, E2E, and final-result jobs consume it. This script reads THE SAME KEYS
+# with THE SAME jq expressions as .github/workflows/ci-portable.yml. Completeness
+# is checked against validate's constructed portable-only plan, never a raw lane
+# file, so plan-construction changes cannot silently fall out of this path.
 #
 # THE PARTITION IS THE SHARD MAP, NOT THE `group` FIELD. A naive implementation
 # gets this wrong in both directions:
@@ -125,14 +122,12 @@ fi
 }
 
 MAP="$ROOT/ci/portable-shards.json"
-DAG="$ROOT/ci/dag/portable.json"
 EXPECTED_E2E_PLAN="$ROOT/ci/expected-e2e-plan.json"
 FETCH_MANIFESTS=(
     Cargo.toml
     liteinst-runtime-build/Cargo.toml
 )
 [[ -f "$MAP" ]] || { echo "run-split-validate: missing $MAP" >&2; exit 2; }
-[[ -f "$DAG" ]] || { echo "run-split-validate: missing $DAG" >&2; exit 2; }
 [[ -f "$EXPECTED_E2E_PLAN" ]] || {
     echo "run-split-validate: missing $EXPECTED_E2E_PLAN" >&2
     exit 2
@@ -142,34 +137,34 @@ FETCH_MANIFESTS=(
 build_nodes=$(jq -r '(.preflight_nodes + .build_debug_nodes + .build_dbt_nodes + .build_aux_nodes)|join(",")' "$MAP")
 
 if [[ -n "$shards" ]]; then
-    test_nodes=$(jq -r --arg sel "$shards" \
+    shard_nodes=$(jq -r --arg sel "$shards" \
         '($sel|split(",")) as $s
          | [ (.debug_shards[], .release_shards[]) | select(.slug as $x | $s | index($x)) | .nodes[] ]
          | join(",")' "$MAP")
-    [[ -n "$test_nodes" ]] || {
+    [[ -n "$shard_nodes" ]] || {
         echo "run-split-validate: no shard matched '$shards'. Known slugs:" >&2
         jq -r '(.debug_shards[], .release_shards[]).slug | "  " + .' "$MAP" >&2
         exit 2
     }
+    test_nodes=$shard_nodes
 else
-    test_nodes=$(jq -r '[ (.debug_shards[], .release_shards[]).nodes[] ]|join(",")' "$MAP")
+    shard_nodes=$(jq -r '[ (.debug_shards[], .release_shards[]).nodes[] ]|join(",")' "$MAP")
+    test_nodes=$(jq -r '[
+        (.debug_shards[], .release_shards[]).nodes[],
+        .e2e_nodes[],
+        .final_nodes[]
+    ]|join(",")' "$MAP")
 fi
-shard_node_count=$(tr ',' '\n' <<<"$test_nodes" | wc -l)
+shard_node_count=$(tr ',' '\n' <<<"$shard_nodes" | wc -l)
 
-# The shard map deliberately excludes manifest buckets because GitHub fans
-# those out as cells. Local split validation still has to run the complete
-# portable DAG, so append exactly the manifest nodes declared by that DAG. Keep
-# --shards useful for focused debugging by adding these only on the default full
-# run. jq preserves .steps order, which preserves the DAG's declared ordering.
+# The constructed plan and the shard map both carry the manifest steps. Keep
+# --shards useful for focused debugging by counting E2E only on the default full
+# run.
 e2e_nodes=""
 e2e_node_count=0
 e2e_cell_count=0
 if [[ -z "$shards" ]]; then
-    e2e_nodes=$(jq -er '[
-        .steps[]
-        | "\(.group).\(.job)"
-        | select(startswith("e2e.manifest_"))
-    ] | if length > 0 then join(",") else error("no e2e.manifest_* nodes") end' "$DAG")
+    e2e_nodes=$(jq -er '.e2e_nodes | if length > 0 then join(",") else error("no e2e.manifest_* steps") end' "$MAP")
     e2e_node_count=$(tr ',' '\n' <<<"$e2e_nodes" | wc -l)
     e2e_cell_count=$(jq -er '
         [.cells[] | select(.lane == "portable")] as $portable
@@ -178,20 +173,6 @@ if [[ -z "$shards" ]]; then
           else error("invalid or empty portable E2E plan")
           end
     ' "$EXPECTED_E2E_PLAN")
-    missing_e2e_categories=$(comm -23 \
-        <(jq -r '[.cells[] | select(.lane == "portable") | .category] | unique[]' \
-            "$EXPECTED_E2E_PLAN") \
-        <(jq -r '[
-            .steps[]
-            | select(("\(.group).\(.job)" | startswith("e2e.manifest_")))
-            | .manifest.category
-        ] | unique[]' "$DAG") || true)
-    [[ -z "$missing_e2e_categories" ]] || {
-        echo "run-split-validate: portable E2E plan categories have no manifest DAG node:" >&2
-        printf '  %s\n' $missing_e2e_categories >&2
-        exit 1
-    }
-    test_nodes="$test_nodes,$e2e_nodes"
 fi
 
 build_node_count=$(tr ',' '\n' <<<"$build_nodes" | wc -l)
@@ -200,16 +181,21 @@ total_node_count=$((build_node_count + test_node_count))
 if [[ -z "$shards" ]]; then
     selected_list=$(tr ',' '\n' <<<"$build_nodes,$test_nodes" | LC_ALL=C sort)
     duplicate_nodes=$(uniq -d <<<"$selected_list" || true)
-    expected_list=$(jq -r '.steps[] | "\(.group).\(.job)"' "$DAG" | LC_ALL=C sort)
+    plan_out=$(mktemp)
+    ./scripts/validate.rs portable-only --show-plan-json \
+        --skip-inner-dirty-working-tree-and-rebase-freshness-checks >"$plan_out"
+    plan_json=$(sed -n '1p' "$plan_out")
+    rm -f "$plan_out"
+    expected_list=$(jq -r '.dags[].steps[].tag' <<<"$plan_json" | LC_ALL=C sort)
     duplicate_dag_nodes=$(uniq -d <<<"$expected_list" || true)
     selected_unique=$(uniq <<<"$selected_list")
     expected_unique=$(uniq <<<"$expected_list")
     missing_nodes=$(comm -23 <(printf '%s\n' "$expected_unique") <(printf '%s\n' "$selected_unique") || true)
     extra_nodes=$(comm -13 <(printf '%s\n' "$expected_unique") <(printf '%s\n' "$selected_unique") || true)
     if [[ -n "$duplicate_nodes" || -n "$duplicate_dag_nodes" || -n "$missing_nodes" || -n "$extra_nodes" ]]; then
-        echo "run-split-validate: full portable node selection does not exactly match $DAG." >&2
+        echo "run-split-validate: full portable step selection does not exactly match validate's constructed plan." >&2
         [[ -z "$duplicate_nodes" ]] || printf '  duplicate selection: %s\n' $duplicate_nodes >&2
-        [[ -z "$duplicate_dag_nodes" ]] || printf '  duplicate DAG node: %s\n' $duplicate_dag_nodes >&2
+        [[ -z "$duplicate_dag_nodes" ]] || printf '  duplicate constructed step: %s\n' $duplicate_dag_nodes >&2
         [[ -z "$missing_nodes" ]] || printf '  missing: %s\n' $missing_nodes >&2
         [[ -z "$extra_nodes" ]] || printf '  extra: %s\n' $extra_nodes >&2
         exit 1
