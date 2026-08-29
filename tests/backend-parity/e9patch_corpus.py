@@ -63,6 +63,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPOSITORY = SCRIPT_DIR.parent.parent
 CORPUS_DIR = SCRIPT_DIR / "e9patch_corpus"
+VERIFICATION_REPORT_BIN = os.environ.get("VERIFICATION_REPORT_BIN")
 
 # name -> (expected_exit, expected_stdout or None). stdout is exact when given.
 CORPUS: dict[str, tuple[int, bytes | None]] = {
@@ -123,7 +124,12 @@ def compile_guest(name: str, out_dir: Path) -> Path:
 
 
 def hermit_command(
-    hermit: Path, e9: bool, verify: bool, guest: Path, host_tmp: Path
+    hermit: Path,
+    e9: bool,
+    verify: bool,
+    guest: Path,
+    host_tmp: Path,
+    verify_json: Path | None = None,
 ) -> list[str]:
     command = [str(hermit)]
     if e9:
@@ -132,6 +138,9 @@ def hermit_command(
     command.append("--strict")
     if verify:
         command.append("--verify")
+        if verify_json is None:
+            raise CorpusError("a verification run requires a typed report path")
+        command.append(f"--verify-json={verify_json}")
     command.append(f"--tmp={host_tmp}")
     command.extend(["--", str(guest)])
     return command
@@ -179,13 +188,28 @@ def metric(name: str, stderr: bytes) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def l2_ok(stderr: bytes) -> bool:
-    return b"Determinism verified" in stderr
+def verification_report_bin(hermit: Path) -> Path:
+    if VERIFICATION_REPORT_BIN:
+        return Path(VERIFICATION_REPORT_BIN)
+    return hermit.parent / "verification-report"
+
+
+def verification_matched(hermit: Path, report: Path) -> tuple[bool, str]:
+    code, _, stderr = run(
+        [str(verification_report_bin(hermit)), "matched", str(report)], timeout=10
+    )
+    return code == 0, stderr.decode(errors="replace").strip()
 
 
 def prerequisites(hermit: Path) -> str | None:
     if not hermit.is_file() or not os.access(hermit, os.X_OK):
         return f"hermit executable unavailable: {hermit}"
+    report_bin = verification_report_bin(hermit)
+    if not report_bin.is_file() or not os.access(report_bin, os.X_OK):
+        return (
+            f"typed verification-report reader unavailable: {report_bin} "
+            "(build it with cargo build -p hermit --bin verification-report)"
+        )
     for var in ("HERMIT_E9TOOL", "HERMIT_E9PATCH_BACKEND"):
         path = os.environ.get(var)
         if not path or not Path(path).is_file():
@@ -216,15 +240,31 @@ def run_guest(hermit: Path, name: str, out_dir: Path) -> tuple[str, str]:
     gx, gout, _ = run(
         hermit_command(hermit, False, False, guest, host_tmp("golden")), timeout=40
     )
-    _, _, gv = run(
-        hermit_command(hermit, False, True, guest, host_tmp("golden-verify")),
+    golden_report = out_dir / f"{name}-golden-verify.json"
+    e9patch_report = out_dir / f"{name}-e9patch-verify.json"
+    _, _, _ = run(
+        hermit_command(
+            hermit,
+            False,
+            True,
+            guest,
+            host_tmp("golden-verify"),
+            golden_report,
+        ),
         timeout=60,
     )
     ex, eout, eerr = run(
         hermit_command(hermit, True, False, guest, host_tmp("e9patch")), timeout=60
     )
-    _, _, ev = run(
-        hermit_command(hermit, True, True, guest, host_tmp("e9patch-verify")),
+    _, _, _ = run(
+        hermit_command(
+            hermit,
+            True,
+            True,
+            guest,
+            host_tmp("e9patch-verify"),
+            e9patch_report,
+        ),
         timeout=90,
     )
 
@@ -238,10 +278,12 @@ def run_guest(hermit: Path, name: str, out_dir: Path) -> tuple[str, str]:
         return "FAIL", f"stdout divergence golden={gout!r} e9patch={eout!r}"
     if expected_stdout is not None and gout != expected_stdout:
         return "FAIL", f"golden stdout {gout!r}, expected {expected_stdout!r}"
-    if not l2_ok(gv):
-        return "FAIL", "golden not L2 (no 'Determinism verified')"
-    if not l2_ok(ev):
-        return "FAIL", "e9patch not L2 (no 'Determinism verified')"
+    golden_matched, golden_reason = verification_matched(hermit, golden_report)
+    if not golden_matched:
+        return "FAIL", f"golden typed verification report did not match: {golden_reason}"
+    e9patch_matched, e9patch_reason = verification_matched(hermit, e9patch_report)
+    if not e9patch_matched:
+        return "FAIL", f"e9patch typed verification report did not match: {e9patch_reason}"
 
     cand, mapped, b0 = (
         metric("candidate_sites", eerr),

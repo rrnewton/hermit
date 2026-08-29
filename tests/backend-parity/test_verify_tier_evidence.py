@@ -12,8 +12,9 @@ that comparison undetected.
 
 So the acceptance rule under test is narrow and one-directional: `bitwise` is
 claimable ONLY from a typed verdict that says `bitwise_parity` AND carries a
-nonzero compared-message count on both sides.  Everything else must degrade to
-`stripped`, `guest` or `gap` -- never upward.
+nonzero compared-message count on both sides. A well-formed weaker match stays
+`stripped` or `guest`; a non-match or malformed current record is refused --
+never promoted into a plausible positive tier.
 
 Both sides are bracketed: each positive plants a record that MUST reach its tier,
 and each negative plants a record that MUST NOT reach `bitwise`.
@@ -64,11 +65,21 @@ def tier_of(record) -> dict[str, str] | None:
 def spec(strictness, compare_logs=True, **over):
     base = {
         "strictness": strictness,
+        "display_name": "BitwiseInfoV1" if strictness == "canonical" else "Stripped",
         "compare_logs": compare_logs,
+        "compare_io_buffers": True,
+        "log_scope": "info",
+        "record_envelope": "all_records_v1",
+        "virtualize_time": True,
         "strip_lines": strictness == "stripped",
         "full_trace": strictness == "canonical",
         "canonicalize_addresses": strictness == "canonical",
         "exact_remainder": strictness == "canonical",
+        "stripped_prefixes": [],
+        "canonicalizations": [],
+        "ignore_lines": False,
+        "skip_commit": False,
+        "skip_detlog": False,
     }
     base.update(over)
     return base
@@ -81,10 +92,19 @@ def record(verified=True, bitwise=False, left=239, right=239, strictness="stripp
         "verified": verified,
         "bitwise_parity": bitwise,
         "verdict": verdict,
+        "no_result_reason": None,
         "comparison": spec(strictness, compare_logs),
         "compared_log_messages": counts,
+        "dbt_counted_branches": None,
+        "runtime": None,
         "guest_exit_code": 0,
         "guest_signal": None,
+        "first_divergent_scheduler_turn": None,
+        "first_divergent_virtual_nanoseconds": None,
+        "first_divergent_record": None,
+        "first_divergent_syscall": None,
+        "first_divergent_left_message": None,
+        "first_divergent_right_message": None,
     }
 
 
@@ -120,7 +140,8 @@ check("tier is 'guest'", got and got["tier"] == "guest", repr(got))
 
 print("case DIVERGED — an unverified record never claims a positive tier")
 got = tier_of(record(verified=False, verdict="diverged"))
-check("tier is 'gap'", got and got["tier"] == "gap", repr(got))
+check("typed divergent verdict is refused rather than assigned a positive tier",
+      got is None, repr(got))
 
 # --------------------------------------------------------------------------
 # Ported from the closed hermit#2303, re-expected against THIS ladder.
@@ -142,11 +163,7 @@ print("case CONTRADICTION — no boolean pair overrules the terminal verdict")
 got = tier_of(record(verified=True, bitwise=True, strictness="canonical",
                      verdict="diverged", left=348, right=348))
 check("diverged+parity is refused the bitwise tier",
-      got and got["tier"] != "bitwise", repr(got))
-check("diverged+parity degrades to 'stripped', not upward",
-      got and got["tier"] == "stripped", repr(got))
-check("diverged+parity reports bitwise_parity 0",
-      got and got["bitwise_parity"] == "0", repr(got))
+      got is None, repr(got))
 
 print("case COMPARATOR — canonical is the only bitwise-capable comparator")
 # The conflation the ladder exists to prevent: a Stripped comparison that
@@ -162,8 +179,8 @@ print("case PARITY TYPE — only a real JSON true is parity")
 # record certified bitwise under the previous predicate.
 for value, why in (("0", 'string "0"'), ("false", 'string "false"'), (1, "int 1")):
     got = tier_of(record(bitwise=value, strictness="canonical", left=348, right=348))
-    check(f"bitwise_parity as {why} is not parity",
-          got and got["tier"] != "bitwise", repr(got))
+    check(f"bitwise_parity as {why} is refused by the typed reader",
+          got is None, repr(got))
 
 print("case COUNTS — only equal positive integer counts are non-vacuous")
 # `type(x) is int` and not isinstance: bool subclasses int, so true|true would
@@ -175,8 +192,12 @@ for left, right, why in (
     (239, 240, "unequal"),
 ):
     got = tier_of(record(bitwise=True, strictness="canonical", left=left, right=right))
+    typed_shape_is_invalid = (
+        type(left) is not int or type(right) is not int or left < 0 or right < 0
+    )
     check(f"{why} counts are refused the bitwise tier",
-          got and got["tier"] != "bitwise", repr(got))
+          got is None if typed_shape_is_invalid else got and got["tier"] != "bitwise",
+          repr(got))
 
 print("case NAMED REFUSAL — a rejection nobody can see is not a check")
 # ⚠️ THE TIER ALONE CANNOT CARRY THIS. Degrading a self-contradictory record to
@@ -212,7 +233,7 @@ check("a parity claim under a stripped comparator names the comparator",
 msg = refusal_for(record(bitwise=True, strictness="canonical", verdict="diverged",
                          left=348, right=348))
 check("a parity claim on a diverged verdict names the verdict",
-      "not 'matched'" in msg, repr(msg))
+      "verdict is diverged" in msg, repr(msg))
 
 msg = refusal_for(record(bitwise=True, strictness="canonical", left=239, right=240))
 check("a parity claim with unequal counts names the counts",
@@ -266,9 +287,11 @@ for reason, why in (
     ({"kind": "first_run_rejected", "exit_code": 1, "signal": None,
       "stdout_bytes": 0, "stderr_bytes": 0}, "first_run_rejected"),
 ):
-    got = tier_of({"verified": False, "bitwise_parity": False, "verdict": "no_result",
-                   "no_result_reason": reason, "comparison": None,
-                   "compared_log_messages": None})
+    no_result = record(verified=False, bitwise=False, verdict="no_result")
+    no_result["no_result_reason"] = reason
+    no_result["comparison"] = None
+    no_result["compared_log_messages"] = None
+    got = tier_of(no_result)
     check(f"a typed no_result ({why}) still yields None, untouched by these conjuncts",
           got is None, repr(got))
 
@@ -276,16 +299,15 @@ for reason, why in (
 # pre-stamped record is `verdict=no_result` with every field null. A path that
 # flips the verdict without filling the comparison would previously have carried
 # `bitwise_parity: true` straight to the top tier.
-got = tier_of({"verified": True, "bitwise_parity": True, "verdict": "matched",
-               "no_result_reason": {"kind": "not_run"}, "comparison": None,
-               "compared_log_messages": None})
-check("a partially updated pre-stamp claiming parity is refused the bitwise tier",
-      got and got["tier"] != "bitwise", repr(got))
+partial = record(verified=True, bitwise=True, verdict="matched")
+partial["no_result_reason"] = {"kind": "not_run"}
+partial["comparison"] = None
+partial["compared_log_messages"] = None
+got = tier_of(partial)
+check("a partially updated pre-stamp claiming parity is refused",
+      got is None, repr(got))
 check("and it is refused BY NAME, not silently",
-      "REFUSED the bitwise tier" in refusal_for(
-          {"verified": True, "bitwise_parity": True, "verdict": "matched",
-           "no_result_reason": {"kind": "not_run"}, "comparison": None,
-           "compared_log_messages": None}), "silent")
+      "comparison is null but verdict is matched" in refusal_for(partial), "silent")
 
 print("case LADDER — the rungs this change deliberately did NOT touch")
 # Pinned so a future collapse to {gap, bitwise} is a visible test failure rather
@@ -396,15 +418,10 @@ check("a declared dbt L2 gap still reports 'gap'",
 check("kvm verify contract stays 'guest'",
       expectation("kvm", "exit_status", True)[0] == "guest")
 
-print("case FALLBACK — a run with no typed verdict must NOT issue a determinism positive")
-# DBT accepts --verify-json and writes nothing (measured: rc=0, no file). The old
-# behaviour emitted deterministic=1 beside a blank comparator and blank counts --
-# a positive whose required fields are empty, which a wired verifier must refuse.
-# Producing rows designed to be refused is not a contract, so the row is published
-# UNMEASURED instead.
+print("case SCORECARD — a typed verdict is the only source of a determinism positive")
 import tempfile as _tf, csv as _csv  # noqa: E402
 from run_matrix import (  # noqa: E402
-    VERIFY_COMPARE_UNAVAILABLE, BITWISE_CAPABLE_COMPARATORS, append_parent_scorecard,
+    append_parent_scorecard,
 )
 
 
@@ -421,18 +438,6 @@ def emitted_row(evidence, *, backend="dbt", detail="d"):
         return list(_csv.DictReader(path.open(encoding="utf-8")))[-1]
 
 
-fallback = emitted_row({"tier": "stripped", "verify_compare": VERIFY_COMPARE_UNAVAILABLE,
-                        "bitwise_parity": "0", "compared_log_messages": "",
-                        "determinism_unmeasured": "1"})
-check("fallback row does NOT claim deterministic=1",
-      fallback["deterministic"] == "", repr(fallback["deterministic"]))
-check("fallback row names why no verdict exists, rather than leaving it blank",
-      fallback["verify_compare"] == VERIFY_COMPARE_UNAVAILABLE, repr(fallback["verify_compare"]))
-check("fallback outcome is still a PASS (the guest ran and the compare succeeded)",
-      fallback["outcome"] == "pass", repr(fallback["outcome"]))
-check("the no-verdict sentinel is not a bitwise-capable comparator",
-      VERIFY_COMPARE_UNAVAILABLE not in BITWISE_CAPABLE_COMPARATORS)
-
 typed = emitted_row({"tier": "bitwise", "verify_compare": "canonical",
                      "bitwise_parity": "1", "compared_log_messages": "348|348"})
 check("a typed verdict DOES still claim deterministic=1 (not inert)",
@@ -440,15 +445,14 @@ check("a typed verdict DOES still claim deterministic=1 (not inert)",
 check("typed row carries its counts into the row",
       typed["compared_log_messages"] == "348|348", repr(typed["compared_log_messages"]))
 
-kvm = emitted_row(
-    {"tier": "guest", "verify_compare": VERIFY_COMPARE_UNAVAILABLE,
+guest = emitted_row(
+    {"tier": "guest", "verify_compare": "output_only",
      "bitwise_parity": "0", "compared_log_messages": ""},
-    backend="kvm",
-    detail="output+exit matched",
+    backend="kvm", detail="output+exit matched",
 )
-check("persisted KVM evidence is not mislabeled L2",
-      kvm["reason"].startswith("Guest-visible verification only") and
-      not kvm["reason"].startswith("L2"), repr(kvm["reason"]))
+check("typed KVM evidence is not mislabeled L2",
+      guest["reason"].startswith("Guest-visible verification only") and
+      not guest["reason"].startswith("L2"), repr(guest["reason"]))
 
 print("case SCHEMA — the evidence columns exist and sit in the canonical header")
 for column in EVIDENCE_COLUMNS:

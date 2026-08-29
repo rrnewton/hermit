@@ -21,6 +21,11 @@ from typing import NamedTuple
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPOSITORY = SCRIPT_DIR.parent.parent
+VERIFICATION_REPORT_BIN = Path(
+    os.environ.get(
+        "VERIFICATION_REPORT_BIN", REPOSITORY / "target/debug/verification-report"
+    )
+)
 BACKENDS = ("ptrace", "dbt", "kvm")
 RUNS = 3
 
@@ -133,11 +138,6 @@ OPTIONAL_SCORECARD_COLUMNS = (
     "stack_parity",
     "heap_parity",
 )
-
-# Recorded as the comparator when the run produced no typed verdict at all, so a
-# reader can tell "no verdict existed" from "a verdict existed and was stripped".
-# A blank would conflate those two, and only one of them is a measurement.
-VERIFY_COMPARE_UNAVAILABLE = "unavailable:no-verify-json"
 
 # Comparators whose match may be read as bitwise identity. An allowlist, not a
 # not-equal-to-"stripped" test: an unrecognised comparator name is an unknown
@@ -982,12 +982,6 @@ def capture_ptrace_reference(
 #    only guest stdout and exit status across the two runs. That is a strictly
 #    weaker guest-visible L2; do not report it as DETLOG determinism.
 #
-# Recording which witness fired keeps the matrix honest about what each backend
-# actually proves under --verify (no false parity).
-VERIFY_WITNESS_DETLOG = b"Determinism verified"
-VERIFY_WITNESS_GUEST_VISIBLE = b"guest output and exit status matched"
-
-
 def verify_tier_from_json(path: Path) -> dict[str, str] | None:
     """Read the tier a `--verify` run actually earned from its typed verdict.
 
@@ -1034,14 +1028,39 @@ def verify_tier_from_json(path: Path) -> dict[str, str] | None:
     fails these conjuncts falls to `stripped` or `guest` by the branches below,
     which are the rungs it already belonged on.
 
-    Returns ``None`` when no usable record exists -- notably the DBT backend,
-    which accepts `--verify-json` and writes nothing (measured: rc=0, no file).
+    The producer-owned Rust type is the vocabulary authority. Python reads the
+    evidence fields only after `verification-report matched` has parsed the
+    complete current shape and accepted the closed `Verdict` enum. Therefore a
+    new Rust variant, an incomplete report, or a self-contradictory verdict is a
+    loud refusal rather than a plausible `guest` or `stripped` tier.
+
+    Returns ``None`` when no usable current matched report exists.
     """
+    try:
+        typed = subprocess.run(
+            [str(VERIFICATION_REPORT_BIN), "matched", str(path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as error:
+        print(
+            f"run_matrix: REFUSED typed verification report {path}: {error}",
+            file=sys.stderr,
+        )
+        return None
+    if typed.returncode != 0:
+        detail = typed.stderr.strip() or f"reader exited {typed.returncode}"
+        print(
+            f"run_matrix: REFUSED typed verification report {path}: {detail}",
+            file=sys.stderr,
+        )
+        return None
     try:
         record = json.loads(path.read_text(encoding="utf-8").strip() or "{}")
     except (OSError, ValueError):
         return None
-    if not isinstance(record, dict) or record.get("verdict") in (None, "no_result"):
+    if not isinstance(record, dict):
         return None
     comparison = record.get("comparison") or {}
     counts = record.get("compared_log_messages") or {}
@@ -1059,7 +1078,7 @@ def verify_tier_from_json(path: Path) -> dict[str, str] | None:
         record.get("verified") is True
         and record.get("verdict") == "matched"
         and record.get("bitwise_parity") is True
-        and strictness == "canonical"
+        and strictness in BITWISE_CAPABLE_COMPARATORS
         and comparison.get("compare_logs") is True
         and positive_count
     )
@@ -1102,9 +1121,7 @@ def verify_tier_from_json(path: Path) -> dict[str, str] | None:
             file=sys.stderr,
         )
 
-    if not record.get("verified"):
-        tier = "gap"
-    elif bitwise:
+    if bitwise:
         tier = "bitwise"
     elif comparison.get("compare_logs"):
         tier = "stripped"
@@ -1175,56 +1192,15 @@ def run_case_verify(
             f"{diagnostic[-300:]}",
             time.monotonic() - started,
         )
-    if observed_evidence is not None:
-        # Typed verdict: authoritative.
-        observed = observed_evidence["tier"]
-    elif VERIFY_WITNESS_DETLOG in result.stderr:
-        # No `--verify-json` record (DBT accepts the flag and writes nothing;
-        # measured rc=0, no file).  The banner proves the DETLOG was COMPARED; it
-        # cannot say under WHICH policy or over HOW MANY messages.  Those are the
-        # two fields a determinism claim rests on, so this run cannot support one.
-        #
-        # It is still a contract PASS -- the guest ran and hermit's own compare
-        # succeeded -- but the row is published UNMEASURED (`deterministic=""`,
-        # which is exactly what blank already means in that column) rather than as
-        # a positive with hollow evidence.  Emitting `deterministic=1` beside a
-        # blank comparator and blank counts is the shape a wired verifier must
-        # refuse, and producing rows designed to be refused is not a contract.
-        observed = "stripped"
-        if evidence is not None:
-            evidence.update(
-                {
-                    "tier": "stripped",
-                    "verify_compare": VERIFY_COMPARE_UNAVAILABLE,
-                    "bitwise_parity": "0",
-                    "compared_log_messages": "",
-                    "determinism_unmeasured": "1",
-                    COMPARISON_TIER_COLUMN: COMPARISON_TIER_SELF_VERIFY_ONLY,
-                }
-            )
-    elif VERIFY_WITNESS_GUEST_VISIBLE in result.stderr:
-        # Guest-visible: stdout+exit compared, the log stream deliberately not.
-        # Absent counts are CORRECT here rather than missing, so this tier can
-        # carry a determinism claim without them -- but it still needs to say
-        # which comparison produced it.
-        observed = "guest"
-        if evidence is not None:
-            evidence.update(
-                {
-                    "tier": "guest",
-                    "verify_compare": VERIFY_COMPARE_UNAVAILABLE,
-                    "bitwise_parity": "0",
-                    "compared_log_messages": "",
-                    "determinism_unmeasured": "1",
-                    COMPARISON_TIER_COLUMN: COMPARISON_TIER_SELF_VERIFY_ONLY,
-                }
-            )
-    else:
+    if observed_evidence is None:
         return (
             "FAIL",
-            f"verify produced no determinism witness: {diagnostic[-300:]}",
+            "verify produced no usable current typed verification report: "
+            f"{diagnostic[-300:]}",
             time.monotonic() - started,
         )
+    # Typed verdict: authoritative.
+    observed = observed_evidence["tier"]
     # A gap being probed (--probe-gaps) has no positive contract to meet; report
     # what it actually reached so it can be evaluated for promotion.
     if expected_l2 != "gap" and L2_RANK[observed] < L2_RANK[expected_l2]:
