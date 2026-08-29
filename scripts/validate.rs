@@ -12800,27 +12800,77 @@ fn compat_test_results(
     outcomes: &[StepOutcome],
     attempts: &[NodeAttempt],
 ) -> Result<TestResults, String> {
-    let mut results = Vec::new();
-    for outcome in outcomes {
-        let Some(label) = outcome.tag.strip_prefix("compat.") else { continue };
-        if outcome_execution(outcome) == AttemptExecution::Unknown || outcome_is_no_result(outcome)
-        {
-            continue;
+    let compat_outcomes = outcomes
+        .iter()
+        .filter(|outcome| outcome.tag.starts_with("compat."))
+        .map(|outcome| (outcome.tag.as_str(), outcome))
+        .collect::<BTreeMap<_, _>>();
+    let mut latest_attempts = BTreeMap::<&str, &NodeAttempt>::new();
+    for attempt in attempts
+        .iter()
+        .filter(|attempt| attempt.tag.starts_with("compat."))
+    {
+        let latest = latest_attempts
+            .entry(attempt.tag.as_str())
+            .or_insert(attempt);
+        if attempt.attempt > latest.attempt {
+            *latest = attempt;
         }
-        let attempts = attempts
-            .iter()
-            .filter(|attempt| {
-                attempt.tag == outcome.tag && attempt.execution == AttemptExecution::Completed
-            })
-            .count();
-        let attempts = u64::try_from(attempts)
-            .map_err(|_| format!("structured compatibility attempts overflowed for {label}"))?;
-        if attempts == 0 {
+    }
+    for (tag, latest) in &latest_attempts {
+        if !compat_outcomes.contains_key(tag) {
             return Err(format!(
-                "structured compatibility result {label} has no completed attempt"
+                "structured compatibility result {tag} has attempt {} but no retained outcome",
+                latest.attempt
             ));
         }
-        results.push(TestResult::new(label.to_string(), outcome.ok, attempts)?);
+    }
+
+    let mut results = Vec::new();
+    for outcome in outcomes {
+        let Some(label) = outcome.tag.strip_prefix("compat.") else {
+            continue;
+        };
+        let tag = outcome.tag.as_str();
+        let latest = latest_attempts.get(tag).copied().ok_or_else(|| {
+            format!("structured compatibility result {label} has no recorded attempt")
+        })?;
+        if !latest.reported || latest.execution != AttemptExecution::Completed {
+            return Err(format!(
+                "structured compatibility result {label} latest attempt {} has no completed report",
+                latest.attempt
+            ));
+        }
+        let retained_result = if outcome_execution(outcome) != AttemptExecution::Completed {
+            None
+        } else if outcome_is_no_result(outcome) {
+            Some("no_result")
+        } else if outcome.ok {
+            Some("pass")
+        } else {
+            Some("fail")
+        };
+        let latest_result = attempt_result(latest);
+        if latest_result != retained_result || latest.returncode != outcome.returncode {
+            return Err(format!(
+                "structured compatibility result {label} disagrees with latest attempt {}",
+                latest.attempt
+            ));
+        }
+        let passed = match latest_result {
+            Some("pass") => true,
+            Some("fail") => false,
+            _ => {
+                return Err(format!(
+                    "structured compatibility result {label} latest attempt {} has no pass/fail verdict",
+                    latest.attempt
+                ));
+            }
+        };
+        let attempt_count = u64::try_from(latest.attempt).map_err(|_| {
+            format!("structured compatibility attempts overflowed for {label}")
+        })?;
+        results.push(TestResult::new(label.to_string(), passed, attempt_count)?);
     }
     let executed = u64::try_from(results.len())
         .map_err(|_| "structured compatibility result count does not fit u64".to_string())?;
@@ -13013,14 +13063,30 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
     }
     let missing_attempt = compat_test_results(&[compat_pass], &[])
         .expect_err("compatibility result without an attempt must refuse");
-    if !missing_attempt.contains("pass-case") || !missing_attempt.contains("no completed attempt")
+    if !missing_attempt.contains("pass-case") || !missing_attempt.contains("no recorded attempt")
     {
         return Err(format!(
             "typed libtest counts: missing compatibility attempt did not fail by name: {missing_attempt}"
         ));
     }
+
+    let stale_fail = outcome("compat.stale-fail", false, None, None);
+    let stale_attempts = vec![
+        reported_attempt(&stale_fail, 1),
+        unreported_attempt(stale_fail.tag.clone(), 2),
+    ];
+    let stale_error = compat_test_results(&[stale_fail], &stale_attempts)
+        .expect_err("a fail followed by an unreported retry must refuse");
+    if !stale_error.contains("stale-fail")
+        || !stale_error.contains("latest attempt 2")
+        || !stale_error.contains("no completed report")
+    {
+        return Err(format!(
+            "typed libtest counts: stale retained failure was not refused by latest attempt: {stale_error}"
+        ));
+    }
     println!(
-        "  typed libtest counts: exact 873/873/350 pass; retained count-only failure stayed unknown; mixed typed failure aggregated exactly; typed mutation moved 1 -> 2; compatibility rows carried terminal verdicts and attempts; 0/0/0 preserved"
+        "  typed libtest counts: exact 873/873/350 pass; retained count-only failure stayed unknown; mixed typed failure aggregated exactly; typed mutation moved 1 -> 2; compatibility rows carried terminal verdicts and latest attempt ordinals; fail-then-unreported refused; 0/0/0 preserved"
     );
     Ok(())
 }
