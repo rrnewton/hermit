@@ -496,6 +496,7 @@ fn sabre_scheduler_empty_info_precedes_fallback_completed_info() {
 
     const SCHEDULER_EMPTY: &str =
         " INFO detcore::scheduler: [scheduler] run queue empty, exiting sched_loop.";
+    const SCHEDULER_EMPTY_KICK: &str = " INFO detcore::scheduler: scheduler (step2_process_blocked): zero threads left anywhere, fizzling.";
     const FALLBACK_COMPLETED: &str =
         " INFO hermit::sabre::fallback: SaBRe ptrace fallback completed";
     for (index, path) in logs.iter().enumerate() {
@@ -506,11 +507,17 @@ fn sabre_scheduler_empty_info_precedes_fallback_completed_info() {
             )
         });
         let scheduler_empty = log.match_indices(SCHEDULER_EMPTY).collect::<Vec<_>>();
+        let scheduler_empty_kicks = log.match_indices(SCHEDULER_EMPTY_KICK).collect::<Vec<_>>();
         let fallback_completed = log.match_indices(FALLBACK_COMPLETED).collect::<Vec<_>>();
         assert_eq!(
             scheduler_empty.len(),
             1,
             "retained run {} must contain exactly one scheduler-empty INFO:\n{log}",
+            index + 1,
+        );
+        assert!(
+            scheduler_empty_kicks.is_empty(),
+            "retained run {} observed final physical exit between the loop-top completion check and step2:\n{log}",
             index + 1,
         );
         assert_eq!(

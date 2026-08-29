@@ -444,7 +444,8 @@ impl GlobalState {
     ///
     /// This only records a barrier observation when the backend advertises physical-exit
     /// reporting; it is therefore a no-op for ptrace, DBT, KVM, and LiteInst execution. The
-    /// exact process's barrier is released at this physical-waitability boundary.
+    /// The scheduler releases the exact process's barrier at its next loop-top
+    /// maintenance point rather than on this host-driven call.
     pub fn complete_physical_process_exit(&self, raw_pid: i32) {
         let detpid = DetPid::from_raw(raw_pid);
         self.pending_exec_states.lock().unwrap().remove(&detpid);
@@ -462,18 +463,18 @@ impl GlobalState {
         }
     }
 
-    /// Releases all physical-process-exit barriers after a backend supervisor has drained every
-    /// tracee and no guest thread can race another lifecycle event.
+    /// Reports every remaining physical process exit after a backend supervisor has drained every
+    /// tracee. The scheduler releases the barriers at its next loop-top maintenance point.
     pub fn release_all_physical_process_exits(&self) {
         self.pending_exec_states.lock().unwrap().clear();
         self.post_exec_fd_blocking.lock().unwrap().clear();
-        let released = self
+        let reported = self
             .sched
             .lock()
             .unwrap()
             .release_all_physical_process_exits();
-        if released != 0 {
-            trace!("released {released} final physical process-exit barrier(s)");
+        if reported != 0 {
+            trace!("reported {reported} final physical process exit(s)");
         }
     }
 
