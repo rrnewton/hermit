@@ -5382,6 +5382,85 @@ backends_disabled:
     }
 
     #[test]
+    fn preparation_uses_the_named_cells_wall_deadline() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-preparation-timeout-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let cell_dir = root.join("cell");
+        fs::create_dir_all(cell_dir.join("captures")).unwrap();
+        let context = RunContext {
+            root: root.clone(),
+            hermit_bin: root.join("hermit"),
+            result_root: root.join("results"),
+            build_root: root.join("build"),
+            run_id: "fixture".into(),
+            machine_shortname: "fixture-host".into(),
+            kernel_version: "7.1.3-fixture".into(),
+            host_capabilities: fixture_host_capabilities(),
+            attempt: 1,
+            run_index: None,
+            source_sha: "0".repeat(40),
+            binary_build_sha: None,
+            source_dirty: false,
+            prebuilt: false,
+            keep_logs: false,
+            run_verify_strict: false,
+            record_verify_strict: false,
+            scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
+            isolated_workdir: None,
+        };
+        let test = recipe(true);
+        let cell = SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: test.id.clone(),
+                mode: "verify".into(),
+                backend: Some("ptrace".into()),
+            },
+            test,
+            enabled: true,
+            timeout_seconds: 1,
+        };
+
+        let error = run_preparation(
+            &context,
+            &cell_dir,
+            "/bin/sh",
+            &["-c".into(), "sleep 60".into()],
+            Instant::now() + Duration::from_secs(1),
+            cell.timeout_seconds,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("cell exceeded 1 s during fixture preparation"),
+            "{error}"
+        );
+        let result = infrastructure_error_result(&context, &cell, error);
+        assert_eq!(result.test, "fixture/test");
+        assert_eq!(result.error_kind.as_deref(), Some("infrastructure"));
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("cell exceeded 1 s during fixture preparation")
+        );
+
+        run_preparation(
+            &context,
+            &cell_dir,
+            "/bin/sh",
+            &["-c".into(), "true".into()],
+            Instant::now() + Duration::from_secs(1),
+            cell.timeout_seconds,
+        )
+        .expect("healthy fixture preparation must finish silently under the same bound");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn prebuilt_copy_cannot_inherit_or_accept_a_nonexecutable_guest() {
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-prebuilt-bracket-{}",
