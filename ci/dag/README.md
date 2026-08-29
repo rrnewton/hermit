@@ -94,13 +94,26 @@ Each node's tag is `group.job` (e.g. `build.workspace`, `lint.clippy`).
 
 The centralized manifests use an explicit build barrier before execution:
 
-1. `e2e.metadata` validates schema, inventory, generated test-footprint freshness,
-   and CI correspondence.
-2. `build.e2e_artifact` waits for both initial Cargo producers, verifies and
-   hash-binds the debug Hermit plus the dereferenced `install_pkg` resource
-   tree, then atomically publishes a content-addressed bundle. Every later
-   shared-target Cargo writer waits on this barrier.
-3. `build.manifest_guests` prepares every `ci=true` program once. One
+1. `e2e.metadata` validates schema, inventory, generated test-footprint
+   freshness, and CI correspondence with `target/debug/test-harness`. Full
+   validation deduplicates it into the equivalent `gate.manifest` preflight.
+2. `lint.clippy`, `doc.doctests`, and `doc.rustdoc` run in a fixed chain after
+   that gate and before `build.workspace`, which is the final writer of the
+   shared debug test artifacts. They cannot overlap the gate because Cargo may
+   replace the `test-harness` executable while the gate is using it.
+3. `build.e2e_artifact` waits for the final debug producer and the release
+   producer, verifies and hash-binds the debug Hermit plus the dereferenced
+   `install_pkg` resource tree, then atomically publishes a content-addressed
+   bundle. The debug producer also records nextest's binaries metadata for each
+   test node's existing package and target selection; later test commands reuse
+   those exact paths without invoking Cargo, so concurrent consumers cannot
+   replace one another's selected executable. The commands retain their Cargo
+   selection arguments as the source of truth for test-footprint generation;
+   the producer records that selection beside the metadata, and
+   `run-nextest-counted.sh` refuses a mismatch before removing only those
+   build-selection arguments when `NEXTEST_BINARIES_METADATA` names the
+   corresponding recorded selection.
+4. `build.manifest_guests` prepares every `ci=true` program once. One
    `e2e.manifest_<bucket>` node per YAML bucket declares both producers and runs
    through `run-with-hermit-e2e-artifact.sh`, which re-verifies identity before
    exporting exact `HERMIT_BIN` and `HERMIT_INSTALL_DIR` paths. Parallel Cargo
