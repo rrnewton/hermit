@@ -154,17 +154,52 @@ struct ParsedEvents {
     results: Vec<TestResult>,
 }
 
-fn skipped_count(filtered_out: u64, ignored: u64, line: usize) -> Result<u64, String> {
-    // nextest 0.9.100's libtest-json adapter represents `0 - ignored` as a
-    // wrapping u64 when every test in a binary is ignored. The typed `ignored`
-    // field already carries those tests, so admit only that exact producer
-    // shape as zero additional filtered tests. Any other overflow is malformed.
-    if ignored > 0 && filtered_out == 0u64.wrapping_sub(ignored) {
-        return Ok(ignored);
+#[derive(Clone, Debug)]
+struct OpenSuite {
+    identity: SuiteIdentity,
+    test_count: u64,
+}
+
+fn suite_population(
+    test_count: u64,
+    passed: u64,
+    failed: u64,
+    ignored: u64,
+    filtered_out: u64,
+    line: usize,
+) -> Result<u64, String> {
+    let executed = passed.checked_add(failed).ok_or_else(|| {
+        format!("nextest-test-results line {line}: passed + failed overflows u64")
+    })?;
+    // nextest 0.9.100's libtest-json adapter subtracts selected ignored tests
+    // from an unsigned running count. Its two observed sentinel shapes are
+    // `0 - ignored` when none ran and `0 - executed` when a selected subset
+    // ran. In both cases the suite-start `test_count` is the exact population.
+    // Admit only those exact producer shapes; another overflowing value is
+    // malformed rather than a count to wrap into a plausible small number.
+    if filtered_out != 0
+        && (filtered_out == 0u64.wrapping_sub(ignored)
+            || filtered_out == 0u64.wrapping_sub(executed))
+    {
+        if executed > ignored || executed > test_count {
+            return Err(format!(
+                "nextest-test-results line {line}: wrapping filtered_out with executed count {executed}, ignored count {ignored}, and suite population {test_count} is inconsistent"
+            ));
+        }
+        return Ok(test_count);
     }
-    ignored.checked_add(filtered_out).ok_or_else(|| {
-        format!("nextest-test-results line {line}: ignored + filtered_out overflows u64")
-    })
+    let population = executed
+        .checked_add(ignored)
+        .and_then(|count| count.checked_add(filtered_out))
+        .ok_or_else(|| {
+            format!(
+                "nextest-test-results line {line}: passed + failed + ignored + filtered_out overflows u64"
+            )
+        })?;
+    // A skipped test can make nextest finalize one partial recap before the
+    // selected tests run. The start count and terminal arithmetic are both
+    // typed producer facts; the larger is the complete suite population.
+    Ok(population.max(test_count))
 }
 
 fn parse_event_text(text: &str) -> Result<ParsedEvents, String> {
@@ -173,8 +208,9 @@ fn parse_event_text(text: &str) -> Result<ParsedEvents, String> {
     // open typed suite by that rendered key so interleaved distinct suites stay
     // attributable. Two open suites with the same key are ambiguous and must
     // refuse: no field on their test rows could distinguish them.
-    let mut open_suites = BTreeMap::<(String, String), SuiteIdentity>::new();
-    let mut skipped_by_suite = BTreeMap::<SuiteIdentity, u64>::new();
+    let mut open_suites = BTreeMap::<(String, String), OpenSuite>::new();
+    let mut population_by_suite = BTreeMap::<SuiteIdentity, u64>::new();
+    let mut executed_by_suite = BTreeMap::<SuiteIdentity, u64>::new();
     let mut suite_passed = 0u64;
     let mut suite_failed = 0u64;
     let mut saw_event = false;
@@ -193,7 +229,11 @@ fn parse_event_text(text: &str) -> Result<ParsedEvents, String> {
             ("suite", "started") => {
                 let suite = SuiteIdentity::from_event(&value, line_number)?;
                 let key = suite.test_name_key();
-                if let Some(active) = open_suites.insert(key.clone(), suite.clone()) {
+                let open = OpenSuite {
+                    identity: suite.clone(),
+                    test_count: required_u64(&value, "test_count", line_number)?,
+                };
+                if let Some(active) = open_suites.insert(key.clone(), open) {
                     return Err(format!(
                         "nextest-test-results line {line_number}: suite key {key:?} is ambiguous because {suite:?} started before {active:?} ended"
                     ));
@@ -207,45 +247,51 @@ fn parse_event_text(text: &str) -> Result<ParsedEvents, String> {
                         "nextest-test-results line {line_number}: suite {ended:?} ended before its typed start metadata"
                     )
                 })?;
-                if started != ended {
-                    if started.package == ended.package
-                        && started.binary == ended.binary
-                        && started.kind != ended.kind
+                if started.identity != ended {
+                    if started.identity.package == ended.package
+                        && started.identity.binary == ended.binary
+                        && started.identity.kind != ended.kind
                     {
                         return Err(format!(
                             "nextest-test-results line {line_number}: suite ({:?}, {:?}) changed kind from {:?} to {:?}",
-                            started.package, started.binary, started.kind, ended.kind
+                            started.identity.package,
+                            started.identity.binary,
+                            started.identity.kind,
+                            ended.kind
                         ));
                     }
                     return Err(format!(
-                        "nextest-test-results line {line_number}: suite ended as {ended:?} after starting as {started:?}"
+                        "nextest-test-results line {line_number}: suite ended as {ended:?} after starting as {:?}",
+                        started.identity
                     ));
                 }
-                suite_passed = suite_passed
-                    .checked_add(required_u64(&value, "passed", line_number)?)
-                    .ok_or_else(|| {
-                        "nextest-test-results: passed count overflows u64".to_string()
-                    })?;
-                suite_failed = suite_failed
-                    .checked_add(required_u64(&value, "failed", line_number)?)
-                    .ok_or_else(|| {
-                        "nextest-test-results: failed count overflows u64".to_string()
-                    })?;
+                let passed = required_u64(&value, "passed", line_number)?;
+                let failed = required_u64(&value, "failed", line_number)?;
+                suite_passed = suite_passed.checked_add(passed).ok_or_else(|| {
+                    "nextest-test-results: passed count overflows u64".to_string()
+                })?;
+                suite_failed = suite_failed.checked_add(failed).ok_or_else(|| {
+                    "nextest-test-results: failed count overflows u64".to_string()
+                })?;
                 let ignored = required_u64(&value, "ignored", line_number)?;
-                let skipped = skipped_count(
-                    required_u64(&value, "filtered_out", line_number)?,
+                let population = suite_population(
+                    started.test_count,
+                    passed,
+                    failed,
                     ignored,
+                    required_u64(&value, "filtered_out", line_number)?,
                     line_number,
                 )?;
                 // nextest may launch one exact-filtered process per test,
-                // repeating the same suite-wide skipped population in every
-                // terminal suite record. Keep one count per full typed suite
-                // identity instead of multiplying recaps or conflating a lib,
-                // bin, or stress suite that renders the same test-name key.
-                skipped_by_suite
+                // repeating the same suite in multiple terminal records. Keep
+                // the greatest complete population, then subtract the unique
+                // terminal test records after the whole stream is parsed.
+                // Never conflate a lib, bin, or stress suite that renders the
+                // same test-name key.
+                population_by_suite
                     .entry(ended)
-                    .and_modify(|current| *current = (*current).max(skipped))
-                    .or_insert(skipped);
+                    .and_modify(|current| *current = (*current).max(population))
+                    .or_insert(population);
             }
             ("test", "started" | "ignored" | "ok" | "failed") => {
                 let name = required_string(&value, "name", line_number)?;
@@ -259,11 +305,11 @@ fn parse_event_text(text: &str) -> Result<ParsedEvents, String> {
                     continue;
                 }
                 let id = displayed_test_id(
-                    &suite.package,
-                    &suite.binary,
+                    &suite.identity.package,
+                    &suite.identity.binary,
                     &test,
-                    &suite.kind,
-                    suite.stress_index,
+                    &suite.identity.kind,
+                    suite.identity.stress_index,
                 );
                 let result = TestResult::new(id.clone(), event == "ok", attempts)?;
                 if results.insert(id.clone(), result).is_some() {
@@ -271,6 +317,10 @@ fn parse_event_text(text: &str) -> Result<ParsedEvents, String> {
                         "nextest-test-results line {line_number}: duplicate terminal test id {id:?}"
                     ));
                 }
+                let count = executed_by_suite.entry(suite.identity.clone()).or_insert(0);
+                *count = count.checked_add(1).ok_or_else(|| {
+                    "nextest-test-results: suite terminal result count overflows u64".to_string()
+                })?;
             }
             _ => {
                 return Err(format!(
@@ -282,7 +332,10 @@ fn parse_event_text(text: &str) -> Result<ParsedEvents, String> {
     if !open_suites.is_empty() {
         return Err(format!(
             "nextest-test-results ended before open suites published terminal events: {:?}",
-            open_suites.into_values().collect::<Vec<_>>()
+            open_suites
+                .into_values()
+                .map(|suite| suite.identity)
+                .collect::<Vec<_>>()
         ));
     }
     if !saw_event {
@@ -299,9 +352,15 @@ fn parse_event_text(text: &str) -> Result<ParsedEvents, String> {
             "nextest-test-results: typed suite records report {suite_executed} executed test(s), but typed terminal test records report {executed_tests}"
         ));
     }
-    let filtered_tests = skipped_by_suite.values().try_fold(0u64, |total, count| {
+    let filtered_tests = population_by_suite.iter().try_fold(0u64, |total, (suite, population)| {
+        let executed = executed_by_suite.get(suite).copied().unwrap_or(0);
+        let skipped = population.checked_sub(executed).ok_or_else(|| {
+            format!(
+                "nextest-test-results: suite {suite:?} has {executed} terminal result(s), exceeding its typed population {population}"
+            )
+        })?;
         total
-            .checked_add(*count)
+            .checked_add(skipped)
             .ok_or_else(|| "nextest-test-results: filtered count overflows u64".to_string())
     })?;
     Ok(ParsedEvents {
@@ -458,8 +517,8 @@ mod tests {
     #[test]
     fn distinct_suites_may_interleave_and_ignore_additive_fields() {
         let events = concat!(
-            "{\"type\":\"suite\",\"event\":\"started\",\"future\":true,\"nextest\":{\"crate\":\"alpha\",\"test_binary\":\"alpha\",\"kind\":\"lib\",\"future\":\"ok\"}}\n",
-            "{\"type\":\"suite\",\"event\":\"started\",\"nextest\":{\"crate\":\"beta\",\"test_binary\":\"tool\",\"kind\":\"bin\"}}\n",
+            "{\"type\":\"suite\",\"event\":\"started\",\"test_count\":1,\"future\":true,\"nextest\":{\"crate\":\"alpha\",\"test_binary\":\"alpha\",\"kind\":\"lib\",\"future\":\"ok\"}}\n",
+            "{\"type\":\"suite\",\"event\":\"started\",\"test_count\":1,\"nextest\":{\"crate\":\"beta\",\"test_binary\":\"tool\",\"kind\":\"bin\"}}\n",
             "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"alpha::alpha$case\"}\n",
             "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"beta::tool$case\"}\n",
             "{\"type\":\"suite\",\"event\":\"ok\",\"passed\":1,\"failed\":0,\"ignored\":0,\"filtered_out\":0,\"nextest\":{\"crate\":\"beta\",\"test_binary\":\"tool\",\"kind\":\"bin\"}}\n",
@@ -477,10 +536,10 @@ mod tests {
     #[test]
     fn lib_stress_suites_keep_distinct_ids() {
         let events = concat!(
-            "{\"type\":\"suite\",\"event\":\"started\",\"nextest\":{\"crate\":\"pkg\",\"test_binary\":\"pkg\",\"kind\":\"lib\",\"stress_index\":1}}\n",
+            "{\"type\":\"suite\",\"event\":\"started\",\"test_count\":1,\"nextest\":{\"crate\":\"pkg\",\"test_binary\":\"pkg\",\"kind\":\"lib\",\"stress_index\":1}}\n",
             "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"pkg::pkg@stress-1$case\"}\n",
             "{\"type\":\"suite\",\"event\":\"ok\",\"passed\":1,\"failed\":0,\"ignored\":0,\"filtered_out\":0,\"nextest\":{\"crate\":\"pkg\",\"test_binary\":\"pkg\",\"kind\":\"lib\",\"stress_index\":1}}\n",
-            "{\"type\":\"suite\",\"event\":\"started\",\"nextest\":{\"crate\":\"pkg\",\"test_binary\":\"pkg\",\"kind\":\"lib\",\"stress_index\":2}}\n",
+            "{\"type\":\"suite\",\"event\":\"started\",\"test_count\":1,\"nextest\":{\"crate\":\"pkg\",\"test_binary\":\"pkg\",\"kind\":\"lib\",\"stress_index\":2}}\n",
             "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"pkg::pkg@stress-2$case\"}\n",
             "{\"type\":\"suite\",\"event\":\"ok\",\"passed\":1,\"failed\":0,\"ignored\":0,\"filtered_out\":0,\"nextest\":{\"crate\":\"pkg\",\"test_binary\":\"pkg\",\"kind\":\"lib\",\"stress_index\":2}}\n",
         );
@@ -496,8 +555,8 @@ mod tests {
     #[test]
     fn ambiguous_wrong_and_incomplete_suite_streams_refuse() {
         let ambiguous = concat!(
-            "{\"type\":\"suite\",\"event\":\"started\",\"nextest\":{\"crate\":\"hermit\",\"test_binary\":\"hermit\",\"kind\":\"lib\"}}\n",
-            "{\"type\":\"suite\",\"event\":\"started\",\"nextest\":{\"crate\":\"hermit\",\"test_binary\":\"hermit\",\"kind\":\"bin\"}}\n",
+            "{\"type\":\"suite\",\"event\":\"started\",\"test_count\":0,\"nextest\":{\"crate\":\"hermit\",\"test_binary\":\"hermit\",\"kind\":\"lib\"}}\n",
+            "{\"type\":\"suite\",\"event\":\"started\",\"test_count\":0,\"nextest\":{\"crate\":\"hermit\",\"test_binary\":\"hermit\",\"kind\":\"bin\"}}\n",
         );
         assert!(
             parse_event_text(ambiguous)
@@ -506,7 +565,7 @@ mod tests {
         );
 
         let wrong_row = concat!(
-            "{\"type\":\"suite\",\"event\":\"started\",\"nextest\":{\"crate\":\"alpha\",\"test_binary\":\"alpha\",\"kind\":\"lib\"}}\n",
+            "{\"type\":\"suite\",\"event\":\"started\",\"test_count\":0,\"nextest\":{\"crate\":\"alpha\",\"test_binary\":\"alpha\",\"kind\":\"lib\"}}\n",
             "{\"type\":\"test\",\"event\":\"failed\",\"name\":\"beta::beta$case\"}\n",
         );
         assert!(
@@ -522,7 +581,7 @@ mod tests {
                 .contains("ended before its typed start metadata")
         );
 
-        let unterminated = "{\"type\":\"suite\",\"event\":\"started\",\"nextest\":{\"crate\":\"pkg\",\"test_binary\":\"pkg\",\"kind\":\"lib\"}}\n";
+        let unterminated = "{\"type\":\"suite\",\"event\":\"started\",\"test_count\":0,\"nextest\":{\"crate\":\"pkg\",\"test_binary\":\"pkg\",\"kind\":\"lib\"}}\n";
         assert!(
             parse_event_text(unterminated)
                 .unwrap_err()
@@ -605,6 +664,50 @@ mod tests {
         let parsed = parse_event_text(events).unwrap();
         assert_eq!(parsed.executed_tests, 0);
         assert_eq!(parsed.filtered_tests, 3);
+    }
+
+    #[test]
+    fn selected_ignored_tests_use_the_more_complete_typed_suite_record() {
+        // Captured from nextest 0.9.100 for `--ignored` with six selected
+        // tests in a fifteen-test binary. The first recap reports no executed
+        // tests; the second reports all six and represents `0 - 6` in the
+        // unsigned filtered_out field. The exact skipped population is nine.
+        let events = concat!(
+            r#"{"type":"suite","event":"started","test_count":15,"nextest":{"crate":"hermit","test_binary":"app_strict_verify","kind":"test"}}"#,
+            "\n",
+            r#"{"type":"test","event":"started","name":"hermit::app_strict_verify$one"}"#,
+            "\n",
+            r#"{"type":"suite","event":"ok","passed":0,"failed":0,"ignored":15,"measured":0,"filtered_out":0,"nextest":{"crate":"hermit","test_binary":"app_strict_verify","kind":"test"}}"#,
+            "\n",
+            r#"{"type":"suite","event":"started","test_count":15,"nextest":{"crate":"hermit","test_binary":"app_strict_verify","kind":"test"}}"#,
+            "\n",
+            r#"{"type":"test","event":"ok","name":"hermit::app_strict_verify$one"}"#,
+            "\n",
+            r#"{"type":"test","event":"ok","name":"hermit::app_strict_verify$two"}"#,
+            "\n",
+            r#"{"type":"test","event":"ok","name":"hermit::app_strict_verify$three"}"#,
+            "\n",
+            r#"{"type":"test","event":"ok","name":"hermit::app_strict_verify$four"}"#,
+            "\n",
+            r#"{"type":"test","event":"ok","name":"hermit::app_strict_verify$five"}"#,
+            "\n",
+            r#"{"type":"test","event":"ok","name":"hermit::app_strict_verify$six"}"#,
+            "\n",
+            r#"{"type":"suite","event":"ok","passed":6,"failed":0,"ignored":15,"measured":0,"filtered_out":18446744073709551610,"nextest":{"crate":"hermit","test_binary":"app_strict_verify","kind":"test"}}"#,
+        );
+        let parsed = parse_event_text(events).unwrap();
+        assert_eq!(parsed.executed_tests, 6);
+        assert_eq!(parsed.filtered_tests, 9);
+
+        let malformed = events.replace(
+            "\"filtered_out\":18446744073709551610",
+            "\"filtered_out\":18446744073709551611",
+        );
+        assert!(
+            parse_event_text(&malformed)
+                .unwrap_err()
+                .contains("ignored + filtered_out overflows u64")
+        );
     }
 
     #[test]
