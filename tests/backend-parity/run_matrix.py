@@ -923,17 +923,55 @@ def stdout_parity_evidence(
 
 
 CPUID_BLOCK_REASON = "host kernel/CPU lacks CPUID faulting"
-CPUID_BLOCK_DIAGNOSTICS = (
-    "continuing without CPUID interception",
-    "CPUID faulting is unavailable",
-)
+HOST_CAPABILITIES = frozenset(("cpuid-faulting", "kvm"))
 
 
-def cpuid_policy_is_blocked(backend: str, name: str, diagnostic: str) -> bool:
+def parse_host_capabilities(raw: bytes) -> dict[str, dict[str, object]]:
+    try:
+        report = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise MatrixError(f"host-capabilities record is not valid JSON: {error}") from error
+    if not isinstance(report, dict) or report.get("schema") != 1:
+        raise MatrixError("host-capabilities record must use schema 1")
+    capabilities = report.get("host_capabilities")
+    if not isinstance(capabilities, dict) or set(capabilities) != HOST_CAPABILITIES:
+        raise MatrixError(
+            "host-capabilities record must contain the complete closed set "
+            f"{sorted(HOST_CAPABILITIES)!r}"
+        )
+    for name, verdict in capabilities.items():
+        if (
+            not isinstance(verdict, dict)
+            or set(verdict) != {"present", "evidence"}
+            or not isinstance(verdict.get("present"), bool)
+            or not isinstance(verdict.get("evidence"), str)
+            or not verdict["evidence"].strip()
+        ):
+            raise MatrixError(f"host-capabilities {name!r} verdict is malformed")
+    return capabilities
+
+
+def read_host_capabilities(hermit: Path) -> dict[str, dict[str, object]]:
+    result = run_with_timeout([str(hermit), "host-capabilities", "--json"])
+    if result is None:
+        raise MatrixError("hermit host-capabilities probe timed out")
+    if result.returncode != 0:
+        detail = result.stderr.decode(errors="replace").strip()
+        raise MatrixError(
+            f"hermit host-capabilities probe failed with exit {result.returncode}: {detail}"
+        )
+    return parse_host_capabilities(result.stdout)
+
+
+def cpuid_policy_is_blocked(
+    backend: str,
+    name: str,
+    host_capabilities: dict[str, dict[str, object]],
+) -> bool:
     return (
         backend == "ptrace"
         and name == "cpuid_policy"
-        and any(marker in diagnostic for marker in CPUID_BLOCK_DIAGNOSTICS)
+        and host_capabilities["cpuid-faulting"]["present"] is False
     )
 
 
@@ -945,6 +983,7 @@ def capture_ptrace_reference(
     expected_status: int,
     expected_stdout: bytes | None,
     host_tmp: Path,
+    host_capabilities: dict[str, dict[str, object]],
 ) -> tuple[bytes | None, str, bool]:
     """Capture the plain-run ptrace stdout used as the cross-backend reference."""
     reference = run_with_timeout(
@@ -954,7 +993,7 @@ def capture_ptrace_reference(
         return None, "ptrace reference timed out", False
     if reference.returncode != expected_status:
         diagnostic = reference.stderr.decode(errors="replace").strip()
-        if cpuid_policy_is_blocked("ptrace", name, diagnostic):
+        if cpuid_policy_is_blocked("ptrace", name, host_capabilities):
             return None, CPUID_BLOCK_REASON, True
         return (
             None,
@@ -1144,6 +1183,7 @@ def run_case_verify(
     expected_status: int,
     expected_l2: str,
     host_tmp: Path,
+    host_capabilities: dict[str, dict[str, object]],
     evidence: dict[str, str] | None = None,
 ) -> tuple[str, str, float]:
     """Verification probe: one `hermit run --strict --verify` invocation.
@@ -1180,7 +1220,7 @@ def run_case_verify(
         return "FAIL", "verify run timed out", time.monotonic() - started
     diagnostic = result.stderr.decode(errors="replace").strip()
     if result.returncode != expected_status:
-        if cpuid_policy_is_blocked(backend, name, diagnostic):
+        if cpuid_policy_is_blocked(backend, name, host_capabilities):
             return (
                 "BLOCKED",
                 CPUID_BLOCK_REASON,
@@ -1238,8 +1278,11 @@ def run_case(
     strict: bool,
     verify: bool = False,
     expected_l2: str = "gap",
+    host_capabilities: dict[str, dict[str, object]] | None = None,
     evidence: dict[str, str] | None = None,
 ) -> tuple[str, str, float]:
+    if host_capabilities is None:
+        raise MatrixError("run_case requires the producer-owned host-capabilities record")
     guest, expected_status, expected_stdout = case_command(name, fixtures)
     reference_guest = [*guest]
     if evidence is not None:
@@ -1263,6 +1306,7 @@ def run_case(
             expected_status,
             expected_l2,
             host_tmp,
+            host_capabilities,
             evidence,
         )
     baseline: bytes | None = None
@@ -1288,6 +1332,7 @@ def run_case(
             expected_status,
             expected_stdout,
             reference_tmp,
+            host_capabilities,
         )
         if evidence is not None:
             evidence.update(stdout_parity_evidence(None, reference_stdout))
@@ -1340,7 +1385,7 @@ def run_case(
 
         if result.returncode != expected_status:
             diagnostic = result.stderr.decode(errors="replace").strip()
-            if cpuid_policy_is_blocked(backend, name, diagnostic):
+            if cpuid_policy_is_blocked(backend, name, host_capabilities):
                 return (
                     "BLOCKED",
                     CPUID_BLOCK_REASON,
@@ -1888,6 +1933,7 @@ def main() -> int:
         raise MatrixError(
             "--parent-scorecard and --no-parent-scorecard cannot be used together"
         )
+    host_capabilities = read_host_capabilities(hermit)
     results: list[dict[str, str]] = []
     failures = 0
     executed_cases = 0
@@ -1930,6 +1976,7 @@ def main() -> int:
                     strict,
                     args.verify,
                     expected,
+                    host_capabilities,
                     evidence,
                 )
                 if is_gap and status == "PASS":

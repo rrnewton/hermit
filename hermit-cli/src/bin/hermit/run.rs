@@ -27,6 +27,8 @@ use std::time::Duration;
 
 use clap::Parser;
 use colored::Colorize;
+use detcore_model::backend_engagement::BackendEngagement;
+use detcore_model::backend_engagement::BackendEngagementReport;
 use detcore_model::happens_before::HappensBeforeProgram;
 use detcore_model::happens_before::Strength;
 use detcore_model::summary::RunSummary;
@@ -109,6 +111,33 @@ fn private_verify_summary() -> Result<tempfile::NamedTempFile, Error> {
         // to both run containers, and the temporary file is removed on drop.
         .tempfile_in(std::env::current_dir()?)
         .context("creating private verification run summary")
+}
+
+fn private_backend_engagement_summary() -> Result<tempfile::NamedTempFile, Error> {
+    tempfile::Builder::new()
+        .prefix(".hermit-backend-engagement-summary-")
+        // Hermit's isolated /tmp is not the host /tmp. The checkout is visible
+        // to the run container, and the temporary file is removed on drop.
+        .tempfile_in(std::env::current_dir()?)
+        .context("creating private backend-engagement run summary")
+}
+
+fn clear_machine_record(path: &Path, description: &str) -> Result<(), Error> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("clearing stale {description} record {}", path.display())),
+    }
+}
+
+fn write_backend_engagement(path: &Path, engagement: BackendEngagement) -> Result<(), Error> {
+    let report = BackendEngagementReport::new(engagement);
+    report.validate().map_err(Error::msg)?;
+    let mut bytes = serde_json::to_vec(&report)?;
+    bytes.push(b'\n');
+    fs::write(path, bytes)
+        .with_context(|| format!("writing backend engagement record {}", path.display()))
 }
 
 fn take_verify_summary_before_next_run(path: &Path) -> Result<Option<RunSummary>, Error> {
@@ -472,6 +501,17 @@ pub struct RunOpts {
     #[clap(long)]
     pub(crate) summary_json: Option<PathBuf>,
 
+    /// Write the selected backend's own engagement evidence as JSON.
+    ///
+    /// This is a single-run record. Verification has separate per-attempt
+    /// records and therefore cannot use one path without losing an attempt.
+    #[clap(
+        long,
+        conflicts_with_all = ["verify", "namespace_only"],
+        value_name = "PATH"
+    )]
+    backend_engagement_json: Option<PathBuf>,
+
     /// Diagnose non-zero network binds. Implies an isolated network namespace and conflicts with
     /// `--network=host`.
     #[clap(long)]
@@ -505,6 +545,12 @@ pub struct RunOpts {
     /// Resolved guest executable path used after e9patch preprocessing.
     #[clap(skip)]
     e9patch_program: Option<PathBuf>,
+
+    /// Number of root-image sites actually rewritten during e9patch
+    /// preparation. Kept as a value so a later consumer never has to recover it
+    /// from the presentation banner.
+    #[clap(skip)]
+    e9patch_mapped_sites: Option<u64>,
 }
 
 pub(super) fn parse_assignment(src: &str) -> Result<(String, Option<String>), Error> {
@@ -744,6 +790,10 @@ impl fmt::Display for RunOpts {
         if let Some(p) = &self.summary_json {
             let s = p.to_str().expect("valid unicode path");
             write!(f, " --summary-json={}", shell_words::quote(s))?;
+        }
+        if let Some(p) = &self.backend_engagement_json {
+            let s = p.to_str().expect("valid unicode path");
+            write!(f, " --backend-engagement-json={}", shell_words::quote(s))?;
         }
         if self.analyze_networking {
             write!(f, " --analyze-networking")?;
@@ -2612,6 +2662,9 @@ impl RunOpts {
         // subcommand (`hermit run --backend X ...`). An explicit subcommand-level
         // value wins; otherwise fall back to the global one.
         self.backend = self.backend.or(global.backend);
+        if let Some(path) = &self.backend_engagement_json {
+            clear_machine_record(path, "backend engagement")?;
+        }
         if self.verify {
             validate_log_level(global)?;
         }
@@ -2693,6 +2746,16 @@ impl RunOpts {
         if backend == Backend::E9patch {
             self.prepare_e9patch_program()?;
         }
+        let private_engagement_summary = if self.backend_engagement_json.is_some()
+            && backend == Backend::Ptrace
+            && self.summary_json.is_none()
+        {
+            let file = private_backend_engagement_summary()?;
+            self.summary_json = Some(file.path().to_owned());
+            Some(file)
+        } else {
+            None
+        };
         // });
 
         // DBT uses its dedicated CLI launch adapter. SaBRe, LiteInst, KVM,
@@ -2720,6 +2783,7 @@ impl RunOpts {
                     retained_log_dir.as_deref(),
                     self.verify_json.as_deref(),
                     self.summary,
+                    self.backend_engagement_json.as_deref(),
                     global.log,
                     global.log_file.as_deref(),
                     &config,
@@ -2751,6 +2815,8 @@ impl RunOpts {
             self.verify(global)
         } else {
             let (status, _) = self.run(global, false)?;
+            self.write_backend_engagement_after_run()?;
+            drop(private_engagement_summary);
             Ok(status)
         }
     }
@@ -2799,6 +2865,15 @@ impl RunOpts {
             anyhow::bail!(
                 "the dbt backend cannot apply --mount, --bind, or --workdir because its \
                  DynamoRIO adapter does not enter the guest mount namespace"
+            );
+        }
+        if self.backend_engagement_json.is_some()
+            && !matches!(backend, Backend::Ptrace | Backend::E9patch | Backend::Dbt)
+        {
+            anyhow::bail!(
+                "--backend-engagement-json is not available for backend `{}`; SaBRe publishes \
+                 HERMIT_SABRE_PATH_EVIDENCE, and liteinst/KVM expose no engagement value",
+                backend.as_str()
             );
         }
         if self.image.is_some() && self.namespace_only {
@@ -3472,6 +3547,7 @@ impl RunOpts {
         self.e9patch_program = Some(guest.clone());
         let overlay_target = self.resolve_e9patch_overlay_target(&guest, &host)?;
         if !is_elf_file(&host)? {
+            self.e9patch_mapped_sites = Some(0);
             eprintln!(
                 ":: Backend: e9patch preprocessing + ptrace runtime; mapped_sites=0; \
                  main_executable=non-ELF; preprocessing=not-applicable"
@@ -3482,6 +3558,10 @@ impl RunOpts {
             anyhow::bail!("backend `e9patch` is unavailable: {reason}");
         }
         let prepared = hermit::e9patch::prepare(&host)?;
+        self.e9patch_mapped_sites = Some(
+            u64::try_from(prepared.patched_sites)
+                .map_err(|_| Error::msg("e9patch mapped-site count does not fit u64"))?,
+        );
         if prepared.patched_sites != 0 {
             self.validate_e9patch_mount_targets()?;
             self.validate_e9patch_source_visibility(&prepared.binary)?;
@@ -3521,6 +3601,50 @@ impl RunOpts {
             );
         }
         Ok(())
+    }
+
+    fn write_backend_engagement_after_run(&self) -> Result<(), Error> {
+        let Some(path) = &self.backend_engagement_json else {
+            return Ok(());
+        };
+        let engagement = match self.selected_backend() {
+            Backend::Ptrace => {
+                let summary_path = self.summary_json.as_deref().ok_or_else(|| {
+                    Error::msg("ptrace backend engagement requires a typed run summary")
+                })?;
+                let summary = fs::read(summary_path)
+                    .with_context(|| {
+                        format!(
+                            "reading ptrace backend engagement from {}",
+                            summary_path.display()
+                        )
+                    })
+                    .and_then(|bytes| {
+                        serde_json::from_slice::<RunSummary>(&bytes).with_context(|| {
+                            format!(
+                                "parsing ptrace backend engagement from {}",
+                                summary_path.display()
+                            )
+                        })
+                    })?;
+                BackendEngagement::Ptrace {
+                    scheduler_turns: summary.sched_turns,
+                }
+            }
+            Backend::E9patch => BackendEngagement::E9patch {
+                mapped_sites: self.e9patch_mapped_sites.ok_or_else(|| {
+                    Error::msg("e9patch backend engagement was not recorded during preparation")
+                })?,
+            },
+            Backend::Dbt => unreachable!("the DBT adapter writes its own engagement record"),
+            Backend::Liteinst | Backend::Sabre | Backend::Kvm => {
+                return Err(Error::msg(format!(
+                    "backend `{}` does not expose an engagement value",
+                    self.selected_backend().as_str()
+                )));
+            }
+        };
+        write_backend_engagement(path, engagement)
     }
 
     fn tmpfs(&self) -> Result<Tmpfs<'_>, Error> {
@@ -4340,6 +4464,48 @@ mod tests {
         assert_eq!(fs::read(file.path()).unwrap(), b"");
 
         Ok::<(), Error>(())
+    }
+
+    #[test]
+    fn ptrace_engagement_record_reads_the_typed_run_summary() {
+        let summary_file = tempfile::NamedTempFile::new().unwrap();
+        let engagement_file = tempfile::NamedTempFile::new().unwrap();
+        let mut options = RunOpts::parse_from(["hermit", "--backend=ptrace", "/bin/true"]);
+        options.summary_json = Some(summary_file.path().to_owned());
+        options.backend_engagement_json = Some(engagement_file.path().to_owned());
+
+        for scheduler_turns in [12, 13] {
+            let summary = RunSummary {
+                sched_turns: scheduler_turns,
+                ..Default::default()
+            };
+            fs::write(summary_file.path(), serde_json::to_vec(&summary).unwrap()).unwrap();
+            options.write_backend_engagement_after_run().unwrap();
+            let report: BackendEngagementReport =
+                serde_json::from_slice(&fs::read(engagement_file.path()).unwrap()).unwrap();
+            assert_eq!(
+                report.engagement,
+                BackendEngagement::Ptrace { scheduler_turns }
+            );
+        }
+    }
+
+    #[test]
+    fn e9patch_engagement_record_follows_the_preparation_value() {
+        let engagement_file = tempfile::NamedTempFile::new().unwrap();
+        let mut options = RunOpts::parse_from(["hermit", "--backend=e9patch", "/bin/true"]);
+        options.backend_engagement_json = Some(engagement_file.path().to_owned());
+
+        for mapped_sites in [0, 2] {
+            options.e9patch_mapped_sites = Some(mapped_sites);
+            options.write_backend_engagement_after_run().unwrap();
+            let report: BackendEngagementReport =
+                serde_json::from_slice(&fs::read(engagement_file.path()).unwrap()).unwrap();
+            assert_eq!(
+                report.engagement,
+                BackendEngagement::E9patch { mapped_sites }
+            );
+        }
     }
 
     #[test]
