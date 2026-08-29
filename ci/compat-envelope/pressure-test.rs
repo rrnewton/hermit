@@ -4944,6 +4944,7 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
         false,
         None,
         None,
+        None,
     );
     let mut oom = StepOutcome::failed(
         "cell.oom".into(),
@@ -4960,6 +4961,7 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
         DEFAULT_CPU_TIMEOUT_MULTIPLIER,
         "",
         false,
+        None,
         None,
         None,
     );
