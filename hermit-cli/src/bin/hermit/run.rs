@@ -549,11 +549,10 @@ pub struct RunOpts {
     #[clap(skip)]
     e9patch_program: Option<PathBuf>,
 
-    /// Number of root-image sites actually rewritten during e9patch
-    /// preparation. Kept as a value so a later consumer never has to recover it
-    /// from the presentation banner.
+    /// Complete root-image preparation result, retained so later consumers do
+    /// not have to recover any count from the presentation banner.
     #[clap(skip)]
-    e9patch_mapped_sites: Option<u64>,
+    e9patch_engagement: Option<BackendEngagement>,
 }
 
 pub(super) fn parse_assignment(src: &str) -> Result<(String, Option<String>), Error> {
@@ -3550,7 +3549,11 @@ impl RunOpts {
         self.e9patch_program = Some(guest.clone());
         let overlay_target = self.resolve_e9patch_overlay_target(&guest, &host)?;
         if !is_elf_file(&host)? {
-            self.e9patch_mapped_sites = Some(0);
+            self.e9patch_engagement = Some(BackendEngagement::E9patch {
+                candidate_sites: 0,
+                mapped_sites: 0,
+                b0_sites: 0,
+            });
             eprintln!(
                 ":: Backend: e9patch preprocessing + ptrace runtime; mapped_sites=0; \
                  main_executable=non-ELF; preprocessing=not-applicable"
@@ -3561,10 +3564,14 @@ impl RunOpts {
             anyhow::bail!("backend `e9patch` is unavailable: {reason}");
         }
         let prepared = hermit::e9patch::prepare(&host)?;
-        self.e9patch_mapped_sites = Some(
-            u64::try_from(prepared.patched_sites)
+        self.e9patch_engagement = Some(BackendEngagement::E9patch {
+            candidate_sites: u64::try_from(prepared.candidate_sites)
+                .map_err(|_| Error::msg("e9patch candidate-site count does not fit u64"))?,
+            mapped_sites: u64::try_from(prepared.patched_sites)
                 .map_err(|_| Error::msg("e9patch mapped-site count does not fit u64"))?,
-        );
+            b0_sites: u64::try_from(prepared.b0_sites)
+                .map_err(|_| Error::msg("e9patch B0-site count does not fit u64"))?,
+        });
         if prepared.patched_sites != 0 {
             self.validate_e9patch_mount_targets()?;
             self.validate_e9patch_source_visibility(&prepared.binary)?;
@@ -3634,11 +3641,9 @@ impl RunOpts {
                     scheduler_turns: summary.sched_turns,
                 }
             }
-            Backend::E9patch => BackendEngagement::E9patch {
-                mapped_sites: self.e9patch_mapped_sites.ok_or_else(|| {
-                    Error::msg("e9patch backend engagement was not recorded during preparation")
-                })?,
-            },
+            Backend::E9patch => self.e9patch_engagement.clone().ok_or_else(|| {
+                Error::msg("e9patch backend engagement was not recorded during preparation")
+            })?,
             Backend::Dbt => unreachable!("the DBT adapter writes its own engagement record"),
             Backend::Liteinst | Backend::Sabre | Backend::Kvm => {
                 return Err(Error::msg(format!(
@@ -4582,14 +4587,22 @@ mod tests {
         let mut options = RunOpts::parse_from(["hermit", "--backend=e9patch", "/bin/true"]);
         options.backend_engagement_json = Some(engagement_file.path().to_owned());
 
-        for mapped_sites in [0, 2] {
-            options.e9patch_mapped_sites = Some(mapped_sites);
+        for (candidate_sites, mapped_sites, b0_sites) in [(0, 0, 0), (2, 2, 0)] {
+            options.e9patch_engagement = Some(BackendEngagement::E9patch {
+                candidate_sites,
+                mapped_sites,
+                b0_sites,
+            });
             options.write_backend_engagement_after_run().unwrap();
             let report: BackendEngagementReport =
                 serde_json::from_slice(&fs::read(engagement_file.path()).unwrap()).unwrap();
             assert_eq!(
                 report.engagement,
-                BackendEngagement::E9patch { mapped_sites }
+                BackendEngagement::E9patch {
+                    candidate_sites,
+                    mapped_sites,
+                    b0_sites,
+                }
             );
         }
     }
