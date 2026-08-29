@@ -239,7 +239,7 @@ Examples:
     --sample 10 --seed 42 --cell-timeout 60
 
   # Check one committed green cell 100 times under the same boxed limits.
-  # The DAG admits at most four manifest guests at once (one for KVM).
+  # The DAG admits at most four manifest guests at once, including KVM guests.
   ./ci/compat-envelope/pressure-test.rs run \
     --test backend-parity-c/fork-exec-pipeline \
     --mode verify --backend ptrace --repetitions 100 --cell-timeout 120
