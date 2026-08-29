@@ -124,6 +124,7 @@ use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::E2E_KERNEL_VERSION_ENV;
 use hermit_manifest_plan::runner::E2E_MACHINE_SHORTNAME_ENV;
 use hermit_manifest_plan::service_result::FinalValidateStatus;
+use hermit_manifest_plan::service_result::ScorecardWriteback;
 use hermit_manifest_plan::service_result::ValidationServiceResult;
 
 use validate_plan::CompatMode;
@@ -436,8 +437,10 @@ fn usage() -> &'static str {
      \x20 FINAL_VALIDATE_STATUS: PASSED          exit 0\n\
      \x20 FINAL_VALIDATE_STATUS: FAILED          exit 1\n\
      \x20 FINAL_VALIDATE_STATUS: COULD_NOT_RUN   exit 75\n\
-     The line is validate's last output. Readers take the last occurrence and\n\
-     require the exit code to agree; no line means validate died before reporting.\n\
+     The line is validate's last output and reports the validation verdict. A\n\
+     post-verdict scorecard write-back failure preserves that line and exits 75;\n\
+     current readers distinguish the two through ValidationServiceResult. No line\n\
+     means validate died before reporting.\n\
      Help, --show-plan, and --probe-host-capability do not attempt validation and\n\
      therefore do not emit a final validate status.\n\
      \n\
@@ -1392,7 +1395,7 @@ fn self_test() -> Result<(), String> {
     let lines = run_summary_lines(&writeback_failed, std::time::Instant::now());
     if (writeback_failed.verdict, writeback_failed.exit_code)
         != (Verdict::Pass, COULD_NOT_RUN_EXIT_CODE)
-        || lines.last().map(String::as_str) != Some("FINAL_VALIDATE_STATUS: COULD_NOT_RUN")
+        || lines.last().map(String::as_str) != Some("FINAL_VALIDATE_STATUS: PASSED")
         || !lines.iter().any(|line| line.contains("validation verdict above is unchanged"))
     {
         return Err(format!(
@@ -1411,11 +1414,15 @@ fn self_test() -> Result<(), String> {
         &std::fs::read(&writeback_result_path)
             .map_err(|error| format!("summary: cannot read write-back result: {error}"))?,
     )?;
-    if writeback_result.final_validate_status != FinalValidateStatus::CouldNotRun
+    if writeback_result.final_validate_status != FinalValidateStatus::Passed
         || writeback_result.exit_code != i32::from(COULD_NOT_RUN_EXIT_CODE)
+        || writeback_result.scorecard_writeback
+            != Some(ScorecardWriteback::Failed {
+                error: "fixture refusal".into(),
+            })
     {
         return Err(format!(
-            "summary: scorecard write-back refusal did not carry the final command status into the service result: {writeback_result:?}"
+            "summary: scorecard write-back refusal did not preserve the validation verdict and carry its own typed failure: {writeback_result:?}"
         ));
     }
     let service_result_dir = tempfile::tempdir()
@@ -1433,6 +1440,7 @@ fn self_test() -> Result<(), String> {
         || service_result.exit_code != 0
         || service_result.executed_nodes != 76
         || service_result.executed_tests != Some(2129)
+        || service_result.scorecard_writeback.is_some()
     {
         return Err(format!(
             "summary: framework service result lost typed status or counts: {service_result:?}"
@@ -4144,12 +4152,17 @@ fn record_scorecard_writeback(
 ) {
     let Some(writeback) = writeback else { return };
     let detail = match writeback {
-        Ok(()) =>
-            "scorecard write-back completed; review the generated SCORECARD.md and ci/compat-envelope/cells.json changes before committing".into(),
+        Ok(()) => {
+            summary.scorecard_writeback = Some(ScorecardWriteback::Completed);
+            "scorecard write-back completed; review the generated SCORECARD.md and ci/compat-envelope/cells.json changes before committing".into()
+        }
         Err(error) => {
             if summary.exit_code == 0 {
                 summary.exit_code = COULD_NOT_RUN_EXIT_CODE;
             }
+            summary.scorecard_writeback = Some(ScorecardWriteback::Failed {
+                error: error.clone(),
+            });
             format!(
                 "scorecard write-back FAILED after validation evidence was finalized: {error}; the validation verdict above is unchanged"
             )
@@ -14537,6 +14550,9 @@ struct RunSummary {
     /// receipt unciteable). `None` on a path that stopped before cleanup; `main`
     /// then measures live rather than printing nothing.
     cpu_wall: Option<(f64, f64, f64)>,
+    /// Bookkeeping performed after the validation verdict was finalized.
+    /// Failure remains a loud command error but cannot rewrite that verdict.
+    scorecard_writeback: Option<ScorecardWriteback>,
 }
 
 impl RunSummary {
@@ -14566,6 +14582,7 @@ impl RunSummary {
             log: None,
             ledger: None,
             cpu_wall: None,
+            scorecard_writeback: None,
         }
     }
     /// Admission control declined. `what` names the gate, `why` the reason.
@@ -15119,13 +15136,12 @@ fn run_summary_lines(s: &RunSummary, started: std::time::Instant) -> Vec<String>
         validate_runtime::cpu_wall_line(human_duration, wall, user, sys, host_cpus)
     ));
     lines.extend(s.epilogue.iter().cloned());
-    if let Some(mut status) = final_validate_status(s.verdict) {
-        if status.exit_code() != i32::from(s.exit_code) {
-            status = FinalValidateStatus::CouldNotRun;
-        }
+    if let Some(status) = final_validate_status(s.verdict) {
         // LAST by contract. A wrapper, guest, fixture or quoted diagnostic may
-        // have written an earlier lookalike to the same channel; readers use the
-        // last occurrence and require its value to agree with the exit code.
+        // have written an earlier lookalike to the same channel. Current readers
+        // take the verdict and command exit from ValidationServiceResult, where a
+        // post-verdict write-back refusal is represented separately. The log-only
+        // reader remains for historical runs whose status and exit were coupled.
         lines.push(format!("{FINAL_VALIDATE_STATUS_PREFIX}{}", status.as_str()));
     }
     lines
@@ -15140,12 +15156,9 @@ fn print_run_summary(s: &RunSummary, started: std::time::Instant) {
 fn write_validation_service_result(path: &Path, summary: &RunSummary) -> Result<(), String> {
     use std::io::Write;
 
-    let Some(mut status) = final_validate_status(summary.verdict) else {
+    let Some(status) = final_validate_status(summary.verdict) else {
         return Ok(());
     };
-    if status.exit_code() != i32::from(summary.exit_code) {
-        status = FinalValidateStatus::CouldNotRun;
-    }
     let result = ValidationServiceResult::new(
         summary.commit.clone(),
         summary.profile.clone(),
@@ -15154,6 +15167,7 @@ fn write_validation_service_result(path: &Path, summary: &RunSummary) -> Result<
         u64::try_from(summary.nodes_executed)
             .map_err(|_| "validation-service-result-executed_nodes exceeds u64".to_string())?,
         summary.executed_tests,
+        summary.scorecard_writeback.clone(),
     )?;
     let bytes = serde_json::to_vec(&result)
         .map_err(|error| format!("cannot encode validation service result: {error}"))?;

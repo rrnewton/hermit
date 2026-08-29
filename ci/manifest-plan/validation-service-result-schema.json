@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "fields": [
     "schema_version",
     "commit",
@@ -7,23 +7,31 @@
     "final_validate_status",
     "exit_code",
     "executed_nodes",
-    "executed_tests"
+    "executed_tests",
+    "scorecard_writeback"
   ],
   "outcomes": {
     "PASSED": {
-      "exit_code": 0,
+      "validation_exit_code": 0,
       "state": "completed",
       "result": "success"
     },
     "FAILED": {
-      "exit_code": 1,
+      "validation_exit_code": 1,
       "state": "completed",
       "result": "failure"
     },
     "COULD_NOT_RUN": {
-      "exit_code": 75,
+      "validation_exit_code": 75,
       "state": "completed",
       "result": "no-result"
+    }
+  },
+  "scorecard_writeback": {
+    "nullable": true,
+    "variants": {
+      "completed": ["status"],
+      "failed": ["status", "error"]
     }
   }
 }
