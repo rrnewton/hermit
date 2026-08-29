@@ -172,6 +172,7 @@ fn startup_stdin() -> io::Result<Option<File>> {
 
 use clap::Parser;
 use colored::*;
+use hermit::BackendUnavailable;
 use hermit::Error;
 use hermit::ExitStatus;
 use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
@@ -535,6 +536,12 @@ fn classify_failure(error: &Error) -> String {
         // caller "hermit is broken" for what is almost always a typo.
         return format!("HERMIT_INTERNAL_FAILURE class={}", fault.class());
     }
+    if let Some(unavailable) = error.downcast_ref::<BackendUnavailable>() {
+        return format!(
+            "HERMIT_INTERNAL_FAILURE class=backend-unavailable backend={}",
+            unavailable.backend().as_str()
+        );
+    }
     if error.downcast_ref::<ContainerChildPanic>().is_some() {
         // The child PANICKED and the panic was caught and reported. Still the
         // tracer breaking, not the CLI refusing -- which is the distinction the
@@ -580,13 +587,33 @@ fn display_error(error: Error) {
 mod tests {
     use clap::CommandFactory;
     use clap::Parser;
+    use hermit::Backend;
+    use hermit::BackendUnavailable;
+    use hermit::Error;
 
     use super::Args;
     use super::Subcommand;
+    use super::classify_failure;
 
     #[test]
     fn clap_configuration_is_valid() {
         Args::command().debug_assert();
+    }
+
+    #[test]
+    fn backend_unavailability_is_classified_by_type_not_message() {
+        let typed = Error::new(BackendUnavailable::new(Backend::Dbt, "SDK absent"));
+        assert_eq!(
+            classify_failure(&typed),
+            "HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=dbt"
+        );
+
+        let prose_only = Error::msg("backend `dbt` is unavailable: SDK absent");
+        assert_eq!(
+            classify_failure(&prose_only),
+            "HERMIT_INTERNAL_FAILURE class=cli-error",
+            "changing only prose must not manufacture the typed class"
+        );
     }
 
     /// Plant a previous invocation's GREEN verdict at `path`, the way a caller
