@@ -37,9 +37,21 @@ if ! command -v "$cc_bin" > /dev/null 2>&1; then
 fi
 
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd -- "$here/../.." && pwd)"
+if [[ $hermit == */* ]]; then
+    default_verification_report_bin="$(dirname -- "$hermit")/verification-report"
+else
+    default_verification_report_bin="$repo_root/target/debug/verification-report"
+fi
+VERIFICATION_REPORT_BIN=${VERIFICATION_REPORT_BIN:-$default_verification_report_bin}
 state_src="$here/../c/timer_create_determinism.c"
 signal_src="$here/../bin/posix_timer_test.c"
 periodic_src="$here/../c/periodic_setitimer_delivery.c"
+
+if [[ ! -x $VERIFICATION_REPORT_BIN ]]; then
+    echo "FAIL: typed verification-report reader is not executable: $VERIFICATION_REPORT_BIN" >&2
+    exit 1
+fi
 
 work=$(mktemp -d strict_timer_test_XXXXXXX)
 function on_exit {
@@ -57,14 +69,20 @@ periodic_guest="$work/periodic_setitimer_guest"
 "$cc_bin" -std=c11 -O2 -Wall -Wextra -Werror -o "$periodic_guest" "$periodic_src"
 
 for guest in "$state_guest" "$signal_guest" "$periodic_guest"; do
-    if "$hermit" run --strict --verify -- "$guest" < /dev/null 2>&1 \
-        | grep -q "Determinism verified"; then
-        echo "ok: $(basename "$guest") verified deterministic under --strict"
-    else
+    verify_report="$work/$(basename "$guest").verify.json"
+    verify_output="$work/$(basename "$guest").verify.log"
+    if ! "$hermit" run --strict --verify --verify-json "$verify_report" -- \
+        "$guest" < /dev/null >"$verify_output" 2>&1; then
         echo "FAIL: $(basename "$guest") did not verify deterministic under --strict"
-        "$hermit" run --strict --verify -- "$guest" < /dev/null 2>&1 | tail -20
+        tail -20 "$verify_output"
         exit 1
     fi
+    if ! "$VERIFICATION_REPORT_BIN" matched "$verify_report"; then
+        echo "FAIL: $(basename "$guest") typed verification report did not match"
+        tail -20 "$verify_output"
+        exit 1
+    fi
+    echo "ok: $(basename "$guest") verified deterministic under --strict"
 done
 
 echo "Test succeeded."

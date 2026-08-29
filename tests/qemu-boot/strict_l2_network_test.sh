@@ -71,6 +71,7 @@ trap 'exit 130' INT TERM
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/../.." && pwd)
 hermit_bin=${HERMIT_BIN:-$repo_root/target/release/hermit}
+VERIFICATION_REPORT_BIN=${VERIFICATION_REPORT_BIN:-$(dirname -- "$hermit_bin")/verification-report}
 kernel_image=${KERNEL_IMAGE:-/boot/vmlinuz}
 output_dir=${OUTPUT_DIR:-$repo_root/target/qemu-strict-l2-network}
 phase_timeout_seconds=${QEMU_L2_PHASE_TIMEOUT_SECONDS:-300}
@@ -83,6 +84,8 @@ if [[ -z $qemu_bin ]]; then
 fi
 
 [[ -x $hermit_bin ]] || fail "Hermit release binary not found: $hermit_bin"
+[[ -x $VERIFICATION_REPORT_BIN ]] || fail \
+  "typed verification-report reader not found: $VERIFICATION_REPORT_BIN"
 [[ -n $qemu_bin && -x $qemu_bin ]] || fail "qemu-system-x86_64 not found; set QEMU_BIN"
 [[ -r $kernel_image ]] || fail "kernel image is not readable: $kernel_image"
 if [[ ! $phase_timeout_seconds =~ ^[1-9][0-9]*$ ]]; then
@@ -242,17 +245,8 @@ cat "$verifier_stderr" >&2
 if ((status != 0)); then
   fail "QEMU strict L2 network verification exited with status $status"
 fi
-grep -Fq ':: Success: deterministic. Determinism verified.' "$verifier_stderr" || \
-  fail "Hermit exited successfully without the L2 verification marker"
 [[ -s $verify_report ]] || fail "Hermit published no typed verification report"
-jq -e '
-  type == "object"
-  and .verdict == "matched"
-  and .verified == true
-  and .bitwise_parity == true
-  and ((.compared_log_messages.left // 0) > 0)
-  and ((.compared_log_messages.right // 0) > 0)
-' "$verify_report" >/dev/null || {
+"$VERIFICATION_REPORT_BIN" canonical-match "$verify_report" || {
   cat "$verify_report" >&2
   fail "typed verification report did not establish non-vacuous bitwise parity"
 }
