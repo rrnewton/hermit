@@ -20,7 +20,8 @@ function write_structured_test_counts {
 }
 
 function emit_libtest_count {
-    local log=$1 status=${2:-0} line finished='' initial='' passed=0 failed=0
+    local log=$1 status=${2:-0} expected=${NEXTEST_EXPECTED_EXECUTED:-}
+    local line finished='' initial='' passed=0 failed=0
     local exec_failed=0 timed_out=0 skipped=0 summary='' categories='' completed=0 executed=0
     local matches=0
     local header_re='Summary.*\][[:space:]]+([0-9]+)(/([0-9]+))?[[:space:]]+tests?[[:space:]]+run:[[:space:]]*(.*)$'
@@ -77,6 +78,18 @@ function emit_libtest_count {
         printf 'run-nextest-counted: successful nextest status disagrees with summary: %s\n' \
             "$summary" >&2
         return 2
+    fi
+    if [[ -n $expected ]]; then
+        if [[ ! $expected =~ ^[0-9]+$ ]]; then
+            printf 'run-nextest-counted: NEXTEST_EXPECTED_EXECUTED must be a nonnegative integer, got %s\n' \
+                "$expected" >&2
+            return 2
+        fi
+        if ((executed != expected)); then
+            printf 'run-nextest-counted: expected %s tests to execute, saw %s; refusing because the selected set changed\n' \
+                "$expected" "$executed" >&2
+            return 2
+        fi
     fi
 
     # The human lines below remain useful in logs, but receipt-bearing dagrun
@@ -135,6 +148,21 @@ function self_test {
     [[ $got == "$expected" ]] || return 1
     [[ $(<"$scratch/counts.json") == \
         '{"schema":1,"executed_tests":8,"filtered_tests":7}' ]] || return 1
+
+    got=$(NEXTEST_EXPECTED_EXECUTED=8 emit_libtest_count "$scratch/with-skips" 0)
+    [[ $got == "$expected" ]] || return 1
+    status=0
+    NEXTEST_EXPECTED_EXECUTED=9 emit_libtest_count "$scratch/with-skips" 0 \
+        >"$scratch/wrong-count.stdout" 2>"$scratch/wrong-count.stderr" || status=$?
+    [[ $status == 2 ]] || return 1
+    [[ $(<"$scratch/wrong-count.stderr") == \
+        'run-nextest-counted: expected 9 tests to execute, saw 8; refusing because the selected set changed' ]] || return 1
+    status=0
+    NEXTEST_EXPECTED_EXECUTED=unknown emit_libtest_count "$scratch/with-skips" 0 \
+        >/dev/null 2>"$scratch/invalid-count.stderr" || status=$?
+    [[ $status == 2 ]] || return 1
+    [[ $(<"$scratch/invalid-count.stderr") == \
+        'run-nextest-counted: NEXTEST_EXPECTED_EXECUTED must be a nonnegative integer, got unknown' ]] || return 1
 
     printf 'Summary [   0.003s] 1 test run: 1 passed\n' >"$scratch/no-skips"
     got=$(emit_libtest_count "$scratch/no-skips" 0)
@@ -220,7 +248,7 @@ function self_test {
     [[ $status == 2 ]] || return 1
     export -n -f emit_libtest_count
 
-    printf 'run-nextest-counted: self-test PASS (7 positive, 7 refusal)\n'
+    printf 'run-nextest-counted: self-test PASS (8 positive, 9 refusal)\n'
 }
 
 if [[ ${1:-} == --self-test ]]; then

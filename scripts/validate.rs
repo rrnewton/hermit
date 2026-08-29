@@ -8992,6 +8992,38 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             .map_err(|e| format!("retry bounds: invalid {field} in {line:?}: {e}"))
     }
 
+    fn require_live_nextest_output(tag: &str, command: &str) -> Result<(), String> {
+        let Some(wrapper) = command.find("run-nextest-counted.sh") else {
+            return Ok(());
+        };
+        let invocation = &command[wrapper..];
+        if invocation.contains(">\"$log\" 2>&1")
+            || invocation.contains("cat \"$log\"")
+            || invocation.contains("sed -n 's/^running ")
+        {
+            return Err(format!(
+                "retry bounds: {tag} buffers or reparses run-nextest-counted output; test events \
+                 must remain live and exact counts must be checked by the wrapper"
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_expected_nextest_count(
+        tag: &str,
+        command: &str,
+        expected: usize,
+    ) -> Result<(), String> {
+        let declaration = format!("NEXTEST_EXPECTED_EXECUTED={expected}");
+        if !command.contains(&declaration) {
+            return Err(format!(
+                "retry bounds: {tag} must require exactly {expected} executed tests through \
+                 {declaration}"
+            ));
+        }
+        Ok(())
+    }
+
     let nextest = std::fs::read_to_string(root.join(".config/nextest.toml"))
         .map_err(|e| format!("retry bounds: cannot read nextest config: {e}"))?;
     let manifest_defaults =
@@ -9036,13 +9068,62 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .max()
         .ok_or("retry bounds: no declared nextest cap")?;
 
-    let smallest_enclosing_deadline_s = ["portable", "privileged"]
+    let lane_configs = ["portable", "privileged"]
         .into_iter()
-        .map(|lane| validate_plan::lane_config(root, lane).map(|cfg| cfg.default_step_timeout))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
+        .map(|lane| validate_plan::lane_config(root, lane).map(|cfg| (lane, cfg)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let smallest_enclosing_deadline_s = lane_configs
+        .iter()
+        .map(|(_, cfg)| cfg.default_step_timeout)
         .min()
         .ok_or("retry bounds: no enclosing lane deadline")?;
+    let mut streamed_nextest_nodes = 0usize;
+    for (_, cfg) in &lane_configs {
+        for step in cfg
+            .steps
+            .iter()
+            .filter(|step| step.cmd.contains("run-nextest-counted.sh"))
+        {
+            require_live_nextest_output(&step.tag(), &step.cmd)?;
+            streamed_nextest_nodes += 1;
+        }
+    }
+    let privileged = lane_configs
+        .iter()
+        .find(|(lane, _)| *lane == "privileged")
+        .map(|(_, cfg)| cfg)
+        .ok_or("retry bounds: privileged lane is absent")?;
+    for (tag, expected) in [
+        ("test.pmu_buck_chaos_cases", 6usize),
+        ("test.cli_kvm", 21usize),
+    ] {
+        let step = privileged
+            .steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .ok_or_else(|| format!("retry bounds: exact-count node {tag} is absent"))?;
+        require_expected_nextest_count(tag, &step.cmd, expected)?;
+    }
+    let buffered_mutation =
+        "./ci/run-nextest-counted.sh -p fixture >\"$log\" 2>&1 || status=$?; cat \"$log\"";
+    let buffered_error = require_live_nextest_output("test.fixture", buffered_mutation)
+        .expect_err("buffered nextest output mutation must be refused");
+    if !buffered_error.contains("test.fixture") || !buffered_error.contains("must remain live") {
+        return Err(format!(
+            "retry bounds: buffered-output mutation did not fail by node name: {buffered_error}"
+        ));
+    }
+    let count_error = require_expected_nextest_count(
+        "test.fixture",
+        "./ci/run-nextest-counted.sh -p fixture",
+        7,
+    )
+    .expect_err("missing exact-count declaration mutation must be refused");
+    if !count_error.contains("test.fixture") || !count_error.contains("exactly 7") {
+        return Err(format!(
+            "retry bounds: exact-count mutation did not fail by node name: {count_error}"
+        ));
+    }
     let attempts = validate_runtime::MAX_ATTEMPTS_PER_CELL as i64;
     let default_with_grace_s = DEFAULT_TEST_CAP_S + NEXTEST_TERMINATION_GRACE_S;
     let largest_nextest_with_grace_s = largest_nextest_cap_s + NEXTEST_TERMINATION_GRACE_S;
@@ -9079,9 +9160,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             tightest_manifest_headroom_s = tightest_manifest_headroom_s.min(headroom_s);
             Ok(())
         };
-    for lane in ["portable", "privileged"] {
-        let cfg = validate_plan::lane_config(root, lane)
-            .map_err(|e| format!("retry bounds: cannot load {lane} lane: {e}"))?;
+    for (lane, cfg) in &lane_configs {
         for step in cfg
             .steps
             .iter()
@@ -9102,7 +9181,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
                 step.timeout,
                 Selection {
                     population: Some(Population::Required),
-                    lane: Some(lane.into()),
+                    lane: Some((*lane).into()),
                     category: Some(category),
                     ..Default::default()
                 },
@@ -9139,7 +9218,8 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         ));
     }
     Ok(format!(
-        "retry bounds: non-manifest retries receive separate node deadlines; default nextest \
+        "retry bounds: {streamed_nextest_nodes} nextest node(s) keep test events live; \
+         non-manifest retries receive separate node deadlines; default nextest \
          cap including grace={default_with_grace_s}s and largest nextest cap including grace=\
          {largest_nextest_with_grace_s}s are below the smallest enclosing lane deadline of \
          {smallest_enclosing_deadline_s}s; {checked_manifest_nodes} manifest node(s) fit both \
