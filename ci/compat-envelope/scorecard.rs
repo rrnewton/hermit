@@ -3256,12 +3256,11 @@ fn infrastructure_error_reason(row: &ResultRow) -> Option<String> {
         let report = attempt.get("verification_report")?.as_str()?;
         let report = canonical_verdict::VerificationReport::from_json_slice(report.as_bytes())
             .ok()?;
-        match report.infrastructure_error {
-            Some(canonical_verdict::InfrastructureError::SkidOvershoot { count }) => Some(
-                format!("verification recorded {count} HERMIT_SKID_OVERSHOOT report(s)"),
-            ),
-            None => None,
-        }
+        report.infrastructure_error.map(
+            |canonical_verdict::InfrastructureError::SkidOvershoot { count }| {
+                format!("verification recorded {count} HERMIT_SKID_OVERSHOOT report(s)")
+            },
+        )
     })
 }
 
