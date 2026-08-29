@@ -43,7 +43,11 @@ from run_matrix import (  # noqa: E402
     parse_host_capabilities,
     verify_tier_from_json,
 )
-from e9patch_corpus import CorpusError, e9patch_feature_from_build_info  # noqa: E402
+from e9patch_corpus import (  # noqa: E402
+    CorpusError,
+    e9patch_engagement,
+    e9patch_feature_from_build_info,
+)
 
 FAILURES: list[str] = []
 
@@ -523,6 +527,39 @@ except Exception as error:
 else:
     refused = False
 check("incomplete host capability set fails by capability name", refused)
+
+print("case E9PATCH RESULT — all preparation counts come from one typed record")
+with tempfile.TemporaryDirectory(prefix="e9patch-engagement-") as tmp:
+    engagement_path = Path(tmp) / "engagement.json"
+    engagement = {
+        "schema": 2,
+        "engagement": {
+            "backend": "e9patch",
+            "candidate_sites": 7,
+            "mapped_sites": 7,
+            "b0_sites": 0,
+        },
+    }
+    engagement_path.write_text(json.dumps(engagement), encoding="utf-8")
+    check(
+        "typed e9patch preparation counts are accepted",
+        e9patch_engagement(engagement_path) == (7, 7, 0),
+    )
+    engagement["engagement"]["mapped_sites"] = 6
+    engagement_path.write_text(json.dumps(engagement), encoding="utf-8")
+    check(
+        "mutating the producer count changes the consumer result",
+        e9patch_engagement(engagement_path) == (7, 6, 0),
+    )
+    del engagement["engagement"]["b0_sites"]
+    engagement_path.write_text(json.dumps(engagement), encoding="utf-8")
+    try:
+        e9patch_engagement(engagement_path)
+    except CorpusError as error:
+        refused = "incomplete" in str(error)
+    else:
+        refused = False
+    check("missing B0 count fails by shape", refused)
 
 print()
 if FAILURES:

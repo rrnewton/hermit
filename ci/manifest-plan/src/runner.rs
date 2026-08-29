@@ -1933,13 +1933,15 @@ fn execute_spec_until(
         .timed_out
         .then(|| format!("cell exceeded {cell_timeout_seconds} s"));
     let mut error_kind = None;
+    let failure_class_line = stderr.lines().next().unwrap_or_default();
     let launch_refusal = spec.id.mode != "naked"
         && !output.status.success()
         && stdout.is_empty()
-        && stderr.lines().next().is_some_and(|line| {
-            line.starts_with("Error: Program ")
-                || line.starts_with("Error: Could not resolve program ")
-        });
+        && matches!(
+            failure_class_line,
+            "HERMIT_INTERNAL_FAILURE class=guest-program-not-found"
+                | "HERMIT_INTERNAL_FAILURE class=guest-program-not-executable"
+        );
     if launch_refusal {
         outcome = "ERROR".into();
         error_kind = Some("guest-launch-refused".into());
@@ -1947,35 +1949,29 @@ fn execute_spec_until(
             "guest launch refused before execution: {}",
             stderr
                 .lines()
-                .next()
-                .unwrap_or("Error: unknown launch refusal")
-                .trim_start_matches("Error: ")
+                .find_map(|line| line.strip_prefix("Error: "))
+                .unwrap_or("unknown launch refusal")
         ));
     }
     // A runner that cannot start the requested backend and a backend that ran
     // but produced no canonical comparison are different failures. Keep both
     // visible as ERROR, but give the pre-guest availability refusal its own
     // machine-readable kind so sweeps cannot count it as a product failure.
-    // This wording is emitted by Backend::ensure_available before any guest is
-    // created; matching a broader nonzero exit would hide real regressions.
+    // The first line is the producer-owned class emitted before human prose.
+    // Matching a broader nonzero exit would hide real regressions.
     // KVM currently bypasses ensure_available, so its availability failures do
     // not enter this class.
-    let unavailable_prefix = spec
-        .id
-        .backend
-        .as_deref()
-        .map(|backend| format!("Error: backend `{backend}` is unavailable:"));
+    let unavailable_class = spec.id.backend.as_deref().map(|backend| {
+        format!("HERMIT_INTERNAL_FAILURE class=backend-unavailable backend={backend}")
+    });
     let backend_unavailable = spec.id.mode != "naked"
         && !launch_refusal
         && !output.timed_out
         && !output.status.success()
         && stdout.is_empty()
-        && unavailable_prefix.as_ref().is_some_and(|prefix| {
-            stderr
-                .lines()
-                .next()
-                .is_some_and(|line| line.starts_with(prefix))
-        });
+        && unavailable_class
+            .as_deref()
+            .is_some_and(|class| failure_class_line == class);
     if backend_unavailable {
         outcome = "ERROR".into();
         error_kind = Some("backend-unavailable".into());
@@ -1983,9 +1979,8 @@ fn execute_spec_until(
             "backend unavailable on this runner, so nothing was measured: {}",
             stderr
                 .lines()
-                .next()
-                .unwrap_or("Error: unknown backend unavailability")
-                .trim_start_matches("Error: ")
+                .find_map(|line| line.strip_prefix("Error: "))
+                .unwrap_or("unknown backend unavailability")
         ));
     }
     let mut report_json = None;
@@ -5468,8 +5463,9 @@ backends_disabled:
         let no_result = r#"{"verified":false,"bitwise_parity":false,"verdict":"no_result","comparison":null,"compared_log_messages":null}"#;
         let unavailable = attempt_from_script(
             "sabre",
-            "printf %s \"$1\" > \"$2\"; printf '%s\\n' 'Error: backend \x60sabre\x60 is unavailable: \
-             HERMIT_SABRE_BINARY=/nonexistent/sabre is not an executable file' >&2; exit 1",
+            "printf %s \"$1\" > \"$2\"; \
+             printf '%s\\n' 'HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=sabre' \
+             'Error: backend \x60sabre\x60 is unavailable: HERMIT_SABRE_BINARY=/nonexistent/sabre is not an executable file' >&2; exit 1",
             Some(no_result),
         );
         let silent = attempt_from_script(
@@ -5544,13 +5540,15 @@ backends_disabled:
         let wrong_backend = attempt_from_script(
             "sabre",
             "printf %s \"$1\" > \"$2\"; \
-             printf '%s\\n' 'Error: backend \x60dbt\x60 is unavailable: no SDK' >&2; exit 7",
+             printf '%s\\n' 'HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=dbt' \
+             'Error: backend \x60dbt\x60 is unavailable: no SDK' >&2; exit 7",
             Some(no_result),
         );
         let guest_output = attempt_from_script(
             "sabre",
             "printf %s \"$1\" > \"$2\"; printf 'guest-started\\n'; \
-             printf '%s\\n' 'Error: backend \x60sabre\x60 is unavailable: spoofed' >&2; exit 8",
+             printf '%s\\n' 'HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=sabre' \
+             'Error: backend \x60sabre\x60 is unavailable: spoofed' >&2; exit 8",
             Some(no_result),
         );
 
@@ -5591,7 +5589,8 @@ backends_disabled:
         let unavailable = attempt_from_script(
             "sabre",
             "printf %s \"$1\" > \"$2\"; \
-             printf '%s\\n' 'Error: backend \x60sabre\x60 is unavailable: no staged runtime' >&2; exit 1",
+             printf '%s\\n' 'HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=sabre' \
+             'Error: backend \x60sabre\x60 is unavailable: no staged runtime' >&2; exit 1",
             Some("{"),
         );
 
@@ -5607,6 +5606,30 @@ backends_disabled:
                 .is_some_and(|reason| reason.contains("no staged runtime")),
             "unreadable evidence must not overwrite the pre-guest refusal: {unavailable:?}"
         );
+    }
+
+    #[test]
+    fn launch_refusal_requires_the_producer_class_line() {
+        let no_result = r#"{"verified":false,"bitwise_parity":false,"verdict":"no_result","comparison":null,"compared_log_messages":null}"#;
+        let typed = attempt_from_script(
+            "ptrace",
+            "printf %s \"$1\" > \"$2\"; printf '%s\\n' \
+             'HERMIT_INTERNAL_FAILURE class=guest-program-not-found' \
+             'Error: Program /missing does not exist' >&2; exit 127",
+            Some(no_result),
+        );
+        let prose_only = attempt_from_script(
+            "ptrace",
+            "printf %s \"$1\" > \"$2\"; printf '%s\\n' \
+             'HERMIT_INTERNAL_FAILURE class=cli-error' \
+             'Error: Program /missing does not exist' >&2; exit 127",
+            Some(no_result),
+        );
+
+        assert_eq!(typed.error_kind.as_deref(), Some("guest-launch-refused"));
+        assert_eq!(typed.outcome, "ERROR");
+        assert_eq!(prose_only.error_kind, None);
+        assert_eq!(prose_only.outcome, "FAIL");
     }
 
     #[test]

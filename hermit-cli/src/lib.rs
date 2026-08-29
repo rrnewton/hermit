@@ -1019,6 +1019,47 @@ pub enum Backend {
     E9patch,
 }
 
+/// A requested backend could not start because its required runtime support is absent.
+///
+/// Keep this as a typed error until the top-level command records its failure class.
+/// The human-readable message is for the operator; consumers must use the class line
+/// emitted by the command rather than matching this prose.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct BackendUnavailable {
+    backend: Backend,
+    reason: String,
+}
+
+impl BackendUnavailable {
+    pub fn new(backend: Backend, reason: impl Into<String>) -> Self {
+        Self {
+            backend,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn backend(&self) -> Backend {
+        self.backend
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl std::fmt::Display for BackendUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "backend `{}` is unavailable: {}",
+            self.backend.as_str(),
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for BackendUnavailable {}
+
 impl Backend {
     const ALL: [Self; 6] = [
         Self::Ptrace,
@@ -1059,10 +1100,7 @@ impl Backend {
     /// Returns an actionable error when this backend's prerequisites are not met.
     pub fn ensure_available(self) -> Result<(), Error> {
         if let Some(reason) = self.unavailable_reason() {
-            Err(anyhow!(
-                "backend `{}` is unavailable: {reason}",
-                self.as_str()
-            ))
+            Err(Error::new(BackendUnavailable::new(self, reason)))
         } else {
             Ok(())
         }
