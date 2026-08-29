@@ -255,7 +255,10 @@ fn cargo_command_packages(
         let recognized = counted_nextest
             || matches!(subcommand, "build" | "test" | "clippy" | "fmt" | "doc")
             || (subcommand == "nextest"
-                && tokens.get(command_index + 2).map(String::as_str) == Some("run"));
+                && matches!(
+                    tokens.get(command_index + 2).map(String::as_str),
+                    Some("run" | "list")
+                ));
         if !recognized {
             command_index += 1;
             continue;
@@ -645,6 +648,14 @@ mod tests {
                 &defaults
             ),
             BTreeSet::from(["a".into(), "c".into()])
+        );
+        assert_eq!(
+            cargo_command_packages(
+                "CARGO_BUILD_JOBS=8 cargo nextest list --workspace --exclude b && cargo nextest list -p b",
+                &all,
+                &defaults
+            ),
+            BTreeSet::from(["a".into(), "b".into(), "c".into()])
         );
         assert_eq!(
             cargo_command_packages("/tmp/tree/ci/run-nextest-counted.sh -p b", &all, &defaults),

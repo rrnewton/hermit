@@ -139,6 +139,7 @@ const LEDGER_PRODUCER: &str = "hermit-validate-rs";
 /// and the fail-closed assertion that requires it cannot drift apart.
 const PIN_GATE_TAG: &str = "pre.reverie_pin";
 const MANIFEST_AUDIT_COMMAND: &str = "target/debug/test-harness validate";
+const DEBUG_TEST_PRODUCER_COMMAND: &str = "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh cargo nextest list ${CI:+--profile ci} --workspace --exclude hermit-detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests --message-format json >/dev/null && CARGO_BUILD_JOBS=8 cargo nextest list ${CI:+--profile ci} -p hermit-detcore --lib --bins --tests --message-format json >/dev/null && CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --lib --bins --tests --message-format json >/dev/null";
 const QUICK_E2E_VERIFY_TIMEOUT_S: i64 = 1800;
 const PINNED_ROOT_FETCH_TAG: &str = "setup.pinned_root_fetch";
 const PINNED_ROOT_FETCH_COMMAND: &str = "seed=(); if [ -n \"${CARGO_HOME:-}\" ]; then seed=(--seed-cargo \"$CARGO_HOME\"); fi; ./ci/hermetic/run-split-validate.sh --fetch-only \"${seed[@]}\"";
@@ -836,9 +837,9 @@ fn nested_scope_probe_step(
 /// step declares a wider `preferred_inner_jobs` than the budget AND manages its own
 /// concurrency (an empty `jobs_flag`) — because clamping such a step's cgroup quota
 /// alone would leave its original worker count running inside a smaller box, which
-/// is a slowdown disguised as a limit. Four nodes are in exactly that position:
-/// `build.workspace` and `build.runtime_release` at 32, and
-/// `e2e.manifest_backend_parity_c` and `e2e.manifest_c_programs` at 20. All four
+/// is a slowdown disguised as a limit. Three nodes are in exactly that position:
+/// `build.runtime_release` at 32, and
+/// `e2e.manifest_backend_parity_c` and `e2e.manifest_c_programs` at 20. All three
 /// bake their measured width into the command itself, so `-j` (host_cpus/8, floor
 /// 2, cap 16) would refuse the entire run.
 ///
@@ -2114,12 +2115,64 @@ cleared-caps refusal names {} starved step(s)",
             .steps
             .iter()
             .find(|s| s.tag() == "build.workspace")
-            .ok_or("full-plan bracket: portable fat build disappeared")?;
-        if !portable_build.cmd.contains("cargo build --workspace --all-targets")
-            || !portable_build.cmd.contains("cargo build -p hermit")
-            || !portable_build.cmd.contains("--bin hermit")
+            .ok_or("full-plan bracket: portable debug test producer disappeared")?;
+        if portable_build.cmd != DEBUG_TEST_PRODUCER_COMMAND
+            || portable_build.deps
+                != ["gate.manifest".to_string(), "setup.nextest".to_string()]
+            || portable_build.hint.preferred_inner_jobs != Some(8)
+            || portable_build.jobs_flag.as_deref() != Some("")
+            || portable_build.jobs_env.as_deref() != Some("")
         {
-            return Err("full-plan bracket: fat build does not finish the debug Hermit producer".into());
+            return Err(format!(
+                "full-plan bracket: debug test producer drifted: cmd={} deps={:?} preferred_inner_jobs={:?} jobs_flag={:?} jobs_env={:?}",
+                portable_build.cmd,
+                portable_build.deps,
+                portable_build.hint.preferred_inner_jobs,
+                portable_build.jobs_flag,
+                portable_build.jobs_env,
+            ));
+        }
+        let shared_target_steps = [
+            "lint.clippy",
+            "doc.doctests",
+            "doc.rustdoc",
+            "test.regular_crates",
+            "test.hermit_unit",
+            "test.detcore_unit",
+            "test.detcore_misc",
+            "test.detcore_parallel",
+            "test.hermit_integration",
+            "test.arbitrary_binaries",
+            "test.cli",
+            "test.liteinst_strict",
+            "test.sabre_examples",
+            "test.hermit_modes",
+            "test.app_strict_verify",
+            "test.command_strict_verify",
+            "test.ignored_syscall_regressions",
+            "test.rr_suite_contract",
+            "privileged-build.privileged_tests",
+            "privileged-test.cli_kvm",
+            "privileged-test.pmu_buck_chaos_cases",
+        ];
+        for tag in shared_target_steps {
+            let step = full
+                .cfg
+                .steps
+                .iter()
+                .find(|step| step.tag() == tag)
+                .ok_or_else(|| format!("full-plan bracket: shared Cargo target step disappeared: {tag}"))?;
+            if step.hint.preferred_inner_jobs != Some(8)
+                || step.jobs_flag.as_deref() != Some("")
+                || step.jobs_env.as_deref() != Some("")
+                || (tag != "privileged-build.privileged_tests"
+                    && !step.cmd.contains("CARGO_BUILD_JOBS=8"))
+            {
+                return Err(format!(
+                    "full-plan bracket: {tag} can use a different Cargo width from build.workspace: cmd={} preferred_inner_jobs={:?} jobs_flag={:?} jobs_env={:?}",
+                    step.cmd, step.hint.preferred_inner_jobs, step.jobs_flag, step.jobs_env,
+                ));
+            }
         }
         let artifact = full
             .cfg
@@ -2260,15 +2313,14 @@ cleared-caps refusal names {} starved step(s)",
                 ));
             }
         }
-        let expected_test_prebuild = "CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run";
         if !privileged_build
             .cmd
             .contains("verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path")
-            || !privileged_build.cmd.contains(expected_test_prebuild)
+            || privileged_build.cmd.contains("cargo ")
             || !privileged_build.cmd.contains("tests_misc-*")
         {
             return Err(
-                "full-plan bracket: privileged build did not assert the artifact and prebuild the exact downstream test binaries".into(),
+                "full-plan bracket: fused privileged build was not a read-only assertion over the portable producer's artifacts".into(),
             );
         }
         let cpuid = full
@@ -5729,7 +5781,12 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // binary and resource identities, then publishes a content-addressed
         // bundle. Every later Cargo writer and manifest consumer runs only after
         // that barrier, so no writer can mutate either source during publication
-        // and no consumer reads a mutable Cargo path afterward.
+        // and no consumer reads a mutable Cargo path afterward. The portable
+        // producer also builds the test-profile targets needed by the privileged
+        // lane, so the fused privileged build becomes a read-only assertion. If it
+        // invoked Cargo here, it would race the now-eligible portable test nodes
+        // for the same target directory and put compile work back under scheduler
+        // control.
         let producer = "build.e2e_artifact";
         let debug_producer = "build.workspace";
         let consumer = "privileged-build.privileged_tests";
@@ -5737,8 +5794,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             .iter()
             .find(|s| s.tag() == debug_producer)
             .ok_or_else(|| format!("fused debug producer disappeared: {debug_producer}"))?;
-        let expected_fat_build = "./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit";
-        if portable_build.cmd != expected_fat_build {
+        if portable_build.cmd != DEBUG_TEST_PRODUCER_COMMAND {
             return Err(format!(
                 "fused debug producer command drifted; re-prove the artifact barrier: {}",
                 portable_build.cmd
@@ -5800,7 +5856,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // selects, so "any one of nine" would let it silently test a STALE
         // artifact -- a check that passes while measuring the wrong thing,
         // which is worse than failing loudly. Zero binaries still fails.
-        privileged_build.cmd = "./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null || exit 1; CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run || exit 1; newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"".to_string();
+        privileged_build.cmd = "./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null || exit 1; newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"".to_string();
 
         let cpuid = steps
             .iter_mut()

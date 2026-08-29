@@ -5,8 +5,8 @@
 # use every granted core. On the 316-CPU validation host that inference produced
 # NUM_JOBS=284 and raced the native linker. K=8 is measurement-backed: on
 # 2026-08-04 the pre-collapse build.dbt_release and rr_suite_contract nodes both
-# completed at j8 under their cgroup-recorded memory caps. The collapsed fat-build
-# nodes declare their independently measured higher width in the DAG manifest.
+# completed at j8 under their cgroup-recorded memory caps. The release build
+# declares its independently measured higher width in the DAG manifest.
 #
 # This file has two explicit source modes. `launcher` preserves the historical
 # shared Cargo widths and strips every portable DBT-budget variable before the
@@ -55,8 +55,8 @@ if [[ $build_job_context == launcher ]]; then
     #
     # The K=8 above is the FLOOR for a step that declares nothing. The comment at the
     # top of this file already says the collapsed fat-build nodes "declare their
-    # independently measured higher width in the DAG manifest" -- build.workspace and
-    # build.runtime_release both declare preferred_inner_jobs=32. That declaration has
+    # independently measured higher width in the DAG manifest" --
+    # build.runtime_release declares preferred_inner_jobs=32. That declaration had
     # never reached Cargo: every jobs_flag in ci/dag/portable.json is the empty string,
     # so the runner had no way to hand a step its width, and this line's ambient 8 was
     # the only value Cargo ever saw. Measured on the 2026-08-24 clean full run.
