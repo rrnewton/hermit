@@ -52,6 +52,7 @@ gate in run_matrix.py):
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -201,6 +202,27 @@ def verification_matched(hermit: Path, report: Path) -> tuple[bool, str]:
     return code == 0, stderr.decode(errors="replace").strip()
 
 
+def e9patch_feature_from_build_info(raw: bytes) -> bool:
+    try:
+        report = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise CorpusError(f"hermit version record is not valid JSON: {error}") from error
+    if not isinstance(report, dict) or report.get("schema") != 1:
+        raise CorpusError("hermit version record must use schema 1")
+    features = report.get("features")
+    if not isinstance(features, dict) or not isinstance(features.get("e9patch"), bool):
+        raise CorpusError("hermit version record must carry boolean features.e9patch")
+    return features["e9patch"]
+
+
+def hermit_has_e9patch_feature(hermit: Path) -> bool:
+    code, stdout, stderr = run([str(hermit), "version", "--json"], timeout=10)
+    if code != 0:
+        detail = stderr.decode(errors="replace").strip() or f"exit {code}"
+        raise CorpusError(f"hermit version record unavailable: {detail}")
+    return e9patch_feature_from_build_info(stdout)
+
+
 def prerequisites(hermit: Path) -> str | None:
     if not hermit.is_file() or not os.access(hermit, os.X_OK):
         return f"hermit executable unavailable: {hermit}"
@@ -214,12 +236,7 @@ def prerequisites(hermit: Path) -> str | None:
         path = os.environ.get(var)
         if not path or not Path(path).is_file():
             return f"{var} is unset or does not point at a file"
-    # A hermit built without the e9patch feature rejects --backend e9patch.
-    code, _, stderr = run(
-        [str(hermit), "--backend", "e9patch", "run", "--", "/bin/true"], timeout=60
-    )
-    text = stderr.decode(errors="replace")
-    if code != 0 and "e9patch" in text and "feature" in text:
+    if not hermit_has_e9patch_feature(hermit):
         return "hermit was not built with the e9patch cargo feature"
     return None
 
