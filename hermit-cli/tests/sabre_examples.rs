@@ -110,7 +110,21 @@ fn controller_diagnostics(path: Option<&Path>) -> String {
 }
 
 fn run_bounded(mut command: Command, label: &str, diagnostic_log: Option<&Path>) -> Output {
+    // Verification observes the guest's current directory. The source checkout is shared by
+    // concurrent validation nodes, so Cargo or another test can change its metadata or entries
+    // between Run1 and Run2. Give this Hermit invocation an empty directory that remains stable
+    // until both runs and their comparison have completed.
+    let working_directory = tempfile::Builder::new()
+        .prefix("sabre-working-directory-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap_or_else(|error| panic!("failed to create {label} working directory: {error}"));
     command
+        .current_dir(working_directory.path())
+        // Bash validates inherited PWD and OLDPWD by statting their path components. Leave them
+        // unset so it obtains the same directory through getcwd without observing mutable
+        // ancestors of this validation checkout.
+        .env_remove("PWD")
+        .env_remove("OLDPWD")
         .process_group(0)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -482,6 +496,7 @@ fn sabre_scheduler_empty_info_precedes_fallback_completed_info() {
 
     const SCHEDULER_EMPTY: &str =
         " INFO detcore::scheduler: [scheduler] run queue empty, exiting sched_loop.";
+    const SCHEDULER_EMPTY_KICK: &str = " INFO detcore::scheduler: scheduler (step2_process_blocked): zero threads left anywhere, fizzling.";
     const FALLBACK_COMPLETED: &str =
         " INFO hermit::sabre::fallback: SaBRe ptrace fallback completed";
     for (index, path) in logs.iter().enumerate() {
@@ -492,11 +507,17 @@ fn sabre_scheduler_empty_info_precedes_fallback_completed_info() {
             )
         });
         let scheduler_empty = log.match_indices(SCHEDULER_EMPTY).collect::<Vec<_>>();
+        let scheduler_empty_kicks = log.match_indices(SCHEDULER_EMPTY_KICK).collect::<Vec<_>>();
         let fallback_completed = log.match_indices(FALLBACK_COMPLETED).collect::<Vec<_>>();
         assert_eq!(
             scheduler_empty.len(),
             1,
             "retained run {} must contain exactly one scheduler-empty INFO:\n{log}",
+            index + 1,
+        );
+        assert!(
+            scheduler_empty_kicks.is_empty(),
+            "retained run {} observed final physical exit between the loop-top completion check and step2:\n{log}",
             index + 1,
         );
         assert_eq!(

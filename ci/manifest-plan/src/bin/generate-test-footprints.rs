@@ -243,6 +243,32 @@ fn cargo_command_packages(
     let mut result = BTreeSet::new();
     let mut command_index = 0;
     while command_index < tokens.len() {
+        if tokens[command_index].ends_with("/ci/prepare-nextest-binaries.sh") {
+            let prepared: BTreeSet<String> = match tokens.get(command_index + 1).map(String::as_str)
+            {
+                Some("portable") => all
+                    .iter()
+                    .filter(|package| package.as_str() != "hermetic_infra_hermit_flaky-tests")
+                    .cloned()
+                    .collect(),
+                Some("privileged") => {
+                    BTreeSet::from(["hermit".to_string(), "hermit-detcore".to_string()])
+                }
+                mode => die(format!(
+                    "prepare-nextest-binaries command has unsupported lane {mode:?}: {command}"
+                )),
+            };
+            for package in &prepared {
+                if !all.contains(package) {
+                    die(format!(
+                        "prepare-nextest-binaries command names non-workspace package `{package}`: {command}"
+                    ));
+                }
+            }
+            result.extend(prepared);
+            command_index += 2;
+            continue;
+        }
         let counted_nextest = tokens[command_index].ends_with("/ci/run-nextest-counted.sh");
         if tokens[command_index] != "cargo" && !counted_nextest {
             command_index += 1;
@@ -255,7 +281,10 @@ fn cargo_command_packages(
         let recognized = counted_nextest
             || matches!(subcommand, "build" | "test" | "clippy" | "fmt" | "doc")
             || (subcommand == "nextest"
-                && tokens.get(command_index + 2).map(String::as_str) == Some("run"));
+                && matches!(
+                    tokens.get(command_index + 2).map(String::as_str),
+                    Some("run" | "list")
+                ));
         if !recognized {
             command_index += 1;
             continue;
@@ -647,8 +676,47 @@ mod tests {
             BTreeSet::from(["a".into(), "c".into()])
         );
         assert_eq!(
+            cargo_command_packages(
+                "CARGO_BUILD_JOBS=8 cargo nextest list --workspace --exclude b && cargo nextest list -p b",
+                &all,
+                &defaults
+            ),
+            BTreeSet::from(["a".into(), "b".into(), "c".into()])
+        );
+        assert_eq!(
             cargo_command_packages("/tmp/tree/ci/run-nextest-counted.sh -p b", &all, &defaults),
             BTreeSet::from(["b".into()])
+        );
+        assert_eq!(
+            cargo_command_packages(
+                "CARGO_BUILD_JOBS=8 ./ci/prepare-nextest-binaries.sh portable",
+                &all,
+                &defaults
+            ),
+            BTreeSet::from(["a".into(), "b".into(), "c".into()])
+        );
+        let all_with_flaky = BTreeSet::from([
+            "a".into(),
+            "b".into(),
+            "c".into(),
+            "hermetic_infra_hermit_flaky-tests".into(),
+        ]);
+        assert_eq!(
+            cargo_command_packages(
+                "CARGO_BUILD_JOBS=8 ./ci/prepare-nextest-binaries.sh portable",
+                &all_with_flaky,
+                &defaults
+            ),
+            BTreeSet::from(["a".into(), "b".into(), "c".into()])
+        );
+        let privileged = BTreeSet::from(["hermit".into(), "hermit-detcore".into(), "other".into()]);
+        assert_eq!(
+            cargo_command_packages(
+                "./ci/prepare-nextest-binaries.sh privileged",
+                &privileged,
+                &defaults
+            ),
+            BTreeSet::from(["hermit".into(), "hermit-detcore".into()])
         );
         assert!(cargo_command_packages("cargo nextest show-config", &all, &defaults).is_empty());
     }

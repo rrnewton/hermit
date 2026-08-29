@@ -5,8 +5,8 @@
 # use every granted core. On the 316-CPU validation host that inference produced
 # NUM_JOBS=284 and raced the native linker. K=8 is measurement-backed: on
 # 2026-08-04 the pre-collapse build.dbt_release and rr_suite_contract nodes both
-# completed at j8 under their cgroup-recorded memory caps. The collapsed fat-build
-# nodes declare their independently measured higher width in the DAG manifest.
+# completed at j8 under their cgroup-recorded memory caps. The release build
+# declares its independently measured higher width in the DAG manifest.
 #
 # This file has two explicit source modes. `launcher` preserves the historical
 # shared Cargo widths and strips every portable DBT-budget variable before the
@@ -55,8 +55,8 @@ if [[ $build_job_context == launcher ]]; then
     #
     # The K=8 above is the FLOOR for a step that declares nothing. The comment at the
     # top of this file already says the collapsed fat-build nodes "declare their
-    # independently measured higher width in the DAG manifest" -- build.workspace and
-    # build.runtime_release both declare preferred_inner_jobs=32. That declaration has
+    # independently measured higher width in the DAG manifest" --
+    # build.runtime_release declares preferred_inner_jobs=32. That declaration had
     # never reached Cargo: every jobs_flag in ci/dag/portable.json is the empty string,
     # so the runner had no way to hand a step its width, and this line's ambient 8 was
     # the only value Cargo ever saw. Measured on the 2026-08-24 clean full run.
@@ -179,8 +179,15 @@ fi
 # The intervening Reverie commits are the LiteInst task-creation change (#447)
 # and a documentation commit (#511); neither can affect the elapsed time of a
 # DynamoRIO content-key miss. Carry, not recalibration.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != af42d9cf7ae604777cd88c5cca5b319460c986e8 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie af42d9cf7ae604777cd88c5cca5b319460c986e8 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO bc106a19 (2026-08-28): both repository inputs to the DynamoRIO
+# content-key miss are byte-identical to af42d9cf:
+#     reverie-dbt/vendor/dynamorio  a3c41e5d3630 -> a3c41e5d3630
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+# The changed Reverie files are confined to reverie-ptrace timer recovery and
+# tests. They require fresh Hermit validation but cannot change this measured
+# native-build budget. Carry, not recalibration.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != bc106a195dfe7ba8e00c358a7bab11256202a1e6 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie bc106a195dfe7ba8e00c358a7bab11256202a1e6 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

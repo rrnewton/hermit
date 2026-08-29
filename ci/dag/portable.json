@@ -1,5 +1,5 @@
 {
-  "resource_caps": {"hermit_guest": 1, "manifest_guest": 8},
+  "resource_caps": {"manifest_guest": 20},
   "mem_cap_factor": 1.25,
   "mem_cap_floor_bytes": 8589934592,
   "outer_mem_safety_factor": 1.0,
@@ -150,25 +150,27 @@
       "hint": {"est_duration_s": 20, "rss_baseline_bytes": 268435456,
                "hard_mem_max_bytes": 1073741824, "classification": "light"}
     },
-      {
+    {
       "group": "setup", "job": "nextest",
       "desc": "cargo-nextest available",
       "cmd": "cargo nextest show-config version >/dev/null 2>&1 || if command -v with-proxy >/dev/null 2>&1; then with-proxy cargo install cargo-nextest --locked --version 0.9.100; else cargo install cargo-nextest --locked --version 0.9.100; fi",
+      "deps": ["e2e.metadata"],
       "timeout": 600,
       "hint": {"est_duration_s": 30, "rss_baseline_bytes": 536870912,
                "hard_mem_max_bytes": 2147483648, "classification": "light"}
     },
     {
       "group": "build", "job": "workspace",
-      "desc": "Build all debug workspace targets in one Cargo invocation",
-      "description": "ONE-FAT-BUILD 2026-08-04 (task collapse-separate-build-nodes-into-one-fat-cargo-invocation): one cargo build owns the complete debug workspace graph, including test targets and the flaky harness. This removes the redundant flaky-harness build node. The explicit bin build completes target/debug/hermit for the later verified E2E artifact publisher. preferred_inner_jobs=32 is measured on a cold empty target at hermit@846baeca: 130.35s, cgroup-recorded peak=11663998976 bytes. The generous 64GiB cap deliberately prioritizes throughput over cap tightness. Release artifacts remain a separate profile because Cargo cannot emit dev and release profiles in one invocation; the privileged lane is a separate DAG and is unchanged.",
-      "cmd": "./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit",
-      "deps": ["e2e.metadata"],
+      "desc": "Build the debug test targets before their concurrent consumers",
+      "description": "TEST-PROFILE PRODUCER 2026-08-29 (task twenty-one-steps-share-a-cargo-target-so-compile-work-migrates-between-them): the former cargo build --all-targets used the dev profile while every cargo-nextest consumer uses the test profile, so it did not prebuild what those nodes execute. The producer also ran at CARGO_BUILD_JOBS=32 while consumers ran at 8 or the runner default 1; Cargo build-script state changed with that value. Two same-commit cold measurements exchanged 284-293 CPU-seconds of compilation between test.hermit_modes and test.command_strict_verify solely according to which started first. The producer now runs each test node's existing package and target selection sequentially and records nextest's binaries metadata. Concurrent test nodes reuse those exact paths without invoking Cargo, so they cannot relink or remove a sibling's selected executable. Their original Cargo selection arguments remain in the DAG for generated test-footprint accounting; run-nextest-counted removes only those build-selection arguments after requiring the corresponding metadata file. A full run that still let consumers invoke Cargo reproduced both failure forms: test.hermit_modes rebuilt Hermit before a 15.002-second timeout, and test.cli lost its selected executable while another nextest invocation rewrote the shared target, producing 60 ENOENT launch failures. Clippy, doctests and rustdoc run in a fixed chain before this final producer. The chain starts only after the manifest audit because that audit executes target/debug/test-harness and a concurrent Cargo writer removed that binary in a full run. This ordering adds the writer durations to the full-run path; that is the measured cost of keeping the shared target rather than rebuilding dependencies in per-step target directories. The producer verifies every recorded binary path against the final shared-target state before publication, so a later selection cannot leave an earlier consumer pointing at a removed executable. The final Hermit selection produces target/debug/hermit for the verified E2E artifact publisher. Release artifacts remain a separate profile.",
+      "cmd": "CARGO_BUILD_JOBS=8 ./ci/prepare-nextest-binaries.sh portable",
+      "deps": ["doc.rustdoc"],
       "timeout": 1200,
       "jobs_flag": "",
+      "jobs_env": "",
       "hint": {"est_duration_s": 130, "rss_baseline_bytes": 11663998976,
                "hard_mem_max_bytes": 68719476736, "classification": "cpu-bound",
-               "preferred_inner_jobs": 32}
+               "preferred_inner_jobs": 8}
     },
     {
       "group": "build", "job": "runtime_release",
@@ -185,7 +187,7 @@
     {
       "group": "build", "job": "e2e_artifact",
       "desc": "Publish a verified content-addressed Hermit binary and complete backend-resource bundle",
-      "description": "This is the publication barrier between the two initial Cargo producers and every later shared-target writer. It hashes target/debug/hermit before and after copying, snapshots target/install_pkg with symlinks dereferenced, verifies required DBT/SaBRe/LiteInst/e9patch resources and the complete resource hash manifest, then atomically publishes a unique content-addressed directory plus pointer. Manifest consumers and all later Cargo writers depend on this node, so the publisher never reads either mutable tree while a sibling writer can relink or recreate it.",
+      "description": "This is the publication barrier after the final debug test-profile producer and the release producer. It hashes target/debug/hermit before and after copying, snapshots target/install_pkg with symlinks dereferenced, verifies required DBT/SaBRe/LiteInst/e9patch resources and the complete resource hash manifest, then atomically publishes a unique content-addressed directory plus pointer. Clippy, doctests and rustdoc run in a fixed chain before build.workspace; later test commands consume the resulting artifacts without a concurrent Cargo writer that can relink or remove them.",
       "cmd": "./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path target/install_pkg",
       "deps": ["build.workspace", "build.runtime_release"],
       "timeout": 120,
@@ -202,7 +204,7 @@
       "hint": {"est_duration_s": 120, "rss_baseline_bytes": 4294967296,
                "hard_mem_max_bytes": 6442450944, "classification": "cpu-bound"}
     },
-        {
+    {
       "group": "e2e", "job": "metadata",
       "desc": "Validate E2E metadata, generated test footprints, and required-cell plan",
       "description": "MEASURED 2026-08-09 at hermit 93575493 after the Rust validate cutover: the warm audit-ci subroutine completed in 71.44s, 72.11s, and 73.84s wall (58.36-60.38s CPU), and the complete command passed in 73.77s. The former 60s ceiling was therefore below intrinsic CPU demand, not detecting a hang. The host was loaded (load 78.58 on 316 CPUs; CPU PSI some 5.74%), but CPU time alone reached the ceiling and all samples made forward progress through footprint generation, splitter, inventory, and correspondence checks. 180s preserves >2.4x headroom for observed host variance without changing the command or hiding failures; a real hang still terminates and records a timeout.",
@@ -235,15 +237,15 @@
     {
       "group": "e2e", "job": "manifest_backend_parity_c",
       "desc": "Portable manifest bucket: backend-parity-c",
-      "description": "WORKER WIDTH measured 2026-08-23: recent 20-way validation runs rotated an identical empty early-Run1 no_result across unrelated ptrace cells, while each affected cell passed in another run. A focused run at eight workers completed all 79 selected strict rows in 175.9s with 79 canonical matches and no no_result, leaving a measured 424.1s margin to the unchanged 600s hang bound. This node reserves all 8 manifest_guest slots plus the exclusive hermit_guest slot and passes the same width to the harness. Tradeoff: blocking validation no longer exercises the former 20-way manifest pressure; every cell and the strict comparator remain enabled and unchanged. MEMORY measured 2026-08-25 at Hermit 16f70d9994 with the complete current-main artifact and width 8 under ambient load 49-64: three uncapped cgroup peaks were 2856333312, 3168403456, and 2857349120 bytes; three stricter 4-GiB-cap repetitions completed all 85 cells with peaks up to 3465289728 bytes and no cgroup kill. The 4-GiB baseline rounds above the observed high-water mark; the 6-GiB hard cap preserves another 2.5 GiB of runaway headroom without reserving the former unmeasured 32 GiB.",
+      "description": "WORKER WIDTH restored to 20 on 2026-08-28 after the width-dependent failure was traced to late precise-PMU timer delivery rather than shared fixture state. Reverie now records and recovers from the late delivery, and Hermit refuses the result as an understood infrastructure failure with the exact overshoot count instead of losing the comparison as an empty early-Run1 no_result. This node reserves all 20 manifest_guest slots and passes that width to the harness, so blocking validation again exercises the pressure that exposed the defect. Every cell and the strict comparator remain enabled and unchanged. MEMORY measured 2026-08-25 at Hermit 16f70d9994 with the complete current-main artifact and width 8 under ambient load 49-64: three uncapped cgroup peaks were 2856333312, 3168403456, and 2857349120 bytes; three stricter 4-GiB-cap repetitions completed all 85 cells with peaks up to 3465289728 bytes and no cgroup kill. The 4-GiB baseline rounds above the observed high-water mark; the 6-GiB hard cap preserves another 2.5 GiB of runaway headroom without reserving the former unmeasured 32 GiB.",
       "manifest": {"lane": "portable", "category": "backend-parity-c"},
-      "cmd": "./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --jobs 8",
+      "cmd": "./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --jobs 20",
       "jobs_flag": "",
       "deps": ["build.e2e_artifact", "build.manifest_guests", "e2e.metadata"],
       "timeout": 600,
-      "hint": {"resources": {"hermit_guest": 1, "manifest_guest": 8}, "est_duration_s": 180,
+      "hint": {"resources": {"manifest_guest": 20}, "est_duration_s": 180,
                "rss_baseline_bytes": 4294967296, "hard_mem_max_bytes": 6442450944,
-               "classification": "latency-bound", "preferred_inner_jobs": 8}
+               "classification": "latency-bound", "preferred_inner_jobs": 20}
     },
     {
       "group": "e2e", "job": "audit_compile_backend_parity_c",
@@ -269,15 +271,15 @@
     {
       "group": "e2e", "job": "manifest_c_programs",
       "desc": "Portable manifest bucket: c-programs",
-      "description": "WORKER WIDTH measured 2026-08-23: recent 20-way validation runs rotated an identical empty early-Run1 no_result across unrelated ptrace cells, while each affected cell passed in another run. A focused run at eight workers completed all 127 selected strict rows in 264.3s with 127 canonical matches and no no_result, leaving a measured 335.7s margin to the unchanged 600s hang bound. This node reserves all 8 manifest_guest slots plus the exclusive hermit_guest slot and passes the same width to the harness. Tradeoff: blocking validation no longer exercises the former 20-way manifest pressure; every cell and the strict comparator remain enabled and unchanged. MEMORY measured 2026-08-25 at Hermit 16f70d9994 with the complete current-main artifact and width 8 under ambient load 40-107: five uncapped cgroup peaks were 2855145472-2894295040 bytes; three stricter 4-GiB-cap repetitions completed all 128 cells with peaks up to 3025047552 bytes and no cgroup kill. The 4-GiB baseline rounds above the observed high-water mark; the 6-GiB hard cap preserves nearly 3 GiB of runaway headroom without reserving the former unmeasured 32 GiB.",
+      "description": "WORKER WIDTH restored to 20 on 2026-08-28 after the width-dependent failure was traced to late precise-PMU timer delivery rather than shared fixture state. Reverie now records and recovers from the late delivery, and Hermit refuses the result as an understood infrastructure failure with the exact overshoot count instead of losing the comparison as an empty early-Run1 no_result. This node reserves all 20 manifest_guest slots and passes that width to the harness, so blocking validation again exercises the pressure that exposed the defect. Every cell and the strict comparator remain enabled and unchanged. MEMORY measured 2026-08-25 at Hermit 16f70d9994 with the complete current-main artifact and width 8 under ambient load 40-107: five uncapped cgroup peaks were 2855145472-2894295040 bytes; three stricter 4-GiB-cap repetitions completed all 128 cells with peaks up to 3025047552 bytes and no cgroup kill. The 4-GiB baseline rounds above the observed high-water mark; the 6-GiB hard cap preserves nearly 3 GiB of runaway headroom without reserving the former unmeasured 32 GiB.",
       "manifest": {"lane": "portable", "category": "c-programs"},
-      "cmd": "./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category c-programs --ci-only --allow-empty --prebuilt --jobs 8",
+      "cmd": "./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category c-programs --ci-only --allow-empty --prebuilt --jobs 20",
       "jobs_flag": "",
       "deps": ["build.e2e_artifact", "build.manifest_guests", "e2e.metadata"],
       "timeout": 600,
-      "hint": {"resources": {"hermit_guest": 1, "manifest_guest": 8}, "est_duration_s": 300,
+      "hint": {"resources": {"manifest_guest": 20}, "est_duration_s": 300,
                "rss_baseline_bytes": 4294967296, "hard_mem_max_bytes": 6442450944,
-               "classification": "latency-bound", "preferred_inner_jobs": 8}
+               "classification": "latency-bound", "preferred_inner_jobs": 20}
     },
     {
       "group": "e2e", "job": "manifest_chaos_c",
@@ -386,18 +388,19 @@
       "cmd": "./ci/run-with-hermit-e2e-artifact.sh --require-install ./tests/e2e/lib/applications/run_all.sh",
       "deps": ["build.e2e_artifact"],
       "timeout": 300,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 30,
+      "hint": {"est_duration_s": 30,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
                "classification": "latency-bound"}
     },
-        {
+    {
       "group": "lint", "job": "clippy",
       "desc": "Clippy (cargo clippy --workspace --all-targets --all-features -D warnings)",
-      "description": "FEATURE SCOPE 2026-08-25 (task workspace-clippy-gate-never-sees-the-dbt-feature): --all-features added. Without it this gate ran hermit-cli's default feature set, so the DBT, SaBRe, e9patch and third-party-backends paths were never linted. --all-features deliberately picks up future features without another manual widening. MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 279248896 bytes after the feature widening; the larger width-8 historical calibration of 4.0 GiB governs. The 4-GiB baseline preserves that floor and the 6-GiB hard cap adds 2 GiB of headroom. CPU WIDTH remains pinned at 8 by CARGO_BUILD_JOBS and preferred_inner_jobs; jobs_flag stays empty because appending '-j 8' would reach rustc. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
+      "description": "FEATURE SCOPE 2026-08-25 (task workspace-clippy-gate-never-sees-the-dbt-feature): --all-features added. Without it this gate ran hermit-cli's default feature set, so the DBT, SaBRe, e9patch and third-party-backends paths were never linted. --all-features deliberately picks up future features without another manual widening. ORDERING 2026-08-29: this is the first of three Cargo commands that may rewrite target/debug before build.workspace produces the exact test-profile artifacts. The chain starts after the manifest audit, which executes target/debug/test-harness and failed when an overlapping writer removed that binary. It must finish before the producer so no test consumer can lose or rebuild an artifact while another consumer is running it. MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 279248896 bytes after the feature widening; the larger width-8 historical calibration of 4.0 GiB governs. The 4-GiB baseline preserves that floor and the 6-GiB hard cap adds 2 GiB of headroom. CPU WIDTH remains pinned at 8 by CARGO_BUILD_JOBS and preferred_inner_jobs; jobs_flag stays empty because appending '-j 8' would reach rustc. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
       "cmd": "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh cargo clippy --workspace --all-targets --all-features -- -D warnings",
-      "deps": ["build.e2e_artifact"],
+      "deps": ["setup.nextest"],
       "timeout": 1200,
       "jobs_flag": "",
+      "jobs_env": "",
       "hint": {"est_duration_s": 300, "rss_baseline_bytes": 4294967296,
                "hard_mem_max_bytes": 6442450944, "classification": "cpu-bound",
                "preferred_inner_jobs": 8}
@@ -405,13 +408,14 @@
     {
       "group": "doc", "job": "doctests",
       "desc": "Test workspace documentation (cargo test --workspace --features third-party-backends --doc)",
-      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> cargo defaulted the build phase to nproc). rss_baseline=measured_peak@j8=208MiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=2.0GiB (was 5GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv. CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 mirrors the leading CARGO_BUILD_JOBS=8 prefix. See doc.rustdoc for the shared derivation; jobs_flag is empty so the declaration sizes the cgroup box only and never edits argv.",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> cargo defaulted the build phase to nproc). The old 208MiB baseline was measured warm after build.workspace. Moving this writer before the final producer exposed the missing cold case: full run 9f6a1742ec7f hit the 2GiB MemoryMax after 32 seconds and four cgroup OOM kills while still compiling dependencies. A 2GiB scheduling baseline now records that proved lower bound and a 4GiB hard cap leaves another 2GiB without returning to the former unmeasured 5GiB. CPU WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 mirrors the leading CARGO_BUILD_JOBS=8 prefix. See doc.rustdoc for the shared derivation; jobs_flag is empty so the declaration sizes the cgroup box only and never edits argv.",
       "cmd": "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh cargo test --workspace --features third-party-backends --doc",
-      "deps": ["build.e2e_artifact"],
+      "deps": ["lint.clippy"],
       "timeout": 900,
       "jobs_flag": "",
-      "hint": {"est_duration_s": 180, "rss_baseline_bytes": 218103808,
-               "hard_mem_max_bytes": 2147483648, "classification": "cpu-bound",
+      "jobs_env": "",
+      "hint": {"est_duration_s": 180, "rss_baseline_bytes": 2147483648,
+               "hard_mem_max_bytes": 4294967296, "classification": "cpu-bound",
                "preferred_inner_jobs": 8}
     },
     {
@@ -419,9 +423,10 @@
       "desc": "Documentation (RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --all-features)",
       "description": "MEM RE-DERIVATION 2026-08-25 (task re_derive_doc_rustdoc): rss_baseline 1181116006 -> 1505439744. The previous figure PREDATED the --all-features/-D warnings change and I flagged it stale when I made that change; this replaces it rather than leaving the caveat standing. method=cgroup-RECORDED (systemd-run --user -p MemoryAccounting=yes, MemoryPeak == cgroup memory.peak), pinned_jobs=8 via the CARGO_BUILD_JOBS=8 prefix, target_state=warm with `rm -rf target/doc` first so rustdoc actually reruns. n=2 complete runs, both result=success: 1505439744 and 1491546112 bytes (1.402 and 1.389 GiB); the larger is recorded. A THIRD, COLDER, INCOMPLETE run peaked HIGHER at 1913589760 (1.78 GiB) before it was killed, so a cold-cache run costs more than this warm figure and 1.78 GiB is a lower bound for that case -- the existing 3 GiB hard cap still clears it, which is why hard_mem_max_bytes is UNCHANGED. ⚠️ est_duration_s DELIBERATELY NOT UPDATED. Warm wall clock here was 12s against the recorded 150, but this box reports 316 effective CPUs (see the run-with-reverie-dbt-budget.sh banner), so its wall clock is not transferable to a CI runner. CPU time consumed was 33.4s, which is the portable number if anyone wants to re-derive duration properly. Memory peak transfers; wall clock on a 316-CPU host does not. ENFORCEMENT 2026-08-25 (task doc_rustdoc_cannot_fail): RUSTDOCFLAGS=-D warnings added. Until now this node ran cargo doc with no RUSTDOCFLAGS, so it EXITED 0 WHILE EMITTING WARNINGS -- it rendered documentation and could not fail on documentation defects. Measured against the real pre-fix source at 89288ed6ad^: the old command exits 0 with 3 warnings; with -D warnings it exits 101 and names both offending items and lines. --all-features added alongside, and HONESTLY IT IS PRECAUTIONARY RATHER THAN A FIX: measured today it changes nothing for rustdoc -- 13 crates and 920 HTML pages either way, zero delta -- because the feature-gated items in hermit-cli are #[doc(hidden)] re-exports and detcore-dbt is a workspace member documented regardless. It is here so that a DOCUMENTED item placed behind a feature gate later cannot become invisible, which is the mechanism that hid clippy findings until e602aaa991. Do not read it as closing a live gap. .github/workflows/docs.yml deliberately NOT changed: it PUBLISHES to gh-pages rather than gating, and a publisher that refuses to publish over a doc warning is a worse trade. MEM/CPU DERIVATION 2026-08-10 (tasks memory-caps-must-scale-with-job-count, fix_doc_rustdoc_dynamorio and p0_dynamorio_build_cache): pinned_jobs=8 via both CARGO_BUILD_JOBS=8 and preferred_inner_jobs=8. THIS NODE CARRIES THE SHARED DERIVATION for every step whose command starts with a CARGO_BUILD_JOBS=<N> prefix; target/debug/test-harness enforces the pairing as a rule over all such steps. The explicit preferred width is load-bearing: safe-ci's declarations-first default (agent-utils DEFAULT_SMALL_CPU_COUNT=1) otherwise boxes this eight-worker cold DynamoRIO build to cpu.max=1 core while the DBT ratchet derives 132s from eight effective workers. ROOT CAUSE, measured: hermit ab4a8c08 advanced the agent-utils gitlink a6f4232 ('make the SMALL default cap OPT-IN, default OFF') -> 1d893fbc, which contains ada564d ('activate small undeclared-step caps'); every head that failed pins the activated runner and both heads that passed pin a6f4232. LIVE CGROUP READ with the runner built at the pinned SHA, each step reporting its own /proc/self/cgroup -> cpu.max: an undeclared step gets '100000 100000' (1 core) and a preferred_inner_jobs=8 step gets '800000 100000' (8 cores). A/B ON THE IDENTICAL DynamoRIO cmake build --parallel 8 (316-core validation host, load avg 46): unboxed 15.37s wall / 102.51 CPU-s at 666% CPU, versus CPUQuota=100% 112.23s wall / 112.01 CPU-s at 99% CPU; cmake configure is a further 3.65s serial. 112s at one core is already 85% of the 132s budget for the build alone, and sharing that core with the node's concurrent rustdoc/cargo work produced the observed 185.51/187.79/188.06/286.70s. CONTROL: build.workspace and build.runtime_release were the only steps that already declared a width (32) and were the only cpu-bound steps that did not regress (91s -> 88s), while undeclared test.detcore_unit went 34s -> 103s. The 132s ratchet is UNCHANGED and stays fully live: 15.4s observed against 132s once eight cores are actually delivered. jobs_flag is empty so the declaration sizes the cgroup box only; CARGO_BUILD_JOBS already conveys the width to Cargo, and appending '-j 8' would edit argv (harmless here, but it would reach libtest or rustc on three sibling steps). rss_baseline=measured_peak@j8=1.1GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm Rust artifacts but a distinct cargo-doc reverie-dbt build-script OUT_DIR can still cold-build DynamoRIO; hermit@21b22c2b. headroom=+1.9GiB additive -> hard_mem_max_bytes=3.0GiB. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
       "cmd": "CARGO_BUILD_JOBS=8 RUSTDOCFLAGS='-D warnings' ./ci/run-with-reverie-dbt-budget.sh cargo doc --workspace --no-deps --all-features",
-      "deps": ["build.e2e_artifact"],
+      "deps": ["doc.doctests"],
       "timeout": 900,
       "jobs_flag": "",
+      "jobs_env": "",
       "hint": {"est_duration_s": 150, "rss_baseline_bytes": 1505439744,
                "hard_mem_max_bytes": 3221225472, "classification": "cpu-bound",
                "preferred_inner_jobs": 8}
@@ -430,10 +435,11 @@
       "group": "test", "job": "regular_crates",
       "desc": "Test regular workspace crates (nextest, excludes hermit-detcore/hermit/flaky)",
       "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (build phase; nextest execution threads stay default). rss_baseline=measured_peak@j8=2.0GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); measured on a 316-core box with nextest's default (nproc) test-thread parallelism, so this peak already reflects full execution-thread fan-out; hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=3.5GiB (was 6GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv. CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 mirrors the leading CARGO_BUILD_JOBS=8 prefix. See doc.rustdoc for the shared derivation; jobs_flag is empty because nextest's -j sets TEST-EXECUTION threads, not build jobs, so appending it would silently change what this step measures.",
-      "cmd": "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} --workspace --exclude hermit-detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests",
+      "cmd": "NEXTEST_BINARIES_METADATA=target/ci/nextest-binaries/regular.json CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} --workspace --exclude hermit-detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
       "jobs_flag": "",
+      "jobs_env": "",
       "hint": {"est_duration_s": 200, "rss_baseline_bytes": 2147483648,
                "hard_mem_max_bytes": 3758096384, "classification": "cpu-bound",
                "preferred_inner_jobs": 8}
@@ -442,11 +448,12 @@
       "group": "test", "job": "hermit_unit",
       "desc": "Test Hermit unit and binary targets (-p hermit --lib --bins)",
       "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 1130741760 bytes; the larger width-8 historical calibration of 4.6 GiB governs. The 5-GiB scheduling baseline rounds above that floor and the 7-GiB hard cap adds 2 GiB of headroom. CPU WIDTH remains pinned at 8 for the build phase while nextest execution remains -j1. See ai_docs/dag-memory-caps-recalibration-20260825.md. TEST CONCURRENCY -j1 EXPLAINED 2026-08-26 (task goal-5-build-the-validate-parallel-scaling-model-1-to-316-threads): the -j1 is DELIBERATE, not a default. It preserves a --test-threads=1 introduced 2026-07-27 in 6044c2d39a and carried to nextest -j1 on 2026-08-10 in 3dc3a08a79, whose message says 'Preserve serial execution where Hermit tests require it'. The sibling test.detcore_unit (-p hermit-detcore --lib --bins) has never carried it, so the choice is selective. Hermit's INTEGRATION tests get the same serialization by a different route -- .config/nextest.toml caps the test-group hermit-serialized at max-threads 1 over filter package(=hermit) & kind(=test); --lib and --bins are NOT kind(=test), which is why this node needs the flag instead. That file states the reason at lines 30-32: the hermit test binaries 'use process-local mutexes to serialize Hermit executions', and several tests here do execute Hermit (for example run::detects_symlink_resolution_through_implicit_mounts and the verify::tests::* family). MEASURED COST OF THE PIN: 1.93x. Two replicates each at a6b0c37648df on the host recorded for this measurement in docs/TESTING_ENVIRONMENTS.md under Named measurement hosts, -j1 gave 27.0s and 27.3s against -j16 at 14.4s and 13.7s. WARNING FOR WHOEVER MEASURES THIS NEXT -- TWO DISTINCT KNOBS, DO NOT PUT THEM ON ONE AXIS. CARGO_BUILD_JOBS=8 bounds BUILD width; nextest -j bounds TEST concurrency. The 1.93x is attributable to -j alone; the wrapper's build width was unchanged throughout. Plotting a build width and a test concurrency on one axis produces a smooth curve that means nothing. Those figures are WARM-REPEAT times, not node times: this node takes 57.6s in a full validate. The SPEEDUP transfers, the absolute seconds do not. NOT ESTABLISHED: whether the serialization is still necessary. No commit or comment names which lib/bin test requires it. Two -j16 runs returned rc=0 and that is NOT evidence of safety, because a race that only appears under concurrency is exactly what two green runs cannot rule out. Raising this needs someone to confirm Hermit's lib and bin targets are free of the process-local mutex constraint; until then the 1.93x is not claimable.",
-      "cmd": "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --lib --bins -j 1",
+      "cmd": "NEXTEST_BINARIES_METADATA=target/ci/nextest-binaries/hermit-unit.json CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --lib --bins -j 1",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
       "jobs_flag": "",
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+      "jobs_env": "",
+      "hint": {"est_duration_s": 120,
                "rss_baseline_bytes": 5368709120, "hard_mem_max_bytes": 7516192768,
                "classification": "cpu-bound", "preferred_inner_jobs": 8}
     },
@@ -454,10 +461,11 @@
       "group": "test", "job": "detcore_unit",
       "desc": "Test Detcore unit and binary targets (-p hermit-detcore --lib --bins)",
       "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> build phase defaulted to nproc). rss_baseline=measured_peak@j8=1.8GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.7GiB additive -> hard_mem_max_bytes=3.5GiB (was 5GiB). NOTE: cpu_timeout intentionally NOT set here or on the sibling test.detcore_misc node -- detcore_misc currently livelocks under load (reverie#355 is the established fix; a cpu_timeout derived from pre-355 hang behaviour would be wrong). cpu_timeout derivation is out of scope for this memory-cap change. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv. CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 mirrors the leading CARGO_BUILD_JOBS=8 prefix. This node is the cleanest measured case of the one-core default: 34s at agent-utils a6f4232 (caps OFF) versus 103s at d2fdfc83 (caps ON), a 3.0x regression against a flat build.runtime_release control that already declared its width. See doc.rustdoc for the shared derivation; jobs_flag is empty so the declaration sizes the cgroup box only and never edits argv.",
-      "cmd": "CARGO_BUILD_JOBS=8 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore --lib --bins",
+      "cmd": "NEXTEST_BINARIES_METADATA=target/ci/nextest-binaries/detcore-unit.json CARGO_BUILD_JOBS=8 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore --lib --bins",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
       "jobs_flag": "",
+      "jobs_env": "",
       "hint": {"est_duration_s": 120,
                "rss_baseline_bytes": 1932735283, "hard_mem_max_bytes": 3758096384,
                "classification": "cpu-bound", "preferred_inner_jobs": 8}
@@ -466,129 +474,152 @@
       "group": "test", "job": "detcore_misc",
       "desc": "Detcore non-CPUID miscellaneous cases (tests_misc, skips RDRAND host probes)",
       "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 66965504 bytes; the larger 1697730560-byte historical completed peak governs. The 2-GiB baseline rounds above that floor and the 4-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
-      "cmd": "./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore --test tests_misc -j 1 -- --skip has_rdrand_without_detcore --skip rdrand_rdseed_is_masked --skip ordinary_clone_child_starts_before_parent_resumes --skip ordinary_clone_parent_mode_can_resume_before_child --skip network_syscalls_are_deterministic_across_five_runs",
+      "cmd": "NEXTEST_BINARIES_METADATA=target/ci/nextest-binaries/detcore-misc.json CARGO_BUILD_JOBS=8 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore --test tests_misc -j 1 -- --skip has_rdrand_without_detcore --skip rdrand_rdseed_is_masked --skip ordinary_clone_child_starts_before_parent_resumes --skip ordinary_clone_parent_mode_can_resume_before_child --skip network_syscalls_are_deterministic_across_five_runs",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 720,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
+      "jobs_flag": "",
+      "jobs_env": "",
+      "hint": {"est_duration_s": 90,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
-               "classification": "cpu-bound"}
+               "classification": "cpu-bound", "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "detcore_parallel",
       "desc": "Detcore non-PMU parallel cases (tests_parallelism, --skip detcore, -j4)",
       "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 411189248 bytes; the larger 1605021696-byte historical completed peak governs. The 2-GiB baseline rounds above that floor and the 4-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
-      "cmd": "./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore --test tests_parallelism -j 4 -- --skip detcore",
+      "cmd": "NEXTEST_BINARIES_METADATA=target/ci/nextest-binaries/detcore-parallel.json CARGO_BUILD_JOBS=8 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore --test tests_parallelism -j 4 -- --skip detcore",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 720,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+      "jobs_flag": "",
+      "jobs_env": "",
+      "hint": {"est_duration_s": 120,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
-               "classification": "cpu-bound"}
+               "classification": "cpu-bound", "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "hermit_integration",
       "desc": "Portable Hermit integration targets (batched compile, serial test binaries)",
       "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): all five current full-population runs were red for existing test failures, so their partial peaks are censored and do not lower the estimate. The last successful historical peak was 5351632896 bytes and an older 4-GiB run OOMed. The 6-GiB baseline rounds above the successful floor and the 8-GiB hard cap preserves 2 GiB more headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
-      "cmd": "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test chown_virtual_root_identity --test clock_determinism --test clock_discipline_determinism --test container_init_deadline --test cpufreq_avg_determinism --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test zero_copy_pipe_fallback -j 1",
+      "cmd": "NEXTEST_BINARIES_METADATA=target/ci/nextest-binaries/hermit-integration.json CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test chown_virtual_root_identity --test clock_determinism --test clock_discipline_determinism --test container_init_deadline --test cpufreq_avg_determinism --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test zero_copy_pipe_fallback -j 1",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 1200,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 300,
+      "jobs_flag": "",
+      "jobs_env": "",
+      "hint": {"est_duration_s": 300,
                "rss_baseline_bytes": 6442450944, "hard_mem_max_bytes": 8589934592,
-               "classification": "latency-bound"}
+               "classification": "latency-bound", "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "arbitrary_binaries",
       "desc": "Portable arbitrary-binary cases",
       "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 255152128 bytes; the larger 1936408576-byte historical completed peak governs. The 2-GiB baseline rounds above that floor and the 4-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
-      "cmd": "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test arbitrary_binaries -j 1 -- --skip record_replay_stable_arbitrary_binaries",
+      "cmd": "NEXTEST_BINARIES_METADATA=target/ci/nextest-binaries/arbitrary-binaries.json CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test arbitrary_binaries -j 1 -- --skip record_replay_stable_arbitrary_binaries",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+      "jobs_flag": "",
+      "jobs_env": "",
+      "hint": {"est_duration_s": 120,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
-               "classification": "latency-bound"}
+               "classification": "latency-bound", "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "cli",
       "desc": "Portable CLI cases (skips KVM/DBT-backend-only cases)",
       "description": "Five exact DBT product failures are excluded from the portable baseline under #2791 and retain source TODOs naming their individual defects; the LiteInst tests remain active. MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 339279872 bytes; the larger 4068401152-byte historical completed peak governs. The 4-GiB baseline rounds above that floor and the 6-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
-      "cmd": "HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbt_strict_returns_with_blocked_stdin_source --skip run_dbt_verifies_pipe_backpressure --skip run_dbt_keeps_diagnostics_out_of_guest_stderr --skip run_dbt_recovers_after_failed_exec --skip run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls --skip run_dbt_verifies_queued_self_signals --skip run_dbt_verifies_self_prlimit --skip run_dbt_verifies_shell_process_lifecycle --skip run_dbt_verifies_simple_env_shebang --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest",
+      "cmd": "NEXTEST_BINARIES_METADATA=target/ci/nextest-binaries/cli.json CARGO_BUILD_JOBS=8 HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbt_strict_returns_with_blocked_stdin_source --skip run_dbt_verifies_pipe_backpressure --skip run_dbt_keeps_diagnostics_out_of_guest_stderr --skip run_dbt_recovers_after_failed_exec --skip run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls --skip run_dbt_verifies_queued_self_signals --skip run_dbt_verifies_self_prlimit --skip run_dbt_verifies_shell_process_lifecycle --skip run_dbt_verifies_simple_env_shebang --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest",
       "deps": ["build.e2e_artifact", "build.liteinst_runtime_release", "setup.nextest"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 150,
+      "jobs_flag": "",
+      "jobs_env": "",
+      "hint": {"est_duration_s": 150,
                "rss_baseline_bytes": 4294967296, "hard_mem_max_bytes": 6442450944,
-               "classification": "latency-bound"}
+               "classification": "latency-bound", "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "liteinst_strict",
       "desc": "Portable LiteInst strict compatibility",
-      "cmd": "HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit ./ci/liteinst-strict-node.sh -- ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test liteinst_advanced -j 1",
+      "cmd": "NEXTEST_BINARIES_METADATA=target/ci/nextest-binaries/liteinst-advanced.json CARGO_BUILD_JOBS=8 HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit ./ci/liteinst-strict-node.sh -- ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test liteinst_advanced -j 1",
       "deps": ["build.e2e_artifact", "build.liteinst_runtime_release", "setup.nextest"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+      "jobs_flag": "",
+      "jobs_env": "",
+      "hint": {"est_duration_s": 120,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
-               "classification": "latency-bound"}
+               "classification": "latency-bound", "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "sabre_examples",
       "desc": "SaBRe non-racy examples: per-backend time determinism and non-time ptrace parity",
-      "cmd": "HERMIT_SABRE_TEST_BINARY=$PWD/target/release/hermit HERMIT_SABRE_BINARY=$PWD/target/install_pkg/rsrcs/sabre ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test sabre_examples -j 1",
+      "cmd": "NEXTEST_BINARIES_METADATA=target/ci/nextest-binaries/sabre-examples.json CARGO_BUILD_JOBS=8 HERMIT_SABRE_TEST_BINARY=$PWD/target/release/hermit HERMIT_SABRE_BINARY=$PWD/target/install_pkg/rsrcs/sabre ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test sabre_examples -j 1",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
+      "jobs_flag": "",
+      "jobs_env": "",
+      "hint": {"est_duration_s": 90,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
-               "classification": "latency-bound"}
+               "classification": "latency-bound", "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "hermit_modes",
       "desc": "Portable Hermit mode cases (skips default_ and chaos_buck_)",
       "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 286810112 bytes; the larger 2038853632-byte historical completed peak governs. The 2-GiB baseline rounds above that floor and the 4-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
-      "cmd": "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test hermit_modes -j 1 -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify",
+      "cmd": "NEXTEST_BINARIES_METADATA=target/ci/nextest-binaries/hermit-modes.json CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test hermit_modes -j 1 -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 150,
+      "jobs_flag": "",
+      "jobs_env": "",
+      "hint": {"est_duration_s": 150,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
-               "classification": "latency-bound"}
+               "classification": "latency-bound", "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "app_strict_verify",
       "desc": "Portable application strict verification (skips java/javac and mountinfo-dependent Go cases)",
       "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five successful current exact-command cgroup samples peaked at 1502470144 bytes, plus one failed/censored attempt; the larger 2838315008-byte historical completed peak governs, while prior 4-GiB pressure argues against a tight hard ceiling. The 3-GiB baseline rounds above the floor and the 6-GiB hard cap preserves 3 GiB of adverse-load headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
-      "cmd": "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test app_strict_verify -j 1 -- --ignored --skip java_ --skip javac_ --skip go_hello_is_deterministic_under_strict_verify --skip go_goroutines_are_deterministic_under_strict_verify",
+      "cmd": "NEXTEST_BINARIES_METADATA=target/ci/nextest-binaries/app-strict-verify.json CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test app_strict_verify -j 1 -- --ignored --skip java_ --skip javac_ --skip go_hello_is_deterministic_under_strict_verify --skip go_goroutines_are_deterministic_under_strict_verify",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
+      "jobs_flag": "",
+      "jobs_env": "",
+      "hint": {"est_duration_s": 180,
                "rss_baseline_bytes": 3221225472, "hard_mem_max_bytes": 6442450944,
-               "classification": "latency-bound"}
+               "classification": "latency-bound", "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "command_strict_verify",
       "desc": "Portable command strict verification (skips mountinfo-dependent kernel pseudofile case)",
       "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 239931392 bytes; the larger 1948848128-byte historical completed peak governs. The 2-GiB baseline rounds above that floor and the 4-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
-      "cmd": "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test command_strict_verify -j 1 -- --ignored --skip kernel_pseudofile_commands_are_deterministic_under_strict_verify",
+      "cmd": "NEXTEST_BINARIES_METADATA=target/ci/nextest-binaries/command-strict-verify.json CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test command_strict_verify -j 1 -- --ignored --skip kernel_pseudofile_commands_are_deterministic_under_strict_verify",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
+      "jobs_flag": "",
+      "jobs_env": "",
+      "hint": {"est_duration_s": 180,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
-               "classification": "latency-bound"}
+               "classification": "latency-bound", "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "ignored_syscall_regressions",
       "desc": "Portable ignored syscall regressions (epoll_determinism, rcx_canonicalization)",
       "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 268689408 bytes; the larger 1774698496-byte historical completed peak governs. The 2-GiB baseline rounds above that floor and the 4-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
-      "cmd": "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test epoll_determinism --test rcx_canonicalization -j 1 -- --ignored",
+      "cmd": "NEXTEST_BINARIES_METADATA=target/ci/nextest-binaries/ignored-syscall-regressions.json CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test epoll_determinism --test rcx_canonicalization -j 1 -- --ignored",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 720,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
+      "jobs_flag": "",
+      "jobs_env": "",
+      "hint": {"est_duration_s": 90,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
-               "classification": "latency-bound"}
+               "classification": "latency-bound", "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "rr_suite_contract",
       "desc": "rr suite source contract (scratch dirs fresh and cleaned)",
       "description": "MEM-CAP DERIVATION 2026-08-04 (follow-on to task memory-caps-must-scale-with-job-count / #1583, which capped the OTHER compile-bearing nodes but MISSED this one): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> the test binary's build phase defaulted to nproc, and under the full portable profile that cc1plus fan-out blew the old 2.0GiB cap -> OOM; the job-pin is the actual fix). rss_baseline=measured_peak@j8=3.5GiB; method=cgroup-RECORDED (dagrun step_profiles peak_bytes == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@b384187e. CAVEAT: peak_bytes is cap-influenced because compile page-cache is reclaimable (a negative-control run at a 512MiB cap PASSED via reclaim, oom_kills=0) -> the true non-reclaimable working set at j8 is well under this figure; the cap is conservative headroom, the pin is the fix. headroom=+1.5GiB additive -> hard_mem_max_bytes=5.0GiB (was 2.0GiB, which was too tight once the node was left unpinned). classification light->cpu-bound (compile-bearing). CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 mirrors the leading CARGO_BUILD_JOBS=8 prefix. See doc.rustdoc for the shared derivation; jobs_flag is empty because appending '-j 8' here would land after '--' and reach libtest, which rejects it.",
-      "cmd": "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test rr_suite -j 1 rr_scratch_directories_are_fresh_and_cleaned -- --exact",
+      "cmd": "NEXTEST_BINARIES_METADATA=target/ci/nextest-binaries/rr-suite.json CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test rr_suite -j 1 rr_scratch_directories_are_fresh_and_cleaned -- --exact",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 720,
       "jobs_flag": "",
+      "jobs_env": "",
       "hint": {"est_duration_s": 30, "rss_baseline_bytes": 3758096384,
                "hard_mem_max_bytes": 5368709120, "classification": "cpu-bound",
                "preferred_inner_jobs": 8}
@@ -600,7 +631,7 @@
       "cmd": "python3 tests/backend-parity/run_matrix.py --hermit target/release/hermit --backend dbt --strict --require-backend --no-parent-scorecard",
       "deps": ["build.runtime_release", "check.dbt_runtime_abi"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
+      "hint": {"est_duration_s": 180,
                "rss_baseline_bytes": 536870912, "hard_mem_max_bytes": 2147483648,
                "classification": "latency-bound"}
     },
@@ -609,9 +640,9 @@
       "desc": "Portable working-envelope levels (L1-L4 over true/echo/date; implemented by scripts/validate.rs)",
       "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 28729344 bytes and the historical completed maximum is 61661184 bytes. The 128-MiB baseline is above both the p90-plus-20-percent estimate and that floor; the 1-GiB hard cap leaves 896 MiB of runaway headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
       "cmd": "set -e; HERMIT=target/debug/hermit; ARGS='run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled'; REPS=${L4_REPS:-20}; EXECUTED=0; publish_counts() { local status=$? count_status; trap - EXIT; set +e; ./ci/write-structured-test-counts.sh \"$EXECUTED\" 0; count_status=$?; if ((status == 0 && count_status != 0)); then status=$count_status; fi; exit \"$status\"; }; trap publish_counts EXIT; run_probe() { local id=\"$1\"; local c=\"$2\"; EXECUTED=$((EXECUTED + 1)); printf '##TEST-START %s\\n' \"$id\" >&2; timeout 30s $HERMIT $ARGS --strict -- $c </dev/null >&2; timeout 30s $HERMIT $ARGS --strict --verify -- $c </dev/null >&2; timeout 30s $HERMIT $ARGS --strict --verify --detlog-heap --detlog-stack -- $c </dev/null >&2; local i; for ((i=0;i<REPS;i++)); do timeout 30s $HERMIT $ARGS --strict --verify -- $c </dev/null >&2; done; printf '##TEST-END %s PASS\\n' \"$id\" >&2; }; run_probe true '/bin/true'; run_probe echo '/bin/echo hermit-envelope'; run_probe date '/bin/date -u +%Y'",
-      "deps": ["build.workspace"],
+      "deps": ["build.workspace", "e2e.metadata"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+      "hint": {"est_duration_s": 120,
                "rss_baseline_bytes": 134217728, "hard_mem_max_bytes": 1073741824,
                "classification": "latency-bound"}
     },
@@ -623,7 +654,7 @@
                "test.regular_crates",
                "test.hermit_unit", "test.detcore_unit", "test.rr_suite_contract"],
       "timeout": 720,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 600,
+      "hint": {"est_duration_s": 600,
                "rss_baseline_bytes": 12884901888, "hard_mem_max_bytes": 25769803776,
                "classification": "latency-bound"}
     }

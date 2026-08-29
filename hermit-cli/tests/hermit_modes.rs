@@ -142,23 +142,21 @@ const CARGO_GUEST_BINARIES: [&str; 21] = [
     "rustbin_thread_random",
 ];
 
-fn cargo_guest_workloads(repository: &Path) -> Vec<Workload> {
+fn cargo_guest_workloads() -> Vec<Workload> {
     let binary_directory = Path::new(env!("CARGO_BIN_EXE_hermit"))
         .parent()
         .expect("Hermit binary should have a parent directory");
-    if CARGO_GUEST_BINARIES
+    let missing = CARGO_GUEST_BINARIES
         .iter()
-        .any(|name| !binary_directory.join(name).is_file())
-    {
-        let mut command = Command::new(env!("CARGO"));
-        command.current_dir(repository).args([
-            "build",
-            "-p",
-            "hermetic_infra_hermit_tests",
-            "--bins",
-        ]);
-        command_output(command, "Cargo guest workload compilation");
-    }
+        .map(|name| binary_directory.join(name))
+        .filter(|path| !path.is_file())
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "missing prebuilt Cargo guest binaries: {}; run ./ci/prepare-nextest-binaries.sh portable or privileged before this test",
+        missing.join(", ")
+    );
 
     CARGO_GUEST_BINARIES
         .iter()
@@ -305,7 +303,7 @@ fn workloads() -> &'static Workloads {
                 .map(|(name, source)| workload(name, repository.join(source))),
         );
 
-        default_only.extend(cargo_guest_workloads(repository));
+        default_only.extend(cargo_guest_workloads());
 
         let resource_determinism = workload(
             "resource_determinism",

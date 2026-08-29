@@ -139,6 +139,8 @@ const LEDGER_PRODUCER: &str = "hermit-validate-rs";
 /// and the fail-closed assertion that requires it cannot drift apart.
 const PIN_GATE_TAG: &str = "pre.reverie_pin";
 const MANIFEST_AUDIT_COMMAND: &str = "target/debug/test-harness validate";
+const DEBUG_TEST_PRODUCER_COMMAND: &str =
+    "CARGO_BUILD_JOBS=8 ./ci/prepare-nextest-binaries.sh portable";
 const QUICK_E2E_VERIFY_TIMEOUT_S: i64 = 1800;
 const PINNED_ROOT_FETCH_TAG: &str = "setup.pinned_root_fetch";
 const PINNED_ROOT_FETCH_COMMAND: &str = "seed=(); if [ -n \"${CARGO_HOME:-}\" ]; then seed=(--seed-cargo \"$CARGO_HOME\"); fi; ./ci/hermetic/run-split-validate.sh --fetch-only \"${seed[@]}\"";
@@ -836,9 +838,9 @@ fn nested_scope_probe_step(
 /// step declares a wider `preferred_inner_jobs` than the budget AND manages its own
 /// concurrency (an empty `jobs_flag`) — because clamping such a step's cgroup quota
 /// alone would leave its original worker count running inside a smaller box, which
-/// is a slowdown disguised as a limit. Four nodes are in exactly that position:
-/// `build.workspace` and `build.runtime_release` at 32, and
-/// `e2e.manifest_backend_parity_c` and `e2e.manifest_c_programs` at 8. All four
+/// is a slowdown disguised as a limit. Three nodes are in exactly that position:
+/// `build.runtime_release` at 32, and
+/// `e2e.manifest_backend_parity_c` and `e2e.manifest_c_programs` at 20. All three
 /// bake their measured width into the command itself, so `-j` (host_cpus/8, floor
 /// 2, cap 16) would refuse the entire run.
 ///
@@ -1150,6 +1152,10 @@ fn self_test() -> Result<(), String> {
             executed_tests: None,
             filtered_tests: None,
             returncode: Some(if ok { 0 } else { 1 }),
+            oomed: false,
+            oom_kills: 0,
+            timed_out: false,
+            cpu_timed_out: false,
             reason: String::new(),
             aborted: false,
         };
@@ -1938,30 +1944,49 @@ fn self_test() -> Result<(), String> {
                     "carry bracket: lane {lane} dropped jobs env but named {jobs_env_error}"
                 ));
             }
-            if base.resource_caps.is_empty() {
-                return Err(format!("carry bracket: lane {lane} declares no resource_caps; \
-                                    the bracket would be vacuous"));
-            }
             let bad = validate_plan::ungrantable_resources(&carried);
             if !bad.is_empty() {
                 return Err(format!(
                     "grantable bracket: lane {lane} carried its caps yet still reports {} \
                      ungrantable demand(s): {:?}", bad.len(), &bad[..bad.len().min(3)]));
             }
-            // NEGATIVE: drop the caps exactly as the bug did -> must be REFUSED,
-            // and must NAME the resource rather than sleeping on it.
-            let mut stripped = carried.clone();
-            stripped.resource_caps.clear();
-            let starved = validate_plan::ungrantable_resources(&stripped);
-            if starved.is_empty() {
-                return Err(format!(
-                    "grantable bracket: lane {lane} with resource_caps CLEARED reported nothing \
-                     ungrantable -- the check is inert and would not have caught the stall"));
+            for unsupported in ["hermit_guest", "kvm"] {
+                if base.resource_caps.contains_key(unsupported)
+                    || base
+                        .steps
+                        .iter()
+                        .any(|step| step.hint.resources.contains_key(unsupported))
+                {
+                    return Err(format!(
+                        "resource-cap bracket: lane {lane} restored unsupported exclusive resource {unsupported}"
+                    ));
+                }
             }
-            let named = base.resource_caps.keys().any(|r| starved.iter().any(|b| b.contains(r)));
-            if !named {
-                return Err(format!("grantable bracket: refusal for {lane} names no resource: {:?}",
-                                   &starved[..starved.len().min(2)]));
+            let mut cleared_cap_starvation = 0;
+            if !base.resource_caps.is_empty() {
+                // NEGATIVE: drop declared caps exactly as the historical bug did
+                // -> every remaining demand must be REFUSED and named rather
+                // than sleeping forever. A lane with neither caps nor demands
+                // is valid and has no negative cap-removal case to construct.
+                let mut stripped = carried.clone();
+                stripped.resource_caps.clear();
+                let starved = validate_plan::ungrantable_resources(&stripped);
+                if starved.is_empty() {
+                    return Err(format!(
+                        "grantable bracket: lane {lane} with resource_caps CLEARED reported nothing \
+                         ungrantable -- the check is inert and would not have caught the stall"));
+                }
+                let named = base
+                    .resource_caps
+                    .keys()
+                    .any(|resource| starved.iter().any(|row| row.contains(resource)));
+                if !named {
+                    return Err(format!(
+                        "grantable bracket: refusal for {lane} names no resource: {:?}",
+                        &starved[..starved.len().min(2)]
+                    ));
+                }
+                cleared_cap_starvation = starved.len();
             }
             // NEGATIVE 2: a dropped config must be DETECTED, not tolerated.
             let defaulted = validate_plan::config_from(carried.steps.clone(), "bracket");
@@ -1972,7 +1997,7 @@ fn self_test() -> Result<(), String> {
             }
             println!("  dag-config: {lane} carries {} cap(s), default_step_timeout={}s; \
 cleared-caps refusal names {} starved step(s)",
-                     base.resource_caps.len(), base.default_step_timeout, starved.len());
+                     base.resource_caps.len(), base.default_step_timeout, cleared_cap_starvation);
         }
     }
     // The full hot path is one fused DAG and pays the exact-tree manifest audit
@@ -2091,12 +2116,114 @@ cleared-caps refusal names {} starved step(s)",
             .steps
             .iter()
             .find(|s| s.tag() == "build.workspace")
-            .ok_or("full-plan bracket: portable fat build disappeared")?;
-        if !portable_build.cmd.contains("cargo build --workspace --all-targets")
-            || !portable_build.cmd.contains("cargo build -p hermit")
-            || !portable_build.cmd.contains("--bin hermit")
+            .ok_or("full-plan bracket: portable debug test producer disappeared")?;
+        if portable_build.cmd != DEBUG_TEST_PRODUCER_COMMAND
+            || portable_build.deps != ["doc.rustdoc".to_string()]
+            || portable_build.hint.preferred_inner_jobs != Some(8)
+            || portable_build.jobs_flag.as_deref() != Some("")
+            || portable_build.jobs_env.as_deref() != Some("")
         {
-            return Err("full-plan bracket: fat build does not finish the debug Hermit producer".into());
+            return Err(format!(
+                "full-plan bracket: debug test producer drifted: cmd={} deps={:?} preferred_inner_jobs={:?} jobs_flag={:?} jobs_env={:?}",
+                portable_build.cmd,
+                portable_build.deps,
+                portable_build.hint.preferred_inner_jobs,
+                portable_build.jobs_flag,
+                portable_build.jobs_env,
+            ));
+        }
+        for (tag, required) in [
+            ("setup.nextest", &["gate.manifest"][..]),
+            ("lint.clippy", &["setup.nextest"][..]),
+            ("doc.doctests", &["lint.clippy"][..]),
+            ("doc.rustdoc", &["doc.doctests"][..]),
+        ] {
+            let step = full
+                .cfg
+                .steps
+                .iter()
+                .find(|step| step.tag() == tag)
+                .ok_or_else(|| format!("full-plan bracket: ordered Cargo writer disappeared: {tag}"))?;
+            if step.deps.iter().map(String::as_str).collect::<Vec<_>>() != required {
+                return Err(format!(
+                    "full-plan bracket: {tag} must run in the fixed pre-producer Cargo chain: deps={:?}",
+                    step.deps
+                ));
+            }
+        }
+        let envelope = full
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "test.envelope_levels")
+            .ok_or("full-plan bracket: envelope test disappeared")?;
+        for required in ["build.workspace", "gate.manifest"] {
+            if !envelope.deps.iter().any(|dependency| dependency == required) {
+                return Err(format!(
+                    "full-plan bracket: envelope test can start before required dependency {required}"
+                ));
+            }
+        }
+        for tag in ["lint.clippy", "doc.doctests", "doc.rustdoc"] {
+            let step = full
+                .cfg
+                .steps
+                .iter()
+                .find(|step| step.tag() == tag)
+                .ok_or_else(|| format!("full-plan bracket: shared Cargo target writer disappeared: {tag}"))?;
+            if step.hint.preferred_inner_jobs != Some(8)
+                || step.jobs_flag.as_deref() != Some("")
+                || step.jobs_env.as_deref() != Some("")
+                || !step.cmd.contains("CARGO_BUILD_JOBS=8")
+            {
+                return Err(format!(
+                    "full-plan bracket: {tag} can use a different Cargo width from build.workspace: cmd={} preferred_inner_jobs={:?} jobs_flag={:?} jobs_env={:?}",
+                    step.cmd, step.hint.preferred_inner_jobs, step.jobs_flag, step.jobs_env,
+                ));
+            }
+        }
+        let nextest_consumers = [
+            ("test.regular_crates", "regular.json"),
+            ("test.hermit_unit", "hermit-unit.json"),
+            ("test.detcore_unit", "detcore-unit.json"),
+            ("test.detcore_misc", "detcore-misc.json"),
+            ("test.detcore_parallel", "detcore-parallel.json"),
+            ("test.hermit_integration", "hermit-integration.json"),
+            ("test.arbitrary_binaries", "arbitrary-binaries.json"),
+            ("test.cli", "cli.json"),
+            ("test.liteinst_strict", "liteinst-advanced.json"),
+            ("test.sabre_examples", "sabre-examples.json"),
+            ("test.hermit_modes", "hermit-modes.json"),
+            ("test.app_strict_verify", "app-strict-verify.json"),
+            ("test.command_strict_verify", "command-strict-verify.json"),
+            (
+                "test.ignored_syscall_regressions",
+                "ignored-syscall-regressions.json",
+            ),
+            ("test.rr_suite_contract", "rr-suite.json"),
+            ("privileged-test.cli_kvm", "cli.json"),
+            ("privileged-test.pmu_buck_chaos_cases", "hermit-modes.json"),
+        ];
+        for (tag, metadata) in nextest_consumers {
+            let step = full
+                .cfg
+                .steps
+                .iter()
+                .find(|step| step.tag() == tag)
+                .ok_or_else(|| format!("full-plan bracket: nextest consumer disappeared: {tag}"))?;
+            let expected_metadata =
+                format!("NEXTEST_BINARIES_METADATA=target/ci/nextest-binaries/{metadata}");
+            if step.hint.preferred_inner_jobs != Some(8)
+                || step.jobs_flag.as_deref() != Some("")
+                || step.jobs_env.as_deref() != Some("")
+                || !step.cmd.contains(&expected_metadata)
+                || !step.cmd.contains("run-nextest-counted.sh")
+            {
+                return Err(format!(
+                    "full-plan bracket: {tag} is not a read-only consumer of {metadata}: cmd={} preferred_inner_jobs={:?} jobs_flag={:?} jobs_env={:?}",
+                    step.cmd, step.hint.preferred_inner_jobs, step.jobs_flag, step.jobs_env,
+                ));
+            }
         }
         let artifact = full
             .cfg
@@ -2237,15 +2364,14 @@ cleared-caps refusal names {} starved step(s)",
                 ));
             }
         }
-        let expected_test_prebuild = "CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run";
         if !privileged_build
             .cmd
             .contains("verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path")
-            || !privileged_build.cmd.contains(expected_test_prebuild)
+            || privileged_build.cmd.contains("cargo ")
             || !privileged_build.cmd.contains("tests_misc-*")
         {
             return Err(
-                "full-plan bracket: privileged build did not assert the artifact and prebuild the exact downstream test binaries".into(),
+                "full-plan bracket: fused privileged build was not a read-only assertion over the portable producer's artifacts".into(),
             );
         }
         let cpuid = full
@@ -5702,11 +5828,16 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         eprintln!("validate: fused lanes; deduped {} identical node(s): {}", removed.len(), removed.join(", "));
     }
     if lanes.len() == 2 {
-        // The artifact barrier waits for both initial Cargo producers, verifies
-        // binary and resource identities, then publishes a content-addressed
-        // bundle. Every later Cargo writer and manifest consumer runs only after
-        // that barrier, so no writer can mutate either source during publication
-        // and no consumer reads a mutable Cargo path afterward.
+        // Clippy, doctests, and rustdoc run in a fixed chain before the final
+        // debug test-profile producer. The artifact barrier then waits for that
+        // producer and the release producer, verifies binary and resource
+        // identities, and publishes a content-addressed bundle. Later test
+        // commands see the producer's artifacts without a sibling Cargo writer
+        // relinking or removing them. The portable producer also builds the
+        // test-profile targets needed by the privileged lane, so the fused
+        // privileged build becomes a read-only assertion. If it invoked Cargo
+        // here, it would race the now-eligible portable test nodes for the same
+        // target directory and put compile work back under scheduler control.
         let producer = "build.e2e_artifact";
         let debug_producer = "build.workspace";
         let consumer = "privileged-build.privileged_tests";
@@ -5714,8 +5845,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             .iter()
             .find(|s| s.tag() == debug_producer)
             .ok_or_else(|| format!("fused debug producer disappeared: {debug_producer}"))?;
-        let expected_fat_build = "./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit";
-        if portable_build.cmd != expected_fat_build {
+        if portable_build.cmd != DEBUG_TEST_PRODUCER_COMMAND {
             return Err(format!(
                 "fused debug producer command drifted; re-prove the artifact barrier: {}",
                 portable_build.cmd
@@ -5740,7 +5870,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             .iter_mut()
             .find(|s| s.tag() == consumer)
             .ok_or_else(|| format!("fused artifact consumer disappeared: {consumer}"))?;
-        let expected_build = "CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run && CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run";
+        let expected_build = "CARGO_BUILD_JOBS=8 ./ci/prepare-nextest-binaries.sh privileged && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path";
         if privileged_build.cmd != expected_build {
             return Err(format!(
                 "fused privileged build command drifted; re-prove that build.workspace is a superset: {}",
@@ -5777,26 +5907,21 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // selects, so "any one of nine" would let it silently test a STALE
         // artifact -- a check that passes while measuring the wrong thing,
         // which is worse than failing loudly. Zero binaries still fails.
-        privileged_build.cmd = "./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null || exit 1; CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run || exit 1; newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"".to_string();
+        privileged_build.cmd = "./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null || exit 1; test -s target/ci/nextest-binaries/cargo-metadata.json; test -s target/ci/nextest-binaries/detcore-misc.json; test -f target/ci/nextest-binaries/detcore-misc.selection; test -s target/ci/nextest-binaries/cli.json; test -f target/ci/nextest-binaries/cli.selection; test -s target/ci/nextest-binaries/hermit-modes.json; test -f target/ci/nextest-binaries/hermit-modes.selection; newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"".to_string();
 
         let cpuid = steps
             .iter_mut()
             .find(|s| s.tag() == "privileged-cpuid.faulting")
             .ok_or("fused prebuilt CPUID consumer disappeared")?;
-        let expected_cpuid = "status=0; timeout --kill-after=5s 30s cargo test -p hermit-detcore --test tests_misc rdrand_rdseed_is_masked -- --exact || status=$?; if [ \"$status\" -eq 124 ] || [ \"$status\" -eq 137 ]; then printf 'test hermit-detcore/tests_misc::rdrand_rdseed_is_masked exceeded 30 s (innermost exact Cargo timeout: exit %s)\\n' \"$status\" >&2; fi; exit \"$status\"";
+        let expected_cpuid = "newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"; status=0; timeout --kill-after=5s 30s \"$newest\" rdrand_rdseed_is_masked --exact || status=$?; if [ \"$status\" -eq 124 ] || [ \"$status\" -eq 137 ]; then printf 'test hermit-detcore/tests_misc::rdrand_rdseed_is_masked exceeded 30 s (innermost exact binary timeout: exit %s)\\n' \"$status\" >&2; fi; exit \"$status\"";
         if cpuid.cmd != expected_cpuid {
             return Err(format!(
                 "fused CPUID command drifted; re-prove direct prebuilt invocation: {}",
                 cpuid.cmd
             ));
         }
-        // Same defect, same fix: `((${#bins[@]} == 1))` failed for exactly the
-        // reason above, so this node could never run in a long-lived checkout
-        // either. It EXECUTES the binary it picks, which is precisely why the
-        // selection must be the NEWEST rather than an arbitrary survivor of a
-        // `-ge 1` relaxation -- running a stale `tests_misc` would report a
-        // CPUID verdict about an artifact that is not the one under test.
-        cpuid.cmd = "newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"; timeout 30 \"$newest\" rdrand_rdseed_is_masked --exact".to_string();
+        // The shipped privileged lane already executes the newest producer-built
+        // tests_misc binary directly, so fusion has no Cargo command to replace.
     }
     attach_compatibility_scorecard(&mut steps, &lanes)?;
     // Fusing lanes means one config for both. Their default wall timeouts differ,
@@ -6600,6 +6725,10 @@ fn summary_listing_bracket() -> Result<String, String> {
         executed_tests: None,
         filtered_tests: None,
         returncode: Some(if ok { 0 } else { 1 }),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: String::new(),
         aborted: false,
     };
@@ -7759,7 +7888,7 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
                 PINNED_ROOT_PRODUCER_STEPS.contains(&step.tag().as_str())
                     || step.job == "manifest_guests"
                     || (step.job == "privileged_tests"
-                        && step.cmd.contains("cargo ")
+                        && step.cmd.contains("prepare-nextest-binaries.sh privileged")
                         && step.cmd.contains("publish-hermit-e2e-artifact.sh"))
             })
             .cloned()
@@ -8177,6 +8306,12 @@ struct NodeAttempt {
     /// fact unless it is written down here.
     reported: bool,
     returncode: Option<i64>,
+    /// Typed scheduler termination facts. `None` means no completion payload
+    /// arrived; it must not be flattened into false or zero.
+    oomed: Option<bool>,
+    oom_kills: Option<i64>,
+    timed_out: Option<bool>,
+    cpu_timed_out: Option<bool>,
     /// The runner's typed failure reason for THIS attempt; `""` when it passed
     /// or was never reported. A later attempt never overwrites it.
     reason: String,
@@ -8242,6 +8377,10 @@ fn reported_attempt(outcome: &StepOutcome, attempt: usize) -> NodeAttempt {
         ok: Some(outcome.ok),
         reported: true,
         returncode: outcome.returncode,
+        oomed: Some(outcome.oomed),
+        oom_kills: Some(outcome.oom_kills),
+        timed_out: Some(outcome.timed_out),
+        cpu_timed_out: Some(outcome.cpu_timed_out),
         reason: outcome.reason.clone(),
         duration_s: outcome.duration_s,
         aborted: outcome.aborted,
@@ -8262,6 +8401,10 @@ fn unreported_attempt(tag: String, attempt: usize) -> NodeAttempt {
         ok: None,
         reported: false,
         returncode: None,
+        oomed: None,
+        oom_kills: None,
+        timed_out: None,
+        cpu_timed_out: None,
         reason: "no completion payload was reported for this node".into(),
         duration_s: 0.0,
         aborted: false,
@@ -11604,129 +11747,54 @@ fn print_retry_ledger(attempts: &[NodeAttempt]) {
     }
 }
 
-/// The exact renderings `step_failure_reason` produces for the two budget
-/// breaches, as prefixes. Everything after them is a number, so a prefix is an
-/// exact identification of the arm rather than a search for a word.
-const WALL_BUDGET_REASON_PREFIX: &str = "TIMEOUT >";
-const CPU_BUDGET_REASON_PREFIX: &str = "CPU-TIMEOUT >";
-
 /// Was this node killed by its wall or CPU budget?
 ///
-/// WHY THIS IS NOT A SUBSTRING TEST, which is what it used to be. `reason` is a
-/// closed set produced by `dagrun::model::step_failure_reason`, and
-/// one member of that set reads:
-///
-///   `received SIGSEGV with no validate timeout, pids guard, or child-cgroup OOM recorded`
-///
-/// A `contains("timeout")` test matches that string — INSIDE THE CLAUSE SAYING
-/// THERE WAS NO TIMEOUT. Every signal-killed node therefore read as a budget
-/// breach, so a segfault, an abort and a SIGKILL were all retry-eligible and
-/// would each be re-run to `max` for the same deterministic answer. That is
-/// precisely the waste the eligibility rule exists to prevent.
-///
-/// A SUBSTRING TEST AGAINST A HUMAN-READABLE MESSAGE IS NOT A PREDICATE. The
-/// message is written for a reader and can carry the word in a negating
-/// context. The typed `timed_out`/`cpu_timed_out` inputs are the real facts, but
-/// `StepOutcome` does not carry them — `StepOutcome::failed` takes them and
-/// keeps only the rendered string. So this matches the two arms EXACTLY, and
-/// `budget_reason_bracket` below pins that match by calling the real producer
-/// with the typed inputs rather than by restating its wording here.
+/// The scheduler retains these facts independently of its human-readable
+/// reason. Presentation text may contain the word "timeout" while explicitly
+/// saying no timeout occurred, and an OOM message may hide a simultaneous
+/// budget breach because the display has a precedence order.
 fn outcome_hit_its_budget(outcome: &StepOutcome) -> bool {
-    reason_is_budget_breach(&outcome.reason)
+    outcome.timed_out || outcome.cpu_timed_out
 }
 
-/// The same rule over a bare reason string, so the bracket can exercise it
-/// against producer output without building a whole `StepOutcome`.
-fn reason_is_budget_breach(reason: &str) -> bool {
-    reason.starts_with(WALL_BUDGET_REASON_PREFIX) || reason.starts_with(CPU_BUDGET_REASON_PREFIX)
-}
-
-/// Pin the budget-breach predicate to the PRODUCER, not to a copy of its text.
+/// Pin the budget-breach predicate to the typed producer facts, not its text.
 ///
-/// Every case below is built by calling `step_failure_reason` itself with the
-/// typed inputs, then asserting the predicate agrees with `timed_out ||
-/// cpu_timed_out`. Nothing here hardcodes a message, so a reworded reason does
-/// not silently drift past the predicate — it fails here instead.
+/// The reason is deliberately replaced after construction. If this test ever
+/// starts following presentation text again, the positive and negative arms
+/// fail independently.
 fn budget_reason_bracket() -> Result<String, String> {
-    use dagrun::model::step_failure_reason;
-    // (label, returncode, oomed, timed_out, pids_tripped, detail_failure, cpu_timed_out)
-    let cases: &[(&str, Option<i64>, bool, bool, bool, bool, bool)] = &[
-        ("wall budget", None, false, true, false, false, false),
-        ("cpu budget", None, false, false, false, false, true),
-        ("oom kill", Some(-9), true, false, false, false, false),
-        ("pids guard", None, false, false, true, false, false),
-        ("detail capture", None, false, false, false, true, false),
-        ("SIGSEGV", Some(-11), false, false, false, false, false),
-        ("SIGABRT", Some(-6), false, false, false, false, false),
-        ("SIGKILL", Some(-9), false, false, false, false, false),
-        ("ordinary exit", Some(1), false, false, false, false, false),
-        ("no exit collected", None, false, false, false, false, false),
-    ];
-    let mut eligible = Vec::new();
-    for (label, rc, oomed, timed_out, pids, detail, cpu_timed_out) in cases {
-        let detail_rows: Vec<String> = if *detail {
-            vec!["fixture detail write failed".to_string()]
-        } else {
-            Vec::new()
-        };
-        let reason = step_failure_reason(
-            *rc,
-            *oomed,
-            if *oomed { 1 } else { 0 },
-            *timed_out,
-            600,
-            *pids,
-            pids.then_some("fixture pids guard"),
-            &detail_rows,
-            *cpu_timed_out,
-            300,
-            300,
-            1.0,
-            "",
-        );
-        let want = *timed_out || *cpu_timed_out;
-        let got = reason_is_budget_breach(&reason);
-        if got != want {
-            return Err(format!(
-                "budget reason: {label} rendered {reason:?}; retry-eligible={got} but the typed                  inputs say timed_out={timed_out} cpu_timed_out={cpu_timed_out}. A reason that                  merely MENTIONS a timeout is not a timeout."
-            ));
-        }
-        if got {
-            eligible.push(*label);
-        }
-    }
-    // The negative direction, stated as its own assertion rather than left
-    // implicit in the loop: the signal arm is the one that used to misclassify,
-    // and it must stay ineligible even though its text contains "timeout".
-    let segv = step_failure_reason(
-        Some(-11),
-        false,
-        0,
-        false,
-        600,
-        false,
-        None,
-        &[],
-        false,
-        300,
-        300,
-        1.0,
-        "",
+    let mut wall = StepOutcome::failed(
+        "wall".into(), 0.0, String::new(), None, false, 0, true, 600,
+        false, 300, 300, 1.0, "", false, None, None,
     );
-    if !segv.contains("timeout") {
-        return Err(format!(
-            "budget reason: the signal arm no longer contains the word 'timeout' ({segv:?}); this              bracket exists because it DOES, so re-check the producer before relaxing it"
-        ));
-    }
-    if reason_is_budget_breach(&segv) {
-        return Err(format!("budget reason: signal-killed reason {segv:?} is retry-eligible"));
-    }
-    Ok(format!(
-        "budget reason: 10 producer-rendered reason(s) classified; retry-eligible = {eligible:?};          the SIGSEGV arm contains the word \"timeout\" and is correctly NOT eligible"
-    ))
-}
+    wall.reason = "presentation text with no classification words".into();
+    let mut cpu = StepOutcome::failed(
+        "cpu".into(), 0.0, String::new(), None, false, 0, false, 600,
+        true, 300, 300, 1.0, "", false, None, None,
+    );
+    cpu.reason = "presentation text with no classification words".into();
+    let mut both_hidden_by_oom = StepOutcome::failed(
+        "both-hidden-by-oom".into(), 0.0, String::new(), Some(-9), true, 1,
+        true, 600, true, 300, 300, 1.0, "", false, None, None,
+    );
+    both_hidden_by_oom.reason = "OOM-KILLED".into();
+    let mut segv = StepOutcome::failed(
+        "segv".into(), 0.0, String::new(), Some(-11), false, 0, false, 600,
+        false, 300, 300, 1.0, "", false, None, None,
+    );
+    segv.reason = "received SIGSEGV after a log line mentioned timeout".into();
 
-/// Nodes the runner reported as killed by their wall or CPU budget.
+    if !outcome_hit_its_budget(&wall)
+        || !outcome_hit_its_budget(&cpu)
+        || !outcome_hit_its_budget(&both_hidden_by_oom)
+    {
+        return Err("budget reason: typed wall/CPU timeout was not retry-eligible".into());
+    }
+    if outcome_hit_its_budget(&segv) {
+        return Err("budget reason: presentation-only timeout text became retry-eligible".into());
+    }
+    Ok("budget reason: typed wall/CPU facts remain eligible through unrelated presentation text; signal text remains ineligible".into())
+}
 
 /// Nodes the runner reported as killed by their wall or CPU budget.
 fn timed_out_nodes(outcomes: &[StepOutcome]) -> Vec<String> {
@@ -12640,6 +12708,10 @@ fn test_node_coverage_bracket() -> Result<(), String> {
         executed_tests,
         filtered_tests: Some(0),
         returncode: Some(if ok { 0 } else { 100 }),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: if ok { String::new() } else { "test failure".into() },
         aborted,
     };
@@ -12688,6 +12760,10 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         executed_tests,
         filtered_tests,
         returncode: Some(if ok { 0 } else { 100 }),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: if ok { String::new() } else { "test failure".into() },
         aborted: false,
     };
@@ -12737,6 +12813,10 @@ fn ledger_gate(outcome: &StepOutcome) -> serde_json::Value {
         "name": outcome.tag,
         "result": ledger_gate_result(outcome),
         "exit_code": outcome.returncode,
+        "oomed": outcome.oomed,
+        "oom_kills": outcome.oom_kills,
+        "timed_out": outcome.timed_out,
+        "cpu_timed_out": outcome.cpu_timed_out,
         "reason": outcome.reason,
         "aborted": outcome.aborted,
         "real_seconds": outcome.duration_s,
@@ -12775,6 +12855,10 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
                 "reported": a.reported,
                 "execution": a.execution.as_str(),
                 "exit_code": a.returncode,
+                "oomed": a.oomed,
+                "oom_kills": a.oom_kills,
+                "timed_out": a.timed_out,
+                "cpu_timed_out": a.cpu_timed_out,
                 "reason": a.reason,
                 "aborted": a.aborted,
                 "real_seconds": a.reported.then_some(a.duration_s),
@@ -12804,6 +12888,10 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
     if let Some(attempt) = latest {
         gate["result"] = serde_json::json!(attempt_result(attempt));
         gate["exit_code"] = serde_json::json!(attempt.returncode);
+        gate["oomed"] = serde_json::json!(attempt.oomed);
+        gate["oom_kills"] = serde_json::json!(attempt.oom_kills);
+        gate["timed_out"] = serde_json::json!(attempt.timed_out);
+        gate["cpu_timed_out"] = serde_json::json!(attempt.cpu_timed_out);
         gate["reason"] = serde_json::json!(attempt.reason);
         gate["aborted"] = serde_json::json!(attempt.aborted);
         gate["real_seconds"] = serde_json::json!(attempt.reported.then_some(attempt.duration_s));
@@ -12826,16 +12914,23 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         executed_tests: Some(1),
         filtered_tests: Some(0),
         returncode: Some(1),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: "fixture failure".into(),
         aborted: false,
     };
     let row = ledger_gate(&failed);
     if row["failure_origin"] != "outer_gate"
         || row["failed_substeps"] != serde_json::json!([])
+        || row["oomed"] != false
+        || row["oom_kills"] != 0
+        || row["timed_out"] != false
+        || row["cpu_timed_out"] != false
     {
         return Err(
-            "ledger gate origin: failed outer gate did not carry a known-empty substep list"
-                .into(),
+            "ledger gate origin: failed outer gate did not carry its typed evidence".into(),
         );
     }
     let mut passed = failed.clone();
@@ -12960,6 +13055,22 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         "unknown",
         false,
     )?;
+    let unreported_retry = unreported_attempt(failed.tag.clone(), 2);
+    let fail_then_unreported = [failed_attempt.clone(), unreported_retry];
+    let unreported_gate = ledger_gate_with_attempts(&failed, &fail_then_unreported);
+    if !unreported_gate["oomed"].is_null()
+        || !unreported_gate["oom_kills"].is_null()
+        || !unreported_gate["timed_out"].is_null()
+        || !unreported_gate["cpu_timed_out"].is_null()
+        || !unreported_gate["attempts"][1]["oomed"].is_null()
+        || !unreported_gate["attempts"][1]["oom_kills"].is_null()
+        || !unreported_gate["attempts"][1]["timed_out"].is_null()
+        || !unreported_gate["attempts"][1]["cpu_timed_out"].is_null()
+    {
+        return Err(format!(
+            "ledger gate origin: an unreported attempt fabricated typed termination facts: {unreported_gate}"
+        ));
+    }
     let mut failed_retry = failed_attempt;
     failed_retry.attempt = 2;
     let pass_then_failure = [passed_attempt, failed_retry];
@@ -13130,6 +13241,10 @@ fn possible_missing_artifact_bracket() -> Result<(), String> {
         executed_tests: None,
         filtered_tests: None,
         returncode,
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: String::new(),
         aborted: false,
     };
@@ -13164,6 +13279,10 @@ fn no_result_propagation_bracket() -> Result<(), String> {
         executed_tests: None,
         filtered_tests: None,
         returncode: Some(returncode),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: String::new(),
         aborted,
     };
@@ -16669,6 +16788,10 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
         executed_tests: None,
         filtered_tests: None,
         returncode: Some(if ok { 0 } else { 1 }),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: if ok { String::new() } else { "stop-test synthetic failure".into() },
         aborted: false,
     };
