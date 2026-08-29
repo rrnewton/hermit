@@ -91,8 +91,8 @@ jobs:
     # --strict --verify pinned to ONE core all pass with zero perf_event_open
     # failures. The former `flock /tmp/hermit-privileged-pmu.lock` guarded that
     # non-existent limit and had no other purpose (perf-dir is already keyed by
-    # $RUNNER_TEMP; kvm nodes are capped in-DAG by resource_caps.kvm), so it is
-    # removed. The `pmu-serial` runner label was retired for the same reason:
+    # $RUNNER_TEMP), so it is removed. The `pmu-serial` runner label was retired
+    # for the same reason:
     # PMU skid is an instruction-space hardware property independent of
     # concurrency, so no determinism argument justifies serializing PMU work.
     # DIAGNOSTIC ONLY, and deliberately NOT `continue-on-error` — the script always exits 0, and

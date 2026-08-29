@@ -176,7 +176,7 @@ Commands:
       boxed checks against the same clean committed source. Use --green with
       --repetitions to select every enabled green cell in one shared-build DAG;
       --mode and --sample may narrow that green population. Existing resource
-      caps allow at most four manifest guests at once and at most one KVM guest.
+      caps allow at most four manifest guests at once, including KVM guests.
       This reports per-cell flakiness; it never edits or demotes the scorecard.
       Only unfiltered --green covers the complete current green set; an exact
       cell, --mode, or --sample is partial evidence.
@@ -204,7 +204,7 @@ Exact-cell options (run and plan):
   --repetitions COUNT      Repeat one exact currently green cell in independent
                            boxed jobs. COUNT must be positive. Plan and run
                            require a clean commit. At most four manifest guests
-                           run at once, and KVM remains limited to one.
+                           run at once, including KVM guests.
   --run-id-prefix ID       Bind each retained result to this physical invocation.
                            Accepted only with one exact repeated cell; letters,
                            digits, '.', '_', and '-' only.
@@ -226,8 +226,7 @@ Bounded-batch options (run and plan):
   --run-timeout SECONDS    Whole-run WALL-CLOCK bound (default 7200). This is
                            not a CPU budget and never weakens per-cell limits.
   --jobs COUNT             Fixed safe-ci scheduler pool (default 4). Named
-                           resource caps still limit manifest guests to four
-                           and KVM guests to one.
+                           resource caps still limit manifest guests to four.
 
 Examples:
   # Probe one currently red ptrace/verify cell with a 60-second boxed wall cap.
@@ -240,7 +239,7 @@ Examples:
     --sample 10 --seed 42 --cell-timeout 60
 
   # Check one committed green cell 100 times under the same boxed limits.
-  # The DAG admits at most four manifest guests at once (one for KVM).
+  # The DAG admits at most four manifest guests at once, including KVM guests.
   ./ci/compat-envelope/pressure-test.rs run \
     --test backend-parity-c/fork-exec-pipeline \
     --mode verify --backend ptrace --repetitions 100 --cell-timeout 120
@@ -265,7 +264,7 @@ How it runs:
   recursively running the full validation metadata audit. Fixture preparation
   is serialized. Every selected red cell, or every selected green-cell
   repetition, then runs in its own safe-ci cgroup. Existing resource caps admit
-  four manifest guests at once and one KVM guest. A failure, timeout, OOM, or missing result does not
+  four manifest guests at once, including KVM guests. A failure, timeout, OOM, or missing result does not
   intentionally stop later selected checks.
   The combined crash/error bucket contains remaining nonzero harness exits,
   including signal-caused crashes when the shell reports a nonzero status; the
@@ -956,7 +955,31 @@ struct RunnerEvidence {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct RetainedOutcome {
+    tag: String,
+    ok: bool,
+    duration_s: f64,
+    returncode: Option<i64>,
+    oomed: bool,
+    oom_kills: i64,
+    timed_out: bool,
+    cpu_timed_out: bool,
+    reason: String,
+    aborted: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedExecution {
+    schema: u64,
+    scheduler_passes: usize,
+    outcomes: Vec<RetainedOutcome>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedOutcomeV1 {
     tag: String,
     ok: bool,
     duration_s: f64,
@@ -966,9 +989,11 @@ struct RetainedOutcome {
 }
 
 #[derive(Debug, Deserialize)]
-struct RetainedExecution {
+#[serde(deny_unknown_fields)]
+struct RetainedExecutionV1 {
     schema: u64,
-    outcomes: Vec<RetainedOutcome>,
+    scheduler_passes: usize,
+    outcomes: Vec<RetainedOutcomeV1>,
 }
 
 struct ExecutionEvidence {
@@ -977,6 +1002,39 @@ struct ExecutionEvidence {
 }
 
 fn outcome_evidence(outcome: &StepOutcome) -> RunnerEvidence {
+    RunnerEvidence {
+        seen: true,
+        ok: outcome.ok,
+        timed_out: outcome.timed_out || outcome.cpu_timed_out,
+        oom: outcome.oomed,
+    }
+}
+
+fn retained_outcome_evidence(outcome: &RetainedOutcome) -> Result<RunnerEvidence, String> {
+    if outcome.oom_kills < 0 || outcome.oomed != (outcome.oom_kills > 0) {
+        return Err(format!(
+            "typed scheduler outcome {} disagrees about oomed={} and oom_kills={}",
+            outcome.tag, outcome.oomed, outcome.oom_kills
+        ));
+    }
+    if outcome.ok && (outcome.oomed || outcome.timed_out || outcome.cpu_timed_out) {
+        return Err(format!(
+            "typed scheduler outcome {} is both successful and terminated by a resource bound",
+            outcome.tag
+        ));
+    }
+    Ok(RunnerEvidence {
+        seen: true,
+        ok: outcome.ok,
+        timed_out: outcome.timed_out || outcome.cpu_timed_out,
+        oom: outcome.oomed,
+    })
+}
+
+fn retained_outcome_v1_evidence(outcome: &RetainedOutcomeV1) -> RunnerEvidence {
+    // Schema 1 predates typed termination facts. Keep that exact historical
+    // interpretation readable; only schema 2 can establish the current typed
+    // contract, and there is no schema-1 write path.
     let reason = outcome.reason.to_ascii_uppercase();
     RunnerEvidence {
         seen: true,
@@ -1102,15 +1160,19 @@ fn retain_execution_evidence(
             ok: outcome.ok,
             duration_s: outcome.duration_s,
             returncode: outcome.returncode,
+            oomed: outcome.oomed,
+            oom_kills: outcome.oom_kills,
+            timed_out: outcome.timed_out,
+            cpu_timed_out: outcome.cpu_timed_out,
             reason: outcome.reason.clone(),
             aborted: outcome.aborted,
         })
         .collect();
-    let document = json!({
-        "schema": 1,
-        "scheduler_passes": execution.passes,
-        "outcomes": retained,
-    });
+    let document = RetainedExecution {
+        schema: 2,
+        scheduler_passes: execution.passes,
+        outcomes: retained,
+    };
     let mut text = serde_json::to_string_pretty(&document)
         .map_err(|error| format!("cannot serialize typed scheduler outcomes: {error}"))?;
     text.push('\n');
@@ -1137,39 +1199,73 @@ fn load_retained_runner_evidence(
     if !path.is_file() {
         return Ok(None);
     }
-    let retained: RetainedExecution = serde_json::from_str(
-        &fs::read_to_string(&path)
-            .map_err(|error| format!("cannot read {}: {error}", path.display()))?,
-    )
-    .map_err(|error| format!("invalid {}: {error}", path.display()))?;
-    if retained.schema != 1 {
-        return Err(format!(
-            "unsupported typed scheduler outcome schema {}",
-            retained.schema
-        ));
-    }
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let value: JsonValue = serde_json::from_str(&text)
+        .map_err(|error| format!("invalid {}: {error}", path.display()))?;
+    let schema = value
+        .get("schema")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| format!("invalid {}: missing integer schema", path.display()))?;
     let mut evidence = BTreeMap::new();
-    for outcome in retained.outcomes {
-        if outcome.aborted {
-            return Err(format!(
-                "typed scheduler evidence retained aborted outcome {} as terminal",
-                outcome.tag
-            ));
+    match schema {
+        1 => {
+            let retained: RetainedExecutionV1 = serde_json::from_str(&text)
+                .map_err(|error| format!("invalid historical {}: {error}", path.display()))?;
+            debug_assert_eq!(retained.schema, 1);
+            let _ = retained.scheduler_passes;
+            for outcome in retained.outcomes {
+                if outcome.aborted {
+                    return Err(format!(
+                        "historical scheduler evidence retained aborted outcome {} as terminal",
+                        outcome.tag
+                    ));
+                }
+                if !outcome.tag.starts_with("cell.") {
+                    continue;
+                }
+                let _ = (outcome.duration_s, outcome.returncode);
+                let row = retained_outcome_v1_evidence(&outcome);
+                if evidence.insert(outcome.tag.clone(), row).is_some() {
+                    return Err(format!(
+                        "historical scheduler evidence contains duplicate outcome {}",
+                        outcome.tag
+                    ));
+                }
+            }
         }
-        if !outcome.tag.starts_with("cell.") {
-            continue;
+        2 => {
+            let retained: RetainedExecution = serde_json::from_str(&text)
+                .map_err(|error| format!("invalid current {}: {error}", path.display()))?;
+            debug_assert_eq!(retained.schema, 2);
+            let _ = retained.scheduler_passes;
+            for outcome in retained.outcomes {
+                if outcome.aborted {
+                    return Err(format!(
+                        "typed scheduler evidence retained aborted outcome {} as terminal",
+                        outcome.tag
+                    ));
+                }
+                if !outcome.tag.starts_with("cell.") {
+                    continue;
+                }
+                let _ = (
+                    outcome.duration_s,
+                    outcome.returncode,
+                    outcome.reason.as_str(),
+                );
+                let row = retained_outcome_evidence(&outcome)?;
+                if evidence.insert(outcome.tag.clone(), row).is_some() {
+                    return Err(format!(
+                        "typed scheduler evidence contains duplicate outcome {}",
+                        outcome.tag
+                    ));
+                }
+            }
         }
-        let reason = outcome.reason.to_ascii_uppercase();
-        let row = RunnerEvidence {
-            seen: true,
-            ok: outcome.ok,
-            timed_out: reason.contains("TIMEOUT"),
-            oom: reason.contains("OOM-KILLED"),
-        };
-        if evidence.insert(outcome.tag.clone(), row).is_some() {
+        _ => {
             return Err(format!(
-                "typed scheduler evidence contains duplicate outcome {}",
-                outcome.tag
+                "unsupported typed scheduler outcome schema {schema}"
             ));
         }
     }
@@ -2371,7 +2467,6 @@ fn require_cell_occupancy_fits(
             .to_string()
     })?;
     let mut all_seconds = 0_i64;
-    let mut kvm_seconds = 0_i64;
     for tracked in cells {
         let budget = budgets
             .get(&(
@@ -2394,24 +2489,17 @@ fn require_cell_occupancy_fits(
             "the selected cells make the declared pressure-test occupancy exceed the supported integer range"
                 .to_string()
         })?;
-        if tracked.id.backend == "kvm" {
-            kvm_seconds = kvm_seconds.checked_add(seconds).ok_or_else(|| {
-                "the selected KVM cells make the declared pressure-test occupancy exceed the supported integer range"
-                    .to_string()
-            })?;
-        }
     }
-    // The generated graph permits at most four manifest guests, and at most one
-    // KVM guest, at a time. If every selected cell consumes its declared cap,
-    // these resource limits impose this minimum wall time even before build and
-    // preparation work. Refuse an impossible public bound instead of printing a
-    // command which cannot satisfy its own contract.
+    // The generated graph permits at most four manifest guests at a time. If
+    // every selected cell consumes its declared cap, this resource limit imposes
+    // this minimum wall time even before build and preparation work. Refuse an
+    // impossible public bound instead of printing a command which cannot satisfy
+    // its own contract.
     let guest_width = jobs.clamp(1, 4);
-    let guest_floor = all_seconds / guest_width + i64::from(all_seconds % guest_width != 0);
-    let occupancy_floor = guest_floor.max(kvm_seconds);
+    let occupancy_floor = all_seconds / guest_width + i64::from(all_seconds % guest_width != 0);
     if occupancy_floor >= run_timeout_seconds {
         return Err(format!(
-            "selected {} cell run(s) have at least {occupancy_floor}s of declared worst-case cell occupancy at -j {jobs}, manifest_guest=4, and kvm=1, which cannot fit the {run_timeout_seconds}s whole-run WALL bound; use --sample (and optionally --cell-timeout), reduce --repetitions, or deliberately raise --run-timeout",
+            "selected {} cell run(s) have at least {occupancy_floor}s of declared worst-case cell occupancy at -j {jobs} and manifest_guest=4, which cannot fit the {run_timeout_seconds}s whole-run WALL bound; use --sample (and optionally --cell-timeout), reduce --repetitions, or deliberately raise --run-timeout",
             i64::try_from(cells.len())
                 .unwrap_or(i64::MAX)
                 .saturating_mul(repetitions)
@@ -2871,10 +2959,7 @@ fn write_plan_after_scorecard_check(
             } else {
                 3_i64 * 1024 * 1024 * 1024
             };
-            let mut resources = BTreeMap::from([("manifest_guest".into(), 1)]);
-            if cell.backend == "kvm" {
-                resources.insert("kvm".into(), 1);
-            }
+            let resources = BTreeMap::from([("manifest_guest".into(), 1)]);
             let deps = selected_cell_dependencies(
                 selection.is_exact(),
                 selection.uses_shared_preparation(),
@@ -2969,11 +3054,8 @@ fn write_plan_after_scorecard_check(
 
     let max_timeout = steps.iter().map(|step| step.timeout).max().unwrap_or(120);
     let mut dag = canonical;
-    dag.resource_caps = BTreeMap::from([
-        ("cargo_writer".into(), 1),
-        ("manifest_guest".into(), 4),
-        ("kvm".into(), 1),
-    ]);
+    dag.resource_caps =
+        BTreeMap::from([("cargo_writer".into(), 1), ("manifest_guest".into(), 4)]);
     dag.default_step_timeout = max_timeout;
     dag.default_step_cpu_timeout = max_timeout * 2;
     dag.steps = steps;
@@ -3664,9 +3746,8 @@ fn classify_result(
         || (mode == "verify"
             && matches!(verification_verdict, Some("matched" | "diverged"))
             && !verification_logs_retained)
+        || (row_valid && verification_verdict == Some("infrastructure_error"))
     {
-        "infrastructure-error"
-    } else if row_valid && verification_verdict == Some("infrastructure_error") {
         "infrastructure-error"
     } else if row_valid && mode == "verify" && verification_verdict == Some("diverged") {
         "determinism-failure"
@@ -4737,13 +4818,98 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
         return Err("typed scheduler outcome retention changed exact cell identities".into());
     }
 
+    let retained_path = retained_results.join("runner-outcomes.json");
+    fs::write(
+        &retained_path,
+        serde_json::to_string_pretty(&json!({
+            "schema": 1,
+            "scheduler_passes": 1,
+            "outcomes": [{
+                "tag": "cell.historical-timeout",
+                "ok": false,
+                "duration_s": 1.0,
+                "returncode": 124,
+                "reason": "TIMEOUT >1s",
+                "aborted": false
+            }]
+        }))
+        .map_err(|error| format!("cannot serialize historical outcome fixture: {error}"))?,
+    )
+    .map_err(|error| format!("cannot write historical outcome fixture: {error}"))?;
+    let historical = load_retained_runner_evidence(&retained_results)?
+        .ok_or("historical typed scheduler outcome file was not loadable")?;
+    if !historical
+        .get("cell.historical-timeout")
+        .is_some_and(|row| row.timed_out && !row.oom)
+    {
+        return Err("schema-1 scheduler evidence lost its historical interpretation".into());
+    }
+
+    fs::write(
+        &retained_path,
+        serde_json::to_string_pretty(&json!({
+            "schema": 2,
+            "scheduler_passes": 1,
+            "outcomes": [{
+                "tag": "cell.missing-cpu-timeout",
+                "ok": false,
+                "duration_s": 1.0,
+                "returncode": 1,
+                "oomed": false,
+                "oom_kills": 0,
+                "timed_out": false,
+                "reason": "failure",
+                "aborted": false
+            }]
+        }))
+        .map_err(|error| format!("cannot serialize incomplete outcome fixture: {error}"))?,
+    )
+    .map_err(|error| format!("cannot write incomplete outcome fixture: {error}"))?;
+    let missing_field = load_retained_runner_evidence(&retained_results)
+        .expect_err("schema-2 scheduler evidence accepted a missing cpu_timed_out field");
+    if !missing_field.contains("cpu_timed_out") {
+        return Err(format!(
+            "schema-2 scheduler evidence refused an incomplete row without naming cpu_timed_out: {missing_field}"
+        ));
+    }
+
+    fs::write(
+        &retained_path,
+        serde_json::to_string_pretty(&json!({
+            "schema": 2,
+            "scheduler_passes": 1,
+            "outcomes": [{
+                "tag": "cell.presentation-only-timeout",
+                "ok": false,
+                "duration_s": 1.0,
+                "returncode": 1,
+                "oomed": false,
+                "oom_kills": 0,
+                "timed_out": false,
+                "cpu_timed_out": false,
+                "reason": "log text mentioned timeout",
+                "aborted": false
+            }]
+        }))
+        .map_err(|error| format!("cannot serialize typed outcome fixture: {error}"))?,
+    )
+    .map_err(|error| format!("cannot write typed outcome fixture: {error}"))?;
+    let presentation_only = load_retained_runner_evidence(&retained_results)?
+        .ok_or("typed scheduler outcome fixture was not loadable")?;
+    if presentation_only
+        .get("cell.presentation-only-timeout")
+        .is_some_and(|row| row.timed_out || row.oom)
+    {
+        return Err("schema-2 scheduler evidence classified presentation text as a typed fact".into());
+    }
+
     // Both fixtures declare no CPU budget (cpu_timed_out=false, cpu_timeout=0), so the
     // three CPU-policy arguments are the inert triple: canonical 0, the default
     // multiplier, and no platform label. That keeps `cpu_timeout_policy_suffix` silent
     // and leaves both `reason` strings exactly what they were before the runner grew
     // the arguments — this bracket is about telling a wall timeout from an OOM, not
     // about CPU-budget scaling.
-    let timeout = StepOutcome::failed(
+    let mut timeout = StepOutcome::failed(
         "cell.timeout".into(),
         1.0,
         String::new(),
@@ -4761,7 +4927,7 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
         None,
         None,
     );
-    let oom = StepOutcome::failed(
+    let mut oom = StepOutcome::failed(
         "cell.oom".into(),
         1.0,
         String::new(),
@@ -4779,6 +4945,8 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
         None,
         None,
     );
+    timeout.reason = "presentation text with no classification words".into();
+    oom.reason = "presentation text with no classification words".into();
     if !outcome_evidence(&timeout).timed_out
         || outcome_evidence(&timeout).oom
         || !outcome_evidence(&oom).oom
@@ -5948,7 +6116,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             .cmd
             .contains("cargo build --release --locked -p hermit --bin hermit")
         || repeated_dag.resource_caps.get("manifest_guest") != Some(&4)
-        || repeated_dag.resource_caps.get("kvm") != Some(&1)
+        || repeated_dag.resource_caps.contains_key("kvm")
     {
         return Err(
             "repeated exact plan lost its shared direct build, preparation, cells, or resource caps, or reintroduced the recursive metadata audit"

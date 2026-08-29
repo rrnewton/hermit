@@ -1313,9 +1313,9 @@ test:
       chaos:
         ci: true
         timeout_seconds:
-          ptrace: 30
+          ptrace: 60
         slow_reason:
-          ptrace: Three complete validation runs measured this schedule search at 27.01-29.78 seconds while passing.
+          ptrace: At 20-way width under the full validation load, five retained attempts measured 26.64-30.44 seconds; the 30-second wall limit terminated otherwise matched seed sequences twice. Sixty seconds keeps the full 32-seed requirement and acts as a backup rather than making this cell's result depend on neighbouring work.
         # The chaos argument preserves the default full floating-point result
         # used by strict verification, but prints only its low three bits here.
         # That gives an exact eight-class ceiling: the output can express at

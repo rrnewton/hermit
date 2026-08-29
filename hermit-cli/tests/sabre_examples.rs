@@ -110,7 +110,16 @@ fn controller_diagnostics(path: Option<&Path>) -> String {
 }
 
 fn run_bounded(mut command: Command, label: &str, diagnostic_log: Option<&Path>) -> Output {
+    // Verification observes the guest's current directory. The source checkout is shared by
+    // concurrent validation nodes, so Cargo or another test can change its metadata or entries
+    // between Run1 and Run2. Give this Hermit invocation an empty directory that remains stable
+    // until both runs and their comparison have completed.
+    let working_directory = tempfile::Builder::new()
+        .prefix("sabre-working-directory-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap_or_else(|error| panic!("failed to create {label} working directory: {error}"));
     command
+        .current_dir(working_directory.path())
         .process_group(0)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

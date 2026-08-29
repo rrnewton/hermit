@@ -166,7 +166,14 @@ fi
 # fixtures, and a documentation commit (#511). Neither can affect the elapsed
 # time of a DynamoRIO content-key miss, so the measured key and conservative
 # threshold carry unchanged and this is NOT a recalibration.
-expected_pin=af42d9cf7ae604777cd88c5cca5b319460c986e8
+# CARRY TO bc106a19 (2026-08-28): both repository inputs to the DynamoRIO
+# content-key miss are byte-identical to af42d9cf:
+#     reverie-dbt/vendor/dynamorio  a3c41e5d3630 -> a3c41e5d3630
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+# The changed Reverie files are confined to reverie-ptrace timer recovery and
+# tests. They are build-relevant to Hermit, so this pin still requires fresh
+# validation; only the measured DBT build budget carries unchanged.
+expected_pin=bc106a195dfe7ba8e00c358a7bab11256202a1e6
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
