@@ -396,7 +396,7 @@
       "desc": "Clippy (cargo clippy --workspace --all-targets --all-features -D warnings)",
       "description": "FEATURE SCOPE 2026-08-25 (task workspace-clippy-gate-never-sees-the-dbt-feature): --all-features added. Without it this gate ran hermit-cli's default feature set, so the DBT, SaBRe, e9patch and third-party-backends paths were never linted. --all-features deliberately picks up future features without another manual widening. ORDERING 2026-08-29: this is the first of three Cargo commands that may rewrite target/debug before build.workspace produces the exact test-profile artifacts. The chain overlaps the longer manifest audit; it must finish before the producer so no test consumer can lose or rebuild an artifact while another consumer is running it. MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 279248896 bytes after the feature widening; the larger width-8 historical calibration of 4.0 GiB governs. The 4-GiB baseline preserves that floor and the 6-GiB hard cap adds 2 GiB of headroom. CPU WIDTH remains pinned at 8 by CARGO_BUILD_JOBS and preferred_inner_jobs; jobs_flag stays empty because appending '-j 8' would reach rustc. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
       "cmd": "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh cargo clippy --workspace --all-targets --all-features -- -D warnings",
-      "deps": ["setup.manifest_plan", "setup.nextest"],
+      "deps": ["setup.manifest_plan"],
       "timeout": 1200,
       "jobs_flag": "",
       "jobs_env": "",

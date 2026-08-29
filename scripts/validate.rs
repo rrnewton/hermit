@@ -2137,7 +2137,7 @@ cleared-caps refusal names {} starved step(s)",
             ));
         }
         for (tag, required) in [
-            ("lint.clippy", &["setup.manifest_plan", "setup.nextest"][..]),
+            ("lint.clippy", &["setup.manifest_plan"][..]),
             ("doc.doctests", &["lint.clippy"][..]),
             ("doc.rustdoc", &["doc.doctests"][..]),
         ] {
