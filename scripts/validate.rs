@@ -109,6 +109,8 @@ use dagrun::model::DagManifest;
 use dagrun::model::RunResult;
 use dagrun::model::Step;
 use dagrun::model::StepOutcome;
+use dagrun::TestResult;
+use dagrun::TestResults;
 use dagrun::container_core_budget;
 use dagrun::perflog::append_step_profiles;
 use dagrun::scheduler::run_dag_boxed_deadline;
@@ -11954,6 +11956,9 @@ struct LedgerCtx {
     reverie_pin_current: bool,
     /// Libtest counts aggregated from typed step outcomes; `None` is UNKNOWN.
     executed_tests: Option<i64>,
+    /// Tests that passed, derived only from runner-owned typed outcomes.
+    /// A failed retained count-only result cannot supply this value.
+    passed_tests: Option<i64>,
     filtered_tests: Option<i64>,
 }
 
@@ -12733,37 +12738,77 @@ fn sum_typed_count(
     seen.then(|| i64::try_from(total).ok()).flatten()
 }
 
-fn libtest_counts(outcomes: &[StepOutcome]) -> (Option<i64>, Option<i64>) {
+fn exact_passed_test_count(outcomes: &[StepOutcome]) -> Option<i64> {
+    let mut seen = false;
+    let mut passed = 0u64;
+    for outcome in outcomes {
+        let count_bearing = outcome.executed_tests.is_some()
+            || outcome.filtered_tests.is_some()
+            || outcome.test_results.is_some();
+        if !count_bearing {
+            continue;
+        }
+        seen = true;
+        let executed = outcome.executed_tests?;
+        let outcome_passed = match &outcome.test_results {
+            Some(results) => {
+                if u64::try_from(results.len()).ok()? != executed {
+                    return None;
+                }
+                u64::try_from(results.iter().filter(|result| result.passed).count()).ok()?
+            }
+            None if executed == 0 || outcome.ok => executed,
+            None => return None,
+        };
+        passed = passed.checked_add(outcome_passed)?;
+    }
+    seen.then(|| i64::try_from(passed).ok()).flatten()
+}
+
+fn libtest_counts(outcomes: &[StepOutcome]) -> (Option<i64>, Option<i64>, Option<i64>) {
     (
         sum_typed_count(outcomes, |o| o.executed_tests),
+        exact_passed_test_count(outcomes),
         sum_typed_count(outcomes, |o| o.filtered_tests),
     )
 }
 
-fn publish_structured_test_counts(executed: i64, filtered: i64) -> Result<(), String> {
+fn publish_structured_test_results(results: &TestResults) -> Result<(), String> {
     let Some(path) = std::env::var_os("DAGRUN_TEST_COUNTS_PATH") else {
         return Ok(());
     };
-    if executed < 0 || filtered < 0 {
-        return Err("structured test counts must be nonnegative".into());
+    results.write_current(&PathBuf::from(path))
+}
+
+fn compat_test_results(
+    outcomes: &[StepOutcome],
+    attempts: &[NodeAttempt],
+) -> Result<TestResults, String> {
+    let mut results = Vec::new();
+    for outcome in outcomes {
+        let Some(label) = outcome.tag.strip_prefix("compat.") else { continue };
+        if outcome_execution(outcome) == AttemptExecution::Unknown || outcome_is_no_result(outcome)
+        {
+            continue;
+        }
+        let attempts = attempts
+            .iter()
+            .filter(|attempt| {
+                attempt.tag == outcome.tag && attempt.execution == AttemptExecution::Completed
+            })
+            .count();
+        let attempts = u64::try_from(attempts)
+            .map_err(|_| format!("structured compatibility attempts overflowed for {label}"))?;
+        if attempts == 0 {
+            return Err(format!(
+                "structured compatibility result {label} has no completed attempt"
+            ));
+        }
+        results.push(TestResult::new(label.to_string(), outcome.ok, attempts)?);
     }
-    let path = PathBuf::from(path);
-    let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
-    let counts = serde_json::json!({
-        "schema": 1,
-        "executed_tests": executed,
-        "filtered_tests": filtered,
-    });
-    let publish = std::fs::write(&temporary, format!("{counts}\n"))
-        .and_then(|()| std::fs::rename(&temporary, &path));
-    if let Err(error) = publish {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(format!(
-            "cannot publish structured test counts to {}: {error}",
-            path.display()
-        ));
-    }
-    Ok(())
+    let executed = u64::try_from(results.len())
+        .map_err(|_| "structured compatibility result count does not fit u64".to_string())?;
+    TestResults::current(executed, 0, results)
 }
 
 /// Derive the per-node coverage obligation from dagrun's structured test counts.
@@ -12868,24 +12913,75 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         outcome("test.a", true, Some(398), Some(0)),
         outcome("test.b", true, Some(475), Some(350)),
     ];
-    if libtest_counts(&full) != (Some(873), Some(350)) {
-        return Err("typed libtest counts: complete outcomes did not sum to 873/350".into());
+    if libtest_counts(&full) != (Some(873), Some(873), Some(350)) {
+        return Err("typed libtest counts: complete outcomes did not sum to 873/873/350".into());
     }
     let failed = outcome("test.failed", false, Some(23), Some(5));
-    if libtest_counts(std::slice::from_ref(&failed)) != (Some(23), Some(5)) || failed.ok {
+    if libtest_counts(std::slice::from_ref(&failed)) != (Some(23), None, Some(5)) || failed.ok {
         return Err(
-            "typed libtest counts: a 23-test failed outcome must contribute counts and remain failed"
+            "typed libtest counts: a retained failed count-only outcome must keep passed unknown"
                 .into(),
         );
     }
-    if libtest_counts(&[outcome("test.zero", true, Some(0), Some(0))]) != (Some(0), Some(0)) {
+    if libtest_counts(&[outcome("test.zero", true, Some(0), Some(0))])
+        != (Some(0), Some(0), Some(0))
+    {
         return Err("typed libtest counts: demonstrated zero was not preserved".into());
     }
-    if libtest_counts(&[outcome("build.only", true, None, None)]) != (None, None) {
+    if libtest_counts(&[outcome("build.only", true, None, None)]) != (None, None, None) {
         return Err("typed libtest counts: unknown bannerless output was coerced".into());
     }
+
+    let mut exact = outcome("test.exact", false, Some(2), Some(0));
+    exact.test_results = Some(vec![
+        TestResult::new("case-a".into(), true, 1)?,
+        TestResult::new("case-b".into(), false, 2)?,
+    ]);
+    if libtest_counts(std::slice::from_ref(&exact)) != (Some(2), Some(1), Some(0)) {
+        return Err("typed libtest counts: exact per-test results did not report one pass".into());
+    }
+    exact.test_results.as_mut().unwrap()[1].passed = true;
+    if libtest_counts(std::slice::from_ref(&exact)) != (Some(2), Some(2), Some(0)) {
+        return Err(
+            "typed libtest counts: mutating a typed terminal result did not move the pass count"
+                .into(),
+        );
+    }
+
+    let compat_pass = outcome("compat.pass-case", true, None, None);
+    let compat_fail = outcome("compat.fail-case", false, None, None);
+    let compat_attempts = vec![
+        reported_attempt(&compat_pass, 1),
+        reported_attempt(&compat_fail, 1),
+        reported_attempt(&compat_fail, 2),
+    ];
+    let compat = compat_test_results(&[compat_pass.clone(), compat_fail.clone()], &compat_attempts)?;
+    let compat_rows = compat
+        .results
+        .as_ref()
+        .ok_or("typed libtest counts: compatibility producer wrote retained schema 1")?;
+    if compat.executed_tests != 2
+        || compat.filtered_tests != 0
+        || compat_rows
+            != &vec![
+                TestResult::new("pass-case".into(), true, 1)?,
+                TestResult::new("fail-case".into(), false, 2)?,
+            ]
+    {
+        return Err(format!(
+            "typed libtest counts: compatibility results lost a verdict or attempt: {compat:?}"
+        ));
+    }
+    let missing_attempt = compat_test_results(&[compat_pass], &[])
+        .expect_err("compatibility result without an attempt must refuse");
+    if !missing_attempt.contains("pass-case") || !missing_attempt.contains("no completed attempt")
+    {
+        return Err(format!(
+            "typed libtest counts: missing compatibility attempt did not fail by name: {missing_attempt}"
+        ));
+    }
     println!(
-        "  typed libtest counts: 873/350 pass and 23/5 failure counted; 0/0 preserved; unknown stayed null"
+        "  typed libtest counts: exact 873/873/350 pass; retained failure stayed unknown; typed mutation moved 1 -> 2; compatibility rows carried terminal verdicts and attempts; 0/0/0 preserved"
     );
     Ok(())
 }
@@ -13616,6 +13712,7 @@ fn write_ledger(
         // the counts every downstream `is_clean_full_pass` predicate keys on, so
         // a row without them is a NON-VERDICT, not a green.
         "executed_tests": ctx.executed_tests,
+        "passed_tests": ctx.passed_tests,
         "filtered_tests": ctx.filtered_tests,
         "gates_run": gates_run,
         "gates_expected": gates_expected,
@@ -16143,7 +16240,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // Whole-run CPU, taken once in THIS process (a worker thread would see only
     // its own accounting, exactly as a bash subshell's `times` would).
     let (cpu_user, cpu_sys) = validate_runtime::process_cpu_seconds();
-    let (executed_tests, filtered_tests) = libtest_counts(&outcomes);
+    let (executed_tests, passed_tests, filtered_tests) = libtest_counts(&outcomes);
     if executed_tests.is_none() {
         eprintln!(
             "validate: WARNING: libtest counts are UNKNOWN for this run. A ledger row with \
@@ -16207,6 +16304,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         cpu_sys,
         env_block_retries: env_retries as i64,
         executed_tests,
+        passed_tests,
         filtered_tests,
     };
     if let (Some(a), Some(l)) = (peak_active, peak_live) {
@@ -16451,21 +16549,12 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // that node executed work. The value comes from the typed compatibility
     // outcomes, never from the nested process's printable summary.
     if nesting.nested {
-        let nested_counts = compat_measured
-            .and_then(|count| i64::try_from(count).ok())
-            .map(|count| (count, 0))
-            .or_else(|| executed_tests.zip(filtered_tests));
-        match nested_counts {
-            Some((executed, filtered)) => {
-                if let Err(error) = publish_structured_test_counts(executed, filtered) {
-                    eprintln!("validate: ERROR: {error}");
-                    exit_code = 1;
-                }
-            }
-            None => {
-                eprintln!(
-                    "validate: ERROR: nested validation produced no structured executed-test count"
-                );
+        match compat_test_results(&outcomes, &attempts)
+            .and_then(|results| publish_structured_test_results(&results))
+        {
+            Ok(()) => {}
+            Err(error) => {
+                eprintln!("validate: ERROR: {error}");
                 exit_code = 1;
             }
         }
@@ -16782,7 +16871,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     }
     match executed_tests {
         Some(n) => detail.push(format!(
-            "{n} test(s) executed, {} filtered (aggregated from typed step outcomes)",
+            "{n} test(s) executed, {} passed, {} filtered (aggregated from typed step outcomes)",
+            passed_tests.map(|p| p.to_string()).unwrap_or_else(|| "unknown".into()),
             filtered_tests.map(|f| f.to_string()).unwrap_or_else(|| "unknown".into())
         )),
         None => detail.push(
@@ -16940,6 +17030,7 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
         cpu_sys,
         env_block_retries: 0,
         executed_tests: None,
+        passed_tests: None,
         filtered_tests: None,
     };
     // `suite_complete: false` — a fixture that ran two synthetic gates must never

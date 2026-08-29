@@ -57,6 +57,12 @@ pub struct HistoryRow {
     /// real pass from a no-result wearing a success badge.
     #[serde(default)]
     pub executed_tests: Option<i64>,
+    /// Tests that passed according to the runner-owned structured result.
+    /// This field is omitted when absent so retained receipt bytes and digests
+    /// stay unchanged. A row without the field remains readable as `None` and
+    /// gains no value reconstructed from presentation text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passed_tests: Option<i64>,
     /// Tests FILTERED OUT by the run's selection. `Some(0)` alongside
     /// `executed_tests == Some(0)` is an empty target; `Some(n>0)` is a filtered
     /// subset (the `1 passed; 154 filtered out` narrowed-scope trap).
@@ -517,6 +523,29 @@ mod tests {
         assert_eq!(
             digest,
             "e909dc57a7de484727d13d556895ad1afd547c956700987ab1945d2d5fb7bb5d"
+        );
+    }
+
+    #[test]
+    fn passed_tests_is_typed_without_changing_retained_receipt_bytes() {
+        let retained: HistoryRow =
+            serde_json::from_str(r#"{"schema_version":5,"executed_tests":7,"filtered_tests":2}"#)
+                .unwrap();
+        assert_eq!(retained.passed_tests, None);
+        assert!(
+            !serde_json::to_string(&retained)
+                .unwrap()
+                .contains("passed_tests")
+        );
+
+        let current: HistoryRow = serde_json::from_str(
+            r#"{"schema_version":7,"executed_tests":7,"passed_tests":5,"filtered_tests":2}"#,
+        )
+        .unwrap();
+        assert_eq!(current.passed_tests, Some(5));
+        assert_eq!(
+            serde_json::to_value(&current).unwrap()["passed_tests"],
+            serde_json::json!(5)
         );
     }
 
