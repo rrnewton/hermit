@@ -3575,42 +3575,31 @@ fn git(root: &Path, args: &[&str]) -> Result<String, String> {
 
 /// Ask the hermit binary which commit it was built from.
 ///
-/// `hermit --version` prints `hermit <version> (<date>, g<sha12>[-dirty])`.
-/// That revision is stamped in at compile time by `hermit-cli/build.rs`, whose
-/// own documentation says it exists "so a released binary can be traced back to
-/// a commit". It is the only provenance available that describes the artifact
-/// rather than the directory the harness is standing in, and it is strictly
-/// richer than the checkout HEAD: it carries the dirtiness of the tree the
-/// binary was BUILT from, and degrades to `unknown` rather than to a plausible
-/// wrong answer.
-///
-/// Returns the token without its `g` prefix, for example `351cd3603f7e-dirty`.
-/// `None` means the binary could not be run, exited nonzero, or printed nothing
-/// recognisable. That is deliberately a distinct outcome from any value: a
-/// provenance that could not be established must not read as one that matched.
+/// The producer-owned `version --json` record is the authority. Human-readable
+/// `--version` output is presentation and must not be parsed into provenance.
+/// `None` means the binary could not be run, refused the current schema, or
+/// returned an invalid revision; it is deliberately distinct from any value.
 fn probe_binary_build_sha(program: &Path) -> Option<String> {
-    let output = Command::new(program).arg("--version").output().ok()?;
+    let output = Command::new(program)
+        .args(["version", "--json"])
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
-    parse_binary_build_sha(&String::from_utf8_lossy(&output.stdout))
+    parse_binary_build_info(&output.stdout)
 }
 
-/// The parsing half of [`probe_binary_build_sha`], separated from the
-/// subprocess so every outcome -- including every way of failing to establish a
-/// provenance -- is reachable in a test without a built binary on disk.
-fn parse_binary_build_sha(version_output: &str) -> Option<String> {
-    version_output.split_whitespace().find_map(|word| {
-        let word = word.trim_matches(|c: char| c == '(' || c == ')' || c == ',');
-        let rest = word.strip_prefix('g')?;
-        let sha = rest.strip_suffix("-dirty").unwrap_or(rest);
-        // `build.rs` emits the literal `unknown` when it cannot reach git. Keep
-        // it: the binary saying "I do not know" is information, and folding it
-        // into `None` would merge it with "I could not ask".
-        let recognised =
-            sha == "unknown" || (sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit()));
-        recognised.then(|| rest.to_owned())
-    })
+fn parse_binary_build_info(bytes: &[u8]) -> Option<String> {
+    let report = serde_json::from_slice::<detcore_model::build_info::BuildInfo>(bytes).ok()?;
+    if report.schema != detcore_model::build_info::BuildInfo::SCHEMA {
+        return None;
+    }
+    let sha = report.git_sha;
+    let hex = sha.strip_suffix("-dirty").unwrap_or(&sha);
+    let recognised =
+        hex == "unknown" || (hex.len() >= 7 && hex.chars().all(|c| c.is_ascii_hexdigit()));
+    recognised.then_some(sha)
 }
 
 fn command_help_contains(program: &Path, args: &[&str], needle: &str) -> bool {
@@ -6398,26 +6387,39 @@ backends_disabled:
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// The binary's own revision is read out of `--version`, including the
+    fn build_info_json(git_sha: &str) -> Vec<u8> {
+        serde_json::to_vec(&detcore_model::build_info::BuildInfo {
+            schema: detcore_model::build_info::BuildInfo::SCHEMA,
+            version: "0.2.0".into(),
+            build_date: Some("2026-08-25".into()),
+            git_sha: git_sha.into(),
+            features: detcore_model::build_info::BuildFeatures {
+                dbt: false,
+                e9patch: false,
+                sabre: false,
+            },
+        })
+        .unwrap()
+    }
+
+    /// The binary's own revision is read from its typed record, including the
     /// dirty marker, which the checkout HEAD cannot supply because it describes
     /// a different tree at a different time.
     #[test]
-    fn binary_build_sha_is_read_from_the_version_line() {
+    fn binary_build_sha_is_read_from_the_typed_build_record() {
         assert_eq!(
-            parse_binary_build_sha("hermit 0.2.0 (2026-08-25, g351cd3603f7e-dirty)").as_deref(),
+            parse_binary_build_info(&build_info_json("351cd3603f7e-dirty")).as_deref(),
             Some("351cd3603f7e-dirty"),
             "a dirty build must keep saying so; that is the fact the checkout cannot supply"
         );
         assert_eq!(
-            parse_binary_build_sha("hermit 0.2.0 (2026-08-24, g3d85028b3bca)").as_deref(),
+            parse_binary_build_info(&build_info_json("3d85028b3bca")).as_deref(),
             Some("3d85028b3bca")
         );
         // 40-hex is equally acceptable; the width is not the contract.
         assert_eq!(
-            parse_binary_build_sha(
-                "hermit 0.2.0 (2026-08-24, g351cd3603f7e537297067e07a20c5ccf7a23c0e0)"
-            )
-            .as_deref(),
+            parse_binary_build_info(&build_info_json("351cd3603f7e537297067e07a20c5ccf7a23c0e0"))
+                .as_deref(),
             Some("351cd3603f7e537297067e07a20c5ccf7a23c0e0")
         );
     }
@@ -6427,7 +6429,7 @@ backends_disabled:
     #[test]
     fn an_unknown_revision_is_preserved_not_dropped() {
         assert_eq!(
-            parse_binary_build_sha("hermit 0.2.0 (2026-08-24, gunknown)").as_deref(),
+            parse_binary_build_info(&build_info_json("unknown")).as_deref(),
             Some("unknown")
         );
     }
@@ -6435,23 +6437,33 @@ backends_disabled:
     /// Nothing recognisable must yield `None`, never a guess. A provenance that
     /// could not be established must not be reported as one that matched.
     #[test]
-    fn unrecognisable_version_output_establishes_nothing() {
-        for text in [
-            "",
-            "hermit 0.1",
-            "hermit 0.2.0",
-            // The Buck build derives its version elsewhere and prints no g-token.
-            "fbsource: rABC123, fbpkg: hermit:42",
-            // A g-word that is not a revision.
-            "hermit 0.2.0 (2026-08-24, gzzzz)",
-            "some general text with git in it",
+    fn malformed_or_unsupported_build_records_establish_nothing() {
+        for bytes in [
+            b"".as_slice(),
+            br#"{"schema":1}"#,
+            br#"{"schema":2,"version":"0.2.0","build_date":null,"git_sha":"351cd3603f7e","features":{"dbt":false,"e9patch":false,"sabre":false}}"#,
+            &build_info_json("zzzz"),
         ] {
             assert_eq!(
-                parse_binary_build_sha(text),
+                parse_binary_build_info(bytes),
                 None,
-                "must not invent a provenance from {text:?}"
+                "must not invent provenance from {}",
+                String::from_utf8_lossy(bytes)
             );
         }
+    }
+
+    /// Mutating the producer's typed value must move the consumer's value.
+    #[test]
+    fn binary_build_sha_follows_the_typed_field() {
+        assert_eq!(
+            parse_binary_build_info(&build_info_json("351cd3603f7e")),
+            Some("351cd3603f7e".into())
+        );
+        assert_eq!(
+            parse_binary_build_info(&build_info_json("aaaaaaaaaaaa")),
+            Some("aaaaaaaaaaaa".into())
+        );
     }
 
     /// The two fields answer different questions and must be independently
@@ -6460,8 +6472,8 @@ backends_disabled:
     #[test]
     fn checkout_sha_and_binary_provenance_are_separate_facts() {
         let checkout = "affda5d9840baeb60c5f5aa9c7b0ff5560e81ef3";
-        let built_from = parse_binary_build_sha("hermit 0.2.0 (2026-08-25, g351cd3603f7e-dirty)")
-            .expect("version line parses");
+        let built_from = parse_binary_build_info(&build_info_json("351cd3603f7e-dirty"))
+            .expect("typed build record parses");
         assert_ne!(
             checkout,
             built_from.trim_end_matches("-dirty"),

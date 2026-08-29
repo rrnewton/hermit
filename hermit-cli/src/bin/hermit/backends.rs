@@ -52,6 +52,10 @@ use std::process::Command as StdCommand;
 use std::process::Output;
 
 use detcore::Config;
+#[cfg(feature = "dbt")]
+use detcore_model::backend_engagement::BackendEngagement;
+#[cfg(feature = "dbt")]
+use detcore_model::backend_engagement::BackendEngagementReport;
 use hermit::Error;
 use hermit::ExitStatus;
 #[cfg(feature = "dbt")]
@@ -94,30 +98,18 @@ use super::verify::write_pending_verification_json;
 #[cfg(feature = "dbt")]
 use super::verify::write_verification_json;
 
-#[derive(Debug)]
 #[cfg(feature = "dbt")]
-struct DbtSummary {
-    branches: u64,
-    syscalls: u64,
-    rewritten: u64,
-    stdin_reads: u64,
-    memory_hash: String,
-}
-
-#[cfg(feature = "dbt")]
-const DBT_SUMMARY_PREFIX: &str = "reverie-dbt: tool=Detcore ";
-
-#[cfg(feature = "dbt")]
-impl DbtSummary {
-    fn same_observable_behavior(&self, other: &Self) -> bool {
-        // `branches` is deliberately absent here because the counted-branch
-        // clock is checked separately, with its own typed evidence. It is NOT
-        // excluded because a difference is tolerable.
-        self.syscalls == other.syscalls
-            && self.rewritten == other.rewritten
-            && self.stdin_reads == other.stdin_reads
-            && self.memory_hash == other.memory_hash
-    }
+fn same_dbt_observable_behavior(
+    first: &DbtBackendStatsSnapshot,
+    second: &DbtBackendStatsSnapshot,
+) -> bool {
+    // `counted_branches` is deliberately absent here because the branch clock
+    // is checked separately, with its own typed evidence. It is NOT excluded
+    // because a difference is tolerable.
+    first.intercepted_syscalls() == second.intercepted_syscalls()
+        && first.rewritten_syscalls() == second.rewritten_syscalls()
+        && first.stdin_reads() == second.stdin_reads()
+        && first.memory_hash_fold() == second.memory_hash_fold()
 }
 
 /// Describe a counted-branch-clock divergence without conflating it with the
@@ -249,7 +241,16 @@ impl DbtStatsCapture {
                 "DBT verification did not reach a verdict: typed whole-process statistics contained no process records",
             ));
         }
-        Ok(aggregator.snapshot())
+        let snapshot = aggregator.snapshot();
+        if snapshot.counted_branches() == 0
+            || snapshot.intercepted_syscalls() == 0
+            || snapshot.rewritten_syscalls() > snapshot.intercepted_syscalls()
+        {
+            return Err(Error::msg(
+                "DBT typed native callback counters are inconsistent",
+            ));
+        }
+        Ok(snapshot)
     }
 }
 
@@ -262,7 +263,7 @@ impl DbtStatsCapture {
 /// translated basic blocks, and `memory hash` is the client's observed
 /// guest-memory digest, not a Detcore RunSummary field.
 #[cfg(feature = "dbt")]
-fn format_dbt_stats(summary: &DbtSummary) -> String {
+fn format_dbt_stats(summary: &DbtBackendStatsSnapshot) -> String {
     format!(
         "=== DBT backend stats (native DynamoRIO client) ===\n\
          counted branches (deterministic branch clock): {}\n\
@@ -270,12 +271,52 @@ fn format_dbt_stats(summary: &DbtSummary) -> String {
          syscall instructions rewritten:                {}\n\
          stdin (fd 0) reads:                            {}\n\
          observed guest-memory hash:                    {}\n",
-        summary.branches,
-        summary.syscalls,
-        summary.rewritten,
-        summary.stdin_reads,
-        summary.memory_hash,
+        summary.counted_branches(),
+        summary.intercepted_syscalls(),
+        summary.rewritten_syscalls(),
+        summary.stdin_reads(),
+        format_args!("{:016x}", summary.memory_hash_fold()),
     )
+}
+
+#[cfg(feature = "dbt")]
+fn write_dbt_engagement(path: &Path, snapshot: &DbtBackendStatsSnapshot) -> Result<(), Error> {
+    let report = BackendEngagementReport::new(BackendEngagement::Dbt {
+        counted_branches: snapshot.counted_branches(),
+    });
+    report.validate().map_err(Error::msg)?;
+    let mut bytes = serde_json::to_vec(&report)?;
+    bytes.push(b'\n');
+    fs::write(path, bytes).map_err(|error| {
+        Error::msg(format!(
+            "writing DBT engagement {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+#[cfg(feature = "dbt")]
+fn finish_single_run_dbt_stats(
+    capture: DbtStatsCapture,
+    summary: bool,
+    engagement_json: Option<&Path>,
+) -> Result<(), Error> {
+    match capture.finish() {
+        Ok(stats) => {
+            if summary {
+                eprint!("{}", format_dbt_stats(&stats));
+            }
+            if let Some(path) = engagement_json {
+                write_dbt_engagement(path, &stats)?;
+            }
+            Ok(())
+        }
+        Err(error) if engagement_json.is_some() => Err(error),
+        Err(error) => {
+            eprintln!(":: DBT summary unavailable: {error}");
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -690,6 +731,7 @@ pub(super) fn run_dbt(
     verify_log_dir: Option<&Path>,
     verify_json: Option<&Path>,
     summary: bool,
+    backend_engagement_json: Option<&Path>,
     log: Option<LevelFilter>,
     log_file: Option<&Path>,
     config: &Config,
@@ -728,6 +770,9 @@ pub(super) fn run_dbt(
             "failed to prepare the Detcore DynamoRIO client: {error}"
         ))
     })?;
+    let single_run_stats = (!verify && (summary || backend_engagement_json.is_some()))
+        .then(DbtStatsCapture::new)
+        .transpose()?;
     let mut runner = DbtRunner::new(&drrun, &client)
         .map_err(|error| {
             Error::msg(format!(
@@ -736,12 +781,11 @@ pub(super) fn run_dbt(
                 client.display()
             ))
         })?
-        // Verification has always compared the native Detcore summary in
-        // addition to stdout/status. Keep collecting it now that every verify
-        // also compares the protected INFO stream; replacing the old path must
-        // not drop an existing observation.
-        .summary(summary || verify)
+        .summary(summary)
         .isolated_process_group(panic_on_unsupported_syscalls);
+    if let Some(capture) = &single_run_stats {
+        runner = capture.configure(runner);
+    }
     if panic_on_unsupported_syscalls {
         runner = runner.client_argument("-panic-on-unsupported-syscalls");
     }
@@ -778,21 +822,15 @@ pub(super) fn run_dbt(
     if !verify {
         if stdin_is_terminal {
             let status = run_status(&runtime, &runner, &guest, &drrun, config)?;
-            if summary {
-                eprintln!(
-                    ":: DBT summary: see the `reverie-dbt: tool=Detcore ...` line above \
-                     (run without a terminal on stdin for the labeled block)"
-                );
+            if let Some(capture) = single_run_stats {
+                finish_single_run_dbt_stats(capture, summary, backend_engagement_json)?;
             }
             return Ok(process_status(status));
         }
         let output = run_once(&runtime, &runner, &guest, &drrun, config, std::io::stdin())?;
         write_output(&output)?;
-        if summary {
-            match detcore_summary(&output) {
-                Ok(stats) => eprint!("{}", format_dbt_stats(&stats)),
-                Err(error) => eprintln!(":: DBT summary unavailable: {error}"),
-            }
+        if let Some(capture) = single_run_stats {
+            finish_single_run_dbt_stats(capture, summary, backend_engagement_json)?;
         }
         return Ok(output_status(&output));
     }
@@ -914,27 +952,6 @@ pub(super) fn run_dbt(
         }
         return Err(Error::msg("First run during --verify exited in error"));
     }
-    let first_summary = match detcore_summary(&first_raw) {
-        Ok(summary) => summary,
-        Err(error) => {
-            if keep_logs {
-                retain_verification_logs([("run 1", log1_path)])?;
-            }
-            return Err(error);
-        }
-    };
-    if terminal_stdin && first_summary.stdin_reads != 0 {
-        let first = dbt_verification_output(first_raw);
-        std::io::stdout().write_all(&first.stdout)?;
-        std::io::stderr().write_all(&first.stderr)?;
-        if keep_logs {
-            retain_verification_logs([("run 1", log1_path)])?;
-        }
-        return Err(Error::msg(format!(
-            "DBT verification cannot replay terminal stdin: guest attempted {} fd-0 read syscall(s)",
-            first_summary.stdin_reads
-        )));
-    }
     let first_stats = match stats1.finish() {
         Ok(stats) => stats,
         Err(error) => {
@@ -944,6 +961,18 @@ pub(super) fn run_dbt(
             return Err(error);
         }
     };
+    if terminal_stdin && first_stats.stdin_reads() != 0 {
+        let first = dbt_verification_output(first_raw);
+        std::io::stdout().write_all(&first.stdout)?;
+        std::io::stderr().write_all(&first.stderr)?;
+        if keep_logs {
+            retain_verification_logs([("run 1", log1_path)])?;
+        }
+        return Err(Error::msg(format!(
+            "DBT verification cannot replay terminal stdin: guest attempted {} fd-0 read syscall(s)",
+            first_stats.stdin_reads()
+        )));
+    }
     let first = dbt_verification_output(first_raw);
 
     replay.seek(SeekFrom::Start(0))?;
@@ -983,15 +1012,6 @@ pub(super) fn run_dbt(
         }
         return Err(error);
     }
-    let second_summary = match detcore_summary(&second_raw) {
-        Ok(summary) => summary,
-        Err(error) => {
-            if keep_logs {
-                retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
-            }
-            return Err(error);
-        }
-    };
     let second_stats = match stats2.finish() {
         Ok(stats) => stats,
         Err(error) => {
@@ -1008,10 +1028,10 @@ pub(super) fn run_dbt(
         right: second_stats.counted_branches(),
     };
     let branch_clock_diverged = !branch_clock_comparison.matched();
-    let summary_failure = (!first_summary.same_observable_behavior(&second_summary)).then(|| {
+    let summary_failure = (!same_dbt_observable_behavior(&first_stats, &second_stats)).then(|| {
         format!(
-            "DBT verification failed: native Detcore summaries differed \
-             ({first_summary:?} != {second_summary:?})"
+            "DBT verification failed: typed native Detcore statistics differed \
+             ({first_stats:?} != {second_stats:?})"
         )
     });
     let mut outcome = compare_two_runs(
@@ -1105,6 +1125,7 @@ pub(super) fn run_dbt(
     _verify_log_dir: Option<&Path>,
     _verify_json: Option<&Path>,
     _summary: bool,
+    _backend_engagement_json: Option<&Path>,
     _log: Option<LevelFilter>,
     _log_file: Option<&Path>,
     _config: &Config,
@@ -1246,62 +1267,6 @@ fn dbt_run_error(drrun: &Path, error: std::io::Error) -> Error {
 #[cfg(any(feature = "dbt", test))]
 fn process_status(status: std::process::ExitStatus) -> ExitStatus {
     ExitStatus::from_raw(status.into_raw())
-}
-
-#[cfg(feature = "dbt")]
-fn detcore_summary(output: &Output) -> Result<DbtSummary, Error> {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let summary = stderr
-        .lines()
-        .rev()
-        .find(|line| line.starts_with(DBT_SUMMARY_PREFIX))
-        .ok_or_else(|| {
-            Error::msg(
-                "DBT verification failed: native DynamoRIO summary did not report tool=Detcore",
-            )
-        })?;
-
-    let field = |name: &str| {
-        summary
-            .split_ascii_whitespace()
-            .find_map(|value| value.strip_prefix(name))
-            .ok_or_else(|| Error::msg(format!("DBT verification failed: summary omitted {name}")))
-    };
-    let branches = field("branches=")?
-        .parse::<u64>()
-        .map_err(|_| Error::msg("DBT verification failed: invalid branch count"))?;
-    let syscalls = field("syscalls=")?
-        .parse::<u64>()
-        .map_err(|_| Error::msg("DBT verification failed: invalid syscall count"))?;
-    let rewritten = field("rewritten=")?
-        .parse::<u64>()
-        .map_err(|_| Error::msg("DBT verification failed: invalid rewritten count"))?;
-    let stdin_reads = field("stdin_reads=")?
-        .parse::<u64>()
-        .map_err(|_| Error::msg("DBT verification failed: invalid stdin read count"))?;
-    // A guest can reach the native callback without asking Detcore to suppress
-    // a syscall. For example, a raw program whose only syscall is the native
-    // lifecycle `exit` reports `rewritten=0`. The callback is still healthy as
-    // long as it observed work and did not report more rewrites than syscalls.
-    if branches == 0 || syscalls == 0 || rewritten > syscalls {
-        return Err(Error::msg(
-            "DBT verification failed: native callback counters are inconsistent",
-        ));
-    }
-
-    let hash = field("memory_hash=")?;
-    if hash.len() != 16 || u64::from_str_radix(hash, 16).is_err() {
-        return Err(Error::msg(
-            "DBT verification failed: invalid observed-memory hash",
-        ));
-    }
-    Ok(DbtSummary {
-        branches,
-        syscalls,
-        rewritten,
-        stdin_reads,
-        memory_hash: hash.to_owned(),
-    })
 }
 
 #[cfg(feature = "dbt")]
@@ -1483,14 +1448,26 @@ mod tests {
     }
 
     #[cfg(feature = "dbt")]
-    fn dbt_summary(branches: u64) -> DbtSummary {
-        DbtSummary {
+    fn dbt_stats(
+        branches: u64,
+        syscalls: u64,
+        rewritten: u64,
+        stdin_reads: u64,
+        memory_hash: u64,
+    ) -> DbtBackendStatsSnapshot {
+        use reverie_dbt::backend_stats::DbtProcessRecord;
+
+        let record = DbtProcessRecord {
             branches,
-            syscalls: 169,
-            rewritten: 168,
-            stdin_reads: 0,
-            memory_hash: "4b5e0e70f3050157".to_owned(),
-        }
+            syscalls,
+            rewritten,
+            stdin_reads,
+            memory_hash,
+            ..Default::default()
+        };
+        let mut aggregator = DbtBackendStatsAggregator::new();
+        aggregator.record(&record);
+        aggregator.snapshot()
     }
 
     #[cfg(feature = "dbt")]
@@ -1731,6 +1708,38 @@ mod tests {
 
     #[test]
     #[cfg(feature = "dbt")]
+    fn dbt_engagement_record_follows_the_typed_branch_count() {
+        fn record(branches: u64) -> serde_json::Value {
+            let capture = DbtStatsCapture::new().unwrap();
+            let row = reverie_dbt::backend_stats::DbtProcessRecord {
+                branches,
+                syscalls: 1,
+                rewritten: 1,
+                ..Default::default()
+            };
+            fs::write(
+                &capture.path,
+                reverie_dbt::backend_stats::encode_process_record(&row),
+            )
+            .unwrap();
+            let output = tempfile::NamedTempFile::new().unwrap();
+            finish_single_run_dbt_stats(capture, false, Some(output.path())).unwrap();
+            serde_json::from_slice(&fs::read(output.path()).unwrap()).unwrap()
+        }
+
+        let first = record(18);
+        let second = record(19);
+        assert_eq!(first["engagement"]["backend"], "dbt");
+        assert_eq!(first["engagement"]["counted_branches"], 18);
+        assert_eq!(second["engagement"]["counted_branches"], 19);
+        assert_ne!(
+            first, second,
+            "mutating the producer count must move the record"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
     fn typed_stats_capture_refuses_missing_empty_or_truncated_evidence() {
         let missing = DbtStatsCapture::new().unwrap();
         let error = missing.finish().unwrap_err();
@@ -1755,6 +1764,26 @@ mod tests {
             "{error}"
         );
         assert!(error.to_string().contains("truncated"), "{error}");
+
+        let inconsistent = DbtStatsCapture::new().unwrap();
+        let record = reverie_dbt::backend_stats::DbtProcessRecord {
+            branches: 18,
+            syscalls: 1,
+            rewritten: 2,
+            ..Default::default()
+        };
+        fs::write(
+            &inconsistent.path,
+            reverie_dbt::backend_stats::encode_process_record(&record),
+        )
+        .unwrap();
+        let error = inconsistent.finish().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("typed native callback counters are inconsistent"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1824,7 +1853,7 @@ mod tests {
     #[test]
     #[cfg(feature = "dbt")]
     fn dbt_stats_block_labels_counters_honestly() {
-        let rendered = format_dbt_stats(&dbt_summary(563_145));
+        let rendered = format_dbt_stats(&dbt_stats(563_145, 169, 168, 0, 0x4b5e0e70f3050157));
         // The branch counter must be labeled as a branch clock, never as
         // "basic blocks translated" — the client counts retired branches.
         assert!(rendered.contains("counted branches (deterministic branch clock): 563145"));
@@ -1839,13 +1868,8 @@ mod tests {
 
     #[test]
     #[cfg(feature = "dbt")]
-    fn dbt_stats_block_round_trips_from_a_client_summary_line() {
-        let output = dbt_output(
-            "reverie-dbt: tool=Detcore branches=42 syscalls=7 rewritten=6 \
-             stdin_reads=0 memory_hash=cbf29ce484222325\n",
-        );
-        let parsed = detcore_summary(&output).unwrap();
-        let rendered = format_dbt_stats(&parsed);
+    fn dbt_stats_block_renders_the_typed_wire_snapshot() {
+        let rendered = format_dbt_stats(&dbt_stats(42, 7, 6, 0, 0xcbf29ce484222325));
         assert!(rendered.contains("counted branches (deterministic branch clock): 42"));
         assert!(rendered.contains("syscalls intercepted:                          7"));
         assert!(
@@ -1856,70 +1880,30 @@ mod tests {
     #[test]
     #[cfg(feature = "dbt")]
     fn dbt_summary_compares_every_non_branch_observation() {
-        let expected = dbt_summary(100);
+        let expected = dbt_stats(100, 169, 168, 0, 0x4b5e0e70f3050157);
 
-        let mut actual = dbt_summary(100);
-        actual.syscalls += 1;
-        assert!(!expected.same_observable_behavior(&actual));
+        assert!(!same_dbt_observable_behavior(
+            &expected,
+            &dbt_stats(100, 170, 168, 0, 0x4b5e0e70f3050157)
+        ));
+        assert!(!same_dbt_observable_behavior(
+            &expected,
+            &dbt_stats(100, 169, 167, 0, 0x4b5e0e70f3050157)
+        ));
+        assert!(!same_dbt_observable_behavior(
+            &expected,
+            &dbt_stats(100, 169, 168, 1, 0x4b5e0e70f3050157)
+        ));
+        assert!(!same_dbt_observable_behavior(
+            &expected,
+            &dbt_stats(100, 169, 168, 0, 0)
+        ));
 
-        let mut actual = dbt_summary(100);
-        actual.rewritten -= 1;
-        assert!(!expected.same_observable_behavior(&actual));
-
-        let mut actual = dbt_summary(100);
-        actual.stdin_reads += 1;
-        assert!(!expected.same_observable_behavior(&actual));
-
-        let mut actual = dbt_summary(100);
-        actual.memory_hash = "0000000000000000".to_owned();
-        assert!(!expected.same_observable_behavior(&actual));
-
-        let different_branch_clock = dbt_summary(101);
+        let different_branch_clock = dbt_stats(101, 169, 168, 0, 0x4b5e0e70f3050157);
         assert!(
-            expected.same_observable_behavior(&different_branch_clock),
+            same_dbt_observable_behavior(&expected, &different_branch_clock),
             "the counted-branch clock has its own typed comparison and must not be folded into \
              the opaque summary mismatch"
-        );
-    }
-
-    #[cfg(feature = "dbt")]
-    fn dbt_output(summary: &str) -> Output {
-        Output {
-            status: std::process::ExitStatus::from_raw(0),
-            stdout: Vec::new(),
-            stderr: summary.as_bytes().to_vec(),
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "dbt")]
-    fn dbt_summary_accepts_a_callback_without_rewritten_syscalls() {
-        let output = dbt_output(
-            "reverie-dbt: tool=Detcore branches=18 syscalls=1 rewritten=0 \
-             stdin_reads=0 memory_hash=cbf29ce484222325\n",
-        );
-
-        let summary = detcore_summary(&output).unwrap();
-
-        assert_eq!(summary.syscalls, 1);
-        assert_eq!(summary.rewritten, 0);
-    }
-
-    #[test]
-    #[cfg(feature = "dbt")]
-    fn dbt_summary_rejects_more_rewrites_than_syscalls() {
-        let output = dbt_output(
-            "reverie-dbt: tool=Detcore branches=18 syscalls=1 rewritten=2 \
-             stdin_reads=0 memory_hash=cbf29ce484222325\n",
-        );
-
-        let error = detcore_summary(&output).unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("native callback counters are inconsistent"),
-            "{error}"
         );
     }
 

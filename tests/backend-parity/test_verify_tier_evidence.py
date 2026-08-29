@@ -37,10 +37,13 @@ from run_matrix import (  # noqa: E402
     DEFAULT_VERIFY_POLICY,
     SCORECARD_HEADER,
     VerifyPolicy,
+    cpuid_policy_is_blocked,
     expectation,
     hermit_command,
+    parse_host_capabilities,
     verify_tier_from_json,
 )
+from e9patch_corpus import CorpusError, e9patch_feature_from_build_info  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -460,6 +463,67 @@ for column in EVIDENCE_COLUMNS:
     check(f"{column} is in SCORECARD_HEADER", column in SCORECARD_HEADER)
 check("evidence columns are the last four",
       SCORECARD_HEADER[-4:] == EVIDENCE_COLUMNS, repr(SCORECARD_HEADER[-4:]))
+
+print("case PRODUCER FACTS — typed build and host records drive decisions")
+build_record = {
+    "schema": 1,
+    "version": "0.2.0",
+    "build_date": "2026-08-29",
+    "git_sha": "0123456789ab",
+    "features": {"dbt": True, "e9patch": True, "sabre": True},
+}
+check(
+    "e9patch compile-time feature true is accepted",
+    e9patch_feature_from_build_info(json.dumps(build_record).encode()) is True,
+)
+build_record["features"]["e9patch"] = False
+check(
+    "mutating the typed e9patch feature changes the decision",
+    e9patch_feature_from_build_info(json.dumps(build_record).encode()) is False,
+)
+try:
+    e9patch_feature_from_build_info(b'{"schema":1,"features":{}}')
+except CorpusError as error:
+    refused = "features.e9patch" in str(error)
+else:
+    refused = False
+check("missing e9patch feature fails by field name", refused)
+
+
+def capability_record(cpuid_present: bool) -> bytes:
+    return json.dumps(
+        {
+            "schema": 1,
+            "host_capabilities": {
+                "cpuid-faulting": {
+                    "present": cpuid_present,
+                    "evidence": "typed fixture",
+                },
+                "kvm": {"present": True, "evidence": "typed fixture"},
+            },
+        }
+    ).encode()
+
+
+capabilities = parse_host_capabilities(capability_record(False))
+check(
+    "typed CPUID absence blocks the CPUID policy cell",
+    cpuid_policy_is_blocked("ptrace", "cpuid_policy", capabilities),
+)
+capabilities = parse_host_capabilities(capability_record(True))
+check(
+    "mutating typed CPUID presence changes the decision",
+    not cpuid_policy_is_blocked("ptrace", "cpuid_policy", capabilities),
+)
+try:
+    parse_host_capabilities(
+        b'{"schema":1,"host_capabilities":{"kvm":{"present":true,"evidence":"x"}}}'
+    )
+except Exception as error:
+    refused = "cpuid-faulting" in str(error)
+else:
+    refused = False
+check("incomplete host capability set fails by capability name", refused)
 
 print()
 if FAILURES:
