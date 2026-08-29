@@ -368,6 +368,10 @@ pub fn self_test() -> Result<String, String> {
         executed_tests: None,
         filtered_tests: None,
         returncode: Some(0),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: String::new(),
         aborted,
     };
