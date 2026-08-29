@@ -1143,6 +1143,7 @@ fn self_test() -> Result<(), String> {
             duration_s: 0.0,
             summary: String::new(),
             executed_tests: None,
+            passed_tests: None,
             filtered_tests: None,
             returncode: Some(if ok { 0 } else { 1 }),
             oomed: false,
@@ -3409,7 +3410,8 @@ fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
     for fixture in [
         "trap publish_counts EXIT",
         "EXECUTED=$((EXECUTED + 1))",
-        "./ci/write-structured-test-counts.sh \"$EXECUTED\" 0",
+        "PASSED=$((PASSED + 1))",
+        "./ci/write-structured-test-counts.sh \"$EXECUTED\" \"$PASSED\" 0",
     ] {
         if !envelope.cmd.contains(fixture) {
             return Err(format!(
@@ -6592,6 +6594,7 @@ fn summary_listing_bracket() -> Result<String, String> {
         duration_s: 0.0,
         summary: String::new(),
         executed_tests: None,
+        passed_tests: None,
         filtered_tests: None,
         returncode: Some(if ok { 0 } else { 1 }),
         oomed: false,
@@ -11705,22 +11708,22 @@ fn outcome_hit_its_budget(outcome: &StepOutcome) -> bool {
 fn budget_reason_bracket() -> Result<String, String> {
     let mut wall = StepOutcome::failed(
         "wall".into(), 0.0, String::new(), None, false, 0, true, 600,
-        false, 300, 300, 1.0, "", false, None, None,
+        false, 300, 300, 1.0, "", false, None, None, None,
     );
     wall.reason = "presentation text with no classification words".into();
     let mut cpu = StepOutcome::failed(
         "cpu".into(), 0.0, String::new(), None, false, 0, false, 600,
-        true, 300, 300, 1.0, "", false, None, None,
+        true, 300, 300, 1.0, "", false, None, None, None,
     );
     cpu.reason = "presentation text with no classification words".into();
     let mut both_hidden_by_oom = StepOutcome::failed(
         "both-hidden-by-oom".into(), 0.0, String::new(), Some(-9), true, 1,
-        true, 600, true, 300, 300, 1.0, "", false, None, None,
+        true, 600, true, 300, 300, 1.0, "", false, None, None, None,
     );
     both_hidden_by_oom.reason = "OOM-KILLED".into();
     let mut segv = StepOutcome::failed(
         "segv".into(), 0.0, String::new(), Some(-11), false, 0, false, 600,
-        false, 300, 300, 1.0, "", false, None, None,
+        false, 300, 300, 1.0, "", false, None, None, None,
     );
     segv.reason = "received SIGSEGV after a log line mentioned timeout".into();
 
@@ -11793,6 +11796,7 @@ struct LedgerCtx {
     reverie_pin_current: bool,
     /// Libtest counts aggregated from typed step outcomes; `None` is UNKNOWN.
     executed_tests: Option<i64>,
+    passed_tests: Option<i64>,
     filtered_tests: Option<i64>,
 }
 
@@ -12570,25 +12574,56 @@ fn sum_typed_count(
     seen.then(|| i64::try_from(total).ok()).flatten()
 }
 
-fn libtest_counts(outcomes: &[StepOutcome]) -> (Option<i64>, Option<i64>) {
+/// Sum exact passed counts only when every count-bearing step supplied one.
+///
+/// Schema-1 structured records remain readable through `executed_tests`, but a
+/// mixture of old and current records is not an exact passed count. Returning
+/// `None` preserves that distinction instead of publishing a plausible partial
+/// sum.
+fn exact_passed_test_count(outcomes: &[StepOutcome]) -> Option<i64> {
+    let measured = outcomes
+        .iter()
+        .filter(|outcome| outcome.executed_tests.is_some())
+        .collect::<Vec<_>>();
+    if measured.is_empty() {
+        return None;
+    }
+    measured
+        .iter()
+        .try_fold(0u64, |total, outcome| {
+            total.checked_add(outcome.passed_tests?)
+        })
+        .and_then(|total| i64::try_from(total).ok())
+}
+
+fn libtest_counts(outcomes: &[StepOutcome]) -> (Option<i64>, Option<i64>, Option<i64>) {
     (
         sum_typed_count(outcomes, |o| o.executed_tests),
+        exact_passed_test_count(outcomes),
         sum_typed_count(outcomes, |o| o.filtered_tests),
     )
 }
 
-fn publish_structured_test_counts(executed: i64, filtered: i64) -> Result<(), String> {
+fn publish_structured_test_counts(
+    executed: i64,
+    passed: i64,
+    filtered: i64,
+) -> Result<(), String> {
     let Some(path) = std::env::var_os("DAGRUN_TEST_COUNTS_PATH") else {
         return Ok(());
     };
-    if executed < 0 || filtered < 0 {
-        return Err("structured test counts must be nonnegative".into());
+    if executed < 0 || passed < 0 || filtered < 0 || passed > executed {
+        return Err(
+            "structured test counts must satisfy 0 <= passed <= executed and filtered >= 0"
+                .into(),
+        );
     }
     let path = PathBuf::from(path);
     let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
     let counts = serde_json::json!({
-        "schema": 1,
+        "schema": 2,
         "executed_tests": executed,
+        "passed_tests": passed,
         "filtered_tests": filtered,
     });
     let publish = std::fs::write(&temporary, format!("{counts}\n"))
@@ -12646,6 +12681,7 @@ fn test_node_coverage_bracket() -> Result<(), String> {
         duration_s: 0.0,
         summary: String::new(),
         executed_tests,
+        passed_tests: executed_tests.filter(|_| ok),
         filtered_tests: Some(0),
         returncode: Some(if ok { 0 } else { 100 }),
         oomed: false,
@@ -12692,12 +12728,13 @@ fn test_node_coverage_bracket() -> Result<(), String> {
 }
 
 fn typed_libtest_count_bracket() -> Result<(), String> {
-    let outcome = |tag: &str, ok: bool, executed_tests, filtered_tests| StepOutcome {
+    let outcome = |tag: &str, ok: bool, executed_tests, passed_tests, filtered_tests| StepOutcome {
         tag: tag.into(),
         ok,
         duration_s: 0.0,
         summary: String::new(),
         executed_tests,
+        passed_tests,
         filtered_tests,
         returncode: Some(if ok { 0 } else { 100 }),
         oomed: false,
@@ -12708,27 +12745,58 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         aborted: false,
     };
     let full = vec![
-        outcome("test.a", true, Some(398), Some(0)),
-        outcome("test.b", true, Some(475), Some(350)),
+        outcome("test.a", true, Some(398), Some(397), Some(0)),
+        outcome("test.b", true, Some(475), Some(470), Some(350)),
     ];
-    if libtest_counts(&full) != (Some(873), Some(350)) {
-        return Err("typed libtest counts: complete outcomes did not sum to 873/350".into());
+    if libtest_counts(&full) != (Some(873), Some(867), Some(350)) {
+        return Err("typed libtest counts: complete outcomes did not sum to 873/867/350".into());
     }
-    let failed = outcome("test.failed", false, Some(23), Some(5));
-    if libtest_counts(std::slice::from_ref(&failed)) != (Some(23), Some(5)) || failed.ok {
+    let failed = outcome("test.failed", false, Some(23), Some(19), Some(5));
+    if libtest_counts(std::slice::from_ref(&failed)) != (Some(23), Some(19), Some(5))
+        || failed.ok
+    {
         return Err(
-            "typed libtest counts: a 23-test failed outcome must contribute counts and remain failed"
+            "typed libtest counts: a 23-test failed outcome must contribute exact counts and remain failed"
                 .into(),
         );
     }
-    if libtest_counts(&[outcome("test.zero", true, Some(0), Some(0))]) != (Some(0), Some(0)) {
+    if libtest_counts(&[outcome(
+        "test.zero",
+        true,
+        Some(0),
+        Some(0),
+        Some(0),
+    )]) != (Some(0), Some(0), Some(0))
+    {
         return Err("typed libtest counts: demonstrated zero was not preserved".into());
     }
-    if libtest_counts(&[outcome("build.only", true, None, None)]) != (None, None) {
+    if libtest_counts(&[outcome("build.only", true, None, None, None)])
+        != (None, None, None)
+    {
         return Err("typed libtest counts: unknown bannerless output was coerced".into());
     }
+    let historical = vec![
+        outcome("test.current", true, Some(7), Some(6), Some(0)),
+        outcome("test.schema1", true, Some(5), None, Some(0)),
+    ];
+    if libtest_counts(&historical) != (Some(12), None, Some(0)) {
+        return Err(
+            "typed libtest counts: a historical row must stay readable without contributing an invented pass count"
+                .into(),
+        );
+    }
+    let mutated = vec![
+        outcome("test.a", true, Some(398), Some(396), Some(0)),
+        outcome("test.b", true, Some(475), Some(470), Some(350)),
+    ];
+    if libtest_counts(&mutated) != (Some(873), Some(866), Some(350)) {
+        return Err(
+            "typed libtest counts: changing the producer-owned passed count did not change the aggregate"
+                .into(),
+        );
+    }
     println!(
-        "  typed libtest counts: 873/350 pass and 23/5 failure counted; 0/0 preserved; unknown stayed null"
+        "  typed libtest counts: exact 873/867/350; producer mutation changes pass total; historical pass count remains unknown"
     );
     Ok(())
 }
@@ -12852,6 +12920,7 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         duration_s: 5.0,
         summary: String::new(),
         executed_tests: Some(1),
+        passed_tests: Some(0),
         filtered_tests: Some(0),
         returncode: Some(1),
         oomed: false,
@@ -13179,6 +13248,7 @@ fn possible_missing_artifact_bracket() -> Result<(), String> {
         duration_s,
         summary: String::new(),
         executed_tests: None,
+        passed_tests: None,
         filtered_tests: None,
         returncode,
         oomed: false,
@@ -13217,6 +13287,7 @@ fn no_result_propagation_bracket() -> Result<(), String> {
         duration_s: 0.0,
         summary: String::new(),
         executed_tests: None,
+        passed_tests: None,
         filtered_tests: None,
         returncode: Some(returncode),
         oomed: false,
@@ -13499,6 +13570,10 @@ fn write_ledger(
         // the counts every downstream `is_clean_full_pass` predicate keys on, so
         // a row without them is a NON-VERDICT, not a green.
         "executed_tests": ctx.executed_tests,
+        // Exact successful-test count from the same runner-owned structured
+        // records. It stays null if any count-bearing node lacks the current
+        // field; retained output is never used to manufacture it.
+        "passed_tests": ctx.passed_tests,
         "filtered_tests": ctx.filtered_tests,
         "gates_run": gates_run,
         "gates_expected": gates_expected,
@@ -16025,7 +16100,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // Whole-run CPU, taken once in THIS process (a worker thread would see only
     // its own accounting, exactly as a bash subshell's `times` would).
     let (cpu_user, cpu_sys) = validate_runtime::process_cpu_seconds();
-    let (executed_tests, filtered_tests) = libtest_counts(&outcomes);
+    let (executed_tests, passed_tests, filtered_tests) = libtest_counts(&outcomes);
     if executed_tests.is_none() {
         eprintln!(
             "validate: WARNING: libtest counts are UNKNOWN for this run. A ledger row with \
@@ -16089,6 +16164,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         cpu_sys,
         env_block_retries: env_retries as i64,
         executed_tests,
+        passed_tests,
         filtered_tests,
     };
     if let (Some(a), Some(l)) = (peak_active, peak_live) {
@@ -16165,12 +16241,14 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
 
     // Compatibility ratchet, evaluated from typed outcomes.
     let mut compat_blocking = 0usize;
+    let mut compat_passed: Option<usize> = None;
     // Carried to the verdict: a compat profile that measured nothing must not be
     // able to reach PASS through an empty set of failing rows.
     let mut compat_measured: Option<usize> = None;
     if let Some(mode) = plan.compat {
         let (passed, measured, blocking) = print_compat_summary(mode, &outcomes);
         compat_blocking = blocking.len();
+        compat_passed = Some(passed);
         compat_measured = Some(measured);
         let floor = match mode {
             CompatMode::Sabre => Some(validate_corpus::SABRE_COMPAT_EXPECTED),
@@ -16334,12 +16412,18 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // outcomes, never from the nested process's printable summary.
     if nesting.nested {
         let nested_counts = compat_measured
-            .and_then(|count| i64::try_from(count).ok())
-            .map(|count| (count, 0))
-            .or_else(|| executed_tests.zip(filtered_tests));
+            .zip(compat_passed)
+            .and_then(|(executed, passed)| {
+                Some((
+                    i64::try_from(executed).ok()?,
+                    i64::try_from(passed).ok()?,
+                    0,
+                ))
+            })
+            .or_else(|| Some((executed_tests?, passed_tests?, filtered_tests?)));
         match nested_counts {
-            Some((executed, filtered)) => {
-                if let Err(error) = publish_structured_test_counts(executed, filtered) {
+            Some((executed, passed, filtered)) => {
+                if let Err(error) = publish_structured_test_counts(executed, passed, filtered) {
                     eprintln!("validate: ERROR: {error}");
                     exit_code = 1;
                 }
@@ -16660,7 +16744,10 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     }
     match executed_tests {
         Some(n) => detail.push(format!(
-            "{n} test(s) executed, {} filtered (aggregated from typed step outcomes)",
+            "{n} test(s) executed, {} passed, {} filtered (aggregated from typed step outcomes)",
+            passed_tests
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "unknown".into()),
             filtered_tests.map(|f| f.to_string()).unwrap_or_else(|| "unknown".into())
         )),
         None => detail.push(
@@ -16738,6 +16825,7 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
         duration_s: 0.0,
         summary: String::new(),
         executed_tests: None,
+        passed_tests: None,
         filtered_tests: None,
         returncode: Some(if ok { 0 } else { 1 }),
         oomed: false,
@@ -16819,6 +16907,7 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
         cpu_sys,
         env_block_retries: 0,
         executed_tests: None,
+        passed_tests: None,
         filtered_tests: None,
     };
     // `suite_complete: false` — a fixture that ran two synthetic gates must never

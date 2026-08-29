@@ -589,6 +589,7 @@ pub fn self_test(root: &Path) -> Result<String, String> {
         duration_s: 0.0,
         summary: String::new(),
         executed_tests: None,
+        passed_tests: None,
         filtered_tests: None,
         returncode: Some(if ok { 0 } else { 1 }),
         oomed: false,
