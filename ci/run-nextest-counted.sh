@@ -103,12 +103,85 @@ function emit_libtest_count {
     fi
 }
 
+function split_nextest_args {
+    NEXTTEST_BUILD_ARGS=()
+    NEXTTEST_RUNTIME_ARGS=()
+    while (($#)); do
+        case $1 in
+            --)
+                NEXTTEST_RUNTIME_ARGS+=("$@")
+                break
+                ;;
+            --workspace | --all | --lib | --bins | --tests | --benches | --examples | \
+                --all-targets | --all-features | --no-default-features)
+                NEXTTEST_BUILD_ARGS+=("$1")
+                shift
+                ;;
+            -p | --package | --exclude | -F | --features | --bin | --example | --test | \
+                --bench | --target)
+                if (($# < 2)); then
+                    printf 'run-nextest-counted: build-selection option %s has no value\n' \
+                        "$1" >&2
+                    return 2
+                fi
+                NEXTTEST_BUILD_ARGS+=("$1" "$2")
+                shift 2
+                ;;
+            --package=* | --exclude=* | --features=* | --bin=* | --example=* | --test=* | \
+                --bench=* | --target=*)
+                NEXTTEST_BUILD_ARGS+=("$1")
+                shift
+                ;;
+            *)
+                NEXTTEST_RUNTIME_ARGS+=("$1")
+                shift
+                ;;
+        esac
+    done
+}
+
+function write_nextest_build_selection {
+    if (($#)); then
+        printf '%s\0' "$@"
+    fi
+}
+
 function run_nextest {
     local summary_log=$1 status count_status=0
     shift
 
+    local -a nextest_args=("$@")
+    if [[ -n ${NEXTEST_BINARIES_METADATA:-} ]]; then
+        local metadata=$NEXTEST_BINARIES_METADATA
+        local metadata_dir cargo_metadata recorded_selection
+        metadata_dir=$(dirname -- "$metadata")
+        cargo_metadata="$metadata_dir/cargo-metadata.json"
+        recorded_selection="${metadata%.json}.selection"
+        if [[ ! -s $metadata || ! -s $cargo_metadata || ! -f $recorded_selection ]]; then
+            printf 'run-nextest-counted: recorded nextest metadata is missing: %s, %s, or %s\n' \
+                "$metadata" "$cargo_metadata" "$recorded_selection" >&2
+            return 2
+        fi
+
+        split_nextest_args "$@" || return $?
+        if ! cmp -s -- "$recorded_selection" \
+            <(write_nextest_build_selection "${NEXTTEST_BUILD_ARGS[@]}"); then
+            printf 'run-nextest-counted: current Cargo selection does not match producer record: %s\n' \
+                "$recorded_selection" >&2
+            return 2
+        fi
+        nextest_args=(
+            --cargo-metadata "$cargo_metadata"
+            --binaries-metadata "$metadata"
+            --target-dir-remap "$PWD/target"
+            "${NEXTTEST_RUNTIME_ARGS[@]}"
+        )
+        printf 'run-nextest-counted: reusing producer-recorded binaries from %s\n' \
+            "$metadata" >&2
+    fi
+
     set +e
-    cargo nextest run --color never "$@" 2>&1 | tee "$summary_log"
+    cargo nextest run --color never "${nextest_args[@]}" 2>&1 | tee "$summary_log"
     status=${PIPESTATUS[0]}
     set -e
 
@@ -180,6 +253,52 @@ function self_test {
     [[ $got == *$'running 0 tests\ntest result: FAILED. nextest: 0 passed, 12 exec failed, 0 skipped; 0 filtered out' ]] || return 1
     [[ $got != *'test result: ok.'* ]] || return 1
 
+    mkdir -p "$scratch/metadata"
+    printf '{}\n' >"$scratch/metadata/cargo-metadata.json"
+    printf '{}\n' >"$scratch/metadata/hermit.json"
+    write_nextest_build_selection -p hermit --features third-party-backends \
+        --test cli >"$scratch/metadata/hermit.selection"
+    function cargo {
+        printf '%s\n' "$@" >"$scratch/reuse-argv"
+        printf 'Summary [   0.010s] 1 test run: 1 passed, 2 skipped\n'
+    }
+    got=$(NEXTEST_BINARIES_METADATA="$scratch/metadata/hermit.json" \
+        run_nextest "$scratch/reuse-wrapper" --profile ci -p hermit \
+        --features third-party-backends --test cli -j 1 -- --skip run_kvm_ \
+        --test guest-side-value)
+    status=$?
+    unset -f cargo
+    [[ $status == 0 ]] || return 1
+    [[ $got == *$'running 1 tests\ntest result: ok. 1 passed; 0 failed; 0 ignored; 2 filtered out' ]] || return 1
+    grep -Fx -- '--cargo-metadata' "$scratch/reuse-argv" >/dev/null || return 1
+    grep -Fx -- "$scratch/metadata/cargo-metadata.json" "$scratch/reuse-argv" >/dev/null || return 1
+    grep -Fx -- '--binaries-metadata' "$scratch/reuse-argv" >/dev/null || return 1
+    grep -Fx -- "$scratch/metadata/hermit.json" "$scratch/reuse-argv" >/dev/null || return 1
+    grep -Fx -- '--target-dir-remap' "$scratch/reuse-argv" >/dev/null || return 1
+    grep -Fx -- "$PWD/target" "$scratch/reuse-argv" >/dev/null || return 1
+    for removed in -p hermit third-party-backends cli; do
+        if grep -Fx -- "$removed" "$scratch/reuse-argv" >/dev/null; then
+            printf 'run-nextest-counted: reuse path retained build-selection argument %s\n' \
+                "$removed" >&2
+            return 1
+        fi
+    done
+    for retained in --profile ci -j 1 -- --skip run_kvm_ --test guest-side-value; do
+        grep -Fx -- "$retained" "$scratch/reuse-argv" >/dev/null || return 1
+    done
+
+    status=0
+    NEXTEST_BINARIES_METADATA="$scratch/metadata/hermit.json" \
+        run_nextest "$scratch/mismatched-selection" --profile ci -p hermit \
+        --features third-party-backends --test hermit_modes -j 1 \
+        >/dev/null 2>&1 || status=$?
+    [[ $status == 2 ]] || return 1
+
+    status=0
+    NEXTEST_BINARIES_METADATA="$scratch/metadata/missing.json" \
+        run_nextest "$scratch/missing-metadata" -p hermit >/dev/null 2>&1 || status=$?
+    [[ $status == 2 ]] || return 1
+
     status=0
     printf 'not a nextest summary\n' >"$scratch/missing"
     emit_libtest_count "$scratch/missing" 0 >/dev/null 2>&1 || status=$?
@@ -220,8 +339,15 @@ function self_test {
     [[ $status == 2 ]] || return 1
     export -n -f emit_libtest_count
 
-    printf 'run-nextest-counted: self-test PASS (7 positive, 7 refusal)\n'
+    printf 'run-nextest-counted: self-test PASS (7 positive, 8 refusal)\n'
 }
+
+if [[ ${1:-} == --print-build-selection ]]; then
+    shift
+    split_nextest_args "$@" || exit $?
+    write_nextest_build_selection "${NEXTTEST_BUILD_ARGS[@]}"
+    exit
+fi
 
 if [[ ${1:-} == --self-test ]]; then
     self_test
