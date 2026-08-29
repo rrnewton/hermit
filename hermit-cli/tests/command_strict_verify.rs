@@ -52,6 +52,10 @@ fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
     let home = tempfile::tempdir().expect("failed to create isolated command HOME");
     std::fs::create_dir_all(home.path().join(".config/procps"))
         .expect("failed to preseed the isolated procps HOME");
+    let working_directory = tempfile::Builder::new()
+        .prefix("command-working-directory-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create isolated command working directory");
     let mut command = Command::new("timeout");
     command
         .args([
@@ -70,6 +74,7 @@ fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
         .arg(&program)
         .args(case.args)
         .env("HOME", home.path())
+        .current_dir(working_directory.path())
         .stdin(if case.stdin.is_some() {
             Stdio::piped()
         } else {
@@ -559,6 +564,10 @@ fn python_prlimit64_query_is_deterministic_under_strict_verify() {
     };
     let python = required_command(&case);
     let query = "import resource; print(resource.getrlimit(resource.RLIMIT_NOFILE))";
+    let working_directory = tempfile::Builder::new()
+        .prefix("python-prlimit64-working-directory-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create isolated Python working directory");
 
     let strict_output = Command::new("timeout")
         .args([
@@ -570,6 +579,7 @@ fn python_prlimit64_query_is_deterministic_under_strict_verify() {
         .args(["--log=off", "run", "--strict", "--"])
         .arg(&python)
         .args(["-c", query])
+        .current_dir(working_directory.path())
         .output()
         .expect("failed to start Python prlimit64 strict-mode value regression");
     let strict_stdout = String::from_utf8_lossy(&strict_output.stdout);
@@ -596,6 +606,7 @@ fn python_prlimit64_query_is_deterministic_under_strict_verify() {
         .args(["--log=info", "run", "--strict", "--verify", "--"])
         .arg(&python)
         .args(["-c", query])
+        .current_dir(working_directory.path())
         .output()
         .expect("failed to start Python prlimit64 strict/verify regression");
 
