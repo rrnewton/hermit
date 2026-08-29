@@ -120,9 +120,11 @@ fn run_bounded(mut command: Command, label: &str, diagnostic_log: Option<&Path>)
         .unwrap_or_else(|error| panic!("failed to create {label} working directory: {error}"));
     command
         .current_dir(working_directory.path())
-        // `Command::current_dir` does not update an inherited PWD. Keep the
-        // process environment consistent with its actual working directory.
-        .env("PWD", working_directory.path())
+        // Bash validates inherited PWD and OLDPWD by statting their path components. Leave them
+        // unset so it obtains the same directory through getcwd without observing mutable
+        // ancestors of this validation checkout.
+        .env_remove("PWD")
+        .env_remove("OLDPWD")
         .process_group(0)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
