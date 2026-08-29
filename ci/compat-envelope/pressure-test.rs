@@ -1,5 +1,5 @@
 #!/usr/bin/env -S rust-script --force
-//! Safely retry red compatibility cells and repeat one committed green cell.
+//! Safely probe and repeat tracked compatibility cells.
 //!
 //! ```cargo
 //! [dependencies]
@@ -150,11 +150,11 @@ fn establish_pressure_cgroups(run_timeout_s: i64) -> Result<BoxedCgroups, String
 const USAGE: &str = r#"Hermit compatibility pressure test
 
 Ordinary `validate` reruns the committed green compatibility cells and fails on
-regressions. This tool either probes currently red cells or repeats enabled
-green cells to measure flakiness. Every check runs under safe-ci resource and
+regressions. This tool probes currently red cells and can repeat either red or
+green cells to measure stability. Every check runs under safe-ci resource and
 time limits and retains its raw evidence under ignored/. Red cells remain red
 unless a later reviewed scorecard change deliberately promotes them; repeated
-green results never edit the scorecard.
+results never edit the scorecard.
 
 Usage: ci/compat-envelope/pressure-test.rs COMMAND [OPTIONS]
 
@@ -172,14 +172,13 @@ Commands:
       is ignored/compat-envelope/pressure-<SHA>-<time>. A red chaos cell whose
       manifest declares no seeds remains red but is unavailable: exact requests
       refuse it, while batches report and omit it rather than inventing a run.
-      Add --repetitions N to an exact currently green cell to run N independent
-      boxed checks against the same clean committed source. Use --green with
-      --repetitions to select every enabled green cell in one shared-build DAG;
-      --mode and --sample may narrow that green population. Existing resource
-      caps allow at most four manifest guests at once and at most one KVM guest.
-      This reports per-cell flakiness; it never edits or demotes the scorecard.
-      Only unfiltered --green covers the complete current green set; an exact
-      cell, --mode, or --sample is partial evidence.
+      Add --repetitions N to repeat one exact tracked cell or the selected red
+      batch against the same clean committed source. Use --green with
+      --repetitions to select enabled green cells instead; --mode and --sample
+      may narrow either batch. Existing resource caps allow at most four
+      manifest guests at once and at most one KVM guest. This reports per-cell
+      stability; it never edits the scorecard. Only an unfiltered batch covers
+      its complete current red or green population.
   plan --results DIR [--mode MODE] [--sample COUNT] [--seed SEED]
       [--green --repetitions COUNT] [--jobs COUNT]
       Generate the same safe-ci execution plan without running it. The default
@@ -199,10 +198,10 @@ Exact-cell options (run and plan):
                            applications/example-timed-progress-bar
   --mode MODE              verify, replay, chaos, or naked
   --backend BACKEND        ptrace, dbt, kvm, sabre, liteinst, or native
-  --cell-timeout SECONDS   Tighter cap for each selected cell; requires either
-                           an exact cell or --sample
-  --repetitions COUNT      Repeat one exact currently green cell in independent
-                           boxed jobs. COUNT must be positive. Plan and run
+  --cell-timeout SECONDS   Tighter cap for each selected cell; requires an exact
+                           cell, --sample, or a repeated batch
+  --repetitions COUNT      Repeat one exact tracked cell or every selected red
+                           cell in independent boxed jobs. COUNT must be positive. Plan and run
                            require a clean commit. At most four manifest guests
                            run at once, and KVM remains limited to one.
   --run-id-prefix ID       Bind each retained result to this physical invocation.
@@ -215,8 +214,8 @@ Bounded-batch options (run and plan):
                            are omitted. Sampling draws only from cells whose
                            manifests provide executable commands. With --green
                            and --repetitions, sample the enabled green cells.
-  --green                  With --repetitions, select all enabled green cells
-                           instead of one exact cell. Optional --mode and
+  --green                  With --repetitions, select enabled green cells
+                           instead of the red batch. Optional --mode and
                            --sample filters are retained in run.json. A sample
                            records selected/eligible counts and its seed in
                            run.json and summary.json; it is subset evidence,
@@ -239,11 +238,15 @@ Examples:
   ./ci/compat-envelope/pressure-test.rs run \
     --sample 10 --seed 42 --cell-timeout 60
 
-  # Check one committed green cell 100 times under the same boxed limits.
+  # Check one tracked cell 100 times under the same boxed limits.
   # The DAG admits at most four manifest guests at once (one for KVM).
   ./ci/compat-envelope/pressure-test.rs run \
     --test backend-parity-c/fork-exec-pipeline \
     --mode verify --backend ptrace --repetitions 100 --cell-timeout 120
+
+  # Check every executable red cell three times with one shared build.
+  ./ci/compat-envelope/pressure-test.rs run \
+    --repetitions 3 --cell-timeout 60 --run-timeout 30000
 
   # Check every enabled green cell once with one shared build.
   ./ci/compat-envelope/pressure-test.rs run \
@@ -263,8 +266,8 @@ How it runs:
   budgets from the typed manifest tool. The in-memory graph then reuses the
   canonical Hermit/resource build commands from ci/dag/portable.json without
   recursively running the full validation metadata audit. Fixture preparation
-  is serialized. Every selected red cell, or every selected green-cell
-  repetition, then runs in its own safe-ci cgroup. Existing resource caps admit
+  is serialized. Every selected cell repetition then runs in its own safe-ci
+  cgroup. Existing resource caps admit
   four manifest guests at once and one KVM guest. A failure, timeout, OOM, or missing result does not
   intentionally stop later selected checks.
   The combined crash/error bucket contains remaining nonzero harness exits,
@@ -299,6 +302,11 @@ struct TrackedCell {
     /// manifest. Absent for `green` and `red`.
     #[serde(default)]
     not_applicable_reason: Option<String>,
+}
+
+struct ExpectedCell {
+    enabled: bool,
+    status: String,
 }
 
 struct PressureCells {
@@ -339,12 +347,12 @@ impl CellSelection {
         self.test.is_some() && self.mode.is_some() && self.backend.is_some()
     }
 
-    fn repeats_green_cell(&self) -> bool {
-        self.repetitions.is_some()
+    fn selects_green_cells(&self) -> bool {
+        self.green
     }
 
     fn uses_shared_preparation(&self) -> bool {
-        !self.is_exact() || self.repeats_green_cell()
+        !self.is_exact() || self.repetitions.is_some()
     }
 
     fn run_count(&self) -> usize {
@@ -356,7 +364,11 @@ impl CellSelection {
     }
 
     fn allows_dirty_source(&self) -> bool {
-        self.is_exact() && !self.repeats_green_cell()
+        self.is_exact() && self.repetitions.is_none()
+    }
+
+    fn repeats_batch(&self) -> bool {
+        self.repetitions.is_some() && !self.is_exact()
     }
 }
 
@@ -394,13 +406,12 @@ fn validate_repetition_selection(selection: &CellSelection) -> Result<(), String
         }
         return Ok(());
     }
-    if !selection.green {
-        return Err(
-            "--repetitions requires either an exact --test/--mode/--backend cell or --green".into(),
-        );
-    }
     if selection.test.is_some() || selection.backend.is_some() {
-        return Err("a repeated green batch accepts only an optional --mode filter".into());
+        return Err(
+            "a repeated batch accepts only an optional --mode filter; name a full \
+             --test/--mode/--backend cell to repeat exactly one"
+                .into(),
+        );
     }
     if selection.run_id_prefix.is_some() {
         return Err("--run-id-prefix is limited to one exact repeated cell".into());
@@ -941,6 +952,12 @@ struct RunMetadata {
     #[serde(default)]
     eligible_cells: usize,
     cells: Vec<CellId>,
+}
+
+impl RunMetadata {
+    fn is_exact_selection(&self) -> bool {
+        self.test.is_some() && self.mode.is_some() && self.backend.is_some()
+    }
 }
 
 fn default_pressure_jobs() -> i64 {
@@ -1576,9 +1593,9 @@ fn result_options(
         );
     }
     if selection.cell_timeout_seconds.is_some()
-        && !(selection.is_exact() || selection.sample.is_some())
+        && !(selection.is_exact() || selection.sample.is_some() || selection.repeats_batch())
     {
-        return Err("--cell-timeout requires an exact cell or --sample".into());
+        return Err("--cell-timeout requires an exact cell, --sample, or a repeated batch".into());
     }
     if selection.sample.is_some() && selection.is_exact() {
         return Err(
@@ -2086,7 +2103,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 && selection.mode.is_none()
                 && !matches!(cell.id.mode.as_str(), "verify" | "replay" | "chaos"));
         match cell.status.as_str() {
-            "red" if selected && !selection.repeats_green_cell() => {
+            "red" if selected && !selection.selects_green_cells() => {
                 let budget = budgets
                     .get(&(
                         cell.id.test.clone(),
@@ -2111,7 +2128,12 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 }
             }
             "red" => {}
-            "green" if selected && selection.repeats_green_cell() && cell.enabled => {
+            "green"
+                if selected
+                    && selection.repetitions.is_some()
+                    && cell.enabled
+                    && (selection.selects_green_cells() || selection.is_exact()) =>
+            {
                 let budget = budgets
                     .get(&(
                         cell.id.test.clone(),
@@ -2168,9 +2190,9 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 selection.mode.as_deref(),
                 selection.backend.as_deref(),
             ) {
-                if selection.repeats_green_cell() {
+                if selection.repetitions.is_some() {
                     format!(
-                        "{test}/{mode}/{backend} is not an enabled green tracked cell; use the scorecard or manifest CLI to inspect it"
+                        "{test}/{mode}/{backend} is not an enabled tracked red or green cell; use the scorecard or manifest CLI to inspect it"
                     )
                 } else {
                     format!(
@@ -2178,12 +2200,12 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                     )
                 }
             } else if let Some(mode) = selection.mode.as_deref() {
-                if selection.repeats_green_cell() {
+                if selection.selects_green_cells() {
                     format!("tracked scorecard has no enabled green cells for mode `{mode}`")
                 } else {
                     format!("tracked scorecard has no red cells for mode `{mode}`")
                 }
-            } else if selection.repeats_green_cell() {
+            } else if selection.selects_green_cells() {
                 "tracked scorecard has no enabled green cells".into()
             } else {
                 "tracked scorecard has no red cells".into()
@@ -2193,7 +2215,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
     let eligible_cells = selected_cells.len();
     if let Some(count) = selection.sample {
         if count > selected_cells.len() {
-            return Err(if selection.repeats_green_cell() {
+            return Err(if selection.selects_green_cells() {
                 format!(
                     "--sample {count} exceeds the {} enabled green cells in the selected population",
                     selected_cells.len()
@@ -2934,9 +2956,8 @@ fn write_plan_after_scorecard_check(
     steps.push(Step {
         group: "pressure".into(),
         job: "summarize".into(),
-        desc: if selection.repeats_green_cell() {
-            "Wait for every repeated green-cell check before reading retained runner evidence"
-                .into()
+        desc: if selection.repetitions.is_some() {
+            "Wait for every repeated cell check before reading retained runner evidence".into()
         } else {
             "Wait for every red-cell attempt before reading retained runner evidence".into()
         },
@@ -3183,7 +3204,7 @@ fn validate_run_contract(
     results: &Path,
     metadata: &RunMetadata,
     allow_dirty_exact_cell: bool,
-) -> Result<BTreeMap<CellId, bool>, String> {
+) -> Result<BTreeMap<CellId, ExpectedCell>, String> {
     if metadata.source_tree_dirty && !allow_dirty_exact_cell {
         return Err("pressure run metadata claims a dirty source tree".into());
     }
@@ -3197,7 +3218,7 @@ fn validate_run_contract(
         return Err("dirty pressure results are accepted only for one exact red cell".into());
     }
     if metadata.source_tree_dirty && metadata.repetitions.is_some() {
-        return Err("repeated green-cell results require a clean committed source tree".into());
+        return Err("repeated results require a clean committed source tree".into());
     }
     if metadata.sample.is_some() != metadata.seed.is_some() {
         return Err("retained sampled run must record both --sample and its seed".into());
@@ -3260,7 +3281,16 @@ fn validate_run_contract(
     let expected_cells = pressure_cells.selected;
     let mut expected = BTreeMap::new();
     for tracked in expected_cells {
-        if expected.insert(tracked.id, tracked.enabled).is_some() {
+        if expected
+            .insert(
+                tracked.id,
+                ExpectedCell {
+                    enabled: tracked.enabled,
+                    status: tracked.status,
+                },
+            )
+            .is_some()
+        {
             return Err("tracked scorecard contains a duplicate red-cell identity".into());
         }
     }
@@ -3687,14 +3717,15 @@ fn classify_result(
 fn repeated_result_description(
     passes: usize,
     infrastructure_errors: usize,
+    retried: usize,
     total: usize,
 ) -> &'static str {
     if total == 0 || infrastructure_errors > 0 {
         "incomplete"
-    } else if passes == total {
-        "passed every repetition"
     } else if passes == 0 {
         "failed every repetition"
+    } else if passes == total && retried == 0 {
+        "passed every repetition"
     } else {
         "flaky"
     }
@@ -3703,11 +3734,12 @@ fn repeated_result_description(
 fn repeated_batch_result_description(
     passes: usize,
     infrastructure_errors: usize,
+    retried: usize,
     total: usize,
 ) -> &'static str {
     if total == 0 || infrastructure_errors > 0 {
         "incomplete"
-    } else if passes == total {
+    } else if passes == total && retried == 0 {
         "passed every repeated check"
     } else {
         "one or more repeated checks failed"
@@ -3718,13 +3750,24 @@ fn top_level_repeated_result_description(
     metadata: &RunMetadata,
     passes: usize,
     infrastructure_errors: usize,
+    retried: usize,
     total: usize,
 ) -> &'static str {
-    if metadata.green {
-        repeated_batch_result_description(passes, infrastructure_errors, total)
+    if metadata.is_exact_selection() {
+        repeated_result_description(passes, infrastructure_errors, retried, total)
     } else {
-        repeated_result_description(passes, infrastructure_errors, total)
+        repeated_batch_result_description(passes, infrastructure_errors, retried, total)
     }
+}
+
+fn repeated_run_has_unacceptable_product_result(
+    repetitions: Option<usize>,
+    repeated_red: bool,
+    passes: usize,
+    retried: usize,
+    total: usize,
+) -> bool {
+    repetitions.is_some() && !repeated_red && (passes != total || retried > 0)
 }
 
 fn result_artifact_dir(results: &Path, row: &CellResult) -> Result<PathBuf, String> {
@@ -3988,6 +4031,8 @@ fn summarize(
         ));
     }
     let expected = validate_run_contract(root, results, &metadata, allow_dirty_exact_cell)?;
+    let repeated_red = metadata.repetitions.is_some()
+        && expected.values().all(|tracked| tracked.status == "red");
     let loaded_runner_evidence = if typed_runner_evidence.is_some() {
         None
     } else if let Some(evidence) = load_retained_runner_evidence(results)? {
@@ -4031,6 +4076,8 @@ fn summarize(
 
     let mut by_backend: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
     let mut by_cell: BTreeMap<CellId, BTreeMap<String, usize>> = BTreeMap::new();
+    let mut retried_by_cell: BTreeMap<CellId, usize> = BTreeMap::new();
+    let mut retried_repetitions = 0usize;
     let mut passing = Vec::new();
     let mut rows = Vec::new();
     for cell in &metadata.cells {
@@ -4110,7 +4157,8 @@ fn summarize(
                             })
                             .collect();
                         result_rows_for_history = result_rows.clone();
-                        let expected_required = expected.get(cell).copied().unwrap_or(false);
+                        let expected_required =
+                            expected.get(cell).is_some_and(|tracked| tracked.enabled);
                         let identities_match = result_rows.iter().all(|row| {
                             result_row_identity_and_invocation_match(
                                 row,
@@ -4266,6 +4314,10 @@ fn summarize(
                 verification_logs.len() == 2,
                 evidence_errors.is_empty(),
             );
+            if metadata.repetitions.is_some() && attempt > 1 {
+                retried_repetitions += 1;
+                *retried_by_cell.entry(cell.clone()).or_default() += 1;
+            }
             *by_backend
                 .entry(cell.backend.clone())
                 .or_default()
@@ -4374,7 +4426,10 @@ fn summarize(
         }
     }
     if metadata.repetitions.is_some() {
-        println!("# Repeated green-cell results");
+        println!(
+            "# Repeated {}-cell results",
+            if repeated_red { "red" } else { "green" }
+        );
     } else {
         println!("# Red-cell pressure-test results");
     }
@@ -4443,9 +4498,14 @@ fn summarize(
         println!();
     }
     let mut repeated_cells = Vec::new();
-    let repeated_result = if metadata.repetitions.is_some() && !metadata.green {
-        let result =
-            top_level_repeated_result_description(&metadata, totals[0], totals[6], totals[7]);
+    let repeated_result = if metadata.repetitions.is_some() && metadata.is_exact_selection() {
+        let result = top_level_repeated_result_description(
+            &metadata,
+            totals[0],
+            totals[6],
+            retried_repetitions,
+            totals[7],
+        );
         if result == "incomplete" {
             println!(
                 "Repeated result: {}/{} passed; incomplete because {} check(s) have no trustworthy result.",
@@ -4460,6 +4520,7 @@ fn summarize(
         repeated_cells.push(json!({
             "cell": &metadata.cells[0],
             "passes": totals[0],
+            "retried_repetitions": retried_repetitions,
             "total": totals[7],
             "result": result,
         }));
@@ -4471,21 +4532,29 @@ fn summarize(
             let counts = by_cell.get(cell).cloned().unwrap_or_default();
             let passes = counts.get("pass").copied().unwrap_or(0);
             let infrastructure_errors = counts.get("infrastructure-error").copied().unwrap_or(0);
+            let retried = retried_by_cell.get(cell).copied().unwrap_or(0);
             let total: usize = counts.values().sum();
-            let result = repeated_result_description(passes, infrastructure_errors, total);
+            let result = repeated_result_description(passes, infrastructure_errors, retried, total);
             println!("| `{}` | {passes}/{total} | {result} |", display_id(cell));
             repeated_cells.push(json!({
                 "cell": cell,
                 "passes": passes,
+                "retried_repetitions": retried,
                 "total": total,
                 "result": result,
             }));
         }
         println!();
-        let result =
-            top_level_repeated_result_description(&metadata, totals[0], totals[6], totals[7]);
+        let result = top_level_repeated_result_description(
+            &metadata,
+            totals[0],
+            totals[6],
+            retried_repetitions,
+            totals[7],
+        );
         println!(
-            "Repeated green-cell batch: {}/{} passed; {result}.",
+            "Repeated {}-cell batch: {}/{} passed; {result}.",
+            if repeated_red { "red" } else { "green" },
             totals[0], totals[7]
         );
         Some(result)
@@ -4518,6 +4587,7 @@ fn summarize(
         "jobs": metadata.jobs,
         "eligible_cells": (metadata.eligible_cells != 0).then_some(metadata.eligible_cells),
         "selected_cells": metadata.cells.len(),
+        "retried_repetitions": retried_repetitions,
         "repeated_result": repeated_result,
         "repeated_cells": repeated_cells,
         "attempted": rows.len(),
@@ -4536,10 +4606,16 @@ fn summarize(
             totals[6]
         ));
     }
-    if metadata.repetitions.is_some() && totals[0] != totals[7] {
+    if repeated_run_has_unacceptable_product_result(
+        metadata.repetitions,
+        repeated_red,
+        totals[0],
+        retried_repetitions,
+        totals[7],
+    ) {
         return Err(format!(
-            "only {}/{} repeated green-cell checks passed; the retained summary classifies every non-pass",
-            totals[0], totals[7]
+            "only {}/{} repeated green-cell checks passed cleanly; {} repetition(s) required a retry, and the retained summary classifies every non-pass",
+            totals[0], totals[7], retried_repetitions
         ));
     }
     Ok(())
@@ -5103,6 +5179,34 @@ fn self_test(root: &Path) -> Result<(), String> {
     two_repetitions.repetitions = Some(2);
     validate_repetition_selection(&two_repetitions)
         .map_err(|e| format!("two repeated checks were refused: {e}"))?;
+    let repeated_red_batch_contract = CellSelection {
+        repetitions: Some(2),
+        cell_timeout_seconds: Some(37),
+        ..CellSelection::default()
+    };
+    validate_repetition_selection(&repeated_red_batch_contract)
+        .map_err(|e| format!("valid repeated red batch was refused: {e}"))?;
+    let mut repeated_mode_batch_contract = repeated_red_batch_contract.clone();
+    repeated_mode_batch_contract.mode = Some("verify".into());
+    validate_repetition_selection(&repeated_mode_batch_contract)
+        .map_err(|e| format!("valid mode-filtered repeated red batch was refused: {e}"))?;
+    let mut repeated_batch_args = vec![
+        "--results".to_string(),
+        "ignored/compat-envelope/repeated-batch-self-test".to_string(),
+        "--repetitions".to_string(),
+        "2".to_string(),
+        "--cell-timeout".to_string(),
+        "37".to_string(),
+    ]
+    .into_iter();
+    let (_, _, parsed_repeated_batch) =
+        result_options(root, &mut repeated_batch_args, false, true)?;
+    if parsed_repeated_batch.repetitions != Some(2)
+        || parsed_repeated_batch.cell_timeout_seconds != Some(37)
+        || parsed_repeated_batch.selects_green_cells()
+    {
+        return Err("repeated red batch options changed population or timeout".into());
+    }
     if CellSelection::default().scheduler_jobs() != default_jobs() {
         return Err("pressure scheduler default diverged from the host-adaptive validate policy".into());
     }
@@ -5821,10 +5925,43 @@ fn self_test(root: &Path) -> Result<(), String> {
         mode: Some(exact_id.mode.clone()),
         backend: Some(exact_id.backend.clone()),
         repetitions: Some(3),
+        cell_timeout_seconds: Some(37),
+        run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
         ..CellSelection::default()
     };
-    if pressure_cells(root, &repeated_red_selection).is_ok() {
-        return Err("repeated green-cell selection accepted a red cell".into());
+    let scorecard_before_repeated_red = fs::read(root.join(TRACKED_CELLS))
+        .map_err(|e| format!("cannot snapshot tracked cells before repeated-red plan: {e}"))?;
+    let repeated_red_cells = pressure_cells(root, &repeated_red_selection)?;
+    if repeated_red_cells.selected.len() != 1
+        || repeated_red_cells.selected[0].id != exact_id
+        || repeated_red_cells.selected[0].status != "red"
+    {
+        return Err("exact repeated-red selection did not retain its tracked red cell".into());
+    }
+    let repeated_red_results = scratch.join("repeated-red-plan");
+    let (repeated_red_metadata, repeated_red_dag) = write_plan_after_scorecard_check(
+        &checked_scorecard,
+        &repeated_red_results,
+        &repeated_red_results.join("dag.json"),
+        &repeated_red_selection,
+    )?;
+    let repeated_red_steps: Vec<_> = repeated_red_dag
+        .steps
+        .iter()
+        .filter(|step| step.group == "cell")
+        .collect();
+    if repeated_red_metadata.green
+        || repeated_red_metadata.cells != [exact_id.clone()]
+        || repeated_red_metadata.repetitions != Some(3)
+        || repeated_red_steps.len() != 3
+        || repeated_red_steps.iter().any(|step| step.timeout != 37)
+        || fs::read(root.join(TRACKED_CELLS))
+            .map_err(|e| format!("cannot re-read tracked cells after repeated-red plan: {e}"))?
+            != scorecard_before_repeated_red
+    {
+        return Err(
+            "repeated-red plan changed its identity, timeout, run count, or scorecard".into(),
+        );
     }
 
     let repeated_results = scratch.join("repeated-plan");
@@ -6097,6 +6234,116 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err("repeated exact ptrace setup refused its direct Hermit build".into());
     }
 
+    let expected_red_ids: BTreeSet<_> = unfiltered
+        .selected
+        .iter()
+        .map(|tracked| tracked.id.clone())
+        .collect();
+    let expected_unavailable_red_ids: BTreeSet<_> = unfiltered
+        .unavailable
+        .iter()
+        .map(|tracked| tracked.id.clone())
+        .collect();
+    let repeated_red_batch_selection = CellSelection {
+        repetitions: Some(2),
+        cell_timeout_seconds: Some(37),
+        run_timeout_seconds: Some(1_000_000),
+        ..CellSelection::default()
+    };
+    let selected_repeated_red_batch = pressure_cells(root, &repeated_red_batch_selection)?;
+    let selected_repeated_red_ids: BTreeSet<_> = selected_repeated_red_batch
+        .selected
+        .iter()
+        .map(|tracked| tracked.id.clone())
+        .collect();
+    let unavailable_repeated_red_ids: BTreeSet<_> = selected_repeated_red_batch
+        .unavailable
+        .iter()
+        .map(|tracked| tracked.id.clone())
+        .collect();
+    if selected_repeated_red_ids != expected_red_ids
+        || unavailable_repeated_red_ids != expected_unavailable_red_ids
+        || selected_repeated_red_batch
+            .selected
+            .iter()
+            .any(|tracked| tracked.status != "red")
+    {
+        return Err("repeated red batch changed the executable red population".into());
+    }
+    let repeated_red_batch_results = scratch.join("repeated-red-batch-plan");
+    let (repeated_red_batch_metadata, repeated_red_batch_dag) =
+        write_plan_after_scorecard_check(
+            &checked_scorecard,
+            &repeated_red_batch_results,
+            &repeated_red_batch_results.join("dag.json"),
+            &repeated_red_batch_selection,
+        )?;
+    let repeated_red_batch_cells: Vec<_> = repeated_red_batch_dag
+        .steps
+        .iter()
+        .filter(|step| step.group == "cell")
+        .collect();
+    let repeated_red_batch_tags: BTreeSet<_> = repeated_red_batch_cells
+        .iter()
+        .map(|step| step.tag())
+        .collect();
+    let repeated_red_batch_summary = repeated_red_batch_dag
+        .steps
+        .iter()
+        .find(|step| step.tag() == "pressure.summarize")
+        .ok_or("repeated red batch lost pressure.summarize")?;
+    let repeated_red_test_count = expected_red_ids
+        .iter()
+        .map(|cell| cell.test.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let repeated_red_batch_builds: BTreeSet<_> = repeated_red_batch_dag
+        .steps
+        .iter()
+        .filter(|step| matches!(step.group.as_str(), "build" | "setup"))
+        .map(|step| step.tag())
+        .collect();
+    let expected_red_batch_builds: BTreeSet<_> = required_build_tags(
+        None,
+        expected_red_ids.iter().any(|cell| cell.backend == "liteinst"),
+    )
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    if repeated_red_batch_metadata.green
+        || repeated_red_batch_metadata.repetitions != Some(2)
+        || repeated_red_batch_metadata.cell_timeout_seconds != Some(37)
+        || repeated_red_batch_metadata
+            .cells
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            != expected_red_ids
+        || repeated_red_batch_cells.len() != expected_red_ids.len().saturating_mul(2)
+        || repeated_red_batch_tags.len() != repeated_red_batch_cells.len()
+        || repeated_red_batch_cells
+            .iter()
+            .any(|step| step.timeout != 37)
+        || repeated_red_batch_dag
+            .steps
+            .iter()
+            .filter(|step| step.group == "prepare")
+            .count()
+            != repeated_red_test_count
+        || repeated_red_batch_builds != expected_red_batch_builds
+        || repeated_red_batch_summary
+            .deps
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            != repeated_red_batch_tags
+    {
+        return Err(
+            "repeated red batch lost its population, repetitions, timeout, shared build/preparation, or summary dependencies"
+                .into(),
+        );
+    }
+
     let green_batch_selection = CellSelection {
         green: true,
         repetitions: Some(1),
@@ -6148,7 +6395,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     )?;
     if !one_cell_mode_metadata.green
         || one_cell_mode_metadata.cells.len() != 1
-        || top_level_repeated_result_description(&one_cell_mode_metadata, 1, 0, 2)
+        || top_level_repeated_result_description(&one_cell_mode_metadata, 1, 0, 0, 2)
             != "one or more repeated checks failed"
     {
         return Err(
@@ -6172,7 +6419,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     )?;
     if !one_cell_sample_metadata.green
         || one_cell_sample_metadata.cells.len() != 1
-        || top_level_repeated_result_description(&one_cell_sample_metadata, 1, 0, 2)
+        || top_level_repeated_result_description(&one_cell_sample_metadata, 1, 0, 0, 2)
             != "one or more repeated checks failed"
     {
         return Err("a one-cell sampled green batch was described as an exact flaky cell".into());
@@ -6729,13 +6976,22 @@ fn self_test(root: &Path) -> Result<(), String> {
             "failure bucketing changed unexpectedly: {classifications:?}"
         ));
     }
-    if repeated_result_description(2, 0, 2) != "passed every repetition"
-        || repeated_result_description(1, 0, 2) != "flaky"
-        || repeated_result_description(0, 0, 2) != "failed every repetition"
-        || repeated_result_description(1, 1, 2) != "incomplete"
-        || repeated_result_description(0, 2, 2) != "incomplete"
-        || repeated_batch_result_description(1, 0, 2) != "one or more repeated checks failed"
-        || repeated_batch_result_description(1, 1, 2) != "incomplete"
+    if repeated_result_description(2, 0, 0, 2) != "passed every repetition"
+        || repeated_result_description(2, 0, 1, 2) != "flaky"
+        || repeated_result_description(1, 0, 0, 2) != "flaky"
+        || repeated_result_description(0, 0, 0, 2) != "failed every repetition"
+        || repeated_result_description(1, 1, 0, 2) != "incomplete"
+        || repeated_result_description(0, 2, 0, 2) != "incomplete"
+        || repeated_batch_result_description(2, 0, 1, 2)
+            != "one or more repeated checks failed"
+        || repeated_batch_result_description(1, 0, 0, 2)
+            != "one or more repeated checks failed"
+        || repeated_batch_result_description(1, 1, 0, 2) != "incomplete"
+        || repeated_run_has_unacceptable_product_result(Some(2), true, 1, 0, 2)
+        || repeated_run_has_unacceptable_product_result(Some(2), true, 2, 1, 2)
+        || !repeated_run_has_unacceptable_product_result(Some(2), false, 1, 0, 2)
+        || !repeated_run_has_unacceptable_product_result(Some(2), false, 2, 1, 2)
+        || repeated_run_has_unacceptable_product_result(None, false, 0, 0, 1)
     {
         return Err(
             "repeated result confused missing evidence with trustworthy pass/failure outcomes"
