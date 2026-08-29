@@ -3413,25 +3413,23 @@ mod tests {
     /// message must say which flag and admit what it did not check.
     #[test]
     fn an_unbuilt_backend_names_the_flag_and_claims_nothing_about_the_machine() {
-        for (backend, flag) in [
-            (Backend::Dbt, "dbt"),
-            (Backend::Sabre, "sabre"),
-            (Backend::E9patch, "e9patch"),
+        for (backend, flag, feature_is_disabled) in [
+            (Backend::Dbt, "dbt", cfg!(not(feature = "dbt"))),
+            (Backend::Sabre, "sabre", cfg!(not(feature = "sabre"))),
+            (Backend::E9patch, "e9patch", cfg!(not(feature = "e9patch"))),
         ] {
-            let Some(reason) = backend.unavailable_reason() else {
-                // Built in on this configuration; nothing to assert.
-                continue;
-            };
-            // ⚠️ KEY THE FILTER ON THE CONDITION, NOT ON THE NEW WORDING. My first
-            // version skipped unless the message already said "not enabled in this
-            // build" -- so reverting to the old "support was not included in this
-            // build" fell through the filter and the test passed. A guard that only
-            // recognises the fixed form cannot catch the regression it exists for.
-            // "build" appears in both wordings and in neither of the runtime ones.
-            if !reason.contains("build") {
-                // Unavailable for a REAL, tested reason (missing runtime, etc.).
+            if !feature_is_disabled {
+                // This build includes the feature, so any unavailability is a
+                // runtime prerequisite result rather than the condition under test.
                 continue;
             }
+            let Some(reason) = backend.unavailable_reason() else {
+                panic!("{backend:?}: disabled feature unexpectedly reported available");
+            };
+            // Key the selection on the compile-time condition, not on the new wording. A
+            // wording filter cannot catch a regression to an older spelling, while matching
+            // the broad word "build" also captures runtime-artifact errors during concurrent
+            // Cargo work.
             assert!(
                 reason.contains(flag),
                 "{backend:?}: a build-flag message must name the flag to rebuild with, got: {reason}"
