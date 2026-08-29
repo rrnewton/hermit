@@ -1087,7 +1087,7 @@ fn main() {
              \n\
              --jobs defaults to 1, which is what eleven of the thirteen e2e nodes use\n\
              (and test-harness's own default). Raise it only to match a node that\n\
-             genuinely runs at 8.\n\
+             genuinely runs at 20.\n\
              \n\
              An id that matches no cell is UNSELECTED and exits 3. It is NEVER a pass.\n\
              `test-harness plan` refuses an id that is in no manifest, but this probe\n\
@@ -1105,7 +1105,7 @@ fn main() {
     // `--jobs` at all -- and `test-harness` itself defaults to 1
     // (test-harness.rs, `ScheduledWorkerCapacity::new(args.jobs.unwrap_or(1))`) --
     // `e2e.manifest_system_utils` pins `--jobs 1` explicitly, and only
-    // `e2e.manifest_backend_parity_c` and `e2e.manifest_c_programs` use `--jobs 8`.
+    // `e2e.manifest_backend_parity_c` and `e2e.manifest_c_programs` use `--jobs 20`.
     //
     // This driver defaulted to 8. An id expands to up to 3 cells (median 1, max 3),
     // so for a multi-cell id the probe was running its cells CONCURRENTLY while the
@@ -1113,7 +1113,7 @@ fn main() {
     // concurrency the node never uses is a bisect on a different phenomenon.
     //
     // Override with `--jobs` when bisecting an id from one of the two categories that
-    // genuinely runs at 8; the honest default is the one eleven of thirteen use.
+    // genuinely runs at 20; the honest default is the one eleven of thirteen use.
     let mut jobs = "1".to_string();
     let mut ids: BTreeSet<String> = BTreeSet::new();
     let mut repro_only = false;

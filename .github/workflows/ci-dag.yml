@@ -93,7 +93,7 @@ jobs:
       # No PMU counter lock: reverie's RCB counters are per-task and
       # context-switched, so concurrent hermit runs do not exhaust the PMU
       # (measured: 32 concurrent --strict --verify on one core, 0 failures).
-      # The DAG's in-run resource_caps still serialize genuine exclusive
-      # resources (kvm).
+      # The DAG's in-run resource caps bound concurrent manifest guests by
+      # measured memory use; /dev/kvm itself is not exclusive.
       - name: Run privileged lane as a DAG
         run: ci/run-dag.sh privileged -j 2 -v
