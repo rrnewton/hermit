@@ -1150,6 +1150,10 @@ fn self_test() -> Result<(), String> {
             executed_tests: None,
             filtered_tests: None,
             returncode: Some(if ok { 0 } else { 1 }),
+            oomed: false,
+            oom_kills: 0,
+            timed_out: false,
+            cpu_timed_out: false,
             reason: String::new(),
             aborted: false,
         };
@@ -6600,6 +6604,10 @@ fn summary_listing_bracket() -> Result<String, String> {
         executed_tests: None,
         filtered_tests: None,
         returncode: Some(if ok { 0 } else { 1 }),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: String::new(),
         aborted: false,
     };
@@ -8177,6 +8185,12 @@ struct NodeAttempt {
     /// fact unless it is written down here.
     reported: bool,
     returncode: Option<i64>,
+    /// Typed scheduler termination facts. `None` means no completion payload
+    /// arrived; it must not be flattened into false or zero.
+    oomed: Option<bool>,
+    oom_kills: Option<i64>,
+    timed_out: Option<bool>,
+    cpu_timed_out: Option<bool>,
     /// The runner's typed failure reason for THIS attempt; `""` when it passed
     /// or was never reported. A later attempt never overwrites it.
     reason: String,
@@ -8242,6 +8256,10 @@ fn reported_attempt(outcome: &StepOutcome, attempt: usize) -> NodeAttempt {
         ok: Some(outcome.ok),
         reported: true,
         returncode: outcome.returncode,
+        oomed: Some(outcome.oomed),
+        oom_kills: Some(outcome.oom_kills),
+        timed_out: Some(outcome.timed_out),
+        cpu_timed_out: Some(outcome.cpu_timed_out),
         reason: outcome.reason.clone(),
         duration_s: outcome.duration_s,
         aborted: outcome.aborted,
@@ -8262,6 +8280,10 @@ fn unreported_attempt(tag: String, attempt: usize) -> NodeAttempt {
         ok: None,
         reported: false,
         returncode: None,
+        oomed: None,
+        oom_kills: None,
+        timed_out: None,
+        cpu_timed_out: None,
         reason: "no completion payload was reported for this node".into(),
         duration_s: 0.0,
         aborted: false,
@@ -11604,129 +11626,54 @@ fn print_retry_ledger(attempts: &[NodeAttempt]) {
     }
 }
 
-/// The exact renderings `step_failure_reason` produces for the two budget
-/// breaches, as prefixes. Everything after them is a number, so a prefix is an
-/// exact identification of the arm rather than a search for a word.
-const WALL_BUDGET_REASON_PREFIX: &str = "TIMEOUT >";
-const CPU_BUDGET_REASON_PREFIX: &str = "CPU-TIMEOUT >";
-
 /// Was this node killed by its wall or CPU budget?
 ///
-/// WHY THIS IS NOT A SUBSTRING TEST, which is what it used to be. `reason` is a
-/// closed set produced by `dagrun::model::step_failure_reason`, and
-/// one member of that set reads:
-///
-///   `received SIGSEGV with no validate timeout, pids guard, or child-cgroup OOM recorded`
-///
-/// A `contains("timeout")` test matches that string — INSIDE THE CLAUSE SAYING
-/// THERE WAS NO TIMEOUT. Every signal-killed node therefore read as a budget
-/// breach, so a segfault, an abort and a SIGKILL were all retry-eligible and
-/// would each be re-run to `max` for the same deterministic answer. That is
-/// precisely the waste the eligibility rule exists to prevent.
-///
-/// A SUBSTRING TEST AGAINST A HUMAN-READABLE MESSAGE IS NOT A PREDICATE. The
-/// message is written for a reader and can carry the word in a negating
-/// context. The typed `timed_out`/`cpu_timed_out` inputs are the real facts, but
-/// `StepOutcome` does not carry them — `StepOutcome::failed` takes them and
-/// keeps only the rendered string. So this matches the two arms EXACTLY, and
-/// `budget_reason_bracket` below pins that match by calling the real producer
-/// with the typed inputs rather than by restating its wording here.
+/// The scheduler retains these facts independently of its human-readable
+/// reason. Presentation text may contain the word "timeout" while explicitly
+/// saying no timeout occurred, and an OOM message may hide a simultaneous
+/// budget breach because the display has a precedence order.
 fn outcome_hit_its_budget(outcome: &StepOutcome) -> bool {
-    reason_is_budget_breach(&outcome.reason)
+    outcome.timed_out || outcome.cpu_timed_out
 }
 
-/// The same rule over a bare reason string, so the bracket can exercise it
-/// against producer output without building a whole `StepOutcome`.
-fn reason_is_budget_breach(reason: &str) -> bool {
-    reason.starts_with(WALL_BUDGET_REASON_PREFIX) || reason.starts_with(CPU_BUDGET_REASON_PREFIX)
-}
-
-/// Pin the budget-breach predicate to the PRODUCER, not to a copy of its text.
+/// Pin the budget-breach predicate to the typed producer facts, not its text.
 ///
-/// Every case below is built by calling `step_failure_reason` itself with the
-/// typed inputs, then asserting the predicate agrees with `timed_out ||
-/// cpu_timed_out`. Nothing here hardcodes a message, so a reworded reason does
-/// not silently drift past the predicate — it fails here instead.
+/// The reason is deliberately replaced after construction. If this test ever
+/// starts following presentation text again, the positive and negative arms
+/// fail independently.
 fn budget_reason_bracket() -> Result<String, String> {
-    use dagrun::model::step_failure_reason;
-    // (label, returncode, oomed, timed_out, pids_tripped, detail_failure, cpu_timed_out)
-    let cases: &[(&str, Option<i64>, bool, bool, bool, bool, bool)] = &[
-        ("wall budget", None, false, true, false, false, false),
-        ("cpu budget", None, false, false, false, false, true),
-        ("oom kill", Some(-9), true, false, false, false, false),
-        ("pids guard", None, false, false, true, false, false),
-        ("detail capture", None, false, false, false, true, false),
-        ("SIGSEGV", Some(-11), false, false, false, false, false),
-        ("SIGABRT", Some(-6), false, false, false, false, false),
-        ("SIGKILL", Some(-9), false, false, false, false, false),
-        ("ordinary exit", Some(1), false, false, false, false, false),
-        ("no exit collected", None, false, false, false, false, false),
-    ];
-    let mut eligible = Vec::new();
-    for (label, rc, oomed, timed_out, pids, detail, cpu_timed_out) in cases {
-        let detail_rows: Vec<String> = if *detail {
-            vec!["fixture detail write failed".to_string()]
-        } else {
-            Vec::new()
-        };
-        let reason = step_failure_reason(
-            *rc,
-            *oomed,
-            if *oomed { 1 } else { 0 },
-            *timed_out,
-            600,
-            *pids,
-            pids.then_some("fixture pids guard"),
-            &detail_rows,
-            *cpu_timed_out,
-            300,
-            300,
-            1.0,
-            "",
-        );
-        let want = *timed_out || *cpu_timed_out;
-        let got = reason_is_budget_breach(&reason);
-        if got != want {
-            return Err(format!(
-                "budget reason: {label} rendered {reason:?}; retry-eligible={got} but the typed                  inputs say timed_out={timed_out} cpu_timed_out={cpu_timed_out}. A reason that                  merely MENTIONS a timeout is not a timeout."
-            ));
-        }
-        if got {
-            eligible.push(*label);
-        }
-    }
-    // The negative direction, stated as its own assertion rather than left
-    // implicit in the loop: the signal arm is the one that used to misclassify,
-    // and it must stay ineligible even though its text contains "timeout".
-    let segv = step_failure_reason(
-        Some(-11),
-        false,
-        0,
-        false,
-        600,
-        false,
-        None,
-        &[],
-        false,
-        300,
-        300,
-        1.0,
-        "",
+    let mut wall = StepOutcome::failed(
+        "wall".into(), 0.0, String::new(), None, false, 0, true, 600,
+        false, 300, 300, 1.0, "", false, None, None,
     );
-    if !segv.contains("timeout") {
-        return Err(format!(
-            "budget reason: the signal arm no longer contains the word 'timeout' ({segv:?}); this              bracket exists because it DOES, so re-check the producer before relaxing it"
-        ));
-    }
-    if reason_is_budget_breach(&segv) {
-        return Err(format!("budget reason: signal-killed reason {segv:?} is retry-eligible"));
-    }
-    Ok(format!(
-        "budget reason: 10 producer-rendered reason(s) classified; retry-eligible = {eligible:?};          the SIGSEGV arm contains the word \"timeout\" and is correctly NOT eligible"
-    ))
-}
+    wall.reason = "presentation text with no classification words".into();
+    let mut cpu = StepOutcome::failed(
+        "cpu".into(), 0.0, String::new(), None, false, 0, false, 600,
+        true, 300, 300, 1.0, "", false, None, None,
+    );
+    cpu.reason = "presentation text with no classification words".into();
+    let mut both_hidden_by_oom = StepOutcome::failed(
+        "both-hidden-by-oom".into(), 0.0, String::new(), Some(-9), true, 1,
+        true, 600, true, 300, 300, 1.0, "", false, None, None,
+    );
+    both_hidden_by_oom.reason = "OOM-KILLED".into();
+    let mut segv = StepOutcome::failed(
+        "segv".into(), 0.0, String::new(), Some(-11), false, 0, false, 600,
+        false, 300, 300, 1.0, "", false, None, None,
+    );
+    segv.reason = "received SIGSEGV after a log line mentioned timeout".into();
 
-/// Nodes the runner reported as killed by their wall or CPU budget.
+    if !outcome_hit_its_budget(&wall)
+        || !outcome_hit_its_budget(&cpu)
+        || !outcome_hit_its_budget(&both_hidden_by_oom)
+    {
+        return Err("budget reason: typed wall/CPU timeout was not retry-eligible".into());
+    }
+    if outcome_hit_its_budget(&segv) {
+        return Err("budget reason: presentation-only timeout text became retry-eligible".into());
+    }
+    Ok("budget reason: typed wall/CPU facts remain eligible through unrelated presentation text; signal text remains ineligible".into())
+}
 
 /// Nodes the runner reported as killed by their wall or CPU budget.
 fn timed_out_nodes(outcomes: &[StepOutcome]) -> Vec<String> {
@@ -12640,6 +12587,10 @@ fn test_node_coverage_bracket() -> Result<(), String> {
         executed_tests,
         filtered_tests: Some(0),
         returncode: Some(if ok { 0 } else { 100 }),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: if ok { String::new() } else { "test failure".into() },
         aborted,
     };
@@ -12688,6 +12639,10 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         executed_tests,
         filtered_tests,
         returncode: Some(if ok { 0 } else { 100 }),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: if ok { String::new() } else { "test failure".into() },
         aborted: false,
     };
@@ -12737,6 +12692,10 @@ fn ledger_gate(outcome: &StepOutcome) -> serde_json::Value {
         "name": outcome.tag,
         "result": ledger_gate_result(outcome),
         "exit_code": outcome.returncode,
+        "oomed": outcome.oomed,
+        "oom_kills": outcome.oom_kills,
+        "timed_out": outcome.timed_out,
+        "cpu_timed_out": outcome.cpu_timed_out,
         "reason": outcome.reason,
         "aborted": outcome.aborted,
         "real_seconds": outcome.duration_s,
@@ -12775,6 +12734,10 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
                 "reported": a.reported,
                 "execution": a.execution.as_str(),
                 "exit_code": a.returncode,
+                "oomed": a.oomed,
+                "oom_kills": a.oom_kills,
+                "timed_out": a.timed_out,
+                "cpu_timed_out": a.cpu_timed_out,
                 "reason": a.reason,
                 "aborted": a.aborted,
                 "real_seconds": a.reported.then_some(a.duration_s),
@@ -12804,6 +12767,10 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
     if let Some(attempt) = latest {
         gate["result"] = serde_json::json!(attempt_result(attempt));
         gate["exit_code"] = serde_json::json!(attempt.returncode);
+        gate["oomed"] = serde_json::json!(attempt.oomed);
+        gate["oom_kills"] = serde_json::json!(attempt.oom_kills);
+        gate["timed_out"] = serde_json::json!(attempt.timed_out);
+        gate["cpu_timed_out"] = serde_json::json!(attempt.cpu_timed_out);
         gate["reason"] = serde_json::json!(attempt.reason);
         gate["aborted"] = serde_json::json!(attempt.aborted);
         gate["real_seconds"] = serde_json::json!(attempt.reported.then_some(attempt.duration_s));
@@ -12826,16 +12793,23 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         executed_tests: Some(1),
         filtered_tests: Some(0),
         returncode: Some(1),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: "fixture failure".into(),
         aborted: false,
     };
     let row = ledger_gate(&failed);
     if row["failure_origin"] != "outer_gate"
         || row["failed_substeps"] != serde_json::json!([])
+        || row["oomed"] != false
+        || row["oom_kills"] != 0
+        || row["timed_out"] != false
+        || row["cpu_timed_out"] != false
     {
         return Err(
-            "ledger gate origin: failed outer gate did not carry a known-empty substep list"
-                .into(),
+            "ledger gate origin: failed outer gate did not carry its typed evidence".into(),
         );
     }
     let mut passed = failed.clone();
@@ -12960,6 +12934,22 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         "unknown",
         false,
     )?;
+    let unreported_retry = unreported_attempt(failed.tag.clone(), 2);
+    let fail_then_unreported = [failed_attempt.clone(), unreported_retry];
+    let unreported_gate = ledger_gate_with_attempts(&failed, &fail_then_unreported);
+    if !unreported_gate["oomed"].is_null()
+        || !unreported_gate["oom_kills"].is_null()
+        || !unreported_gate["timed_out"].is_null()
+        || !unreported_gate["cpu_timed_out"].is_null()
+        || !unreported_gate["attempts"][1]["oomed"].is_null()
+        || !unreported_gate["attempts"][1]["oom_kills"].is_null()
+        || !unreported_gate["attempts"][1]["timed_out"].is_null()
+        || !unreported_gate["attempts"][1]["cpu_timed_out"].is_null()
+    {
+        return Err(format!(
+            "ledger gate origin: an unreported attempt fabricated typed termination facts: {unreported_gate}"
+        ));
+    }
     let mut failed_retry = failed_attempt;
     failed_retry.attempt = 2;
     let pass_then_failure = [passed_attempt, failed_retry];
@@ -13130,6 +13120,10 @@ fn possible_missing_artifact_bracket() -> Result<(), String> {
         executed_tests: None,
         filtered_tests: None,
         returncode,
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: String::new(),
         aborted: false,
     };
@@ -13164,6 +13158,10 @@ fn no_result_propagation_bracket() -> Result<(), String> {
         executed_tests: None,
         filtered_tests: None,
         returncode: Some(returncode),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: String::new(),
         aborted,
     };
@@ -16669,6 +16667,10 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
         executed_tests: None,
         filtered_tests: None,
         returncode: Some(if ok { 0 } else { 1 }),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: if ok { String::new() } else { "stop-test synthetic failure".into() },
         aborted: false,
     };
