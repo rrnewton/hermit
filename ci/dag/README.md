@@ -96,11 +96,15 @@ The centralized manifests use an explicit build barrier before execution:
 
 1. `e2e.metadata` validates schema, inventory, generated test-footprint freshness,
    and CI correspondence.
-2. `build.e2e_artifact` waits for both initial Cargo producers, verifies and
-   hash-binds the debug Hermit plus the dereferenced `install_pkg` resource
-   tree, then atomically publishes a content-addressed bundle. Every later
-   shared-target Cargo writer waits on this barrier.
-3. `build.manifest_guests` prepares every `ci=true` program once. One
+2. `lint.clippy`, `doc.doctests`, and `doc.rustdoc` run in a fixed chain before
+   `build.workspace`, which is the final writer of the shared debug test
+   artifacts. This chain overlaps the longer manifest audit.
+3. `build.e2e_artifact` waits for the final debug producer and the release
+   producer, verifies and hash-binds the debug Hermit plus the dereferenced
+   `install_pkg` resource tree, then atomically publishes a content-addressed
+   bundle. Later test commands consume the completed artifacts without a
+   concurrent Cargo writer replacing them.
+4. `build.manifest_guests` prepares every `ci=true` program once. One
    `e2e.manifest_<bucket>` node per YAML bucket declares both producers and runs
    through `run-with-hermit-e2e-artifact.sh`, which re-verifies identity before
    exporting exact `HERMIT_BIN` and `HERMIT_INSTALL_DIR` paths. Parallel Cargo

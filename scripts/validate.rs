@@ -2118,7 +2118,11 @@ cleared-caps refusal names {} starved step(s)",
             .ok_or("full-plan bracket: portable debug test producer disappeared")?;
         if portable_build.cmd != DEBUG_TEST_PRODUCER_COMMAND
             || portable_build.deps
-                != ["gate.manifest".to_string(), "setup.nextest".to_string()]
+                != [
+                    "doc.rustdoc".to_string(),
+                    "gate.manifest".to_string(),
+                    "setup.nextest".to_string(),
+                ]
             || portable_build.hint.preferred_inner_jobs != Some(8)
             || portable_build.jobs_flag.as_deref() != Some("")
             || portable_build.jobs_env.as_deref() != Some("")
@@ -2131,6 +2135,24 @@ cleared-caps refusal names {} starved step(s)",
                 portable_build.jobs_flag,
                 portable_build.jobs_env,
             ));
+        }
+        for (tag, required) in [
+            ("lint.clippy", &["setup.manifest_plan", "setup.nextest"][..]),
+            ("doc.doctests", &["lint.clippy"][..]),
+            ("doc.rustdoc", &["doc.doctests"][..]),
+        ] {
+            let step = full
+                .cfg
+                .steps
+                .iter()
+                .find(|step| step.tag() == tag)
+                .ok_or_else(|| format!("full-plan bracket: ordered Cargo writer disappeared: {tag}"))?;
+            if step.deps.iter().map(String::as_str).collect::<Vec<_>>() != required {
+                return Err(format!(
+                    "full-plan bracket: {tag} must run in the fixed pre-producer Cargo chain: deps={:?}",
+                    step.deps
+                ));
+            }
         }
         let shared_target_steps = [
             "lint.clippy",
@@ -5777,16 +5799,16 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         eprintln!("validate: fused lanes; deduped {} identical node(s): {}", removed.len(), removed.join(", "));
     }
     if lanes.len() == 2 {
-        // The artifact barrier waits for both initial Cargo producers, verifies
-        // binary and resource identities, then publishes a content-addressed
-        // bundle. Every later Cargo writer and manifest consumer runs only after
-        // that barrier, so no writer can mutate either source during publication
-        // and no consumer reads a mutable Cargo path afterward. The portable
-        // producer also builds the test-profile targets needed by the privileged
-        // lane, so the fused privileged build becomes a read-only assertion. If it
-        // invoked Cargo here, it would race the now-eligible portable test nodes
-        // for the same target directory and put compile work back under scheduler
-        // control.
+        // Clippy, doctests, and rustdoc run in a fixed chain before the final
+        // debug test-profile producer. The artifact barrier then waits for that
+        // producer and the release producer, verifies binary and resource
+        // identities, and publishes a content-addressed bundle. Later test
+        // commands see the producer's artifacts without a sibling Cargo writer
+        // relinking or removing them. The portable producer also builds the
+        // test-profile targets needed by the privileged lane, so the fused
+        // privileged build becomes a read-only assertion. If it invoked Cargo
+        // here, it would race the now-eligible portable test nodes for the same
+        // target directory and put compile work back under scheduler control.
         let producer = "build.e2e_artifact";
         let debug_producer = "build.workspace";
         let consumer = "privileged-build.privileged_tests";
