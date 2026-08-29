@@ -131,6 +131,7 @@ def hermit_command(
     guest: Path,
     host_tmp: Path,
     verify_json: Path | None = None,
+    backend_engagement_json: Path | None = None,
 ) -> list[str]:
     command = [str(hermit)]
     if e9:
@@ -142,6 +143,8 @@ def hermit_command(
         if verify_json is None:
             raise CorpusError("a verification run requires a typed report path")
         command.append(f"--verify-json={verify_json}")
+    if backend_engagement_json is not None:
+        command.append(f"--backend-engagement-json={backend_engagement_json}")
     command.append(f"--tmp={host_tmp}")
     command.extend(["--", str(guest)])
     return command
@@ -184,9 +187,25 @@ def detlog_syscalls(
     return lines
 
 
-def metric(name: str, stderr: bytes) -> int | None:
-    match = re.search(rf"{name}=([0-9]+)", stderr.decode(errors="replace"))
-    return int(match.group(1)) if match else None
+def e9patch_engagement(path: Path) -> tuple[int, int, int]:
+    try:
+        report = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise CorpusError(f"e9patch engagement record is unavailable: {error}") from error
+    if not isinstance(report, dict) or set(report) != {"schema", "engagement"}:
+        raise CorpusError("e9patch engagement record has unexpected fields")
+    if report.get("schema") != 2:
+        raise CorpusError("e9patch engagement record must use schema 2")
+    engagement = report.get("engagement")
+    expected = {"backend", "candidate_sites", "mapped_sites", "b0_sites"}
+    if not isinstance(engagement, dict) or set(engagement) != expected:
+        raise CorpusError("e9patch engagement value is incomplete")
+    if engagement.get("backend") != "e9patch":
+        raise CorpusError("e9patch engagement record names another backend")
+    values = tuple(engagement[name] for name in ("candidate_sites", "mapped_sites", "b0_sites"))
+    if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in values):
+        raise CorpusError("e9patch engagement counts must be nonnegative integers")
+    return values
 
 
 def verification_report_bin(hermit: Path) -> Path:
@@ -259,6 +278,7 @@ def run_guest(hermit: Path, name: str, out_dir: Path) -> tuple[str, str]:
     )
     golden_report = out_dir / f"{name}-golden-verify.json"
     e9patch_report = out_dir / f"{name}-e9patch-verify.json"
+    engagement_report = out_dir / f"{name}-e9patch-engagement.json"
     _, _, _ = run(
         hermit_command(
             hermit,
@@ -270,8 +290,16 @@ def run_guest(hermit: Path, name: str, out_dir: Path) -> tuple[str, str]:
         ),
         timeout=60,
     )
-    ex, eout, eerr = run(
-        hermit_command(hermit, True, False, guest, host_tmp("e9patch")), timeout=60
+    ex, eout, _eerr = run(
+        hermit_command(
+            hermit,
+            True,
+            False,
+            guest,
+            host_tmp("e9patch"),
+            backend_engagement_json=engagement_report,
+        ),
+        timeout=60,
     )
     _, _, _ = run(
         hermit_command(
@@ -302,13 +330,10 @@ def run_guest(hermit: Path, name: str, out_dir: Path) -> tuple[str, str]:
     if not e9patch_matched:
         return "FAIL", f"e9patch typed verification report did not match: {e9patch_reason}"
 
-    cand, mapped, b0 = (
-        metric("candidate_sites", eerr),
-        metric("mapped_sites", eerr),
-        metric("b0_sites", eerr),
-    )
-    if cand is None or mapped is None or b0 is None:
-        return "FAIL", "missing e9patch backend metrics"
+    try:
+        cand, mapped, b0 = e9patch_engagement(engagement_report)
+    except CorpusError as error:
+        return "FAIL", str(error)
     if cand == 0:
         return "FAIL", "candidate_sites=0 (guest did not exercise the rewrite path)"
     if mapped != cand:

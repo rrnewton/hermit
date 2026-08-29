@@ -13,6 +13,7 @@ repo=$DEFAULT_REPO
 gate_ruleset_name=$DEFAULT_GATE_RULESET_NAME
 history_ruleset_name=$DEFAULT_HISTORY_RULESET_NAME
 mode=check
+json_output=0
 
 usage() {
     cat <<'EOF'
@@ -27,6 +28,7 @@ Options:
   --repo R                  Repository (default: rrnewton/hermit).
   --ruleset-name N          Legacy check-gating ruleset name.
   --history-ruleset-name N  History-protection ruleset name.
+  --json                     Emit the check result as one JSON object.
   -h, --help                Show this help.
 EOF
 }
@@ -41,10 +43,16 @@ while (($# > 0)); do
             history_ruleset_name=${2:?--history-ruleset-name requires a value}
             shift 2
             ;;
+        --json) json_output=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'configure-merge-gate-ruleset: unknown argument: %s\n' "$1" >&2; exit 2 ;;
     esac
 done
+
+if [[ $mode != check && $json_output == 1 ]]; then
+    printf 'configure-merge-gate-ruleset: --json is valid only with --check\n' >&2
+    exit 2
+fi
 
 for command in gh jq sha256sum; do
     if ! command -v "$command" >/dev/null 2>&1; then
@@ -121,12 +129,15 @@ history_enforcement=$(jq -r '.enforcement' <<<"$current_history")
 
 if [[ $mode == check ]]; then
     failed=0
+    gate_matches=true
+    history_matches=true
     if [[ $gate_rule_count != 0 || $gate_bypass_count != 0 ||
           $gate_enforcement != active ]] || ! scope_is_default_branch <<<"$current_gate"; then
         printf 'FAIL: check-gating ruleset %s has types=%s enforcement=%s bypass_count=%s scope=%s; expected no rules / active / 0 / branch default-only.\n' \
             "$gate_ruleset_id" "$(rule_types <<<"$current_gate")" "$gate_enforcement" \
             "$gate_bypass_count" "$(scope_state <<<"$current_gate")" >&2
         failed=1
+        gate_matches=false
     fi
     if [[ $history_types != deletion,non_fast_forward,required_linear_history ||
           $history_bypass_count != 0 || $history_enforcement != active ]] ||
@@ -135,12 +146,26 @@ if [[ $mode == check ]]; then
             "$history_ruleset_id" "${history_types:-none}" "$history_enforcement" \
             "$history_bypass_count" "$(scope_state <<<"$current_history")" >&2
         failed=1
+        history_matches=false
     fi
     if ((failed != 0)); then
+        if ((json_output == 1)); then
+            jq -cn \
+                --arg state fail \
+                --argjson gate_matches "$gate_matches" \
+                --argjson history_matches "$history_matches" \
+                '{schema:1,state:$state,gate_policy_matches:$gate_matches,history_policy_matches:$history_matches}'
+        fi
         exit 1
     fi
-    printf 'PASS: check-gating ruleset %s is inert; history ruleset %s enforces zero-bypass deletion + non-fast-forward + linear history.\n' \
-        "$gate_ruleset_id" "$history_ruleset_id"
+    if ((json_output == 1)); then
+        jq -cn \
+            --arg state pass \
+            '{schema:1,state:$state,gate_policy_matches:true,history_policy_matches:true}'
+    else
+        printf 'PASS: check-gating ruleset %s is inert; history ruleset %s enforces zero-bypass deletion + non-fast-forward + linear history.\n' \
+            "$gate_ruleset_id" "$history_ruleset_id"
+    fi
     exit 0
 fi
 

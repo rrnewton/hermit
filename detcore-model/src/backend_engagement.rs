@@ -19,9 +19,17 @@ use serde::Serialize;
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "backend", rename_all = "lowercase", deny_unknown_fields)]
 pub enum BackendEngagement {
-    Ptrace { scheduler_turns: u64 },
-    E9patch { mapped_sites: u64 },
-    Dbt { counted_branches: u64 },
+    Ptrace {
+        scheduler_turns: u64,
+    },
+    E9patch {
+        candidate_sites: u64,
+        mapped_sites: u64,
+        b0_sites: u64,
+    },
+    Dbt {
+        counted_branches: u64,
+    },
 }
 
 /// One complete `--backend-engagement-json` record.
@@ -33,7 +41,7 @@ pub struct BackendEngagementReport {
 }
 
 impl BackendEngagementReport {
-    pub const SCHEMA: u8 = 1;
+    pub const SCHEMA: u8 = 2;
 
     pub const fn new(engagement: BackendEngagement) -> Self {
         Self {
@@ -60,20 +68,26 @@ mod tests {
 
     #[test]
     fn backend_and_counter_cannot_be_recombined() {
-        let report = BackendEngagementReport::new(BackendEngagement::E9patch { mapped_sites: 7 });
+        let report = BackendEngagementReport::new(BackendEngagement::E9patch {
+            candidate_sites: 7,
+            mapped_sites: 7,
+            b0_sites: 0,
+        });
         let json = serde_json::to_string(&report).unwrap();
         assert_eq!(
             json,
-            r#"{"schema":1,"engagement":{"backend":"e9patch","mapped_sites":7}}"#
+            r#"{"schema":2,"engagement":{"backend":"e9patch","candidate_sites":7,"mapped_sites":7,"b0_sites":0}}"#
         );
         let changed =
             serde_json::to_string(&BackendEngagementReport::new(BackendEngagement::E9patch {
+                candidate_sites: 8,
                 mapped_sites: 8,
+                b0_sites: 0,
             }))
             .unwrap();
         assert_ne!(json, changed, "the producer's value must reach the record");
 
-        let mismatched = r#"{"schema":1,"engagement":{"backend":"e9patch","counted_branches":7}}"#;
+        let mismatched = r#"{"schema":2,"engagement":{"backend":"e9patch","counted_branches":7}}"#;
         let error = serde_json::from_str::<BackendEngagementReport>(mismatched).unwrap_err();
         assert!(
             error
@@ -85,14 +99,24 @@ mod tests {
     #[test]
     fn unsupported_schema_refuses_by_name() {
         let report = BackendEngagementReport {
-            schema: 2,
+            schema: 3,
             engagement: BackendEngagement::Dbt {
                 counted_branches: 11,
             },
         };
         assert_eq!(
             report.validate().unwrap_err(),
-            "backend-engagement schema must be 1, got 2"
+            "backend-engagement schema must be 2, got 3"
         );
+    }
+    #[test]
+    fn e9patch_result_requires_all_three_counts() {
+        for incomplete in [
+            r#"{"schema":2,"engagement":{"backend":"e9patch","mapped_sites":7,"b0_sites":0}}"#,
+            r#"{"schema":2,"engagement":{"backend":"e9patch","candidate_sites":7,"b0_sites":0}}"#,
+            r#"{"schema":2,"engagement":{"backend":"e9patch","candidate_sites":7,"mapped_sites":7}}"#,
+        ] {
+            assert!(serde_json::from_str::<BackendEngagementReport>(incomplete).is_err());
+        }
     }
 }

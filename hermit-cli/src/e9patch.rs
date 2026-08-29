@@ -499,9 +499,9 @@ fn prepare_in_impl(
             output.status
         )));
     }
-    let (patched, total) = parse_metric(&diagnostic, "num_patched").ok_or_else(|| {
+    let (patched, total) = parse_metric(&diagnostic, "num_patched").map_err(|reason| {
         Error::msg(format!(
-            "e9tool did not report patch coverage for {}:\n{diagnostic}",
+            "e9tool did not report unambiguous patch coverage for {}: {reason}:\n{diagnostic}",
             snapshot.original.display()
         ))
     })?;
@@ -511,16 +511,17 @@ fn prepare_in_impl(
             snapshot.original.display()
         ))
     })?;
-    let b0_sites = if let Some((b0_sites, b0_total)) = parse_metric(&diagnostic, "num_patched_B0") {
-        if b0_total != total {
-            return Err(Error::msg(
-                "e9tool B0 coverage total did not match its recovered-site total",
-            ));
-        }
-        b0_sites
-    } else {
-        0
-    };
+    let (b0_sites, b0_total) = parse_metric(&diagnostic, "num_patched_B0").map_err(|reason| {
+        Error::msg(format!(
+            "e9tool did not report unambiguous B0 coverage for {}: {reason}:\n{diagnostic}",
+            snapshot.original.display()
+        ))
+    })?;
+    if b0_total != total {
+        return Err(Error::msg(
+            "e9tool B0 coverage total did not match its recovered-site total",
+        ));
+    }
     if b0_sites != 0 {
         return Err(Error::msg(format!(
             "e9tool used B0 signal fallback for {b0_sites} sites in {}; refusing a rewrite that \
@@ -1092,18 +1093,37 @@ fn command_diagnostic(stdout: &[u8], stderr: &[u8]) -> String {
     diagnostic
 }
 
-fn parse_metric(diagnostic: &str, name: &str) -> Option<(usize, usize)> {
-    diagnostic.lines().find_map(|line| {
-        let counts = line
+fn parse_metric(diagnostic: &str, name: &str) -> Result<(usize, usize), String> {
+    let mut found = None;
+    for line in diagnostic.lines() {
+        let Some(rest) = line.trim().strip_prefix(name) else {
+            continue;
+        };
+        let Some(counts) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        if found.is_some() {
+            return Err(format!("duplicate {name} field"));
+        }
+        let (value, total) = counts
             .trim()
-            .strip_prefix(name)?
-            .trim_start()
-            .strip_prefix('=')?
-            .trim();
-        let (value, total) = counts.split_once('/')?;
-        let total = total.split_whitespace().next()?;
-        Some((value.trim().parse().ok()?, total.parse().ok()?))
-    })
+            .split_once('/')
+            .ok_or_else(|| format!("malformed {name} field"))?;
+        let total = total
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| format!("malformed {name} total"))?;
+        found = Some((
+            value
+                .trim()
+                .parse()
+                .map_err(|_| format!("malformed {name} value"))?,
+            total
+                .parse()
+                .map_err(|_| format!("malformed {name} total"))?,
+        ));
+    }
+    found.ok_or_else(|| format!("missing {name} field"))
 }
 
 fn validate_patch_coverage(
@@ -1147,9 +1167,22 @@ mod tests {
     #[test]
     fn parses_e9tool_coverage_and_signal_fallback_summary() {
         let summary = "num_patched = 2 / 2 (100.00%)\nnum_patched_B0 = 1 / 2 (50.00%)\n";
-        assert_eq!(parse_metric(summary, "num_patched"), Some((2, 2)));
-        assert_eq!(parse_metric(summary, "num_patched_B0"), Some((1, 2)));
-        assert_eq!(parse_metric(summary, "num_patched_B1"), None);
+        assert_eq!(parse_metric(summary, "num_patched"), Ok((2, 2)));
+        assert_eq!(parse_metric(summary, "num_patched_B0"), Ok((1, 2)));
+        assert_eq!(
+            parse_metric(summary, "num_patched_B1"),
+            Err("missing num_patched_B1 field".into())
+        );
+
+        let duplicate = format!("{summary}num_patched = 2 / 2 (100.00%)\n");
+        assert_eq!(
+            parse_metric(&duplicate, "num_patched"),
+            Err("duplicate num_patched field".into())
+        );
+        assert_eq!(
+            parse_metric("num_patched = two / 2\n", "num_patched"),
+            Err("malformed num_patched value".into())
+        );
     }
 
     #[test]
