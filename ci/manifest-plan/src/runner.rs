@@ -2210,6 +2210,21 @@ fn cell_artifact_dir(context: &RunContext, cell: &SelectedCell) -> PathBuf {
         .join(slug)
 }
 
+/// Apply a failed chaos population assertion without erasing an attempt-level
+/// infrastructure result. A timeout or unavailable verification report means
+/// the population was not fully measured; it is not a product failure merely
+/// because the incomplete sample also missed `min_passes`.
+fn apply_failed_chaos_assertion(
+    outcome: &mut String,
+    reason: &mut Option<String>,
+    assertion_reason: String,
+) {
+    if outcome != "ERROR" {
+        *outcome = "FAIL".into();
+        *reason = Some(assertion_reason);
+    }
+}
+
 pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult, String> {
     let dir = cell_artifact_dir(context, cell);
     let started = Instant::now();
@@ -2382,10 +2397,13 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
                 .min_normalized_entropy
                 .is_some_and(|minimum| normalized_entropy < minimum)
         {
-            outcome = "FAIL".into();
-            reason = Some(format!(
-                "chaos distinct={distinct} passes={pass_count} failures={failure_count} normalized_entropy={normalized_entropy:.4}"
-            ));
+            apply_failed_chaos_assertion(
+                &mut outcome,
+                &mut reason,
+                format!(
+                    "chaos distinct={distinct} passes={pass_count} failures={failure_count} normalized_entropy={normalized_entropy:.4}"
+                ),
+            );
         }
     }
     let execution_path = match summarize_sabre_path_evidence(&attempts) {
@@ -5296,6 +5314,35 @@ backends_disabled:
         let chaos = nonzero_with_canonical_receipt("chaos");
         assert_eq!(chaos.outcome, "PASS");
         assert_eq!(chaos.status, Some(7));
+    }
+
+    #[test]
+    fn chaos_assertion_does_not_relabel_an_incomplete_population_as_a_product_failure() {
+        let mut outcome = "ERROR".to_string();
+        let mut reason = Some("seed-31 timed out before producing a comparison".to_string());
+        apply_failed_chaos_assertion(
+            &mut outcome,
+            &mut reason,
+            "chaos distinct=8 passes=31 failures=1 normalized_entropy=0.9180".into(),
+        );
+        assert_eq!(outcome, "ERROR");
+        assert_eq!(
+            reason.as_deref(),
+            Some("seed-31 timed out before producing a comparison")
+        );
+
+        let mut outcome = "PASS".to_string();
+        let mut reason = None;
+        apply_failed_chaos_assertion(
+            &mut outcome,
+            &mut reason,
+            "chaos distinct=6 passes=32 failures=0 normalized_entropy=0.7000".into(),
+        );
+        assert_eq!(outcome, "FAIL");
+        assert_eq!(
+            reason.as_deref(),
+            Some("chaos distinct=6 passes=32 failures=0 normalized_entropy=0.7000")
+        );
     }
 
     fn no_result_with_exit_status(
