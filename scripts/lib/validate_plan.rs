@@ -59,8 +59,6 @@ pub use hermit_manifest_plan::host_capability::probe_host_capability;
 use crate::validate_corpus;
 use crate::validate_corpus::CorpusPaths;
 
-pub const E2E_ATTEMPT_ENV: &str = "E2E_ATTEMPT";
-
 /// Wall budget for the preflight gates. Submodule init reaches the network
 /// through `with-proxy`, so it needs more than a trivial ceiling but must not
 /// inherit a lane-sized one.
@@ -511,7 +509,6 @@ pub fn lane_nodes(
                 " --results \"$E2E_RESULT_ROOT/{lane}/{}/results.jsonl\" --junit \"$E2E_RESULT_ROOT/{lane}/{}/junit.xml\"",
                 s.job, s.job
             ));
-            step.env.insert(E2E_ATTEMPT_ENV.into(), "1".into());
         }
         step.group = retag(&s.group);
         step.deps = s

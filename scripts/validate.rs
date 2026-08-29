@@ -185,13 +185,8 @@ fn validation_step_identity(step: &Step) -> ValidationStepIdentity {
     }
 }
 
-fn set_manifest_attempt(step: &mut Step, attempt: usize) {
-    if validation_step_identity(step) == ValidationStepIdentity::ManifestRun {
-        step.env.insert(
-            validate_plan::E2E_ATTEMPT_ENV.into(),
-            attempt.to_string(),
-        );
-    }
+fn is_manifest_run_step(step: &Step) -> bool {
+    validation_step_identity(step) == ValidationStepIdentity::ManifestRun
 }
 
 const LEDGER_ENV: &str = "HERMIT_VALIDATE_LEDGER";
@@ -2184,14 +2179,9 @@ cleared-caps refusal names {} starved step(s)",
                     consumer.tag(), consumer.cmd
                 ));
             }
-            if consumer
-                .env
-                .get(validate_plan::E2E_ATTEMPT_ENV)
-                .map(String::as_str)
-                != Some("1")
-            {
+            if consumer.env.contains_key("E2E_ATTEMPT") {
                 return Err(format!(
-                    "full-plan bracket: {} does not declare initial E2E attempt 1: {:?}",
+                    "full-plan bracket: {} still receives the outer E2E_ATTEMPT variable: {:?}",
                     consumer.tag(), consumer.env
                 ));
             }
@@ -10284,13 +10274,12 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     let e2e_attempts = tmp.join("e2e-attempts");
     let e2e_log = tmp.join("e2e-attempts.log");
     let e2e_cmd = format!(
-        "printf '%s\\n' \"$E2E_ATTEMPT\" >> {}; exit 1",
+        "printf '%s\\n' run >> {}; exit 1",
         validate_plan::shell_quote(&e2e_attempts.to_string_lossy()),
     );
     let mut e2e_step = step("manifest_attempt", &e2e_cmd);
     e2e_step.group = "e2e".into();
     e2e_step.job = "manifest_attempt".into();
-    set_manifest_attempt(&mut e2e_step, 1);
     let e2e_retry = run_lane_with_env_retries(
         &DagConfig { steps: vec![e2e_step], ..Default::default() },
         1,
@@ -10313,7 +10302,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     if e2e_retry.ok
         || e2e_retry.env_retries != 0
         || e2e_node_attempts != 1
-        || recorded_attempts.lines().collect::<Vec<_>>() != ["1"]
+        || recorded_attempts.lines().collect::<Vec<_>>() != ["run"]
     {
         return Err(format!(
             "scheduler accounting: outer scheduler retried an executed manifest node: \
@@ -11122,12 +11111,8 @@ fn run_lane_with_env_retries(
         };
     }
     let mut round_log_start = settled_log_len(log_path);
-    let mut first_cfg = cfg.clone();
-    for step in &mut first_cfg.steps {
-        set_manifest_attempt(step, 1);
-    }
     let first = run_dag_boxed_deadline(
-        &first_cfg,
+        cfg,
         jobs,
         keep_going,
         verbosity,
@@ -11369,10 +11354,6 @@ fn run_lane_with_env_retries(
         let mut retry_cfg = cfg.clone();
         retry_cfg.description = format!("{} — retry round {env_retries}", cfg.description);
         retry_cfg.steps = steps;
-        for step in &mut retry_cfg.steps {
-            let attempt = next_attempt_ordinal(&attempts, &step.tag());
-            set_manifest_attempt(step, attempt);
-        }
         // Everything before this byte belongs to an earlier scheduler
         // invocation. The retry may emit no detail at all; that must stay
         // unknown rather than inheriting a stale banner through whole-log rfind.
@@ -13960,6 +13941,12 @@ fn retain_cells_with_retry_attempt_available(
     keep.retain(|tag| retry_attempt_available(cfg, attempts, tag));
 }
 
+fn is_manifest_run_tag(cfg: &DagConfig, tag: &str) -> bool {
+    cfg.steps
+        .iter()
+        .any(|step| step.tag() == tag && is_manifest_run_step(step))
+}
+
 fn retry_candidate_tags(
     cfg: &DagConfig,
     blocked: &[(String, String)],
@@ -13973,6 +13960,12 @@ fn retry_candidate_tags(
     keep.extend(by_tag.values().filter(|outcome| outcome.aborted).map(|outcome| outcome.tag.clone()));
     keep.extend(unreported_non_intentional_steps(cfg, by_tag, skipped));
     keep.extend(latest_unreported.iter().cloned());
+    // Manifest cells already spend their retry inside test-harness. Exclude
+    // every manifest node here, including a skipped, aborted, or unreported
+    // peer carried into a retry opened by some other failure. The outer unit is
+    // a whole category; admitting it would rerun passing cells beside the one
+    // that failed.
+    keep.retain(|tag| !is_manifest_run_tag(cfg, tag));
     retain_cells_with_retry_attempt_available(&mut keep, cfg, attempts);
     keep
 }
@@ -16811,8 +16804,8 @@ mod e2e_attempt_tests {
     use super::*;
 
     #[test]
-    fn only_manifest_harness_steps_receive_the_retry_attempt() {
-        let mut manifest = step_with_caps(
+    fn manifest_harness_steps_do_not_receive_an_outer_attempt() {
+        let manifest = step_with_caps(
             "quick",
             "e2e_verify",
             "fixture",
@@ -16826,29 +16819,42 @@ mod e2e_attempt_tests {
             validation_step_identity(&manifest),
             ValidationStepIdentity::ManifestRun
         );
-        set_manifest_attempt(&mut manifest, 2);
-        assert_eq!(
-            manifest
-                .env
-                .get(validate_plan::E2E_ATTEMPT_ENV)
-                .map(String::as_str),
-            Some("2")
-        );
+        assert!(!manifest.env.contains_key("E2E_ATTEMPT"));
+    }
 
-        let mut unrelated = step_with_caps(
-            "test",
-            "unit",
+    #[test]
+    fn manifest_harness_steps_never_enter_an_outer_retry_as_peers() {
+        let manifest = step_with_caps(
+            "e2e",
+            "manifest_applications",
             "fixture",
-            "cargo test".into(),
+            "target/debug/test-harness run --lane portable --ci-only".into(),
             Vec::new(),
             30,
             30,
             64 * 1024 * 1024,
         );
-        set_manifest_attempt(&mut unrelated, 2);
-        assert!(!unrelated.env.contains_key(validate_plan::E2E_ATTEMPT_ENV));
-
-        let mut relabelled = step_with_caps(
+        let privileged_manifest = step_with_caps(
+            "privileged-e2e",
+            "manifest_backend_parity_c",
+            "fixture",
+            "target/debug/test-harness run --lane privileged --ci-only".into(),
+            Vec::new(),
+            30,
+            30,
+            64 * 1024 * 1024,
+        );
+        let quick_manifest = step_with_caps(
+            "quick",
+            "e2e_verify",
+            "fixture",
+            "target/debug/test-harness run --lane portable --ci-only".into(),
+            Vec::new(),
+            30,
+            30,
+            64 * 1024 * 1024,
+        );
+        let relabelled = step_with_caps(
             "fixture",
             "custom_manifest_runner",
             "fixture",
@@ -16859,26 +16865,45 @@ mod e2e_attempt_tests {
             30,
             64 * 1024 * 1024,
         );
+        let ordinary = step_with_caps(
+            "test",
+            "unit",
+            "fixture",
+            "cargo test".into(),
+            Vec::new(),
+            30,
+            30,
+            64 * 1024 * 1024,
+        );
         assert_eq!(
             validation_step_identity(&relabelled),
             ValidationStepIdentity::ManifestRun
         );
-        set_manifest_attempt(&mut relabelled, 1);
-        assert_eq!(
-            relabelled
-                .env
-                .get(validate_plan::E2E_ATTEMPT_ENV)
-                .map(String::as_str),
-            Some("1")
-        );
-        let relabelled_cfg = DagConfig {
-            steps: vec![relabelled],
+        let ordinary_tag = ordinary.tag();
+        let manifest_tags = [
+            manifest.tag(),
+            privileged_manifest.tag(),
+            quick_manifest.tag(),
+            relabelled.tag(),
+        ];
+        let cfg = DagConfig {
+            steps: vec![
+                manifest,
+                privileged_manifest,
+                quick_manifest,
+                relabelled,
+                ordinary,
+            ],
             ..Default::default()
         };
-        assert!(!retry_attempt_available(
-            &relabelled_cfg,
-            &[unreported_attempt("fixture.custom_manifest_runner".into(), 1)],
-            "fixture.custom_manifest_runner"
-        ));
+        let keep = retry_candidate_tags(
+            &cfg,
+            &[(ordinary_tag.clone(), "always-eligible".into())],
+            &manifest_tags,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &[unreported_attempt(ordinary_tag.clone(), 1)],
+        );
+        assert_eq!(keep, BTreeSet::from([ordinary_tag]));
     }
 }
