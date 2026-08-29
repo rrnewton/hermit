@@ -8,6 +8,10 @@
 
 //! Widely-shared type definitions.
 
+pub mod backend_engagement;
+pub mod build_info;
+pub mod host_capability;
+
 /// Exit status for a run HERMIT DELIBERATELY REFUSED, as distinct from one
 /// where hermit itself broke.
 ///

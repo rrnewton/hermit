@@ -6,7 +6,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::io::Write;
 use std::sync::OnceLock;
+
+use clap::Args;
+use hermit::Error;
+use hermit::ExitStatus;
 
 pub struct Version(String);
 
@@ -52,5 +57,25 @@ impl Version {
                 env!("HERMIT_BUILD_GIT_SHA"),
             ))
         }
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct VersionOpts {
+    /// Emit the producer-owned build facts as one JSON object.
+    #[clap(long)]
+    json: bool,
+}
+
+impl VersionOpts {
+    pub fn main(&self) -> Result<ExitStatus, Error> {
+        let mut stdout = std::io::stdout().lock();
+        if self.json {
+            serde_json::to_writer(&mut stdout, &hermit::build_info::current())?;
+            writeln!(stdout)?;
+        } else {
+            writeln!(stdout, "hermit {}", Version::get())?;
+        }
+        Ok(ExitStatus::Exited(0))
     }
 }
