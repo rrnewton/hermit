@@ -16,7 +16,11 @@ success-output = "never"
 # This is the per-test-process bound, below the enclosing DAG node's batch
 # bound. Hermit failures commonly stop making progress instead of exiting, so a
 # single test that has not completed in 15 seconds is terminated and named by
-# nextest rather than consuming the rest of a 900-second node allowance.
+# nextest rather than consuming the rest of a 900-second node allowance. These
+# nextest clocks begin after cargo has built and enumerated the suite; the DAG
+# step's typed CPU and wall bounds remain conservative backups for that earlier
+# work. Keep nextest output live so a missing scheduler event is not confused
+# with a period in which no test was running.
 slow-timeout = { period = "15s", terminate-after = 1, grace-period = "2s" }
 global-timeout = "60m"
 
