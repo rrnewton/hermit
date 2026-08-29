@@ -94,11 +94,13 @@ Each node's tag is `group.job` (e.g. `build.workspace`, `lint.clippy`).
 
 The centralized manifests use an explicit build barrier before execution:
 
-1. `e2e.metadata` validates schema, inventory, generated test-footprint freshness,
-   and CI correspondence.
-2. `lint.clippy`, `doc.doctests`, and `doc.rustdoc` run in a fixed chain before
-   `build.workspace`, which is the final writer of the shared debug test
-   artifacts. This chain overlaps the longer manifest audit.
+1. `e2e.metadata` validates schema, inventory, generated test-footprint
+   freshness, and CI correspondence with `target/debug/test-harness`. Full
+   validation deduplicates it into the equivalent `gate.manifest` preflight.
+2. `lint.clippy`, `doc.doctests`, and `doc.rustdoc` run in a fixed chain after
+   that gate and before `build.workspace`, which is the final writer of the
+   shared debug test artifacts. They cannot overlap the gate because Cargo may
+   replace the `test-harness` executable while the gate is using it.
 3. `build.e2e_artifact` waits for the final debug producer and the release
    producer, verifies and hash-binds the debug Hermit plus the dereferenced
    `install_pkg` resource tree, then atomically publishes a content-addressed

@@ -2613,12 +2613,15 @@ fn retain_required_build_dependencies(
             retained.push("setup.nextest".to_string());
             continue;
         }
-        // These two current edges order product builds after the complete
+        // These current edges order setup or product builds after the complete
         // metadata audit. That audit produces no binary or prebuilt artifact;
         // pressure plan generation performs its scorecard and typed-manifest
         // checks before execution instead.
         if dependency == "e2e.metadata"
-            && matches!(tag.as_str(), "build.workspace" | "build.runtime_release")
+            && matches!(
+                tag.as_str(),
+                "setup.nextest" | "build.workspace" | "build.runtime_release"
+            )
         {
             continue;
         }

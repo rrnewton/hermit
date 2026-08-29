@@ -2132,7 +2132,7 @@ cleared-caps refusal names {} starved step(s)",
             ));
         }
         for (tag, required) in [
-            ("setup.nextest", &["setup.manifest_plan"][..]),
+            ("setup.nextest", &["gate.manifest"][..]),
             ("lint.clippy", &["setup.nextest"][..]),
             ("doc.doctests", &["lint.clippy"][..]),
             ("doc.rustdoc", &["doc.doctests"][..]),
