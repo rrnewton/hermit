@@ -922,6 +922,9 @@ enum ValidateRowEvidence {
         left_info_messages: BTreeSet<u64>,
         right_info_messages: BTreeSet<u64>,
     },
+    NotRun {
+        reason: String,
+    },
     Unavailable {
         reason: String,
     },
@@ -1767,9 +1770,11 @@ impl ResultRow {
             return Err("no_result row carries a divergence coordinate".into());
         }
         if saw_not_run && !saw_canonical_match {
-            return Err(unavailable.clone().unwrap_or_else(|| {
-                "NO_RESULT: no attempt completed a canonical comparison".into()
-            }));
+            return Ok(ValidateRowEvidence::NotRun {
+                reason: unavailable.clone().unwrap_or_else(|| {
+                    "NO_RESULT: no attempt completed a canonical comparison".into()
+                }),
+            });
         }
         if let Some(reason) = unavailable {
             return Ok(ValidateRowEvidence::Unavailable { reason });
@@ -3837,20 +3842,76 @@ fn apply_validate_results(
     store_invocation: bool,
     store_positions: bool,
 ) -> Result<ValidateFold, String> {
+    let mut updated = tracked.clone();
     let mut fold = ValidateFold::default();
     for (id, candidates) in rows {
-        let Some(index) = tracked.cells.iter().position(|cell| &cell.id == id) else {
+        let Some(index) = updated.cells.iter().position(|cell| &cell.id == id) else {
             continue;
         };
-        for candidate in candidates {
+        let mut classified = candidates
+            .iter()
+            .map(|candidate| {
+                candidate
+                    .row
+                    .comparison_evidence()
+                    .map(|evidence| (candidate, evidence))
+                    .map_err(|error| format!("{} {error}", display_id(id)))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        classified.sort_by(|(left, _), (right, _)| {
+            left.row
+                .run_id
+                .cmp(&right.row.run_id)
+                .then(left.row.attempt.cmp(&right.row.attempt))
+                .then(left.evidence_identity.cmp(&right.evidence_identity))
+        });
+        let mut distinct = Vec::with_capacity(classified.len());
+        let mut identities_by_attempt = BTreeMap::<(String, u64), String>::new();
+        for (candidate, evidence) in classified {
+            let key = (candidate.row.run_id.clone(), candidate.row.attempt);
+            if let Some(identity) = identities_by_attempt.get(&key) {
+                if identity == &candidate.evidence_identity {
+                    continue;
+                }
+                return Err(format!(
+                    "{} run {} has conflicting evidence for outer attempt {}",
+                    display_id(id),
+                    candidate.row.run_id,
+                    candidate.row.attempt
+                ));
+            }
+            identities_by_attempt.insert(key, candidate.evidence_identity.clone());
+            distinct.push((candidate, evidence));
+        }
+        let classified = distinct;
+        let mut attempts_by_run = BTreeMap::<String, BTreeMap<u64, bool>>::new();
+        for (candidate, evidence) in &classified {
+            let canonical = matches!(
+                evidence,
+                ValidateRowEvidence::Matched { .. } | ValidateRowEvidence::Diverged { .. }
+            );
+            attempts_by_run
+                .entry(candidate.row.run_id.clone())
+                .or_default()
+                .insert(candidate.row.attempt, canonical);
+        }
+        for (candidate, evidence) in &classified {
+            let ValidateRowEvidence::NotRun { reason } = evidence else {
+                continue;
+            };
+            let has_later_canonical = attempts_by_run[&candidate.row.run_id]
+                .iter()
+                .any(|(attempt, canonical)| *attempt > candidate.row.attempt && *canonical);
+            if !has_later_canonical {
+                return Err(format!("{} {reason}", display_id(id)));
+            }
+        }
+        for (candidate, evidence) in classified {
             let row = &candidate.row;
             let located_nothing = row.first_divergent_scheduler_turn.is_none()
                 && row.first_divergent_virtual_nanoseconds.is_none()
                 && row.first_divergent_record.is_none()
                 && row.first_divergent_syscall.is_none();
-            let evidence = row
-                .comparison_evidence()
-                .map_err(|error| format!("{} {error}", display_id(id)))?;
             let (result, left_info_messages, right_info_messages) = match evidence {
                 ValidateRowEvidence::Matched {
                     left_info_messages,
@@ -3872,6 +3933,14 @@ fn apply_validate_results(
                     left_info_messages,
                     right_info_messages,
                 ),
+                ValidateRowEvidence::NotRun { reason } => {
+                    fold.errored.push(format!(
+                        "{} (outcome={}, reason={reason})",
+                        display_id(id),
+                        row.outcome,
+                    ));
+                    continue;
+                }
                 ValidateRowEvidence::Unavailable { reason } => {
                     // No product observation and no `last_tested`: a mixed row
                     // is one cell measurement, not a bag of independently
@@ -3887,7 +3956,7 @@ fn apply_validate_results(
             // Stamp only after the whole row established a product result.
             // Doing this before classification made a timed-out population look
             // freshly measured even though no scorecard observation was stored.
-            tracked.cells[index].last_tested = Some(LastTested {
+            updated.cells[index].last_tested = Some(LastTested {
                 hermit_sha: hermit_sha.to_string(),
                 detcore_tree: detcore_tree.to_string(),
                 depth: depth.clone(),
@@ -3932,7 +4001,7 @@ fn apply_validate_results(
                     row.outcome
                 ));
             }
-            let observations = &mut tracked.cells[index].observations;
+            let observations = &mut updated.cells[index].observations;
             let position = observations.iter().position(|observation| {
                 observation.detcore_tree == detcore_tree
                     && observation.provenance == ObservationProvenance::Validate
@@ -4023,6 +4092,7 @@ fn apply_validate_results(
             }
         }
     }
+    *tracked = updated;
     Ok(fold)
 }
 
@@ -5241,6 +5311,13 @@ fn read_retained_results(
                 candidate.path.display()
             )
         })? {
+            ValidateRowEvidence::NotRun { reason } => {
+                return Err(format!(
+                    "malformed retained evidence for {} at {}: {reason}",
+                    display_id(&id),
+                    candidate.path.display()
+                ));
+            }
             ValidateRowEvidence::Unavailable { .. } => continue,
             ValidateRowEvidence::Matched { .. } | ValidateRowEvidence::Diverged { .. } => {}
         }
@@ -8217,7 +8294,7 @@ red/`measured-and-passed` count is **0**.",
             ResultCandidate {
                 evidence_identity: recovered_pass_identity,
                 path: PathBuf::from("fixture/results.jsonl"),
-                row: recovered_pass_row,
+                row: recovered_pass_row.clone(),
             },
         ],
     )]);
@@ -8255,33 +8332,208 @@ red/`measured-and-passed` count is **0**.",
         ));
     }
 
-    let fold_fixture_row = |row: ResultRow| -> Result<(TrackedCells, ValidateFold), String> {
-        let identity = row.evidence_identity()?;
-        let rows = BTreeMap::from([(
-            unlocated_id.clone(),
-            vec![ResultCandidate {
-                evidence_identity: identity,
+    let fold_fixture_rows =
+        |fixture_rows: Vec<ResultRow>| -> Result<(TrackedCells, ValidateFold), String> {
+            let candidates = fixture_rows
+                .into_iter()
+                .map(|row| {
+                    Ok(ResultCandidate {
+                        evidence_identity: row.evidence_identity()?,
+                        path: PathBuf::from("fixture/results.jsonl"),
+                        row,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let rows = BTreeMap::from([(unlocated_id.clone(), candidates)]);
+            let mut tracked = TrackedCells {
+                schema: SCHEMA,
+                projection: None,
+                cells: vec![bare_cell(&unlocated_id)],
+            };
+            let fold = apply_validate_results(
+                &mut tracked,
+                &rows,
+                "sha-1",
+                "tree-1",
+                &depth_fixture,
+                true,
+                true,
+            )?;
+            refresh_measurement(&mut tracked);
+            Ok((tracked, fold))
+        };
+    let fold_fixture_row = |row: ResultRow| fold_fixture_rows(vec![row]);
+
+    let mut not_run_row = validate_row.clone();
+    not_run_row.run_id = "fixture-recovered-not-run".into();
+    not_run_row.attempt = 1;
+    not_run_row.outcome = "ERROR".into();
+    not_run_row.first_divergent_scheduler_turn = None;
+    not_run_row.first_divergent_virtual_nanoseconds = None;
+    not_run_row.first_divergent_record = None;
+    not_run_row.first_divergent_syscall = None;
+    not_run_row.attempts = vec![validate_attempt("ERROR")];
+    let mut not_run_pass = recovered_pass_row.clone();
+    not_run_pass.run_id = not_run_row.run_id.clone();
+
+    for (label, rows) in [
+        (
+            "attempt-order",
+            vec![not_run_row.clone(), not_run_pass.clone()],
+        ),
+        (
+            "file-order",
+            vec![not_run_pass.clone(), not_run_row.clone()],
+        ),
+    ] {
+        let (tracked, fold) = fold_fixture_rows(rows)
+            .map_err(|error| format!("recovered NotRun {label} was refused: {error}"))?;
+        if fold.passed != 1
+            || fold.errored.len() != 1
+            || !fold.errored[0].contains("did not complete its first run")
+            || fold.reads_all_green()
+            || tracked.cells[0].measurement != MeasurementState::MeasuredAndPassed
+            || tracked.cells[0].last_tested.is_none()
+            || tracked.cells[0].observations.len() != 1
+            || tracked.cells[0].observations[0].results != BTreeSet::from([ObservedResult::Pass])
+        {
+            return Err(format!(
+                "recovered NotRun {label} did not retain only the later canonical PASS: {fold:?}"
+            ));
+        }
+    }
+
+    for (label, rows) in [
+        ("terminal", vec![not_run_row.clone()]),
+        (
+            "after-match",
+            vec![
+                {
+                    let mut first = not_run_pass.clone();
+                    first.attempt = 1;
+                    first
+                },
+                {
+                    let mut terminal = not_run_row.clone();
+                    terminal.attempt = 2;
+                    terminal
+                },
+            ],
+        ),
+        (
+            "different-run",
+            vec![not_run_row.clone(), {
+                let mut unrelated = not_run_pass.clone();
+                unrelated.run_id = "fixture-unrelated-run".into();
+                unrelated
+            }],
+        ),
+    ] {
+        let error = fold_fixture_rows(rows)
+            .expect_err("terminal or unrelated NotRun evidence was accepted");
+        if !error.contains("did not complete its first run") {
+            return Err(format!(
+                "{label} NotRun refusal did not name the missing first run: {error}"
+            ));
+        }
+    }
+    let mut mixed_terminal = not_run_row.clone();
+    mixed_terminal.run_id = "fixture-mixed-terminal-not-run".into();
+    mixed_terminal.attempts.push(no_result_row.attempts[0].clone());
+    if !fold_fixture_rows(vec![mixed_terminal])
+        .expect_err("mixed terminal NotRun evidence was accepted")
+        .contains("did not complete its first run")
+    {
+        return Err("mixed terminal NotRun refusal did not name the missing first run".into());
+    }
+
+    let mut later_divergence = validate_row.clone();
+    later_divergence.run_id = not_run_row.run_id.clone();
+    later_divergence.attempt = 2;
+    let (tracked, fold) = fold_fixture_rows(vec![not_run_row.clone(), later_divergence])?;
+    if fold.located != 1
+        || fold.errored.len() != 1
+        || tracked.cells[0].last_tested.is_none()
+        || tracked.cells[0].observations.len() != 1
+        || tracked.cells[0].observations[0].results
+            != BTreeSet::from([ObservedResult::DeterminismFailure])
+    {
+        return Err(format!(
+            "a later canonical divergence did not remain sticky after NotRun: {fold:?}"
+        ));
+    }
+
+    for (label, mut malformed) in [
+        ("wrong-hash", not_run_row.clone()),
+        ("missing-report", not_run_row.clone()),
+    ] {
+        if label == "wrong-hash" {
+            malformed.attempts[0]["verification_report_sha256"] = "0".repeat(64).into();
+        } else {
+            malformed.attempts[0]
+                .as_object_mut()
+                .unwrap()
+                .remove("verification_report");
+        }
+        if fold_fixture_rows(vec![malformed, not_run_pass.clone()]).is_ok() {
+            return Err(format!(
+                "{label} NotRun evidence was authorized by a later canonical PASS"
+            ));
+        }
+    }
+
+    let (tracked, fold) = fold_fixture_rows(vec![not_run_pass.clone(), not_run_pass.clone()])?;
+    if fold.passed != 1 || tracked.cells[0].observations.len() != 1 {
+        return Err("identical duplicate outer-attempt evidence was counted twice".into());
+    }
+    let mut conflicting_attempt = validate_row.clone();
+    conflicting_attempt.run_id = not_run_pass.run_id.clone();
+    conflicting_attempt.attempt = not_run_pass.attempt;
+    if !fold_fixture_rows(vec![not_run_pass, conflicting_attempt])
+        .expect_err("conflicting outer-attempt evidence was accepted")
+        .contains("conflicting evidence for outer attempt")
+    {
+        return Err("conflicting outer-attempt refusal was not explicit".into());
+    }
+
+    let mut atomic_first = recovered_pass_row.clone();
+    atomic_first.run_id = "fixture-atomic-refusal".into();
+    atomic_first.attempt = 1;
+    let mut atomic_malformed = atomic_first.clone();
+    atomic_malformed.attempt = 2;
+    atomic_malformed.attempts[0]["index"] = serde_json::json!(2);
+    let atomic_rows = [atomic_first, atomic_malformed]
+        .into_iter()
+        .map(|row| {
+            Ok(ResultCandidate {
+                evidence_identity: row.evidence_identity()?,
                 path: PathBuf::from("fixture/results.jsonl"),
                 row,
-            }],
-        )]);
-        let mut tracked = TrackedCells {
-            schema: SCHEMA,
-            projection: None,
-            cells: vec![bare_cell(&unlocated_id)],
-        };
-        let fold = apply_validate_results(
-            &mut tracked,
-            &rows,
-            "sha-1",
-            "tree-1",
-            &depth_fixture,
-            true,
-            true,
-        )?;
-        refresh_measurement(&mut tracked);
-        Ok((tracked, fold))
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut atomic_tracked = TrackedCells {
+        schema: SCHEMA,
+        projection: None,
+        cells: vec![bare_cell(&unlocated_id)],
     };
+    let atomic_before = encoded_cells(&atomic_tracked)?;
+    if !apply_validate_results(
+        &mut atomic_tracked,
+        &BTreeMap::from([(unlocated_id.clone(), atomic_rows)]),
+        "sha-1",
+        "tree-1",
+        &depth_fixture,
+        true,
+        true,
+    )
+    .expect_err("a malformed later attempt was accepted")
+    .contains("unreadable attempt record")
+        || encoded_cells(&atomic_tracked)? != atomic_before
+    {
+        return Err("validate evidence mutated the scorecard before a later refusal".into());
+    }
+
     let mut timed_out_no_result = validate_attempt("PASS");
     let timed_out_report =
         serde_json::to_string(&canonical_verdict::VerificationReport::no_result()).unwrap();
