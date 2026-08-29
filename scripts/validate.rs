@@ -2117,12 +2117,7 @@ cleared-caps refusal names {} starved step(s)",
             .find(|s| s.tag() == "build.workspace")
             .ok_or("full-plan bracket: portable debug test producer disappeared")?;
         if portable_build.cmd != DEBUG_TEST_PRODUCER_COMMAND
-            || portable_build.deps
-                != [
-                    "doc.rustdoc".to_string(),
-                    "gate.manifest".to_string(),
-                    "setup.nextest".to_string(),
-                ]
+            || portable_build.deps != ["doc.rustdoc".to_string()]
             || portable_build.hint.preferred_inner_jobs != Some(8)
             || portable_build.jobs_flag.as_deref() != Some("")
             || portable_build.jobs_env.as_deref() != Some("")
@@ -2137,7 +2132,8 @@ cleared-caps refusal names {} starved step(s)",
             ));
         }
         for (tag, required) in [
-            ("lint.clippy", &["setup.manifest_plan"][..]),
+            ("setup.nextest", &["setup.manifest_plan"][..]),
+            ("lint.clippy", &["setup.nextest"][..]),
             ("doc.doctests", &["lint.clippy"][..]),
             ("doc.rustdoc", &["doc.doctests"][..]),
         ] {
@@ -2151,6 +2147,19 @@ cleared-caps refusal names {} starved step(s)",
                 return Err(format!(
                     "full-plan bracket: {tag} must run in the fixed pre-producer Cargo chain: deps={:?}",
                     step.deps
+                ));
+            }
+        }
+        let envelope = full
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "test.envelope_levels")
+            .ok_or("full-plan bracket: envelope test disappeared")?;
+        for required in ["build.workspace", "gate.manifest"] {
+            if !envelope.deps.iter().any(|dependency| dependency == required) {
+                return Err(format!(
+                    "full-plan bracket: envelope test can start before required dependency {required}"
                 ));
             }
         }

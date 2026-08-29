@@ -150,10 +150,11 @@
       "hint": {"est_duration_s": 20, "rss_baseline_bytes": 268435456,
                "hard_mem_max_bytes": 1073741824, "classification": "light"}
     },
-      {
+    {
       "group": "setup", "job": "nextest",
       "desc": "cargo-nextest available",
       "cmd": "cargo nextest show-config version >/dev/null 2>&1 || if command -v with-proxy >/dev/null 2>&1; then with-proxy cargo install cargo-nextest --locked --version 0.9.100; else cargo install cargo-nextest --locked --version 0.9.100; fi",
+      "deps": ["setup.manifest_plan"],
       "timeout": 600,
       "hint": {"est_duration_s": 30, "rss_baseline_bytes": 536870912,
                "hard_mem_max_bytes": 2147483648, "classification": "light"}
@@ -163,7 +164,7 @@
       "desc": "Build the debug test targets before their concurrent consumers",
       "description": "TEST-PROFILE PRODUCER 2026-08-29 (task twenty-one-steps-share-a-cargo-target-so-compile-work-migrates-between-them): the former cargo build --all-targets used the dev profile while every cargo-nextest consumer uses the test profile, so it did not prebuild what those nodes execute. The producer also ran at CARGO_BUILD_JOBS=32 while consumers ran at 8 or the runner default 1; Cargo build-script state changed with that value. Two same-commit cold measurements exchanged 284-293 CPU-seconds of compilation between test.hermit_modes and test.command_strict_verify solely according to which started first. These three cargo-nextest list invocations build the exact package/feature/target classes later nodes use. The 21 consumers hard-code the same CARGO_BUILD_JOBS=8 and opt out of the runner's inherited jobs environment; otherwise a concurrent plan can clamp each consumer to four, invalidate Cargo build-script fingerprints, and reintroduce compilation after the producer. A later full run proved matching width alone insufficient: Clippy, doctests and rustdoc still rewrote the shared target after this producer, one test timed out after recompiling, and another lost its selected executable while a sibling Cargo command replaced it. Those three writers now run in a fixed chain before this final producer. They overlap the longer manifest audit, so correctness does not require serializing the test consumers or adding their durations to the full-run critical path. This keeps the shared target cache rather than rebuilding dependencies in per-step target directories. Cold measurement at hermit 02d9787363: the three producer invocations took 106.94s wall / 692.21 CPU-s total versus 78.41s / 705.36 CPU-s for the old build command; the extra 28.53 wall-seconds moves already-required compilation ahead of the consumers without increasing compile CPU. The final Hermit selection produces target/debug/hermit for the verified E2E artifact publisher. Release artifacts remain a separate profile.",
       "cmd": "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh cargo nextest list ${CI:+--profile ci} --workspace --exclude hermit-detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests --message-format json >/dev/null && CARGO_BUILD_JOBS=8 cargo nextest list ${CI:+--profile ci} -p hermit-detcore --lib --bins --tests --message-format json >/dev/null && CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --lib --bins --tests --message-format json >/dev/null",
-      "deps": ["doc.rustdoc", "e2e.metadata", "setup.nextest"],
+      "deps": ["doc.rustdoc"],
       "timeout": 1200,
       "jobs_flag": "",
       "jobs_env": "",
@@ -203,7 +204,7 @@
       "hint": {"est_duration_s": 120, "rss_baseline_bytes": 4294967296,
                "hard_mem_max_bytes": 6442450944, "classification": "cpu-bound"}
     },
-        {
+    {
       "group": "e2e", "job": "metadata",
       "desc": "Validate E2E metadata, generated test footprints, and required-cell plan",
       "description": "MEASURED 2026-08-09 at hermit 93575493 after the Rust validate cutover: the warm audit-ci subroutine completed in 71.44s, 72.11s, and 73.84s wall (58.36-60.38s CPU), and the complete command passed in 73.77s. The former 60s ceiling was therefore below intrinsic CPU demand, not detecting a hang. The host was loaded (load 78.58 on 316 CPUs; CPU PSI some 5.74%), but CPU time alone reached the ceiling and all samples made forward progress through footprint generation, splitter, inventory, and correspondence checks. 180s preserves >2.4x headroom for observed host variance without changing the command or hiding failures; a real hang still terminates and records a timeout.",
@@ -391,12 +392,12 @@
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
                "classification": "latency-bound"}
     },
-        {
+    {
       "group": "lint", "job": "clippy",
       "desc": "Clippy (cargo clippy --workspace --all-targets --all-features -D warnings)",
       "description": "FEATURE SCOPE 2026-08-25 (task workspace-clippy-gate-never-sees-the-dbt-feature): --all-features added. Without it this gate ran hermit-cli's default feature set, so the DBT, SaBRe, e9patch and third-party-backends paths were never linted. --all-features deliberately picks up future features without another manual widening. ORDERING 2026-08-29: this is the first of three Cargo commands that may rewrite target/debug before build.workspace produces the exact test-profile artifacts. The chain overlaps the longer manifest audit; it must finish before the producer so no test consumer can lose or rebuild an artifact while another consumer is running it. MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 279248896 bytes after the feature widening; the larger width-8 historical calibration of 4.0 GiB governs. The 4-GiB baseline preserves that floor and the 6-GiB hard cap adds 2 GiB of headroom. CPU WIDTH remains pinned at 8 by CARGO_BUILD_JOBS and preferred_inner_jobs; jobs_flag stays empty because appending '-j 8' would reach rustc. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
       "cmd": "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh cargo clippy --workspace --all-targets --all-features -- -D warnings",
-      "deps": ["setup.manifest_plan"],
+      "deps": ["setup.nextest"],
       "timeout": 1200,
       "jobs_flag": "",
       "jobs_env": "",
@@ -407,14 +408,14 @@
     {
       "group": "doc", "job": "doctests",
       "desc": "Test workspace documentation (cargo test --workspace --features third-party-backends --doc)",
-      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> cargo defaulted the build phase to nproc). rss_baseline=measured_peak@j8=208MiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=2.0GiB (was 5GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv. CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 mirrors the leading CARGO_BUILD_JOBS=8 prefix. See doc.rustdoc for the shared derivation; jobs_flag is empty so the declaration sizes the cgroup box only and never edits argv.",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> cargo defaulted the build phase to nproc). The old 208MiB baseline was measured warm after build.workspace. Moving this writer before the final producer exposed the missing cold case: full run 9f6a1742ec7f hit the 2GiB MemoryMax after 32 seconds and four cgroup OOM kills while still compiling dependencies. A 2GiB scheduling baseline now records that proved lower bound and a 4GiB hard cap leaves another 2GiB without returning to the former unmeasured 5GiB. CPU WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 mirrors the leading CARGO_BUILD_JOBS=8 prefix. See doc.rustdoc for the shared derivation; jobs_flag is empty so the declaration sizes the cgroup box only and never edits argv.",
       "cmd": "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh cargo test --workspace --features third-party-backends --doc",
       "deps": ["lint.clippy"],
       "timeout": 900,
       "jobs_flag": "",
       "jobs_env": "",
-      "hint": {"est_duration_s": 180, "rss_baseline_bytes": 218103808,
-               "hard_mem_max_bytes": 2147483648, "classification": "cpu-bound",
+      "hint": {"est_duration_s": 180, "rss_baseline_bytes": 2147483648,
+               "hard_mem_max_bytes": 4294967296, "classification": "cpu-bound",
                "preferred_inner_jobs": 8}
     },
     {
@@ -639,7 +640,7 @@
       "desc": "Portable working-envelope levels (L1-L4 over true/echo/date; implemented by scripts/validate.rs)",
       "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 28729344 bytes and the historical completed maximum is 61661184 bytes. The 128-MiB baseline is above both the p90-plus-20-percent estimate and that floor; the 1-GiB hard cap leaves 896 MiB of runaway headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
       "cmd": "set -e; HERMIT=target/debug/hermit; ARGS='run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled'; REPS=${L4_REPS:-20}; EXECUTED=0; publish_counts() { local status=$? count_status; trap - EXIT; set +e; ./ci/write-structured-test-counts.sh \"$EXECUTED\" 0; count_status=$?; if ((status == 0 && count_status != 0)); then status=$count_status; fi; exit \"$status\"; }; trap publish_counts EXIT; run_probe() { local id=\"$1\"; local c=\"$2\"; EXECUTED=$((EXECUTED + 1)); printf '##TEST-START %s\\n' \"$id\" >&2; timeout 30s $HERMIT $ARGS --strict -- $c </dev/null >&2; timeout 30s $HERMIT $ARGS --strict --verify -- $c </dev/null >&2; timeout 30s $HERMIT $ARGS --strict --verify --detlog-heap --detlog-stack -- $c </dev/null >&2; local i; for ((i=0;i<REPS;i++)); do timeout 30s $HERMIT $ARGS --strict --verify -- $c </dev/null >&2; done; printf '##TEST-END %s PASS\\n' \"$id\" >&2; }; run_probe true '/bin/true'; run_probe echo '/bin/echo hermit-envelope'; run_probe date '/bin/date -u +%Y'",
-      "deps": ["build.workspace"],
+      "deps": ["build.workspace", "e2e.metadata"],
       "timeout": 900,
       "hint": {"est_duration_s": 120,
                "rss_baseline_bytes": 134217728, "hard_mem_max_bytes": 1073741824,
