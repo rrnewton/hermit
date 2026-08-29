@@ -1846,9 +1846,10 @@ const CONTAINER_REPLACED_TMP: &str = "/tmp";
 /// hypothesis cost real investigation time, and it came from this message saying
 /// only "No such file or directory".
 ///
-/// It matters more than a stray report: the project's own landing recipe is
-/// `git worktree add --detach /tmp/<name> origin/main`, so an agent following the
-/// documented workflow lands in the one subtree where this fires.
+/// It mattered more than a stray report because the historical landing recipe
+/// placed detached worktrees below `/tmp`, exactly where this fires. Current
+/// dev-hermit worktrees are created through wrkslots below `worktrees/`, but the
+/// diagnostic remains necessary for arbitrary callers and older checkouts.
 ///
 /// The message names the mechanism and both ways out. It deliberately does NOT
 /// silently fall back to `/`: changing the guest's working directory out from

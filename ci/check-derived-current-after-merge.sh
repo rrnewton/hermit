@@ -113,12 +113,6 @@ if [[ -n $(git status --porcelain) ]]; then
     exit 1
 fi
 
-scratch=$(mktemp -d)
-worktree="$scratch/merged"
-# shellcheck disable=SC2317 # invoked indirectly by the trap below
-cleanup() { git worktree remove --force "$worktree" >/dev/null 2>&1 || true; rm -rf "$scratch"; }
-trap cleanup EXIT
-
 # Resolve HEAD to a SHA in THIS repo before handing it to the scratch worktree.
 # `git -C "$worktree" merge HEAD` resolves HEAD *inside that worktree*, where it is
 # the base commit -- so the merge is a no-op and the script silently checks the BASE
@@ -127,7 +121,65 @@ trap cleanup EXIT
 # refused. Pass the SHA, never the symbolic name.
 head_sha=$(git rev-parse HEAD)
 
-git worktree add --quiet --detach "$worktree" "$BASE_REF"
+parent_root=${DEV_HERMIT_PARENT:-$(git rev-parse --show-superproject-working-tree 2>/dev/null || true)}
+wrkslots="$parent_root/ci-hub/bin/wrkslots"
+if [[ -z $parent_root || ! -x $wrkslots ]]; then
+    echo "check-derived-current-after-merge: wrkslots is unavailable." >&2
+    echo "  state: REFUSED -- the merged tree was not created and the generator never ran." >&2
+    echo "  remedy: run from a dev-hermit slot with DEV_HERMIT_PARENT set, or ask the coordinator to provide one." >&2
+    exit 1
+fi
+slot="derived-${head_sha:0:12}-$$"
+slot_created=0
+worktree=""
+# shellcheck disable=SC2317 # invoked indirectly by the trap below
+cleanup() {
+    local rc=$?
+    trap - EXIT
+    if [[ $slot_created -eq 1 ]]; then
+        cleanup_output=$(
+            "$wrkslots" --allow-existing-unregistered-worktrees \
+                remove "$slot" --validate-complete \
+                --coordinator-pid "$$" --expected-generation 1 2>&1
+        )
+        cleanup_rc=$?
+        if [[ $cleanup_rc -ne 0 ]]; then
+            printf '%s\n' \
+                "check-derived-current-after-merge: validation checkout RETAINED after wrkslots cleanup refused." \
+                "  state: RETAINED -- the check exit remains $rc; cleanup did not complete." \
+                "  remedy: $cleanup_output" >&2
+        fi
+    fi
+    exit "$rc"
+}
+trap cleanup EXIT
+
+create_output=$(
+    "$wrkslots" --allow-existing-unregistered-worktrees \
+        create "$slot" --format json --slot-type validate \
+        --coordinator-authorized --agent "derived-check-$$" \
+        --task "derived-current-after-merge" \
+        --purpose "evaluate derived artifacts in the prospective merged tree" \
+        --owner-pid "$$" --coordinator-pid "$$" \
+        --repo checkout=hermit --start "checkout=$BASE_REF"
+)
+create_rc=$?
+if [[ $create_rc -ne 0 ]]; then
+    echo "check-derived-current-after-merge: wrkslots refused the validation checkout." >&2
+    echo "  state: REFUSED -- the merged tree was not created and the generator never ran." >&2
+    echo "  remedy: follow the wrkslots refusal above, then rerun this check." >&2
+    exit 1
+fi
+slot_created=1
+worktree=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["checkouts"][0]["path"])' <<<"$create_output")
+parse_rc=$?
+if [[ $parse_rc -ne 0 || ! -d $worktree ]]; then
+    echo "check-derived-current-after-merge: wrkslots returned no readable checkout path." >&2
+    echo "  state: REFUSED -- the generator never ran." >&2
+    echo "  remedy: run '$wrkslots status --slot $slot --format json' and inspect the recorded path." >&2
+    exit 1
+fi
+
 if ! git -C "$worktree" -c core.hooksPath=/dev/null merge --no-edit --no-ff "$head_sha" >/dev/null 2>&1; then
     echo "check-derived-current-after-merge: HEAD does not merge cleanly onto $BASE_REF." >&2
     echo "  Rebase first; the derived artifacts cannot be judged against a tree that" >&2
