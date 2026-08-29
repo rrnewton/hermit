@@ -56,6 +56,7 @@ use hermit_manifest_plan::host_capability::HostCapability;
 use hermit_manifest_plan::runner::AttemptResult;
 use hermit_manifest_plan::runner::CELL_RESULT_SCHEMA;
 use hermit_manifest_plan::runner::CellResult;
+use hermit_manifest_plan::runner::cell_result_after_retries;
 use hermit_manifest_plan::runner::E2E_RUN_INDEX_ENV;
 use serde::Deserialize;
 use serde::Serialize;
@@ -4129,7 +4130,7 @@ fn summarize(
                             .iter()
                             .map(|row| result_artifact_dir(results, row))
                             .collect::<Result<Vec<_>, _>>();
-                        let row = result_rows.last().expect("nonempty result rows");
+                        let row = cell_result_after_retries(&result_rows)?;
                         let row_matches = result_row_matches_cell(
                             row,
                             &evidence_run_id,
@@ -4141,7 +4142,7 @@ fn summarize(
                         let runner_completed =
                             runner_observed_terminal_attempt(runner, harness_status);
                         match artifact_dirs {
-                            Ok(artifact_dirs)
+                            Ok(_)
                                 if identities_match
                                     && row_matches
                                     && (proven_oom || runner_completed) =>
@@ -4155,7 +4156,7 @@ fn summarize(
                                             row.error_kind.clone(),
                                             row.attempt,
                                             Some(invocation),
-                                            artifact_dirs.last().cloned(),
+                                            Some(result_artifact_dir(results, row)?),
                                         )
                                     }
                                     Err(error) => {
@@ -4285,12 +4286,11 @@ fn summarize(
                 passing.push(display_id(cell));
             }
             // ⚠️ AN EARLIER ATTEMPT THAT DIVERGED IS STILL AN OBSERVATION.
-            // The row above reports the TERMINAL attempt, which is what the
-            // harness exit describes. An attempt before it that located a
-            // divergence is emitted as its own row carrying the same repetition
-            // and its own attempt ordinal, so the observation is recorded instead
-            // of being dropped when a retry happens to pass. A flake is exactly
-            // "diverged, then passed".
+            // The row above reports the framework-selected cell result: a passing
+            // retry is green, while a product failure stays red if every retry
+            // fails. Any other attempt that located a divergence is emitted as its
+            // own row carrying the same repetition and its own attempt ordinal, so
+            // the observation is not dropped when a retry happens to pass.
             //
             // ⚠️ THIS CANNOT MOVE A STATUS. These rows only add observations, and
             // observations feed `measurement`; `status` is owned by a different
@@ -4301,6 +4301,9 @@ fn summarize(
                         &result_rows_for_history,
                         terminal.attempt,
                     ) {
+                        if earlier_row.attempt == attempt {
+                            continue;
+                        }
                         let earlier_invocation = result_row_invocation(earlier_row)?;
                         let earlier_artifact_dir = result_artifact_dir(results, earlier_row)?;
                         let earlier_verification = read_verification_report(
@@ -4909,9 +4912,18 @@ fn self_test(root: &Path) -> Result<(), String> {
                 earlier.len()
             ));
         }
-        let terminal = all.last().ok_or("a terminal row must still be selected")?;
-        if terminal.attempt != 2 || terminal.outcome != "PASS" {
-            return Err("the terminal retry must remain the cell's reported row".into());
+        let reported = cell_result_after_retries(&all)?;
+        if reported.attempt != 2 || reported.outcome != "PASS" {
+            return Err("a passing retry must remain the cell's reported row".into());
+        }
+        let mut product_then_infrastructure = all.clone();
+        product_then_infrastructure[1].outcome = "ERROR".into();
+        let reported = cell_result_after_retries(&product_then_infrastructure)?;
+        if reported.attempt != 1 || reported.outcome != "FAIL" {
+            return Err(
+                "a product failure must remain the reported result when its retry has an infrastructure error"
+                    .into(),
+            );
         }
         let both_clean = format!(
             "{}\n{}\n",

@@ -184,13 +184,8 @@ fn validation_step_identity(step: &Step) -> ValidationStepIdentity {
     }
 }
 
-fn set_manifest_attempt(step: &mut Step, attempt: usize) {
-    if validation_step_identity(step) == ValidationStepIdentity::ManifestRun {
-        step.env.insert(
-            validate_plan::E2E_ATTEMPT_ENV.into(),
-            attempt.to_string(),
-        );
-    }
+fn is_manifest_run_step(step: &Step) -> bool {
+    validation_step_identity(step) == ValidationStepIdentity::ManifestRun
 }
 
 const LEDGER_ENV: &str = "HERMIT_VALIDATE_LEDGER";
@@ -2180,14 +2175,9 @@ cleared-caps refusal names {} starved step(s)",
                     consumer.tag(), consumer.cmd
                 ));
             }
-            if consumer
-                .env
-                .get(validate_plan::E2E_ATTEMPT_ENV)
-                .map(String::as_str)
-                != Some("1")
-            {
+            if consumer.env.contains_key("E2E_ATTEMPT") {
                 return Err(format!(
-                    "full-plan bracket: {} does not declare initial E2E attempt 1: {:?}",
+                    "full-plan bracket: {} still receives the outer E2E_ATTEMPT variable: {:?}",
                     consumer.tag(), consumer.env
                 ));
             }
@@ -8827,37 +8817,36 @@ mod scheduler_explanation_tests {
         let quick_manifest = "quick.e2e_verify";
         let ordinary = "test.cli";
         let never_launched = "e2e.manifest_c_programs";
+        let manifest_step = |group: &str, job: &str| {
+            let mut step = step_with_caps(
+                group,
+                job,
+                "fixture",
+                "false".into(),
+                Vec::new(),
+                30,
+                30,
+                64 * 1024 * 1024,
+            );
+            step.manifest = Some(DagManifest {
+                lane: "portable".into(),
+                category: job.into(),
+            });
+            step
+        };
         let cfg = DagConfig {
             steps: vec![
-                step_with_caps(
+                manifest_step(
                     "e2e",
                     "manifest_applications",
-                    "fixture",
-                    "false".into(),
-                    Vec::new(),
-                    30,
-                    30,
-                    64 * 1024 * 1024,
                 ),
-                step_with_caps(
+                manifest_step(
                     "privileged-e2e",
                     "manifest_backend_parity_c",
-                    "fixture",
-                    "false".into(),
-                    Vec::new(),
-                    30,
-                    30,
-                    64 * 1024 * 1024,
                 ),
-                step_with_caps(
+                manifest_step(
                     "quick",
                     "e2e_verify",
-                    "fixture",
-                    "false".into(),
-                    Vec::new(),
-                    30,
-                    30,
-                    64 * 1024 * 1024,
                 ),
                 step_with_caps(
                     "test",
@@ -8869,15 +8858,9 @@ mod scheduler_explanation_tests {
                     30,
                     64 * 1024 * 1024,
                 ),
-                step_with_caps(
+                manifest_step(
                     "e2e",
                     "manifest_c_programs",
-                    "fixture",
-                    "false".into(),
-                    Vec::new(),
-                    30,
-                    30,
-                    64 * 1024 * 1024,
                 ),
             ],
             ..Default::default()
@@ -9219,6 +9202,25 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     ));
     std::fs::create_dir(&tmp)
         .map_err(|e| format!("scheduler accounting: cannot create {}: {e}", tmp.display()))?;
+    let evidence_dir = tmp.join("dagrun-evidence");
+    std::fs::create_dir(&evidence_dir).map_err(|e| {
+        format!(
+            "scheduler accounting: cannot create private evidence directory {}: {e}",
+            evidence_dir.display()
+        )
+    })?;
+    std::fs::set_permissions(&evidence_dir, std::fs::Permissions::from_mode(0o700)).map_err(
+        |e| {
+            format!(
+                "scheduler accounting: cannot make evidence directory private {}: {e}",
+                evidence_dir.display()
+            )
+        },
+    )?;
+    let prior_dagrun_log_dir = std::env::var_os("DAGRUN_LOG_DIR");
+    // SAFETY: this self-test runs its scheduler fixtures serially. Restored
+    // immediately after the bracket, including when a fixture returns Err.
+    unsafe { std::env::set_var("DAGRUN_LOG_DIR", &evidence_dir) };
 
     let result = (|| -> Result<(), String> {
     let step = |job: &str, cmd: &str| {
@@ -10444,8 +10446,19 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     // ordinals at one.
     let e2e_attempts = tmp.join("e2e-attempts");
     let e2e_log = tmp.join("e2e-attempts.log");
+    let structured_counts = serde_json::json!({
+        "schema": 2,
+        "executed_tests": 2,
+        "filtered_tests": 0,
+        "results": [
+            {"id": "failing-cell", "result": "fail", "attempts": 2},
+            {"id": "passing-peer", "result": "pass", "attempts": 1},
+        ],
+    })
+    .to_string();
     let e2e_cmd = format!(
-        "printf '%s\\n' \"$E2E_ATTEMPT\" >> {}; exit 1",
+        "printf '%s\\n' {} > \"$DAGRUN_TEST_COUNTS_PATH\"; printf '%s\\n' run >> {}; exit 1",
+        validate_plan::shell_quote(&structured_counts),
         validate_plan::shell_quote(&e2e_attempts.to_string_lossy()),
     );
     let mut e2e_step = step("manifest_attempt", &e2e_cmd);
@@ -10455,7 +10468,6 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         lane: "portable".into(),
         category: "applications".into(),
     });
-    set_manifest_attempt(&mut e2e_step, 1);
     let e2e_retry = run_lane_with_env_retries(
         &DagConfig { steps: vec![e2e_step], ..Default::default() },
         1,
@@ -10474,16 +10486,74 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         .attempts
         .iter()
         .filter(|attempt| attempt.tag == "e2e.manifest_attempt")
-        .count();
+        .collect::<Vec<_>>();
+    let e2e_results = e2e_node_attempts
+        .first()
+        .and_then(|attempt| attempt.test_results.as_ref());
     if e2e_retry.ok
         || e2e_retry.env_retries != 0
-        || e2e_node_attempts != 1
-        || recorded_attempts.lines().collect::<Vec<_>>() != ["1"]
+        || e2e_node_attempts.len() != 1
+        || e2e_results
+            != Some(&vec![
+                dagrun::TestResult::new("failing-cell".into(), false, 2)?,
+                dagrun::TestResult::new("passing-peer".into(), true, 1)?,
+            ])
+        || recorded_attempts.lines().collect::<Vec<_>>() != ["run"]
     {
         return Err(format!(
-            "scheduler accounting: outer scheduler retried an executed manifest node: \
-             ok={} retries={} attempts={} rows={recorded_attempts:?}",
-            e2e_retry.ok, e2e_retry.env_retries, e2e_node_attempts
+            "scheduler accounting: manifest framework retry did not preserve the 2/1/1 proof: \
+             ok={} retries={} node_attempts={} results={e2e_results:?} rows={recorded_attempts:?}",
+            e2e_retry.ok, e2e_retry.env_retries, e2e_node_attempts.len()
+        ));
+    }
+
+    // The same real scheduler node without typed manifest identity is the
+    // control: its outer retry runs the whole payload twice, including the
+    // passing peer represented in the structured result.
+    let ordinary_attempts = tmp.join("ordinary-structured-attempts");
+    let ordinary_log = tmp.join("ordinary-structured-attempts.log");
+    let ordinary_cmd = format!(
+        "printf '%s\\n' {} > \"$DAGRUN_TEST_COUNTS_PATH\"; printf '%s\\n' run >> {}; exit 1",
+        validate_plan::shell_quote(&structured_counts),
+        validate_plan::shell_quote(&ordinary_attempts.to_string_lossy()),
+    );
+    let ordinary_retry = run_lane_with_env_retries(
+        &DagConfig { steps: vec![step("ordinary_structured", &ordinary_cmd)], ..Default::default() },
+        1,
+        true,
+        0,
+        None,
+        &ordinary_log,
+        None,
+        1,
+        &BTreeMap::new(),
+        false,
+    );
+    let ordinary_node_attempts = ordinary_retry
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.tag == "fixture.ordinary_structured")
+        .collect::<Vec<_>>();
+    let ordinary_runs = std::fs::read_to_string(&ordinary_attempts)
+        .map_err(|e| format!("scheduler accounting: cannot read ordinary retry fixture: {e}"))?;
+    if ordinary_retry.ok
+        || ordinary_retry.env_retries != 1
+        || ordinary_node_attempts.len() != 2
+        || ordinary_node_attempts.iter().any(|attempt| {
+            attempt.test_results.as_ref().is_none_or(|results| {
+                results.iter().find(|result| result.id == "passing-peer").is_none_or(|peer| {
+                    !peer.passed || peer.attempts != 1
+                })
+            })
+        })
+        || ordinary_runs.lines().count() != 2
+    {
+        return Err(format!(
+            "scheduler accounting: ordinary-node control did not rerun its passing peer: \
+             ok={} retries={} node_attempts={} rows={ordinary_runs:?}",
+            ordinary_retry.ok,
+            ordinary_retry.env_retries,
+            ordinary_node_attempts.len()
         ));
     }
 
@@ -11212,6 +11282,11 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     Ok(())
     })();
 
+    match prior_dagrun_log_dir {
+        Some(value) => unsafe { std::env::set_var("DAGRUN_LOG_DIR", value) },
+        None => unsafe { std::env::remove_var("DAGRUN_LOG_DIR") },
+    }
+
     let cleanup = std::fs::remove_dir_all(&tmp)
         .map_err(|e| format!("scheduler accounting: cannot remove {}: {e}", tmp.display()));
     match (result, cleanup) {
@@ -11287,12 +11362,8 @@ fn run_lane_with_env_retries(
         };
     }
     let mut round_log_start = settled_log_len(log_path);
-    let mut first_cfg = cfg.clone();
-    for step in &mut first_cfg.steps {
-        set_manifest_attempt(step, 1);
-    }
     let first = run_dag_boxed_deadline(
-        &first_cfg,
+        cfg,
         jobs,
         keep_going,
         verbosity,
@@ -11534,10 +11605,6 @@ fn run_lane_with_env_retries(
         let mut retry_cfg = cfg.clone();
         retry_cfg.description = format!("{} — retry round {env_retries}", cfg.description);
         retry_cfg.steps = steps;
-        for step in &mut retry_cfg.steps {
-            let attempt = next_attempt_ordinal(&attempts, &step.tag());
-            set_manifest_attempt(step, attempt);
-        }
         // Everything before this byte belongs to an earlier scheduler
         // invocation. The retry may emit no detail at all; that must stay
         // unknown rather than inheriting a stale banner through whole-log rfind.
@@ -14356,6 +14423,12 @@ fn retain_cells_with_retry_attempt_available(
     keep.retain(|tag| retry_attempt_available(cfg, attempts, tag));
 }
 
+fn is_manifest_run_tag(cfg: &DagConfig, tag: &str) -> bool {
+    cfg.steps
+        .iter()
+        .any(|step| step.tag() == tag && is_manifest_run_step(step))
+}
+
 fn retry_candidate_tags(
     cfg: &DagConfig,
     blocked: &[(String, String)],
@@ -14369,6 +14442,12 @@ fn retry_candidate_tags(
     keep.extend(by_tag.values().filter(|outcome| outcome.aborted).map(|outcome| outcome.tag.clone()));
     keep.extend(unreported_non_intentional_steps(cfg, by_tag, skipped));
     keep.extend(latest_unreported.iter().cloned());
+    // The framework already spends a manifest cell's retry inside test-harness.
+    // Keep every manifest node out of later scheduler graphs, whether its first
+    // graph result was a reported failure, dependency skip, abort, or no report.
+    // Those incomplete states remain explicit evidence; retrying the category
+    // here would rerun passing peers beside the cell that failed.
+    keep.retain(|tag| !is_manifest_run_tag(cfg, tag));
     retain_cells_with_retry_attempt_available(&mut keep, cfg, attempts);
     keep
 }
@@ -17216,11 +17295,10 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
 mod e2e_attempt_tests {
     use super::*;
 
-    #[test]
-    fn only_manifest_harness_steps_receive_the_retry_attempt() {
-        let mut manifest = step_with_caps(
-            "quick",
-            "e2e_verify",
+    fn manifest_step(job: &str) -> Step {
+        let mut step = step_with_caps(
+            "e2e",
+            job,
             "fixture",
             "target/debug/test-harness run --lane portable --ci-only".into(),
             Vec::new(),
@@ -17228,71 +17306,150 @@ mod e2e_attempt_tests {
             30,
             64 * 1024 * 1024,
         );
-        assert_eq!(
-            validation_step_identity(&manifest),
-            ValidationStepIdentity::ManifestRun
-        );
-        set_manifest_attempt(&mut manifest, 2);
-        assert_eq!(
-            manifest
-                .env
-                .get(validate_plan::E2E_ATTEMPT_ENV)
-                .map(String::as_str),
-            Some("2")
-        );
+        step.manifest = Some(DagManifest {
+            lane: "portable".into(),
+            category: "applications".into(),
+        });
+        step
+    }
 
-        let mut unrelated = step_with_caps(
+    fn ordinary_step(job: &str) -> Step {
+        step_with_caps(
             "test",
-            "unit",
+            job,
             "fixture",
             "cargo test".into(),
             Vec::new(),
             30,
             30,
             64 * 1024 * 1024,
-        );
-        set_manifest_attempt(&mut unrelated, 2);
-        assert!(!unrelated.env.contains_key(validate_plan::E2E_ATTEMPT_ENV));
+        )
+    }
 
-        let mut relabelled = step_with_caps(
-            "fixture",
-            "custom_manifest_runner",
-            "fixture",
-            "./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane portable"
-                .into(),
-            Vec::new(),
-            30,
-            30,
-            64 * 1024 * 1024,
+    fn outcome(tag: &str, ok: bool, aborted: bool) -> StepOutcome {
+        StepOutcome {
+            tag: tag.into(),
+            ok,
+            duration_s: 0.0,
+            summary: String::new(),
+            executed_tests: None,
+            filtered_tests: None,
+            test_results: None,
+            returncode: Some(if ok { 0 } else { 1 }),
+            oomed: false,
+            oom_kills: 0,
+            timed_out: false,
+            cpu_timed_out: false,
+            reason: if ok { String::new() } else { "fixture failure".into() },
+            aborted,
+        }
+    }
+
+    fn assert_only_ordinary(keep: BTreeSet<String>, ordinary: &str, source: &str) {
+        assert_eq!(keep, BTreeSet::from([ordinary.to_string()]), "source={source}");
+    }
+
+    #[test]
+    fn manifest_harness_steps_do_not_receive_an_outer_attempt() {
+        let manifest = manifest_step("manifest_applications");
+        assert_eq!(validation_step_identity(&manifest), ValidationStepIdentity::ManifestRun);
+        assert!(!manifest.env.contains_key("E2E_ATTEMPT"));
+
+        let ordinary = ordinary_step("unit");
+        assert_eq!(validation_step_identity(&ordinary), ValidationStepIdentity::Other);
+        assert!(!ordinary.env.contains_key("E2E_ATTEMPT"));
+    }
+
+    #[test]
+    fn manifest_harness_steps_never_enter_an_outer_retry_from_any_source() {
+        let manifest = manifest_step("manifest_applications");
+        let ordinary = ordinary_step("unit");
+        let manifest_tag = manifest.tag();
+        let ordinary_tag = ordinary.tag();
+        let cfg = DagConfig { steps: vec![manifest, ordinary], ..Default::default() };
+
+        let failed_by_tag = BTreeMap::from([
+            (manifest_tag.clone(), outcome(&manifest_tag, false, false)),
+            (ordinary_tag.clone(), outcome(&ordinary_tag, false, false)),
+        ]);
+        let failed_attempts = vec![
+            reported_attempt(failed_by_tag.get(&manifest_tag).unwrap(), 1),
+            reported_attempt(failed_by_tag.get(&ordinary_tag).unwrap(), 1),
+        ];
+        assert_only_ordinary(
+            retry_candidate_tags(
+                &cfg,
+                &[
+                    (manifest_tag.clone(), "always-eligible".into()),
+                    (ordinary_tag.clone(), "always-eligible".into()),
+                ],
+                &[],
+                &failed_by_tag,
+                &BTreeSet::new(),
+                &failed_attempts,
+            ),
+            &ordinary_tag,
+            "reported failure/blocked",
         );
-        assert_eq!(
-            validation_step_identity(&relabelled),
-            ValidationStepIdentity::Other
+
+        assert_only_ordinary(
+            retry_candidate_tags(
+                &cfg,
+                &[],
+                &[manifest_tag.clone(), ordinary_tag.clone()],
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                &[],
+            ),
+            &ordinary_tag,
+            "dependency-skipped",
         );
-        relabelled.manifest = Some(DagManifest {
-            lane: "portable".into(),
-            category: "applications".into(),
-        });
-        assert_eq!(
-            validation_step_identity(&relabelled),
-            ValidationStepIdentity::ManifestRun
+
+        let aborted_by_tag = BTreeMap::from([
+            (manifest_tag.clone(), outcome(&manifest_tag, false, true)),
+            (ordinary_tag.clone(), outcome(&ordinary_tag, false, true)),
+        ]);
+        assert_only_ordinary(
+            retry_candidate_tags(
+                &cfg,
+                &[],
+                &[],
+                &aborted_by_tag,
+                &BTreeSet::new(),
+                &[],
+            ),
+            &ordinary_tag,
+            "aborted by_tag",
         );
-        set_manifest_attempt(&mut relabelled, 1);
-        assert_eq!(
-            relabelled
-                .env
-                .get(validate_plan::E2E_ATTEMPT_ENV)
-                .map(String::as_str),
-            Some("1")
+
+        assert_only_ordinary(
+            retry_candidate_tags(
+                &cfg,
+                &[],
+                &[],
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                &[],
+            ),
+            &ordinary_tag,
+            "derived unreported",
         );
-        let relabelled_cfg = DagConfig {
-            steps: vec![relabelled],
-            ..Default::default()
-        };
-        assert!(!retry_attempt_available(
-            &relabelled_cfg,
-            &[unreported_attempt("fixture.custom_manifest_runner".into(), 1)],
-            "fixture.custom_manifest_runner"
-        ));
+
+        let completed_by_tag = BTreeMap::from([
+            (manifest_tag.clone(), outcome(&manifest_tag, true, false)),
+            (ordinary_tag.clone(), outcome(&ordinary_tag, true, false)),
+        ]);
+        assert_only_ordinary(
+            retry_candidate_tags(
+                &cfg,
+                &[],
+                &[],
+                &completed_by_tag,
+                &BTreeSet::from([manifest_tag, ordinary_tag.clone()]),
+                &[],
+            ),
+            &ordinary_tag,
+            "latest_unreported",
+        );
     }
 }

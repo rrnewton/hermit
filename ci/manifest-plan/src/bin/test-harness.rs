@@ -20,6 +20,8 @@ use hermit_manifest_plan::runner::RunContext;
 use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 use hermit_manifest_plan::runner::Selection;
 use hermit_manifest_plan::runner::append_result;
+use hermit_manifest_plan::runner::cell_result_after_retries;
+use hermit_manifest_plan::runner::cell_result_and_attempts_after_retries;
 use hermit_manifest_plan::runner::host_inapplicable_result;
 use hermit_manifest_plan::runner::infrastructure_error_result;
 use hermit_manifest_plan::runner::prepare_result_path;
@@ -138,12 +140,12 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
     args
 }
 
-fn structured_test_results(results: &[CellResult]) -> Result<TestResults, String> {
-    structured_test_results_from_rows(
-        results
-            .iter()
-            .filter(|result| result.outcome != "HOST-INAPPLICABLE")
-            .map(|result| {
+fn structured_test_results(histories: &[Vec<CellResult>]) -> Result<TestResults, String> {
+    let rows = histories
+        .iter()
+        .map(|history| {
+            let (result, attempts) = cell_result_and_attempts_after_retries(history)?;
+            Ok((result.outcome != "HOST-INAPPLICABLE").then(|| {
                 (
                     format!(
                         "{} [{}/{}]",
@@ -152,10 +154,12 @@ fn structured_test_results(results: &[CellResult]) -> Result<TestResults, String
                         result.mode
                     ),
                     result.outcome == "PASS",
-                    result.attempt,
+                    attempts,
                 )
-            }),
-    )
+            }))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    structured_test_results_from_rows(rows.into_iter().flatten())
 }
 
 fn structured_test_results_from_rows(
@@ -1276,6 +1280,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         ))
     });
     let mut indexed_results = Vec::new();
+    let mut attempt_results = vec![Vec::new(); cells.len()];
     let mut failed = false;
     let expected = cells.len();
     for_each_parallel(
@@ -1381,7 +1386,21 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 located
             );
 
+            attempt_results[index].push(result);
             if !effective_will_retry {
+                let result = match cell_result_after_retries(&attempt_results[index]) {
+                    Ok(result) => result.clone(),
+                    Err(error) => {
+                        let mut result = attempt_results[index]
+                            .last()
+                            .expect("the current attempt was retained before reporting")
+                            .clone();
+                        result.outcome = "ERROR".into();
+                        result.error_kind = Some("result-history".into());
+                        result.reason = Some(error);
+                        result
+                    }
+                };
                 failed |= matches!(result.outcome.as_str(), "FAIL" | "ERROR");
                 indexed_results.push((index, result));
             }
@@ -1414,7 +1433,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     if let Some(path) = std::env::var_os("DAGRUN_TEST_COUNTS_PATH") {
         let path = PathBuf::from(path);
         if let Err(error) =
-            structured_test_results(&results).and_then(|report| report.write_current(&path))
+            structured_test_results(&attempt_results).and_then(|report| report.write_current(&path))
         {
             eprintln!("test-harness: {error}");
             failed = true;

@@ -1060,22 +1060,6 @@ impl RunContext {
                 std::process::id()
             )
         });
-        let attempt = std::env::var("E2E_ATTEMPT")
-            .ok()
-            .map(|value| {
-                value
-                    .parse::<u64>()
-                    .ok()
-                    .filter(|attempt| (1..=MAX_ATTEMPTS_PER_CELL).contains(attempt))
-                    .ok_or_else(|| {
-                        format!(
-                            "E2E_ATTEMPT must be between 1 and {MAX_ATTEMPTS_PER_CELL}, got \
-                             {value:?}"
-                        )
-                    })
-            })
-            .transpose()?
-            .unwrap_or(1);
         let run_index = std::env::var(E2E_RUN_INDEX_ENV)
             .ok()
             .map(|value| {
@@ -1149,7 +1133,7 @@ impl RunContext {
             machine_shortname,
             kernel_version,
             host_capabilities,
-            attempt,
+            attempt: 1,
             run_index,
             source_sha,
             source_dirty,
@@ -1174,6 +1158,105 @@ impl RunContext {
 
 /// One initial execution plus one retry, scoped to one selected cell.
 pub const MAX_ATTEMPTS_PER_CELL: u64 = 2;
+
+/// Select the outcome that the framework reports for one cell's complete
+/// attempt history.
+///
+/// A passing retry makes the cell pass, while the appended rows still retain
+/// the failure it recovered from. If no attempt passes, any product failure
+/// keeps the cell failed even when a later attempt ends in an infrastructure
+/// error. A history containing only infrastructure errors remains an error.
+/// Host-inapplicable is terminal and cannot be mixed with executed attempts.
+pub fn outcome_after_retries<'a>(
+    attempts: impl IntoIterator<Item = (u64, &'a str)>,
+) -> Result<&'static str, String> {
+    let mut expected_attempt = 1;
+    let mut saw_pass = false;
+    let mut saw_failure = false;
+    let mut saw_error = false;
+    let mut saw_host_inapplicable = false;
+
+    for (attempt, outcome) in attempts {
+        if attempt > MAX_ATTEMPTS_PER_CELL {
+            return Err(format!(
+                "cell result attempt {attempt} exceeds the shared maximum of {MAX_ATTEMPTS_PER_CELL}"
+            ));
+        }
+        if attempt != expected_attempt {
+            return Err(format!(
+                "cell result attempt {attempt} does not follow the preceding attempts; expected {expected_attempt}"
+            ));
+        }
+        if saw_pass || saw_host_inapplicable {
+            return Err(format!(
+                "cell result attempt {attempt} follows terminal outcome {}",
+                if saw_pass {
+                    "PASS"
+                } else {
+                    "HOST-INAPPLICABLE"
+                }
+            ));
+        }
+        match outcome {
+            "PASS" => saw_pass = true,
+            "FAIL" => saw_failure = true,
+            "ERROR" => saw_error = true,
+            "HOST-INAPPLICABLE" => saw_host_inapplicable = true,
+            other => {
+                return Err(format!(
+                    "cell result attempt {attempt} has unknown outcome {other:?}"
+                ));
+            }
+        }
+        expected_attempt += 1;
+    }
+
+    if expected_attempt == 1 {
+        return Err("cell result has no attempts".into());
+    }
+    if saw_host_inapplicable && (saw_failure || saw_error) {
+        return Err("HOST-INAPPLICABLE cannot be mixed with executed cell attempts".into());
+    }
+    Ok(if saw_pass {
+        "PASS"
+    } else if saw_failure {
+        "FAIL"
+    } else if saw_error {
+        "ERROR"
+    } else {
+        "HOST-INAPPLICABLE"
+    })
+}
+
+/// Return the framework result row that carries the outcome selected by
+/// [`outcome_after_retries`]. All attempt rows remain in `results.jsonl`; this
+/// row is the one used for the cell's JUnit and summary entry.
+pub fn cell_result_after_retries(results: &[CellResult]) -> Result<&CellResult, String> {
+    let outcome = outcome_after_retries(
+        results
+            .iter()
+            .map(|result| (result.attempt, result.outcome.as_str())),
+    )?;
+    results
+        .iter()
+        .rev()
+        .find(|result| result.outcome == outcome)
+        .ok_or_else(|| format!("cell result history selected {outcome} without a matching row"))
+}
+
+/// Return both the selected result row and the number of attempts in its
+/// validated history. The selected row keeps its own ordinal and artifact;
+/// the separate count is what structured summaries report.
+pub fn cell_result_and_attempts_after_retries(
+    results: &[CellResult],
+) -> Result<(&CellResult, u64), String> {
+    let selected = cell_result_after_retries(results)?;
+    let attempts = results
+        .last()
+        .map(|result| result.attempt)
+        .ok_or_else(|| "cell result has no attempts".to_string())?;
+    Ok((selected, attempts))
+}
 
 fn command_text(program: &str, args: &[&str]) -> Result<String, String> {
     let output = Command::new(program)
@@ -3139,6 +3222,91 @@ mod tests {
     use super::*;
     use crate::ci_selection::BackendCiDisabledReason;
     use crate::ci_selection::CiDisabledResult;
+
+    #[test]
+    fn retry_outcome_preserves_recovery_and_product_failure() {
+        assert_eq!(
+            outcome_after_retries([(1, "FAIL"), (2, "PASS")]).unwrap(),
+            "PASS"
+        );
+        assert_eq!(
+            outcome_after_retries([(1, "ERROR"), (2, "PASS")]).unwrap(),
+            "PASS"
+        );
+        assert_eq!(
+            outcome_after_retries([(1, "FAIL"), (2, "ERROR")]).unwrap(),
+            "FAIL"
+        );
+        assert_eq!(
+            outcome_after_retries([(1, "ERROR"), (2, "ERROR")]).unwrap(),
+            "ERROR"
+        );
+        assert_eq!(
+            outcome_after_retries([(1, "HOST-INAPPLICABLE")]).unwrap(),
+            "HOST-INAPPLICABLE"
+        );
+    }
+
+    #[test]
+    fn retry_outcome_refuses_malformed_history_by_name() {
+        for (attempts, named) in [
+            (vec![], "no attempts"),
+            (vec![(2, "FAIL")], "expected 1"),
+            (
+                vec![(1, "PASS"), (2, "FAIL")],
+                "follows terminal outcome PASS",
+            ),
+            (
+                vec![(1, "HOST-INAPPLICABLE"), (2, "ERROR")],
+                "follows terminal outcome HOST-INAPPLICABLE",
+            ),
+            (vec![(1, "UNKNOWN")], "unknown outcome \"UNKNOWN\""),
+            (
+                vec![(1, "FAIL"), (2, "ERROR"), (3, "PASS")],
+                "exceeds the shared maximum of 2",
+            ),
+        ] {
+            let error = outcome_after_retries(attempts).unwrap_err();
+            assert!(error.contains(named), "{error:?} did not name {named:?}");
+        }
+    }
+
+    #[test]
+    fn selected_retry_row_keeps_its_ordinal_while_summary_keeps_history_count() {
+        let mut first = cell_result_that_located_nothing();
+        first.outcome = "FAIL".into();
+        first.attempt = 1;
+
+        let mut infrastructure = first.clone();
+        infrastructure.outcome = "ERROR".into();
+        infrastructure.attempt = 2;
+        let product_then_infrastructure = [first.clone(), infrastructure];
+        let (selected, attempts) =
+            cell_result_and_attempts_after_retries(&product_then_infrastructure).unwrap();
+        assert_eq!(
+            (selected.outcome.as_str(), selected.attempt, attempts),
+            ("FAIL", 1, 2)
+        );
+
+        let mut recovered = first.clone();
+        recovered.outcome = "PASS".into();
+        recovered.attempt = 2;
+        let recovered_history = [first, recovered];
+        let (selected, attempts) =
+            cell_result_and_attempts_after_retries(&recovered_history).unwrap();
+        assert_eq!(
+            (selected.outcome.as_str(), selected.attempt, attempts),
+            ("PASS", 2, 2)
+        );
+
+        let peer = cell_result_that_located_nothing();
+        let (selected, attempts) =
+            cell_result_and_attempts_after_retries(std::slice::from_ref(&peer)).unwrap();
+        assert_eq!(
+            (selected.outcome.as_str(), selected.attempt, attempts),
+            ("PASS", 1, 1)
+        );
+    }
 
     fn recipe(ci: bool) -> TestRecipe {
         let disabled = BTreeMap::from([
