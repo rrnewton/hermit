@@ -3256,12 +3256,11 @@ fn infrastructure_error_reason(row: &ResultRow) -> Option<String> {
         let report = attempt.get("verification_report")?.as_str()?;
         let report = canonical_verdict::VerificationReport::from_json_slice(report.as_bytes())
             .ok()?;
-        match report.infrastructure_error {
-            Some(canonical_verdict::InfrastructureError::SkidOvershoot { count }) => Some(
-                format!("verification recorded {count} HERMIT_SKID_OVERSHOOT report(s)"),
-            ),
-            None => None,
-        }
+        report.infrastructure_error.map(
+            |canonical_verdict::InfrastructureError::SkidOvershoot { count }| {
+                format!("verification recorded {count} HERMIT_SKID_OVERSHOOT report(s)")
+            },
+        )
     })
 }
 
@@ -7120,6 +7119,38 @@ red/`measured-and-passed` count is **0**.",
             .then_some(())
             .ok_or_else(|| format!("git {} failed", args.join(" ")))
     };
+    let local_agent_utils = format!(
+        "submodule.agent-utils.url={}",
+        command_root.join("agent-utils").display()
+    );
+    git_ok(
+        &result_command_root,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "-c",
+            &local_agent_utils,
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+            "--",
+            "agent-utils",
+        ],
+    )?;
+    let cloned_agent_utils = result_command_root.join("agent-utils");
+    if !cloned_agent_utils.join("rs/dagrun/Cargo.toml").is_file() {
+        return Err(
+            "result-command fixture did not materialize agent-utils/rs/dagrun/Cargo.toml".into(),
+        );
+    }
+    let expected_agent_utils = git_rev_parse(&result_command_root, "HEAD:agent-utils")?;
+    let actual_agent_utils = git_head(&cloned_agent_utils)?;
+    if actual_agent_utils != expected_agent_utils {
+        return Err(format!(
+            "result-command fixture agent-utils is {actual_agent_utils}, expected gitlink {expected_agent_utils}"
+        ));
+    }
 
     // Give the clone an unrelated sibling Reverie history. Its HEAD is not the
     // pin recorded by this Hermit revision, so it must be omitted rather than

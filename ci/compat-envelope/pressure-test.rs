@@ -3670,9 +3670,8 @@ fn classify_result(
         || (mode == "verify"
             && matches!(verification_verdict, Some("matched" | "diverged"))
             && !verification_logs_retained)
+        || (row_valid && verification_verdict == Some("infrastructure_error"))
     {
-        "infrastructure-error"
-    } else if row_valid && verification_verdict == Some("infrastructure_error") {
         "infrastructure-error"
     } else if row_valid && mode == "verify" && verification_verdict == Some("diverged") {
         "determinism-failure"
