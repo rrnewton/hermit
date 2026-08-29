@@ -1011,6 +1011,181 @@ impl ResultRow {
         Ok(())
     }
 
+    /// Return the typed reason when this FAIL records only completed first
+    /// runs rejected before comparison. Such a row is execution evidence, but
+    /// not product-behavior evidence: it must be named and skipped rather than
+    /// forced through the canonical-comparison path.
+    fn typed_no_result_reason(&self) -> Result<Option<String>, String> {
+        if self.outcome != "FAIL"
+            || !matches!(self.mode.as_str(), "verify" | "replay" | "chaos")
+        {
+            return Ok(None);
+        }
+        if self.attempts.is_empty() {
+            return Err("result row contains no attempt".into());
+        }
+
+        // Decide whether this is the narrow typed no-result case before
+        // applying its invariants. Ordinary divergence rows legitimately carry
+        // coordinates and must continue through the canonical comparison path.
+        let mut reports = Vec::new();
+        for (index, attempt) in self.attempts.iter().enumerate() {
+            let report_text = attempt
+                .get("verification_report")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| {
+                    format!("attempt {} has no embedded verification report", index + 1)
+                })?;
+            let recorded_sha = attempt
+                .get("verification_report_sha256")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| {
+                    format!("attempt {} has no verification-report identity", index + 1)
+                })?;
+            let actual_sha = format!("{:x}", Sha256::digest(report_text.as_bytes()));
+            if recorded_sha != actual_sha {
+                return Err(format!(
+                    "attempt {} verification-report identity does not match its embedded report",
+                    index + 1
+                ));
+            }
+            let raw: JsonValue = serde_json::from_str(report_text).map_err(|error| {
+                format!(
+                    "attempt {} has an unreadable verification report: {error}",
+                    index + 1
+                )
+            })?;
+            if raw.get("verdict").and_then(JsonValue::as_str) != Some("no_result") {
+                return Ok(None);
+            }
+            let report = canonical_verdict::VerificationReport::from_current_json_value(raw)
+                .map_err(|error| format!("attempt {} {error}", index + 1))?;
+            reports.push((index, attempt, report));
+        }
+
+        if self.first_divergent_scheduler_turn.is_some()
+            || self.first_divergent_virtual_nanoseconds.is_some()
+            || self.first_divergent_record.is_some()
+            || self.first_divergent_syscall.is_some()
+        {
+            return Err("no_result row carries a divergence coordinate".into());
+        }
+
+        let mut reasons = Vec::new();
+        for (index, attempt, report) in reports {
+            let attempt_outcome = attempt
+                .get("outcome")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| format!("attempt {} has no outcome", index + 1))?;
+            if attempt_outcome != "FAIL" {
+                return Err(format!(
+                    "attempt {} outcome {attempt_outcome} does not agree with FAIL/no_result",
+                    index + 1
+                ));
+            }
+            if attempt.get("timed_out").and_then(JsonValue::as_bool) != Some(false) {
+                return Err(format!(
+                    "attempt {} is timed out or omitted its timeout state",
+                    index + 1
+                ));
+            }
+            if attempt
+                .get("status")
+                .and_then(JsonValue::as_i64)
+                .is_none_or(|status| status == 0)
+            {
+                return Err(format!(
+                    "attempt {} has no nonzero wrapper exit status",
+                    index + 1
+                ));
+            }
+            if attempt.get("signal").is_none_or(|value| !value.is_null()) {
+                return Err(format!(
+                    "attempt {} has a signal beside its wrapper exit status",
+                    index + 1
+                ));
+            }
+            if attempt.get("error_kind").is_none_or(|value| !value.is_null()) {
+                return Err(format!(
+                    "attempt {} has an error classification beside FAIL/no_result",
+                    index + 1
+                ));
+            }
+            if [
+                "first_divergent_scheduler_turn",
+                "first_divergent_virtual_nanoseconds",
+                "first_divergent_record",
+                "first_divergent_syscall",
+                "first_divergent_left_message",
+                "first_divergent_right_message",
+            ]
+            .iter()
+            .any(|field| attempt.get(field).is_some_and(|value| !value.is_null()))
+            {
+                return Err(format!(
+                    "attempt {} carries divergence evidence beside no_result",
+                    index + 1
+                ));
+            }
+            if report.verified
+                || report.bitwise_parity
+                || report.comparison.is_some()
+                || report.compared_log_messages.is_some()
+                || report.infrastructure_error.is_some()
+                || report.dbt_counted_branches.is_some()
+                || report.first_divergent_scheduler_turn.is_some()
+                || report.first_divergent_virtual_nanoseconds.is_some()
+                || report.first_divergent_record.is_some()
+                || report.first_divergent_syscall.is_some()
+                || report.first_divergent_left_message.is_some()
+                || report.first_divergent_right_message.is_some()
+                || report.runtime.as_ref().is_some_and(|runtime| {
+                    runtime.run1.is_none() || runtime.run2.is_some()
+                })
+            {
+                return Err(format!(
+                    "attempt {} has a contradictory no_result verification report",
+                    index + 1
+                ));
+            }
+            let reason = match report.no_result_reason.as_ref() {
+                Some(canonical_verdict::NoResultReason::FirstRunRejected {
+                    exit_code,
+                    signal,
+                    ..
+                }) => {
+                    if exit_code.is_none() == signal.is_none()
+                        || report.guest_exit_code != *exit_code
+                        || report.guest_signal != *signal
+                    {
+                        return Err(format!(
+                            "attempt {} first-run disposition does not match its no_result reason",
+                            index + 1
+                        ));
+                    }
+                    report.no_result_reason.as_ref().unwrap()
+                }
+                Some(canonical_verdict::NoResultReason::NotRun) => {
+                    return Err(format!(
+                        "attempt {} did not complete its first run",
+                        index + 1
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "attempt {} no_result omitted no_result_reason",
+                        index + 1
+                    ));
+                }
+            };
+            reasons.push(
+                serde_json::to_string(reason)
+                    .map_err(|error| format!("cannot encode no_result reason: {error}"))?,
+            );
+        }
+        Ok(Some(reasons.join(", ")))
+    }
+
     fn evidence_identity(&self) -> Result<String, String> {
         let evidence = serde_json::json!({
             "run_id": self.run_id,
@@ -3279,11 +3454,12 @@ struct ValidateFold {
     located: usize,
     /// Rows that diverged and carried none of them.
     unlocated: usize,
-    /// Rows whose outcome was an infrastructure `ERROR` and which located
-    /// nothing. NEITHER A PASS NOR A FAILURE, and counted separately for that
-    /// reason: nothing was compared, so there is no product behaviour to record,
-    /// and folding one as an observation would assert a measurement that never
-    /// happened. Counting it is what keeps the run from reading all-green.
+    /// Rows that determined no product result: an infrastructure `ERROR`, a
+    /// completed FAIL/no_result before comparison, or another non-PASS/non-FAIL
+    /// outcome. Counted separately because nothing was compared, so there is no
+    /// product behaviour to record, and folding one as an observation would
+    /// assert a measurement that never happened. Counting it is what keeps the
+    /// run from reading all-green.
     ///
     /// ⚠️ NAMED, NOT JUST COUNTED, following `apply_pressure_summary` -- the sibling
     /// writer already prints every row it drops with its cell and reason, on the
@@ -3357,7 +3533,8 @@ fn apply_validate_results(
             // comparisons for every one of them.
             // An ERROR -- or ANY other non-PASS, non-FAIL outcome -- that located
             // nothing is NO LONGER skipped as it was before: the branch below counts
-            // and names it.
+            // and names it. A completed FAIL/no_result is handled separately below:
+            // it proves a first run occurred but still has no comparison to store.
             //
             // ⚠️ A **FAIL** THAT LOCATED NOTHING IS A DIFFERENT FACT AND IS NOW
             // RECORDED. Skipping it as well is what made the two states this
@@ -3401,6 +3578,18 @@ fn apply_validate_results(
                     display_id(id),
                     row.outcome,
                     infrastructure_error_reason(row).as_deref().unwrap_or("not recorded")
+                ));
+                continue;
+            }
+            if let Some(reason) = row
+                .typed_no_result_reason()
+                .map_err(|error| format!("{} {error}", display_id(id)))?
+            {
+                row.require_provenance()
+                    .map_err(|error| format!("{} {error}", display_id(id)))?;
+                fold.errored.push(format!(
+                    "{} (outcome=NO_RESULT, reason={reason})",
+                    display_id(id)
                 ));
                 continue;
             }
@@ -3625,8 +3814,8 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
     // is what stops anyone looking, so this is the worst place for it to happen.
     if !fold.errored.is_empty() {
         println!(
-            "  ⚠️ {} row(s) DETERMINED NOTHING -- an infrastructure ERROR, or another \
-             non-PASS non-FAIL outcome, with no divergence coordinate. \
+            "  ⚠️ {} row(s) DETERMINED NOTHING -- an infrastructure ERROR, a completed \
+             FAIL/no_result before comparison, or another non-PASS non-FAIL outcome. \
              NOTHING WAS COMPARED for them, so this run is NOT all-green -- and it is \
              NOT a product failure either. No observation was stored, because there \
              is no product behaviour to store. Re-run these cells; do not read this \
@@ -6424,6 +6613,7 @@ red/`measured-and-passed` count is **0**.",
         serde_json::json!({
             "index": "1",
             "outcome": outcome,
+            "error_kind": null,
             "status": if outcome == "PASS" { 0 } else { 1 },
             "signal": null,
             "timed_out": false,
@@ -6466,6 +6656,13 @@ red/`measured-and-passed` count is **0**.",
         first_divergent_syscall: Some(9),
         attempts: vec![validate_attempt("FAIL")],
     };
+    if validate_row
+        .typed_no_result_reason()
+        .map_err(|error| format!("canonical divergence was refused as no_result: {error}"))?
+        .is_some()
+    {
+        return Err("canonical divergence was misclassified as no_result".into());
+    }
 
     let validate_candidate = |run_id: &str, coordinates: DivergenceCoordinates| {
         let mut row = validate_row.clone();
@@ -7611,6 +7808,266 @@ red/`measured-and-passed` count is **0**.",
              measurement"
                 .into(),
         );
+    }
+
+    // A cell retry can recover after the first Hermit invocation completed
+    // without reaching a comparison. The no-result attempt is real execution
+    // evidence, but it has no product result or INFO-message counts to store.
+    // Name it, skip it, and retain the later canonical PASS.
+    let mut no_result_report = canonical_verdict::VerificationReport::no_result();
+    no_result_report.no_result_reason = Some(canonical_verdict::NoResultReason::FirstRunRejected {
+        exit_code: Some(1),
+        signal: None,
+        stdout_bytes: 0,
+        stderr_bytes: 0,
+    });
+    no_result_report.guest_exit_code = Some(1);
+    let no_result_report = serde_json::to_string(&no_result_report).unwrap();
+    let mut no_result_attempt = validate_attempt("PASS");
+    no_result_attempt["outcome"] = JsonValue::String("FAIL".into());
+    no_result_attempt["status"] = serde_json::json!(125);
+    no_result_attempt["verification_report_sha256"] =
+        JsonValue::String(format!("{:x}", Sha256::digest(no_result_report.as_bytes())));
+    no_result_attempt["verification_report"] = JsonValue::String(no_result_report);
+
+    let mut no_result_row = validate_row.clone();
+    no_result_row.run_id = "fixture-recovered-no-result".into();
+    no_result_row.attempt = 1;
+    no_result_row.outcome = "FAIL".into();
+    no_result_row.first_divergent_scheduler_turn = None;
+    no_result_row.first_divergent_virtual_nanoseconds = None;
+    no_result_row.first_divergent_record = None;
+    no_result_row.first_divergent_syscall = None;
+    no_result_row.attempts = vec![no_result_attempt];
+    let no_result_identity = no_result_row.evidence_identity().unwrap();
+
+    let mut recovered_pass_row = validate_row.clone();
+    recovered_pass_row.run_id = no_result_row.run_id.clone();
+    recovered_pass_row.attempt = 2;
+    recovered_pass_row.outcome = "PASS".into();
+    recovered_pass_row.first_divergent_scheduler_turn = None;
+    recovered_pass_row.first_divergent_virtual_nanoseconds = None;
+    recovered_pass_row.first_divergent_record = None;
+    recovered_pass_row.first_divergent_syscall = None;
+    recovered_pass_row.attempts = vec![validate_attempt("PASS")];
+    let recovered_pass_identity = recovered_pass_row.evidence_identity().unwrap();
+
+    let recovered_rows = BTreeMap::from([(
+        unlocated_id.clone(),
+        vec![
+            ResultCandidate {
+                evidence_identity: no_result_identity,
+                path: PathBuf::from("fixture/results.jsonl"),
+                row: no_result_row.clone(),
+            },
+            ResultCandidate {
+                evidence_identity: recovered_pass_identity,
+                path: PathBuf::from("fixture/results.jsonl"),
+                row: recovered_pass_row,
+            },
+        ],
+    )]);
+    let mut recovered = TrackedCells {
+        schema: SCHEMA,
+        projection: None,
+        cells: vec![bare_cell(&unlocated_id)],
+    };
+    let recovered_fold = apply_validate_results(
+        &mut recovered,
+        &recovered_rows,
+        "sha-1",
+        "tree-1",
+        &depth_fixture,
+        true,
+        true,
+    )
+    .map_err(|e| format!("a recovered no-result retry was refused: {e}"))?;
+    refresh_measurement(&mut recovered);
+    if recovered_fold.passed != 1
+        || recovered_fold.errored.len() != 1
+        || !recovered_fold.errored[0].contains("NO_RESULT")
+        || recovered_fold.reads_all_green()
+        || recovered.cells[0].measurement != MeasurementState::MeasuredAndPassed
+        || recovered.cells[0].observations.len() != 1
+        || recovered.cells[0].observations[0].results != BTreeSet::from([ObservedResult::Pass])
+        || recovered.cells[0].observations[0]
+            .canonical_comparisons
+            .len()
+            != 1
+    {
+        return Err(format!(
+            "a recovered no-result retry was not named while retaining only its canonical PASS: {:?}",
+            recovered_fold
+        ));
+    }
+
+    let assert_recovered_refuses = |mut row: ResultRow, expected: &str| {
+        row.run_id = format!("fixture-refuse-{expected}");
+        let identity = row.evidence_identity().unwrap();
+        let rows = BTreeMap::from([(
+            unlocated_id.clone(),
+            vec![ResultCandidate {
+                evidence_identity: identity,
+                path: PathBuf::from("fixture/results.jsonl"),
+                row,
+            }],
+        )]);
+        let error = apply_validate_results(
+            &mut TrackedCells {
+                schema: SCHEMA,
+                projection: None,
+                cells: vec![bare_cell(&unlocated_id)],
+            },
+            &rows,
+            "sha-1",
+            "tree-1",
+            &depth_fixture,
+            true,
+            true,
+        )
+        .expect_err("malformed no-result evidence was accepted");
+        if !error.contains(expected) {
+            panic!("expected refusal containing {expected:?}, got {error:?}");
+        }
+    };
+    let replace_embedded_report = |row: &mut ResultRow, report: JsonValue| {
+        let report = serde_json::to_string(&report).unwrap();
+        row.attempts[0]["verification_report_sha256"] =
+            JsonValue::String(format!("{:x}", Sha256::digest(report.as_bytes())));
+        row.attempts[0]["verification_report"] = JsonValue::String(report);
+    };
+
+    let mut missing_report = no_result_row.clone();
+    missing_report.attempts[0]
+        .as_object_mut()
+        .unwrap()
+        .remove("verification_report");
+    assert_recovered_refuses(missing_report, "no embedded verification report");
+
+    let mut bad_hash = no_result_row.clone();
+    bad_hash.attempts[0]["verification_report_sha256"] = JsonValue::String("0".repeat(64));
+    assert_recovered_refuses(bad_hash, "identity does not match");
+
+    let mut malformed_report = no_result_row.clone();
+    malformed_report.attempts[0]["verification_report"] = JsonValue::String("{".into());
+    malformed_report.attempts[0]["verification_report_sha256"] =
+        JsonValue::String(format!("{:x}", Sha256::digest(b"{")));
+    assert_recovered_refuses(malformed_report, "unreadable verification report");
+
+    let mut not_run = no_result_row.clone();
+    replace_embedded_report(
+        &mut not_run,
+        serde_json::to_value(canonical_verdict::VerificationReport::no_result()).unwrap(),
+    );
+    assert_recovered_refuses(not_run, "did not complete its first run");
+
+    let mut attempt_outcome_mismatch = no_result_row.clone();
+    attempt_outcome_mismatch.attempts[0]["outcome"] = JsonValue::String("PASS".into());
+    assert_recovered_refuses(attempt_outcome_mismatch, "does not agree with FAIL/no_result");
+
+    for (name, status, signal, expected) in [
+        (
+            "zero-status",
+            serde_json::json!(0),
+            JsonValue::Null,
+            "no nonzero wrapper exit status",
+        ),
+        (
+            "missing-status",
+            JsonValue::Null,
+            JsonValue::Null,
+            "no nonzero wrapper exit status",
+        ),
+        (
+            "signal",
+            serde_json::json!(125),
+            serde_json::json!(9),
+            "signal beside its wrapper exit status",
+        ),
+    ] {
+        let mut invalid_disposition = no_result_row.clone();
+        invalid_disposition.run_id = format!("fixture-{name}");
+        invalid_disposition.attempts[0]["status"] = status;
+        invalid_disposition.attempts[0]["signal"] = signal;
+        assert_recovered_refuses(invalid_disposition, expected);
+    }
+
+    let mut attempt_divergence = no_result_row.clone();
+    attempt_divergence.attempts[0]["first_divergent_record"] = serde_json::json!(1);
+    assert_recovered_refuses(attempt_divergence, "attempt 1 carries divergence evidence");
+
+    let mut row_divergence = no_result_row.clone();
+    row_divergence.first_divergent_record = Some(1);
+    assert_recovered_refuses(row_divergence, "row carries a divergence coordinate");
+
+    for (name, field, value) in [
+        (
+            "report-coordinate",
+            "first_divergent_record",
+            serde_json::json!(1),
+        ),
+        (
+            "report-message",
+            "first_divergent_left_message",
+            serde_json::json!("unexpected divergence"),
+        ),
+        (
+            "report-dbt-count",
+            "dbt_counted_branches",
+            serde_json::json!({"left": 1, "right": 1}),
+        ),
+        (
+            "report-second-run",
+            "runtime",
+            serde_json::json!({
+                "run1": {"scheduler_turns": 1, "virtual_nanoseconds": 1},
+                "run2": {"scheduler_turns": 1, "virtual_nanoseconds": 1}
+            }),
+        ),
+    ] {
+        let mut contradictory = no_result_row.clone();
+        contradictory.run_id = format!("fixture-{name}");
+        let mut report: JsonValue = serde_json::from_str(
+            contradictory.attempts[0]["verification_report"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        report[field] = value;
+        replace_embedded_report(&mut contradictory, report);
+        assert_recovered_refuses(contradictory, "contradictory no_result");
+    }
+
+    let mut disposition_mismatch = no_result_row.clone();
+    let mut report: JsonValue = serde_json::from_str(
+        disposition_mismatch.attempts[0]["verification_report"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    report["guest_exit_code"] = serde_json::json!(2);
+    replace_embedded_report(&mut disposition_mismatch, report);
+    assert_recovered_refuses(disposition_mismatch, "disposition does not match");
+
+    for outcome in ["PASS", "FAIL"] {
+        let mut missing_counts = validate_row.clone();
+        missing_counts.run_id = format!("fixture-{outcome}-missing-counts");
+        missing_counts.outcome = outcome.into();
+        missing_counts.first_divergent_scheduler_turn = None;
+        missing_counts.first_divergent_virtual_nanoseconds = None;
+        missing_counts.first_divergent_record = None;
+        missing_counts.first_divergent_syscall = None;
+        missing_counts.attempts = vec![validate_attempt(outcome)];
+        let report_text = missing_counts.attempts[0]["verification_report"]
+            .as_str()
+            .unwrap();
+        let mut report: JsonValue = serde_json::from_str(report_text).unwrap();
+        report["compared_log_messages"] = JsonValue::Null;
+        let report = serde_json::to_string(&report).unwrap();
+        missing_counts.attempts[0]["verification_report_sha256"] =
+            JsonValue::String(format!("{:x}", Sha256::digest(report.as_bytes())));
+        missing_counts.attempts[0]["verification_report"] = JsonValue::String(report);
+        assert_recovered_refuses(missing_counts, "no left INFO-message count");
     }
 
     for (field, weaker_value) in [
@@ -9045,7 +9502,7 @@ red/`measured-and-passed` count is **0**.",
     }
 
     println!(
-        "compatibility scorecard self-test: retained-comparison FRESH/DRIFTED/WRONG/UNCHECKABLE, provenance, distinct-evidence, result, selected-chaos, status-measurement-display, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, empty-result command, source-identity, writer-boundary, projection, path-independence, infrastructure-refusal, and divergence-without-a-comparison brackets pass"
+        "compatibility scorecard self-test: retained-comparison FRESH/DRIFTED/WRONG/UNCHECKABLE, provenance, distinct-evidence, result, selected-chaos, status-measurement-display, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, recovered-no-result, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, empty-result command, source-identity, writer-boundary, projection, path-independence, infrastructure-refusal, and divergence-without-a-comparison brackets pass"
     );
     Ok(())
 }
