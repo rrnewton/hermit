@@ -2605,6 +2605,14 @@ fn retain_required_build_dependencies(
             retained.push(dependency.clone());
             continue;
         }
+        // Full validation orders every target/debug writer before its final
+        // test-profile producer. The pressure plan does not run the lint and
+        // documentation writers, but build.workspace still needs the nextest
+        // tool at the start of that omitted chain.
+        if tag == "build.workspace" && dependency == "doc.rustdoc" {
+            retained.push("setup.nextest".to_string());
+            continue;
+        }
         // These two current edges order product builds after the complete
         // metadata audit. That audit produces no binary or prebuilt artifact;
         // pressure plan generation performs its scorecard and typed-manifest
