@@ -838,7 +838,7 @@ fn nested_scope_probe_step(
 /// alone would leave its original worker count running inside a smaller box, which
 /// is a slowdown disguised as a limit. Four nodes are in exactly that position:
 /// `build.workspace` and `build.runtime_release` at 32, and
-/// `e2e.manifest_backend_parity_c` and `e2e.manifest_c_programs` at 8. All four
+/// `e2e.manifest_backend_parity_c` and `e2e.manifest_c_programs` at 20. All four
 /// bake their measured width into the command itself, so `-j` (host_cpus/8, floor
 /// 2, cap 16) would refuse the entire run.
 ///
@@ -1942,30 +1942,49 @@ fn self_test() -> Result<(), String> {
                     "carry bracket: lane {lane} dropped jobs env but named {jobs_env_error}"
                 ));
             }
-            if base.resource_caps.is_empty() {
-                return Err(format!("carry bracket: lane {lane} declares no resource_caps; \
-                                    the bracket would be vacuous"));
-            }
             let bad = validate_plan::ungrantable_resources(&carried);
             if !bad.is_empty() {
                 return Err(format!(
                     "grantable bracket: lane {lane} carried its caps yet still reports {} \
                      ungrantable demand(s): {:?}", bad.len(), &bad[..bad.len().min(3)]));
             }
-            // NEGATIVE: drop the caps exactly as the bug did -> must be REFUSED,
-            // and must NAME the resource rather than sleeping on it.
-            let mut stripped = carried.clone();
-            stripped.resource_caps.clear();
-            let starved = validate_plan::ungrantable_resources(&stripped);
-            if starved.is_empty() {
-                return Err(format!(
-                    "grantable bracket: lane {lane} with resource_caps CLEARED reported nothing \
-                     ungrantable -- the check is inert and would not have caught the stall"));
+            for unsupported in ["hermit_guest", "kvm"] {
+                if base.resource_caps.contains_key(unsupported)
+                    || base
+                        .steps
+                        .iter()
+                        .any(|step| step.hint.resources.contains_key(unsupported))
+                {
+                    return Err(format!(
+                        "resource-cap bracket: lane {lane} restored unsupported exclusive resource {unsupported}"
+                    ));
+                }
             }
-            let named = base.resource_caps.keys().any(|r| starved.iter().any(|b| b.contains(r)));
-            if !named {
-                return Err(format!("grantable bracket: refusal for {lane} names no resource: {:?}",
-                                   &starved[..starved.len().min(2)]));
+            let mut cleared_cap_starvation = 0;
+            if !base.resource_caps.is_empty() {
+                // NEGATIVE: drop declared caps exactly as the historical bug did
+                // -> every remaining demand must be REFUSED and named rather
+                // than sleeping forever. A lane with neither caps nor demands
+                // is valid and has no negative cap-removal case to construct.
+                let mut stripped = carried.clone();
+                stripped.resource_caps.clear();
+                let starved = validate_plan::ungrantable_resources(&stripped);
+                if starved.is_empty() {
+                    return Err(format!(
+                        "grantable bracket: lane {lane} with resource_caps CLEARED reported nothing \
+                         ungrantable -- the check is inert and would not have caught the stall"));
+                }
+                let named = base
+                    .resource_caps
+                    .keys()
+                    .any(|resource| starved.iter().any(|row| row.contains(resource)));
+                if !named {
+                    return Err(format!(
+                        "grantable bracket: refusal for {lane} names no resource: {:?}",
+                        &starved[..starved.len().min(2)]
+                    ));
+                }
+                cleared_cap_starvation = starved.len();
             }
             // NEGATIVE 2: a dropped config must be DETECTED, not tolerated.
             let defaulted = validate_plan::config_from(carried.steps.clone(), "bracket");
@@ -1976,7 +1995,7 @@ fn self_test() -> Result<(), String> {
             }
             println!("  dag-config: {lane} carries {} cap(s), default_step_timeout={}s; \
 cleared-caps refusal names {} starved step(s)",
-                     base.resource_caps.len(), base.default_step_timeout, starved.len());
+                     base.resource_caps.len(), base.default_step_timeout, cleared_cap_starvation);
         }
     }
     // The full hot path is one fused DAG and pays the exact-tree manifest audit

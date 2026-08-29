@@ -127,7 +127,8 @@ jobs:
       - name: Privileged PMU and CPUID test DAG
         # No flock: the PMU counter-exhaustion premise the lock guarded was
         # measured false (per-task counters; 32 concurrent runs, 0 failures).
-        # In-DAG resource_caps still serialize genuinely exclusive resources.
+        # In-DAG resource caps bound measured memory pressure; /dev/kvm itself
+        # is not exclusive.
         # --allow-cgroup-failure: at the advanced runner pin the runner skips its
         # systemd --user scope under $GITHUB_ACTIONS (hosted AND self-hosted) and
         # would otherwise fail-close (exit 3); opt out to best-effort UNBOXED
