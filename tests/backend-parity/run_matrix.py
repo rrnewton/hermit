@@ -1529,17 +1529,57 @@ def write_results(path: Path, results: list[dict[str, str]]) -> None:
     print(f"TRACKING: wrote {len(results)} result row(s) to {path}")
 
 
-def write_structured_test_counts(executed: int, filtered: int) -> None:
-    """Publish the scheduler-owned count record without trusting stdout."""
+def write_structured_test_counts(
+    executed: int,
+    filtered: int,
+    results: list[dict[str, str]],
+    *,
+    strict: bool,
+) -> None:
+    """Publish the scheduler-owned counts and terminal per-case results."""
     configured = os.environ.get("DAGRUN_TEST_COUNTS_PATH")
     if not configured:
         return
     path = Path(configured)
     temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    mode = "strict" if strict else "compat"
+    terminal = []
+    seen = set()
+    for index, result in enumerate(results):
+        status = result.get("result")
+        if status == "GAP":
+            continue
+        if status not in ("PASS", "FAIL", "XPASS"):
+            raise MatrixError(
+                f"structured test result {index} has unknown status {status!r}"
+            )
+        test_name = result.get("test_name")
+        backend = result.get("backend")
+        if not test_name or not backend:
+            raise MatrixError(
+                f"structured test result {index} lacks test_name or backend"
+            )
+        identity = f"backend-parity/{test_name} [{backend}/{mode}]"
+        if identity in seen:
+            raise MatrixError(f"structured test result id is duplicated: {identity}")
+        seen.add(identity)
+        terminal.append(
+            {
+                "id": identity,
+                "result": "fail" if status == "FAIL" else "pass",
+                "attempts": 1,
+            }
+        )
+    if len(terminal) != executed:
+        raise MatrixError(
+            "structured test result count disagrees with executed_cases: "
+            f"{len(terminal)} terminal row(s), {executed} executed"
+        )
     payload = {
-        "schema": 1,
+        "schema": 2,
         "executed_tests": executed,
         "filtered_tests": filtered,
+        "results": terminal,
     }
     try:
         temporary.write_text(
@@ -2007,7 +2047,12 @@ def main() -> int:
         verify=args.verify,
         probe_gaps=args.probe_gaps,
     )
-    write_structured_test_counts(executed_cases, filtered_cases)
+    write_structured_test_counts(
+        executed_cases,
+        filtered_cases,
+        results,
+        strict=strict,
+    )
     return 1 if failures else 0
 
 

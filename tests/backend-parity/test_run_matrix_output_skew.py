@@ -216,21 +216,55 @@ def main() -> int:
         counts = workdir / "counts.json"
         prior = os.environ.get("DAGRUN_TEST_COUNTS_PATH")
         os.environ["DAGRUN_TEST_COUNTS_PATH"] = str(counts)
+        fixed_rendered_output = "PASS ptrace/random_sources: fixed human text"
+        structured_rows = [
+            make_row("file_metadata"),
+            {**make_row("random_sources"), "result": "FAIL"},
+        ]
         try:
-            rm.write_structured_test_counts(27, 0)
+            rm.write_structured_test_counts(
+                2, 3, structured_rows, strict=True
+            )
+            first_structured = json.loads(counts.read_text(encoding="utf-8"))
+            mutated = [{**row} for row in structured_rows]
+            mutated[1]["result"] = "PASS"
+            rm.write_structured_test_counts(2, 3, mutated, strict=True)
+            second_structured = json.loads(counts.read_text(encoding="utf-8"))
         finally:
             if prior is None:
                 os.environ.pop("DAGRUN_TEST_COUNTS_PATH", None)
             else:
                 os.environ["DAGRUN_TEST_COUNTS_PATH"] = prior
         check(
-            json.loads(counts.read_text(encoding="utf-8"))
-            == {"schema": 1, "executed_tests": 27, "filtered_tests": 0},
-            "structured DBT count records 27 executed cases",
+            first_structured
+            == {
+                "schema": 2,
+                "executed_tests": 2,
+                "filtered_tests": 3,
+                "results": [
+                    {
+                        "id": "backend-parity/file_metadata [ptrace/strict]",
+                        "result": "pass",
+                        "attempts": 1,
+                    },
+                    {
+                        "id": "backend-parity/random_sources [ptrace/strict]",
+                        "result": "fail",
+                        "attempts": 1,
+                    },
+                ],
+            },
+            "structured DBT record carries counts and terminal case results",
         )
         check(
             not list(workdir.glob("counts.json.tmp.*")),
             "structured DBT count leaves no temporary file",
+        )
+        check(
+            fixed_rendered_output == "PASS ptrace/random_sources: fixed human text"
+            and first_structured["results"][1]["result"] == "fail"
+            and second_structured["results"][1]["result"] == "pass",
+            "mutating only the typed case result changes the structured verdict",
         )
 
     print()

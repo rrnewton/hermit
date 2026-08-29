@@ -10106,7 +10106,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         }
         let nextest_nodes = BTreeSet::from(["fixture.environmental".to_string()]);
         let (observations, typed_errors) =
-            nextest_test_observations(&nextest_attempts, &nextest_nodes);
+            structured_test_observations(&nextest_attempts, &nextest_nodes);
         if !typed_errors.is_empty() || observations.len() != 4 {
             return Err(format!(
                 "end-of-run summary: typed nextest results were not retained exactly: observations={observations:?}, errors={typed_errors:?}"
@@ -10114,9 +10114,9 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         }
         let mut missing_results = nextest_attempts.clone();
         missing_results[0].test_results = None;
-        let (_, missing_errors) = nextest_test_observations(&missing_results, &nextest_nodes);
+        let (_, missing_errors) = structured_test_observations(&missing_results, &nextest_nodes);
         if missing_errors.len() != 1
-            || !missing_errors[0].contains("individual nextest results are UNKNOWN")
+            || !missing_errors[0].contains("individual test results are UNKNOWN")
             || !missing_errors[0].contains("fixture.environmental attempt 1")
         {
             return Err(format!(
@@ -10148,7 +10148,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         ]);
         let inner_nodes = BTreeSet::from([inner_retry.tag.clone()]);
         let (inner_observations, inner_errors) =
-            nextest_test_observations(std::slice::from_ref(&inner_retry), &inner_nodes);
+            structured_test_observations(std::slice::from_ref(&inner_retry), &inner_nodes);
         let inner_summary = test_id_summary(inner_observations, &[], &BTreeSet::new());
         if !inner_errors.is_empty()
             || inner_summary.recovered.len() != 1
@@ -10159,15 +10159,32 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
                 "end-of-run summary: a nextest pass after an inner retry was not retained as one recovered retry: errors={inner_errors:?}, summary={inner_summary:?}"
             ));
         }
-        let dbt_log = "[test.dbt_parity] ▶ START DynamoRIO DBT strict backend parity matrix\n\
-[test.dbt_parity] PASS dbt/file_metadata: matched\n\
-[test.dbt_parity] FAIL dbt/random_sources: output differed\n\
-[test.dbt_parity] PASS dbt/: empty case\n\
-[test.dbt_parity] PASS ptrace/wrong_backend: matched\n\
-[test.dbt_parity] PASS dbt/missing_colon\n\
-[test.dbt_parity] XPASS dbt/known_gap: candidate\n\
-[test.other] FAIL dbt/other_node: ignored\n";
-        let dbt = dbt_parity_test_observations(dbt_log);
+        let mut dbt_attempt = nextest_attempts
+            .iter()
+            .find(|attempt| attempt.tag == "fixture.environmental" && attempt.attempt == 2)
+            .cloned()
+            .ok_or("end-of-run summary: no completed attempt for DBT fixture")?;
+        dbt_attempt.tag = DBT_PARITY_NODE.into();
+        dbt_attempt.attempt = 1;
+        dbt_attempt.reason = "PASS dbt/random_sources: fixed human text".into();
+        dbt_attempt.retry_class = None;
+        dbt_attempt.test_results = Some(vec![
+            dagrun::TestResult::new(
+                "backend-parity/file_metadata [dbt/strict]".into(),
+                true,
+                1,
+            )
+            .map_err(|error| format!("end-of-run summary: {error}"))?,
+            dagrun::TestResult::new(
+                "backend-parity/random_sources [dbt/strict]".into(),
+                false,
+                1,
+            )
+            .map_err(|error| format!("end-of-run summary: {error}"))?,
+        ]);
+        let dbt_nodes = BTreeSet::from([DBT_PARITY_NODE.to_string()]);
+        let (dbt, dbt_errors) =
+            structured_test_observations(std::slice::from_ref(&dbt_attempt), &dbt_nodes);
         let expected_dbt = vec![
             TestAttemptObservation {
                 node: DBT_PARITY_NODE.into(),
@@ -10184,10 +10201,25 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
                 inner_attempts: 1,
             },
         ];
-        if dbt != expected_dbt {
+        if !dbt_errors.is_empty() || dbt != expected_dbt {
             return Err(format!(
-                "end-of-run summary: DBT parity PASS/FAIL rows or malformed-line refusal were \
-                 parsed incorrectly: {dbt:?}"
+                "end-of-run summary: DBT parity typed rows were not retained exactly: \
+                 observations={dbt:?}, errors={dbt_errors:?}"
+            ));
+        }
+        let fixed_human_text = dbt_attempt.reason.clone();
+        dbt_attempt.test_results.as_mut().unwrap()[1].passed = true;
+        let (mutated_dbt, mutated_errors) =
+            structured_test_observations(std::slice::from_ref(&dbt_attempt), &dbt_nodes);
+        if !mutated_errors.is_empty()
+            || dbt_attempt.reason != fixed_human_text
+            || !mutated_dbt[1].passed
+            || dbt[1].passed
+        {
+            return Err(format!(
+                "end-of-run summary: changing only the typed DBT result did not change the \
+                 consumer verdict while human text stayed fixed: before={dbt:?}, \
+                 after={mutated_dbt:?}, errors={mutated_errors:?}"
             ));
         }
         let dbt_failed = test_id_summary(
@@ -10205,12 +10237,27 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             ));
         }
 
-        let dbt_retry_log = "[test.dbt_parity] ▶ START first attempt\n\
-[test.dbt_parity] FAIL dbt/virtual_clock: first attempt failed\n\
-[test.dbt_parity] ▶ START second attempt\n\
-[test.dbt_parity] PASS dbt/virtual_clock: retry passed\n";
-        let dbt_retry = dbt_parity_test_observations(dbt_retry_log);
+        let mut dbt_attempts = vec![dbt_attempt.clone(), dbt_attempt];
+        dbt_attempts[0].attempt = 1;
+        dbt_attempts[0].test_results = Some(vec![dagrun::TestResult::new(
+            "backend-parity/virtual_clock [dbt/strict]".into(),
+            false,
+            1,
+        )
+        .map_err(|error| format!("end-of-run summary: {error}"))?]);
+        dbt_attempts[0].retry_class = Some(RetryClass::AlwaysEligible);
+        dbt_attempts[0].retry_detail = Some("self-test retry".into());
+        dbt_attempts[1].attempt = 2;
+        dbt_attempts[1].test_results = Some(vec![dagrun::TestResult::new(
+            "backend-parity/virtual_clock [dbt/strict]".into(),
+            true,
+            1,
+        )
+        .map_err(|error| format!("end-of-run summary: {error}"))?]);
+        let (dbt_retry, dbt_retry_errors) =
+            structured_test_observations(&dbt_attempts, &dbt_nodes);
         if dbt_retry.len() != 2
+            || !dbt_retry_errors.is_empty()
             || dbt_retry[0].attempt != 1
             || dbt_retry[0].passed
             || dbt_retry[1].attempt != 2
@@ -10221,12 +10268,6 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
                 "end-of-run summary: DBT parity retry lost its per-attempt result: {dbt_retry:?}"
             ));
         }
-        let mut dbt_attempts = vec![
-            unreported_attempt(DBT_PARITY_NODE.into(), 1),
-            unreported_attempt(DBT_PARITY_NODE.into(), 2),
-        ];
-        dbt_attempts[0].retry_class = Some(RetryClass::AlwaysEligible);
-        dbt_attempts[0].retry_detail = Some("self-test retry".into());
         let dbt_retry_summary = test_id_summary(dbt_retry, &dbt_attempts, &BTreeSet::new());
         if dbt_retry_summary.recovered.len() != 1
             || dbt_retry_summary.recovered[0].id
@@ -10240,19 +10281,24 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             ));
         }
 
-        let dbt_pre_case_death = dbt_parity_test_observations(
-            "[test.dbt_parity] ▶ START DynamoRIO DBT strict backend parity matrix\n\
-[test.dbt_parity] ERROR: process died before the first case result\n",
-        );
+        let mut dbt_pre_case_death = dbt_attempts[0].clone();
+        dbt_pre_case_death.test_results = None;
+        dbt_pre_case_death.reason = "ERROR: process died before the first case result".into();
+        let (dbt_pre_case_observations, dbt_pre_case_errors) =
+            structured_test_observations(std::slice::from_ref(&dbt_pre_case_death), &dbt_nodes);
         let dbt_pre_case_summary = test_id_summary(
-            dbt_pre_case_death,
-            &[],
+            dbt_pre_case_observations,
+            std::slice::from_ref(&dbt_pre_case_death),
             &BTreeSet::from([DBT_PARITY_NODE.to_string()]),
         );
-        if dbt_pre_case_summary.failed_nodes_without_test_ids != [DBT_PARITY_NODE] {
+        if dbt_pre_case_errors.len() != 1
+            || !dbt_pre_case_errors[0].contains("test.dbt_parity attempt 1")
+            || dbt_pre_case_summary.failed_nodes_without_test_ids != [DBT_PARITY_NODE]
+        {
             return Err(format!(
                 "end-of-run summary: a DBT parity node that died before its first case gained an \
-                 invented test id: {dbt_pre_case_summary:?}"
+                 invented test id or lost the named missing result: \
+                 summary={dbt_pre_case_summary:?}, errors={dbt_pre_case_errors:?}"
             ));
         }
         let e2e_root = tmp.join("summary-e2e");
@@ -14705,19 +14751,19 @@ fn inner_retry_occurrences_for_test(
         .count()
 }
 
-/// Read terminal nextest results from the exact scheduler attempt that received them.
+/// Read terminal test results from the exact scheduler attempt that received them.
 ///
-/// A completed nextest step with no structured result is an error, not an empty
+/// A completed controlled-runner step with no structured result is an error, not an empty
 /// test population. Human output remains presentation and cannot manufacture a
 /// functional test result.
-fn nextest_test_observations(
+fn structured_test_observations(
     attempts: &[NodeAttempt],
-    nextest_nodes: &BTreeSet<String>,
+    structured_result_nodes: &BTreeSet<String>,
 ) -> (Vec<TestAttemptObservation>, Vec<String>) {
     let mut observations = Vec::new();
     let mut errors = Vec::new();
     for attempt in attempts {
-        if !nextest_nodes.contains(&attempt.tag)
+        if !structured_result_nodes.contains(&attempt.tag)
             || !attempt.reported
             || attempt.execution != AttemptExecution::Completed
         {
@@ -14725,7 +14771,7 @@ fn nextest_test_observations(
         }
         let Some(results) = &attempt.test_results else {
             errors.push(format!(
-                "individual nextest results are UNKNOWN for node {} attempt {}: the controlled runner published no typed test-result rows",
+                "individual test results are UNKNOWN for node {} attempt {}: the controlled runner published no typed test-result rows",
                 attempt.tag, attempt.attempt
             ));
             continue;
@@ -14738,7 +14784,7 @@ fn nextest_test_observations(
             } = result;
             let Ok(inner_attempts) = usize::try_from(*inner_attempts) else {
                 errors.push(format!(
-                    "individual nextest result {} for node {} has an attempt count too large for this process",
+                    "individual test result {} for node {} has an attempt count too large for this process",
                     id, attempt.tag
                 ));
                 continue;
@@ -14756,61 +14802,6 @@ fn nextest_test_observations(
 }
 
 const DBT_PARITY_NODE: &str = "test.dbt_parity";
-
-/// Parse one result emitted by the standalone DBT parity matrix.
-///
-/// `run_matrix.py` owns the stable case name `backend-parity/<case>`; the
-/// suffix records the backend and mode selected by the DAG node. Diagnostic,
-/// gap, blocked, and malformed lines are not individual test outcomes.
-fn dbt_parity_test_observation(rest: &str) -> Option<(bool, String)> {
-    let rest = rest.trim_start();
-    let (passed, result) = if let Some(result) = rest.strip_prefix("PASS ") {
-        (true, result)
-    } else {
-        (false, rest.strip_prefix("FAIL ")?)
-    };
-    let (identity, _detail) = result.split_once(':')?;
-    let case = identity.strip_prefix("dbt/")?;
-    if case.is_empty()
-        || !case
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
-    {
-        return None;
-    }
-    Some((passed, format!("backend-parity/{case} [dbt/strict]")))
-}
-
-/// Recover DBT parity case results from the durable scheduler log.
-///
-/// Each scheduler START begins a new attempt. Keeping that boundary means a
-/// failed case that passes on retry remains visible as a recovered test id,
-/// while a node that dies before emitting any case result still has no invented
-/// id and remains in `failed_nodes_without_test_ids`.
-fn dbt_parity_test_observations(log: &str) -> Vec<TestAttemptObservation> {
-    let mut attempt = 0;
-    let mut seen: BTreeSet<(usize, String)> = BTreeSet::new();
-    let mut observations = Vec::new();
-    for line in log.lines() {
-        let Some(after_open) = line.strip_prefix('[') else { continue };
-        let Some((node, rest)) = after_open.split_once(']') else { continue };
-        if node != DBT_PARITY_NODE {
-            continue;
-        }
-        if rest.trim_start().starts_with("▶ START") {
-            attempt += 1;
-            continue;
-        }
-        let Some((passed, id)) = dbt_parity_test_observation(rest) else { continue };
-        let attempt = attempt.max(1);
-        if seen.insert((attempt, id.clone())) {
-            observations.push(TestAttemptObservation {
-                node: DBT_PARITY_NODE.to_string(), attempt, id, passed, inner_attempts: 1,
-            });
-        }
-    }
-    observations
-}
 
 fn collect_e2e_result_files(path: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
     for entry in std::fs::read_dir(path)
@@ -17180,13 +17171,13 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
 
     // Read the individual results before removing the disposable build root: a
     // caller may deliberately place E2E_RESULT_ROOT there. The scheduler is
-    // finished, and `read_log_since_settled` flushes the live tee before reading.
+    // finished, so its typed per-attempt result records are complete.
     let failed_finally: BTreeSet<String> = outcomes
         .iter()
         .filter(|o| outcome_is_failure(o))
         .map(|o| o.tag.clone())
         .collect();
-    let nextest_nodes = plan
+    let mut structured_result_nodes = plan
         .cfg
         .steps
         .iter()
@@ -17194,18 +17185,9 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         .filter(|step| step.cmd.contains("run-nextest-counted.sh"))
         .map(Step::tag)
         .collect::<BTreeSet<_>>();
+    structured_result_nodes.insert(DBT_PARITY_NODE.to_string());
     let (mut test_observations, mut test_summary_errors) =
-        nextest_test_observations(&attempts, &nextest_nodes);
-    match read_log_since_settled(&log_path, 0) {
-        Some(log) => test_observations.extend(dbt_parity_test_observations(&log)),
-        None => {
-            test_summary_errors.push(
-                "individual DBT test ids could not be read from the durable log; failed DAG nodes \
-                 are listed separately below rather than mislabeled as test ids"
-                    .to_string(),
-            );
-        }
-    }
+        structured_test_observations(&attempts, &structured_result_nodes);
     match e2e_test_observations(&e2e_result_root) {
         Ok(mut observations) => test_observations.append(&mut observations),
         Err(error) => test_summary_errors.push(format!(
