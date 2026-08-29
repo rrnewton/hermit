@@ -12,12 +12,13 @@ readonly SCRIPT_DIR
 readonly COUNTS_WRITER="$SCRIPT_DIR/../../../../ci/write-structured-test-counts.sh"
 
 executed_tests=0
+passed_tests=0
 
 function publish_test_counts {
     local status=$? count_status
     trap - EXIT
     set +e
-    "$COUNTS_WRITER" "$executed_tests" 0
+    "$COUNTS_WRITER" "$executed_tests" "$passed_tests" 0
     count_status=$?
     if ((status == 0 && count_status != 0)); then
         status=$count_status
@@ -42,4 +43,5 @@ for test_script in sqlite_on_disk.sh sqlite_deep.sh build_tools.sh; do
     printf '==> %s\n' "$test_script"
     executed_tests=$((executed_tests + 1))
     "$SCRIPT_DIR/$test_script"
+    passed_tests=$((passed_tests + 1))
 done

@@ -217,7 +217,7 @@ def main() -> int:
         prior = os.environ.get("DAGRUN_TEST_COUNTS_PATH")
         os.environ["DAGRUN_TEST_COUNTS_PATH"] = str(counts)
         try:
-            rm.write_structured_test_counts(27, 0)
+            rm.write_structured_test_counts(27, 25, 0)
         finally:
             if prior is None:
                 os.environ.pop("DAGRUN_TEST_COUNTS_PATH", None)
@@ -225,7 +225,12 @@ def main() -> int:
                 os.environ["DAGRUN_TEST_COUNTS_PATH"] = prior
         check(
             json.loads(counts.read_text(encoding="utf-8"))
-            == {"schema": 1, "executed_tests": 27, "filtered_tests": 0},
+            == {
+                "schema": 2,
+                "executed_tests": 27,
+                "passed_tests": 25,
+                "filtered_tests": 0,
+            },
             "structured DBT count records 27 executed cases",
         )
         check(

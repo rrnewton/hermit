@@ -1535,7 +1535,7 @@ def write_results(path: Path, results: list[dict[str, str]]) -> None:
     print(f"TRACKING: wrote {len(results)} result row(s) to {path}")
 
 
-def write_structured_test_counts(executed: int, filtered: int) -> None:
+def write_structured_test_counts(executed: int, passed: int, filtered: int) -> None:
     """Publish the scheduler-owned count record without trusting stdout."""
     configured = os.environ.get("DAGRUN_TEST_COUNTS_PATH")
     if not configured:
@@ -1543,8 +1543,9 @@ def write_structured_test_counts(executed: int, filtered: int) -> None:
     path = Path(configured)
     temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}")
     payload = {
-        "schema": 1,
+        "schema": 2,
         "executed_tests": executed,
+        "passed_tests": passed,
         "filtered_tests": filtered,
     }
     try:
@@ -2012,7 +2013,8 @@ def main() -> int:
         verify=args.verify,
         probe_gaps=args.probe_gaps,
     )
-    write_structured_test_counts(executed_cases, filtered_cases)
+    passed_cases = sum(result["result"] in {"PASS", "XPASS"} for result in results)
+    write_structured_test_counts(executed_cases, passed_cases, filtered_cases)
     return 1 if failures else 0
 
 

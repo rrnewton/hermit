@@ -3,12 +3,12 @@
 set -uo pipefail
 
 function write_structured_test_counts {
-    local executed=$1 filtered=$2 path=${DAGRUN_TEST_COUNTS_PATH:-} tmp
+    local executed=$1 passed=$2 filtered=$3 path=${DAGRUN_TEST_COUNTS_PATH:-} tmp
     [[ -n $path ]] || return 0
     tmp="${path}.tmp.$$"
     umask 077
-    if ! printf '{"schema":1,"executed_tests":%s,"filtered_tests":%s}\n' \
-        "$executed" "$filtered" >"$tmp"; then
+    if ! printf '{"schema":2,"executed_tests":%s,"passed_tests":%s,"filtered_tests":%s}\n' \
+        "$executed" "$passed" "$filtered" >"$tmp"; then
         printf 'run-nextest-counted: cannot write structured test counts to %s\n' "$tmp" >&2
         return 2
     fi
@@ -96,7 +96,7 @@ function emit_libtest_count {
     # clients consume this exact file instead. A command that merely prints a
     # libtest-looking banner therefore cannot manufacture an executed-test
     # count.
-    write_structured_test_counts "$executed" "$skipped" || return $?
+    write_structured_test_counts "$executed" "$passed" "$skipped" || return $?
 
     # Preserve the canonical libtest spelling for human-facing logs and older
     # dagrun clients that have not required the structured count file.
@@ -147,7 +147,7 @@ function self_test {
         emit_libtest_count "$scratch/with-skips" 0)
     [[ $got == "$expected" ]] || return 1
     [[ $(<"$scratch/counts.json") == \
-        '{"schema":1,"executed_tests":8,"filtered_tests":7}' ]] || return 1
+        '{"schema":2,"executed_tests":8,"passed_tests":8,"filtered_tests":7}' ]] || return 1
 
     got=$(NEXTEST_EXPECTED_EXECUTED=8 emit_libtest_count "$scratch/with-skips" 0)
     [[ $got == "$expected" ]] || return 1

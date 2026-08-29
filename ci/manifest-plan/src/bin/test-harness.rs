@@ -142,12 +142,14 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
 fn write_structured_test_counts(
     path: &Path,
     executed: usize,
+    passed: usize,
     filtered: usize,
 ) -> Result<(), String> {
     let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
     let counts = serde_json::json!({
-        "schema": 1,
+        "schema": 2,
         "executed_tests": executed,
+        "passed_tests": passed,
         "filtered_tests": filtered,
     });
     let publish =
@@ -1448,9 +1450,13 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         .filter(|result| result.outcome == "HOST-INAPPLICABLE")
         .count();
     let executed = results.len().saturating_sub(host_inapplicable);
+    let passed = results
+        .iter()
+        .filter(|result| result.outcome == "PASS")
+        .count();
     if let Some(path) = std::env::var_os("DAGRUN_TEST_COUNTS_PATH") {
         let path = PathBuf::from(path);
-        if let Err(error) = write_structured_test_counts(&path, executed, 0) {
+        if let Err(error) = write_structured_test_counts(&path, executed, passed, 0) {
             eprintln!("test-harness: {error}");
             failed = true;
         }
@@ -1524,15 +1530,16 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        write_structured_test_counts(&path, 17, 3).unwrap();
+        write_structured_test_counts(&path, 17, 15, 3).unwrap();
         let counts: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         std::fs::remove_file(path).unwrap();
         assert_eq!(
             counts,
             serde_json::json!({
-                "schema": 1,
+                "schema": 2,
                 "executed_tests": 17,
+                "passed_tests": 15,
                 "filtered_tests": 3,
             })
         );
