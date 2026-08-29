@@ -113,6 +113,12 @@ record cli ./ci/run-with-reverie-dbt-budget.sh cargo nextest list -- \
 record hermit-modes ./ci/run-with-reverie-dbt-budget.sh cargo nextest list -- \
     ${CI:+--profile ci} -p hermit --features third-party-backends --test hermit_modes
 
+# hermit_modes executes these binaries as runtime inputs. Build them here so
+# the timed test process never conditionally invokes Cargo based on shared
+# target-directory state.
+./ci/run-with-reverie-dbt-budget.sh cargo build --locked \
+    -p hermetic_infra_hermit_tests --bins
+
 for metadata in "$scratch"/*.json; do
     if [[ $metadata == */cargo-metadata.json ]]; then
         jq -e '.workspace_root and .target_directory and (.packages | length > 0)' \
