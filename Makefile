@@ -129,12 +129,10 @@ check-skill-discovery: ## Verify Claude and stock Codex discover the same produc
 # checkers in this target had no such node (measured 2026-08-25 at a5fef7ff7623).
 lint: lint-checks lint-cargo ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, Reverie pin policy, nested lockfiles, record-version floor)
 
-# ⚠️ The FULL scripts/test_validate_stop_paths.py run is deliberately NOT in this
-# recipe. It SPAWNS A VALIDATE -- `Popen([scripts/validate.rs, "full"])` in its
-# run_signal -- so as a DAG node it runs a validate from inside a validate. The child
-# is refused before emitting VALIDATE_STOP_TEST_READY. Its
-# `--final-status-self-test` mode below is pure string/file classification and does
-# not launch validate, so the output-channel contract is gated without nesting.
+# The full stop-path checker is safe to run inside validation: it clears the outer
+# HERMIT_VALIDATE_ACTIVE marker before launching fixtures, and every full-validate
+# child enters the stop-test seam before admission or the DAG. The full run also
+# exercises the final-status contract, so it replaces the narrower self-test here.
 #
 # ⚠️ Comments INSIDE the recipe below must be TAB-indented. A comment at column 0 ends
 # the recipe, silently dropping every line after it.
@@ -142,7 +140,7 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 	./scripts/check-skill-discovery.rs
 	./scripts/test-required-check-outcomes.sh
 	./scripts/test-check-status-outcome.sh
-	python3 ./scripts/test_validate_stop_paths.py --final-status-self-test
+	python3 ./scripts/test_validate_stop_paths.py
 	./scripts/check-merge-gate-policy.sh
 	./scripts/test-configure-merge-gate-ruleset.sh
 	python3 ./scripts/test_pr_status.py

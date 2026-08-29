@@ -6,12 +6,13 @@ https://github.com/rrnewton/hermit/pull/2637 was that the consumer searched the
 complete captured channel for refusal-shaped text.  That turned ordinary failures
 which merely mentioned that text into `ValidateChildRefused`.
 
-The stop-path test cannot run inside `make lint-checks`: it starts a full
-validate, and a validate started from inside validation is refused.  Importing
-the file is safe, however, because its process-spawning work is guarded by
-`if __name__ == "__main__"`.  This check therefore drives the real
-`wait_for_text()` path with genuine re-entrancy refusals, other could-not-run
-outcomes, status mismatches, quoted text, and ordinary failure output.
+The full stop-path test can run inside `make lint-checks`: it clears the inherited
+active-validation marker, and every child enters stop-test mode before admission
+or the DAG.  This companion check imports the file without spawning those children
+because its process work is guarded by `if __name__ == "__main__"`.  It therefore
+drives the real `wait_for_text()` path directly with genuine re-entrancy refusals,
+other could-not-run outcomes, status mismatches, quoted text, and ordinary failure
+output, including branches the full happy-path run may not encounter.
 
 The check refuses when the refusal-classification path is absent.  Pull request
 2637 must therefore be underneath this change before it can land. The
