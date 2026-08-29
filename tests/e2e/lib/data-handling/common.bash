@@ -9,10 +9,11 @@ set -euo pipefail
 DATA_HANDLING_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd -- "$DATA_HANDLING_DIR/../../../.." && pwd)"
 HERMIT_BIN=${HERMIT_BIN:-$ROOT_DIR/target/debug/hermit}
+VERIFICATION_REPORT_BIN=${VERIFICATION_REPORT_BIN:-$(dirname -- "$HERMIT_BIN")/verification-report}
 DATA_HANDLING_TIMEOUT=${DATA_HANDLING_TIMEOUT:-120s}
 NATIVE_ATTEMPTS=${NATIVE_ATTEMPTS:-12}
 NATIVE_RETRY_DELAY=${NATIVE_RETRY_DELAY:-0}
-readonly DATA_HANDLING_DIR ROOT_DIR HERMIT_BIN DATA_HANDLING_TIMEOUT
+readonly DATA_HANDLING_DIR ROOT_DIR HERMIT_BIN VERIFICATION_REPORT_BIN DATA_HANDLING_TIMEOUT
 
 function require_tools {
     local tool
@@ -108,14 +109,19 @@ function assert_deterministic_with_hermit {
         echo "Hermit binary is not executable: $HERMIT_BIN" >&2
         return 1
     fi
+    if [[ ! -x $VERIFICATION_REPORT_BIN ]]; then
+        echo "typed verification-report reader is not executable: $VERIFICATION_REPORT_BIN" >&2
+        return 1
+    fi
 
     evidence=$(mktemp -d "${TMPDIR:-/tmp}/hermit-data-strict.XXXXXX")
     stdout=$evidence/stdout
     stderr=$evidence/stderr
+    local verify_report=$evidence/verify.json
 
     if ! run_captured "$stdout" "$stderr" \
         "$HERMIT_BIN" --log=info run \
-        --strict --verify \
+        --strict --verify --verify-json "$verify_report" \
         --no-virtualize-cpuid --max-timeslice=disabled \
         -- "$@"; then
         echo "$label: strict Hermit verification failed" >&2
@@ -124,8 +130,8 @@ function assert_deterministic_with_hermit {
         rm -rf -- "$evidence"
         return 1
     fi
-    if ! grep -Fq 'Determinism verified' "$stdout" "$stderr"; then
-        echo "$label: Hermit exited without a determinism verdict" >&2
+    if ! "$VERIFICATION_REPORT_BIN" matched "$verify_report"; then
+        echo "$label: typed verification report did not match" >&2
         cat "$stdout" >&2
         cat "$stderr" >&2
         rm -rf -- "$evidence"

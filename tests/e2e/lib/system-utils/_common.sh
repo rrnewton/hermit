@@ -66,10 +66,13 @@ init_system_utility_test() {
     readonly SYSTEM_UTIL_TIMEOUT_SECONDS=$timeout_seconds
     readonly HERMIT_BIN=$hermit_bin
     readonly SYSTEM_UTIL_REPO_ROOT=$repo_root
+    readonly VERIFICATION_REPORT_BIN=${VERIFICATION_REPORT_BIN:-$(dirname -- "$hermit_bin")/verification-report}
 
     backend_is_allowed || skip \
         "backend is outside allowlist: ${BACKEND_ALLOWLIST[*]}"
     [[ -x $HERMIT_BIN ]] || fail "Hermit binary is not executable: $HERMIT_BIN"
+    [[ -x $VERIFICATION_REPORT_BIN ]] \
+        || fail "typed verification-report reader is not executable: $VERIFICATION_REPORT_BIN"
     command -v timeout >/dev/null || fail "required host command is missing: timeout"
     command -v sha256sum >/dev/null || fail "required host command is missing: sha256sum"
 
@@ -141,7 +144,8 @@ run_strict_verify() {
     STRICT_STDERR=$SYSTEM_UTIL_WORKDIR/strict.stderr
     VERIFY_STDOUT=$SYSTEM_UTIL_WORKDIR/verify.stdout
     VERIFY_STDERR=$SYSTEM_UTIL_WORKDIR/verify.stderr
-    readonly STRICT_STDOUT STRICT_STDERR VERIFY_STDOUT VERIFY_STDERR
+    VERIFY_REPORT=$SYSTEM_UTIL_WORKDIR/verify.json
+    readonly STRICT_STDOUT STRICT_STDERR VERIFY_STDOUT VERIFY_STDERR VERIFY_REPORT
 
     local status
     set +e
@@ -158,7 +162,8 @@ run_strict_verify() {
     set +e
     timeout -k 5s "${SYSTEM_UTIL_TIMEOUT_SECONDS}s" \
         "$HERMIT_BIN" --log INFO run --backend "$SYSTEM_UTIL_BACKEND" \
-        --strict --verify -- "$@" >"$VERIFY_STDOUT" 2>"$VERIFY_STDERR"
+        --strict --verify --verify-json "$VERIFY_REPORT" -- "$@" \
+        >"$VERIFY_STDOUT" 2>"$VERIFY_STDERR"
     status=$?
     set -e
     if ((status != 0)); then
@@ -166,11 +171,10 @@ run_strict_verify() {
         fail "strict verification exited $status"
     fi
 
-    if ! grep -Fq 'Determinism verified' "$VERIFY_STDERR" \
-        && ! grep -Fq 'KVM guest output and exit status matched' "$VERIFY_STDERR"; then
+    if ! "$VERIFICATION_REPORT_BIN" matched "$VERIFY_REPORT"; then
         cat "$VERIFY_STDOUT" >&2
         tail -80 "$VERIFY_STDERR" >&2
-        fail "verification exited successfully without a determinism verdict"
+        fail "typed verification report did not match"
     fi
 
     printf '%s strict stdout:\n' "$SYSTEM_UTIL_TEST_NAME"

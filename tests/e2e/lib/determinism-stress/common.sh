@@ -5,6 +5,7 @@ set -euo pipefail
 stress_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$stress_dir/../../../.." && pwd)
 hermit_bin=${HERMIT_BIN:-$repo_root/target/release/hermit}
+VERIFICATION_REPORT_BIN=${VERIFICATION_REPORT_BIN:-$(dirname -- "$hermit_bin")/verification-report}
 cc_bin=${CC:-cc}
 verify_repetitions=${DETERMINISM_STRESS_REPETITIONS:-1}
 native_repetitions=${NATIVE_STRESS_REPETITIONS:-3}
@@ -131,6 +132,8 @@ fi
 
 [[ -x $hermit_bin ]] || fail \
   "Hermit release binary not found: $hermit_bin (run: cargo build --release -p hermit --bin hermit)"
+[[ -x $VERIFICATION_REPORT_BIN ]] || fail \
+  "typed verification-report reader not found: $VERIFICATION_REPORT_BIN (run: cargo build -p hermit --bin verification-report)"
 command -v "$cc_bin" >/dev/null 2>&1 || fail "C compiler not found: $cc_bin"
 command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required"
 command -v timeout >/dev/null 2>&1 || fail "timeout is required"
@@ -197,21 +200,23 @@ verify_guest() {
     verify_index=$((verify_index + 1))
     local stdout=$stress_workdir/verify-$verify_index.stdout
     local stderr=$stress_workdir/verify-$verify_index.stderr
+    local verify_report=$stress_workdir/verify-$verify_index.json
 
     printf '[hermit verify] %s (attempt %s/%s)\n' \
       "$label" "$attempt" "$verify_repetitions"
     if ! timeout --kill-after=10 "${verify_timeout}s" \
-      "$hermit_bin" --log info run --strict --verify -- "$@" \
+      "$hermit_bin" --log info run --strict --verify \
+      --verify-json "$verify_report" -- "$@" \
       >"$stdout" 2>"$stderr"; then
       cat "$stdout" >&2
       tail -200 "$stderr" >&2
       printf 'error: %s failed under hermit run --strict --verify\n' "$label" >&2
       return 1
     fi
-    if ! grep -Fq 'Determinism verified' "$stdout" "$stderr"; then
+    if ! "$VERIFICATION_REPORT_BIN" matched "$verify_report"; then
       cat "$stdout" >&2
       tail -200 "$stderr" >&2
-      printf 'error: %s exited without the determinism marker\n' "$label" >&2
+      printf 'error: %s typed verification report did not match\n' "$label" >&2
       return 1
     fi
     record_comparison_evidence "$stderr"
