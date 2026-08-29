@@ -8827,28 +8827,52 @@ mod scheduler_explanation_tests {
         let quick_manifest = "quick.e2e_verify";
         let ordinary = "test.cli";
         let never_launched = "e2e.manifest_c_programs";
+        let mut manifest_step = step_with_caps(
+            "e2e",
+            "manifest_applications",
+            "fixture",
+            "false".into(),
+            Vec::new(),
+            30,
+            30,
+            64 * 1024 * 1024,
+        );
+        manifest_step.manifest = Some(DagManifest {
+            lane: "portable".into(),
+            category: "applications".into(),
+        });
+        let mut privileged_manifest_step = step_with_caps(
+            "privileged-e2e",
+            "manifest_backend_parity_c",
+            "fixture",
+            "false".into(),
+            Vec::new(),
+            30,
+            30,
+            64 * 1024 * 1024,
+        );
+        privileged_manifest_step.manifest = Some(DagManifest {
+            lane: "privileged".into(),
+            category: "backend-parity-c".into(),
+        });
+        let mut never_launched_step = step_with_caps(
+            "e2e",
+            "manifest_c_programs",
+            "fixture",
+            "false".into(),
+            Vec::new(),
+            30,
+            30,
+            64 * 1024 * 1024,
+        );
+        never_launched_step.manifest = Some(DagManifest {
+            lane: "portable".into(),
+            category: "c-programs".into(),
+        });
         let cfg = DagConfig {
             steps: vec![
-                step_with_caps(
-                    "e2e",
-                    "manifest_applications",
-                    "fixture",
-                    "false".into(),
-                    Vec::new(),
-                    30,
-                    30,
-                    64 * 1024 * 1024,
-                ),
-                step_with_caps(
-                    "privileged-e2e",
-                    "manifest_backend_parity_c",
-                    "fixture",
-                    "false".into(),
-                    Vec::new(),
-                    30,
-                    30,
-                    64 * 1024 * 1024,
-                ),
+                manifest_step,
+                privileged_manifest_step,
                 step_with_caps(
                     "quick",
                     "e2e_verify",
@@ -8869,16 +8893,7 @@ mod scheduler_explanation_tests {
                     30,
                     64 * 1024 * 1024,
                 ),
-                step_with_caps(
-                    "e2e",
-                    "manifest_c_programs",
-                    "fixture",
-                    "false".into(),
-                    Vec::new(),
-                    30,
-                    30,
-                    64 * 1024 * 1024,
-                ),
+                never_launched_step,
             ],
             ..Default::default()
         };
