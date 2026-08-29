@@ -239,7 +239,9 @@ impl StressProbe {
         match self {
             StressProbe::KvmVerify => Some("kvm_available"),
             StressProbe::DbtVerify => Some("dbt_available"),
-            _ => None,
+            StressProbe::PtraceStrictVerify
+            | StressProbe::PtracePipeline
+            | StressProbe::PtraceRecordReplay => None,
         }
     }
 

@@ -17245,7 +17245,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         let floor = match mode {
             CompatMode::Sabre => Some(validate_corpus::SABRE_COMPAT_EXPECTED),
             CompatMode::Rr => Some(validate_corpus::RR_COMPAT_EXPECTED),
-            _ => None,
+            CompatMode::Strict | CompatMode::PortableStrict | CompatMode::E9patch => None,
         };
         if let Some(f) = floor {
             if passed < f {

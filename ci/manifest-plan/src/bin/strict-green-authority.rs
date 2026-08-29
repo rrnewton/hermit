@@ -381,7 +381,7 @@ fn verify_claim(
                 context()
             ));
         }
-        _ => {}
+        Tier::Short | Tier::Large => {}
     }
 
     let register_cadence = match claim.register_coverage.kind {
