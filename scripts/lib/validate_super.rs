@@ -592,6 +592,10 @@ pub fn self_test(root: &Path) -> Result<String, String> {
         filtered_tests: None,
         test_results: None,
         returncode: Some(if ok { 0 } else { 1 }),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: String::new(),
         aborted: false,
     };

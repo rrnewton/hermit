@@ -1535,17 +1535,39 @@ def write_results(path: Path, results: list[dict[str, str]]) -> None:
     print(f"TRACKING: wrote {len(results)} result row(s) to {path}")
 
 
-def write_structured_test_counts(executed: int, filtered: int) -> None:
-    """Publish the scheduler-owned count record without trusting stdout."""
+def write_structured_test_results(
+    results: list[dict[str, str]], executed: int, filtered: int, mode: str
+) -> None:
+    """Publish exact terminal matrix results without trusting stdout."""
     configured = os.environ.get("DAGRUN_TEST_COUNTS_PATH")
     if not configured:
         return
+    terminal = [result for result in results if result["result"] != "GAP"]
+    if len(terminal) != executed:
+        raise MatrixError(
+            "structured DBT results disagree with the executed-case count: "
+            f"{len(terminal)} terminal row(s), {executed} executed case(s)"
+        )
+    rows = [
+        {
+            "id": (
+                f"backend-parity/{result['test_name']} "
+                f"[{result['backend']}/{mode}]"
+            ),
+            "result": "pass" if result["result"] in {"PASS", "XPASS"} else "fail",
+            "attempts": 1,
+        }
+        for result in terminal
+    ]
+    if len({row["id"] for row in rows}) != len(rows):
+        raise MatrixError("structured DBT results contain a duplicate test identity")
     path = Path(configured)
     temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}")
     payload = {
-        "schema": 1,
+        "schema": 2,
         "executed_tests": executed,
         "filtered_tests": filtered,
+        "results": rows,
     }
     try:
         temporary.write_text(
@@ -2012,7 +2034,8 @@ def main() -> int:
         verify=args.verify,
         probe_gaps=args.probe_gaps,
     )
-    write_structured_test_counts(executed_cases, filtered_cases)
+    mode = "verify" if args.verify else "strict" if strict else "repeat"
+    write_structured_test_results(results, executed_cases, filtered_cases, mode)
     return 1 if failures else 0
 
 

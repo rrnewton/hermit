@@ -10,6 +10,8 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::thread;
 
+use dagrun::TestResult;
+use dagrun::TestResults;
 use hermit_manifest_plan::runner::CellResult;
 use hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL;
 use hermit_manifest_plan::runner::ManifestSet;
@@ -136,27 +138,38 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
     args
 }
 
-fn write_structured_test_counts(
-    path: &Path,
-    executed: usize,
-    filtered: usize,
-) -> Result<(), String> {
-    let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
-    let counts = serde_json::json!({
-        "schema": 1,
-        "executed_tests": executed,
-        "filtered_tests": filtered,
-    });
-    let publish =
-        fs::write(&temporary, format!("{counts}\n")).and_then(|()| fs::rename(&temporary, path));
-    if let Err(error) = publish {
-        let _ = fs::remove_file(&temporary);
-        return Err(format!(
-            "cannot publish structured test counts to {}: {error}",
-            path.display()
-        ));
-    }
-    Ok(())
+fn structured_test_results(results: &[CellResult]) -> Result<TestResults, String> {
+    structured_test_results_from_rows(
+        results
+            .iter()
+            .filter(|result| result.outcome != "HOST-INAPPLICABLE")
+            .map(|result| {
+                (
+                    format!(
+                        "{} [{}/{}]",
+                        result.test,
+                        result.backend.as_deref().unwrap_or("native"),
+                        result.mode
+                    ),
+                    result.outcome == "PASS",
+                    result.attempt,
+                )
+            }),
+    )
+}
+
+fn structured_test_results_from_rows(
+    rows: impl IntoIterator<Item = (String, bool, u64)>,
+) -> Result<TestResults, String> {
+    let rows = rows
+        .into_iter()
+        .map(|(id, passed, attempts)| TestResult::new(id, passed, attempts))
+        .collect::<Result<Vec<_>, _>>()?;
+    TestResults::current(
+        u64::try_from(rows.len()).map_err(|_| "cell result count does not fit u64")?,
+        0,
+        rows,
+    )
 }
 fn host_inapplicable_reason(
     requires: &[String],
@@ -1398,10 +1411,11 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         .iter()
         .filter(|result| result.outcome == "HOST-INAPPLICABLE")
         .count();
-    let executed = results.len().saturating_sub(host_inapplicable);
     if let Some(path) = std::env::var_os("DAGRUN_TEST_COUNTS_PATH") {
         let path = PathBuf::from(path);
-        if let Err(error) = write_structured_test_counts(&path, executed, 0) {
+        if let Err(error) =
+            structured_test_results(&results).and_then(|report| report.write_current(&path))
+        {
             eprintln!("test-harness: {error}");
             failed = true;
         }
@@ -1463,10 +1477,10 @@ mod tests {
     use super::parse;
     use super::run_with_retry;
     use super::scheduled_worker_capacity;
-    use super::write_structured_test_counts;
+    use super::structured_test_results_from_rows;
 
     #[test]
-    fn structured_test_counts_are_machine_readable_and_exact() {
+    fn structured_test_results_are_machine_readable_and_exact_on_failure() {
         let path = std::env::temp_dir().join(format!(
             "hermit-manifest-counts-{}-{}.json",
             std::process::id(),
@@ -1475,16 +1489,26 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        write_structured_test_counts(&path, 17, 3).unwrap();
+        structured_test_results_from_rows([
+            ("suite$passes".into(), true, 1),
+            ("suite$fails".into(), false, 2),
+        ])
+        .unwrap()
+        .write_current(&path)
+        .unwrap();
         let counts: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         std::fs::remove_file(path).unwrap();
         assert_eq!(
             counts,
             serde_json::json!({
-                "schema": 1,
-                "executed_tests": 17,
-                "filtered_tests": 3,
+                "schema": 2,
+                "executed_tests": 2,
+                "filtered_tests": 0,
+                "results": [
+                    {"id": "suite$passes", "result": "pass", "attempts": 1},
+                    {"id": "suite$fails", "result": "fail", "attempts": 2},
+                ],
             })
         );
     }

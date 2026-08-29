@@ -1150,6 +1150,10 @@ fn self_test() -> Result<(), String> {
             filtered_tests: None,
             test_results: None,
             returncode: Some(if ok { 0 } else { 1 }),
+            oomed: false,
+            oom_kills: 0,
+            timed_out: false,
+            cpu_timed_out: false,
             reason: String::new(),
             aborted: false,
         };
@@ -3400,7 +3404,13 @@ fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
             return Err(format!("verbosity: envelope lost stable identity fixture {fixture:?}"));
         }
     }
-    if envelope.cmd.matches("\"$id\"").count() != 2 {
+    if !envelope
+        .cmd
+        .contains("printf '##TEST-START %s\\n' \"$id\" >&2")
+        || !envelope
+            .cmd
+            .contains("printf '##TEST-END %s PASS\\n' \"$id\" >&2")
+    {
         return Err("verbosity: envelope START/END must use the same whitespace-free identity".into());
     }
     if envelope.cmd.matches("\"$id\" >&2").count() != 2
@@ -3413,7 +3423,9 @@ fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
     for fixture in [
         "trap publish_counts EXIT",
         "EXECUTED=$((EXECUTED + 1))",
-        "./ci/write-structured-test-counts.sh \"$EXECUTED\" 0",
+        "RESULTS+=(\"envelope/$id\" pass 1)",
+        "RESULTS+=(\"envelope/$CURRENT_TEST\" fail 1)",
+        "./ci/write-structured-test-counts.sh \"$EXECUTED\" 0 \"${RESULTS[@]}\"",
     ] {
         if !envelope.cmd.contains(fixture) {
             return Err(format!(
@@ -6613,6 +6625,10 @@ fn summary_listing_bracket() -> Result<String, String> {
         filtered_tests: None,
         test_results: None,
         returncode: Some(if ok { 0 } else { 1 }),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: String::new(),
         aborted: false,
     };
@@ -12857,6 +12873,10 @@ fn test_node_coverage_bracket() -> Result<(), String> {
         filtered_tests: Some(0),
         test_results: None,
         returncode: Some(if ok { 0 } else { 100 }),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: if ok { String::new() } else { "test failure".into() },
         aborted,
     };
@@ -12906,6 +12926,10 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         filtered_tests,
         test_results: None,
         returncode: Some(if ok { 0 } else { 100 }),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: if ok { String::new() } else { "test failure".into() },
         aborted: false,
     };
@@ -12948,6 +12972,21 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         );
     }
 
+    let mut mixed_failure = outcome("test.mixed-failure", false, Some(2), Some(1));
+    mixed_failure.test_results = Some(vec![
+        TestResult::new("mixed-pass".into(), true, 1)?,
+        TestResult::new("mixed-fail".into(), false, 1)?,
+    ]);
+    let successful_count_only = outcome("test.successful-count-only", true, Some(3), Some(2));
+    if libtest_counts(&[mixed_failure, successful_count_only])
+        != (Some(5), Some(4), Some(3))
+    {
+        return Err(
+            "typed libtest counts: mixed failed typed and successful count-only outcomes did not retain an exact pass total"
+                .into(),
+        );
+    }
+
     let compat_pass = outcome("compat.pass-case", true, None, None);
     let compat_fail = outcome("compat.fail-case", false, None, None);
     let compat_attempts = vec![
@@ -12981,7 +13020,7 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         ));
     }
     println!(
-        "  typed libtest counts: exact 873/873/350 pass; retained failure stayed unknown; typed mutation moved 1 -> 2; compatibility rows carried terminal verdicts and attempts; 0/0/0 preserved"
+        "  typed libtest counts: exact 873/873/350 pass; retained count-only failure stayed unknown; mixed typed failure aggregated exactly; typed mutation moved 1 -> 2; compatibility rows carried terminal verdicts and attempts; 0/0/0 preserved"
     );
     Ok(())
 }
@@ -13096,6 +13135,10 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         filtered_tests: Some(0),
         test_results: None,
         returncode: Some(1),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: "fixture failure".into(),
         aborted: false,
     };
@@ -13401,6 +13444,10 @@ fn possible_missing_artifact_bracket() -> Result<(), String> {
         filtered_tests: None,
         test_results: None,
         returncode,
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: String::new(),
         aborted: false,
     };
@@ -13436,6 +13483,10 @@ fn no_result_propagation_bracket() -> Result<(), String> {
         filtered_tests: None,
         test_results: None,
         returncode: Some(returncode),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: String::new(),
         aborted,
     };
@@ -16955,6 +17006,10 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
         filtered_tests: None,
         test_results: None,
         returncode: Some(if ok { 0 } else { 1 }),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: if ok { String::new() } else { "stop-test synthetic failure".into() },
         aborted: false,
     };
