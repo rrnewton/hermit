@@ -1,0 +1,140 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+//! Machine-readable evidence that the selected backend performed its own work.
+
+use serde::Deserialize;
+use serde::Serialize;
+
+/// SaBRe's typed evidence that its in-guest path, ptrace fallback, or trusted
+/// shared-object path handled the run.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathEvidence {
+    pub schema: u8,
+    pub guest_rpc_observed: bool,
+    pub ptrace_fallback_sites: usize,
+    pub trusted_shared_object_sites: usize,
+    pub trusted_shared_objects: Vec<String>,
+}
+
+impl PathEvidence {
+    pub const SCHEMA: u8 = 1;
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != Self::SCHEMA {
+            return Err(format!(
+                "sabre path-evidence schema must be {}, got {}",
+                Self::SCHEMA,
+                self.schema
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The backend-specific value used by compatibility-envelope scoring.
+///
+/// The variants keep each number attached to what it counts. A bare numeric
+/// field would allow a scheduler-turn count to be consumed as a mapped-site or
+/// branch count while remaining perfectly well formed.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "backend", rename_all = "lowercase", deny_unknown_fields)]
+pub enum BackendEngagement {
+    Ptrace { scheduler_turns: u64 },
+    E9patch { mapped_sites: u64 },
+    Dbt { counted_branches: u64 },
+}
+
+/// One complete `--backend-engagement-json` record.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendEngagementReport {
+    pub schema: u8,
+    pub engagement: BackendEngagement,
+}
+
+impl BackendEngagementReport {
+    pub const SCHEMA: u8 = 1;
+
+    pub const fn new(engagement: BackendEngagement) -> Self {
+        Self {
+            schema: Self::SCHEMA,
+            engagement,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != Self::SCHEMA {
+            return Err(format!(
+                "backend-engagement schema must be {}, got {}",
+                Self::SCHEMA,
+                self.schema
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_and_counter_cannot_be_recombined() {
+        let report = BackendEngagementReport::new(BackendEngagement::E9patch { mapped_sites: 7 });
+        let json = serde_json::to_string(&report).unwrap();
+        assert_eq!(
+            json,
+            r#"{"schema":1,"engagement":{"backend":"e9patch","mapped_sites":7}}"#
+        );
+        let changed =
+            serde_json::to_string(&BackendEngagementReport::new(BackendEngagement::E9patch {
+                mapped_sites: 8,
+            }))
+            .unwrap();
+        assert_ne!(json, changed, "the producer's value must reach the record");
+
+        let mismatched = r#"{"schema":1,"engagement":{"backend":"e9patch","counted_branches":7}}"#;
+        let error = serde_json::from_str::<BackendEngagementReport>(mismatched).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `counted_branches`")
+        );
+    }
+
+    #[test]
+    fn unsupported_schema_refuses_by_name() {
+        let report = BackendEngagementReport {
+            schema: 2,
+            engagement: BackendEngagement::Dbt {
+                counted_branches: 11,
+            },
+        };
+        assert_eq!(
+            report.validate().unwrap_err(),
+            "backend-engagement schema must be 1, got 2"
+        );
+    }
+
+    #[test]
+    fn sabre_path_evidence_refuses_an_unsupported_schema() {
+        let evidence = PathEvidence {
+            schema: 2,
+            guest_rpc_observed: true,
+            ptrace_fallback_sites: 0,
+            trusted_shared_object_sites: 0,
+            trusted_shared_objects: Vec::new(),
+        };
+        assert_eq!(
+            evidence.validate().unwrap_err(),
+            "sabre path-evidence schema must be 1, got 2"
+        );
+    }
+}

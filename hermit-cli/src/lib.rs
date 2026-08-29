@@ -11,6 +11,7 @@
 #![allow(clippy::uninlined_format_args)]
 
 mod backend_stats;
+pub mod build_info;
 pub mod canonical_verdict;
 mod chroot;
 mod consts;

@@ -25,13 +25,13 @@ use std::sync::atomic::Ordering;
 use anyhow::Context;
 use anyhow::Error;
 use anyhow::anyhow;
+pub use detcore_model::backend_engagement::PathEvidence;
 use nix::sys::ptrace;
 use nix::sys::signal::Signal;
 use nix::sys::wait::WaitPidFlag;
 use nix::sys::wait::WaitStatus;
 use nix::sys::wait::waitpid;
 use nix::unistd::Pid;
-use serde::Serialize;
 
 const SYSCALL_INSN: [u8; 2] = [0x0f, 0x05];
 // SaBRe's SIGILL handler recognizes this reserved two-byte instruction as a
@@ -44,15 +44,6 @@ pub struct Output {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub path_evidence: PathEvidence,
-}
-
-#[derive(Debug, Serialize)]
-pub struct PathEvidence {
-    pub schema: u8,
-    pub guest_rpc_observed: bool,
-    pub ptrace_fallback_sites: usize,
-    pub trusted_shared_object_sites: usize,
-    pub trusted_shared_objects: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

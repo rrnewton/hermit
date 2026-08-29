@@ -23,6 +23,7 @@ mod clean;
 mod container;
 mod gdb_client;
 mod global_opts;
+mod host_capabilities;
 mod image;
 mod instruction_map;
 mod list;
@@ -183,6 +184,7 @@ use self::container::PolicyRefusal;
 use self::container::RunTimeoutMarker;
 use self::container::SignalDeath;
 use self::global_opts::GlobalOpts;
+use self::host_capabilities::HostCapabilitiesOpts;
 use self::instruction_map::InstructionMapOpts;
 use self::logdiff::LogDiffCLIOpts;
 use self::oci::OciOpts;
@@ -193,6 +195,7 @@ use self::run::RunOpts;
 use self::strace::StraceOpts;
 use self::verify::write_pending_verification_json;
 use self::version::Version;
+use self::version::VersionOpts;
 
 #[derive(Debug, Parser)]
 #[clap(
@@ -209,6 +212,14 @@ struct Args {
 
 #[derive(Debug, Parser)]
 enum Subcommand {
+    /// Report the machine facilities that control validation selection.
+    #[clap(name = "host-capabilities")]
+    HostCapabilities(HostCapabilitiesOpts),
+
+    /// Print version and build information.
+    #[clap(name = "version")]
+    Version(VersionOpts),
+
     /// Run a program sandboxed and fully deterministically (unless external networking is allowed).
     #[clap(name = "run", trailing_var_arg = true)]
     Run(Box<RunOpts>),
@@ -365,6 +376,8 @@ impl Subcommand {
         }
         self.validate_backend_scope(global.backend)?;
         match self {
+            Subcommand::HostCapabilities(x) => x.main(),
+            Subcommand::Version(x) => x.main(),
             Subcommand::Run(x) => x.main(global),
             Subcommand::Strace(x) => x.main(global),
             Subcommand::Record(x) => x.main(global),
