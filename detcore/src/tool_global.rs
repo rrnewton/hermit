@@ -444,7 +444,7 @@ impl GlobalState {
     ///
     /// This only records a barrier observation when the backend advertises physical-exit
     /// reporting; it is therefore a no-op for ptrace, DBT, KVM, and LiteInst execution. The
-    /// The scheduler releases the exact process's barrier at its next loop-top
+    /// scheduler releases the exact process's barrier at its next loop-top
     /// maintenance point rather than on this host-driven call.
     pub fn complete_physical_process_exit(&self, raw_pid: i32) {
         let detpid = DetPid::from_raw(raw_pid);
@@ -2947,7 +2947,7 @@ where
     }
 }
 
-/// Wait without requesting a scheduler turn for a backend's physical-exit report.
+/// Wait without requesting a scheduler turn for a backend's physical-exit report to be applied.
 pub async fn await_exact_child_physical_exit<G, T>(
     guest: &mut G,
     child: DetPid,

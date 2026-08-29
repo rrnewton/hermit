@@ -236,7 +236,7 @@ pub struct BlockedPool {
     /// Threads parked until a matching child process exits logically.
     pub child_waiters: BTreeMap<DetTid, (DetPid, ChildWaitSpec)>,
 
-    /// Threads parked between logical process exit and a backend's final
+    /// Threads parked between logical process exit and the scheduler applying a backend's final
     /// physical-exit report.
     pub physical_child_waiters: BTreeMap<DetPid, BTreeSet<DetTid>>,
 
@@ -603,19 +603,24 @@ pub struct Scheduler {
     /// Whether the backend will report final physical process exits after logical cleanup.
     backend_reports_physical_process_exits: bool,
 
-    /// SaBRe process leaders whose tool exit hook ran before the ptrace supervisor observed the
-    /// final kernel exit status. While the run queue is empty, these prevent virtual timers from
-    /// overtaking a child exit that is not physically waitable yet.
+    /// SaBRe process leaders whose tool exit hook ran before the scheduler applied the ptrace
+    /// supervisor's final kernel exit status. While the run queue is empty, these prevent virtual
+    /// timers from overtaking a child exit that is not yet scheduler-visible as physically exited.
     pending_physical_process_exits: BTreeSet<DetPid>,
 
     /// Logically exited child processes whose terminal wait status has not been consumed.
     logically_exited_processes: BTreeSet<DetPid>,
 
-    /// Reporting-backend children whose final physical exit has been observed.
+    /// Reporting-backend children whose final physical exit has been observed but not yet applied
+    /// by the scheduler.
     ///
     /// The backend records observations here, but only the scheduler removes the
     /// corresponding pending barrier at the top of its loop. That keeps host
     /// wait-status delivery from changing which branch observes shutdown.
+    reported_physical_process_exits: BTreeSet<DetPid>,
+
+    /// Reporting-backend children whose physical exit has been applied by the scheduler but whose
+    /// terminal wait status has not been consumed.
     completed_physical_process_exits: BTreeSet<DetPid>,
 
     /// Whether the backend defers spawning a vfork child until after the parent posts its
@@ -1150,7 +1155,7 @@ async fn sched_loop_inner(
         // If there are NO threads left in the system, then we're truly done:
         {
             let mut sched = sched.lock().unwrap();
-            sched.drain_completed_physical_process_exits();
+            sched.drain_reported_physical_process_exits();
             if sched.run_queue.is_empty()
                 && sched.blocked.is_empty()
                 && sched.pending_physical_process_exits.is_empty()
@@ -1428,6 +1433,7 @@ impl Scheduler {
             backend_reports_physical_process_exits: cfg.backend_reports_physical_process_exits,
             pending_physical_process_exits: Default::default(),
             logically_exited_processes: Default::default(),
+            reported_physical_process_exits: Default::default(),
             backend_defers_vfork_child_registration: cfg.backend_defers_vfork_child_registration,
             completed_physical_process_exits: Default::default(),
             resources: Default::default(),
@@ -1924,6 +1930,8 @@ impl Scheduler {
         self.logically_killed_threads.remove(&new_leader);
         self.deregistration_accounted.remove(&new_leader);
         self.pending_physical_process_exits.remove(&detpid);
+        self.reported_physical_process_exits.remove(&detpid);
+        self.completed_physical_process_exits.remove(&detpid);
         assert!(
             self.next_turns
                 .insert(
@@ -2023,6 +2031,7 @@ impl Scheduler {
         if self.backend_reports_physical_process_exits {
             let inserted = self.pending_physical_process_exits.insert(detpid);
             if inserted {
+                self.reported_physical_process_exits.remove(&detpid);
                 self.completed_physical_process_exits.remove(&detpid);
                 trace!(
                     "[detcore, dpid {}] waiting for final physical process exit",
@@ -2042,27 +2051,28 @@ impl Scheduler {
     /// race that same loop-top completion check.
     pub(crate) fn complete_physical_process_exit(&mut self, detpid: DetPid) -> bool {
         self.pending_physical_process_exits.contains(&detpid)
-            && self.completed_physical_process_exits.insert(detpid)
+            && self.reported_physical_process_exits.insert(detpid)
     }
 
     /// Record every remaining physical exit after the backend supervisor has drained all tracees.
     /// The scheduler releases the barriers at its next deterministic maintenance point.
     pub(crate) fn release_all_physical_process_exits(&mut self) -> usize {
         let reported = self.pending_physical_process_exits.len();
-        self.completed_physical_process_exits
+        self.reported_physical_process_exits
             .extend(self.pending_physical_process_exits.iter().copied());
         reported
     }
 
     /// Apply host-reported physical exits at the scheduler's fixed maintenance point.
-    fn drain_completed_physical_process_exits(&mut self) {
-        let completed = self
-            .pending_physical_process_exits
-            .intersection(&self.completed_physical_process_exits)
-            .copied()
-            .collect::<Vec<_>>();
-        for child in completed {
-            self.pending_physical_process_exits.remove(&child);
+    fn drain_reported_physical_process_exits(&mut self) {
+        let reported = std::mem::take(&mut self.reported_physical_process_exits);
+        for child in reported {
+            if !self.pending_physical_process_exits.remove(&child) {
+                continue;
+            }
+            if self.logically_exited_processes.contains(&child) {
+                self.completed_physical_process_exits.insert(child);
+            }
             self.wake_physical_child_waiters(child);
         }
     }
@@ -3329,9 +3339,10 @@ impl Scheduler {
 
         if self.run_queue.is_empty() {
             if !self.pending_physical_process_exits.is_empty() {
-                // The SaBRe plugin has run the child process's logical exit hook, but the ptrace
-                // supervisor has not received its final wait status. Fast-forwarding the next
-                // timer here can fire a parent's timeout before the child becomes waitable.
+                // The SaBRe plugin has run the child process's logical exit hook, but the scheduler
+                // has not applied the ptrace supervisor's final wait status. Fast-forwarding the
+                // next timer here can fire a parent's timeout before physical exit becomes visible
+                // at the deterministic loop-top boundary.
                 trace!(
                     "waiting for physical process exits before empty-queue timer fast-forward: {:?}",
                     self.pending_physical_process_exits
@@ -3345,13 +3356,14 @@ impl Scheduler {
                 // by owner ruling after 08ff51a33e demoted it.
                 //
                 // THE DEMOTION'S ARGUMENT AND WHY IT WAS REJECTED. It ran: how
-                // many times this branch is reached depends on when the host
-                // delivers a child's final wait status, that is an external
-                // real-time event, an INFO line driven by one is a determinism
-                // hazard by construction, so keep the loop sub-INFO. The
+                // many times this branch is reached depended on when the host
+                // delivered a child's final wait status, so an INFO line driven
+                // by that event was a determinism hazard by construction. The
                 // measurement offered with it was real -- over 312 concurrent
                 // SaBRe cell-runs, 4 diverged, and in each the whole difference
-                // was this line plus one unrelated WARN.
+                // was this line plus one unrelated WARN. Physical-exit reports
+                // are now applied at the scheduler's loop-top maintenance point,
+                // so host delivery no longer selects this branch directly.
                 //
                 // The owner's ruling: this fizzle is part of the deterministic
                 // scheduling model, not record/replay external-IO terrain, so it
@@ -3733,8 +3745,7 @@ impl Scheduler {
                         self.turn, dettid, child
                     );
                     let completion_already_applied =
-                        self.completed_physical_process_exits.contains(child)
-                            && !self.pending_physical_process_exits.contains(child);
+                        self.completed_physical_process_exits.contains(child);
                     assert!(
                         self.blocked
                             .physical_child_waiters
@@ -6608,13 +6619,13 @@ mod test {
         assert!(!scheduler.complete_physical_process_exit(unrelated_process));
         assert!(scheduler.complete_physical_process_exit(first_process));
         assert!(!scheduler.complete_physical_process_exit(first_process));
-        scheduler.drain_completed_physical_process_exits();
+        scheduler.drain_reported_physical_process_exits();
         assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
         assert!(!scheduler.blocked.timed_waiters.is_empty());
         assert_eq!(global_time.lock().unwrap().as_nanos(), initial_time);
 
         assert!(scheduler.complete_physical_process_exit(second_process));
-        scheduler.drain_completed_physical_process_exits();
+        scheduler.drain_reported_physical_process_exits();
         assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
         assert!(scheduler.blocked.timed_waiters.is_empty());
         assert_eq!(global_time.lock().unwrap().as_nanos(), exit_deadline);
@@ -6629,6 +6640,7 @@ mod test {
         let mut scheduler = Scheduler::new(&config);
         let child = DetPid::from_raw(300);
 
+        scheduler.logically_exited_processes.insert(child);
         assert!(scheduler.begin_physical_process_exit(child));
         assert!(scheduler.complete_physical_process_exit(child));
         assert!(!scheduler.begin_physical_process_exit(child));
@@ -6637,11 +6649,64 @@ mod test {
         // loop-top shutdown decision between two scheduler iterations. A duplicate
         // logical-exit notification cannot erase the already recorded completion.
         assert!(scheduler.pending_physical_process_exits.contains(&child));
-        assert!(scheduler.completed_physical_process_exits.contains(&child));
+        assert!(scheduler.reported_physical_process_exits.contains(&child));
+        assert!(!scheduler.completed_physical_process_exits.contains(&child));
 
-        scheduler.drain_completed_physical_process_exits();
+        scheduler.drain_reported_physical_process_exits();
         assert!(!scheduler.pending_physical_process_exits.contains(&child));
+        assert!(!scheduler.reported_physical_process_exits.contains(&child));
         assert!(scheduler.completed_physical_process_exits.contains(&child));
+    }
+
+    fn consumed_child_wait_releases_physical_exit_barrier(report_before_consume: bool) {
+        let config = Config {
+            backend_reports_physical_process_exits: true,
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let initial_time = global_time.lock().unwrap().as_nanos();
+        let deadline = initial_time + LogicalTime::from_nanos(1_000);
+        let parent = DetPid::from_raw(100);
+        let child = DetPid::from_raw(200);
+
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, child, true);
+        scheduler.logically_exited_processes.insert(child);
+        assert!(scheduler.begin_physical_process_exit(child));
+        scheduler.register_alarm(
+            parent,
+            parent,
+            initial_time,
+            LogicalTime::from_nanos(1_000),
+            LogicalTime::ZERO,
+            Signal::SIGALRM,
+        );
+
+        if report_before_consume {
+            assert!(scheduler.complete_physical_process_exit(child));
+        }
+        assert!(scheduler.consume_child_wait(parent, child));
+        if !report_before_consume {
+            assert!(scheduler.complete_physical_process_exit(child));
+        }
+
+        scheduler.drain_reported_physical_process_exits();
+        assert!(scheduler.pending_physical_process_exits.is_empty());
+        assert!(scheduler.reported_physical_process_exits.is_empty());
+        assert!(scheduler.completed_physical_process_exits.is_empty());
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+    }
+
+    #[test]
+    fn physical_exit_report_survives_child_wait_consumption_before_drain() {
+        consumed_child_wait_releases_physical_exit_barrier(true);
+    }
+
+    #[test]
+    fn physical_exit_report_after_child_wait_consumption_releases_barrier() {
+        consumed_child_wait_releases_physical_exit_barrier(false);
     }
 
     fn physical_wait_handoff_queue(completion_before_wait: bool) -> Vec<DetTid> {
@@ -6692,7 +6757,7 @@ mod test {
             assert!(scheduler.complete_physical_process_exit(child));
         }
 
-        scheduler.drain_completed_physical_process_exits();
+        scheduler.drain_reported_physical_process_exits();
         assert!(scheduler.step2_process_blocked(&global_time).is_ok());
         assert!(scheduler.pending_run_queue_admissions.is_empty());
         assert!(scheduler.blocked.physical_child_ready.contains(&waiter));
@@ -7358,7 +7423,7 @@ mod test {
             scheduler.pending_physical_process_exits,
             BTreeSet::from([root])
         );
-        scheduler.drain_completed_physical_process_exits();
+        scheduler.drain_reported_physical_process_exits();
         assert!(scheduler.pending_physical_process_exits.is_empty());
 
         scheduler.logically_kill_thread(&child, &child, MmId::initial(child));
@@ -7371,7 +7436,7 @@ mod test {
             scheduler.pending_physical_process_exits,
             BTreeSet::from([child])
         );
-        scheduler.drain_completed_physical_process_exits();
+        scheduler.drain_reported_physical_process_exits();
         assert!(scheduler.pending_physical_process_exits.is_empty());
     }
 
@@ -7409,7 +7474,7 @@ mod test {
             scheduler.pending_physical_process_exits,
             BTreeSet::from([child])
         );
-        scheduler.drain_completed_physical_process_exits();
+        scheduler.drain_reported_physical_process_exits();
         assert!(scheduler.pending_physical_process_exits.is_empty());
         assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
         assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);

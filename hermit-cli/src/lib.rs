@@ -1625,9 +1625,9 @@ async fn run_sabre(
             return Err(error);
         }
     };
-    // The supervisor returns only after every tracee reached a final kernel wait status. Release
-    // the root process's barrier (and any intentionally unreaped child barriers) before scheduler
-    // shutdown; no guest thread remains that could race timer fast-forward here.
+    // The supervisor returns only after every tracee reached a final kernel wait status. Record
+    // the root process's exit (and any intentionally unreaped child exits) for the scheduler's
+    // next loop-top drain; no guest thread remains that could race timer fast-forward here.
     global.release_all_physical_process_exits();
     // A SaBRe execution in which no guest thread ever reached the coordinator
     // is an execution in which Detcore was never loaded as a Reverie tool: the
