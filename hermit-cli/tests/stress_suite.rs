@@ -460,7 +460,7 @@ fn schedule_bisect_localizes_publish_ordering_race() {
         match outcome {
             GuestOutcome::Clean if good.is_none() => good = Some(schedule),
             GuestOutcome::Exposed if bad.is_none() => bad = Some(schedule),
-            _ => {}
+            GuestOutcome::Clean | GuestOutcome::Exposed => {}
         }
         if good.is_some() && bad.is_some() {
             break;

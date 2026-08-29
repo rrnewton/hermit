@@ -4046,7 +4046,7 @@ impl RunOpts {
             Backend::Liteinst => {
                 Some("LiteInst host hybrid (reverie-liteinst patch runtime + ptrace Detcore Tool)")
             }
-            _ => None,
+            Backend::Ptrace | Backend::Dbt | Backend::Sabre | Backend::E9patch => None,
         };
         if let Some(backend_banner) = backend_banner {
             eprintln!(":: Backend: {backend_banner}");
