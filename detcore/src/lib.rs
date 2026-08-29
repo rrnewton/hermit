@@ -1787,6 +1787,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
         if guest.thread_state().guest_past_first_execve() {
             detlog!(
+                event = crate::detlog::DetLogEvent::Syscall;
                 "[syscall][detcore, dtid {}] inbound syscall: {} = ?",
                 dettid,
                 call.display(&guest.memory())
@@ -2668,6 +2669,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         };
 
         detlog!(
+            event = crate::detlog::DetLogEvent::SyscallResult {
+                finished_syscall_number: new_count,
+            };
             "[syscall][detcore, dtid {}] finish syscall #{}: {} = {:?}",
             dettid,
             new_count,

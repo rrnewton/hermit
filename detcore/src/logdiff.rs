@@ -24,6 +24,9 @@ use clap::Parser;
 use regex::Regex;
 use tempfile::NamedTempFile;
 
+use crate::detlog::DetLogEvent;
+use crate::detlog::DetLogRecord;
+
 /// The in-band line a bounded log writer emits when a run's log file reaches
 /// its configured size bound.
 ///
@@ -169,6 +172,11 @@ pub struct LogDiffOpts {
     #[clap(skip)]
     pub side_labels: ComparisonSideLabels,
 
+    /// Require current producer-owned DETLOG records instead of using the
+    /// historical text compatibility path.
+    #[clap(skip)]
+    pub require_structured_events: bool,
+
     /// Print both selected logs exactly as they are passed to the comparator.
     ///
     /// The output names the active comparison policy and reflects every
@@ -215,7 +223,7 @@ impl LogDiffOpts {
         !self.include_detlogs.contains(&filter)
     }
 
-    fn skip_detlog(&self, entry: &str) -> bool {
+    fn skip_detlog(&self, entry: &LogMessage<'_>) -> bool {
         if self.skip_detlog {
             return true;
         }
@@ -237,13 +245,17 @@ impl LogDiffOpts {
         false
     }
 
-    fn filter_deterministic<'a>(&self, v: &[(usize, &'a str)]) -> Vec<(usize, &'a str)> {
+    fn filter_deterministic<'a>(&self, v: &[LogMessage<'a>]) -> Vec<LogMessage<'a>> {
         v.iter()
-            .filter_map(|(i, s)| {
-                if (is_detlog(s) && !self.skip_detlog(s) && !is_scheduler_committed_time(s))
-                    || (is_commit(s) && !self.skip_commit && !is_internal_io_poll_commit(s))
+            .filter_map(|message| {
+                if (is_detlog(message)
+                    && !self.skip_detlog(message)
+                    && !is_scheduler_committed_time(message))
+                    || (is_commit(message)
+                        && !self.skip_commit
+                        && !is_internal_io_poll_commit(message))
                 {
-                    Some((*i, *s))
+                    Some(*message)
                 } else {
                     None
                 }
@@ -468,25 +480,28 @@ fn canonicalize_addresses_in_line(
         .into_owned()
 }
 
-fn messages_for_comparison(messages: &[(usize, &str)], policy: LogComparisonPolicy) -> Vec<String> {
+fn messages_for_comparison(
+    messages: &[LogMessage<'_>],
+    policy: LogComparisonPolicy,
+) -> Vec<String> {
     match policy.normalization {
         LogNormalization::Stripped => messages
             .iter()
-            .map(|(_, message)| strip_log_entry(message))
+            .map(|message| strip_log_entry(message.text))
             .collect(),
         LogNormalization::Canonical => {
             let mut addresses = HashMap::new();
             let mut next_address = 1usize;
             messages
                 .iter()
-                .map(|(_, message)| {
-                    canonicalize_addresses_in_line(message, &mut addresses, &mut next_address)
+                .map(|message| {
+                    canonicalize_addresses_in_line(message.text, &mut addresses, &mut next_address)
                 })
                 .collect()
         }
         LogNormalization::Exact => messages
             .iter()
-            .map(|(_, message)| (*message).to_owned())
+            .map(|message| message.text.to_owned())
             .collect(),
     }
 }
@@ -503,7 +518,7 @@ fn canonical_info_from_str_with_filter(
     let info = filter_infos(
         &extract_log_messages(contents)?
             .into_iter()
-            .filter(|(_, record)| keep_record(record))
+            .filter(|record| keep_record(record.text))
             .collect::<Vec<_>>(),
     );
     let opts = LogDiffOpts {
@@ -613,7 +628,14 @@ pub fn take_complete_records(contents: &str, n: usize) -> Option<&str> {
 /// backend emitting its own untagged diagnostics into the same stream --
 /// measured: DBT writes fourteen `detcore-dbt: ...` startup lines, which is
 /// what makes a ptrace-vs-DBT comparison impossible today.
-fn extract_log_messages(contents: &str) -> std::io::Result<Vec<(usize, &str)>> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LogMessage<'a> {
+    index: usize,
+    text: &'a str,
+    event: Option<DetLogEvent>,
+}
+
+fn extract_log_messages(contents: &str) -> std::io::Result<Vec<LogMessage<'_>>> {
     let ts = &*RECORD_START;
     let tag = Regex::new("^(ERROR|WARN|INFO|DEBUG|TRACE) ").unwrap();
     ts.split(contents) // Not aware of a streaming version of this RE split operation.
@@ -622,31 +644,61 @@ fn extract_log_messages(contents: &str) -> std::io::Result<Vec<(usize, &str)>> {
         .filter(|(_, s)| !s.is_empty())
         .map(|(i, s)| {
             // Only let through lines that start with one of the expected tags:
-            if tag.is_match(s) {
-                Ok((i, s))
-            } else {
-                Err(std::io::Error::new(
+            if !tag.is_match(s) {
+                return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
                         "log line {i} has no ERROR/WARN/INFO/DEBUG/TRACE tag, so it cannot be \
                          placed in the compared record stream: {s}"
                     ),
-                ))
+                ));
             }
+            let (text, record) = DetLogRecord::split(s).map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("log record {i} has an invalid structured DETLOG result: {error}"),
+                )
+            })?;
+            Ok(LogMessage {
+                index: i,
+                text,
+                event: record.map(|record| record.event),
+            })
         })
         .collect()
 }
 
-fn is_info(line: &str) -> bool {
-    line.starts_with("INFO ")
+fn is_info(message: &LogMessage<'_>) -> bool {
+    message.text.starts_with("INFO ")
 }
 
-fn is_commit(line: &str) -> bool {
+fn historical_is_commit(line: &str) -> bool {
     line.contains(" COMMIT ")
 }
 
-fn is_detlog(line: &str) -> bool {
+fn historical_is_detlog(line: &str) -> bool {
     line.contains(" DETLOG ")
+}
+
+fn is_commit(message: &LogMessage<'_>) -> bool {
+    match message.event {
+        Some(DetLogEvent::SchedulerCommit { .. }) => true,
+        Some(_) => false,
+        None => historical_is_commit(message.text),
+    }
+}
+
+fn is_detlog(message: &LogMessage<'_>) -> bool {
+    match message.event {
+        Some(
+            DetLogEvent::Other
+            | DetLogEvent::Syscall
+            | DetLogEvent::SyscallResult { .. }
+            | DetLogEvent::SchedulerCommittedTime,
+        ) => true,
+        Some(_) => false,
+        None => historical_is_detlog(message.text),
+    }
 }
 
 /// A scheduler COMMIT turn that only grants the `InternalIOPolling` resource, i.e. a
@@ -669,11 +721,19 @@ fn is_detlog(line: &str) -> bool {
 /// "advance global time for scheduler turn" DETLOG line for these turns at the source (see
 /// `Scheduler::bump_global_time`), so the two mechanisms together make the deterministic
 /// comparison insensitive to host-timing-dependent polling-loop counts.
-fn is_internal_io_poll_commit(line: &str) -> bool {
-    is_commit(line)
-        && (line.contains("{InternalIOPolling: ")
-            || line.contains(" [sabre-internal-pipe-io]")
-            || line.contains(" [sabre-loopback-poll-zero-timeout]"))
+fn is_internal_io_poll_commit(message: &LogMessage<'_>) -> bool {
+    match message.event {
+        Some(DetLogEvent::SchedulerCommit {
+            internal_io_poll, ..
+        }) => internal_io_poll,
+        Some(_) => false,
+        None => {
+            historical_is_commit(message.text)
+                && (message.text.contains("{InternalIOPolling: ")
+                    || message.text.contains(" [sabre-internal-pipe-io]")
+                    || message.text.contains(" [sabre-loopback-poll-zero-timeout]"))
+        }
+    }
 }
 
 /// The scheduler's per-turn `committed_time` advance bookkeeping. `committed_time` tracks
@@ -684,23 +744,79 @@ fn is_internal_io_poll_commit(line: &str) -> bool {
 /// guest-observable signal is lost: the value is redundant with the (retained,
 /// retry-count-insensitive) "advance global time for scheduler turn" DETLOG line and with
 /// the per-turn committed time echoed on each COMMIT line.
-fn is_scheduler_committed_time(line: &str) -> bool {
-    line.contains("advancing committed_time from ")
+fn is_scheduler_committed_time(message: &LogMessage<'_>) -> bool {
+    match message.event {
+        Some(DetLogEvent::SchedulerCommittedTime) => true,
+        Some(_) => false,
+        None => message.text.contains("advancing committed_time from "),
+    }
 }
 
-fn is_detcore(line: &str) -> bool {
+fn is_detcore(message: &LogMessage<'_>) -> bool {
     static PREFIX: LazyLock<Regex> =
         LazyLock::new(|| Regex::new("^(ERROR|WARN|INFO|DEBUG|TRACE).* detcore:").unwrap());
 
-    PREFIX.is_match(line)
+    PREFIX.is_match(message.text)
 }
 
-fn is_detlog_syscall(line: &str) -> bool {
-    is_detlog(line) && line.contains("[syscall]")
+fn is_detlog_syscall(message: &LogMessage<'_>) -> bool {
+    match message.event {
+        Some(DetLogEvent::Syscall | DetLogEvent::SyscallResult { .. }) => true,
+        Some(_) => false,
+        None => historical_is_detlog(message.text) && message.text.contains("[syscall]"),
+    }
 }
 
-fn is_detlog_syscall_result(line: &str) -> bool {
-    is_detlog_syscall(line) && line.contains("finish syscall")
+fn is_detlog_syscall_result(message: &LogMessage<'_>) -> bool {
+    match message.event {
+        Some(DetLogEvent::SyscallResult { .. }) => true,
+        Some(_) => false,
+        None => is_detlog_syscall(message) && message.text.contains("finish syscall"),
+    }
+}
+
+fn event_matches_human_record(event: DetLogEvent, text: &str) -> bool {
+    match event {
+        DetLogEvent::Other
+        | DetLogEvent::Syscall
+        | DetLogEvent::SyscallResult { .. }
+        | DetLogEvent::SchedulerCommittedTime => historical_is_detlog(text),
+        DetLogEvent::SchedulerCommit { .. } => historical_is_commit(text),
+        DetLogEvent::SchedulerEmptyQueueKick => text.contains(SCHEDULER_EMPTY_QUEUE_KICK),
+    }
+}
+
+fn validate_structured_events(
+    label: &str,
+    messages: &[LogMessage<'_>],
+    require: bool,
+) -> std::io::Result<()> {
+    for message in messages {
+        let is_semantic_record = historical_is_detlog(message.text)
+            || historical_is_commit(message.text)
+            || message.text.contains(SCHEDULER_EMPTY_QUEUE_KICK);
+        if require && is_semantic_record && message.event.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{label} log record {} is missing its structured DETLOG result",
+                    message.index
+                ),
+            ));
+        }
+        if let Some(event) = message.event
+            && !event_matches_human_record(event, message.text)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{label} log record {} has structured DETLOG kind {:?} that disagrees with its human record",
+                    message.index, event
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 // TODO:
@@ -709,16 +825,24 @@ fn _truncate_messages(_v: &[&str]) -> String {
     unimplemented!()
 }
 
-fn filter_infos<'a>(v: &[(usize, &'a str)]) -> Vec<(usize, &'a str)> {
-    v.iter().filter(|(_i, s)| is_info(s)).copied().collect()
+fn filter_infos<'a>(v: &[LogMessage<'a>]) -> Vec<LogMessage<'a>> {
+    v.iter()
+        .filter(|message| is_info(message))
+        .copied()
+        .collect()
 }
 
-fn filter_detcore<'a>(v: &[(usize, &'a str)]) -> Vec<(usize, &'a str)> {
-    v.iter().filter(|(_, s)| is_detcore(s)).copied().collect()
+fn filter_detcore<'a>(v: &[LogMessage<'a>]) -> Vec<LogMessage<'a>> {
+    v.iter()
+        .filter(|message| is_detcore(message))
+        .copied()
+        .collect()
 }
 
-/// Text of the INFO message the scheduler logs when it finds the run queue
-/// empty but is not finished yet. `Scheduler::step2_process_blocked` in
+/// Historical text of the INFO message the scheduler logs when it finds the
+/// run queue empty but is not finished yet. Current records carry
+/// [`DetLogEvent::SchedulerEmptyQueueKick`]; this spelling remains only so
+/// retained logs stay readable. `Scheduler::step2_process_blocked` in
 /// [`crate::scheduler`] emits it and returns `SkipTurn`, so the loop goes
 /// around again and still exits later through the ordinary
 /// "run queue empty, exiting sched_loop." message.
@@ -736,14 +860,19 @@ fn filter_detcore<'a>(v: &[(usize, &'a str)]) -> Vec<(usize, &'a str)> {
 const SCHEDULER_EMPTY_QUEUE_KICK: &str = "zero threads left anywhere, fizzling.";
 
 /// How many of `v` record the scheduler's empty-run-queue kick.
-fn count_empty_queue_kicks(v: &[(usize, &str)]) -> usize {
+fn count_empty_queue_kicks(v: &[LogMessage<'_>]) -> usize {
     v.iter()
-        .filter(|(_, s)| s.contains(SCHEDULER_EMPTY_QUEUE_KICK))
+        .filter(|message| match message.event {
+            Some(DetLogEvent::SchedulerEmptyQueueKick) => true,
+            Some(_) => false,
+            None => message.text.contains(SCHEDULER_EMPTY_QUEUE_KICK),
+        })
         .count()
 }
 
-/// Resource text of the COMMIT record produced when a guest's runtime reads the
-/// process's own memory map during bootstrap.
+/// Historical resource text of the COMMIT record produced when a guest's
+/// runtime reads the process's own memory map during bootstrap. Current records
+/// carry `runtime_maps_read`; this spelling remains only for retained logs.
 ///
 /// This record carries the second known shape of backend self-nondeterminism,
 /// and it is unlike the empty-run-queue kick in a way that matters. Two runs of
@@ -774,11 +903,18 @@ fn describe_maps_commit(first: Option<(u64, Option<u64>)>) -> String {
 
 /// COMMIT records in `v` that read the process's own memory map: how many there
 /// are, and the turn and committed virtual time of the first.
-fn maps_read_commits(v: &[(usize, &str)]) -> (usize, Option<(u64, Option<u64>)>) {
+fn maps_read_commits(v: &[LogMessage<'_>]) -> (usize, Option<(u64, Option<u64>)>) {
     let mut count = 0;
     let mut first = None;
-    for (_, message) in v {
-        if !message.contains(RUNTIME_MAPS_READ_RESOURCE) {
+    for message in v {
+        let reads_runtime_maps = match message.event {
+            Some(DetLogEvent::SchedulerCommit {
+                runtime_maps_read, ..
+            }) => runtime_maps_read,
+            Some(_) => false,
+            None => message.text.contains(RUNTIME_MAPS_READ_RESOURCE),
+        };
+        if !reads_runtime_maps {
             continue;
         }
         let Some(position) = commit_position(message) else {
@@ -792,13 +928,13 @@ fn maps_read_commits(v: &[(usize, &str)]) -> (usize, Option<(u64, Option<u64>)>)
     (count, first)
 }
 
-fn filter_ignored<'a>(lines: Vec<(usize, &'a str)>, omits: &Vec<String>) -> Vec<(usize, &'a str)> {
+fn filter_ignored<'a>(lines: Vec<LogMessage<'a>>, omits: &Vec<String>) -> Vec<LogMessage<'a>> {
     lines
         .into_iter()
-        .filter(|(_ix, ln)| {
+        .filter(|message| {
             let mut keep = true;
             for omit in omits {
-                if ln.contains(omit) {
+                if message.text.contains(omit) {
                     keep = false
                 }
             }
@@ -807,17 +943,17 @@ fn filter_ignored<'a>(lines: Vec<(usize, &'a str)>, omits: &Vec<String>) -> Vec<
         .collect()
 }
 
-fn collect_syscalls<'a>(v: &[(usize, &'a str)]) -> Vec<(usize, &'a str)> {
+fn collect_syscalls<'a>(v: &[LogMessage<'a>]) -> Vec<LogMessage<'a>> {
     v.iter()
-        .filter(|(_, entry)| is_detlog_syscall(entry))
+        .filter(|entry| is_detlog_syscall(entry))
         .copied()
         .collect()
 }
 
 fn first_different_message_indices(
-    left: &[(usize, &str)],
+    left: &[LogMessage<'_>],
     compared_left: &[String],
-    right: &[(usize, &str)],
+    right: &[LogMessage<'_>],
     compared_right: &[String],
 ) -> Option<(Option<usize>, Option<usize>)> {
     let common = compared_left.len().min(compared_right.len());
@@ -825,12 +961,12 @@ fn first_different_message_indices(
     if let Some(position) =
         (0..common).find(|&position| compared_left[position] != compared_right[position])
     {
-        return Some((Some(left[position].0), Some(right[position].0)));
+        return Some((Some(left[position].index), Some(right[position].index)));
     }
 
     match compared_left.len().cmp(&compared_right.len()) {
-        Ordering::Less => Some((None, Some(right[common].0))),
-        Ordering::Greater => Some((Some(left[common].0), None)),
+        Ordering::Less => Some((None, Some(right[common].index))),
+        Ordering::Greater => Some((Some(left[common].index), None)),
         Ordering::Equal => None,
     }
 }
@@ -842,7 +978,7 @@ fn first_different_message_indices(
 /// resource names, thread identities, payload bytes, and all other numbers stay
 /// exact. Record position is not part of the message and remains a separate
 /// observation.
-fn first_divergent_message(message: &str) -> String {
+fn first_divergent_message(message: &LogMessage<'_>) -> String {
     static FINISHED_SYSCALL: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(finish syscall #)[0-9][0-9_]*").unwrap());
     static COMMIT_TURN: LazyLock<Regex> =
@@ -852,19 +988,19 @@ fn first_divergent_message(message: &str) -> String {
             .unwrap()
     });
 
-    let (first_line, continuation) = match message.split_once('\n') {
+    let (first_line, continuation) = match message.text.split_once('\n') {
         Some((first_line, continuation)) => (first_line, Some(continuation)),
-        None => (message, None),
+        None => (message.text, None),
     };
     let first_line =
-        if is_detlog_syscall_result(first_line) && finished_syscall_number(first_line).is_some() {
+        if is_detlog_syscall_result(message) && finished_syscall_number(message).is_some() {
             FINISHED_SYSCALL
                 .replace_all(first_line, "${1}<NUM>")
                 .into_owned()
         } else {
             first_line.to_string()
         };
-    let first_line = if is_commit(&first_line) && commit_position(&first_line).is_some() {
+    let first_line = if is_commit(message) && commit_position(message).is_some() {
         let first_line = COMMIT_TURN.replace_all(&first_line, "${1}<NUM>");
         COMMITTED_TIME
             .replace_all(&first_line, "${1}<NANOSECONDS>")
@@ -879,16 +1015,19 @@ fn first_divergent_message(message: &str) -> String {
 }
 
 fn compared_message_at_record(
-    records: &[(usize, &str)],
+    records: &[LogMessage<'_>],
     compared: &[String],
     record: Option<usize>,
 ) -> Option<String> {
     let record = record?;
-    records
-        .iter()
-        .position(|(index, _)| *index == record)
-        .and_then(|position| compared.get(position))
-        .map(|message| first_divergent_message(message))
+    let position = records.iter().position(|message| message.index == record)?;
+    let original = records.get(position)?;
+    let prepared = LogMessage {
+        index: original.index,
+        text: compared.get(position)?,
+        event: original.event,
+    };
+    Some(first_divergent_message(&prepared))
 }
 
 fn parse_underscored_u64(value: &str) -> Option<u64> {
@@ -917,7 +1056,7 @@ fn parse_virtual_nanoseconds(value: &str, unit: Option<&str>) -> Option<u64> {
     }
 }
 
-fn commit_position(message: &str) -> Option<(u64, Option<u64>)> {
+fn historical_commit_position(message: &str) -> Option<(u64, Option<u64>)> {
     static TURN: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"\bCOMMIT turn ([0-9][0-9_]*)\b").unwrap());
     static TIME: LazyLock<Regex> = LazyLock::new(|| {
@@ -935,29 +1074,48 @@ fn commit_position(message: &str) -> Option<(u64, Option<u64>)> {
     Some((turn, virtual_nanoseconds))
 }
 
+fn commit_position(message: &LogMessage<'_>) -> Option<(u64, Option<u64>)> {
+    match message.event {
+        Some(DetLogEvent::SchedulerCommit {
+            scheduler_turn,
+            virtual_nanoseconds,
+            ..
+        }) => Some((scheduler_turn, Some(virtual_nanoseconds))),
+        Some(_) => None,
+        None => historical_commit_position(message.text),
+    }
+}
+
 fn commit_position_at_or_before(
-    messages: &[(usize, &str)],
+    messages: &[LogMessage<'_>],
     message_index: usize,
 ) -> Option<(u64, Option<u64>)> {
     messages
         .iter()
         .rev()
-        .filter(|(index, _)| *index <= message_index)
-        .find_map(|(_, message)| commit_position(message))
+        .filter(|message| message.index <= message_index)
+        .find_map(commit_position)
 }
 
-/// detcore's OWN syscall counter, read verbatim from a `finish syscall #N`
-/// record rather than derived by counting.
+/// Detcore's own syscall counter from the producer-owned record.
 ///
-/// Counting compared records would invent a SECOND numbering that could
-/// silently disagree with the one printed in the log, and this project has
-/// already had a bare ordinal misread against the wrong axis. Parsing the
-/// number detcore itself emitted means the value can be grepped straight out of
-/// the log it came from.
-fn finished_syscall_number(line: &str) -> Option<u64> {
+/// Retained historical logs fall back to the old `finish syscall #N` spelling.
+/// Current verification sets `require_structured_events`, so removing the
+/// structured number refuses rather than silently restoring prose authority.
+fn historical_finished_syscall_number(line: &str) -> Option<u64> {
     let rest = line.split("finish syscall #").nth(1)?;
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
     digits.parse().ok()
+}
+
+fn finished_syscall_number(message: &LogMessage<'_>) -> Option<u64> {
+    match message.event {
+        Some(DetLogEvent::SyscallResult {
+            finished_syscall_number,
+        }) => Some(finished_syscall_number),
+        Some(_) => None,
+        None => historical_finished_syscall_number(message.text),
+    }
 }
 
 /// How many syscalls the guest had COMPLETED when the divergence appeared.
@@ -973,21 +1131,21 @@ fn finished_syscall_number(line: &str) -> Option<u64> {
 /// syscall-stream difference between two backends IS the parity divergence.
 /// Do not restrict this to within-backend use or label it incomparable; that
 /// would hide exactly what parity cells exist to detect.
-fn finished_syscall_at_or_before(v: &[(usize, &str)], message_index: usize) -> Option<u64> {
+fn finished_syscall_at_or_before(v: &[LogMessage<'_>], message_index: usize) -> Option<u64> {
     v.iter()
         .rev()
-        .filter(|(index, _)| *index <= message_index)
-        .find_map(|(_, message)| finished_syscall_number(message))
+        .filter(|message| message.index <= message_index)
+        .find_map(finished_syscall_number)
 }
 
 fn syscall_at_or_before<'a>(
-    syscalls: &[(usize, &'a str)],
+    syscalls: &'a [LogMessage<'a>],
     index: usize,
-) -> Option<(usize, &'a str)> {
+) -> Option<LogMessage<'a>> {
     syscalls
         .iter()
         .rev()
-        .find(|(syscall_index, _)| *syscall_index <= index)
+        .find(|message| message.index <= index)
         .copied()
 }
 
@@ -1003,8 +1161,8 @@ fn write_syscall_context(
     w: &mut impl std::io::Write,
     left_index: usize,
     right_index: usize,
-    left_syscalls: &[(usize, &str)],
-    right_syscalls: &[(usize, &str)],
+    left_syscalls: &[LogMessage<'_>],
+    right_syscalls: &[LogMessage<'_>],
     labels: &ComparisonSideLabels,
     history_count: u64,
 ) -> std::io::Result<()> {
@@ -1023,8 +1181,12 @@ fn write_syscall_context(
         (labels.left.as_str(), left_current),
         (labels.right.as_str(), right_current),
     ] {
-        if let Some((index, syscall)) = current {
-            writeln!(w, "  {label}, log message {index}: {syscall}")?;
+        if let Some(syscall) = current {
+            writeln!(
+                w,
+                "  {label}, log message {}: {}",
+                syscall.index, syscall.text
+            )?;
         } else {
             writeln!(w, "  {label}: <no syscall observed>")?;
         }
@@ -1036,21 +1198,19 @@ fn write_syscall_context(
         (labels.right.as_str(), right_index, right_syscalls),
     ] {
         let history_boundary =
-            syscall_at_or_before(syscalls, index).map_or(index, |(current_index, _)| current_index);
+            syscall_at_or_before(syscalls, index).map_or(index, |current| current.index);
         let mut history = syscalls
             .iter()
             .rev()
-            .filter(|(syscall_index, entry)| {
-                *syscall_index < history_boundary && is_detlog_syscall_result(entry)
-            })
+            .filter(|entry| entry.index < history_boundary && is_detlog_syscall_result(entry))
             .take(history_limit)
             .copied()
             .collect::<Vec<_>>();
         history.reverse();
         if !history.is_empty() {
             writeln!(w, "  Prior completed syscalls for {label}:")?;
-            for (_, syscall) in history {
-                writeln!(w, "    {syscall}")?;
+            for syscall in history {
+                writeln!(w, "    {}", syscall.text)?;
             }
         }
     }
@@ -1103,12 +1263,12 @@ impl<'a> Display for Comparison<'a> {
 //  - detect reorderings and/or switch to larger differences for consecutive multi-line mismatches
 fn diff_vecs(
     which: &str,
-    left: (&[(usize, &str)], &[String]),
-    right: (&[(usize, &str)], &[String]),
+    left: (&[LogMessage<'_>], &[String]),
+    right: (&[LogMessage<'_>], &[String]),
     opts: &LogDiffOpts,
     w: &mut impl std::io::Write,
-    left_syscalls: &[(usize, &str)],
-    right_syscalls: &[(usize, &str)],
+    left_syscalls: &[LogMessage<'_>],
+    right_syscalls: &[LogMessage<'_>],
 ) -> std::io::Result<bool> {
     let (v1, compared_left) = left;
     let (v2, compared_right) = right;
@@ -1118,9 +1278,7 @@ fn diff_vecs(
     }
 
     let mut diff_count = 0;
-    for (position, ((left_index, left), (right_index, right))) in
-        v1.iter().zip(v2.iter()).enumerate()
-    {
+    for (position, (left, right)) in v1.iter().zip(v2.iter()).enumerate() {
         let left_compared = &compared_left[position];
         let right_compared = &compared_right[position];
         if left_compared == right_compared {
@@ -1138,8 +1296,10 @@ fn diff_vecs(
 
         write!(
             w,
-            "({which}) Mismatch at log messages {left_index} ({}) and {right_index} ({}): {}",
+            "({which}) Mismatch at log messages {} ({}) and {} ({}): {}",
+            left.index,
             opts.side_labels.left,
+            right.index,
             opts.side_labels.right,
             Comparison::new(opts.no_color, left_compared, right_compared)
         )?;
@@ -1147,13 +1307,13 @@ fn diff_vecs(
             write!(
                 w,
                 "({which}) Original entries before normalization: {}",
-                Comparison::new(opts.no_color, left, right)
+                Comparison::new(opts.no_color, left.text, right.text)
             )?;
         }
         write_syscall_context(
             w,
-            *left_index,
-            *right_index,
+            left.index,
+            right.index,
             left_syscalls,
             right_syscalls,
             &opts.side_labels,
@@ -1227,12 +1387,12 @@ fn write_compared_logs(
 
 fn git_diff(
     which: &str,
-    left: (&[(usize, &str)], &[String]),
-    right: (&[(usize, &str)], &[String]),
+    left: (&[LogMessage<'_>], &[String]),
+    right: (&[LogMessage<'_>], &[String]),
     opts: &LogDiffOpts,
     w: &mut impl std::io::Write,
-    left_syscalls: &[(usize, &str)],
-    right_syscalls: &[(usize, &str)],
+    left_syscalls: &[LogMessage<'_>],
+    right_syscalls: &[LogMessage<'_>],
 ) -> std::io::Result<bool> {
     let (v1, compared_left) = left;
     let (v2, compared_right) = right;
@@ -1573,17 +1733,29 @@ pub fn log_diff_summary_from_strs_with_filter(
         });
     }
 
+    let extracted_a = extract_log_messages(file_a_str.as_ref())?;
+    let extracted_b = extract_log_messages(file_b_str.as_ref())?;
+    validate_structured_events(
+        opts.side_labels.left.as_str(),
+        &extracted_a,
+        opts.require_structured_events,
+    )?;
+    validate_structured_events(
+        opts.side_labels.right.as_str(),
+        &extracted_b,
+        opts.require_structured_events,
+    )?;
     let all_a = filter_ignored(
-        extract_log_messages(file_a_str.as_ref())?
+        extracted_a
             .into_iter()
-            .filter(|(_, record)| keep_record(record))
+            .filter(|record| keep_record(record.text))
             .collect(),
         &opts.ignore_lines,
     );
     let all_b = filter_ignored(
-        extract_log_messages(file_b_str.as_ref())?
+        extracted_b
             .into_iter()
-            .filter(|(_, record)| keep_record(record))
+            .filter(|record| keep_record(record.text))
             .collect(),
         &opts.ignore_lines,
     );
@@ -1801,12 +1973,35 @@ mod test {
 
     use super::finished_syscall_at_or_before;
     use super::finished_syscall_number;
+    use crate::detlog::DetLogEvent;
     use crate::logdiff::DetLogFilter;
 
     /// One well-formed log record. Records are delimited by their leading
     /// timestamp, so `body` may contain newlines and still be one record.
     fn record(second: usize, body: &str) -> String {
         format!("Apr 09 06:08:{second:02}.100  INFO detcore: {body}\n")
+    }
+
+    fn structured_record(second: usize, body: &str, event: DetLogEvent) -> String {
+        record(
+            second,
+            &format!("{body}{}", crate::detlog::record_suffix(event)),
+        )
+    }
+
+    fn historical(index: usize, text: &str) -> super::LogMessage<'_> {
+        super::LogMessage {
+            index,
+            text,
+            event: None,
+        }
+    }
+
+    fn indexed_text<'a>(messages: &'a [super::LogMessage<'a>]) -> Vec<(usize, &'a str)> {
+        messages
+            .iter()
+            .map(|message| (message.index, message.text))
+            .collect()
     }
 
     fn info_opts() -> super::LogDiffOpts {
@@ -2012,25 +2207,29 @@ mod test {
         assert_eq!(records.len(), 2);
     }
 
-    /// The syscall counter is READ from detcore's own `finish syscall #N`
-    /// text, not re-derived by counting records. Counting would invent a second
-    /// numbering that could disagree with the log it came from.
+    /// Historical logs remain readable through their `finish syscall #N`
+    /// spelling. Current verification separately refuses that shape.
     #[test]
-    fn the_syscall_number_is_parsed_from_the_record_detcore_wrote() {
+    fn historical_syscall_numbers_remain_readable() {
         assert_eq!(
-            finished_syscall_number(
+            finished_syscall_number(&historical(
+                0,
                 "DETLOG [syscall][detcore, dtid 3] finish syscall #37: write(1, 0x5, 6) = Ok(6)"
-            ),
+            )),
             Some(37)
         );
         // `inbound` records carry no number: the guest has not got anywhere yet.
         assert_eq!(
-            finished_syscall_number(
+            finished_syscall_number(&historical(
+                0,
                 "DETLOG [syscall][detcore, dtid 3] inbound syscall: brk(NULL) = ?"
-            ),
+            )),
             None
         );
-        assert_eq!(finished_syscall_number("no syscall here"), None);
+        assert_eq!(
+            finished_syscall_number(&historical(0, "no syscall here")),
+            None
+        );
     }
 
     /// Reports the LAST syscall completed at or before the divergence, and
@@ -2044,7 +2243,7 @@ mod test {
         let finished = |n: u64| format!("finish syscall #{n}: write(1, 0x5, 6) = Ok(6)");
         let a = finished(2);
         let b = finished(37);
-        let syscalls = vec![(10usize, a.as_str()), (90usize, b.as_str())];
+        let syscalls = vec![historical(10, a.as_str()), historical(90, b.as_str())];
         assert_eq!(finished_syscall_at_or_before(&syscalls, 98), Some(37));
         assert_eq!(finished_syscall_at_or_before(&syscalls, 90), Some(37));
         assert_eq!(finished_syscall_at_or_before(&syscalls, 50), Some(2));
@@ -2053,6 +2252,136 @@ mod test {
             None,
             "a divergence before any syscall completed has no syscall count, \
              and that is a state rather than a missing value"
+        );
+    }
+
+    #[test]
+    fn structured_positions_and_syscall_counts_are_authoritative() -> std::io::Result<()> {
+        let run = |turn: u64, time: u64, syscall: u64, value: u64| {
+            format!(
+                "{}{}{}",
+                structured_record(
+                    1,
+                    "COMMIT turn 999 at time 999",
+                    DetLogEvent::SchedulerCommit {
+                        scheduler_turn: turn,
+                        virtual_nanoseconds: time,
+                        internal_io_poll: false,
+                        runtime_maps_read: false,
+                    },
+                ),
+                structured_record(
+                    2,
+                    "DETLOG [syscall] finish syscall #999: write = Ok(1)",
+                    DetLogEvent::SyscallResult {
+                        finished_syscall_number: syscall,
+                    },
+                ),
+                structured_record(3, &format!("DETLOG value={value}"), DetLogEvent::Other),
+            )
+        };
+        let options = super::LogDiffOpts {
+            require_structured_events: true,
+            ..Default::default()
+        };
+
+        let original = super::log_diff_summary_from_strs(
+            run(17, 123, 37, 1),
+            run(17, 123, 37, 2),
+            &options,
+            &mut Vec::new(),
+        )?;
+        assert_eq!(original.first_divergent_scheduler_turn, Some(17));
+        assert_eq!(original.first_divergent_virtual_nanoseconds, Some(123));
+        assert_eq!(original.first_divergent_syscall, Some(37));
+
+        let mutated = super::log_diff_summary_from_strs(
+            run(18, 124, 38, 1),
+            run(18, 124, 38, 2),
+            &options,
+            &mut Vec::new(),
+        )?;
+        assert_eq!(mutated.first_divergent_scheduler_turn, Some(18));
+        assert_eq!(mutated.first_divergent_virtual_nanoseconds, Some(124));
+        assert_eq!(mutated.first_divergent_syscall, Some(38));
+        Ok(())
+    }
+
+    #[test]
+    fn current_verification_refuses_a_missing_structured_record_by_name() {
+        let options = super::LogDiffOpts {
+            require_structured_events: true,
+            ..Default::default()
+        };
+        let error = super::log_diff_summary_from_strs(
+            record(1, "DETLOG value=1"),
+            record(1, "DETLOG value=1"),
+            &options,
+            &mut Vec::new(),
+        )
+        .expect_err("current verification must not fall back to prose");
+        assert!(
+            error
+                .to_string()
+                .contains("missing its structured DETLOG result"),
+            "refusal must name the missing result: {error}"
+        );
+    }
+
+    #[test]
+    fn structured_kind_not_the_human_tag_selects_the_syscall_class() {
+        let text = "INFO detcore: DETLOG [syscall] inbound syscall: read = ?";
+        let other = super::LogMessage {
+            index: 0,
+            text,
+            event: Some(DetLogEvent::Other),
+        };
+        let syscall = super::LogMessage {
+            event: Some(DetLogEvent::Syscall),
+            ..other
+        };
+        assert!(!super::is_detlog_syscall(&other));
+        assert!(super::is_detlog_syscall(&syscall));
+    }
+
+    #[test]
+    fn structured_scheduler_flags_control_filtering_and_retained_counts() {
+        let text = "INFO detcore::scheduler: COMMIT turn 999 at time 999";
+        let internal = super::LogMessage {
+            index: 0,
+            text,
+            event: Some(DetLogEvent::SchedulerCommit {
+                scheduler_turn: 17,
+                virtual_nanoseconds: 123,
+                internal_io_poll: true,
+                runtime_maps_read: false,
+            }),
+        };
+        let maps_read = super::LogMessage {
+            event: Some(DetLogEvent::SchedulerCommit {
+                scheduler_turn: 17,
+                virtual_nanoseconds: 123,
+                internal_io_poll: false,
+                runtime_maps_read: true,
+            }),
+            ..internal
+        };
+
+        assert!(
+            super::LogDiffOpts::default()
+                .filter_deterministic(&[internal])
+                .is_empty()
+        );
+        assert_eq!(
+            super::LogDiffOpts::default()
+                .filter_deterministic(&[maps_read])
+                .len(),
+            1
+        );
+        assert_eq!(super::maps_read_commits(&[internal]), (0, None));
+        assert_eq!(
+            super::maps_read_commits(&[maps_read]),
+            (1, Some((17, Some(123))))
         );
     }
 
@@ -2287,6 +2616,7 @@ mod test {
                 canonicalize_addresses: false,
                 comparison: super::LogComparisonMode::Deterministic,
                 side_labels: super::ComparisonSideLabels::default(),
+                require_structured_events: false,
                 print_logs: false,
                 syscall_history: 5,
                 no_color: false,
@@ -2758,15 +3088,15 @@ mod test {
 
         let v = opts.filter_deterministic(
             &[
-                (
+                historical(
                     1,
                     "INFO detcore: registers [dtid 3]. user_regs_struct { r15...",
                 ),
-                (
+                historical(
                     2,
                     "INFO DETLOG detcore: registers [dtid 3]. user_regs_struct { r15...",
                 ),
-                (
+                historical(
                     3,
                     "INFO COMMIT turn 5, dettid 2 using resources {Path(\"/proc/2/fd/1\"): W} at time 946684799205300000",
                 ),
@@ -2774,7 +3104,7 @@ mod test {
         );
 
         assert_eq!(
-            v,
+            indexed_text(&v),
             vec![
                 (
                     2,
@@ -2798,21 +3128,21 @@ mod test {
 
         let v = opts.filter_deterministic(
             &[
-                (
+                historical(
                     1,
                     "INFO detcore: registers [dtid 3]. user_regs_struct { r15...",
                 ),
-                (
-                    2,
-                    "INFO DETLOG detcore:[syscall] syscall 1",
-                ),
-                (
+                historical(2, "INFO DETLOG detcore:[syscall] syscall 1"),
+                historical(
                     3,
                     "INFO COMMIT turn 5, dettid 2 using resources {Path(\"/proc/2/fd/1\"): W} at time 946684799205300000",
                 ),
             ],
         );
-        assert_eq!(v, vec![(2, "INFO DETLOG detcore:[syscall] syscall 1")]);
+        assert_eq!(
+            indexed_text(&v),
+            vec![(2, "INFO DETLOG detcore:[syscall] syscall 1")]
+        );
     }
 
     /// Regression: the deterministic comparison must ignore the scheduler bookkeeping emitted
@@ -2824,19 +3154,19 @@ mod test {
     fn test_filter_deterministic_drops_io_polling_bookkeeping() {
         let opts = super::LogDiffOpts::default();
         let v = opts.filter_deterministic(&[
-            (
+            historical(
                 0,
                 "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 17, dettid 5 using resources {InternalIOPolling: W}, on previously committed 1s",
             ),
-            (
+            historical(
                 1,
                 "DEBUG detcore::scheduler: DETLOG [sched-step1] advancing committed_time from 1 to 2",
             ),
-            (
+            historical(
                 2,
                 "INFO detcore: DETLOG [syscall][detcore, dtid 5] finish syscall #9: read(3, 0x1000, 1) = Ok(1)",
             ),
-            (
+            historical(
                 3,
                 "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {Path(\"/proc/5/fd/3\"): R}, on previously committed 2s",
             ),
@@ -2844,7 +3174,7 @@ mod test {
         // The InternalIOPolling COMMIT (0) and the committed_time line (1) are dropped; the
         // guest-observable syscall (2) and the ordinary COMMIT turn (3) survive.
         assert_eq!(
-            v,
+            indexed_text(&v),
             vec![
                 (
                     2,
@@ -2862,18 +3192,18 @@ mod test {
     fn test_filter_deterministic_drops_sabre_internal_pipe_resource_turn() {
         let opts = super::LogDiffOpts::default();
         let v = opts.filter_deterministic(&[
-            (
+            historical(
                 0,
                 "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 17, dettid 5 using resources {Device(ContainerStdout): W}, on previously committed 1s [sabre-internal-pipe-io]",
             ),
-            (
+            historical(
                 1,
                 "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {Device(ContainerStdout): W}, on previously committed 2s",
             ),
         ]);
 
         assert_eq!(
-            v,
+            indexed_text(&v),
             vec![(
                 1,
                 "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {Device(ContainerStdout): W}, on previously committed 2s"
@@ -2885,18 +3215,18 @@ mod test {
     fn test_filter_deterministic_drops_sabre_loopback_poll_yield() {
         let opts = super::LogDiffOpts::default();
         let v = opts.filter_deterministic(&[
-            (
+            historical(
                 0,
                 "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 17, dettid 5 using resources {SchedYield: W}, on previously committed 1s [sabre-loopback-poll-zero-timeout]",
             ),
-            (
+            historical(
                 1,
                 "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {SchedYield: W}, on previously committed 2s",
             ),
         ]);
 
         assert_eq!(
-            v,
+            indexed_text(&v),
             vec![(
                 1,
                 "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {SchedYield: W}, on previously committed 2s"
@@ -3210,9 +3540,10 @@ Jun 09 06:49:17.742  INFO detcore: [t] use 0x1111";
             )
         );
         assert_eq!(
-            super::first_divergent_message(
+            super::first_divergent_message(&historical(
+                0,
                 "INFO detcore::scheduler: COMMIT turn 110 at time 123\npayload at time 456"
-            ),
+            )),
             "INFO detcore::scheduler: COMMIT turn <NUM> at time <NANOSECONDS>\npayload at time 456",
             "only the structured first line carries the separately recorded position"
         );
@@ -3327,17 +3658,17 @@ Apr 09 06:08:03.200  INFO detcore: [t] finish syscall: exit_group(0)";
     #[test]
     fn test_filter_infos() {
         let v = super::filter_infos(&[
-            (
+            historical(
                 0,
                 "DEBUG detcore::scheduler: [sched-step3] advancing committed_time from 946684799165300000 to 946684799205300000",
             ),
-            (
+            historical(
                 1,
                 "INFO detcore: registers [dtid 3]. user_regs_struct { r15: 140737354129904, ...",
             ),
         ]);
         assert_eq!(
-            v,
+            indexed_text(&v),
             vec![(
                 1,
                 "INFO detcore: registers [dtid 3]. user_regs_struct { r15: 140737354129904, ..."
@@ -3754,11 +4085,11 @@ Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar
     fn only_a_maps_read_commit_is_counted() {
         assert_eq!(
             super::maps_read_commits(&[
-                (
+                historical(
                     0,
                     "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {Path(\"/proc/5/fd/3\"): R}, on previously committed 2s"
                 ),
-                (
+                historical(
                     1,
                     "INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #257: openat(-100, \"/proc/self/maps\", 0x0) = Ok(4)"
                 ),
@@ -3768,7 +4099,7 @@ Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar
              excluded"
         );
         assert_eq!(
-            super::maps_read_commits(&[(
+            super::maps_read_commits(&[historical(
                 0,
                 "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 10, dettid 3 using resources {Path(\"/proc/self/maps\"): R}, on previously committed 12.345_678_901s"
             )]),
@@ -3782,11 +4113,11 @@ Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar
     fn only_the_kick_message_is_counted() {
         assert_eq!(
             super::count_empty_queue_kicks(&[
-                (
+                historical(
                     0,
                     "INFO detcore::scheduler: [scheduler] run queue empty, exiting sched_loop."
                 ),
-                (
+                historical(
                     1,
                     "INFO detcore::scheduler: COMMIT turn 18, dettid 2, on previously committed 2s"
                 ),
@@ -3794,7 +4125,7 @@ Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar
             0
         );
         assert_eq!(
-            super::count_empty_queue_kicks(&[(
+            super::count_empty_queue_kicks(&[historical(
                 0,
                 "INFO detcore::scheduler: scheduler (step2_process_blocked): zero threads left anywhere, fizzling."
             )]),

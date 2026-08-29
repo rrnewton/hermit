@@ -882,6 +882,12 @@ fn compare_two_runs_with_unsupported_scan(
                 canonicalize_addresses: spec.canonicalize_addresses,
                 comparison: spec.log_comparison_mode(),
                 side_labels: compared_labels.clone(),
+                // These logs were produced by this invocation, so accepting the
+                // historical prose-only shape would hide a producer regression.
+                // Standalone log-diff keeps that compatibility path for retained
+                // older logs; a current verification result requires Detcore's
+                // structured event records.
+                require_structured_events: true,
                 syscall_history: if options.verbose { 10 } else { 5 },
                 // Thread the filter facts from the spec so what the verdict *reports*
                 // (`spec.skip_commit`/`spec.skip_detlog`) is exactly what the diff
@@ -1322,8 +1328,9 @@ mod tests {
     /// leading tag lets `extract_log_messages` accept it; " DETLOG " + "detcore:"
     /// let it survive the deterministic-message filter.
     fn detlog_with_value(value: u64) -> String {
+        let record_suffix = detcore::detlog::record_suffix(detcore::detlog::DetLogEvent::Syscall);
         format!(
-            "2026-08-06T01:00:00.000000Z INFO detcore: [dtid 2] DETLOG [syscall] write(fd=1, count={value})\n"
+            "2026-08-06T01:00:00.000000Z INFO detcore: [dtid 2] DETLOG [syscall] write(fd=1, count={value}){record_suffix}\n"
         )
     }
 
@@ -1992,16 +1999,28 @@ mod tests {
         let (left, right) = empty_logs();
         let left_path = left.to_path_buf();
         let right_path = right.to_path_buf();
+        let commit =
+            detcore::detlog::record_suffix(detcore::detlog::DetLogEvent::SchedulerCommit {
+                scheduler_turn: 23,
+                virtual_nanoseconds: 4_567_890_123,
+                internal_io_poll: false,
+                runtime_maps_read: false,
+            });
+        let other = detcore::detlog::record_suffix(detcore::detlog::DetLogEvent::Other);
         fs::write(
             &left_path,
-            "2026-08-13T01:02:03.000000Z INFO detcore::scheduler: COMMIT turn 23, dettid 2, on previously committed 4.567_890_123s\n\
-             2026-08-13T01:02:03.000001Z INFO detcore: DETLOG value=1\n",
+            format!(
+                "2026-08-13T01:02:03.000000Z INFO detcore::scheduler: COMMIT turn 23, dettid 2, on previously committed 4.567_890_123s{commit}\n\
+                 2026-08-13T01:02:03.000001Z INFO detcore: DETLOG value=1{other}\n"
+            ),
         )
         .unwrap();
         fs::write(
             &right_path,
-            "2026-08-13T01:02:04.000000Z INFO detcore::scheduler: COMMIT turn 23, dettid 2, on previously committed 4.567_890_123s\n\
-             2026-08-13T01:02:04.000001Z INFO detcore: DETLOG value=2\n",
+            format!(
+                "2026-08-13T01:02:04.000000Z INFO detcore::scheduler: COMMIT turn 23, dettid 2, on previously committed 4.567_890_123s{commit}\n\
+                 2026-08-13T01:02:04.000001Z INFO detcore: DETLOG value=2{other}\n"
+            ),
         )
         .unwrap();
 
@@ -2040,16 +2059,27 @@ mod tests {
         let (left, right) = empty_logs();
         let left_path = left.to_path_buf();
         let right_path = right.to_path_buf();
+        let commit =
+            detcore::detlog::record_suffix(detcore::detlog::DetLogEvent::SchedulerCommit {
+                scheduler_turn: 23,
+                virtual_nanoseconds: 4_567_890_123,
+                internal_io_poll: false,
+                runtime_maps_read: false,
+            });
         fs::write(
             &left_path,
-            "INFO detcore::scheduler: COMMIT turn 23 at time 4567890123\n\
-             INFO detcore: DETLOG value=1\n",
+            format!(
+                "INFO detcore::scheduler: COMMIT turn 23 at time 4567890123\n\
+                 INFO detcore: DETLOG value=1{commit}\n"
+            ),
         )
         .unwrap();
         fs::write(
             &right_path,
-            "INFO detcore::scheduler: COMMIT turn 23 at time 4567890123\n\
-             INFO detcore: DETLOG value=2\n",
+            format!(
+                "INFO detcore::scheduler: COMMIT turn 23 at time 4567890123\n\
+                 INFO detcore: DETLOG value=2{commit}\n"
+            ),
         )
         .unwrap();
 
@@ -2596,10 +2626,13 @@ mod tests {
     fn dbt_real_detcore_record_matches_under_the_disclosed_envelope() {
         let output = output(0, b"hello\n", b"");
         let (left, right) = empty_logs();
-        let log = "1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized\n\
-2026-08-21T10:00:00.000000Z INFO detcore: DETLOG [syscall] getpid() = Ok(3)\n";
-        fs::write(&left, log).unwrap();
-        fs::write(&right, log).unwrap();
+        let record = detcore::detlog::record_suffix(detcore::detlog::DetLogEvent::Syscall);
+        let log = format!(
+            "1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized\n\
+             2026-08-21T10:00:00.000000Z INFO detcore: DETLOG [syscall] getpid() = Ok(3){record}\n"
+        );
+        fs::write(&left, &log).unwrap();
+        fs::write(&right, &log).unwrap();
 
         let outcome = compare_with_envelope(
             &output,

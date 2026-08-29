@@ -3363,7 +3363,15 @@ impl Scheduler {
                 // If this line is noisy again, the fix is to make a child's exit
                 // become observable to its parent at a deterministic point, not
                 // to lower the level.
-                info!("scheduler (step2_process_blocked): zero threads left anywhere, fizzling.");
+                if enabled!(Level::INFO) {
+                    let record_suffix = crate::detlog::record_suffix(
+                        crate::detlog::DetLogEvent::SchedulerEmptyQueueKick,
+                    );
+                    info!(
+                        "scheduler (step2_process_blocked): zero threads left anywhere, fizzling.{}",
+                        record_suffix
+                    );
+                }
                 return Err(SkipTurn);
             } else if timed_empty && external_waits_empty && (!futex_empty || !rt_sigsuspend_empty)
             {
@@ -4051,6 +4059,7 @@ impl Scheduler {
                 // deterministic `--verify` comparison in `logdiff::is_scheduler_committed_time`
                 // (it is redundant with the per-turn "advance global time" DETLOG anyway).
                 detlog_debug!(
+                    event = crate::detlog::DetLogEvent::SchedulerCommittedTime;
                     "[sched-step1] advancing committed_time from {} to {}",
                     self.committed_time,
                     snapshot
@@ -4086,14 +4095,35 @@ impl Scheduler {
                 } else {
                     ""
                 };
-                info!(
-                    "[sched-step5] >>>>>>>\n\n COMMIT turn {}, dettid {} using resources {:?}, on previously committed {}{}",
-                    self.turn,
-                    next_dtid,
-                    rsrcs.resources,
-                    self.committed_time,
-                    normalization_marker,
-                );
+                if enabled!(Level::INFO) {
+                    let internal_io_poll =
+                        rsrcs.resources.contains_key(&ResourceID::InternalIOPolling)
+                            || self.is_sabre_internal_pipe_io_turn(rsrcs)
+                            || self.is_sabre_loopback_poll_yield_turn(rsrcs);
+                    let runtime_maps_read = rsrcs.resources.keys().any(|resource| {
+                        matches!(
+                            resource,
+                            ResourceID::Path(path)
+                                if path.as_path() == std::path::Path::new("/proc/self/maps")
+                        )
+                    });
+                    let record_suffix =
+                        crate::detlog::record_suffix(crate::detlog::DetLogEvent::SchedulerCommit {
+                            scheduler_turn: self.turn,
+                            virtual_nanoseconds: self.committed_time.as_nanos(),
+                            internal_io_poll,
+                            runtime_maps_read,
+                        });
+                    info!(
+                        "[sched-step5] >>>>>>>\n\n COMMIT turn {}, dettid {} using resources {:?}, on previously committed {}{}{}",
+                        self.turn,
+                        next_dtid,
+                        rsrcs.resources,
+                        self.committed_time,
+                        normalization_marker,
+                        record_suffix,
+                    );
+                }
                 self.unblock_guest(next_dtid, resp);
                 Ok(())
             }
