@@ -73,8 +73,9 @@ const PORTABLE_DAG: &str = "ci/dag/portable.json";
 const TRACKED_CELLS_SCHEMA: u64 = 6;
 const RUN_SCHEMA: u64 = 3;
 const SUMMARY_SCHEMA: u64 = 4;
-const REQUIRED_BUILD_TAGS: [&str; 5] = [
+const REQUIRED_BUILD_TAGS: [&str; 6] = [
     "setup.manifest_plan",
+    "setup.nextest",
     "build.workspace",
     "build.runtime_release",
     "build.e2e_artifact",
@@ -6400,7 +6401,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         let deps: BTreeSet<&str> = step.deps.iter().map(String::as_str).collect();
         let tag = step.tag();
         let expected: BTreeSet<&str> = match tag.as_str() {
-            "build.workspace" | "build.runtime_release" => BTreeSet::new(),
+            "build.workspace" => BTreeSet::from(["setup.nextest"]),
+            "build.runtime_release" => BTreeSet::new(),
             "build.e2e_artifact" => {
                 BTreeSet::from(["build.workspace", "build.runtime_release"])
             }

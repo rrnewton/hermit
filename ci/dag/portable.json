@@ -160,15 +160,16 @@
     },
     {
       "group": "build", "job": "workspace",
-      "desc": "Build all debug workspace targets in one Cargo invocation",
-      "description": "ONE-FAT-BUILD 2026-08-04 (task collapse-separate-build-nodes-into-one-fat-cargo-invocation): one cargo build owns the complete debug workspace graph, including test targets and the flaky harness. This removes the redundant flaky-harness build node. The explicit bin build completes target/debug/hermit for the later verified E2E artifact publisher. preferred_inner_jobs=32 is measured on a cold empty target at hermit@846baeca: 130.35s, cgroup-recorded peak=11663998976 bytes. The generous 64GiB cap deliberately prioritizes throughput over cap tightness. Release artifacts remain a separate profile because Cargo cannot emit dev and release profiles in one invocation; the privileged lane is a separate DAG and is unchanged.",
-      "cmd": "./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit",
-      "deps": ["e2e.metadata"],
+      "desc": "Build the debug test targets before their concurrent consumers",
+      "description": "TEST-PROFILE PRODUCER 2026-08-29 (task twenty-one-steps-share-a-cargo-target-so-compile-work-migrates-between-them): the former cargo build --all-targets used the dev profile while every cargo-nextest consumer uses the test profile, so it did not prebuild what those nodes execute. The producer also ran at CARGO_BUILD_JOBS=32 while consumers ran at 8 or the runner default 1; Cargo build-script state changed with that value. Two same-commit cold measurements exchanged 284-293 CPU-seconds of compilation between test.hermit_modes and test.command_strict_verify solely according to which started first. These three cargo-nextest list invocations build the exact package/feature/target classes later nodes use. The 21 consumers hard-code the same CARGO_BUILD_JOBS=8 and opt out of the runner's inherited jobs environment; otherwise a concurrent plan can clamp each consumer to four, invalidate Cargo build-script fingerprints, and reintroduce compilation after the producer. This keeps the shared target cache rather than rebuilding dependencies in per-step target directories. Cold measurement at hermit 02d9787363: the three producer invocations took 106.94s wall / 692.21 CPU-s total versus 78.41s / 705.36 CPU-s for the old build command; the extra 28.53 wall-seconds moves already-required compilation ahead of the consumers without increasing compile CPU. The final Hermit selection produces target/debug/hermit for the verified E2E artifact publisher. Release artifacts remain a separate profile.",
+      "cmd": "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh cargo nextest list ${CI:+--profile ci} --workspace --exclude hermit-detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests --message-format json >/dev/null && CARGO_BUILD_JOBS=8 cargo nextest list ${CI:+--profile ci} -p hermit-detcore --lib --bins --tests --message-format json >/dev/null && CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --lib --bins --tests --message-format json >/dev/null",
+      "deps": ["e2e.metadata", "setup.nextest"],
       "timeout": 1200,
       "jobs_flag": "",
+      "jobs_env": "",
       "hint": {"est_duration_s": 130, "rss_baseline_bytes": 11663998976,
                "hard_mem_max_bytes": 68719476736, "classification": "cpu-bound",
-               "preferred_inner_jobs": 32}
+               "preferred_inner_jobs": 8}
     },
     {
       "group": "build", "job": "runtime_release",
@@ -398,6 +399,7 @@
       "deps": ["build.e2e_artifact"],
       "timeout": 1200,
       "jobs_flag": "",
+      "jobs_env": "",
       "hint": {"est_duration_s": 300, "rss_baseline_bytes": 4294967296,
                "hard_mem_max_bytes": 6442450944, "classification": "cpu-bound",
                "preferred_inner_jobs": 8}
@@ -410,6 +412,7 @@
       "deps": ["build.e2e_artifact"],
       "timeout": 900,
       "jobs_flag": "",
+      "jobs_env": "",
       "hint": {"est_duration_s": 180, "rss_baseline_bytes": 218103808,
                "hard_mem_max_bytes": 2147483648, "classification": "cpu-bound",
                "preferred_inner_jobs": 8}
@@ -422,6 +425,7 @@
       "deps": ["build.e2e_artifact"],
       "timeout": 900,
       "jobs_flag": "",
+      "jobs_env": "",
       "hint": {"est_duration_s": 150, "rss_baseline_bytes": 1505439744,
                "hard_mem_max_bytes": 3221225472, "classification": "cpu-bound",
                "preferred_inner_jobs": 8}
@@ -434,6 +438,7 @@
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
       "jobs_flag": "",
+      "jobs_env": "",
       "hint": {"est_duration_s": 200, "rss_baseline_bytes": 2147483648,
                "hard_mem_max_bytes": 3758096384, "classification": "cpu-bound",
                "preferred_inner_jobs": 8}
@@ -446,6 +451,7 @@
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
       "jobs_flag": "",
+      "jobs_env": "",
       "hint": {"est_duration_s": 120,
                "rss_baseline_bytes": 5368709120, "hard_mem_max_bytes": 7516192768,
                "classification": "cpu-bound", "preferred_inner_jobs": 8}
@@ -458,6 +464,7 @@
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
       "jobs_flag": "",
+      "jobs_env": "",
       "hint": {"est_duration_s": 120,
                "rss_baseline_bytes": 1932735283, "hard_mem_max_bytes": 3758096384,
                "classification": "cpu-bound", "preferred_inner_jobs": 8}
@@ -466,120 +473,142 @@
       "group": "test", "job": "detcore_misc",
       "desc": "Detcore non-CPUID miscellaneous cases (tests_misc, skips RDRAND host probes)",
       "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 66965504 bytes; the larger 1697730560-byte historical completed peak governs. The 2-GiB baseline rounds above that floor and the 4-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
-      "cmd": "./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore --test tests_misc -j 1 -- --skip has_rdrand_without_detcore --skip rdrand_rdseed_is_masked --skip ordinary_clone_child_starts_before_parent_resumes --skip ordinary_clone_parent_mode_can_resume_before_child --skip network_syscalls_are_deterministic_across_five_runs",
+      "cmd": "CARGO_BUILD_JOBS=8 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore --test tests_misc -j 1 -- --skip has_rdrand_without_detcore --skip rdrand_rdseed_is_masked --skip ordinary_clone_child_starts_before_parent_resumes --skip ordinary_clone_parent_mode_can_resume_before_child --skip network_syscalls_are_deterministic_across_five_runs",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 720,
+      "jobs_flag": "",
+      "jobs_env": "",
       "hint": {"est_duration_s": 90,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
-               "classification": "cpu-bound"}
+               "classification": "cpu-bound", "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "detcore_parallel",
       "desc": "Detcore non-PMU parallel cases (tests_parallelism, --skip detcore, -j4)",
       "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 411189248 bytes; the larger 1605021696-byte historical completed peak governs. The 2-GiB baseline rounds above that floor and the 4-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
-      "cmd": "./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore --test tests_parallelism -j 4 -- --skip detcore",
+      "cmd": "CARGO_BUILD_JOBS=8 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore --test tests_parallelism -j 4 -- --skip detcore",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 720,
+      "jobs_flag": "",
+      "jobs_env": "",
       "hint": {"est_duration_s": 120,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
-               "classification": "cpu-bound"}
+               "classification": "cpu-bound", "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "hermit_integration",
       "desc": "Portable Hermit integration targets (batched compile, serial test binaries)",
       "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): all five current full-population runs were red for existing test failures, so their partial peaks are censored and do not lower the estimate. The last successful historical peak was 5351632896 bytes and an older 4-GiB run OOMed. The 6-GiB baseline rounds above the successful floor and the 8-GiB hard cap preserves 2 GiB more headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
-      "cmd": "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test chown_virtual_root_identity --test clock_determinism --test clock_discipline_determinism --test container_init_deadline --test cpufreq_avg_determinism --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test zero_copy_pipe_fallback -j 1",
+      "cmd": "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test chown_virtual_root_identity --test clock_determinism --test clock_discipline_determinism --test container_init_deadline --test cpufreq_avg_determinism --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test zero_copy_pipe_fallback -j 1",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 1200,
+      "jobs_flag": "",
+      "jobs_env": "",
       "hint": {"est_duration_s": 300,
                "rss_baseline_bytes": 6442450944, "hard_mem_max_bytes": 8589934592,
-               "classification": "latency-bound"}
+               "classification": "latency-bound", "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "arbitrary_binaries",
       "desc": "Portable arbitrary-binary cases",
       "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 255152128 bytes; the larger 1936408576-byte historical completed peak governs. The 2-GiB baseline rounds above that floor and the 4-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
-      "cmd": "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test arbitrary_binaries -j 1 -- --skip record_replay_stable_arbitrary_binaries",
+      "cmd": "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test arbitrary_binaries -j 1 -- --skip record_replay_stable_arbitrary_binaries",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
+      "jobs_flag": "",
+      "jobs_env": "",
       "hint": {"est_duration_s": 120,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
-               "classification": "latency-bound"}
+               "classification": "latency-bound", "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "cli",
       "desc": "Portable CLI cases (skips KVM/DBT-backend-only cases)",
       "description": "Five exact DBT product failures are excluded from the portable baseline under #2791 and retain source TODOs naming their individual defects; the LiteInst tests remain active. MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 339279872 bytes; the larger 4068401152-byte historical completed peak governs. The 4-GiB baseline rounds above that floor and the 6-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
-      "cmd": "HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbt_strict_returns_with_blocked_stdin_source --skip run_dbt_verifies_pipe_backpressure --skip run_dbt_keeps_diagnostics_out_of_guest_stderr --skip run_dbt_recovers_after_failed_exec --skip run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls --skip run_dbt_verifies_queued_self_signals --skip run_dbt_verifies_self_prlimit --skip run_dbt_verifies_shell_process_lifecycle --skip run_dbt_verifies_simple_env_shebang --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest",
+      "cmd": "CARGO_BUILD_JOBS=8 HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbt_strict_returns_with_blocked_stdin_source --skip run_dbt_verifies_pipe_backpressure --skip run_dbt_keeps_diagnostics_out_of_guest_stderr --skip run_dbt_recovers_after_failed_exec --skip run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls --skip run_dbt_verifies_queued_self_signals --skip run_dbt_verifies_self_prlimit --skip run_dbt_verifies_shell_process_lifecycle --skip run_dbt_verifies_simple_env_shebang --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest",
       "deps": ["build.e2e_artifact", "build.liteinst_runtime_release", "setup.nextest"],
       "timeout": 900,
+      "jobs_flag": "",
+      "jobs_env": "",
       "hint": {"est_duration_s": 150,
                "rss_baseline_bytes": 4294967296, "hard_mem_max_bytes": 6442450944,
-               "classification": "latency-bound"}
+               "classification": "latency-bound", "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "liteinst_strict",
       "desc": "Portable LiteInst strict compatibility",
-      "cmd": "HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit ./ci/liteinst-strict-node.sh -- ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test liteinst_advanced -j 1",
+      "cmd": "CARGO_BUILD_JOBS=8 HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit ./ci/liteinst-strict-node.sh -- ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test liteinst_advanced -j 1",
       "deps": ["build.e2e_artifact", "build.liteinst_runtime_release", "setup.nextest"],
       "timeout": 900,
+      "jobs_flag": "",
+      "jobs_env": "",
       "hint": {"est_duration_s": 120,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
-               "classification": "latency-bound"}
+               "classification": "latency-bound", "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "sabre_examples",
       "desc": "SaBRe non-racy examples: per-backend time determinism and non-time ptrace parity",
-      "cmd": "HERMIT_SABRE_TEST_BINARY=$PWD/target/release/hermit HERMIT_SABRE_BINARY=$PWD/target/install_pkg/rsrcs/sabre ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test sabre_examples -j 1",
+      "cmd": "CARGO_BUILD_JOBS=8 HERMIT_SABRE_TEST_BINARY=$PWD/target/release/hermit HERMIT_SABRE_BINARY=$PWD/target/install_pkg/rsrcs/sabre ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test sabre_examples -j 1",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
+      "jobs_flag": "",
+      "jobs_env": "",
       "hint": {"est_duration_s": 90,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
-               "classification": "latency-bound"}
+               "classification": "latency-bound", "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "hermit_modes",
       "desc": "Portable Hermit mode cases (skips default_ and chaos_buck_)",
       "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 286810112 bytes; the larger 2038853632-byte historical completed peak governs. The 2-GiB baseline rounds above that floor and the 4-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
-      "cmd": "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test hermit_modes -j 1 -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify",
+      "cmd": "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test hermit_modes -j 1 -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
+      "jobs_flag": "",
+      "jobs_env": "",
       "hint": {"est_duration_s": 150,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
-               "classification": "latency-bound"}
+               "classification": "latency-bound", "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "app_strict_verify",
       "desc": "Portable application strict verification (skips java/javac and mountinfo-dependent Go cases)",
       "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five successful current exact-command cgroup samples peaked at 1502470144 bytes, plus one failed/censored attempt; the larger 2838315008-byte historical completed peak governs, while prior 4-GiB pressure argues against a tight hard ceiling. The 3-GiB baseline rounds above the floor and the 6-GiB hard cap preserves 3 GiB of adverse-load headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
-      "cmd": "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test app_strict_verify -j 1 -- --ignored --skip java_ --skip javac_ --skip go_hello_is_deterministic_under_strict_verify --skip go_goroutines_are_deterministic_under_strict_verify",
+      "cmd": "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test app_strict_verify -j 1 -- --ignored --skip java_ --skip javac_ --skip go_hello_is_deterministic_under_strict_verify --skip go_goroutines_are_deterministic_under_strict_verify",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
+      "jobs_flag": "",
+      "jobs_env": "",
       "hint": {"est_duration_s": 180,
                "rss_baseline_bytes": 3221225472, "hard_mem_max_bytes": 6442450944,
-               "classification": "latency-bound"}
+               "classification": "latency-bound", "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "command_strict_verify",
       "desc": "Portable command strict verification (skips mountinfo-dependent kernel pseudofile case)",
       "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 239931392 bytes; the larger 1948848128-byte historical completed peak governs. The 2-GiB baseline rounds above that floor and the 4-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
-      "cmd": "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test command_strict_verify -j 1 -- --ignored --skip kernel_pseudofile_commands_are_deterministic_under_strict_verify",
+      "cmd": "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test command_strict_verify -j 1 -- --ignored --skip kernel_pseudofile_commands_are_deterministic_under_strict_verify",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
+      "jobs_flag": "",
+      "jobs_env": "",
       "hint": {"est_duration_s": 180,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
-               "classification": "latency-bound"}
+               "classification": "latency-bound", "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "ignored_syscall_regressions",
       "desc": "Portable ignored syscall regressions (epoll_determinism, rcx_canonicalization)",
       "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 268689408 bytes; the larger 1774698496-byte historical completed peak governs. The 2-GiB baseline rounds above that floor and the 4-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
-      "cmd": "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test epoll_determinism --test rcx_canonicalization -j 1 -- --ignored",
+      "cmd": "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test epoll_determinism --test rcx_canonicalization -j 1 -- --ignored",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 720,
+      "jobs_flag": "",
+      "jobs_env": "",
       "hint": {"est_duration_s": 90,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
-               "classification": "latency-bound"}
+               "classification": "latency-bound", "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "rr_suite_contract",
@@ -589,6 +618,7 @@
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 720,
       "jobs_flag": "",
+      "jobs_env": "",
       "hint": {"est_duration_s": 30, "rss_baseline_bytes": 3758096384,
                "hard_mem_max_bytes": 5368709120, "classification": "cpu-bound",
                "preferred_inner_jobs": 8}
