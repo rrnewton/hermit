@@ -73,11 +73,36 @@ fn displayed_test_id(package: &str, binary: &str, test: &str, suite_kind: &str) 
     format!("{display_binary}${test}")
 }
 
-fn parse_events(path: &Path) -> Result<Vec<TestResult>, String> {
-    let text = fs::read_to_string(path)
-        .map_err(|error| format!("nextest-test-results-read {}: {error}", path.display()))?;
+fn suite_identity(value: &Value, line: usize) -> Result<((String, String), String), String> {
+    let nextest = value
+        .get("nextest")
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("nextest-test-results line {line}: nextest must be an object"))?;
+    let package = nextest
+        .get("crate")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("nextest-test-results line {line}: nextest.crate must be a string"))?;
+    let binary = nextest
+        .get("test_binary")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            format!("nextest-test-results line {line}: nextest.test_binary must be a string")
+        })?;
+    let suite_kind = nextest
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("nextest-test-results line {line}: nextest.kind must be a string"))?;
+    if package.is_empty() || binary.is_empty() || suite_kind.is_empty() {
+        return Err(format!(
+            "nextest-test-results line {line}: suite identity fields must be nonempty"
+        ));
+    }
+    Ok(((package.to_string(), binary.to_string()), suite_kind.to_string()))
+}
+
+fn parse_event_text(text: &str) -> Result<Vec<TestResult>, String> {
     let mut results = BTreeMap::new();
-    let mut suite_kinds = BTreeMap::new();
+    let mut active_suite_kinds = BTreeMap::new();
     for (offset, line) in text.lines().enumerate() {
         let line_number = offset + 1;
         if line.trim().is_empty() {
@@ -89,39 +114,26 @@ fn parse_events(path: &Path) -> Result<Vec<TestResult>, String> {
         let kind = required_string(&value, "type", line_number)?;
         let event = required_string(&value, "event", line_number)?;
         match (kind, event) {
-            ("suite", "started" | "ok" | "failed") => {
-                let nextest = value
-                    .get("nextest")
-                    .and_then(Value::as_object)
-                    .ok_or_else(|| {
-                        format!(
-                            "nextest-test-results line {line_number}: nextest must be an object"
-                        )
-                    })?;
-                let package = nextest.get("crate").and_then(Value::as_str).ok_or_else(|| {
-                    format!("nextest-test-results line {line_number}: nextest.crate must be a string")
-                })?;
-                let binary = nextest
-                    .get("test_binary")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        format!("nextest-test-results line {line_number}: nextest.test_binary must be a string")
-                    })?;
-                let suite_kind = nextest.get("kind").and_then(Value::as_str).ok_or_else(|| {
-                    format!(
-                        "nextest-test-results line {line_number}: nextest.kind must be a string"
-                    )
-                })?;
-                if package.is_empty() || binary.is_empty() || suite_kind.is_empty() {
+            ("suite", "started") => {
+                let (key, suite_kind) = suite_identity(&value, line_number)?;
+                if let Some(prior) = active_suite_kinds.insert(key.clone(), suite_kind.clone()) {
                     return Err(format!(
-                        "nextest-test-results line {line_number}: suite identity fields must be nonempty"
+                        "nextest-test-results line {line_number}: suite {key:?} started as {suite_kind:?} while {prior:?} is still active"
                     ));
                 }
-                let key = (package.to_string(), binary.to_string());
-                if let Some(prior) = suite_kinds.insert(key.clone(), suite_kind.to_string()) {
-                    if prior != suite_kind {
+            }
+            ("suite", "ok" | "failed") => {
+                let (key, suite_kind) = suite_identity(&value, line_number)?;
+                match active_suite_kinds.remove(&key) {
+                    Some(prior) if prior == suite_kind => {}
+                    Some(prior) => {
                         return Err(format!(
-                            "nextest-test-results line {line_number}: suite {key:?} changed kind from {prior:?} to {suite_kind:?}"
+                            "nextest-test-results line {line_number}: suite {key:?} ended as {suite_kind:?} after starting as {prior:?}"
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "nextest-test-results line {line_number}: suite {key:?} ended without a matching start"
                         ));
                     }
                 }
@@ -130,7 +142,7 @@ fn parse_events(path: &Path) -> Result<Vec<TestResult>, String> {
             ("test", "ok" | "failed") => {
                 let name = required_string(&value, "name", line_number)?;
                 let (key, test, attempts) = test_identity(name, line_number)?;
-                let suite_kind = suite_kinds.get(&key).ok_or_else(|| {
+                let suite_kind = active_suite_kinds.get(&key).ok_or_else(|| {
                     format!(
                         "nextest-test-results line {line_number}: test names suite {key:?} before its typed suite metadata"
                     )
@@ -150,7 +162,18 @@ fn parse_events(path: &Path) -> Result<Vec<TestResult>, String> {
             }
         }
     }
+    if let Some((key, kind)) = active_suite_kinds.first_key_value() {
+        return Err(format!(
+            "nextest-test-results: suite {key:?} kind {kind:?} emitted no terminal event"
+        ));
+    }
     Ok(results.into_values().collect())
+}
+
+fn parse_events(path: &Path) -> Result<Vec<TestResult>, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("nextest-test-results-read {}: {error}", path.display()))?;
+    parse_event_text(&text)
 }
 
 fn parse_u64(value: String, name: &str) -> Result<u64, String> {
@@ -231,5 +254,33 @@ mod tests {
             displayed_test_id("hermit", "cli", "module::case", "test"),
             "hermit::cli$module::case"
         );
+    }
+
+    #[test]
+    fn sequential_lib_and_binary_suites_with_the_same_name_remain_distinct() {
+        let events = concat!(
+            "{\"type\":\"suite\",\"event\":\"started\",\"nextest\":{\"crate\":\"hermit\",\"test_binary\":\"hermit\",\"kind\":\"lib\"}}\n",
+            "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"hermit::hermit$lib_case\"}\n",
+            "{\"type\":\"suite\",\"event\":\"ok\",\"nextest\":{\"crate\":\"hermit\",\"test_binary\":\"hermit\",\"kind\":\"lib\"}}\n",
+            "{\"type\":\"suite\",\"event\":\"started\",\"nextest\":{\"crate\":\"hermit\",\"test_binary\":\"hermit\",\"kind\":\"bin\"}}\n",
+            "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"hermit::hermit$bin_case\"}\n",
+            "{\"type\":\"suite\",\"event\":\"ok\",\"nextest\":{\"crate\":\"hermit\",\"test_binary\":\"hermit\",\"kind\":\"bin\"}}\n",
+        );
+        let results = parse_event_text(events).unwrap();
+        assert_eq!(
+            results,
+            vec![
+                TestResult::new("hermit$lib_case".into(), true, 1).unwrap(),
+                TestResult::new("hermit::hermit$bin_case".into(), true, 1).unwrap(),
+            ]
+        );
+
+        let overlapping = events.replacen(
+            "{\"type\":\"suite\",\"event\":\"ok\",\"nextest\":{\"crate\":\"hermit\",\"test_binary\":\"hermit\",\"kind\":\"lib\"}}\n",
+            "",
+            1,
+        );
+        let error = parse_event_text(&overlapping).unwrap_err();
+        assert!(error.contains("while \"lib\" is still active"), "{error}");
     }
 }
