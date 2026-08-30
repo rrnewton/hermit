@@ -189,10 +189,9 @@ fn cell_verdict(row: &Value) -> Result<CellVerdict, String> {
         "replay" => false,
         "verify" | "chaos" => true,
         _ => {
-            return Ok(CellVerdict::UnavailableWithReason {
-                comparison_tier: ComparisonTier::DeclaredButUnverifiable,
-                reason: format!("{mode} mode has no declared canonical comparison policy"),
-            });
+            return Err(format!(
+                "unsupported cell mode `{mode}` has no declared canonical comparison policy"
+            ));
         }
     };
     let Some(attempts) = row.get("attempts").and_then(Value::as_array) else {
@@ -1035,6 +1034,54 @@ mod tests {
             } else {
                 assert!(verdict.get("comparison").is_none());
             }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn schema7_refuses_unknown_or_missing_mode_before_publishing_an_artifact() {
+        for (case, mode) in [
+            ("unknown", Some(Value::String("future-mode".into()))),
+            ("missing", None),
+        ] {
+            let root = fixture_root();
+            let results = root.join("results");
+            let commit = "1717171717171717171717171717171717171717";
+            let run_id = format!("validate-{case}-mode");
+            let mut row = result_row(&run_id, commit);
+            match mode {
+                Some(mode) => row["mode"] = mode,
+                None => {
+                    row.as_object_mut().unwrap().remove("mode");
+                }
+            }
+            write_result(&results, &row);
+            let expected = if case == "missing" {
+                vec![serde_json::json!({
+                    "lane": "portable",
+                    "category": "c-programs",
+                    "test": "uname",
+                    "mode": "verify",
+                    "backend": "ptrace"
+                })]
+            } else {
+                expected(&row)
+            };
+
+            let error = retain(&root, &results, commit, &expected).unwrap_err();
+            if case == "unknown" {
+                assert!(error.contains("unsupported cell mode `future-mode`"), "{error}");
+            } else {
+                assert!(error.contains("no nonempty mode"), "{error}");
+            }
+            assert!(
+                !root
+                    .join("ignored/validate/artifacts")
+                    .join(&run_id)
+                    .join("cell-results.jsonl")
+                    .exists(),
+                "{case} mode published a retained artifact"
+            );
             fs::remove_dir_all(root).unwrap();
         }
     }
