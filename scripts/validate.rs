@@ -5896,7 +5896,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // cell run cannot appear twice under two producer names.
         let command = format!(
             "env -u DEV_HERMIT_PARENT ./ci/compat-envelope/pressure-test.rs run --results \"$E2E_RESULT_ROOT\" \
-             --test {} --mode {} --backend {} --repetitions 1 \
+             --test {} --mode {} --backend {} --green --repetitions 1 \
              --run-id-prefix \"$E2E_RUN_ID-pid$$\" --jobs 1",
             validate_plan::shell_quote(test),
             validate_plan::shell_quote(mode),
@@ -14367,19 +14367,91 @@ fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
             "requalification plan: outer scheduler can append an unsupported -j flag".into(),
         );
     }
-    for token in [
-        "env -u DEV_HERMIT_PARENT ./ci/compat-envelope/pressure-test.rs run",
-        "--test applications/timed-progress-bar",
-        "--mode verify",
-        "--backend ptrace",
-        "--repetitions 1",
-        "--run-id-prefix \"$E2E_RUN_ID-pid$$\"",
-    ] {
-        if !step.cmd.contains(token) {
-            return Err(format!("requalification plan: command omitted {token}"));
-        }
+    // Execute the generated handoff through pressure-test's real parser and
+    // selection path. `plan` stops before guest execution while preserving the
+    // exact arguments produced for `run`, so this proves that the selected
+    // currently-green cell reaches the pressure runner as a green repetition.
+    let probe_dir = tempfile::tempdir()
+        .map_err(|error| format!("requalification plan: cannot create probe dir: {error}"))?;
+    let result_root = probe_dir.path().join("results");
+    let probe_command = step.cmd.replacen(
+        "./ci/compat-envelope/pressure-test.rs run",
+        "./ci/compat-envelope/pressure-test.rs plan",
+        1,
+    );
+    if probe_command == step.cmd {
+        return Err("requalification plan: generated command did not invoke pressure run".into());
     }
-    println!("  requalification plan: one exact selected cell, schema-7 eligible, never full authority");
+    let output = Command::new("bash")
+        .args(["-ceu", &probe_command])
+        .env("E2E_RESULT_ROOT", &result_root)
+        .env("E2E_RUN_ID", "validate-requalification-self-test")
+        .current_dir(root)
+        .output()
+        .map_err(|error| {
+            format!("requalification plan: cannot execute pressure handoff: {error}")
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "requalification plan: generated pressure handoff refused the selected green cell with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let metadata: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(result_root.join("run.json"))
+            .map_err(|error| format!("requalification plan: cannot read pressure run.json: {error}"))?,
+    )
+    .map_err(|error| format!("requalification plan: pressure run.json is invalid: {error}"))?;
+    let cells = metadata["cells"]
+        .as_array()
+        .ok_or("requalification plan: pressure run.json omitted selected cells")?;
+    if metadata["green"] != true
+        || metadata["repetitions"] != 1
+        || cells.len() != 1
+        || cells[0]["test"] != "applications/timed-progress-bar"
+        || cells[0]["mode"] != "verify"
+        || cells[0]["backend"] != "ptrace"
+    {
+        return Err(format!(
+            "requalification plan: pressure handoff did not retain the exact green repetition: {metadata}"
+        ));
+    }
+
+    // Controlled broken variant: remove only the population handoff and run
+    // the same generated command through the same real selector. This must be
+    // refused specifically because the selected cell is green, which proves
+    // the positive execution above depends on the production `--green` flag.
+    let broken_dir = tempfile::tempdir().map_err(|error| {
+        format!("requalification plan: cannot create broken-variant dir: {error}")
+    })?;
+    let broken_result_root = broken_dir.path().join("results");
+    let broken_command = probe_command.replacen(" --green", "", 1);
+    if broken_command == probe_command {
+        return Err("requalification plan: controlled mutation found no --green flag".into());
+    }
+    let broken = Command::new("bash")
+        .args(["-ceu", &broken_command])
+        .env("E2E_RESULT_ROOT", &broken_result_root)
+        .env("E2E_RUN_ID", "validate-requalification-broken-self-test")
+        .current_dir(root)
+        .output()
+        .map_err(|error| {
+            format!("requalification plan: cannot execute broken pressure handoff: {error}")
+        })?;
+    let broken_stderr = String::from_utf8_lossy(&broken.stderr);
+    if broken.status.success()
+        || !broken_stderr.contains("is not a currently red tracked cell")
+    {
+        return Err(format!(
+            "requalification plan: removing --green did not trigger the real selection refusal; status={} stderr={}",
+            broken.status,
+            broken_stderr.trim()
+        ));
+    }
+    println!(
+        "  requalification plan: generated handoff selected one exact green cell; the same handoff without --green was refused; schema-7 eligible, never full authority"
+    );
     Ok(())
 }
 
