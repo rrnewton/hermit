@@ -140,6 +140,7 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 	./scripts/check-skill-discovery.rs
 	./scripts/test-required-check-outcomes.sh
 	./scripts/test-check-status-outcome.sh
+	bash ./tests/compat/real_compat_workload.sh --self-test-localhost-port
 	python3 ./scripts/test_validate_stop_paths.py
 	./scripts/check-merge-gate-policy.sh
 	./scripts/test-configure-merge-gate-ruleset.sh

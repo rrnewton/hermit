@@ -19,6 +19,10 @@ rm -rf "$FIXTURE_ROOT"
 mkdir -p "$FIXTURE_ROOT/binutils" "$FIXTURE_ROOT/gprof" "$FIXTURE_ROOT/gcov" \
     "$FIXTURE_ROOT/lsof"
 
+gcc -O2 -Wall -Wextra -Werror -Wl,--build-id=none \
+    "$PWD/tests/compat/localhost_http_server.c" \
+    -o "$FIXTURE_ROOT/localhost-http-server"
+
 cat >"$FIXTURE_ROOT/binutils/fixture.c" <<'EOF'
 __attribute__((noinline)) int compat_line(int value) {
     return value + 1;
