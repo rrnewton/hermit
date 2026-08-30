@@ -190,6 +190,7 @@ fn is_manifest_run_step(step: &Step) -> bool {
 
 const LEDGER_ENV: &str = "HERMIT_VALIDATE_LEDGER";
 const PARENT_ENV: &str = "DEV_HERMIT_PARENT";
+const TOOL_ROOT_ENV: &str = "DEV_HERMIT_TOOL_ROOT";
 const OWN_SCOPE_DEADLINE_ENV: &str = "HERMIT_VALIDATE_SCOPE_DEADLINE_MONOTONIC_NS";
 const NESTED_SCOPE_SELF_TEST_ENV: &str = "HERMIT_VALIDATE_NESTED_SCOPE_SELF_TEST";
 const SUMMARY_EPILOGUE_SELF_TEST_ENV: &str = "HERMIT_VALIDATE_SUMMARY_EPILOGUE_SELF_TEST";
@@ -439,7 +440,8 @@ fn usage() -> &'static str {
      VALIDATE_SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS,\n\
      VALIDATE_IGNORE_CACHE, VALIDATE_VERBOSITY, VALIDATE_VERBOSE, VALIDATE_FORCE_FULL,\n\
      HERMIT_VALIDATE_LEDGER, PR_NUMBER, SUPER_REPETITIONS, L4_REPS, ENVELOPE_JSON,\n\
-     HERMIT_LAST_GREEN_SHA, CI_HUB_APPLY_LOCAL_LABEL, DEV_HERMIT_PARENT.\n\
+     HERMIT_LAST_GREEN_SHA, CI_HUB_APPLY_LOCAL_LABEL, DEV_HERMIT_PARENT,\n\
+     DEV_HERMIT_TOOL_ROOT.\n\
      \n\
      HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT=<name>[,<name>] asserts that this\n\
      machine HAS a declared host capability, so its nodes run without probing.\n\
@@ -1904,6 +1906,7 @@ fn self_test() -> Result<(), String> {
     typed_libtest_count_bracket()?;
     ledger_gate_origin_bracket()?;
     requalification_plan_bracket(&root)?;
+    tool_root_split_bracket()?;
     validate_series_writer_bracket()?;
     no_result_propagation_bracket()?;
     possible_missing_artifact_bracket()?;
@@ -3990,6 +3993,7 @@ mod concurrent_validate_path_tests {
 /// terminal-verdict projection instead of maintaining another result file.
 fn append_validate_series(
     parent: Option<&Path>,
+    tool_root: Option<&Path>,
     checkout: &Path,
     result_root: &Path,
     tree: &str,
@@ -3997,6 +4001,7 @@ fn append_validate_series(
     let Some(parent) = parent else {
         return Ok(false);
     };
+    let tool_root = tool_root.ok_or("dev-hermit state root has no executable tool root")?;
     let rows = validate_cell_results::all_result_rows(result_root)?;
     if rows.is_empty() {
         return Ok(false);
@@ -4004,10 +4009,10 @@ fn append_validate_series(
     let run_id = std::env::var_os("E2E_RUN_ID")
         .filter(|value| !value.is_empty())
         .ok_or("E2E_RUN_ID is missing after completed cell rows were recorded")?;
-    let script = parent.join("ci-hub/series/series.py");
+    let script = tool_root.join("ci-hub/series/series.py");
     if !script.is_file() {
         return Err(format!(
-            "{} does not exist; DEV_HERMIT_PARENT does not contain the series writer",
+            "{} does not exist; {TOOL_ROOT_ENV} does not contain the series writer",
             script.display()
         ));
     }
@@ -4410,6 +4415,119 @@ fn find_parent(root: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Resolve executable ci-hub code separately from the canonical parent that
+/// owns locks, ledgers, and other shared state.
+///
+/// Older direct callers supplied only `DEV_HERMIT_PARENT`, so absence retains
+/// that behavior. An explicit tool root comes from the admitted launcher and
+/// must be an absolute, existing dev-hermit checkout; silently falling back to
+/// the state root would execute whatever code happens to be in the primary
+/// checkout instead of the code that admitted this run.
+fn configured_tool_root(parent: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    let Some(value) = std::env::var_os(TOOL_ROOT_ENV) else {
+        return Ok(parent.map(Path::to_path_buf));
+    };
+    if value.is_empty() {
+        return Err(format!("{TOOL_ROOT_ENV} is explicitly empty"));
+    }
+    let supplied = PathBuf::from(value);
+    if !supplied.is_absolute() {
+        return Err(format!(
+            "{TOOL_ROOT_ENV} must be absolute, got {}",
+            supplied.display()
+        ));
+    }
+    let resolved = std::fs::canonicalize(&supplied).map_err(|error| {
+        format!(
+            "cannot resolve explicit {TOOL_ROOT_ENV} {}: {error}",
+            supplied.display()
+        )
+    })?;
+    if !resolved.join("ci-hub").is_dir() {
+        return Err(format!(
+            "explicit {TOOL_ROOT_ENV} {} has no ci-hub directory",
+            resolved.display()
+        ));
+    }
+    let state_root = parent.ok_or_else(|| {
+        format!("explicit {TOOL_ROOT_ENV} has no canonical {PARENT_ENV} to bind to")
+    })?;
+    let git = |root: &Path, args: &[&str]| -> Result<String, String> {
+        let output = Command::new("git")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .args(["--no-optional-locks", "-C"])
+            .arg(root)
+            .args(args)
+            .output()
+            .map_err(|error| format!("cannot inspect {}: {error}", root.display()))?;
+        if !output.status.success() {
+            return Err(format!(
+                "{} is not a readable Git worktree: {}",
+                root.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+    let top = std::fs::canonicalize(git(&resolved, &["rev-parse", "--show-toplevel"])?)
+        .map_err(|error| format!("cannot resolve tool worktree top level: {error}"))?;
+    if top != resolved {
+        return Err(format!(
+            "explicit {TOOL_ROOT_ENV} {} is inside {}, not its top level",
+            resolved.display(),
+            top.display()
+        ));
+    }
+    let state = std::fs::canonicalize(state_root).map_err(|error| {
+        format!("cannot resolve canonical {PARENT_ENV} {}: {error}", state_root.display())
+    })?;
+    let state_top = std::fs::canonicalize(git(&state, &["rev-parse", "--show-toplevel"])?)
+        .map_err(|error| format!("cannot resolve state worktree top level: {error}"))?;
+    if state_top != state {
+        return Err(format!(
+            "canonical {PARENT_ENV} {} is inside {}, not its top level",
+            state.display(),
+            state_top.display()
+        ));
+    }
+    let common = |root: &Path| -> Result<PathBuf, String> {
+        let path = git(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+        std::fs::canonicalize(&path)
+            .map_err(|error| format!("cannot resolve Git common directory {path}: {error}"))
+    };
+    if common(&resolved)? != common(&state)? {
+        return Err(format!(
+            "explicit {TOOL_ROOT_ENV} {} is not a worktree of canonical {PARENT_ENV} {}",
+            resolved.display(),
+            state.display()
+        ));
+    }
+    if git(
+        &resolved,
+        &["config", "-f", ".gitmodules", "--get", "submodule.hermit.path"],
+    )? != "hermit"
+    {
+        return Err(format!(
+            "explicit {TOOL_ROOT_ENV} {} is not a dev-hermit checkout",
+            resolved.display()
+        ));
+    }
+    let dirty = git(
+        &resolved,
+        &["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"],
+    )?;
+    if !dirty.is_empty() {
+        return Err(format!(
+            "explicit {TOOL_ROOT_ENV} {} is dirty: {}",
+            resolved.display(),
+            dirty.lines().next().unwrap_or("unknown change")
+        ));
+    }
+    Ok(Some(resolved))
+}
+
 /// Whether this invocation is real product work in a dev-hermit workspace and
 /// therefore needs canonical ci-hub admission.
 ///
@@ -4456,7 +4574,7 @@ fn local_off_the_record_refusal(args: &Args, dirty: bool) -> Option<String> {
 /// Construct the refusal for an unadmitted product run. Production supplies
 /// `canonically_admitted` only from [`canonical_validate_lock_admission`].
 fn product_front_door_refusal(
-    parent: &Path,
+    tool_root: &Path,
     root: &Path,
     commit: &str,
     requested_args: &str,
@@ -4466,7 +4584,7 @@ fn product_front_door_refusal(
     if canonically_admitted {
         return None;
     }
-    let ci_hub_path = parent.join("ci-hub/ci-hub");
+    let ci_hub_path = tool_root.join("ci-hub/ci-hub");
     let ci_hub = validate_plan::shell_quote(&ci_hub_path.to_string_lossy());
     let checkout = validate_plan::shell_quote(&root.to_string_lossy());
     let remediation = if ci_hub_launcher_available {
@@ -12382,13 +12500,13 @@ impl Default for ReceiptEvidence {
 /// Any missing helper, failed command, or malformed output stays explicit null;
 /// the schema-5 consumer then refuses qualification.
 fn receipt_evidence(
-    parent: Option<&Path>,
+    tool_root: Option<&Path>,
     root: &Path,
     log: &Path,
     commit: &str,
 ) -> ReceiptEvidence {
-    let Some(parent) = parent else { return ReceiptEvidence::default() };
-    let helper = parent.join("ci-hub/validate/finalize_receipt.py");
+    let Some(tool_root) = tool_root else { return ReceiptEvidence::default() };
+    let helper = tool_root.join("ci-hub/validate/finalize_receipt.py");
     if !helper.is_file() || log.as_os_str().is_empty() || commit.is_empty() {
         return ReceiptEvidence::default();
     }
@@ -12424,7 +12542,7 @@ fn receipt_evidence(
 /// Production never trusts caller-supplied owner PIDs or sidecar paths. The
 /// stop-test JSON seam is confined to an intrinsically non-qualifying fixture.
 fn canonical_validate_lock_admission(
-    parent: Option<&Path>,
+    tool_root: Option<&Path>,
     commit: &str,
     host: &str,
 ) -> Result<(), String> {
@@ -12434,10 +12552,10 @@ fn canonical_validate_lock_admission(
         };
         fixture.into_bytes()
     } else {
-        let Some(parent) = parent else {
-            return Err("no dev-hermit parent was detected".into());
+        let Some(tool_root) = tool_root else {
+            return Err("no dev-hermit tool root was detected".into());
         };
-        let ci_hub = parent.join("ci-hub/ci-hub");
+        let ci_hub = tool_root.join("ci-hub/ci-hub");
         if !ci_hub.is_file() {
             return Err(format!(
                 "the canonical launcher is missing at {}",
@@ -13037,6 +13155,7 @@ fn product_front_door_process_bracket() -> Result<(), String> {
                 .env_remove("VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON")
                 .env_remove("HERMIT_VALIDATE_STOP_TEST_EXIT_EARLY")
                 .env_remove(PARENT_ENV)
+                .env_remove(TOOL_ROOT_ENV)
                 .env_remove(validate_runtime::ACTIVE_ENV)
                 .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_PID")
                 .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_FILE");
@@ -13788,6 +13907,184 @@ fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn tool_root_split_bracket() -> Result<(), String> {
+    let root = std::env::temp_dir().join(format!(
+        "validate-tool-root-{}-{}",
+        std::process::id(),
+        epoch_now()
+    ));
+    let state_root = root.join("state-root");
+    let tool_root = root.join("tool-root");
+    let other_root = root.join("other-root");
+    let fake_root = root.join("fake-root");
+    let checkout = root.join("checkout");
+    let log = root.join("validate.log");
+    let git = |dir: &Path, args: &[&str]| -> Result<(), String> {
+        let status = Command::new("git")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .args(["-C", dir.to_str().ok_or("tool-root split: non-UTF-8 path")?])
+            .args(args)
+            .status()
+            .map_err(|error| format!("tool-root split: cannot run git: {error}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("tool-root split: git {args:?} exited {status}"))
+        }
+    };
+    std::fs::create_dir_all(state_root.join("ci-hub/validate"))
+        .and_then(|_| std::fs::create_dir_all(state_root.join("ci-hub/ledger")))
+        .and_then(|_| std::fs::create_dir_all(&checkout))
+        .and_then(|_| std::fs::create_dir_all(fake_root.join("ci-hub")))
+        .map_err(|error| format!("tool-root split: cannot create fixture: {error}"))?;
+    std::fs::write(
+        state_root.join(".gitmodules"),
+        "[submodule \"hermit\"]\n\tpath = hermit\n\turl = fixture://hermit\n",
+    )
+    .and_then(|_| {
+        std::fs::write(
+            state_root.join("ci-hub/ci-hub"),
+            "#!/bin/sh\nroot=$(CDPATH= cd -- \"$(dirname \"$0\")/..\" && pwd)\n: > \"$root/authority-called\"\nexit 23\n",
+        )
+    })
+    .and_then(|_| {
+        std::fs::write(
+            state_root.join("ci-hub/validate/finalize_receipt.py"),
+            "import json\nfrom pathlib import Path\nroot = Path(__file__).resolve().parents[2]\nprint(json.dumps({'base_sha':root.name,'base_tree':'tool-tree','reverie_base_sha':'rev','reverie_base_tree':'rev-tree'}))\n",
+        )
+    })
+    .and_then(|_| {
+        std::fs::write(
+            state_root.join("ci-hub/ledger/validate_rows.py"),
+            "import json\nfrom pathlib import Path\nprint(json.dumps({'adapter_root': Path(__file__).resolve().parents[2].name}))\n",
+        )
+    })
+    .and_then(|_| std::fs::write(&log, "fixture\n"))
+    .map_err(|error| format!("tool-root split: cannot write fixture: {error}"))?;
+    std::fs::set_permissions(
+        state_root.join("ci-hub/ci-hub"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .map_err(|error| format!("tool-root split: cannot chmod fixture: {error}"))?;
+    git(&state_root, &["init", "-b", "main"])?;
+    git(&state_root, &["config", "user.email", "fixture@example.com"])?;
+    git(&state_root, &["config", "user.name", "fixture"])?;
+    git(&state_root, &["add", "."])?;
+    git(&state_root, &["commit", "-m", "fixture"])?;
+    git(
+        &state_root,
+        &["worktree", "add", "-b", "tool", tool_root.to_str().unwrap()],
+    )?;
+    git(
+        &root,
+        &["clone", state_root.to_str().unwrap(), other_root.to_str().unwrap()],
+    )?;
+
+    let saved_tool_root = std::env::var_os(TOOL_ROOT_ENV);
+    let saved_ledger = std::env::var_os(LEDGER_ENV);
+    // SAFETY: validate's self-test is single-threaded and restores this value.
+    unsafe { std::env::set_var(TOOL_ROOT_ENV, "relative/tool-root") };
+    if !configured_tool_root(Some(&state_root))
+        .is_err_and(|error| error.contains("must be absolute"))
+    {
+        return Err("tool-root split: relative explicit tool root did not refuse".into());
+    }
+    unsafe { std::env::set_var(TOOL_ROOT_ENV, root.join("missing")) };
+    if !configured_tool_root(Some(&state_root))
+        .is_err_and(|error| error.contains("cannot resolve explicit"))
+    {
+        return Err("tool-root split: missing explicit tool root did not refuse".into());
+    }
+    unsafe { std::env::set_var(TOOL_ROOT_ENV, &fake_root) };
+    if !configured_tool_root(Some(&state_root))
+        .is_err_and(|error| error.contains("not a readable Git worktree"))
+    {
+        return Err("tool-root split: non-repository tool root did not refuse".into());
+    }
+    unsafe { std::env::set_var(TOOL_ROOT_ENV, &other_root) };
+    if !configured_tool_root(Some(&state_root))
+        .is_err_and(|error| error.contains("is not a worktree of canonical"))
+    {
+        return Err("tool-root split: unrelated repository tool root did not refuse".into());
+    }
+    std::fs::write(tool_root.join("dirty"), "fixture\n")
+        .map_err(|error| format!("tool-root split: cannot dirty fixture: {error}"))?;
+    unsafe { std::env::set_var(TOOL_ROOT_ENV, &tool_root) };
+    if !configured_tool_root(Some(&state_root))
+        .is_err_and(|error| error.contains(" is dirty:"))
+    {
+        return Err("tool-root split: dirty explicit tool root did not refuse".into());
+    }
+    std::fs::remove_file(tool_root.join("dirty"))
+        .map_err(|error| format!("tool-root split: cannot clean fixture: {error}"))?;
+    let resolved = configured_tool_root(Some(&state_root))?
+        .ok_or("tool-root split: explicit tool root disappeared")?;
+    if resolved != std::fs::canonicalize(&tool_root).map_err(|error| error.to_string())? {
+        return Err("tool-root split: explicit tool root resolved to another checkout".into());
+    }
+    if validate_history::canonical_ledger_adapter(
+        &state_root.join("ledger"),
+        Some(&tool_root),
+    ) != Some(tool_root.join("ci-hub/ledger/validate_rows.py"))
+    {
+        return Err("tool-root split: ledger adapter resolved through the state root".into());
+    }
+    let tool_authority_marker = tool_root.join("authority-called");
+    let authority = canonical_validate_lock_admission(Some(&tool_root), "fixture", "fixture-host");
+    if authority.is_ok() || !tool_authority_marker.is_file() {
+        return Err(
+            "tool-root split: authority did not execute exclusively from the tool root".into(),
+        );
+    }
+
+    let receipt = receipt_evidence(Some(&tool_root), &checkout, &log, "fixture");
+    if receipt.base_sha != serde_json::json!("tool-root")
+        || receipt.base_tree != serde_json::json!("tool-tree")
+    {
+        return Err("tool-root split: receipt finalizer did not execute from the tool root".into());
+    }
+
+    let refusal = product_front_door_refusal(
+        &tool_root,
+        &checkout,
+        "fixture",
+        "full --no-label-pr",
+        true,
+        false,
+    )
+    .ok_or("tool-root split: product front door omitted refusal")?;
+    let tool_launcher = tool_root.join("ci-hub/ci-hub").to_string_lossy().into_owned();
+    let state_launcher = state_root.join("ci-hub/ci-hub").to_string_lossy().into_owned();
+    if !refusal.contains(&tool_launcher) || refusal.contains(&state_launcher) {
+        return Err("tool-root split: remediation named the state root instead of tool root".into());
+    }
+
+    // The reader and writer share this single adapter-path resolver. Exercise
+    // the real reader from the tool checkout while the ledger itself remains
+    // rooted under canonical state.
+    unsafe { std::env::remove_var(LEDGER_ENV) };
+    let rows = validate_history::read_rows(&state_root.join("ledger"));
+    if rows.len() != 1 || rows[0]["adapter_root"] != "tool-root" {
+        return Err("tool-root split: canonical ledger adapter executed from state root".into());
+    }
+
+    match saved_tool_root {
+        Some(value) => unsafe { std::env::set_var(TOOL_ROOT_ENV, value) },
+        None => unsafe { std::env::remove_var(TOOL_ROOT_ENV) },
+    }
+    match saved_ledger {
+        Some(value) => unsafe { std::env::set_var(LEDGER_ENV, value) },
+        None => unsafe { std::env::remove_var(LEDGER_ENV) },
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+    println!(
+        "  tool-root split: authority, receipt finalizer, and remediation use executable code; state remains separate"
+    );
+    Ok(())
+}
+
 fn validate_series_writer_bracket() -> Result<(), String> {
     let root = std::env::temp_dir().join(format!(
         "validate-series-writer-{}-{}",
@@ -13795,14 +14092,16 @@ fn validate_series_writer_bracket() -> Result<(), String> {
         epoch_now()
     ));
     let parent = root.join("parent");
+    let tool_root = root.join("tool-root");
     let checkout = root.join("checkout");
     let results = root.join("results/bucket");
-    std::fs::create_dir_all(parent.join("ci-hub/series"))
+    std::fs::create_dir_all(&parent)
+        .and_then(|_| std::fs::create_dir_all(tool_root.join("ci-hub/series")))
         .and_then(|_| std::fs::create_dir_all(&checkout))
         .and_then(|_| std::fs::create_dir_all(&results))
         .map_err(|error| format!("validate series writer: cannot create fixture: {error}"))?;
     std::fs::write(
-        parent.join("ci-hub/series/series.py"),
+        tool_root.join("ci-hub/series/series.py"),
         r#"import json
 import pathlib
 import sys
@@ -13837,6 +14136,7 @@ print("fixture append accepted")
     unsafe { std::env::set_var("E2E_RUN_ID", "validate-series-fixture") };
     let appended = append_validate_series(
         Some(&parent),
+        Some(&tool_root),
         &checkout,
         &root.join("results"),
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -14265,11 +14565,16 @@ fn write_ledger(
         .filter(|value| !value.is_empty())
         .is_some_and(|value| Path::new(&value) == ledger);
     if !explicit && ledger.file_name().is_some_and(|name| name == "ledger") {
-        let Some(parent) = ledger.parent() else {
+        let configured_tool_root = std::env::var_os(TOOL_ROOT_ENV)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        let Some(adapter) = validate_history::canonical_ledger_adapter(
+            ledger,
+            configured_tool_root.as_deref(),
+        ) else {
             eprintln!("validate: warning: canonical ledger root has no parent: {}", ledger.display());
             return;
         };
-        let adapter = parent.join("ci-hub/ledger/validate_rows.py");
         let mut child = match Command::new("python3")
             .arg(&adapter)
             .arg("record")
@@ -15711,7 +16016,11 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // that merely prints a libtest-looking banner cannot manufacture evidence
     // that tests executed.
     unsafe { std::env::set_var("DAGRUN_REQUIRE_STRUCTURED_TEST_COUNTS", "1") };
-    let parent = find_parent(&root);
+    let discovered_parent = find_parent(&root);
+    let parent = std::env::var_os(PARENT_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or(discovered_parent);
     if std::env::var_os(PARENT_ENV).is_none() {
         if let Some(parent) = &parent {
             // Child test-harness processes use the same parent checkout for the
@@ -15720,6 +16029,22 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             std::env::set_var(PARENT_ENV, parent);
         }
     }
+    let tool_root = match configured_tool_root(parent.as_deref()) {
+        Ok(tool_root) => tool_root,
+        Err(error) => {
+            return RunSummary::refused(
+                2,
+                &level_name,
+                "dev-hermit tool root",
+                vec![
+                    error,
+                    format!(
+                        "an explicit {TOOL_ROOT_ENV} must identify the immutable dev-hermit checkout whose ci-hub code launched this run"
+                    ),
+                ],
+            );
+        }
+    };
     // The profile name is needed by the admission gates below, which run BEFORE
     // the plan exists. It is derived exactly as `build_plan` derives it, so the
     // lock record and the ledger row can never disagree about what was running.
@@ -15810,6 +16135,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             &root,
             &profile_name,
             parent.as_deref(),
+            tool_root.as_deref(),
             args.allow_local_off_the_record_run,
         );
     }
@@ -15843,7 +16169,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // Help, self-test and the stop-test seam returned above; `--show-plan` is
     // explicitly inert here.
     let ci_hub_dir_present =
-        parent.as_ref().is_some_and(|candidate| candidate.join("ci-hub").is_dir());
+        tool_root.as_ref().is_some_and(|candidate| candidate.join("ci-hub").is_dir());
     if !args.allow_local_off_the_record_run
         && product_front_door_applies(
         parent.is_some(),
@@ -15852,11 +16178,13 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         args.show_plan,
     )
     {
-        let parent = parent.as_deref().expect("front-door predicate requires a parent");
+        let tool_root = tool_root
+            .as_deref()
+            .expect("front-door predicate requires an executable tool root");
         let commit = git_sha();
         let host = short_hostname();
-        let ci_hub_launcher_available = parent.join("ci-hub/ci-hub").is_file();
-        let admission = canonical_validate_lock_admission(Some(parent), &commit, &host);
+        let ci_hub_launcher_available = tool_root.join("ci-hub/ci-hub").is_file();
+        let admission = canonical_validate_lock_admission(Some(tool_root), &commit, &host);
         // NAME THE CONJUNCT THAT FAILED. The decision is unchanged -- it is still
         // exactly `admission.is_ok()` -- but a refusal that lists three
         // possibilities and identifies none is undiagnosable from outside, and
@@ -15865,7 +16193,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         let admitted = admission.is_ok();
         let why = admission.err();
         if let Some(refusal) = product_front_door_refusal(
-            parent,
+            tool_root,
             &root,
             &commit,
             &requested_validate_args(),
@@ -16736,7 +17064,13 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let series_error = if nesting.nested || args.allow_local_off_the_record_run {
         None
     } else {
-        match append_validate_series(parent.as_deref(), &root, &e2e_result_root, &commit) {
+        match append_validate_series(
+            parent.as_deref(),
+            tool_root.as_deref(),
+            &root,
+            &e2e_result_root,
+            &commit,
+        ) {
             Ok(_) => None,
             Err(error) => {
                 eprintln!("validate: ERROR: completed cell results were not added to the series: {error}");
@@ -16768,7 +17102,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // The parent still supplies exact base and pin evidence, but its historical
     // per-node coverage parser reads printable banners. Rebuild coverage from
     // dagrun's structured producer results so stdout cannot qualify a node.
-    let receipt = receipt_evidence(parent.as_deref(), &root, &log_path, &commit);
+    let receipt = receipt_evidence(tool_root.as_deref(), &root, &log_path, &commit);
     let coverage = typed_test_node_coverage(&plan.planned_test_nodes, &outcomes);
 
     let behind_ahead = sh("git", &["rev-list", "--left-right", "--count", "origin/main...HEAD"])
@@ -16781,7 +17115,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // Observed, not inferred: did the pin gate actually run and pass in THIS run?
     let pin_gate_passed = outcomes.iter().any(|o| o.tag == PIN_GATE_TAG && o.ok);
     let lock_admitted =
-        canonical_validate_lock_admission(parent.as_deref(), &commit, &host).is_ok();
+        canonical_validate_lock_admission(tool_root.as_deref(), &commit, &host).is_ok();
     let ctx = LedgerCtx {
         started_at,
         host: host.clone(),
@@ -17477,6 +17811,7 @@ fn stop_test_seam(
     root: &Path,
     profile: &str,
     parent: Option<&Path>,
+    tool_root: Option<&Path>,
     off_the_record: bool,
 ) -> RunSummary {
     let started_at = utc_now();
@@ -17536,7 +17871,7 @@ fn stop_test_seam(
     let wall = started.elapsed().as_secs_f64();
     let ledger = ledger_path(root);
     let host = short_hostname();
-    let lock_admitted = canonical_validate_lock_admission(parent, &commit, &host).is_ok();
+    let lock_admitted = canonical_validate_lock_admission(tool_root, &commit, &host).is_ok();
     let ctx = LedgerCtx {
         started_at,
         host,
