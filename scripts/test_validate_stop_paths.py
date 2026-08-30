@@ -129,6 +129,26 @@ def find_parent_adapter() -> Path | None:
     return None
 VALIDATE = ROOT / "scripts" / "validate.rs"
 TEST_ROOTS: list[Path] = []
+OUTER_VALIDATE_ENV = (
+    "DEV_HERMIT_PARENT",
+    "DEV_HERMIT_TOOL_ROOT",
+    "CI_HUB_APPLY_LOCAL_LABEL",
+    "CI_HUB_VALIDATE_PRODUCER",
+    "CI_HUB_VALIDATE_CONCURRENT",
+    "CI_HUB_VALIDATE_LOCK_OWNER_PID",
+    "CI_HUB_VALIDATE_LOCK_OWNER_FILE",
+    "VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON",
+)
+
+
+def test_env_without_outer_validate() -> dict[str, str]:
+    env = os.environ.copy()
+    # These children exercise validate's stop and cleanup paths, not the outer
+    # launcher's split-root or admission contract. Each case supplies the exact
+    # parent/ledger/authority inputs it owns.
+    for name in OUTER_VALIDATE_ENV:
+        env.pop(name, None)
+    return env
 
 
 def stop_test_env(
@@ -139,13 +159,14 @@ def stop_test_env(
     forged_owner: bool = False,
 ) -> dict[str, str]:
     TEST_ROOTS.append(tmpdir)
-    env = os.environ.copy()
+    env = test_env_without_outer_validate()
     env.update(
         HERMIT_VALIDATE_STOP_TEST_MODE="1",
         HERMIT_VALIDATE_LEDGER=str(ledger),
         DEV_HERMIT_PARENT=str(ROOT.parent),
         VALIDATE_SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS="1",
         VALIDATE_STOP_TEST_TMP_ROOT=str(tmpdir / "validation"),
+        DAGRUN_LOG_DIR=str(tmpdir / "dagrun-evidence"),
         TMPDIR=str(tmpdir),
     )
     if lock_proven:
@@ -190,6 +211,27 @@ def stop_test_env(
             CI_HUB_VALIDATE_LOCK_OWNER_FILE=str(owner_file),
         )
     return env
+
+
+def assert_stop_test_never_started_dagrun(tmpdir: Path, output: str) -> None:
+    assert not (tmpdir / "dagrun-evidence").exists(), output
+    assert "[dagrun]" not in output and "[scheduler]" not in output, output
+
+
+def check_stop_test_env_does_not_inherit_outer_validate() -> None:
+    saved = os.environ.copy()
+    try:
+        os.environ.update({name: "/outer/value" for name in OUTER_VALIDATE_ENV})
+        with tempfile.TemporaryDirectory(prefix="validate-stop-env-") as tmp:
+            tmpdir = Path(tmp)
+            env = stop_test_env(tmpdir, tmpdir / "ledger.jsonl")
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+    assert env["DEV_HERMIT_PARENT"] == str(ROOT.parent), env
+    for name in set(OUTER_VALIDATE_ENV) - {"DEV_HERMIT_PARENT"}:
+        assert name not in env, (name, env[name])
 
 
 # HOW LONG A HOOK MAY TAKE TO SIGNAL READY, AND WHY IT IS NOT 10 SECONDS.
@@ -523,13 +565,16 @@ def run_signal(
             process.send_signal(sig)
             rc = process.wait(timeout=EXIT_TIMEOUT_SECONDS)
 
+        rendered = log.read_text(errors="replace")
+        assert_stop_test_never_started_dagrun(tmpdir, rendered)
+
         rows = [json.loads(line) for line in ledger.read_text().splitlines()] if ledger.exists() else []
         if not expect_record:
             assert not rows, (sig.name, rows)
             assert rc == -sig.value, (sig.name, rc)
             return
 
-        assert rc == NO_RESULT_EXIT_CODE, (sig.name, rc, log.read_text(errors="replace"))
+        assert rc == NO_RESULT_EXIT_CODE, (sig.name, rc, rendered)
         assert len(rows) == 1, (sig.name, rows)
         row = rows[0]
         assert_schema5_contract(row, admitted=lock_proven)
@@ -622,7 +667,7 @@ def run_canonical_adapter_contract(*, refuse: bool) -> None:
                 )
         raw_shadow = parent / "ignored" / "validate-run-ledger.jsonl"
         raw_before = raw_shadow.read_bytes() if raw_shadow.exists() else None
-        env = os.environ.copy()
+        env = test_env_without_outer_validate()
         env.update(
             HERMIT_VALIDATE_STOP_TEST_MODE="1",
             DEV_HERMIT_PARENT=str(parent),
@@ -803,6 +848,7 @@ def main(argv: list[str] | None = None) -> None:
     os.environ.pop("HERMIT_VALIDATE_ACTIVE", None)
 
     run_final_validate_status_contract()
+    check_stop_test_env_does_not_inherit_outer_validate()
     check_signal_refusal_does_not_skip_incomplete_exit()
 
     unevaluated: list[str] = []
