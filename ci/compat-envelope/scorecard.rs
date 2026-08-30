@@ -31,24 +31,29 @@ use std::time::Duration;
 use std::time::Instant;
 
 use fs2::FileExt;
+use hermit_manifest_plan::canonical_verdict;
+use hermit_manifest_plan::runner::FailureClass;
+use hermit_manifest_plan::runner::ObservedResult;
+use hermit_manifest_plan::stress_series::HostCapability;
+use hermit_manifest_plan::stress_series::HostCapabilityVerdict;
+use hermit_manifest_plan::stress_series::SeriesCoordinates;
+use hermit_manifest_plan::stress_series::SeriesOutcome;
+use hermit_manifest_plan::stress_series::SeriesPayload;
+use hermit_manifest_plan::stress_series::SeriesProducer;
+use hermit_manifest_plan::stress_series::SeriesRow;
+use hermit_manifest_plan::stress_series::SeriesSchema;
+use hermit_manifest_plan::stress_series::SourceDepth;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use sha2::Digest;
 use sha2::Sha256;
 use tempfile::NamedTempFile;
-use hermit_manifest_plan::canonical_verdict;
-use hermit_manifest_plan::runner::FailureClass;
-use hermit_manifest_plan::runner::ObservedResult;
-use hermit_manifest_plan::stress_series::{
-    HostCapability, HostCapabilityVerdict, SeriesCoordinates, SeriesOutcome, SeriesPayload,
-    SeriesProducer, SeriesRow, SeriesSchema, SourceDepth,
-};
 
 const SCORECARD: &str = "SCORECARD.md";
 const CELLS: &str = "ci/compat-envelope/cells.json";
 const EXPECTED_PLAN: &str = "ci/expected-e2e-plan.json";
-const SCHEMA: u64 = 6;
+const SCHEMA: u64 = 7;
 const PRESSURE_SUMMARY_SCHEMA: u64 = 4;
 const CELL_RESULT_SCHEMA: u64 = 4;
 
@@ -238,7 +243,10 @@ struct TrackedCell {
     /// no writer recorded one, NOT that the cell was never run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_tested: Option<LastTested>,
-    /// Comparison evidence, keyed by `(detcore_tree, provenance)`.
+    /// Comparison evidence, keyed by `(recorded code identity, provenance)`.
+    /// Explicit Detcore trees remain in `detcore_tree`. A projected legacy row
+    /// without that field omits it and carries exactly one recorded Hermit SHA,
+    /// which the versioned projector treats as a distinct identity variant.
     ///
     /// `update-observations`, `observe-results`, `import-results`, and
     /// `project-observations` write it. Direct top-level local validates invoke
@@ -316,7 +324,8 @@ impl CellStatus {
 /// Merging them would produce one number moving for two unrelated causes -- "the
 /// code changed" and "this varies run to run" -- which is the measurement trap
 /// this project has repeatedly been bitten by. Observations are therefore keyed
-/// by `(detcore_tree, provenance)`, not by tree alone.
+/// by `(recorded code identity, provenance)`, not by identity alone. See
+/// [`Observation::detcore_tree`] for the schema-gated legacy representation.
 #[derive(
     Clone,
     Copy,
@@ -448,7 +457,21 @@ fn refresh_measurement(cells: &mut TrackedCells) {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct Observation {
-    detcore_tree: String,
+    /// The exact recorded Detcore tree for ordinary/current evidence.
+    /// Scorecard schema 7 also permits this field to be absent for a projected
+    /// legacy series row; its single `hermit_shas` entry is then the recorded
+    /// code identity. Other writers always supply a real Detcore tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detcore_tree: Option<String>,
+    /// Exact immutable series events folded into this projected aggregate.
+    /// Empty means the observation predates projection ownership or belongs to
+    /// another writer and therefore may not be replaced by the projector.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeSet::is_empty",
+        deserialize_with = "deserialize_unique_event_ids"
+    )]
+    event_ids: BTreeSet<String>,
     /// Defaulted to `pressure-test` so the pre-provenance corpus keeps its
     /// meaning: before this field existed, the pressure test was the ONLY
     /// writer of observations, so that is what any older entry must have been.
@@ -571,7 +594,8 @@ struct LastTested {
     hermit_sha: String,
     /// The staleness key. Content-addressed, so comparing it to `HEAD:detcore`
     /// says whether the result still describes the current code regardless of
-    /// how old or recent the run was.
+    /// how old or recent the run was. A legacy projected row without a recorded
+    /// Detcore tree cannot update this field.
     detcore_tree: String,
     /// Keyed by repository: hermit depth and reverie depth are different
     /// keyspaces and a bare number would be read against the wrong one.
@@ -1012,9 +1036,7 @@ impl ResultRow {
     /// not product-behavior evidence: it must be named and skipped rather than
     /// forced through the canonical-comparison path.
     fn typed_no_result_reason(&self) -> Result<Option<String>, String> {
-        if self.outcome != "FAIL"
-            || !matches!(self.mode.as_str(), "verify" | "replay" | "chaos")
-        {
+        if self.outcome != "FAIL" || !matches!(self.mode.as_str(), "verify" | "replay" | "chaos") {
             return Ok(None);
         }
         if self.attempts.is_empty() {
@@ -1101,7 +1123,10 @@ impl ResultRow {
                     index + 1
                 ));
             }
-            if attempt.get("error_kind").is_none_or(|value| !value.is_null()) {
+            if attempt
+                .get("error_kind")
+                .is_none_or(|value| !value.is_null())
+            {
                 return Err(format!(
                     "attempt {} has an error classification beside FAIL/no_result",
                     index + 1
@@ -1135,9 +1160,10 @@ impl ResultRow {
                 || report.first_divergent_syscall.is_some()
                 || report.first_divergent_left_message.is_some()
                 || report.first_divergent_right_message.is_some()
-                || report.runtime.as_ref().is_some_and(|runtime| {
-                    runtime.run1.is_none() || runtime.run2.is_some()
-                })
+                || report
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.run1.is_none() || runtime.run2.is_some())
             {
                 return Err(format!(
                     "attempt {} has a contradictory no_result verification report",
@@ -1541,8 +1567,7 @@ impl ResultRow {
             }
 
             match report.verdict {
-                canonical_verdict::Verdict::Matched
-                | canonical_verdict::Verdict::Diverged => {
+                canonical_verdict::Verdict::Matched | canonical_verdict::Verdict::Diverged => {
                     match report.verdict {
                         canonical_verdict::Verdict::Matched
                             if report.verified && report.bitwise_parity => {}
@@ -1590,17 +1615,14 @@ impl ResultRow {
                     single.shell_command = attempt
                         .get("shell_command")
                         .and_then(JsonValue::as_str)
-                        .ok_or_else(|| {
-                            format!("attempt {} has invalid shell_command", index + 1)
-                        })?
+                        .ok_or_else(|| format!("attempt {} has invalid shell_command", index + 1))?
                         .into();
                     single.outcome = if report.verdict == canonical_verdict::Verdict::Matched {
                         "PASS".into()
                     } else {
                         "FAIL".into()
                     };
-                    single.first_divergent_scheduler_turn =
-                        report.first_divergent_scheduler_turn;
+                    single.first_divergent_scheduler_turn = report.first_divergent_scheduler_turn;
                     single.first_divergent_virtual_nanoseconds =
                         report.first_divergent_virtual_nanoseconds;
                     single.first_divergent_record = report.first_divergent_record;
@@ -1647,9 +1669,7 @@ impl ResultRow {
                                 "first_divergent_right_message",
                             ]
                             .iter()
-                            .any(|field| {
-                                attempt.get(field).is_some_and(|value| !value.is_null())
-                            })
+                            .any(|field| attempt.get(field).is_some_and(|value| !value.is_null()))
                         {
                             return Err(format!(
                                 "attempt {} has a contradictory no_result verification report",
@@ -1658,9 +1678,8 @@ impl ResultRow {
                         }
                         let status = attempt.get("status").and_then(JsonValue::as_i64);
                         let signal = attempt.get("signal").and_then(JsonValue::as_i64);
-                        let disposition =
-                            matches!((status, signal), (Some(status), None) if status != 0)
-                                || matches!((status, signal), (None, Some(_)));
+                        let disposition = matches!((status, signal), (Some(status), None) if status != 0)
+                            || matches!((status, signal), (None, Some(_)));
                         if attempt.get("outcome").and_then(JsonValue::as_str) != Some("ERROR")
                             || attempt.get("timed_out").and_then(JsonValue::as_bool) != Some(true)
                             || attempt
@@ -2964,10 +2983,13 @@ fn load_existing(root: &Path) -> Result<Option<TrackedCells>, String> {
     if !path.exists() {
         return Ok(None);
     }
-    read_json(&path).map(Some)
+    let cells = read_json(&path)?;
+    validate_observation_identity_namespace(&cells)?;
+    Ok(Some(cells))
 }
 
 fn encoded_cells(cells: &TrackedCells) -> Result<String, String> {
+    validate_observation_identity_namespace(cells)?;
     // ⚠️ THE NORMALISATION HAPPENS HERE, AT THE SINGLE WRITE CHOKE POINT, AND
     // NOT ONLY AT INGEST. `update` carries already-tracked rows forward without
     // re-reading their results, so an ingest-only fix would clean new rows and
@@ -3010,7 +3032,11 @@ fn encoded_cells(cells: &TrackedCells) -> Result<String, String> {
     Ok(text)
 }
 
-fn wait_for_scorecard_write_lock(file: &File, path: &Path, timeout: Duration) -> Result<(), String> {
+fn wait_for_scorecard_write_lock(
+    file: &File,
+    path: &Path,
+    timeout: Duration,
+) -> Result<(), String> {
     let started = Instant::now();
     loop {
         match FileExt::try_lock_exclusive(file) {
@@ -3060,7 +3086,12 @@ fn acquire_scorecard_write_lock(root: &Path) -> Result<File, String> {
         .create(true)
         .truncate(false)
         .open(&path)
-        .map_err(|e| format!("cannot open scorecard write-back lock {}: {e}", path.display()))?;
+        .map_err(|e| {
+            format!(
+                "cannot open scorecard write-back lock {}: {e}",
+                path.display()
+            )
+        })?;
     wait_for_scorecard_write_lock(&file, &path, Duration::from_secs(30))?;
     Ok(file)
 }
@@ -3322,6 +3353,20 @@ fn source_depths(
 /// `last_tested` means NO WRITER RECORDED ONE, not that the cell was never
 /// exercised, and the only way to keep that honest is to state the coverage out
 /// loud every time the table is printed.
+fn observation_tree_counts(tracked: &TrackedCells, head_tree: &str) -> (usize, usize) {
+    tracked
+        .cells
+        .iter()
+        .flat_map(|cell| cell.observations.iter())
+        .fold((0, 0), |(different, unknown), observation| {
+            match observation.detcore_tree.as_deref() {
+                Some(tree) if tree != head_tree => (different + 1, unknown),
+                None => (different, unknown + 1),
+                _ => (different, unknown),
+            }
+        })
+}
+
 fn render_evidence_coverage(root: &Path) -> Result<String, String> {
     let Some(tracked) = load_existing(root)? else {
         return Ok(String::new());
@@ -3349,16 +3394,10 @@ fn render_evidence_coverage(root: &Path) -> Result<String, String> {
         .iter()
         .filter(|cell| !cell.observations.is_empty())
         .count();
-    let stale_observations = tracked
-        .cells
-        .iter()
-        .flat_map(|cell| cell.observations.iter())
-        .filter(|observation| {
-            head_tree
-                .as_deref()
-                .is_some_and(|head| head != observation.detcore_tree)
-        })
-        .count();
+    let (different_observations, unknown_observations) = head_tree
+        .as_deref()
+        .map(|head| observation_tree_counts(&tracked, head))
+        .unwrap_or_default();
 
     let mut out = String::new();
     out.push_str("\nRecorded evidence (not part of the green/red verdict)\n");
@@ -3368,7 +3407,7 @@ fn render_evidence_coverage(root: &Path) -> Result<String, String> {
     if stamped < total {
         out.push_str(concat!(
             "      the remainder have NO RECORD, which is not the same as never tested:\n",
-             "      only the explicit fold commands write it, and validate runs only\n",
+            "      only the explicit fold commands write it, and validate runs only\n",
             "      the selected plan, so red cells stay blank until a pressure-test\n",
             "      campaign covers them.\n",
         ));
@@ -3397,16 +3436,18 @@ fn render_evidence_coverage(root: &Path) -> Result<String, String> {
     // at N=40.
     let mut conflicts = Vec::new();
     for cell in &tracked.cells {
-        for tree in cell
+        let identities = cell
             .observations
             .iter()
-            .map(|o| o.detcore_tree.clone())
-            .collect::<BTreeSet<_>>()
-        {
+            .map(SeriesObservationIdentity::from_observation)
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        for identity in identities {
             let at = |p: ObservationProvenance| {
-                cell.observations
-                    .iter()
-                    .find(|o| o.detcore_tree == tree && o.provenance == p)
+                cell.observations.iter().find(|observation| {
+                    SeriesObservationIdentity::from_observation(observation).as_ref()
+                        == Ok(&identity)
+                        && observation.provenance == p
+                })
             };
             let (Some(pressure), Some(validate)) = (
                 at(ObservationProvenance::PressureTest),
@@ -3415,20 +3456,20 @@ fn render_evidence_coverage(root: &Path) -> Result<String, String> {
                 continue;
             };
             if pressure.results != validate.results {
-                conflicts.push((display_id(&cell.id), tree.clone(), pressure, validate));
+                conflicts.push((display_id(&cell.id), identity, pressure, validate));
             }
         }
     }
     if !conflicts.is_empty() {
         out.push_str(&format!(
             concat!(
-                "\n  !! {} cell(s) where PRESSURE AND VALIDATE DISAGREE at the same tree.\n",
+                "\n  !! {} cell(s) where PRESSURE AND VALIDATE DISAGREE at the same recorded code identity.\n",
                 "      This is a finding, not an error: the pressure test may simply have\n",
                 "      stressed the cell harder. Read both results with their sample counts.\n",
             ),
             conflicts.len()
         ));
-        for (id, tree, pressure, validate) in conflicts {
+        for (id, identity, pressure, validate) in conflicts {
             let n = |o: &Observation| {
                 o.first_divergent_record
                     .range()
@@ -3436,9 +3477,15 @@ fn render_evidence_coverage(root: &Path) -> Result<String, String> {
                     .map(|r| r.samples)
                     .unwrap_or(0)
             };
+            let (identity_kind, identity) = match &identity {
+                SeriesObservationIdentity::DetcoreTree(tree) => ("detcore tree", tree),
+                SeriesObservationIdentity::HermitCommit(commit) => {
+                    ("recorded Hermit commit", commit)
+                }
+            };
             out.push_str(&format!(
-                "      {id} @ tree {}\n         pressure: {:?} (positions from {} run(s), {} invocation(s))\n         validate: {:?} (positions from {} run(s), {} invocation(s))\n",
-                &tree[..12.min(tree.len())],
+                "      {id} @ {identity_kind} {}\n         pressure: {:?} (positions from {} run(s), {} invocation(s))\n         validate: {:?} (positions from {} run(s), {} invocation(s))\n",
+                &identity[..12.min(identity.len())],
                 pressure.results,
                 n(pressure),
                 pressure.invocations.len(),
@@ -3448,9 +3495,14 @@ fn render_evidence_coverage(root: &Path) -> Result<String, String> {
             ));
         }
     }
-    if stale_observations > 0 {
+    if different_observations > 0 {
         out.push_str(&format!(
-            "      {stale_observations} observation(s) were taken against a DIFFERENT detcore tree\n"
+            "      {different_observations} observation(s) were taken against a DIFFERENT detcore tree\n"
+        ));
+    }
+    if unknown_observations > 0 {
+        out.push_str(&format!(
+            "      {unknown_observations} observation(s) do not record a detcore tree, so their relation to HEAD:detcore is UNKNOWN\n"
         ));
     }
     Ok(out)
@@ -3755,14 +3807,15 @@ fn apply_pressure_summary(
         // Keyed by tree AND provenance. Keying by tree alone would let a
         // validate point and a pressure-test distribution fall into one range.
         let position = observations.iter().position(|observation| {
-            observation.detcore_tree == summary.detcore_tree
+            observation.detcore_tree.as_deref() == Some(summary.detcore_tree.as_str())
                 && observation.provenance == ObservationProvenance::PressureTest
         });
         let observation = match position {
             Some(position) => &mut observations[position],
             None => {
                 observations.push(Observation {
-                    detcore_tree: summary.detcore_tree.clone(),
+                    detcore_tree: Some(summary.detcore_tree.clone()),
+                    event_ids: BTreeSet::new(),
                     provenance: ObservationProvenance::PressureTest,
                     depth: depth.clone(),
                     hermit_shas: BTreeSet::new(),
@@ -4051,14 +4104,15 @@ fn apply_validate_results(
             }
             let observations = &mut updated.cells[index].observations;
             let position = observations.iter().position(|observation| {
-                observation.detcore_tree == detcore_tree
+                observation.detcore_tree.as_deref() == Some(detcore_tree)
                     && observation.provenance == ObservationProvenance::Validate
             });
             let observation = match position {
                 Some(position) => &mut observations[position],
                 None => {
                     observations.push(Observation {
-                        detcore_tree: detcore_tree.to_string(),
+                        detcore_tree: Some(detcore_tree.to_string()),
+                        event_ids: BTreeSet::new(),
                         provenance: ObservationProvenance::Validate,
                         depth: depth.clone(),
                         hermit_shas: BTreeSet::new(),
@@ -4198,7 +4252,9 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
             check_observation_worktree(root)?;
             let current_head = git_head(root)?;
             if current_head != head {
-                return Err(format!("HEAD moved from {head} to {current_head} during write-back"));
+                return Err(format!(
+                    "HEAD moved from {head} to {current_head} during write-back"
+                ));
             }
             if read_generated_files(root)? != original {
                 return Err("the generated scorecard files changed during write-back".into());
@@ -4582,11 +4638,7 @@ fn update_observations(root: &Path, summary_path: &Path) -> Result<(), String> {
 /// The series row's `cell` is already the manifest's exact
 /// `test/mode/backend` identity. Retained validate history uses a different
 /// input path; the import and this projection preserve one another's evidence.
-fn project_observations(
-    root: &Path,
-    series_root: &Path,
-    refreshed_at: &str,
-) -> Result<(), String> {
+fn project_observations(root: &Path, series_root: &Path, refreshed_at: &str) -> Result<(), String> {
     let derived = check_tracked(root)?;
     let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
     let before = tracked.clone();
@@ -4596,10 +4648,11 @@ fn project_observations(
     // recorded commit behind.
     let snapshot = snapshot_series_source(series_root)?;
     let rows = read_series_rows(&snapshot)?;
-    let projection = apply_series_rows(root, &mut tracked, &rows)?;
+    let projection = apply_series_rows(root, &mut tracked, &rows, Some(&snapshot.source))?;
     let skipped = &projection.skipped;
 
     let rows_read = rows.len() as u64;
+    tracked.schema = SCHEMA;
     tracked.projection = Some(ObservationProjection {
         source: snapshot.source.clone(),
         source_commit: Some(snapshot.source_commit.clone()),
@@ -4625,6 +4678,11 @@ fn project_observations(
         snapshot.source,
         snapshot.source_commit,
         snapshot.source_tree
+    );
+    println!(
+        "  {} row(s) were already represented by one exact recorded run/attempt; \
+         replaced {} prior projector-owned observation(s) by exact event_id",
+        projection.represented_rows, projection.replaced_observations
     );
     if rows_read == 0 {
         println!(
@@ -4707,9 +4765,7 @@ fn replace_generated_files_with(
     });
     if let Err(error) = second {
         return match old_scorecard.persist(&scorecard) {
-            Ok(_) => Err(format!(
-                "{error}; restored the original generated files"
-            )),
+            Ok(_) => Err(format!("{error}; restored the original generated files")),
             Err(rollback) => {
                 let rollback_error = rollback.error;
                 match rollback.file.keep() {
@@ -4733,21 +4789,60 @@ struct ProjectObservationsOutcome {
     cells: usize,
     rows: usize,
     runs: u64,
+    represented_rows: usize,
+    replaced_observations: usize,
     skipped: Vec<String>,
     pre_series_corpus: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct PreparedSeriesRow {
     cell_index: usize,
-    detcore_tree: String,
+    observation_identity: SeriesObservationIdentity,
     provenance: ObservationProvenance,
+    event_id: String,
     hermit_sha: String,
+    run_id: String,
+    attempt: u64,
     result: ObservedResult,
     num_runs: u64,
+    main_ancestry: Option<bool>,
     depth: BTreeMap<String, SourceDepth>,
     coordinates: Option<SeriesCoordinates>,
     order: (String, String, u64, String),
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum SeriesObservationIdentity {
+    DetcoreTree(String),
+    HermitCommit(String),
+}
+
+impl SeriesObservationIdentity {
+    fn from_observation(observation: &Observation) -> Result<Self, String> {
+        match observation.detcore_tree.as_ref() {
+            Some(tree) => Ok(Self::DetcoreTree(tree.clone())),
+            None if observation.hermit_shas.len() == 1 => Ok(Self::HermitCommit(
+                observation
+                    .hermit_shas
+                    .iter()
+                    .next()
+                    .expect("one Hermit SHA exists")
+                    .clone(),
+            )),
+            None => Err(format!(
+                "legacy projected observation has {} Hermit identities; expected exactly one",
+                observation.hermit_shas.len()
+            )),
+        }
+    }
+
+    fn detcore_tree(&self) -> Option<&str> {
+        match self {
+            Self::DetcoreTree(tree) => Some(tree),
+            Self::HermitCommit(_) => None,
+        }
+    }
 }
 
 fn is_object_id(value: &str) -> bool {
@@ -4755,6 +4850,67 @@ fn is_object_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn deserialize_unique_event_ids<'de, D>(deserializer: D) -> Result<BTreeSet<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Vec::<String>::deserialize(deserializer)?;
+    if values.iter().any(|value| value.trim().is_empty()) {
+        return Err(serde::de::Error::custom(
+            "projected observation event_ids must be nonempty",
+        ));
+    }
+    let unique = values.iter().cloned().collect::<BTreeSet<_>>();
+    if unique.len() != values.len() {
+        return Err(serde::de::Error::custom(
+            "projected observation event_ids must be unique",
+        ));
+    }
+    Ok(unique)
+}
+
+fn validate_observation_identity_namespace(cells: &TrackedCells) -> Result<(), String> {
+    let permits_projected_identity = cells.schema >= 7
+        && cells.projection.as_ref().is_some_and(|projection| {
+            projection.source_commit.is_some() && projection.source_tree.is_some()
+        });
+    let mut seen_event_ids = BTreeSet::new();
+    for cell in &cells.cells {
+        let id = display_id(&cell.id);
+        for observation in &cell.observations {
+            let projected = !observation.event_ids.is_empty();
+            if (projected || observation.detcore_tree.is_none()) && !permits_projected_identity {
+                return Err(format!(
+                    "{id} uses projected identity without scorecard schema 7 and complete source identity"
+                ));
+            }
+            if projected
+                && (!observation.canonical_comparisons.is_empty()
+                    || !observation.invocations.is_empty())
+            {
+                return Err(format!(
+                    "{id} mixes projector-owned event_ids with independent evidence"
+                ));
+            }
+            for event_id in &observation.event_ids {
+                if event_id.trim().is_empty() || !seen_event_ids.insert(event_id) {
+                    return Err(format!("invalid or repeated projected event_id {event_id:?}"));
+                }
+            }
+            if observation.detcore_tree.is_none()
+                && (!projected
+                    || observation.hermit_shas.len() != 1
+                    || !is_object_id(observation.hermit_shas.iter().next().unwrap()))
+            {
+                return Err(format!(
+                    "{id} has no Detcore tree and not exactly one valid recorded Hermit identity"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn deserialize_optional_object_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -4822,39 +4978,120 @@ fn series_result(row: &SeriesRow, mode: &str) -> Option<ObservedResult> {
     }
 }
 
-fn series_detcore_tree(root: &Path, row: &SeriesRow) -> Result<String, String> {
-    if !is_object_id(&row.series.tree) {
-        return Err(format!(
-            "Hermit tree must be a lowercase 40-hex object id, got {:?}",
-            row.series.tree
-        ));
-    }
-    let recovered = git_rev_parse(root, &format!("{}:detcore", row.series.tree))
-        .ok()
-        .filter(|tree| is_object_id(tree));
-    match (&row.series.detcore_tree, recovered) {
-        (Some(recorded), _) if !is_object_id(recorded) => Err(format!(
-            "detcore tree must be a lowercase 40-hex object id, got {recorded:?}"
+fn series_observation_identity(row: &SeriesRow) -> Result<SeriesObservationIdentity, String> {
+    match &row.series.detcore_tree {
+        Some(tree) if is_object_id(tree) => {
+            Ok(SeriesObservationIdentity::DetcoreTree(tree.clone()))
+        }
+        Some(tree) => Err(format!(
+            "detcore tree must be a lowercase 40-hex object id, got {tree:?}"
         )),
-        (Some(recorded), Some(recovered)) if recorded != &recovered => Err(format!(
-            "recorded detcore tree {recorded} does not match {}:detcore ({recovered})",
-            row.series.tree
+        None if is_object_id(&row.series.tree) => Ok(SeriesObservationIdentity::HermitCommit(
+            row.series.tree.clone(),
         )),
-        (Some(recorded), _) => Ok(recorded.clone()),
-        (None, Some(recovered)) => Ok(recovered),
-        (None, None) => Err(format!(
-            "no detcore_tree was recorded and {}:detcore is not available in this checkout",
+        None => Err(format!(
+            "row records neither a valid detcore_tree nor a valid Hermit tree identity: {:?}",
             row.series.tree
         )),
     }
 }
 
-fn apply_series_rows(
-    root: &Path,
+fn should_replace_last_tested(previous: Option<&LastTested>, row: &PreparedSeriesRow) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    if previous.hermit_sha == row.hermit_sha {
+        return true;
+    }
+    if row.main_ancestry == Some(false) {
+        return false;
+    }
+    let previous_depth = previous
+        .depth
+        .get("hermit")
+        .map(|depth| (depth.first_parent, depth.commits));
+    let row_depth = row
+        .depth
+        .get("hermit")
+        .map(|depth| (depth.first_parent, depth.commits));
+    match (previous_depth, row_depth) {
+        (None, Some(_)) => true,
+        (Some(previous), Some(candidate)) => candidate > previous,
+        _ => false,
+    }
+}
+
+fn remove_replaceable_projected_observations(
     tracked: &mut TrackedCells,
     rows: &[SeriesRow],
+    projection_source: Option<&str>,
+) -> Result<usize, String> {
+    let owned = tracked
+        .cells
+        .iter()
+        .flat_map(|cell| cell.observations.iter())
+        .filter(|observation| !observation.event_ids.is_empty())
+        .count();
+    if owned == 0 {
+        return Ok(0);
+    }
+    let Some(source) = projection_source else {
+        return Err(
+            "projected observations carry event_ids, but the caller supplied no immutable source metadata"
+                .into(),
+        );
+    };
+    let projection = tracked
+        .projection
+        .as_ref()
+        .ok_or("projected observations carry event_ids without recorded projection metadata")?;
+    if tracked.schema < 7 || projection.source_commit.is_none() || projection.source_tree.is_none()
+    {
+        return Err(
+            "projected observations carry event_ids without scorecard schema 7 and complete source identity"
+                .into(),
+        );
+    }
+    if projection.source != source {
+        return Err(format!(
+            "projected observations belong to source {:?}, not requested source {source:?}",
+            projection.source
+        ));
+    }
+    let current_event_ids = rows
+        .iter()
+        .map(|row| row.event_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if let Some((cell, event_id)) = tracked.cells.iter().find_map(|cell| {
+        cell.observations.iter().find_map(|observation| {
+            observation
+                .event_ids
+                .iter()
+                .find(|event_id| !current_event_ids.contains(event_id.as_str()))
+                .map(|event_id| (cell, event_id))
+        })
+    }) {
+        return Err(format!(
+            "{} has projector-owned event_id {event_id:?} absent from source {source:?}",
+            display_id(&cell.id)
+        ));
+    }
+    for cell in &mut tracked.cells {
+        cell.observations
+            .retain(|observation| observation.event_ids.is_empty());
+    }
+    Ok(owned)
+}
+
+fn apply_series_rows(
+    _ambient_git_root: &Path,
+    tracked: &mut TrackedCells,
+    rows: &[SeriesRow],
+    projection_source: Option<&str>,
 ) -> Result<ProjectObservationsOutcome, String> {
-    let history_ranks = git_history_ranks(root)?;
+    validate_observation_identity_namespace(tracked)?;
+    let replaced_observations =
+        remove_replaceable_projected_observations(tracked, rows, projection_source)?;
     let mut cell_indices: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (index, cell) in tracked.cells.iter().enumerate() {
         cell_indices
@@ -4896,8 +5133,8 @@ fn apply_series_rows(
                 continue;
             }
         };
-        let detcore_tree = match series_detcore_tree(root, row) {
-            Ok(tree) => tree,
+        let observation_identity = match series_observation_identity(row) {
+            Ok(identity) => identity,
             Err(why) => {
                 skipped.push(format!("{label}: {why}"));
                 continue;
@@ -4905,11 +5142,15 @@ fn apply_series_rows(
         };
         prepared.push(PreparedSeriesRow {
             cell_index,
-            detcore_tree,
+            observation_identity,
             provenance,
+            event_id: row.event_id.clone(),
             hermit_sha: row.series.tree.clone(),
+            run_id: row.run_id.clone(),
+            attempt: row.series.attempt.unwrap_or(1),
             result,
             num_runs: row.series.num_runs,
+            main_ancestry: row.series.main_ancestry,
             depth: row.series.depth.clone(),
             coordinates: row.series.coordinates.clone(),
             order: (
@@ -4933,129 +5174,188 @@ fn apply_series_rows(
         ));
     }
 
+    let admitted_rows = prepared.len();
+    let admitted_runs = prepared.iter().map(|row| row.num_runs).sum();
+    let admitted_cells = prepared
+        .iter()
+        .map(|row| row.cell_index)
+        .collect::<BTreeSet<_>>();
+    let mut preserved = BTreeMap::new();
+    for (cell_index, cell) in tracked.cells.iter().enumerate() {
+        for observation in &cell.observations {
+            if !observation.event_ids.is_empty() {
+                continue;
+            }
+            let mut runs = BTreeMap::<(String, String), BTreeSet<ObservedResult>>::new();
+            for (hermit_sha, run_id, result) in observation
+                .canonical_comparisons
+                .iter()
+                .map(|row| (&row.hermit_sha, &row.run_id, row.result))
+                .chain(
+                    observation
+                        .invocations
+                        .iter()
+                        .map(|row| (&row.hermit_sha, &row.run_id, row.result)),
+                )
+            {
+                runs.entry((hermit_sha.clone(), run_id.clone()))
+                    .or_default()
+                    .insert(result);
+            }
+            for ((hermit_sha, run_id), results) in runs {
+                let entry = preserved
+                    .entry((cell_index, observation.provenance, hermit_sha, run_id))
+                    .or_insert_with(|| (0usize, BTreeSet::new()));
+                entry.0 += 1;
+                entry.1.extend(results);
+            }
+        }
+    }
+    let source_counts = prepared.iter().fold(BTreeMap::new(), |mut counts, row| {
+        *counts
+            .entry((
+                row.cell_index,
+                row.provenance,
+                row.hermit_sha.clone(),
+                row.run_id.clone(),
+            ))
+            .or_insert(0usize) += 1;
+        counts
+    });
+    let mut represented_rows = 0usize;
+    let mut to_project = Vec::new();
+    for row in prepared.iter().cloned() {
+        let key = (
+            row.cell_index,
+            row.provenance,
+            row.hermit_sha.clone(),
+            row.run_id.clone(),
+        );
+        let Some((matches, results)) = preserved.get(&key) else {
+            to_project.push(row);
+            continue;
+        };
+        if row.attempt != 1 {
+            return Err(format!(
+                "series event {} maps to existing run {} at Hermit {}, but records outer attempt {}; preserved evidence does not retain that attempt identity",
+                row.event_id, row.run_id, row.hermit_sha, row.attempt
+            ));
+        }
+        let source_rows = source_counts[&key];
+        if *matches != 1 || source_rows != 1 || row.num_runs != 1 {
+            return Err(format!(
+                "source event {} cannot map one-to-one to preserved run {} attempt {} at Hermit {}: source_rows={} matching_observations={} num_runs={}",
+                row.event_id,
+                row.run_id,
+                row.attempt,
+                row.hermit_sha,
+                source_rows,
+                matches,
+                row.num_runs
+            ));
+        }
+        if results != &BTreeSet::from([row.result]) {
+            return Err(format!(
+                "series event {} maps to existing run {} at Hermit {}, but results {results:?} disagree with {:?}",
+                row.event_id, row.run_id, row.hermit_sha, row.result
+            ));
+        }
+        represented_rows += 1;
+    }
+    let mut prepared = to_project;
+
     prepared.sort_by(|left, right| left.order.cmp(&right.order));
-    let mut projected_keys = BTreeSet::new();
-    let mut projected_cells = BTreeSet::new();
+    let mut grouped =
+        BTreeMap::<(usize, SeriesObservationIdentity, ObservationProvenance), Observation>::new();
     let mut latest_by_cell: BTreeMap<usize, usize> = BTreeMap::new();
     for (prepared_index, row) in prepared.iter().enumerate() {
-        projected_cells.insert(row.cell_index);
-        projected_keys.insert((row.cell_index, row.detcore_tree.clone(), row.provenance));
+        let observation = grouped
+            .entry((
+                row.cell_index,
+                row.observation_identity.clone(),
+                row.provenance,
+            ))
+            .or_insert_with(|| Observation {
+                detcore_tree: row.observation_identity.detcore_tree().map(str::to_string),
+                event_ids: BTreeSet::new(),
+                provenance: row.provenance,
+                depth: BTreeMap::new(),
+                hermit_shas: BTreeSet::new(),
+                results: BTreeSet::new(),
+                canonical_comparisons: BTreeSet::new(),
+                invocations: BTreeSet::new(),
+                first_divergent_scheduler_turn: ObservedPositions::default(),
+                first_divergent_virtual_nanoseconds: ObservedPositions::default(),
+                first_divergent_record: ObservedPositions::default(),
+                first_divergent_syscall: ObservedPositions::default(),
+            });
+        observation.event_ids.insert(row.event_id.clone());
+        observation.depth = row.depth.clone();
+        observation.hermit_shas.insert(row.hermit_sha.clone());
+        observation.results.insert(row.result);
+        for _ in 0..row.num_runs {
+            observation.first_divergent_scheduler_turn.record(
+                row.coordinates
+                    .as_ref()
+                    .and_then(|coordinates| coordinates.first_divergent_scheduler_turn),
+            );
+            observation.first_divergent_virtual_nanoseconds.record(
+                row.coordinates
+                    .as_ref()
+                    .and_then(|coordinates| coordinates.first_divergent_virtual_nanoseconds),
+            );
+            observation.first_divergent_record.record(
+                row.coordinates
+                    .as_ref()
+                    .and_then(|coordinates| coordinates.first_divergent_record),
+            );
+            observation.first_divergent_syscall.record(
+                row.coordinates
+                    .as_ref()
+                    .and_then(|coordinates| coordinates.first_divergent_syscall),
+            );
+        }
         latest_by_cell.insert(row.cell_index, prepared_index);
     }
 
-    let mut inherited_pre_series = false;
-    for (cell_index, detcore_tree, provenance) in &projected_keys {
-        let cell = &mut tracked.cells[*cell_index];
-        let inherited = cell
-            .observations
-            .iter()
-            .find(|observation| {
-                observation.detcore_tree == *detcore_tree
-                    && observation.provenance == *provenance
-            });
-        let inherited_canonical_comparisons = inherited
-            .map(|observation| observation.canonical_comparisons.clone())
-            .unwrap_or_default();
-        let inherited_invocations = inherited
-            .map(|observation| observation.invocations.clone())
-            .unwrap_or_default();
-        inherited_pre_series |=
-            !inherited_canonical_comparisons.is_empty() || !inherited_invocations.is_empty();
-        cell.observations.retain(|observation| {
-            observation.detcore_tree != *detcore_tree
-                || observation.provenance != *provenance
-        });
-        let mut observation = Observation {
-            detcore_tree: detcore_tree.clone(),
-            provenance: *provenance,
-            depth: BTreeMap::new(),
-            hermit_shas: BTreeSet::new(),
-            results: BTreeSet::new(),
-            canonical_comparisons: inherited_canonical_comparisons,
-            invocations: inherited_invocations,
-            first_divergent_scheduler_turn: ObservedPositions::default(),
-            first_divergent_virtual_nanoseconds: ObservedPositions::default(),
-            first_divergent_record: ObservedPositions::default(),
-            first_divergent_syscall: ObservedPositions::default(),
-        };
-        for row in prepared.iter().filter(|row| {
-            row.cell_index == *cell_index
-                && row.detcore_tree == *detcore_tree
-                && row.provenance == *provenance
-        }) {
-            observation.depth = row.depth.clone();
-            observation.hermit_shas.insert(row.hermit_sha.clone());
-            observation.results.insert(row.result);
-            for _ in 0..row.num_runs {
-                observation.first_divergent_scheduler_turn.record(
-                    row.coordinates
-                        .as_ref()
-                        .and_then(|coordinates| coordinates.first_divergent_scheduler_turn),
-                );
-                observation.first_divergent_virtual_nanoseconds.record(
-                    row.coordinates
-                        .as_ref()
-                        .and_then(|coordinates| coordinates.first_divergent_virtual_nanoseconds),
-                );
-                observation.first_divergent_record.record(
-                    row.coordinates
-                        .as_ref()
-                        .and_then(|coordinates| coordinates.first_divergent_record),
-                );
-                observation.first_divergent_syscall.record(
-                    row.coordinates
-                        .as_ref()
-                        .and_then(|coordinates| coordinates.first_divergent_syscall),
-                );
-            }
-        }
+    for ((cell_index, _, _), observation) in grouped {
+        let cell = &mut tracked.cells[cell_index];
         cell.observations.push(observation);
         cell.observations.sort_by(|left, right| {
             left.detcore_tree
                 .cmp(&right.detcore_tree)
                 .then(left.provenance.cmp(&right.provenance))
+                .then(left.event_ids.cmp(&right.event_ids))
         });
     }
 
     for (cell_index, prepared_index) in latest_by_cell {
         let row = &prepared[prepared_index];
-        let replace = match &tracked.cells[cell_index].last_tested {
-            None => true,
-            Some(previous) if previous.hermit_sha == row.hermit_sha => true,
-            Some(previous) => match (
-                history_ranks.get(&previous.hermit_sha),
-                history_ranks.get(&row.hermit_sha),
-            ) {
-                (Some(previous_rank), Some(row_rank)) => row_rank < previous_rank,
-                (None, Some(_)) => true,
-                _ => false,
-            },
+        let Some(detcore_tree) = row.observation_identity.detcore_tree() else {
+            continue;
         };
-        if replace {
+        if should_replace_last_tested(tracked.cells[cell_index].last_tested.as_ref(), row) {
             tracked.cells[cell_index].last_tested = Some(LastTested {
                 hermit_sha: row.hermit_sha.clone(),
-                detcore_tree: row.detcore_tree.clone(),
+                detcore_tree: detcore_tree.to_string(),
                 depth: row.depth.clone(),
             });
         }
     }
 
     let pre_series_corpus = rows.is_empty()
-        || inherited_pre_series
-        || tracked.cells.iter().enumerate().any(|(cell_index, cell)| {
-            cell.observations.iter().any(|observation| {
-                !projected_keys.contains(&(
-                    cell_index,
-                    observation.detcore_tree.clone(),
-                    observation.provenance,
-                ))
-            })
+        || tracked.cells.iter().any(|cell| {
+            cell.observations
+                .iter()
+                .any(|observation| observation.event_ids.is_empty())
         });
 
     Ok(ProjectObservationsOutcome {
-        cells: projected_cells.len(),
-        rows: prepared.len(),
-        runs: prepared.iter().map(|row| row.num_runs).sum(),
+        cells: admitted_cells.len(),
+        rows: admitted_rows,
+        runs: admitted_runs,
+        represented_rows,
+        replaced_observations,
         skipped,
         pre_series_corpus,
     })
@@ -6148,6 +6448,12 @@ fn remove_imported_validate_projection(cell: &mut TrackedCell) {
     }
 }
 
+/// Rank commits in the current Hermit history for retained-result import.
+///
+/// This helper intentionally remains checkout-relative: retained result files
+/// are admitted only when their commits are on the current branch. The series
+/// projector does not call it and must remain independent of ambient refs and
+/// objects.
 fn git_history_ranks(root: &Path) -> Result<BTreeMap<String, usize>, String> {
     let output = Command::new("git")
         .args(["rev-list", "--topo-order", "HEAD"])
@@ -6950,9 +7256,7 @@ red/`measured-and-passed` count is **0**.",
     ) || !status_section.contains("| `ptrace` | 0 | 0 | 1 | 1 |")
         || !status_section.contains("| `verify` | 0 / 1 | 0 | 0 | 1 | 1 |")
     {
-        return Err(
-            "status prose and tables did not use the same manifest-disabled count".into(),
-        );
+        return Err("status prose and tables did not use the same manifest-disabled count".into());
     }
     let old_green = TrackedCells {
         schema: SCHEMA,
@@ -7207,9 +7511,7 @@ red/`measured-and-passed` count is **0**.",
     if retried_outcome.rows != 2
         || retry_observation.results
             != BTreeSet::from([ObservedResult::Pass, ObservedResult::DeterminismFailure])
-        || retry_observation
-            .first_divergent_scheduler_turn
-            .range()
+        || retry_observation.first_divergent_scheduler_turn.range()
             != Some(ObservedRange {
                 earliest: 20,
                 latest: 20,
@@ -8120,8 +8422,8 @@ red/`measured-and-passed` count is **0**.",
     // compares one recording with its replay and deliberately reports real
     // time; verify compares independent executions and still requires virtual
     // time.
-    let result_command_fixture = tempfile::tempdir()
-        .map_err(|e| format!("cannot create result-command fixture: {e}"))?;
+    let result_command_fixture =
+        tempfile::tempdir().map_err(|e| format!("cannot create result-command fixture: {e}"))?;
     let result_command_root = result_command_fixture.path().join("repo");
     let clone = Command::new("git")
         .args(["clone", "--quiet", "--shared"])
@@ -8238,7 +8540,9 @@ red/`measured-and-passed` count is **0**.",
     replay_row.attempts[0]["argv"] = serde_json::to_value(&replay_row.argv).unwrap();
     replay_row.attempts[0]["shell_command"] = JsonValue::String(replay_row.shell_command.clone());
     let mut report: JsonValue = serde_json::from_str(
-        replay_row.attempts[0]["verification_report"].as_str().unwrap(),
+        replay_row.attempts[0]["verification_report"]
+            .as_str()
+            .unwrap(),
     )
     .unwrap();
     report["comparison"]["virtualize_time"] = serde_json::json!(false);
@@ -8278,7 +8582,12 @@ red/`measured-and-passed` count is **0**.",
             result_command_root.join(SCORECARD),
             &result_command_before.scorecard,
         )
-        .and_then(|()| fs::write(result_command_root.join(CELLS), &result_command_before.cells))
+        .and_then(|()| {
+            fs::write(
+                result_command_root.join(CELLS),
+                &result_command_before.cells,
+            )
+        })
         .map_err(|e| e.to_string())
     };
 
@@ -8366,15 +8675,17 @@ red/`measured-and-passed` count is **0**.",
         );
     }
 
-    for (staged_clean, unrelated_clean, allowed) in
-        [(true, true, true), (false, true, false), (true, false, false)]
-    {
+    for (staged_clean, unrelated_clean, allowed) in [
+        (true, true, true),
+        (false, true, false),
+        (true, false, false),
+    ] {
         if observation_dirt_error(staged_clean, unrelated_clean).is_none() != allowed {
             return Err("observe-results accepted forbidden tracked dirt".into());
         }
     }
-    let lock_root = tempfile::tempdir()
-        .map_err(|e| format!("cannot create scorecard lock fixture: {e}"))?;
+    let lock_root =
+        tempfile::tempdir().map_err(|e| format!("cannot create scorecard lock fixture: {e}"))?;
     let lock_path = lock_root.path().join("writeback.lock");
     let held = OpenOptions::new()
         .read(true)
@@ -8393,13 +8704,15 @@ red/`measured-and-passed` count is **0**.",
     let lock_error = wait_for_scorecard_write_lock(&contender, &lock_path, Duration::ZERO)
         .expect_err("a held scorecard lock must refuse at its bounded deadline");
     if !lock_error.contains("timed out after 0s") {
-        return Err(format!("scorecard lock refusal lost its deadline: {lock_error}"));
+        return Err(format!(
+            "scorecard lock refusal lost its deadline: {lock_error}"
+        ));
     }
     drop(held);
     wait_for_scorecard_write_lock(&contender, &lock_path, Duration::ZERO)?;
 
-    let pair_root = tempfile::tempdir()
-        .map_err(|e| format!("cannot create generated-file fixture: {e}"))?;
+    let pair_root =
+        tempfile::tempdir().map_err(|e| format!("cannot create generated-file fixture: {e}"))?;
     fs::create_dir_all(pair_root.path().join("ci/compat-envelope"))
         .map_err(|e| format!("cannot create generated-file fixture: {e}"))?;
     fs::write(pair_root.path().join(SCORECARD), b"old scorecard\n")
@@ -8475,7 +8788,8 @@ red/`measured-and-passed` count is **0**.",
                 .observations
                 .iter()
                 .find(|observation| {
-                    observation.provenance == provenance && observation.detcore_tree == "tree-1"
+                    observation.provenance == provenance
+                        && observation.detcore_tree.as_deref() == Some("tree-1")
                 })
                 .cloned()
         };
@@ -8572,9 +8886,8 @@ red/`measured-and-passed` count is **0**.",
             let mut report = canonical_verdict::VerificationReport::no_result();
             report.verdict = canonical_verdict::Verdict::InfrastructureError;
             report.no_result_reason = None;
-            report.infrastructure_error = Some(
-                canonical_verdict::InfrastructureError::SkidOvershoot { count: 1 },
-            );
+            report.infrastructure_error =
+                Some(canonical_verdict::InfrastructureError::SkidOvershoot { count: 1 });
             let report = serde_json::to_string(&report).unwrap();
             row.attempts[0]["outcome"] = JsonValue::String("ERROR".into());
             row.attempts[0]["error_kind"] = JsonValue::String("infrastructure".into());
@@ -8873,7 +9186,9 @@ red/`measured-and-passed` count is **0**.",
     }
     let mut mixed_terminal = not_run_row.clone();
     mixed_terminal.run_id = "fixture-mixed-terminal-not-run".into();
-    mixed_terminal.attempts.push(no_result_row.attempts[0].clone());
+    mixed_terminal
+        .attempts
+        .push(no_result_row.attempts[0].clone());
     if !fold_fixture_rows(vec![mixed_terminal])
         .expect_err("mixed terminal NotRun evidence was accepted")
         .contains("did not complete its first run")
@@ -8981,16 +9296,13 @@ red/`measured-and-passed` count is **0**.",
     timed_out_no_result["argv"] = serde_json::json!(["hermit", "run", "--seed=31"]);
     timed_out_no_result["shell_command"] =
         JsonValue::String("cd /repo && env LC_ALL=C hermit run --seed=31".into());
-    timed_out_no_result["verification_report_sha256"] = JsonValue::String(format!(
-        "{:x}",
-        Sha256::digest(timed_out_report.as_bytes())
-    ));
+    timed_out_no_result["verification_report_sha256"] =
+        JsonValue::String(format!("{:x}", Sha256::digest(timed_out_report.as_bytes())));
     timed_out_no_result["verification_report"] = JsonValue::String(timed_out_report);
     let bind_row_to_first_attempt = |row: &mut ResultRow| {
         row.argv = serde_json::from_value(row.attempts[0]["argv"].clone()).unwrap();
         row.effective_args = row.argv.iter().skip(1).cloned().collect();
-        row.guest_argv =
-            serde_json::from_value(row.attempts[0]["guest_argv"].clone()).unwrap();
+        row.guest_argv = serde_json::from_value(row.attempts[0]["guest_argv"].clone()).unwrap();
         row.env = serde_json::from_value(row.attempts[0]["env"].clone()).unwrap();
         row.cwd = row.attempts[0]["cwd"].as_str().unwrap().into();
         row.shell_command = row.attempts[0]["shell_command"].as_str().unwrap().into();
@@ -9122,7 +9434,8 @@ red/`measured-and-passed` count is **0**.",
     mixed_missing_report.first_divergent_virtual_nanoseconds = None;
     mixed_missing_report.first_divergent_record = None;
     mixed_missing_report.first_divergent_syscall = None;
-    mixed_missing_report.attempts = vec![validate_attempt("PASS"), timed_out_without_report.clone()];
+    mixed_missing_report.attempts =
+        vec![validate_attempt("PASS"), timed_out_without_report.clone()];
     let (tracked, fold) = fold_fixture_row(mixed_missing_report)?;
     if fold.errored.len() != 1
         || !tracked.cells[0].observations.is_empty()
@@ -9209,7 +9522,10 @@ red/`measured-and-passed` count is **0**.",
 
     let mut attempt_outcome_mismatch = no_result_row.clone();
     attempt_outcome_mismatch.attempts[0]["outcome"] = JsonValue::String("PASS".into());
-    assert_recovered_refuses(attempt_outcome_mismatch, "does not agree with FAIL/no_result");
+    assert_recovered_refuses(
+        attempt_outcome_mismatch,
+        "does not agree with FAIL/no_result",
+    );
 
     for (name, status, signal, expected) in [
         (
@@ -9427,8 +9743,7 @@ red/`measured-and-passed` count is **0**.",
     report["verified"] = JsonValue::Bool(false);
     report["bitwise_parity"] = JsonValue::Bool(false);
     report["verdict"] = JsonValue::String("infrastructure_error".into());
-    report["infrastructure_error"] =
-        serde_json::json!({"kind": "skid_overshoot", "count": 1});
+    report["infrastructure_error"] = serde_json::json!({"kind": "skid_overshoot", "count": 1});
     report["first_divergent_scheduler_turn"] = serde_json::json!(7);
     report["first_divergent_virtual_nanoseconds"] = serde_json::json!(70);
     report["first_divergent_record"] = serde_json::json!(12);
@@ -9552,16 +9867,22 @@ red/`measured-and-passed` count is **0**.",
     // tree-1 pressure bounds, the tree-1 VALIDATE bounds folded by the bracket
     // above, and the new tree-2 pressure entry. A bare length check would pass
     // for the wrong reason if two of these ever collapsed while a third split.
-    let keys: Vec<(String, ObservationProvenance)> = observed.cells[0]
+    let keys: Vec<(Option<String>, ObservationProvenance)> = observed.cells[0]
         .observations
         .iter()
         .map(|o| (o.detcore_tree.clone(), o.provenance))
         .collect();
     if keys
         != vec![
-            ("tree-1".to_string(), ObservationProvenance::PressureTest),
-            ("tree-1".to_string(), ObservationProvenance::Validate),
-            ("tree-2".to_string(), ObservationProvenance::PressureTest),
+            (
+                Some("tree-1".to_string()),
+                ObservationProvenance::PressureTest,
+            ),
+            (Some("tree-1".to_string()), ObservationProvenance::Validate),
+            (
+                Some("tree-2".to_string()),
+                ObservationProvenance::PressureTest,
+            ),
         ]
     {
         return Err(format!(
@@ -9831,7 +10152,8 @@ red/`measured-and-passed` count is **0**.",
         cell
     };
     let sample = Observation {
-        detcore_tree: "tree".into(),
+        detcore_tree: Some("tree".into()),
+        event_ids: BTreeSet::new(),
         provenance: ObservationProvenance::PressureTest,
         depth: BTreeMap::new(),
         hermit_shas: BTreeSet::new(),
@@ -9843,6 +10165,21 @@ red/`measured-and-passed` count is **0**.",
         first_divergent_record: ObservedPositions::default(),
         first_divergent_syscall: ObservedPositions::default(),
     };
+    let mut different_tree = sample.clone();
+    different_tree.detcore_tree = Some("other-tree".into());
+    let mut unknown_tree = sample.clone();
+    unknown_tree.detcore_tree = None;
+    let tree_count_fixture = TrackedCells {
+        schema: SCHEMA,
+        projection: None,
+        cells: vec![boundary_cell(
+            vec![sample.clone(), different_tree, unknown_tree],
+            CellStatus::Red,
+        )],
+    };
+    if observation_tree_counts(&tree_count_fixture, "tree") != (1, 1) {
+        return Err("show conflated unknown and different observation trees".into());
+    }
     let with_evidence = TrackedCells {
         schema: SCHEMA,
         projection: None,
@@ -10138,7 +10475,8 @@ red/`measured-and-passed` count is **0**.",
                       producer: SeriesProducer,
                       num_runs: u64,
                       detcore_tree: Option<String>,
-                      coordinate: Option<u64>| -> SeriesRow {
+                      coordinate: Option<u64>|
+     -> SeriesRow {
         let mode = cell.rsplit('/').nth(1).unwrap_or_default();
         let (result, failure_class) = match outcome {
             SeriesOutcome::Passed => (Some(ObservedResult::Pass), None),
@@ -10151,77 +10489,68 @@ red/`measured-and-passed` count is **0**.",
                 Some(FailureClass::ProductFailure),
             ),
             SeriesOutcome::NoResult => (None, Some(FailureClass::NoResult)),
-            SeriesOutcome::Timeout => (
-                Some(ObservedResult::Timeout),
-                Some(FailureClass::NoResult),
-            ),
+            SeriesOutcome::Timeout => (Some(ObservedResult::Timeout), Some(FailureClass::NoResult)),
             SeriesOutcome::Errored => (
                 Some(ObservedResult::CrashError),
                 Some(FailureClass::ProductFailure),
             ),
-            SeriesOutcome::Skipped => {
-                (None, Some(FailureClass::UnderstoodPrerequisiteFailure))
-            }
+            SeriesOutcome::Skipped => (None, Some(FailureClass::UnderstoodPrerequisiteFailure)),
         };
         SeriesRow {
-        source: "fixture-series:1".into(),
-        schema: SeriesSchema::V3,
-        event_id: format!(
-            "fixture-{cell}-{}-{}",
-            outcome.as_str(),
-            producer.as_str()
-        ),
-        event_type: "series.observation".into(),
-        emitted_at: "2026-08-27T05:00:00Z".into(),
-        team: "hermit".into(),
-        host: "fixture-host".into(),
-        producer,
-        run_id: "fixture-run".into(),
-        series: SeriesPayload {
-            cell: cell.into(),
-            tree: fixture_hermit_tree.clone(),
-            detcore_tree,
-            outcome,
-            result,
-            failure_class,
-            run_index: 1,
-            attempt: None,
-            num_runs,
-            last_run_index: None,
-            main_ancestry: Some(true),
-            runtime: None,
-            source_tree_dirty: false,
-            depth: BTreeMap::from([(
-                "hermit".into(),
-                SourceDepth {
-                    commits: 10,
-                    first_parent: 9,
-                },
-            )]),
-            coordinates: coordinate.map(|position| SeriesCoordinates {
-                first_divergent_scheduler_turn: Some(position),
-                ..SeriesCoordinates::default()
-            }),
-            first_divergent_messages: None,
-            machine_shortname: Some("fixture-host".into()),
-            kernel_version: Some("7.1.3-fixture".into()),
-            host_capabilities: Some(BTreeMap::from([
-                (
-                    HostCapability::CpuidFaulting,
-                    HostCapabilityVerdict {
-                        present: true,
-                        evidence: "fixture cpuid probe".into(),
+            source: "fixture-series:1".into(),
+            schema: SeriesSchema::V3,
+            event_id: format!("fixture-{cell}-{}-{}", outcome.as_str(), producer.as_str()),
+            event_type: "series.observation".into(),
+            emitted_at: "2026-08-27T05:00:00Z".into(),
+            team: "hermit".into(),
+            host: "fixture-host".into(),
+            producer,
+            run_id: "fixture-run".into(),
+            series: SeriesPayload {
+                cell: cell.into(),
+                tree: fixture_hermit_tree.clone(),
+                detcore_tree,
+                outcome,
+                result,
+                failure_class,
+                run_index: 1,
+                attempt: None,
+                num_runs,
+                last_run_index: None,
+                main_ancestry: Some(true),
+                runtime: None,
+                source_tree_dirty: false,
+                depth: BTreeMap::from([(
+                    "hermit".into(),
+                    SourceDepth {
+                        commits: 10,
+                        first_parent: 9,
                     },
-                ),
-                (
-                    HostCapability::Kvm,
-                    HostCapabilityVerdict {
-                        present: false,
-                        evidence: "fixture kvm probe".into(),
-                    },
-                ),
-            ])),
-        },
+                )]),
+                coordinates: coordinate.map(|position| SeriesCoordinates {
+                    first_divergent_scheduler_turn: Some(position),
+                    ..SeriesCoordinates::default()
+                }),
+                first_divergent_messages: None,
+                machine_shortname: Some("fixture-host".into()),
+                kernel_version: Some("7.1.3-fixture".into()),
+                host_capabilities: Some(BTreeMap::from([
+                    (
+                        HostCapability::CpuidFaulting,
+                        HostCapabilityVerdict {
+                            present: true,
+                            evidence: "fixture cpuid probe".into(),
+                        },
+                    ),
+                    (
+                        HostCapability::Kvm,
+                        HostCapabilityVerdict {
+                            present: false,
+                            evidence: "fixture kvm probe".into(),
+                        },
+                    ),
+                ])),
+            },
         }
     };
     let mut projected_from_series = TrackedCells {
@@ -10265,7 +10594,7 @@ red/`measured-and-passed` count is **0**.",
             None,
         ),
     ];
-    let projected = apply_series_rows(&root, &mut projected_from_series, &projection_rows)?;
+    let projected = apply_series_rows(&root, &mut projected_from_series, &projection_rows, None)?;
     let projected_cell = &projected_from_series.cells[0];
     if projected.cells != 1
         || projected.rows != 2
@@ -10289,11 +10618,17 @@ red/`measured-and-passed` count is **0**.",
         .observations
         .iter()
         .find(|observation| {
-            observation.detcore_tree == fixture_detcore_tree
+            observation.detcore_tree.is_none()
+                && observation.hermit_shas == BTreeSet::from([fixture_hermit_tree.clone()])
                 && observation.provenance == ObservationProvenance::PressureTest
         })
-        .ok_or("a historical row without detcore_tree did not create an observation")?;
-    if projected_observation.first_divergent_scheduler_turn.positions != vec![68, 68, 68]
+        .ok_or(
+            "a historical row without detcore_tree did not create a recorded-commit observation",
+        )?;
+    if projected_observation
+        .first_divergent_scheduler_turn
+        .positions
+        != vec![68, 68, 68]
         || projected_observation.results
             != BTreeSet::from([ObservedResult::Pass, ObservedResult::ParityFailure])
     {
@@ -10302,10 +10637,8 @@ red/`measured-and-passed` count is **0**.",
                 .into(),
         );
     }
-    if projected_cell.last_tested.as_ref().map(|last| (&last.hermit_sha, &last.detcore_tree))
-        != Some((&fixture_hermit_tree, &fixture_detcore_tree))
-    {
-        return Err("series projection did not stamp last_tested from the admitted row".into());
+    if projected_cell.last_tested.is_some() {
+        return Err("a legacy row without a Detcore tree stamped last_tested".into());
     }
 
     // A projection of older series history must not move `last_tested` behind a
@@ -10315,7 +10648,13 @@ red/`measured-and-passed` count is **0**.",
     let current_last_tested = LastTested {
         hermit_sha: fixture_hermit_tree.clone(),
         detcore_tree: fixture_detcore_tree.clone(),
-        depth: BTreeMap::new(),
+        depth: BTreeMap::from([(
+            "hermit".into(),
+            SourceDepth {
+                commits: 11,
+                first_parent: 10,
+            },
+        )]),
     };
     let mut preserve_newer = TrackedCells {
         schema: SCHEMA,
@@ -10332,7 +10671,7 @@ red/`measured-and-passed` count is **0**.",
         None,
     );
     older_row.series.tree = older_hermit_tree;
-    apply_series_rows(&root, &mut preserve_newer, &[older_row])?;
+    apply_series_rows(&root, &mut preserve_newer, &[older_row], None)?;
     if preserve_newer.cells[0].last_tested.as_ref() != Some(&current_last_tested) {
         return Err("older series history replaced a newer imported last_tested record".into());
     }
@@ -10350,7 +10689,7 @@ red/`measured-and-passed` count is **0**.",
         right_info_messages: BTreeSet::from([12]),
     };
     let mut imported_observation = sample.clone();
-    imported_observation.detcore_tree = fixture_detcore_tree.clone();
+    imported_observation.detcore_tree = Some(fixture_detcore_tree.clone());
     imported_observation.provenance = ObservationProvenance::Validate;
     imported_observation
         .canonical_comparisons
@@ -10360,7 +10699,7 @@ red/`measured-and-passed` count is **0**.",
         projection: None,
         cells: vec![boundary_cell(vec![imported_observation], CellStatus::Green)],
     };
-    let current_validate_row = series_row(
+    let mut current_validate_row = series_row(
         "fixture/boundary/verify/ptrace",
         SeriesOutcome::Passed,
         SeriesProducer::Validate,
@@ -10368,12 +10707,55 @@ red/`measured-and-passed` count is **0**.",
         Some(fixture_detcore_tree.clone()),
         None,
     );
-    apply_series_rows(&root, &mut preserve_import, &[current_validate_row])?;
+    current_validate_row.run_id = canonical.run_id.clone();
+    current_validate_row.event_id = "fixture-stable-mapped-event".into();
+    let preserved = apply_series_rows(&root, &mut preserve_import, &[current_validate_row], None)?;
+    if preserved.represented_rows != 1 || preserved.replaced_observations != 0 {
+        return Err(format!(
+            "stable source event did not map one-to-one to preserved evidence: {preserved:?}"
+        ));
+    }
     if !preserve_import.cells[0].observations[0]
         .canonical_comparisons
         .contains(&canonical)
     {
         return Err("series projection erased an imported canonical comparison".into());
+    }
+    let mut collision_observation = sample.clone();
+    collision_observation.detcore_tree = Some(fixture_detcore_tree.clone());
+    collision_observation.provenance = ObservationProvenance::Validate;
+    collision_observation
+        .hermit_shas
+        .insert(fixture_hermit_tree.clone());
+    collision_observation.results.insert(ObservedResult::Pass);
+    let mut collision_comparison = canonical.clone();
+    collision_comparison.run_id = "fixture-attempt-collision".into();
+    collision_observation
+        .canonical_comparisons
+        .insert(collision_comparison);
+    let mut attempt_collision = TrackedCells {
+        schema: SCHEMA,
+        projection: None,
+        cells: vec![boundary_cell(
+            vec![collision_observation],
+            CellStatus::Green,
+        )],
+    };
+    let mut wrong_attempt = series_row(
+        "fixture/boundary/verify/ptrace",
+        SeriesOutcome::Passed,
+        SeriesProducer::Validate,
+        1,
+        Some(fixture_detcore_tree.clone()),
+        None,
+    );
+    wrong_attempt.run_id = "fixture-attempt-collision".into();
+    wrong_attempt.series.attempt = Some(2);
+    if !apply_series_rows(&root, &mut attempt_collision, &[wrong_attempt], None)
+        .expect_err("same-run different-attempt evidence was accepted")
+        .contains("records outer attempt 2")
+    {
+        return Err("same-run different-attempt refusal lost its exact reason".into());
     }
     refresh_measurement(&mut projected_from_series);
     if projected_from_series.cells[0].measurement != MeasurementState::Diverged {
@@ -10396,7 +10778,7 @@ red/`measured-and-passed` count is **0**.",
         Some(fixture_detcore_tree.clone()),
         None,
     );
-    let no_comparison_error = apply_series_rows(&root, &mut no_comparison, &[no_result])
+    let no_comparison_error = apply_series_rows(&root, &mut no_comparison, &[no_result], None)
         .expect_err("a no_result row was accepted as evidence");
     if !no_comparison_error.contains("fixture/boundary/verify/ptrace")
         || !no_comparison_error.contains("produced no comparison")
@@ -10468,11 +10850,10 @@ red/`measured-and-passed` count is **0**.",
         wrong_team,
         empty_host,
     ];
-    let exact = apply_series_rows(&root, &mut exact_mapping, &exact_rows)?;
-    if exact.rows != 1
-        || exact.skipped.len() != 6
+    let exact = apply_series_rows(&root, &mut exact_mapping, &exact_rows, None)?;
+    if exact.rows != 2
+        || exact.skipped.len() != 5
         || !exact.skipped[0].contains("no exact test/mode/backend match")
-        || !exact.skipped[1].contains("does not match")
         || exact
             .skipped
             .iter()
@@ -10491,13 +10872,224 @@ red/`measured-and-passed` count is **0**.",
             .skipped
             .iter()
             .any(|line| line.contains("host must be nonempty"))
-        || exact_mapping.cells[0].observations[0].provenance
-            != ObservationProvenance::HermitRepeat
+        || !exact_mapping.cells[0]
+            .observations
+            .iter()
+            .any(|observation| {
+                observation.detcore_tree.as_deref() == Some(fixture_detcore_tree.as_str())
+                    && observation.provenance == ObservationProvenance::HermitRepeat
+            })
+        || !exact_mapping.cells[0]
+            .observations
+            .iter()
+            .any(|observation| {
+                observation
+                    .detcore_tree
+                    .as_ref()
+                    .is_some_and(|tree| tree == &"f".repeat(40))
+                    && observation.provenance == ObservationProvenance::Validate
+            })
     {
         return Err(format!(
             "series projection did not preserve exact test/mode/backend identity: {exact:?}"
         ));
     }
+
+    // Projection must be a pure fold of the recorded rows. These are the six
+    // historical Hermit commits whose presence in one developer's object store
+    // used to admit 2,129 rows that an empty or base-only clone skipped. Replace
+    // refs make the exact names resolvable in the `full` fixture without having
+    // to retain those unrelated commit objects in this repository forever.
+    let ambient_commits = [
+        "0ecc03c0fd710c599392429d2b8a2d066365c578",
+        "35aae1f65126480d5ff1ec6e4cefbe8ab59bbddd",
+        "62a5c8fd48c2c640d4735d96a9c434d4b778993d",
+        "d452986e9871c875f1e5c3c2c66cd8ff593467df",
+        "dcdf94ac6bd7a6daa36c6f32d72852a4e7214882",
+        "e6e60d8b7c9b61791195b16454b5057a93caee71",
+    ];
+    let object_store_fixture = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let empty_store = object_store_fixture.path().join("empty");
+    let base_store = object_store_fixture.path().join("base");
+    let full_store = object_store_fixture.path().join("full");
+    fs::create_dir_all(&empty_store).map_err(|e| e.to_string())?;
+    for store in [&base_store, &full_store] {
+        fs::create_dir_all(store).map_err(|e| e.to_string())?;
+        git_ok(store, &["init", "--quiet"])?;
+    }
+    fs::create_dir_all(full_store.join("detcore")).map_err(|e| e.to_string())?;
+    fs::write(full_store.join("detcore/identity"), "fixture\n").map_err(|e| e.to_string())?;
+    git_ok(&full_store, &["add", "detcore/identity"])?;
+    git_ok(
+        &full_store,
+        &[
+            "-c",
+            "user.name=x",
+            "-c",
+            "user.email=x",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    )?;
+    let full_commit = git_rev_parse(&full_store, "HEAD^{commit}")?;
+    for commit in ambient_commits {
+        let replace_ref = format!("refs/replace/{commit}");
+        git_ok(&full_store, &["update-ref", &replace_ref, &full_commit])?;
+    }
+
+    let procfs_cell = "c-programs/procfs-positioned-probe/verify/ptrace";
+    let legacy_row = |key: usize, outcome: SeriesOutcome, detcore_tree: Option<String>| {
+            let commit = ambient_commits.get(key).unwrap_or(&ambient_commits[0]);
+            let mut row = series_row(
+                procfs_cell,
+                outcome,
+                SeriesProducer::Validate,
+                1,
+                detcore_tree,
+                None,
+            );
+            row.schema = SeriesSchema::V2;
+            row.event_id = format!("ambient-event-{key}");
+            row.run_id = format!("ambient-run-{key}");
+            row.emitted_at = format!("2026-08-27T05:00:{key:02}Z");
+            row.series.tree = (*commit).into();
+            row.series.result = None;
+            row.series.failure_class = None;
+            row
+        };
+    let mut ambient_rows = (0..ambient_commits.len())
+        .map(|index| legacy_row(index, SeriesOutcome::Passed, None))
+        .collect::<Vec<_>>();
+    ambient_rows.extend([
+        legacy_row(6, SeriesOutcome::Diverged, None),
+        legacy_row(
+            7,
+            SeriesOutcome::Passed,
+            Some(ambient_commits[0].into()),
+        ),
+    ]);
+
+    let source_commit = "a".repeat(40);
+    let source_tree = "b".repeat(40);
+    let source_identity = "fixture-series";
+    let mut prior_observation = sample.clone();
+    prior_observation.detcore_tree = Some("d".repeat(40));
+    prior_observation.hermit_shas = BTreeSet::from(["e".repeat(40)]);
+    prior_observation.results = BTreeSet::from([ObservedResult::Pass]);
+    let mut object_store_outputs = Vec::new();
+    let mut projected_fixture = None;
+    for store in [&empty_store, &base_store, &full_store] {
+        let mut target_cell = boundary_cell(vec![prior_observation.clone()], CellStatus::Red);
+        target_cell.id.test = "c-programs/procfs-positioned-probe".into();
+        let mut target = TrackedCells {
+            schema: SCHEMA,
+            projection: Some(ObservationProjection {
+                source: "fixture-series".into(),
+                source_commit: Some(source_commit.clone()),
+                source_tree: Some(source_tree.clone()),
+                refreshed_at: "fixture-stamp".into(),
+                rows_read: ambient_rows.len() as u64,
+                pre_series_corpus: false,
+            }),
+            cells: vec![target_cell],
+        };
+        let outcome = apply_series_rows(store, &mut target, &ambient_rows, Some(source_identity))?;
+        refresh_measurement(&mut target);
+        if outcome.rows != ambient_rows.len() || !outcome.skipped.is_empty() {
+            return Err("object-store-independent projection dropped recorded rows".into());
+        }
+        let encoded = encoded_cells(&target)?;
+        projected_fixture.get_or_insert_with(|| target.clone());
+        object_store_outputs.push(encoded);
+    }
+    if object_store_outputs
+        .windows(2)
+        .any(|pair| pair[0].as_bytes() != pair[1].as_bytes())
+    {
+        return Err("empty/base/full object stores changed projection bytes".into());
+    }
+    let projected_fixture = projected_fixture.expect("one object-store fixture was projected");
+    let cell = &projected_fixture.cells[0];
+    if !cell.observations.contains(&prior_observation)
+        || cell.measurement != MeasurementState::DivergedUnlocated
+        || !ambient_commits.iter().all(|commit| {
+            cell.observations.iter().any(|observation| {
+                observation.detcore_tree.is_none()
+                    && observation.hermit_shas == BTreeSet::from([(*commit).into()])
+            })
+        })
+    {
+        return Err("object-store-independent projection lost recorded evidence".into());
+    }
+    if !cell
+        .observations
+        .iter()
+        .any(|observation| observation.detcore_tree.as_deref() == Some(ambient_commits[0]))
+        || cell.observations.len() != ambient_commits.len() + 2
+    {
+        return Err("explicit Detcore identity aliased a recorded Hermit identity".into());
+    }
+    let mut repeated = projected_fixture.clone();
+    let repeated_outcome = apply_series_rows(
+        &empty_store,
+        &mut repeated,
+        &ambient_rows,
+        Some(source_identity),
+    )?;
+    refresh_measurement(&mut repeated);
+    if repeated_outcome.replaced_observations != ambient_commits.len() + 1
+        || encoded_cells(&repeated)? != object_store_outputs[0]
+    {
+        return Err("projecting the same source twice was not byte-idempotent".into());
+    }
+    let mut foreign_event = projected_fixture.clone();
+    foreign_event.cells[0]
+        .observations
+        .iter_mut()
+        .find(|observation| !observation.event_ids.is_empty())
+        .expect("projected observation exists")
+        .event_ids
+        .insert("foreign-series-event".into());
+    if !apply_series_rows(
+        &empty_store,
+        &mut foreign_event,
+        &ambient_rows,
+        Some(source_identity),
+    )
+    .expect_err("foreign projector-owned event_id was replaced")
+    .contains("absent from source")
+    {
+        return Err("foreign event_id refusal lost its exact reason".into());
+    }
+    let mut missing_event_ids = projected_fixture.clone();
+    missing_event_ids.cells[0]
+        .observations
+        .iter_mut()
+        .find(|observation| observation.detcore_tree.is_none())
+        .expect("legacy projected observation exists")
+        .event_ids
+        .clear();
+    if encoded_cells(&missing_event_ids).is_ok() {
+        return Err("legacy projected observation without event_ids was accepted".into());
+    }
+    let mut duplicate_event_ids: JsonValue = serde_json::from_str(&object_store_outputs[0])
+        .map_err(|e| format!("cannot decode projected fixture for duplicate-ID test: {e}"))?;
+    let event_ids = duplicate_event_ids["cells"][0]["observations"]
+        .as_array_mut()
+        .and_then(|observations| {
+            observations.iter_mut().find_map(|observation| {
+                let event_ids = observation.get_mut("event_ids")?.as_array_mut()?;
+                (!event_ids.is_empty()).then_some(event_ids)
+            })
+        })
+        .expect("projected JSON observation has event_ids");
+    let duplicate_event_id = event_ids[0].clone();
+    event_ids.push(duplicate_event_id);
+    if serde_json::from_value::<TrackedCells>(duplicate_event_ids).is_ok() {
+        return Err("duplicate projected observation event_id was accepted".into());
+    }
+
     // The real erasure mode: the observation SURVIVES and its coordinates are
     // blanked. A guard comparing observation counts cannot see this, which is
     // how the first version of it passed the unit case and then walked straight
@@ -10802,8 +11394,7 @@ red/`measured-and-passed` count is **0**.",
         || replacement_guarded_rows[0].event_id != source_row.event_id
     {
         return Err(
-            "series snapshot followed a Git replacement ref instead of the recorded commit"
-                .into(),
+            "series snapshot followed a Git replacement ref instead of the recorded commit".into(),
         );
     }
     let replacement_ref = format!("refs/replace/{expected_source_commit}");
@@ -10927,10 +11518,9 @@ red/`measured-and-passed` count is **0**.",
         r#"{"source":"s","refreshed_at":"t","rows_read":3,"pre_series_corpus":false}"#,
     )
     .map_err(|e| format!("historical projection without source_commit no longer loads: {e}"))?;
-    if historical_projection.source_commit.is_some()
-        || historical_projection.source_tree.is_some()
+    if historical_projection.source_commit.is_some() || historical_projection.source_tree.is_some()
     {
-        return Err("historical projection invented immutable source identity".into());
+        return Err("historical projection invented an immutable source identity".into());
     }
     let historical_commit = "a".repeat(40);
     let pre_tree_projection: ObservationProjection = serde_json::from_str(&format!(
@@ -10942,6 +11532,24 @@ red/`measured-and-passed` count is **0**.",
         || pre_tree_projection.source_tree.is_some()
     {
         return Err("projection predating source_tree changed its recorded identity".into());
+    }
+    let mut namespaced_identity = stamped.clone();
+    namespaced_identity.cells[0].observations[0].detcore_tree = None;
+    namespaced_identity.cells[0].observations[0].event_ids =
+        BTreeSet::from(["fixture-series-event".into()]);
+    namespaced_identity.cells[0].observations[0].hermit_shas = BTreeSet::from(["c".repeat(40)]);
+    encoded_cells(&namespaced_identity)
+        .map_err(|e| format!("schema-7 projection rejected its recorded identity: {e}"))?;
+    let mut unversioned_identity = namespaced_identity.clone();
+    unversioned_identity.schema = 6;
+    if encoded_cells(&unversioned_identity).is_ok() {
+        return Err("schema-6 writer accepted an observation without a Detcore tree".into());
+    }
+    let mut malformed_identity = namespaced_identity;
+    malformed_identity.cells[0].observations[0].hermit_shas =
+        BTreeSet::from(["not-an-object-id".into()]);
+    if encoded_cells(&malformed_identity).is_ok() {
+        return Err("projection schema accepted a malformed recorded Hermit identity".into());
     }
     if serde_json::from_str::<ObservationProjection>(
         r#"{"source":"s","source_commit":"not-a-commit","refreshed_at":"t","rows_read":3,"pre_series_corpus":false}"#,
@@ -11136,7 +11744,7 @@ red/`measured-and-passed` count is **0**.",
     }
 
     println!(
-        "compatibility scorecard self-test: retained-comparison FRESH/DRIFTED/WRONG/UNCHECKABLE, provenance, distinct-evidence, result, selected-chaos, status-measurement-display, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, recovered-no-result, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, empty-result command, source-identity, writer-boundary, projection, path-independence, infrastructure-refusal, and divergence-without-a-comparison brackets pass"
+        "compatibility scorecard self-test: retained-comparison FRESH/DRIFTED/WRONG/UNCHECKABLE, provenance, distinct-evidence, result, selected-chaos, status-measurement-display, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, recovered-no-result, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, empty-result command, source-identity, writer-boundary, projection, projection-schema, object-store-independence, path-independence, infrastructure-refusal, and divergence-without-a-comparison brackets pass"
     );
     Ok(())
 }
