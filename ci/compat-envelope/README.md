@@ -256,8 +256,14 @@ diverging comparisons create observations and update `last_tested`; compressed
 `num_runs` rows contribute their full sample count to any recorded divergence
 position. `no_result`, `timeout`, `errored`, and `skipped` rows are named but do
 not become evidence. Historical rows that predate the `detcore_tree` field use
-the recorded Hermit tree's `detcore` entry when that commit is available; a row
-whose tree cannot be resolved is named and skipped rather than guessed.
+their exact recorded Hermit commit as a distinct internal grouping key and
+never consult the projection checkout's refs or object store. Scorecard schema
+7 represents that legacy case as an observation with no `detcore_tree` and
+exactly one recorded `hermit_shas` entry. It cannot alias an explicit
+Detcore-tree observation, and it does not update `last_tested`, whose staleness
+check requires a real Detcore tree. Older scorecards remain readable. A row is
+skipped for identity only when it records neither a valid explicit Detcore tree
+nor a valid Hermit commit.
 
 This projection does not import retained validate result directories. That is
 a separate input path even though both ultimately update the same observation
