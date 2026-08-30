@@ -15626,7 +15626,12 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // the invocation lock: it never runs a gate, and a leaked fixture must never
     // wedge a real run.
     if validate_runtime::stop_test_requested() {
-        return stop_test_seam(&root, &profile_name, parent.as_deref());
+        return stop_test_seam(
+            &root,
+            &profile_name,
+            parent.as_deref(),
+            args.allow_local_off_the_record_run,
+        );
     }
 
     if args.allow_local_off_the_record_run {
@@ -17288,7 +17293,12 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
 /// that unrepresentable — orphan detection (`getppid() == 1`) and a lifetime
 /// deadline — and the Python harness additionally tears its own child's process
 /// group down in a `finally`.
-fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSummary {
+fn stop_test_seam(
+    root: &Path,
+    profile: &str,
+    parent: Option<&Path>,
+    off_the_record: bool,
+) -> RunSummary {
     let started_at = utc_now();
     let started = std::time::Instant::now();
     let prior_failure = env_flag("VALIDATE_STOP_TEST_PRIOR_FAILURE", "1");
@@ -17389,23 +17399,25 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     // The fixture plans exactly the synthetic gates it ran, withholds nothing,
     // and leaves nothing unaccounted.
     let planned_tags: BTreeSet<String> = outcomes.iter().map(|o| o.tag.clone()).collect();
-    write_ledger(
-        &ledger,
-        &ctx,
-        &outcomes,
-        &[],
-        &[],
-        &[],
-        &planned_tags,
-        wall,
-        exit_code,
-        "",
-        false,
-        serde_json::json!({}),
-        None,
-    );
+    if !off_the_record {
+        write_ledger(
+            &ledger,
+            &ctx,
+            &outcomes,
+            &[],
+            &[],
+            &[],
+            &planned_tags,
+            wall,
+            exit_code,
+            "",
+            false,
+            serde_json::json!({}),
+            None,
+        );
+    }
 
-    let detail = match exit {
+    let mut detail = match exit {
         validate_runtime::StopTestExit::Signalled => vec![format!(
             "stop-path fixture: stopped by SIG{}; recorded as {}",
             interruption.clone().unwrap_or_default(),
@@ -17427,6 +17439,12 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
                 .into(),
         ],
     };
+    if off_the_record {
+        detail.push(
+            "stop-path fixture ran OFF THE RECORD: no ledger row, receipt, scorecard, or label was published"
+                .into(),
+        );
+    }
     let mut s = RunSummary::new(
         if interruption.is_some() { Verdict::Interrupted } else { Verdict::Fail },
         exit_code,
@@ -17437,7 +17455,9 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     s.nodes_failed = outcomes.iter().filter(|o| !o.ok).count();
     s.wall_s = Some(wall);
     s.cpu_wall = Some((wall, cpu_user, cpu_sys));
-    s.ledger = Some(ledger);
+    if !off_the_record {
+        s.ledger = Some(ledger);
+    }
     s
 }
 
