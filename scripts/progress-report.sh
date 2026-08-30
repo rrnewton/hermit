@@ -56,9 +56,18 @@ test_result_counts() { # <result-file> <command-status>
   if ! load_test_results "$result_file"; then
     printf 'unknown (typed test result unavailable; command exit %s)' "$command_status"
     return
+  elif ((command_status != 0 && TEST_RESULTS_FAILED > 0)); then
+    printf 'ABORTED at exit %s after %s passed; first failure: %s' \
+      "$command_status" "$TEST_RESULTS_PASSED" "$TEST_RESULTS_FIRST_FAILURE"
+  elif ((command_status != 0)); then
+    printf 'ABORTED at exit %s after %s passed; no typed individual-test failure was recorded' \
+      "$command_status" "$TEST_RESULTS_PASSED"
+  elif ((TEST_RESULTS_FAILED > 0)); then
+    printf 'UNKNOWN (exit 0 disagrees with %s typed failure(s))' "$TEST_RESULTS_FAILED"
+  else
+    printf '%s passed, %s failed, %s filtered' \
+      "$TEST_RESULTS_PASSED" "$TEST_RESULTS_FAILED" "$TEST_RESULTS_FILTERED"
   fi
-  printf '%s passed, %s failed, %s filtered' \
-    "$TEST_RESULTS_PASSED" "$TEST_RESULTS_FAILED" "$TEST_RESULTS_FILTERED"
 }
 
 strict_result() { # <result-file> <command-status>
@@ -92,7 +101,11 @@ self_test() {
     "$ROOT_DIR/ci/write-structured-test-counts.sh" 2 7 \
       'suite$passes' pass 1 'suite$fails' fail 1 || return 1
   first=$(test_result_counts "$scratch/results.json" 1)
-  [[ $first == '1 passed, 1 failed, 7 filtered' ]] || return 1
+  # shellcheck disable=SC2016 # `$` is part of the expected failure identity.
+  [[ $first == 'ABORTED at exit 1 after 1 passed; first failure: suite$fails' ]] \
+    || return 1
+  [[ $(test_result_counts "$scratch/results.json" 0) == \
+    'UNKNOWN (exit 0 disagrees with 1 typed failure(s))' ]] || return 1
   # shellcheck disable=SC2016 # `$` is part of the expected failure identity.
   [[ $(strict_result "$scratch/results.json" 1) == \
     'ABORTED at exit 1 after 1 passed; first failure: suite$fails' ]] || return 1
@@ -107,6 +120,15 @@ self_test() {
     'passed (3 enabled, 4 filtered)' ]] || return 1
   [[ $(strict_result "$scratch/results.json" 7) == \
     'ABORTED at exit 7 after 3 passed; no typed individual-test failure was recorded' ]] \
+    || return 1
+  [[ $(test_result_counts "$scratch/results.json" 7) == \
+    'ABORTED at exit 7 after 3 passed; no typed individual-test failure was recorded' ]] \
+    || return 1
+
+  DAGRUN_TEST_COUNTS_PATH="$scratch/results.json" \
+    "$ROOT_DIR/ci/write-structured-test-counts.sh" 0 0 || return 1
+  [[ $(test_result_counts "$scratch/results.json" 100) == \
+    'ABORTED at exit 100 after 0 passed; no typed individual-test failure was recorded' ]] \
     || return 1
   [[ $(sha256sum "$scratch/fixed-human.log") == "$fixed_log_hash" ]] || return 1
 
