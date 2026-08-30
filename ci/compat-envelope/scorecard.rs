@@ -151,8 +151,8 @@ struct TrackedCells {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ObservationProjection {
-    /// Where the authoritative rows live. Recorded so a stale projection can be
-    /// re-derived without anyone having to remember.
+    /// Repository-relative path to the authoritative rows. Recorded so a stale
+    /// projection can be re-derived without anyone having to remember.
     source: String,
     /// A commit in the Git repository containing `source` whose JSONL shard
     /// population and bytes produced this projection.
@@ -166,6 +166,18 @@ struct ObservationProjection {
         deserialize_with = "deserialize_optional_object_id"
     )]
     source_commit: Option<String>,
+    /// The Git tree object for the selected source directory at
+    /// `source_commit`. Unlike `source`, this identity is independent of the
+    /// producer's checkout and current working directory.
+    ///
+    /// Historical projection blocks predate this field and remain readable,
+    /// but a consumer cannot verify which subtree they projected.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_source_tree"
+    )]
+    source_tree: Option<String>,
     /// When this projection was last refreshed from that source.
     refreshed_at: String,
     /// How many series rows the refresh actually read.
@@ -4519,8 +4531,9 @@ fn project_observations(
 
     let rows_read = rows.len() as u64;
     tracked.projection = Some(ObservationProjection {
-        source: series_root.display().to_string(),
+        source: snapshot.source.clone(),
         source_commit: Some(snapshot.source_commit.clone()),
+        source_tree: Some(snapshot.source_tree.clone()),
         refreshed_at: refreshed_at.to_string(),
         rows_read,
         pre_series_corpus: projection.pre_series_corpus,
@@ -4535,12 +4548,13 @@ fn project_observations(
 
     println!(
         "compatibility scorecard: projected {} cell(s) from {} comparison row(s) \
-         representing {} run(s); read {rows_read} canonical series row(s) under {} at {}",
+         representing {} run(s); read {rows_read} canonical series row(s) under {} at {} tree {}",
         projection.cells,
         projection.rows,
         projection.runs,
-        series_root.display(),
-        snapshot.source_commit
+        snapshot.source,
+        snapshot.source_commit,
+        snapshot.source_tree
     );
     if rows_read == 0 {
         println!(
@@ -4682,6 +4696,21 @@ where
         if !is_object_id(value) {
             return Err(serde::de::Error::custom(format!(
                 "source_commit must be a lowercase 40-hex object id, got {value:?}"
+            )));
+        }
+    }
+    Ok(value)
+}
+
+fn deserialize_optional_source_tree<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if let Some(value) = &value {
+        if !is_object_id(value) {
+            return Err(serde::de::Error::custom(format!(
+                "source_tree must be a lowercase 40-hex object id, got {value:?}"
             )));
         }
     }
@@ -4964,7 +4993,9 @@ fn apply_series_rows(
 
 #[derive(Debug)]
 struct SeriesSourceSnapshot {
+    source: String,
     source_commit: String,
+    source_tree: String,
     shards: Vec<SeriesSourceShard>,
 }
 
@@ -5032,10 +5063,34 @@ fn snapshot_series_source(series_root: &Path) -> Result<SeriesSourceSnapshot, St
             repository.display()
         )
     })?;
+    let source = if relative_root.as_os_str().is_empty() {
+        ".".to_string()
+    } else {
+        relative_root
+            .to_str()
+            .ok_or_else(|| {
+                format!(
+                    "series root {} is not representable as a UTF-8 repository-relative path",
+                    canonical.display()
+                )
+            })?
+            .to_string()
+    };
     let source_commit = git_no_replace_rev_parse(&repository, "HEAD^{commit}")?;
     if !is_object_id(&source_commit) {
         return Err(format!(
             "series source commit must be a lowercase 40-hex object id, got {source_commit:?}"
+        ));
+    }
+    let source_revision = if source == "." {
+        format!("{source_commit}^{{tree}}")
+    } else {
+        format!("{source_commit}:{source}")
+    };
+    let source_tree = git_no_replace_rev_parse(&repository, &source_revision)?;
+    if !is_object_id(&source_tree) {
+        return Err(format!(
+            "series source tree must be a lowercase 40-hex object id, got {source_tree:?}"
         ));
     }
 
@@ -5148,7 +5203,9 @@ fn snapshot_series_source(series_root: &Path) -> Result<SeriesSourceSnapshot, St
         });
     }
     Ok(SeriesSourceSnapshot {
+        source,
         source_commit,
+        source_tree,
         shards,
     })
 }
@@ -10337,6 +10394,7 @@ red/`measured-and-passed` count is **0**.",
         projection: Some(ObservationProjection {
             source: "fixture-series".into(),
             source_commit: Some("a".repeat(40)),
+            source_tree: Some("b".repeat(40)),
             refreshed_at: "fixture-stamp".into(),
             rows_read: 7,
             pre_series_corpus: false,
@@ -10436,12 +10494,111 @@ red/`measured-and-passed` count is **0**.",
 
     let source_snapshot = snapshot_series_source(&source_repo.join("series"))?;
     let expected_source_commit = git_rev_parse(source_repo, "HEAD^{commit}")?;
+    let expected_source_tree =
+        git_rev_parse(source_repo, &format!("{expected_source_commit}:series"))?;
     if source_snapshot.source_commit != expected_source_commit {
         return Err(format!(
             "series snapshot recorded {} instead of resolved commit {expected_source_commit}",
             source_snapshot.source_commit
         ));
     }
+    if source_snapshot.source != "series" || source_snapshot.source_tree != expected_source_tree {
+        return Err(format!(
+            "series snapshot recorded source {:?} at tree {} instead of repository-relative series at {expected_source_tree}",
+            source_snapshot.source, source_snapshot.source_tree
+        ));
+    }
+
+    let missing_tree = source_repo.join("empty-untracked-series");
+    fs::create_dir(&missing_tree)
+        .map_err(|e| format!("cannot create missing-tree fixture: {e}"))?;
+    let missing_tree_error = snapshot_series_source(&missing_tree)
+        .expect_err("an uncommitted empty source directory acquired a Git tree identity");
+    if !missing_tree_error.contains("rev-parse") {
+        return Err(format!(
+            "missing-tree refusal did not name the failed Git lookup: {missing_tree_error}"
+        ));
+    }
+
+    // Equivalent caller spellings and symlinks must all reduce to the same
+    // repository-relative path and immutable tree object.
+    let direct_hermit = source_repo.join("hermit");
+    let standalone_hermit = source_repo.join("worktrees/standalone");
+    fs::create_dir_all(&direct_hermit)
+        .map_err(|e| format!("cannot create direct Hermit path fixture: {e}"))?;
+    fs::create_dir_all(&standalone_hermit)
+        .map_err(|e| format!("cannot create standalone Hermit path fixture: {e}"))?;
+    let series_link = source_repo.join("series-link");
+    std::os::unix::fs::symlink(source_repo.join("series"), &series_link)
+        .map_err(|e| format!("cannot create series symlink fixture: {e}"))?;
+    for spelling in [
+        direct_hermit.join("../series"),
+        standalone_hermit.join("../../series"),
+        series_link,
+    ] {
+        let equivalent = snapshot_series_source(&spelling)?;
+        if equivalent.source != "series"
+            || equivalent.source_commit != expected_source_commit
+            || equivalent.source_tree != expected_source_tree
+        {
+            return Err(format!(
+                "equivalent series source {} recorded {:?} at commit {} tree {}",
+                spelling.display(),
+                equivalent.source,
+                equivalent.source_commit,
+                equivalent.source_tree
+            ));
+        }
+    }
+
+    let alternate_dir = source_repo.join("alternate-series/hermit/fixture");
+    fs::create_dir_all(&alternate_dir)
+        .map_err(|e| format!("cannot create alternate series fixture: {e}"))?;
+    let mut alternate_row = source_row.clone();
+    alternate_row.event_id = "fixture-alternate-event".into();
+    fs::write(
+        alternate_dir.join("2026-08.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::to_string(&alternate_row)
+                .map_err(|e| format!("cannot encode alternate series row: {e}"))?
+        ),
+    )
+    .map_err(|e| format!("cannot write alternate series shard: {e}"))?;
+    git_ok(source_repo, &["add", "alternate-series"])?;
+    git_ok(
+        source_repo,
+        &[
+            "-c",
+            "user.name=scorecard fixture",
+            "-c",
+            "user.email=scorecard@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "alternate series",
+        ],
+    )?;
+    let alternate_snapshot = snapshot_series_source(&source_repo.join("alternate-series"))?;
+    if alternate_snapshot.source != "alternate-series"
+        || alternate_snapshot.source_tree == expected_source_tree
+    {
+        return Err(format!(
+            "alternate tracked source was not distinguished: source={:?} tree={}",
+            alternate_snapshot.source, alternate_snapshot.source_tree
+        ));
+    }
+
+    git_ok(
+        source_repo,
+        &[
+            "--no-replace-objects",
+            "reset",
+            "--hard",
+            "--quiet",
+            &expected_source_commit,
+        ],
+    )?;
 
     let mut replacement_row = source_row.clone();
     replacement_row.event_id = "fixture-replacement-event".into();
@@ -10470,6 +10627,7 @@ red/`measured-and-passed` count is **0**.",
     let replacement_guarded = snapshot_series_source(&source_repo.join("series"))?;
     let replacement_guarded_rows = read_series_rows(&replacement_guarded)?;
     if replacement_guarded.source_commit != expected_source_commit
+        || replacement_guarded.source_tree != expected_source_tree
         || replacement_guarded_rows.len() != 1
         || replacement_guarded_rows[0].event_id != source_row.event_id
     {
@@ -10599,8 +10757,21 @@ red/`measured-and-passed` count is **0**.",
         r#"{"source":"s","refreshed_at":"t","rows_read":3,"pre_series_corpus":false}"#,
     )
     .map_err(|e| format!("historical projection without source_commit no longer loads: {e}"))?;
-    if historical_projection.source_commit.is_some() {
-        return Err("historical projection invented a source_commit".into());
+    if historical_projection.source_commit.is_some()
+        || historical_projection.source_tree.is_some()
+    {
+        return Err("historical projection invented immutable source identity".into());
+    }
+    let historical_commit = "a".repeat(40);
+    let pre_tree_projection: ObservationProjection = serde_json::from_str(&format!(
+        r#"{{"source":"../../series","source_commit":"{}","refreshed_at":"t","rows_read":3,"pre_series_corpus":false}}"#,
+        historical_commit
+    ))
+    .map_err(|e| format!("projection predating source_tree no longer loads: {e}"))?;
+    if pre_tree_projection.source_commit.as_deref() != Some(historical_commit.as_str())
+        || pre_tree_projection.source_tree.is_some()
+    {
+        return Err("projection predating source_tree changed its recorded identity".into());
     }
     if serde_json::from_str::<ObservationProjection>(
         r#"{"source":"s","source_commit":"not-a-commit","refreshed_at":"t","rows_read":3,"pre_series_corpus":false}"#,
@@ -10608,6 +10779,16 @@ red/`measured-and-passed` count is **0**.",
     .is_ok()
     {
         return Err("ObservationProjection accepted a malformed source_commit".into());
+    }
+    if serde_json::from_str::<ObservationProjection>(
+        &format!(
+            r#"{{"source":"series","source_commit":"{}","source_tree":"not-a-tree","refreshed_at":"t","rows_read":3,"pre_series_corpus":false}}"#,
+            "a".repeat(40)
+        ),
+    )
+    .is_ok()
+    {
+        return Err("ObservationProjection accepted a malformed source_tree".into());
     }
     // ⚠️ THE SAME LOAD-BEARING REFUSAL AS THE OBSERVED-POSITIONS SCHEMA. Without
     // `deny_unknown_fields` a projection block carrying a misspelled or future
