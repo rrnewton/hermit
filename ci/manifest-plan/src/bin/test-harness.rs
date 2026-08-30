@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -37,6 +38,8 @@ use hermit_manifest_plan::stress_series::HostCapability;
 use hermit_manifest_plan::stress_series::HostCapabilityVerdict;
 use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
+
+const EXPECTED_PLAN_SCHEMA: u64 = 1;
 
 fn fail(message: impl std::fmt::Display) -> ! {
     eprintln!("test-harness: {message}");
@@ -308,7 +311,11 @@ fn validate_args(command: &str, args: &Args) {
 fn main() -> ExitCode {
     let mut values = std::env::args().skip(1);
     let command = values.next().unwrap_or_else(|| fail("missing command"));
-    let args = parse(values);
+    let values = values.collect::<Vec<_>>();
+    if command == "expected-plan" && !values.is_empty() {
+        fail("expected-plan accepts no options");
+    }
+    let args = parse(values.into_iter());
     validate_args(&command, &args);
     let root = root();
     let manifests = ManifestSet::load(&root).unwrap_or_else(|error| fail(error));
@@ -319,6 +326,7 @@ fn main() -> ExitCode {
     match command.as_str() {
         "validate" => validate(&root, &manifests),
         "plan" => print_plan(&manifests, &args, Population::Required),
+        "expected-plan" => print_expected_plan(&root, &manifests),
         "audit-gaps" => print_plan(&manifests, &args, Population::Disabled),
         "audit-inventory" | "audit-test-binary-registration" => ExitCode::SUCCESS,
         "audit-test-footprints" => {
@@ -551,14 +559,14 @@ fn unique_plan_rows(label: &str, rows: Vec<JsonValue>) -> Result<BTreeSet<String
     Ok(normalized)
 }
 
-fn audit_expected_plan(root: &Path, manifests: &ManifestSet) -> usize {
+fn required_plan_rows(manifests: &ManifestSet) -> (usize, Vec<JsonValue>) {
     let cells = manifests
         .select(&Selection {
             population: Some(Population::Required),
             ..Selection::default()
         })
         .unwrap_or_else(|e| fail(e));
-    let actual = cells
+    let mut actual = cells
         .iter()
         .map(|cell| {
             let capabilities = cell
@@ -580,8 +588,70 @@ fn audit_expected_plan(root: &Path, manifests: &ManifestSet) -> usize {
             row
         })
         .collect::<Vec<_>>();
+    actual.sort_by_key(|row| {
+        PlanCellIdentity::from_json(row).expect("required plan rows have complete identities")
+    });
+    (cells.len(), actual)
+}
+
+fn expected_plan_document(root: &Path, manifests: &ManifestSet) -> JsonValue {
+    let (_, cells) = required_plan_rows(manifests);
+    let mut remaining = cells
+        .into_iter()
+        .map(|row| {
+            let identity = PlanCellIdentity::from_json(&row)
+                .expect("required plan rows have complete identities");
+            (identity, row)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut cells = Vec::with_capacity(remaining.len());
+    let path = root.join("ci/expected-e2e-plan.json");
+    if let Ok(source) = fs::read(&path) {
+        let current: JsonValue = serde_json::from_slice(&source)
+            .unwrap_or_else(|error| fail(format!("cannot parse {}: {error}", path.display())));
+        let current = current["cells"]
+            .as_array()
+            .unwrap_or_else(|| fail(format!("{} has no cells array", path.display())));
+        let mut seen = BTreeSet::new();
+        for row in current {
+            let identity = PlanCellIdentity::from_json(row)
+                .unwrap_or_else(|error| fail(format!("{}: {error}", path.display())));
+            if !seen.insert(identity.clone()) {
+                fail(format!(
+                    "{} contains duplicate identity {}",
+                    path.display(),
+                    identity.display()
+                ));
+            }
+            if let Some(row) = remaining.remove(&identity) {
+                cells.push(row);
+            }
+        }
+    }
+    cells.extend(remaining.into_values());
+    serde_json::json!({
+        "schema": EXPECTED_PLAN_SCHEMA,
+        "cells": cells,
+    })
+}
+
+fn print_expected_plan(root: &Path, manifests: &ManifestSet) -> ExitCode {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&expected_plan_document(root, manifests)).unwrap()
+    );
+    ExitCode::SUCCESS
+}
+
+fn audit_expected_plan(root: &Path, manifests: &ManifestSet) -> usize {
+    let (cell_count, actual) = required_plan_rows(manifests);
     let expected: serde_json::Value =
         serde_json::from_slice(&fs::read(root.join("ci/expected-e2e-plan.json")).unwrap()).unwrap();
+    if expected.get("schema").and_then(JsonValue::as_u64) != Some(EXPECTED_PLAN_SCHEMA) {
+        fail(format!(
+            "ci/expected-e2e-plan.json schema must be {EXPECTED_PLAN_SCHEMA}; regenerate it with `target/debug/test-harness expected-plan`"
+        ));
+    }
     let expected = expected["cells"]
         .as_array()
         .cloned()
@@ -593,7 +663,7 @@ fn audit_expected_plan(root: &Path, manifests: &ManifestSet) -> usize {
     if actual != expected {
         fail("required E2E plan changed; update ci/expected-e2e-plan.json in the same review");
     }
-    cells.len()
+    cell_count
 }
 
 fn run_audit(root: &Path, program: &Path, args: &[&str]) {
@@ -1573,18 +1643,22 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::fs;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
+    use hermit_manifest_plan::runner::ManifestSet;
     use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 
+    use super::EXPECTED_PLAN_SCHEMA;
     use super::HostCapability;
     use super::HostCapabilityVerdict;
     use super::accumulate_cell_cpu_usage;
     use super::audit_privileged_unboxed_guard;
     use super::command_jobs;
+    use super::expected_plan_document;
     use super::for_each_parallel;
     use super::host_inapplicable_reason;
     use super::parse;
@@ -1592,6 +1666,18 @@ mod tests {
     use super::scheduled_worker_capacity;
     use super::structured_test_results_from_rows;
     use super::unique_plan_rows;
+
+    #[test]
+    fn generated_expected_plan_is_versioned_and_matches_the_tracked_file() {
+        let root = super::root();
+        let manifests = ManifestSet::load(&root).unwrap();
+        let generated = expected_plan_document(&root, &manifests);
+        assert_eq!(generated["schema"], EXPECTED_PLAN_SCHEMA);
+        let tracked: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("ci/expected-e2e-plan.json")).unwrap())
+                .unwrap();
+        assert_eq!(tracked, generated);
+    }
 
     fn duplicate_plan_fixture(mode: &str) -> Vec<serde_json::Value> {
         let mut rows = (0..307)

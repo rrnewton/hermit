@@ -2719,5 +2719,6 @@
       "mode": "verify",
       "test": "c-programs/unix-autobind-seqpacket"
     }
-  ]
+  ],
+  "schema": 1
 }
