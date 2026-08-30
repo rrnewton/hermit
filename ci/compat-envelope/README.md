@@ -181,15 +181,19 @@ Because `--series-root` is resolved from the current directory, a checkout under
   --series-root ../series --refreshed-at STAMP                         # series
 ```
 
-`project-observations` records the exact commit whose series rows it
-projected. It snapshots the committed JSONL shard population and bytes, then
-refuses a worktree with changed, missing, or untracked shards. Git replacement
-refs are ignored so the recorded object ID and read tree cannot disagree.
+`project-observations` records the selected source as a canonical
+repository-relative path together with the exact commit and Git tree object
+whose series rows it projected. Thus `../series`, `../../series`, and a symlink
+to that directory all record the same checkout-independent `series` identity.
+It snapshots the committed JSONL shard population and bytes, then refuses a
+worktree with changed, missing, or untracked shards. Git replacement refs are
+ignored so the recorded object IDs and read tree cannot disagree.
 Malformed rows or shards without their final newline, read-invalid rows, and
 conflicting bodies under one `event_id` are also refusals. Semantically
 identical repeats of an event collapse to one canonical row, which is what
-`rows_read` counts. Projection blocks written before `source_commit` existed
-remain readable.
+`rows_read` counts. Projection blocks written before `source_commit` or
+`source_tree` existed remain readable, but consumers cannot qualify them until
+they are regenerated with the immutable source identity.
 
 `observe-results` walks every `results.jsonl` under `DIR`, so several runs fold
 in one invocation — which is how a validate-side range widens beyond a point.
