@@ -1,6 +1,6 @@
 {
   "_comment": [
-    "Job-assignment map for the parallel portable fan-out (ci-portable-parallel.yml).",
+    "Job-assignment map for the parallel portable fan-out (ci-portable.yml).",
     "Every step in validate's constructed portable-only plan is assigned to exactly one",
     "hosted job here. ci/check-shard-coverage.sh asks validate for that plan and fails",
     "closed if this map drifts, so lane merging, deduplication, or edge changes cannot",
@@ -16,23 +16,24 @@
   "preflight_nodes": [
     "pre.submodules",
     "pre.reverie_pin",
+    "setup.manifest_plan",
+    "gate.manifest"
+  ],
+  "check_nodes": [
     "check.skill_discovery",
     "check.exit_status_class",
     "check.shard_coverage",
     "check.backend_abstraction",
     "check.backend_parity_mutation",
-    "check.backend_parity_suites",
     "check.portability_paths",
     "check.dagrun_naming",
     "check.run_node_args",
     "check.check_outcome_consumers",
     "check.lint_checks",
     "check.script_sigpipe",
-    "lint.rustfmt",
-    "gate.manifest"
+    "lint.rustfmt"
   ],
   "build_debug_nodes": [
-    "setup.manifest_plan",
     "e2e.audit_compile_backend_parity_c",
     "setup.nextest",
     "build.workspace",
@@ -42,6 +43,7 @@
     "build.runtime_release"
   ],
   "build_aux_nodes": [
+    "build.e2e_artifact",
     "build.liteinst_runtime_release"
   ],
   "e2e_nodes": [
@@ -62,6 +64,9 @@
   "final_nodes": [
     "scorecard.compatibility"
   ],
+  "strict_compat_nodes": [
+    "test.strict_compat"
+  ],
   "debug_shards": [
     {
       "slug": "unit",
@@ -81,7 +86,7 @@
     {
       "slug": "integration",
       "nodes": [
-        "build.e2e_artifact",
+        "check.backend_parity_suites",
         "test.hermit_integration",
         "test.cli",
         "test.arbitrary_binaries",
@@ -115,12 +120,6 @@
       "nodes": [
         "doc.doctests",
         "doc.rustdoc"
-      ]
-    },
-    {
-      "slug": "strict-compat",
-      "nodes": [
-        "test.strict_compat"
       ]
     }
   ],

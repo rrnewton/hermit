@@ -52,8 +52,14 @@ The path is deliberately direct:
    argv, explicit environment, working directory, and pasteable shell command.
    The framework also writes the existing pressure `result` value and an
    explicit `failure_class`; `error_kind` remains the narrower mechanism. A
-   retry adds another row with its own values, so a change such as
-   `determinism-failure` then `crash-error` is retained rather than overwritten.
+   retry adds another row rather than replacing the earlier observation, so a
+   change such as `determinism-failure` then `crash-error` is retained.
+   `attempts[].cpu_usage_usec` records `wait4` user-plus-system CPU for that
+   launched child and descendants it reaped. The row-level `cpu_usage_usec`
+   adds preparation and every launched attempt with checked arithmetic; it is
+   null when execution did not occur or any required measurement is incomplete.
+   The bucket `summary.json` field `cell_cpu_usage_usec` likewise sums every
+   emitted applicable row, including failed rows followed by retries.
 4. The final `scorecard.compatibility` node requires a clean, exact-HEAD PASS
    row for every selected cell and prints the table.
 5. The checked-in table and cell identities must still equal what the manifest

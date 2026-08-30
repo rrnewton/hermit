@@ -109,6 +109,8 @@ use dagrun::model::DagManifest;
 use dagrun::model::RunResult;
 use dagrun::model::Step;
 use dagrun::model::StepOutcome;
+use dagrun::TestResult;
+use dagrun::TestResults;
 use dagrun::container_core_budget;
 use dagrun::perflog::append_step_profiles;
 use dagrun::scheduler::run_dag_boxed_deadline;
@@ -124,6 +126,7 @@ use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::E2E_KERNEL_VERSION_ENV;
 use hermit_manifest_plan::runner::E2E_MACHINE_SHORTNAME_ENV;
 use hermit_manifest_plan::service_result::FinalValidateStatus;
+use hermit_manifest_plan::service_result::ScorecardWriteback;
 use hermit_manifest_plan::service_result::ValidationServiceResult;
 
 use validate_plan::CompatMode;
@@ -185,17 +188,13 @@ fn validation_step_identity(step: &Step) -> ValidationStepIdentity {
     }
 }
 
-fn set_manifest_attempt(step: &mut Step, attempt: usize) {
-    if validation_step_identity(step) == ValidationStepIdentity::ManifestRun {
-        step.env.insert(
-            validate_plan::E2E_ATTEMPT_ENV.into(),
-            attempt.to_string(),
-        );
-    }
+fn is_manifest_run_step(step: &Step) -> bool {
+    validation_step_identity(step) == ValidationStepIdentity::ManifestRun
 }
 
 const LEDGER_ENV: &str = "HERMIT_VALIDATE_LEDGER";
 const PARENT_ENV: &str = "DEV_HERMIT_PARENT";
+const TOOL_ROOT_ENV: &str = "DEV_HERMIT_TOOL_ROOT";
 const OWN_SCOPE_DEADLINE_ENV: &str = "HERMIT_VALIDATE_SCOPE_DEADLINE_MONOTONIC_NS";
 const NESTED_SCOPE_SELF_TEST_ENV: &str = "HERMIT_VALIDATE_NESTED_SCOPE_SELF_TEST";
 const SUMMARY_EPILOGUE_SELF_TEST_ENV: &str = "HERMIT_VALIDATE_SUMMARY_EPILOGUE_SELF_TEST";
@@ -436,8 +435,10 @@ fn usage() -> &'static str {
      \x20 FINAL_VALIDATE_STATUS: PASSED          exit 0\n\
      \x20 FINAL_VALIDATE_STATUS: FAILED          exit 1\n\
      \x20 FINAL_VALIDATE_STATUS: COULD_NOT_RUN   exit 75\n\
-     The line is validate's last output. Readers take the last occurrence and\n\
-     require the exit code to agree; no line means validate died before reporting.\n\
+     The line is validate's last output and reports the validation verdict. A\n\
+     post-verdict scorecard write-back failure preserves that line and exits 75;\n\
+     current readers distinguish the two through ValidationServiceResult. No line\n\
+     means validate died before reporting.\n\
      Help, --show-plan, and --probe-host-capability do not attempt validation and\n\
      therefore do not emit a final validate status.\n\
      \n\
@@ -445,7 +446,8 @@ fn usage() -> &'static str {
      VALIDATE_SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS,\n\
      VALIDATE_IGNORE_CACHE, VALIDATE_VERBOSITY, VALIDATE_VERBOSE, VALIDATE_FORCE_FULL,\n\
      HERMIT_VALIDATE_LEDGER, PR_NUMBER, SUPER_REPETITIONS, L4_REPS, ENVELOPE_JSON,\n\
-     HERMIT_LAST_GREEN_SHA, CI_HUB_APPLY_LOCAL_LABEL, DEV_HERMIT_PARENT.\n\
+     HERMIT_LAST_GREEN_SHA, CI_HUB_APPLY_LOCAL_LABEL, DEV_HERMIT_PARENT,\n\
+     DEV_HERMIT_TOOL_ROOT.\n\
      \n\
      HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT=<name>[,<name>] asserts that this\n\
      machine HAS a declared host capability, so its nodes run without probing.\n\
@@ -1151,6 +1153,10 @@ fn self_test() -> Result<(), String> {
             filtered_tests: None,
             test_results: None,
             returncode: Some(if ok { 0 } else { 1 }),
+            oomed: false,
+            oom_kills: 0,
+            timed_out: false,
+            cpu_timed_out: false,
             reason: String::new(),
             aborted: false,
         };
@@ -1392,7 +1398,7 @@ fn self_test() -> Result<(), String> {
     let lines = run_summary_lines(&writeback_failed, std::time::Instant::now());
     if (writeback_failed.verdict, writeback_failed.exit_code)
         != (Verdict::Pass, COULD_NOT_RUN_EXIT_CODE)
-        || lines.last().map(String::as_str) != Some("FINAL_VALIDATE_STATUS: COULD_NOT_RUN")
+        || lines.last().map(String::as_str) != Some("FINAL_VALIDATE_STATUS: PASSED")
         || !lines.iter().any(|line| line.contains("validation verdict above is unchanged"))
     {
         return Err(format!(
@@ -1411,11 +1417,36 @@ fn self_test() -> Result<(), String> {
         &std::fs::read(&writeback_result_path)
             .map_err(|error| format!("summary: cannot read write-back result: {error}"))?,
     )?;
-    if writeback_result.final_validate_status != FinalValidateStatus::CouldNotRun
+    if writeback_result.final_validate_status != FinalValidateStatus::Passed
         || writeback_result.exit_code != i32::from(COULD_NOT_RUN_EXIT_CODE)
+        || writeback_result.scorecard_writeback
+            != Some(ScorecardWriteback::Failed {
+                error: "fixture refusal".into(),
+            })
     {
         return Err(format!(
-            "summary: scorecard write-back refusal did not carry the final command status into the service result: {writeback_result:?}"
+            "summary: scorecard write-back refusal did not preserve the validation verdict and carry its own typed failure: {writeback_result:?}"
+        ));
+    }
+    let mut genuine_could_not_run =
+        RunSummary::new(Verdict::NoResult, COULD_NOT_RUN_EXIT_CODE, "self-test", Vec::new());
+    genuine_could_not_run.nodes_executed = 1;
+    let could_not_run_path = writeback_result_dir.path().join("could-not-run.json");
+    write_validation_service_result(&could_not_run_path, &genuine_could_not_run)?;
+    let could_not_run = ValidationServiceResult::from_json_slice(
+        &std::fs::read(&could_not_run_path)
+            .map_err(|error| format!("summary: cannot read could-not-run result: {error}"))?,
+    )?;
+    if could_not_run.final_validate_status != FinalValidateStatus::CouldNotRun
+        || could_not_run.exit_code != i32::from(COULD_NOT_RUN_EXIT_CODE)
+        || could_not_run.scorecard_writeback.is_some()
+        || run_summary_lines(&genuine_could_not_run, std::time::Instant::now())
+            .last()
+            .map(String::as_str)
+            != Some("FINAL_VALIDATE_STATUS: COULD_NOT_RUN")
+    {
+        return Err(format!(
+            "summary: genuine could-not-run collapsed into a write-back failure: {could_not_run:?}"
         ));
     }
     let service_result_dir = tempfile::tempdir()
@@ -1433,6 +1464,7 @@ fn self_test() -> Result<(), String> {
         || service_result.exit_code != 0
         || service_result.executed_nodes != 76
         || service_result.executed_tests != Some(2129)
+        || service_result.scorecard_writeback.is_some()
     {
         return Err(format!(
             "summary: framework service result lost typed status or counts: {service_result:?}"
@@ -1981,6 +2013,8 @@ fn self_test() -> Result<(), String> {
     // Completeness is what a self-certifying driver is least able to check about
     // itself, so its refusal predicate is bracketed here rather than assumed.
     verdict_refusal_bracket()?;
+    pin_gate_receipt_bracket()?;
+    scorecard_writeback_scope_bracket()?;
     host_capability_bracket(&root)?;
     coverage_schema_bracket()?;
     cell_results_schema_bracket()?;
@@ -1988,6 +2022,7 @@ fn self_test() -> Result<(), String> {
     typed_libtest_count_bracket()?;
     ledger_gate_origin_bracket()?;
     requalification_plan_bracket(&root)?;
+    tool_root_split_bracket()?;
     validate_series_writer_bracket()?;
     no_result_propagation_bracket()?;
     possible_missing_artifact_bracket()?;
@@ -2261,14 +2296,9 @@ cleared-caps refusal names {} starved step(s)",
                     consumer.tag(), consumer.cmd
                 ));
             }
-            if consumer
-                .env
-                .get(validate_plan::E2E_ATTEMPT_ENV)
-                .map(String::as_str)
-                != Some("1")
-            {
+            if consumer.env.contains_key("E2E_ATTEMPT") {
                 return Err(format!(
-                    "full-plan bracket: {} does not declare initial E2E attempt 1: {:?}",
+                    "full-plan bracket: {} still receives the outer E2E_ATTEMPT variable: {:?}",
                     consumer.tag(), consumer.env
                 ));
             }
@@ -2328,6 +2358,55 @@ cleared-caps refusal names {} starved step(s)",
             return Err(
                 "full-plan bracket: privileged build did not assert the artifact and prebuild the exact downstream test binaries".into(),
             );
+        }
+        if ["test.cli", "test.hermit_modes"]
+            .iter()
+            .any(|forbidden| privileged_build.deps.iter().any(|dep| dep == forbidden))
+        {
+            return Err(format!(
+                "full-plan bracket: privileged build depends on portable test success: {:?}",
+                privileged_build.deps
+            ));
+        }
+        assert_fused_shared_integration_test_resources(
+            &full.cfg.steps,
+            &full.cfg.resource_caps,
+        )?;
+        let mut missing_shared_demand = full.cfg.steps.clone();
+        missing_shared_demand
+            .iter_mut()
+            .find(|step| step.tag() == "test.cli")
+            .expect("portable cli exists")
+            .hint
+            .resources
+            .remove("integration_test_binaries.cli");
+        let mut missing_shared_cap = full.cfg.resource_caps.clone();
+        missing_shared_cap.remove("integration_test_binaries.hermit_modes");
+        if assert_fused_shared_integration_test_resources(
+            &missing_shared_demand,
+            &full.cfg.resource_caps,
+        )
+        .is_ok()
+            || assert_fused_shared_integration_test_resources(&full.cfg.steps, &missing_shared_cap)
+                .is_ok()
+        {
+            return Err("full-plan bracket: missing shared-test resource demand/cap was accepted".into());
+        }
+        let mut selected = Plan {
+            cfg: full.cfg.clone(),
+            profile: "full".into(),
+            ..Default::default()
+        };
+        select_constructed_steps(
+            &mut selected,
+            "privileged-test.cli_kvm,privileged-test.pmu_buck_chaos_cases",
+            false,
+        )?;
+        let tags: BTreeSet<String> = selected.cfg.steps.iter().map(Step::tag).collect();
+        if ["test.cli", "test.hermit_modes"].iter().any(|tag| tags.contains(*tag)) {
+            return Err(format!(
+                "full-plan bracket: selected privileged tests acquired a portable-test dependency: {tags:?}"
+            ));
         }
         let cpuid = full
             .cfg
@@ -2412,6 +2491,17 @@ cleared-caps refusal names {} starved step(s)",
         let sequential = build_plan(&root, &sequential_args, &tmp)?;
         if sequential.second.is_none() {
             return Err("full-plan bracket: --sequential-lanes did not preserve the fallback".into());
+        }
+        let sequential_has_shared_resource = std::iter::once(&sequential.cfg)
+            .chain(sequential.second.iter())
+            .any(|cfg| {
+                cfg.resource_caps
+                    .keys()
+                    .chain(cfg.steps.iter().flat_map(|step| step.hint.resources.keys()))
+                    .any(|resource| resource.starts_with(FUSED_INTEGRATION_TEST_RESOURCE_PREFIX))
+            });
+        if sequential_has_shared_resource {
+            return Err("full-plan bracket: fused shared-test resources leaked into the sequential plan".into());
         }
         let portable_tests = test_nodes_of(&validate_plan::lane_config(&root, "portable")?);
         let privileged_tests = test_nodes_of(&validate_plan::lane_config(&root, "privileged")?);
@@ -3508,7 +3598,13 @@ fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
             return Err(format!("verbosity: envelope lost stable identity fixture {fixture:?}"));
         }
     }
-    if envelope.cmd.matches("\"$id\"").count() != 2 {
+    if !envelope
+        .cmd
+        .contains("printf '##TEST-START %s\\n' \"$id\" >&2")
+        || !envelope
+            .cmd
+            .contains("printf '##TEST-END %s PASS\\n' \"$id\" >&2")
+    {
         return Err("verbosity: envelope START/END must use the same whitespace-free identity".into());
     }
     if envelope.cmd.matches("\"$id\" >&2").count() != 2
@@ -3521,7 +3617,9 @@ fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
     for fixture in [
         "trap publish_counts EXIT",
         "EXECUTED=$((EXECUTED + 1))",
-        "./ci/write-structured-test-counts.sh \"$EXECUTED\" 0",
+        "RESULTS+=(\"envelope/$id\" pass 1)",
+        "RESULTS+=(\"envelope/$CURRENT_TEST\" fail 1)",
+        "./ci/write-structured-test-counts.sh \"$EXECUTED\" 0 \"${RESULTS[@]}\"",
     ] {
         if !envelope.cmd.contains(fixture) {
             return Err(format!(
@@ -4034,6 +4132,7 @@ mod concurrent_validate_path_tests {
 /// terminal-verdict projection instead of maintaining another result file.
 fn append_validate_series(
     parent: Option<&Path>,
+    tool_root: Option<&Path>,
     checkout: &Path,
     result_root: &Path,
     tree: &str,
@@ -4041,6 +4140,7 @@ fn append_validate_series(
     let Some(parent) = parent else {
         return Ok(false);
     };
+    let tool_root = tool_root.ok_or("dev-hermit state root has no executable tool root")?;
     let rows = validate_cell_results::all_result_rows(result_root)?;
     if rows.is_empty() {
         return Ok(false);
@@ -4048,10 +4148,10 @@ fn append_validate_series(
     let run_id = std::env::var_os("E2E_RUN_ID")
         .filter(|value| !value.is_empty())
         .ok_or("E2E_RUN_ID is missing after completed cell rows were recorded")?;
-    let script = parent.join("ci-hub/series/series.py");
+    let script = tool_root.join("ci-hub/series/series.py");
     if !script.is_file() {
         return Err(format!(
-            "{} does not exist; DEV_HERMIT_PARENT does not contain the series writer",
+            "{} does not exist; {TOOL_ROOT_ENV} does not contain the series writer",
             script.display()
         ));
     }
@@ -4109,13 +4209,19 @@ fn append_validate_series(
 }
 
 /// Merge one top-level validate's completed per-cell rows into the tracked
-/// scorecard files. Nested validates leave this to their outer run.
+/// scorecard files. Nested and off-the-record validates leave the tracked view
+/// untouched; only a receipt-producing top-level run owns that projection.
+fn should_write_scorecard(nested: bool, off_the_record: bool) -> bool {
+    !nested && !off_the_record
+}
+
 fn local_scorecard_writeback(
     root: &Path,
     result_root: &Path,
     nested: bool,
+    off_the_record: bool,
 ) -> Option<Result<(), String>> {
-    if nested {
+    if !should_write_scorecard(nested, off_the_record) {
         return None;
     }
     let script = root.join("ci/compat-envelope/scorecard.rs");
@@ -4144,12 +4250,17 @@ fn record_scorecard_writeback(
 ) {
     let Some(writeback) = writeback else { return };
     let detail = match writeback {
-        Ok(()) =>
-            "scorecard write-back completed; review the generated SCORECARD.md and ci/compat-envelope/cells.json changes before committing".into(),
+        Ok(()) => {
+            summary.scorecard_writeback = Some(ScorecardWriteback::Completed);
+            "scorecard write-back completed; review the generated SCORECARD.md and ci/compat-envelope/cells.json changes before committing".into()
+        }
         Err(error) => {
             if summary.exit_code == 0 {
                 summary.exit_code = COULD_NOT_RUN_EXIT_CODE;
             }
+            summary.scorecard_writeback = Some(ScorecardWriteback::Failed {
+                error: error.clone(),
+            });
             format!(
                 "scorecard write-back FAILED after validation evidence was finalized: {error}; the validation verdict above is unchanged"
             )
@@ -4448,6 +4559,119 @@ fn find_parent(root: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Resolve executable ci-hub code separately from the canonical parent that
+/// owns locks, ledgers, and other shared state.
+///
+/// Older direct callers supplied only `DEV_HERMIT_PARENT`, so absence retains
+/// that behavior. An explicit tool root comes from the admitted launcher and
+/// must be an absolute, existing dev-hermit checkout; silently falling back to
+/// the state root would execute whatever code happens to be in the primary
+/// checkout instead of the code that admitted this run.
+fn configured_tool_root(parent: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    let Some(value) = std::env::var_os(TOOL_ROOT_ENV) else {
+        return Ok(parent.map(Path::to_path_buf));
+    };
+    if value.is_empty() {
+        return Err(format!("{TOOL_ROOT_ENV} is explicitly empty"));
+    }
+    let supplied = PathBuf::from(value);
+    if !supplied.is_absolute() {
+        return Err(format!(
+            "{TOOL_ROOT_ENV} must be absolute, got {}",
+            supplied.display()
+        ));
+    }
+    let resolved = std::fs::canonicalize(&supplied).map_err(|error| {
+        format!(
+            "cannot resolve explicit {TOOL_ROOT_ENV} {}: {error}",
+            supplied.display()
+        )
+    })?;
+    if !resolved.join("ci-hub").is_dir() {
+        return Err(format!(
+            "explicit {TOOL_ROOT_ENV} {} has no ci-hub directory",
+            resolved.display()
+        ));
+    }
+    let state_root = parent.ok_or_else(|| {
+        format!("explicit {TOOL_ROOT_ENV} has no canonical {PARENT_ENV} to bind to")
+    })?;
+    let git = |root: &Path, args: &[&str]| -> Result<String, String> {
+        let output = Command::new("git")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .args(["--no-optional-locks", "-C"])
+            .arg(root)
+            .args(args)
+            .output()
+            .map_err(|error| format!("cannot inspect {}: {error}", root.display()))?;
+        if !output.status.success() {
+            return Err(format!(
+                "{} is not a readable Git worktree: {}",
+                root.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+    let top = std::fs::canonicalize(git(&resolved, &["rev-parse", "--show-toplevel"])?)
+        .map_err(|error| format!("cannot resolve tool worktree top level: {error}"))?;
+    if top != resolved {
+        return Err(format!(
+            "explicit {TOOL_ROOT_ENV} {} is inside {}, not its top level",
+            resolved.display(),
+            top.display()
+        ));
+    }
+    let state = std::fs::canonicalize(state_root).map_err(|error| {
+        format!("cannot resolve canonical {PARENT_ENV} {}: {error}", state_root.display())
+    })?;
+    let state_top = std::fs::canonicalize(git(&state, &["rev-parse", "--show-toplevel"])?)
+        .map_err(|error| format!("cannot resolve state worktree top level: {error}"))?;
+    if state_top != state {
+        return Err(format!(
+            "canonical {PARENT_ENV} {} is inside {}, not its top level",
+            state.display(),
+            state_top.display()
+        ));
+    }
+    let common = |root: &Path| -> Result<PathBuf, String> {
+        let path = git(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+        std::fs::canonicalize(&path)
+            .map_err(|error| format!("cannot resolve Git common directory {path}: {error}"))
+    };
+    if common(&resolved)? != common(&state)? {
+        return Err(format!(
+            "explicit {TOOL_ROOT_ENV} {} is not a worktree of canonical {PARENT_ENV} {}",
+            resolved.display(),
+            state.display()
+        ));
+    }
+    if git(
+        &resolved,
+        &["config", "-f", ".gitmodules", "--get", "submodule.hermit.path"],
+    )? != "hermit"
+    {
+        return Err(format!(
+            "explicit {TOOL_ROOT_ENV} {} is not a dev-hermit checkout",
+            resolved.display()
+        ));
+    }
+    let dirty = git(
+        &resolved,
+        &["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"],
+    )?;
+    if !dirty.is_empty() {
+        return Err(format!(
+            "explicit {TOOL_ROOT_ENV} {} is dirty: {}",
+            resolved.display(),
+            dirty.lines().next().unwrap_or("unknown change")
+        ));
+    }
+    Ok(Some(resolved))
+}
+
 /// Whether this invocation is real product work in a dev-hermit workspace and
 /// therefore needs canonical ci-hub admission.
 ///
@@ -4494,7 +4718,7 @@ fn local_off_the_record_refusal(args: &Args, dirty: bool) -> Option<String> {
 /// Construct the refusal for an unadmitted product run. Production supplies
 /// `canonically_admitted` only from [`canonical_validate_lock_admission`].
 fn product_front_door_refusal(
-    parent: &Path,
+    tool_root: &Path,
     root: &Path,
     commit: &str,
     requested_args: &str,
@@ -4504,7 +4728,7 @@ fn product_front_door_refusal(
     if canonically_admitted {
         return None;
     }
-    let ci_hub_path = parent.join("ci-hub/ci-hub");
+    let ci_hub_path = tool_root.join("ci-hub/ci-hub");
     let ci_hub = validate_plan::shell_quote(&ci_hub_path.to_string_lossy());
     let checkout = validate_plan::shell_quote(&root.to_string_lossy());
     let remediation = if ci_hub_launcher_available {
@@ -5271,6 +5495,91 @@ fn test_nodes_of(cfg: &DagConfig) -> BTreeSet<String> {
         .collect()
 }
 
+const EXPECTED_FUSED_SHARED_INTEGRATION_TESTS: [(&str, &str, &str); 2] = [
+    ("cli", "test.cli", "privileged-test.cli_kvm"),
+    ("hermit_modes", "test.hermit_modes", "privileged-test.pmu_buck_chaos_cases"),
+];
+const FUSED_INTEGRATION_TEST_RESOURCE_PREFIX: &str = "integration_test_binaries.";
+const FUSED_INTEGRATION_TEST_BUILDER: &str = "privileged-build.privileged_tests";
+
+fn assert_fused_shared_integration_test_consumers(steps: &[Step]) -> Result<(), String> {
+    let mut by_binary: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for step in steps {
+        for binary in step.integration_test_binaries.iter().flatten() {
+            by_binary.entry(binary).or_default().push(step.tag());
+        }
+    }
+    by_binary.retain(|_, consumers| {
+        consumers.sort();
+        consumers.iter().any(|tag| tag.starts_with("privileged-"))
+            && consumers.iter().any(|tag| !tag.starts_with("privileged-"))
+    });
+    if by_binary.len() != EXPECTED_FUSED_SHARED_INTEGRATION_TESTS.len()
+        || EXPECTED_FUSED_SHARED_INTEGRATION_TESTS.iter().any(|(binary, portable, privileged)| {
+            by_binary.get(binary) != Some(&vec![(*privileged).into(), (*portable).into()])
+        })
+    {
+        return Err(format!(
+            "fused shared integration-test consumers changed: expected={EXPECTED_FUSED_SHARED_INTEGRATION_TESTS:?}, actual={by_binary:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn add_fused_shared_integration_test_resources(
+    steps: &mut [Step],
+) -> Result<BTreeMap<String, i64>, String> {
+    assert_fused_shared_integration_test_consumers(steps)?;
+    let mut caps = BTreeMap::new();
+    for (binary, portable, privileged) in EXPECTED_FUSED_SHARED_INTEGRATION_TESTS {
+        let resource = format!("{FUSED_INTEGRATION_TEST_RESOURCE_PREFIX}{binary}");
+        caps.insert(resource.clone(), 1);
+        for tag in [portable, privileged, FUSED_INTEGRATION_TEST_BUILDER] {
+            let step = steps
+                .iter_mut()
+                .find(|step| step.tag() == tag)
+                .ok_or_else(|| format!("fused shared-test resource lost {tag}"))?;
+            if step.hint.resources.insert(resource.clone(), 1).is_some() {
+                return Err(format!("fused shared-test resource already declared by {tag}"));
+            }
+        }
+    }
+    Ok(caps)
+}
+
+fn assert_fused_shared_integration_test_resources(
+    steps: &[Step],
+    caps: &BTreeMap<String, i64>,
+) -> Result<(), String> {
+    assert_fused_shared_integration_test_consumers(steps)?;
+    let resource_count = caps
+        .keys()
+        .chain(steps.iter().flat_map(|step| step.hint.resources.keys()))
+        .filter(|resource| resource.starts_with(FUSED_INTEGRATION_TEST_RESOURCE_PREFIX))
+        .collect::<BTreeSet<_>>()
+        .len();
+    if resource_count != EXPECTED_FUSED_SHARED_INTEGRATION_TESTS.len() {
+        return Err(format!("fused shared integration-test resource count changed: {resource_count}"));
+    }
+    for (binary, portable, privileged) in EXPECTED_FUSED_SHARED_INTEGRATION_TESTS {
+        let resource = format!("{FUSED_INTEGRATION_TEST_RESOURCE_PREFIX}{binary}");
+        let expected = vec![
+            (FUSED_INTEGRATION_TEST_BUILDER.to_string(), 1),
+            (privileged.to_string(), 1),
+            (portable.to_string(), 1),
+        ];
+        let mut actual: Vec<(String, i64)> = steps
+            .iter()
+            .filter_map(|step| step.hint.resources.get(&resource).map(|n| (step.tag(), *n)))
+            .collect();
+        actual.sort();
+        if caps.get(&resource) != Some(&1) || actual != expected {
+            return Err(format!("fused shared-test resource {resource} has cap={:?}, demanders={actual:?}; expected cap=1, demanders={expected:?}", caps.get(&resource)));
+        }
+    }
+    Ok(())
+}
+
 /// Add one final node that checks the complete fresh result set and prints the
 /// compatibility table. The existing bucket exits remain authoritative: in
 /// particular, preserving their node identity keeps environmental retry and
@@ -5829,6 +6138,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
     if !removed.is_empty() {
         eprintln!("validate: fused lanes; deduped {} identical node(s): {}", removed.len(), removed.join(", "));
     }
+    let mut shared_test_resource_caps = BTreeMap::new();
     if lanes.len() == 2 {
         // The artifact barrier waits for both initial Cargo producers, verifies
         // binary and resource identities, then publishes a content-addressed
@@ -5842,7 +6152,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             .iter()
             .find(|s| s.tag() == debug_producer)
             .ok_or_else(|| format!("fused debug producer disappeared: {debug_producer}"))?;
-        let expected_fat_build = "./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit";
+        let expected_fat_build = "./ci/run-with-reverie-dbt-budget.sh cargo build --locked -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit";
         if portable_build.cmd != expected_fat_build {
             return Err(format!(
                 "fused debug producer command drifted; re-prove the artifact barrier: {}",
@@ -5864,6 +6174,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
                 artifact.cmd, artifact.deps
             ));
         }
+        shared_test_resource_caps = add_fused_shared_integration_test_resources(&mut steps)?;
         let privileged_build = steps
             .iter_mut()
             .find(|s| s.tag() == consumer)
@@ -5877,7 +6188,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         }
         for dependency in [producer, "build.liteinst_runtime_release"] {
             if !privileged_build.deps.iter().any(|d| d == dependency) {
-                privileged_build.deps.push(dependency.to_string());
+                privileged_build.deps.push(dependency.into());
             }
         }
         privileged_build.deps.sort();
@@ -5906,7 +6217,6 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // artifact -- a check that passes while measuring the wrong thing,
         // which is worse than failing loudly. Zero binaries still fails.
         privileged_build.cmd = "./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null || exit 1; CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run || exit 1; newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"".to_string();
-
         let cpuid = steps
             .iter_mut()
             .find(|s| s.tag() == "privileged-cpuid.faulting")
@@ -5949,6 +6259,14 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             }
             fused.resource_caps.insert(r.clone(), *n);
         }
+    }
+    for (resource, capacity) in shared_test_resource_caps {
+        if fused.resource_caps.insert(resource.clone(), capacity).is_some() {
+            return Err(format!("fused shared-test resource cap already exists: {resource}"));
+        }
+    }
+    if lanes.len() == 2 {
+        assert_fused_shared_integration_test_resources(&steps, &fused.resource_caps)?;
     }
     let cfg = validate_plan::config_from_base(&fused, steps, "fused lanes");
     Ok(Plan {
@@ -6753,6 +7071,10 @@ fn summary_listing_bracket() -> Result<String, String> {
         filtered_tests: None,
         test_results: None,
         returncode: Some(if ok { 0 } else { 1 }),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: String::new(),
         aborted: false,
     };
@@ -7189,6 +7511,16 @@ fn verdict_refusals(
 /// partial run into exit zero.
 fn exit_code_with_execution_completeness(exit_code: u8, execution_complete: bool) -> u8 {
     if execution_complete { exit_code } else { exit_code.max(1) }
+}
+
+/// A missing pin gate invalidates a passing receipt, not an explicitly
+/// off-the-record selected run. Selected hosted jobs inherit the exact commit
+/// and a successful preflight through the external workflow dependency, and
+/// they are already forbidden from writing a ledger row or publishing a
+/// receipt. Turning a completed selected step into failure here would discard
+/// its result without strengthening any evidence claim.
+fn pin_gate_blocks_pass(exit_code: u8, pin_gate_passed: bool, off_the_record: bool) -> bool {
+    exit_code == 0 && !pin_gate_passed && !off_the_record
 }
 
 /// Fast exit 127 is useful missing-artifact guidance only in `--only`, whose
@@ -7725,6 +8057,43 @@ fn verdict_refusal_bracket() -> Result<(), String> {
     println!(
         "  verdict refusals: 3 positive(s) fire (0-measured+spine, 0-executed, spine-with-full-matrix), \
          2 negative(s) inert (complete run, unknown counts)"
+    );
+    Ok(())
+}
+
+/// Both sides of [`pin_gate_blocks_pass`], using only planted booleans.
+fn pin_gate_receipt_bracket() -> Result<(), String> {
+    if !pin_gate_blocks_pass(0, false, false) {
+        return Err("pin gate: a receipt-producing pass without the gate was accepted".into());
+    }
+    for (exit_code, pin_gate_passed, off_the_record, label) in [
+        (0, true, false, "receipt-producing pass with gate"),
+        (1, false, false, "existing failure without gate"),
+        (0, false, true, "off-the-record selected pass without gate"),
+    ] {
+        if pin_gate_blocks_pass(exit_code, pin_gate_passed, off_the_record) {
+            return Err(format!("pin gate: {label} was incorrectly refused"));
+        }
+    }
+    println!(
+        "  pin gate: receipt-producing pass requires the observed gate; off-the-record selected pass does not claim a receipt"
+    );
+    Ok(())
+}
+
+fn scorecard_writeback_scope_bracket() -> Result<(), String> {
+    if !should_write_scorecard(false, false)
+        || should_write_scorecard(true, false)
+        || should_write_scorecard(false, true)
+        || should_write_scorecard(true, true)
+    {
+        return Err(
+            "scorecard write-back: only a receipt-producing top-level run may update the tracked projection"
+                .into(),
+        );
+    }
+    println!(
+        "  scorecard write-back: receipt-producing top-level run only; nested and off-the-record runs inert"
     );
     Ok(())
 }
@@ -9151,37 +9520,36 @@ mod scheduler_explanation_tests {
         let quick_manifest = "quick.e2e_verify";
         let ordinary = "test.cli";
         let never_launched = "e2e.manifest_c_programs";
+        let manifest_step = |group: &str, job: &str| {
+            let mut step = step_with_caps(
+                group,
+                job,
+                "fixture",
+                "false".into(),
+                Vec::new(),
+                30,
+                30,
+                64 * 1024 * 1024,
+            );
+            step.manifest = Some(DagManifest {
+                lane: "portable".into(),
+                category: job.into(),
+            });
+            step
+        };
         let cfg = DagConfig {
             steps: vec![
-                step_with_caps(
+                manifest_step(
                     "e2e",
                     "manifest_applications",
-                    "fixture",
-                    "false".into(),
-                    Vec::new(),
-                    30,
-                    30,
-                    64 * 1024 * 1024,
                 ),
-                step_with_caps(
+                manifest_step(
                     "privileged-e2e",
                     "manifest_backend_parity_c",
-                    "fixture",
-                    "false".into(),
-                    Vec::new(),
-                    30,
-                    30,
-                    64 * 1024 * 1024,
                 ),
-                step_with_caps(
+                manifest_step(
                     "quick",
                     "e2e_verify",
-                    "fixture",
-                    "false".into(),
-                    Vec::new(),
-                    30,
-                    30,
-                    64 * 1024 * 1024,
                 ),
                 step_with_caps(
                     "test",
@@ -9193,15 +9561,9 @@ mod scheduler_explanation_tests {
                     30,
                     64 * 1024 * 1024,
                 ),
-                step_with_caps(
+                manifest_step(
                     "e2e",
                     "manifest_c_programs",
-                    "fixture",
-                    "false".into(),
-                    Vec::new(),
-                    30,
-                    30,
-                    64 * 1024 * 1024,
                 ),
             ],
             ..Default::default()
@@ -9243,6 +9605,28 @@ mod nextest_timeout_tests {
     fn nextest_uses_the_manifest_default_and_named_overrides() {
         let config = include_str!("../.config/nextest.toml");
         let manifest = include_str!("../tests/e2e/manifests/defaults.yaml");
+        let manifest_timeout_stanzas = [
+            "- filter: test(/(^|::)every_record_container_site_classifies_a_child_fault_by_name$/)\n    timeout_seconds: 45",
+            "- filter: test(/(^|::)run_timeout_fallback_fires_when_the_unwind_does_not_finish$/)\n    timeout_seconds: 30",
+            "- filter: binary(=container_init_deadline)\n    timeout_seconds: 30",
+        ];
+        let manifest_timeouts_match = |source: &str| {
+            manifest_timeout_stanzas
+                .iter()
+                .all(|stanza| source.contains(stanza))
+        };
+        assert!(manifest_timeouts_match(manifest));
+        for wrong_timeout in [44, 30] {
+            let mutated = manifest.replacen(
+                "timeout_seconds: 45",
+                &format!("timeout_seconds: {wrong_timeout}"),
+                1,
+            );
+            assert!(
+                !manifest_timeouts_match(&mutated),
+                "source-audit timeout mutation 45->{wrong_timeout} escaped the ratchet"
+            );
+        }
         let timeouts: Vec<&str> = config
             .lines()
             .map(str::trim)
@@ -9252,11 +9636,11 @@ mod nextest_timeout_tests {
             timeouts,
             vec![
                 "slow-timeout = { period = \"15s\", terminate-after = 1, grace-period = \"2s\" }",
-                "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
+                "slow-timeout = { period = \"45s\", terminate-after = 1, grace-period = \"2s\" }",
                 "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
                 "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
             ],
-            "the per-test timeout must stay at 15s with exactly three justified 30s overrides"
+            "the per-test timeout must stay at 15s with one justified 45s override and two justified 30s overrides"
         );
         for required in [
             "test(/(^|::)every_record_container_site_classifies_a_child_fault_by_name$/)",
@@ -9268,7 +9652,11 @@ mod nextest_timeout_tests {
         }
         for required in [
             "12 separate Hermit processes",
-            "25.98-26.30s while passing",
+            "85 attempts",
+            "64 passed",
+            "21 timed out",
+            "29.935s",
+            "45s is 1.50x",
         ] {
             assert!(config.contains(required), "nextest config lost {required}");
             assert!(manifest.contains(required), "manifest lost {required}");
@@ -9374,6 +9762,38 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             .map_err(|e| format!("retry bounds: invalid {field} in {line:?}: {e}"))
     }
 
+    fn require_live_nextest_output(tag: &str, command: &str) -> Result<(), String> {
+        let Some(wrapper) = command.find("run-nextest-counted.sh") else {
+            return Ok(());
+        };
+        let invocation = &command[wrapper..];
+        if invocation.contains(">\"$log\" 2>&1")
+            || invocation.contains("cat \"$log\"")
+            || invocation.contains("sed -n 's/^running ")
+        {
+            return Err(format!(
+                "retry bounds: {tag} buffers or reparses run-nextest-counted output; test events \
+                 must remain live and exact counts must be checked by the wrapper"
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_expected_nextest_count(
+        tag: &str,
+        command: &str,
+        expected: usize,
+    ) -> Result<(), String> {
+        let declaration = format!("NEXTEST_EXPECTED_EXECUTED={expected}");
+        if !command.contains(&declaration) {
+            return Err(format!(
+                "retry bounds: {tag} must require exactly {expected} executed tests through \
+                 {declaration}"
+            ));
+        }
+        Ok(())
+    }
+
     let nextest = std::fs::read_to_string(root.join(".config/nextest.toml"))
         .map_err(|e| format!("retry bounds: cannot read nextest config: {e}"))?;
     let manifest_defaults =
@@ -9418,13 +9838,62 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .max()
         .ok_or("retry bounds: no declared nextest cap")?;
 
-    let smallest_enclosing_deadline_s = ["portable", "privileged"]
+    let lane_configs = ["portable", "privileged"]
         .into_iter()
-        .map(|lane| validate_plan::lane_config(root, lane).map(|cfg| cfg.default_step_timeout))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
+        .map(|lane| validate_plan::lane_config(root, lane).map(|cfg| (lane, cfg)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let smallest_enclosing_deadline_s = lane_configs
+        .iter()
+        .map(|(_, cfg)| cfg.default_step_timeout)
         .min()
         .ok_or("retry bounds: no enclosing lane deadline")?;
+    let mut streamed_nextest_nodes = 0usize;
+    for (_, cfg) in &lane_configs {
+        for step in cfg
+            .steps
+            .iter()
+            .filter(|step| step.cmd.contains("run-nextest-counted.sh"))
+        {
+            require_live_nextest_output(&step.tag(), &step.cmd)?;
+            streamed_nextest_nodes += 1;
+        }
+    }
+    let privileged = lane_configs
+        .iter()
+        .find(|(lane, _)| *lane == "privileged")
+        .map(|(_, cfg)| cfg)
+        .ok_or("retry bounds: privileged lane is absent")?;
+    for (tag, expected) in [
+        ("test.pmu_buck_chaos_cases", 6usize),
+        ("test.cli_kvm", 21usize),
+    ] {
+        let step = privileged
+            .steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .ok_or_else(|| format!("retry bounds: exact-count node {tag} is absent"))?;
+        require_expected_nextest_count(tag, &step.cmd, expected)?;
+    }
+    let buffered_mutation =
+        "./ci/run-nextest-counted.sh -p fixture >\"$log\" 2>&1 || status=$?; cat \"$log\"";
+    let buffered_error = require_live_nextest_output("test.fixture", buffered_mutation)
+        .expect_err("buffered nextest output mutation must be refused");
+    if !buffered_error.contains("test.fixture") || !buffered_error.contains("must remain live") {
+        return Err(format!(
+            "retry bounds: buffered-output mutation did not fail by node name: {buffered_error}"
+        ));
+    }
+    let count_error = require_expected_nextest_count(
+        "test.fixture",
+        "./ci/run-nextest-counted.sh -p fixture",
+        7,
+    )
+    .expect_err("missing exact-count declaration mutation must be refused");
+    if !count_error.contains("test.fixture") || !count_error.contains("exactly 7") {
+        return Err(format!(
+            "retry bounds: exact-count mutation did not fail by node name: {count_error}"
+        ));
+    }
     let attempts = validate_runtime::MAX_ATTEMPTS_PER_CELL as i64;
     let default_with_grace_s = DEFAULT_TEST_CAP_S + NEXTEST_TERMINATION_GRACE_S;
     let largest_nextest_with_grace_s = largest_nextest_cap_s + NEXTEST_TERMINATION_GRACE_S;
@@ -9461,9 +9930,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             tightest_manifest_headroom_s = tightest_manifest_headroom_s.min(headroom_s);
             Ok(())
         };
-    for lane in ["portable", "privileged"] {
-        let cfg = validate_plan::lane_config(root, lane)
-            .map_err(|e| format!("retry bounds: cannot load {lane} lane: {e}"))?;
+    for (lane, cfg) in &lane_configs {
         for step in cfg
             .steps
             .iter()
@@ -9489,7 +9956,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
                 step.timeout,
                 Selection {
                     population: Some(Population::Required),
-                    lane: Some(lane.into()),
+                    lane: Some((*lane).into()),
                     category: Some(category.clone()),
                     ..Default::default()
                 },
@@ -9526,7 +9993,8 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         ));
     }
     Ok(format!(
-        "retry bounds: non-manifest retries receive separate node deadlines; default nextest \
+        "retry bounds: {streamed_nextest_nodes} nextest node(s) keep test events live; \
+         non-manifest retries receive separate node deadlines; default nextest \
          cap including grace={default_with_grace_s}s and largest nextest cap including grace=\
          {largest_nextest_with_grace_s}s are below the smallest enclosing lane deadline of \
          {smallest_enclosing_deadline_s}s; {checked_manifest_nodes} manifest node(s) fit both \
@@ -9543,6 +10011,25 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     ));
     std::fs::create_dir(&tmp)
         .map_err(|e| format!("scheduler accounting: cannot create {}: {e}", tmp.display()))?;
+    let evidence_dir = tmp.join("dagrun-evidence");
+    std::fs::create_dir(&evidence_dir).map_err(|e| {
+        format!(
+            "scheduler accounting: cannot create private evidence directory {}: {e}",
+            evidence_dir.display()
+        )
+    })?;
+    std::fs::set_permissions(&evidence_dir, std::fs::Permissions::from_mode(0o700)).map_err(
+        |e| {
+            format!(
+                "scheduler accounting: cannot make evidence directory private {}: {e}",
+                evidence_dir.display()
+            )
+        },
+    )?;
+    let prior_dagrun_log_dir = std::env::var_os("DAGRUN_LOG_DIR");
+    // SAFETY: this self-test runs its scheduler fixtures serially. Restored
+    // immediately after the bracket, including when a fixture returns Err.
+    unsafe { std::env::set_var("DAGRUN_LOG_DIR", &evidence_dir) };
 
     let result = (|| -> Result<(), String> {
     let step = |job: &str, cmd: &str| {
@@ -10361,7 +10848,6 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
                 ));
             }
         }
-
         let mut red = RunSummary::new(Verdict::Fail, 1, "self-test", Vec::new());
         red.flaky = split.recovered.clone();
         red.failed_ids = split.failed.clone();
@@ -10779,8 +11265,19 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     // ordinals at one.
     let e2e_attempts = tmp.join("e2e-attempts");
     let e2e_log = tmp.join("e2e-attempts.log");
+    let structured_counts = serde_json::json!({
+        "schema": 2,
+        "executed_tests": 2,
+        "filtered_tests": 0,
+        "results": [
+            {"id": "failing-cell", "result": "fail", "attempts": 2},
+            {"id": "passing-peer", "result": "pass", "attempts": 1},
+        ],
+    })
+    .to_string();
     let e2e_cmd = format!(
-        "printf '%s\\n' \"$E2E_ATTEMPT\" >> {}; exit 1",
+        "printf '%s\\n' {} > \"$DAGRUN_TEST_COUNTS_PATH\"; printf '%s\\n' run >> {}; exit 1",
+        validate_plan::shell_quote(&structured_counts),
         validate_plan::shell_quote(&e2e_attempts.to_string_lossy()),
     );
     let mut e2e_step = step("manifest_attempt", &e2e_cmd);
@@ -10790,7 +11287,6 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         lane: "portable".into(),
         category: "applications".into(),
     });
-    set_manifest_attempt(&mut e2e_step, 1);
     let e2e_retry = run_lane_with_retries(
         &DagConfig { steps: vec![e2e_step], ..Default::default() },
         1,
@@ -10809,16 +11305,74 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         .attempts
         .iter()
         .filter(|attempt| attempt.tag == "e2e.manifest_attempt")
-        .count();
+        .collect::<Vec<_>>();
+    let e2e_results = e2e_node_attempts
+        .first()
+        .and_then(|attempt| attempt.test_results.as_ref());
     if e2e_retry.ok
         || e2e_retry.retry_rounds != 0
-        || e2e_node_attempts != 1
-        || recorded_attempts.lines().collect::<Vec<_>>() != ["1"]
+        || e2e_node_attempts.len() != 1
+        || e2e_results
+            != Some(&vec![
+                dagrun::TestResult::new("failing-cell".into(), false, 2)?,
+                dagrun::TestResult::new("passing-peer".into(), true, 1)?,
+            ])
+        || recorded_attempts.lines().collect::<Vec<_>>() != ["run"]
     {
         return Err(format!(
-            "scheduler accounting: outer scheduler retried an executed manifest node: \
-             ok={} retries={} attempts={} rows={recorded_attempts:?}",
-            e2e_retry.ok, e2e_retry.retry_rounds, e2e_node_attempts
+            "scheduler accounting: manifest framework retry did not preserve the 2/1/1 proof: \
+             ok={} retries={} node_attempts={} results={e2e_results:?} rows={recorded_attempts:?}",
+            e2e_retry.ok, e2e_retry.retry_rounds, e2e_node_attempts.len()
+        ));
+    }
+
+    // The same real scheduler node without typed manifest identity is the
+    // control: its outer retry runs the whole payload twice, including the
+    // passing peer represented in the structured result.
+    let ordinary_attempts = tmp.join("ordinary-structured-attempts");
+    let ordinary_log = tmp.join("ordinary-structured-attempts.log");
+    let ordinary_cmd = format!(
+        "printf '%s\\n' {} > \"$DAGRUN_TEST_COUNTS_PATH\"; printf '%s\\n' run >> {}; exit 1",
+        validate_plan::shell_quote(&structured_counts),
+        validate_plan::shell_quote(&ordinary_attempts.to_string_lossy()),
+    );
+    let ordinary_retry = run_lane_with_retries(
+        &DagConfig { steps: vec![step("ordinary_structured", &ordinary_cmd)], ..Default::default() },
+        1,
+        true,
+        0,
+        None,
+        &ordinary_log,
+        None,
+        1,
+        &BTreeMap::new(),
+        false,
+    );
+    let ordinary_node_attempts = ordinary_retry
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.tag == "fixture.ordinary_structured")
+        .collect::<Vec<_>>();
+    let ordinary_runs = std::fs::read_to_string(&ordinary_attempts)
+        .map_err(|e| format!("scheduler accounting: cannot read ordinary retry fixture: {e}"))?;
+    if ordinary_retry.ok
+        || ordinary_retry.retry_rounds != 1
+        || ordinary_node_attempts.len() != 2
+        || ordinary_node_attempts.iter().any(|attempt| {
+            attempt.test_results.as_ref().is_none_or(|results| {
+                results.iter().find(|result| result.id == "passing-peer").is_none_or(|peer| {
+                    !peer.passed || peer.attempts != 1
+                })
+            })
+        })
+        || ordinary_runs.lines().count() != 2
+    {
+        return Err(format!(
+            "scheduler accounting: ordinary-node control did not rerun its passing peer: \
+             ok={} retries={} node_attempts={} rows={ordinary_runs:?}",
+            ordinary_retry.ok,
+            ordinary_retry.retry_rounds,
+            ordinary_node_attempts.len()
         ));
     }
 
@@ -11583,6 +12137,11 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     Ok(())
     })();
 
+    match prior_dagrun_log_dir {
+        Some(value) => unsafe { std::env::set_var("DAGRUN_LOG_DIR", value) },
+        None => unsafe { std::env::remove_var("DAGRUN_LOG_DIR") },
+    }
+
     let cleanup = std::fs::remove_dir_all(&tmp)
         .map_err(|e| format!("scheduler accounting: cannot remove {}: {e}", tmp.display()));
     match (result, cleanup) {
@@ -11658,12 +12217,8 @@ fn run_lane_with_retries(
         };
     }
     let mut round_log_start = settled_log_len(log_path);
-    let mut first_cfg = cfg.clone();
-    for step in &mut first_cfg.steps {
-        set_manifest_attempt(step, 1);
-    }
     let first = run_dag_boxed_deadline(
-        &first_cfg,
+        cfg,
         jobs,
         keep_going,
         verbosity,
@@ -11877,10 +12432,6 @@ fn run_lane_with_retries(
         let mut retry_cfg = cfg.clone();
         retry_cfg.description = format!("{} — retry round {retry_rounds}", cfg.description);
         retry_cfg.steps = steps;
-        for step in &mut retry_cfg.steps {
-            let attempt = next_attempt_ordinal(&attempts, &step.tag());
-            set_manifest_attempt(step, attempt);
-        }
         // Everything before this byte belongs to an earlier scheduler
         // invocation. The retry may emit no detail at all; that must stay
         // unknown rather than inheriting a stale banner through whole-log rfind.
@@ -12329,6 +12880,9 @@ struct LedgerCtx {
     reverie_pin_current: bool,
     /// Libtest counts aggregated from typed step outcomes; `None` is UNKNOWN.
     executed_tests: Option<i64>,
+    /// Tests that passed, derived only from runner-owned typed outcomes.
+    /// A failed retained count-only result cannot supply this value.
+    passed_tests: Option<i64>,
     filtered_tests: Option<i64>,
 }
 
@@ -12354,13 +12908,13 @@ impl Default for ReceiptEvidence {
 /// Any missing helper, failed command, or malformed output stays explicit null;
 /// the schema-5 consumer then refuses qualification.
 fn receipt_evidence(
-    parent: Option<&Path>,
+    tool_root: Option<&Path>,
     root: &Path,
     log: &Path,
     commit: &str,
 ) -> ReceiptEvidence {
-    let Some(parent) = parent else { return ReceiptEvidence::default() };
-    let helper = parent.join("ci-hub/validate/finalize_receipt.py");
+    let Some(tool_root) = tool_root else { return ReceiptEvidence::default() };
+    let helper = tool_root.join("ci-hub/validate/finalize_receipt.py");
     if !helper.is_file() || log.as_os_str().is_empty() || commit.is_empty() {
         return ReceiptEvidence::default();
     }
@@ -12396,7 +12950,7 @@ fn receipt_evidence(
 /// Production never trusts caller-supplied owner PIDs or sidecar paths. The
 /// stop-test JSON seam is confined to an intrinsically non-qualifying fixture.
 fn canonical_validate_lock_admission(
-    parent: Option<&Path>,
+    tool_root: Option<&Path>,
     commit: &str,
     host: &str,
 ) -> Result<(), String> {
@@ -12406,10 +12960,10 @@ fn canonical_validate_lock_admission(
         };
         fixture.into_bytes()
     } else {
-        let Some(parent) = parent else {
-            return Err("no dev-hermit parent was detected".into());
+        let Some(tool_root) = tool_root else {
+            return Err("no dev-hermit tool root was detected".into());
         };
-        let ci_hub = parent.join("ci-hub/ci-hub");
+        let ci_hub = tool_root.join("ci-hub/ci-hub");
         if !ci_hub.is_file() {
             return Err(format!(
                 "the canonical launcher is missing at {}",
@@ -13009,6 +13563,7 @@ fn product_front_door_process_bracket() -> Result<(), String> {
                 .env_remove("VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON")
                 .env_remove("HERMIT_VALIDATE_STOP_TEST_EXIT_EARLY")
                 .env_remove(PARENT_ENV)
+                .env_remove(TOOL_ROOT_ENV)
                 .env_remove(validate_runtime::ACTIVE_ENV)
                 .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_PID")
                 .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_FILE");
@@ -13108,37 +13663,127 @@ fn sum_typed_count(
     seen.then(|| i64::try_from(total).ok()).flatten()
 }
 
-fn libtest_counts(outcomes: &[StepOutcome]) -> (Option<i64>, Option<i64>) {
+fn exact_passed_test_count(outcomes: &[StepOutcome]) -> Option<i64> {
+    let mut seen = false;
+    let mut passed = 0u64;
+    for outcome in outcomes {
+        let count_bearing = outcome.executed_tests.is_some()
+            || outcome.filtered_tests.is_some()
+            || outcome.test_results.is_some();
+        if !count_bearing {
+            continue;
+        }
+        seen = true;
+        let executed = outcome.executed_tests?;
+        let outcome_passed = match &outcome.test_results {
+            Some(results) => {
+                if u64::try_from(results.len()).ok()? != executed {
+                    return None;
+                }
+                u64::try_from(results.iter().filter(|result| result.passed).count()).ok()?
+            }
+            None if executed == 0 || outcome.ok => executed,
+            None => return None,
+        };
+        passed = passed.checked_add(outcome_passed)?;
+    }
+    seen.then(|| i64::try_from(passed).ok()).flatten()
+}
+
+fn libtest_counts(outcomes: &[StepOutcome]) -> (Option<i64>, Option<i64>, Option<i64>) {
     (
         sum_typed_count(outcomes, |o| o.executed_tests),
+        exact_passed_test_count(outcomes),
         sum_typed_count(outcomes, |o| o.filtered_tests),
     )
 }
 
-fn publish_structured_test_counts(executed: i64, filtered: i64) -> Result<(), String> {
+fn publish_structured_test_results(results: &TestResults) -> Result<(), String> {
     let Some(path) = std::env::var_os("DAGRUN_TEST_COUNTS_PATH") else {
         return Ok(());
     };
-    if executed < 0 || filtered < 0 {
-        return Err("structured test counts must be nonnegative".into());
+    results.write_current(&PathBuf::from(path))
+}
+
+fn compat_test_results(
+    outcomes: &[StepOutcome],
+    attempts: &[NodeAttempt],
+) -> Result<TestResults, String> {
+    let compat_outcomes = outcomes
+        .iter()
+        .filter(|outcome| outcome.tag.starts_with("compat."))
+        .map(|outcome| (outcome.tag.as_str(), outcome))
+        .collect::<BTreeMap<_, _>>();
+    let mut latest_attempts = BTreeMap::<&str, &NodeAttempt>::new();
+    for attempt in attempts
+        .iter()
+        .filter(|attempt| attempt.tag.starts_with("compat."))
+    {
+        let latest = latest_attempts
+            .entry(attempt.tag.as_str())
+            .or_insert(attempt);
+        if attempt.attempt > latest.attempt {
+            *latest = attempt;
+        }
     }
-    let path = PathBuf::from(path);
-    let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
-    let counts = serde_json::json!({
-        "schema": 1,
-        "executed_tests": executed,
-        "filtered_tests": filtered,
-    });
-    let publish = std::fs::write(&temporary, format!("{counts}\n"))
-        .and_then(|()| std::fs::rename(&temporary, &path));
-    if let Err(error) = publish {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(format!(
-            "cannot publish structured test counts to {}: {error}",
-            path.display()
-        ));
+    for (tag, latest) in &latest_attempts {
+        if !compat_outcomes.contains_key(tag) {
+            return Err(format!(
+                "structured compatibility result {tag} has attempt {} but no retained outcome",
+                latest.attempt
+            ));
+        }
     }
-    Ok(())
+
+    let mut results = Vec::new();
+    for outcome in outcomes {
+        let Some(label) = outcome.tag.strip_prefix("compat.") else {
+            continue;
+        };
+        let tag = outcome.tag.as_str();
+        let latest = latest_attempts.get(tag).copied().ok_or_else(|| {
+            format!("structured compatibility result {label} has no recorded attempt")
+        })?;
+        if !latest.reported || latest.execution != AttemptExecution::Completed {
+            return Err(format!(
+                "structured compatibility result {label} latest attempt {} has no completed report",
+                latest.attempt
+            ));
+        }
+        let retained_result = if outcome_execution(outcome) != AttemptExecution::Completed {
+            None
+        } else if outcome_is_no_result(outcome) {
+            Some("no_result")
+        } else if outcome.ok {
+            Some("pass")
+        } else {
+            Some("fail")
+        };
+        let latest_result = attempt_result(latest);
+        if latest_result != retained_result || latest.returncode != outcome.returncode {
+            return Err(format!(
+                "structured compatibility result {label} disagrees with latest attempt {}",
+                latest.attempt
+            ));
+        }
+        let passed = match latest_result {
+            Some("pass") => true,
+            Some("fail") => false,
+            _ => {
+                return Err(format!(
+                    "structured compatibility result {label} latest attempt {} has no pass/fail verdict",
+                    latest.attempt
+                ));
+            }
+        };
+        let attempt_count = u64::try_from(latest.attempt).map_err(|_| {
+            format!("structured compatibility attempts overflowed for {label}")
+        })?;
+        results.push(TestResult::new(label.to_string(), passed, attempt_count)?);
+    }
+    let executed = u64::try_from(results.len())
+        .map_err(|_| "structured compatibility result count does not fit u64".to_string())?;
+    TestResults::current(executed, 0, results)
 }
 
 /// Derive the per-node coverage obligation from dagrun's structured test counts.
@@ -13187,6 +13832,10 @@ fn test_node_coverage_bracket() -> Result<(), String> {
         filtered_tests: Some(0),
         test_results: None,
         returncode: Some(if ok { 0 } else { 100 }),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: if ok { String::new() } else { "test failure".into() },
         aborted,
     };
@@ -13236,6 +13885,10 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         filtered_tests,
         test_results: None,
         returncode: Some(if ok { 0 } else { 100 }),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: if ok { String::new() } else { "test failure".into() },
         aborted: false,
     };
@@ -13243,24 +13896,106 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         outcome("test.a", true, Some(398), Some(0)),
         outcome("test.b", true, Some(475), Some(350)),
     ];
-    if libtest_counts(&full) != (Some(873), Some(350)) {
-        return Err("typed libtest counts: complete outcomes did not sum to 873/350".into());
+    if libtest_counts(&full) != (Some(873), Some(873), Some(350)) {
+        return Err("typed libtest counts: complete outcomes did not sum to 873/873/350".into());
     }
     let failed = outcome("test.failed", false, Some(23), Some(5));
-    if libtest_counts(std::slice::from_ref(&failed)) != (Some(23), Some(5)) || failed.ok {
+    if libtest_counts(std::slice::from_ref(&failed)) != (Some(23), None, Some(5)) || failed.ok {
         return Err(
-            "typed libtest counts: a 23-test failed outcome must contribute counts and remain failed"
+            "typed libtest counts: a retained failed count-only outcome must keep passed unknown"
                 .into(),
         );
     }
-    if libtest_counts(&[outcome("test.zero", true, Some(0), Some(0))]) != (Some(0), Some(0)) {
+    if libtest_counts(&[outcome("test.zero", true, Some(0), Some(0))])
+        != (Some(0), Some(0), Some(0))
+    {
         return Err("typed libtest counts: demonstrated zero was not preserved".into());
     }
-    if libtest_counts(&[outcome("build.only", true, None, None)]) != (None, None) {
+    if libtest_counts(&[outcome("build.only", true, None, None)]) != (None, None, None) {
         return Err("typed libtest counts: unknown bannerless output was coerced".into());
     }
+
+    let mut exact = outcome("test.exact", false, Some(2), Some(0));
+    exact.test_results = Some(vec![
+        TestResult::new("case-a".into(), true, 1)?,
+        TestResult::new("case-b".into(), false, 2)?,
+    ]);
+    if libtest_counts(std::slice::from_ref(&exact)) != (Some(2), Some(1), Some(0)) {
+        return Err("typed libtest counts: exact per-test results did not report one pass".into());
+    }
+    exact.test_results.as_mut().unwrap()[1].passed = true;
+    if libtest_counts(std::slice::from_ref(&exact)) != (Some(2), Some(2), Some(0)) {
+        return Err(
+            "typed libtest counts: mutating a typed terminal result did not move the pass count"
+                .into(),
+        );
+    }
+
+    let mut mixed_failure = outcome("test.mixed-failure", false, Some(2), Some(1));
+    mixed_failure.test_results = Some(vec![
+        TestResult::new("mixed-pass".into(), true, 1)?,
+        TestResult::new("mixed-fail".into(), false, 1)?,
+    ]);
+    let successful_count_only = outcome("test.successful-count-only", true, Some(3), Some(2));
+    if libtest_counts(&[mixed_failure, successful_count_only])
+        != (Some(5), Some(4), Some(3))
+    {
+        return Err(
+            "typed libtest counts: mixed failed typed and successful count-only outcomes did not retain an exact pass total"
+                .into(),
+        );
+    }
+
+    let compat_pass = outcome("compat.pass-case", true, None, None);
+    let compat_fail = outcome("compat.fail-case", false, None, None);
+    let compat_attempts = vec![
+        reported_attempt(&compat_pass, 1),
+        reported_attempt(&compat_fail, 1),
+        reported_attempt(&compat_fail, 2),
+    ];
+    let compat = compat_test_results(&[compat_pass.clone(), compat_fail.clone()], &compat_attempts)?;
+    let compat_rows = compat
+        .results
+        .as_ref()
+        .ok_or("typed libtest counts: compatibility producer wrote retained schema 1")?;
+    if compat.executed_tests != 2
+        || compat.filtered_tests != 0
+        || compat_rows
+            != &vec![
+                TestResult::new("pass-case".into(), true, 1)?,
+                TestResult::new("fail-case".into(), false, 2)?,
+            ]
+    {
+        return Err(format!(
+            "typed libtest counts: compatibility results lost a verdict or attempt: {compat:?}"
+        ));
+    }
+    let missing_attempt = compat_test_results(&[compat_pass], &[])
+        .expect_err("compatibility result without an attempt must refuse");
+    if !missing_attempt.contains("pass-case") || !missing_attempt.contains("no recorded attempt")
+    {
+        return Err(format!(
+            "typed libtest counts: missing compatibility attempt did not fail by name: {missing_attempt}"
+        ));
+    }
+
+    let stale_fail = outcome("compat.stale-fail", false, None, None);
+    let stale_attempts = vec![
+        reported_attempt(&stale_fail, 1),
+        unreported_attempt(stale_fail.tag.clone(), 2),
+    ];
+    let stale_error = compat_test_results(&[stale_fail], &stale_attempts)
+        .expect_err("a fail followed by an unreported retry must refuse");
+    if !stale_error.contains("stale-fail")
+        || !stale_error.contains("latest attempt 2")
+        || !stale_error.contains("no completed report")
+    {
+        return Err(format!(
+            "typed libtest counts: stale retained failure was not refused by latest attempt: {stale_error}"
+        ));
+    }
     println!(
-        "  typed libtest counts: 873/350 pass and 23/5 failure counted; 0/0 preserved; unknown stayed null"
+        "  typed libtest counts: exact 873/873/350 pass; retained count-only failure stayed unknown; mixed typed failure aggregated exactly; typed mutation moved 1 -> 2; compatibility rows carried terminal verdicts and latest attempt ordinals; fail-then-unreported refused; 0/0/0 preserved"
     );
     Ok(())
 }
@@ -13403,6 +14138,10 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         filtered_tests: Some(0),
         test_results: None,
         returncode: Some(1),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: "fixture failure".into(),
         aborted: false,
     };
@@ -13644,6 +14383,188 @@ fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn tool_root_split_bracket() -> Result<(), String> {
+    let root = std::env::temp_dir().join(format!(
+        "validate-tool-root-{}-{}",
+        std::process::id(),
+        epoch_now()
+    ));
+    let state_root = root.join("state-root");
+    let tool_root = root.join("tool-root");
+    let other_root = root.join("other-root");
+    let fake_root = root.join("fake-root");
+    let checkout = root.join("checkout");
+    let log = root.join("validate.log");
+    let git = |dir: &Path, args: &[&str]| -> Result<(), String> {
+        let status = Command::new("git")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .args(["-C", dir.to_str().ok_or("tool-root split: non-UTF-8 path")?])
+            .args(args)
+            .status()
+            .map_err(|error| format!("tool-root split: cannot run git: {error}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("tool-root split: git {args:?} exited {status}"))
+        }
+    };
+    std::fs::create_dir_all(state_root.join("ci-hub/validate"))
+        .and_then(|_| std::fs::create_dir_all(state_root.join("ci-hub/ledger")))
+        .and_then(|_| std::fs::create_dir_all(&checkout))
+        .and_then(|_| std::fs::create_dir_all(fake_root.join("ci-hub")))
+        // A real validate points TMPDIR inside its worktree. Without this
+        // invalid marker, Git walks upward from fake_root, finds that outer
+        // checkout, and this no longer exercises the non-repository refusal.
+        .and_then(|_| std::fs::write(fake_root.join(".git"), "not a git worktree\n"))
+        .map_err(|error| format!("tool-root split: cannot create fixture: {error}"))?;
+    std::fs::write(
+        state_root.join(".gitmodules"),
+        "[submodule \"hermit\"]\n\tpath = hermit\n\turl = fixture://hermit\n",
+    )
+    .and_then(|_| {
+        std::fs::write(
+            state_root.join("ci-hub/ci-hub"),
+            "#!/bin/sh\nroot=$(CDPATH= cd -- \"$(dirname \"$0\")/..\" && pwd)\n: > \"$root/authority-called\"\nexit 23\n",
+        )
+    })
+    .and_then(|_| {
+        std::fs::write(
+            state_root.join("ci-hub/validate/finalize_receipt.py"),
+            "import json\nfrom pathlib import Path\nroot = Path(__file__).resolve().parents[2]\nprint(json.dumps({'base_sha':root.name,'base_tree':'tool-tree','reverie_base_sha':'rev','reverie_base_tree':'rev-tree'}))\n",
+        )
+    })
+    .and_then(|_| {
+        std::fs::write(
+            state_root.join("ci-hub/ledger/validate_rows.py"),
+            "import json\nfrom pathlib import Path\nprint(json.dumps({'adapter_root': Path(__file__).resolve().parents[2].name}))\n",
+        )
+    })
+    .and_then(|_| std::fs::write(&log, "fixture\n"))
+    .map_err(|error| format!("tool-root split: cannot write fixture: {error}"))?;
+    std::fs::set_permissions(
+        state_root.join("ci-hub/ci-hub"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .map_err(|error| format!("tool-root split: cannot chmod fixture: {error}"))?;
+    git(&state_root, &["init", "-b", "main"])?;
+    git(&state_root, &["config", "user.email", "fixture@example.com"])?;
+    git(&state_root, &["config", "user.name", "fixture"])?;
+    git(&state_root, &["add", "."])?;
+    git(&state_root, &["commit", "-m", "fixture"])?;
+    git(
+        &state_root,
+        &["worktree", "add", "-b", "tool", tool_root.to_str().unwrap()],
+    )?;
+    git(
+        &root,
+        &["clone", state_root.to_str().unwrap(), other_root.to_str().unwrap()],
+    )?;
+
+    let saved_tool_root = std::env::var_os(TOOL_ROOT_ENV);
+    let saved_ledger = std::env::var_os(LEDGER_ENV);
+    // SAFETY: validate's self-test is single-threaded and restores this value.
+    unsafe { std::env::set_var(TOOL_ROOT_ENV, "relative/tool-root") };
+    if !configured_tool_root(Some(&state_root))
+        .is_err_and(|error| error.contains("must be absolute"))
+    {
+        return Err("tool-root split: relative explicit tool root did not refuse".into());
+    }
+    unsafe { std::env::set_var(TOOL_ROOT_ENV, root.join("missing")) };
+    if !configured_tool_root(Some(&state_root))
+        .is_err_and(|error| error.contains("cannot resolve explicit"))
+    {
+        return Err("tool-root split: missing explicit tool root did not refuse".into());
+    }
+    unsafe { std::env::set_var(TOOL_ROOT_ENV, &fake_root) };
+    if !configured_tool_root(Some(&state_root))
+        .is_err_and(|error| error.contains("not a readable Git worktree"))
+    {
+        return Err("tool-root split: non-repository tool root did not refuse".into());
+    }
+    unsafe { std::env::set_var(TOOL_ROOT_ENV, &other_root) };
+    if !configured_tool_root(Some(&state_root))
+        .is_err_and(|error| error.contains("is not a worktree of canonical"))
+    {
+        return Err("tool-root split: unrelated repository tool root did not refuse".into());
+    }
+    std::fs::write(tool_root.join("dirty"), "fixture\n")
+        .map_err(|error| format!("tool-root split: cannot dirty fixture: {error}"))?;
+    unsafe { std::env::set_var(TOOL_ROOT_ENV, &tool_root) };
+    if !configured_tool_root(Some(&state_root))
+        .is_err_and(|error| error.contains(" is dirty:"))
+    {
+        return Err("tool-root split: dirty explicit tool root did not refuse".into());
+    }
+    std::fs::remove_file(tool_root.join("dirty"))
+        .map_err(|error| format!("tool-root split: cannot clean fixture: {error}"))?;
+    let resolved = configured_tool_root(Some(&state_root))?
+        .ok_or("tool-root split: explicit tool root disappeared")?;
+    if resolved != std::fs::canonicalize(&tool_root).map_err(|error| error.to_string())? {
+        return Err("tool-root split: explicit tool root resolved to another checkout".into());
+    }
+    if validate_history::canonical_ledger_adapter(
+        &state_root.join("ledger"),
+        Some(&tool_root),
+    ) != Some(tool_root.join("ci-hub/ledger/validate_rows.py"))
+    {
+        return Err("tool-root split: ledger adapter resolved through the state root".into());
+    }
+    let tool_authority_marker = tool_root.join("authority-called");
+    let authority = canonical_validate_lock_admission(Some(&tool_root), "fixture", "fixture-host");
+    if authority.is_ok() || !tool_authority_marker.is_file() {
+        return Err(
+            "tool-root split: authority did not execute exclusively from the tool root".into(),
+        );
+    }
+
+    let receipt = receipt_evidence(Some(&tool_root), &checkout, &log, "fixture");
+    if receipt.base_sha != serde_json::json!("tool-root")
+        || receipt.base_tree != serde_json::json!("tool-tree")
+    {
+        return Err("tool-root split: receipt finalizer did not execute from the tool root".into());
+    }
+
+    let refusal = product_front_door_refusal(
+        &tool_root,
+        &checkout,
+        "fixture",
+        "full --no-label-pr",
+        true,
+        false,
+    )
+    .ok_or("tool-root split: product front door omitted refusal")?;
+    let tool_launcher = tool_root.join("ci-hub/ci-hub").to_string_lossy().into_owned();
+    let state_launcher = state_root.join("ci-hub/ci-hub").to_string_lossy().into_owned();
+    if !refusal.contains(&tool_launcher) || refusal.contains(&state_launcher) {
+        return Err("tool-root split: remediation named the state root instead of tool root".into());
+    }
+
+    // The reader and writer share this single adapter-path resolver. Exercise
+    // the real reader from the tool checkout while the ledger itself remains
+    // rooted under canonical state.
+    unsafe { std::env::remove_var(LEDGER_ENV) };
+    let rows = validate_history::read_rows(&state_root.join("ledger"));
+    if rows.len() != 1 || rows[0]["adapter_root"] != "tool-root" {
+        return Err("tool-root split: canonical ledger adapter executed from state root".into());
+    }
+
+    match saved_tool_root {
+        Some(value) => unsafe { std::env::set_var(TOOL_ROOT_ENV, value) },
+        None => unsafe { std::env::remove_var(TOOL_ROOT_ENV) },
+    }
+    match saved_ledger {
+        Some(value) => unsafe { std::env::set_var(LEDGER_ENV, value) },
+        None => unsafe { std::env::remove_var(LEDGER_ENV) },
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+    println!(
+        "  tool-root split: authority, receipt finalizer, and remediation use executable code; state remains separate"
+    );
+    Ok(())
+}
+
 fn validate_series_writer_bracket() -> Result<(), String> {
     let root = std::env::temp_dir().join(format!(
         "validate-series-writer-{}-{}",
@@ -13651,14 +14572,16 @@ fn validate_series_writer_bracket() -> Result<(), String> {
         epoch_now()
     ));
     let parent = root.join("parent");
+    let tool_root = root.join("tool-root");
     let checkout = root.join("checkout");
     let results = root.join("results/bucket");
-    std::fs::create_dir_all(parent.join("ci-hub/series"))
+    std::fs::create_dir_all(&parent)
+        .and_then(|_| std::fs::create_dir_all(tool_root.join("ci-hub/series")))
         .and_then(|_| std::fs::create_dir_all(&checkout))
         .and_then(|_| std::fs::create_dir_all(&results))
         .map_err(|error| format!("validate series writer: cannot create fixture: {error}"))?;
     std::fs::write(
-        parent.join("ci-hub/series/series.py"),
+        tool_root.join("ci-hub/series/series.py"),
         r#"import json
 import pathlib
 import sys
@@ -13693,6 +14616,7 @@ print("fixture append accepted")
     unsafe { std::env::set_var("E2E_RUN_ID", "validate-series-fixture") };
     let appended = append_validate_series(
         Some(&parent),
+        Some(&tool_root),
         &checkout,
         &root.join("results"),
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -13748,6 +14672,10 @@ fn possible_missing_artifact_bracket() -> Result<(), String> {
         filtered_tests: None,
         test_results: None,
         returncode,
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: String::new(),
         aborted: false,
     };
@@ -13783,6 +14711,10 @@ fn no_result_propagation_bracket() -> Result<(), String> {
         filtered_tests: None,
         test_results: None,
         returncode: Some(returncode),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: String::new(),
         aborted,
     };
@@ -14070,6 +15002,7 @@ fn write_ledger(
         // the counts every downstream `is_clean_full_pass` predicate keys on, so
         // a row without them is a NON-VERDICT, not a green.
         "executed_tests": ctx.executed_tests,
+        "passed_tests": ctx.passed_tests,
         "filtered_tests": ctx.filtered_tests,
         "gates_run": gate_records,
         "gates_expected": gates_expected,
@@ -14138,11 +15071,16 @@ fn write_ledger(
         .filter(|value| !value.is_empty())
         .is_some_and(|value| Path::new(&value) == ledger);
     if !explicit && ledger.file_name().is_some_and(|name| name == "ledger") {
-        let Some(parent) = ledger.parent() else {
+        let configured_tool_root = std::env::var_os(TOOL_ROOT_ENV)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        let Some(adapter) = validate_history::canonical_ledger_adapter(
+            ledger,
+            configured_tool_root.as_deref(),
+        ) else {
             eprintln!("validate: warning: canonical ledger root has no parent: {}", ledger.display());
             return;
         };
-        let adapter = parent.join("ci-hub/ledger/validate_rows.py");
         let mut child = match Command::new("python3")
             .arg(&adapter)
             .arg("record")
@@ -14455,6 +15393,7 @@ struct RunSummary {
     /// status-line ordering contract.
     epilogue: Vec<String>,
     profile: String,
+    selection_mode: Option<String>,
     commit: String,
     nodes_executed: usize,
     nodes_failed: usize,
@@ -14491,6 +15430,9 @@ struct RunSummary {
     /// receipt unciteable). `None` on a path that stopped before cleanup; `main`
     /// then measures live rather than printing nothing.
     cpu_wall: Option<(f64, f64, f64)>,
+    /// Bookkeeping performed after the validation verdict was finalized.
+    /// Failure remains a loud command error but cannot rewrite that verdict.
+    scorecard_writeback: Option<ScorecardWriteback>,
 }
 
 impl RunSummary {
@@ -14504,6 +15446,7 @@ impl RunSummary {
             detail,
             epilogue: Vec::new(),
             profile: profile.to_string(),
+            selection_mode: None,
             commit: git_sha(),
             nodes_executed: 0,
             nodes_failed: 0,
@@ -14520,6 +15463,7 @@ impl RunSummary {
             log: None,
             ledger: None,
             cpu_wall: None,
+            scorecard_writeback: None,
         }
     }
     /// Admission control declined. `what` names the gate, `why` the reason.
@@ -14586,6 +15530,12 @@ fn retain_cells_with_retry_attempt_available(
     keep.retain(|tag| retry_attempt_available(cfg, attempts, tag));
 }
 
+fn is_manifest_run_tag(cfg: &DagConfig, tag: &str) -> bool {
+    cfg.steps
+        .iter()
+        .any(|step| step.tag() == tag && is_manifest_run_step(step))
+}
+
 fn retry_candidate_tags(
     cfg: &DagConfig,
     blocked: &[(String, RetryClass, Option<String>)],
@@ -14600,6 +15550,12 @@ fn retry_candidate_tags(
     keep.extend(by_tag.values().filter(|outcome| outcome.aborted).map(|outcome| outcome.tag.clone()));
     keep.extend(unreported_non_intentional_steps(cfg, by_tag, skipped));
     keep.extend(latest_unreported.iter().cloned());
+    // The framework already spends a manifest cell's retry inside test-harness.
+    // Keep every manifest node out of later scheduler graphs, whether its first
+    // graph result was a reported failure, dependency skip, abort, or no report.
+    // Those incomplete states remain explicit evidence; retrying the category
+    // here would rerun passing peers beside the cell that failed.
+    keep.retain(|tag| !is_manifest_run_tag(cfg, tag));
     retain_cells_with_retry_attempt_available(&mut keep, cfg, attempts);
     keep
 }
@@ -14987,8 +15943,7 @@ fn run_summary_lines(s: &RunSummary, started: std::time::Instant) -> Vec<String>
         return Vec::new();
     }
     let validation_exit_code = final_validate_status(s.verdict)
-        .map(FinalValidateStatus::exit_code)
-        .and_then(|code| u8::try_from(code).ok())
+        .map(|status| u8::try_from(status.exit_code()).expect("fixed exit fits u8"))
         .unwrap_or(s.exit_code);
     let mut lines = vec![
         String::new(),
@@ -15128,13 +16083,11 @@ fn run_summary_lines(s: &RunSummary, started: std::time::Instant) -> Vec<String>
         validate_runtime::cpu_wall_line(human_duration, wall, user, sys, host_cpus)
     ));
     lines.extend(s.epilogue.iter().cloned());
-    if let Some(mut status) = final_validate_status(s.verdict) {
-        if status.exit_code() != i32::from(s.exit_code) {
-            status = FinalValidateStatus::CouldNotRun;
-        }
+    if let Some(status) = final_validate_status(s.verdict) {
         // LAST by contract. A wrapper, guest, fixture or quoted diagnostic may
-        // have written an earlier lookalike to the same channel; readers use the
-        // last occurrence and require its value to agree with the exit code.
+        // have written an earlier lookalike to the same channel. This line is the
+        // validation verdict; the versioned result records a distinct post-verdict
+        // write-back failure when the command exit does not match that verdict.
         lines.push(format!("{FINAL_VALIDATE_STATUS_PREFIX}{}", status.as_str()));
     }
     lines
@@ -15149,21 +16102,22 @@ fn print_run_summary(s: &RunSummary, started: std::time::Instant) {
 fn write_validation_service_result(path: &Path, summary: &RunSummary) -> Result<(), String> {
     use std::io::Write;
 
-    let Some(mut status) = final_validate_status(summary.verdict) else {
+    let Some(status) = final_validate_status(summary.verdict) else {
         return Ok(());
     };
-    if status.exit_code() != i32::from(summary.exit_code) {
-        status = FinalValidateStatus::CouldNotRun;
-    }
-    let result = ValidationServiceResult::new(
-        summary.commit.clone(),
-        summary.profile.clone(),
-        status,
-        i32::from(summary.exit_code),
-        u64::try_from(summary.nodes_executed)
+    let result = ValidationServiceResult {
+        schema_version: hermit_manifest_plan::service_result::SCHEMA_VERSION,
+        commit: summary.commit.clone(),
+        profile: summary.profile.clone(),
+        selection_mode: summary.selection_mode.clone(),
+        final_validate_status: status,
+        exit_code: i32::from(summary.exit_code),
+        executed_nodes: u64::try_from(summary.nodes_executed)
             .map_err(|_| "validation-service-result-executed_nodes exceeds u64".to_string())?,
-        summary.executed_tests,
-    )?;
+        executed_tests: summary.executed_tests,
+        scorecard_writeback: summary.scorecard_writeback.clone(),
+    }
+    .validated()?;
     let bytes = serde_json::to_vec(&result)
         .map_err(|error| format!("cannot encode validation service result: {error}"))?;
     let parent = path.parent().ok_or_else(|| {
@@ -15624,7 +16578,11 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // that merely prints a libtest-looking banner cannot manufacture evidence
     // that tests executed.
     unsafe { std::env::set_var("DAGRUN_REQUIRE_STRUCTURED_TEST_COUNTS", "1") };
-    let parent = find_parent(&root);
+    let discovered_parent = find_parent(&root);
+    let parent = std::env::var_os(PARENT_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or(discovered_parent);
     if std::env::var_os(PARENT_ENV).is_none() {
         if let Some(parent) = &parent {
             // Child test-harness processes use the same parent checkout for the
@@ -15633,6 +16591,22 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             std::env::set_var(PARENT_ENV, parent);
         }
     }
+    let tool_root = match configured_tool_root(parent.as_deref()) {
+        Ok(tool_root) => tool_root,
+        Err(error) => {
+            return RunSummary::refused(
+                2,
+                &level_name,
+                "dev-hermit tool root",
+                vec![
+                    error,
+                    format!(
+                        "an explicit {TOOL_ROOT_ENV} must identify the immutable dev-hermit checkout whose ci-hub code launched this run"
+                    ),
+                ],
+            );
+        }
+    };
     // The profile name is needed by the admission gates below, which run BEFORE
     // the plan exists. It is derived exactly as `build_plan` derives it, so the
     // lock record and the ledger row can never disagree about what was running.
@@ -15719,7 +16693,13 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // the invocation lock: it never runs a gate, and a leaked fixture must never
     // wedge a real run.
     if validate_runtime::stop_test_requested() {
-        return stop_test_seam(&root, &profile_name, parent.as_deref());
+        return stop_test_seam(
+            &root,
+            &profile_name,
+            parent.as_deref(),
+            tool_root.as_deref(),
+            args.allow_local_off_the_record_run,
+        );
     }
 
     if args.allow_local_off_the_record_run {
@@ -15751,7 +16731,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // Help, self-test and the stop-test seam returned above; `--show-plan` is
     // explicitly inert here.
     let ci_hub_dir_present =
-        parent.as_ref().is_some_and(|candidate| candidate.join("ci-hub").is_dir());
+        tool_root.as_ref().is_some_and(|candidate| candidate.join("ci-hub").is_dir());
     if !args.allow_local_off_the_record_run
         && product_front_door_applies(
         parent.is_some(),
@@ -15760,11 +16740,13 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         args.show_plan,
     )
     {
-        let parent = parent.as_deref().expect("front-door predicate requires a parent");
+        let tool_root = tool_root
+            .as_deref()
+            .expect("front-door predicate requires an executable tool root");
         let commit = git_sha();
         let host = short_hostname();
-        let ci_hub_launcher_available = parent.join("ci-hub/ci-hub").is_file();
-        let admission = canonical_validate_lock_admission(Some(parent), &commit, &host);
+        let ci_hub_launcher_available = tool_root.join("ci-hub/ci-hub").is_file();
+        let admission = canonical_validate_lock_admission(Some(tool_root), &commit, &host);
         // NAME THE CONJUNCT THAT FAILED. The decision is unchanged -- it is still
         // exactly `admission.is_ok()` -- but a refusal that lists three
         // possibilities and identifies none is undiagnosable from outside, and
@@ -15773,7 +16755,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         let admitted = admission.is_ok();
         let why = admission.err();
         if let Some(refusal) = product_front_door_refusal(
-            parent,
+            tool_root,
             &root,
             &commit,
             &requested_validate_args(),
@@ -16337,6 +17319,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                     ),
                 ],
             );
+            s.selection_mode = Some(plan.selection_mode.into());
             s.ledger = Some(ledger.clone());
             return s;
         }
@@ -16644,7 +17627,13 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let series_error = if nesting.nested || args.allow_local_off_the_record_run {
         None
     } else {
-        match append_validate_series(parent.as_deref(), &root, &e2e_result_root, &commit) {
+        match append_validate_series(
+            parent.as_deref(),
+            tool_root.as_deref(),
+            &root,
+            &e2e_result_root,
+            &commit,
+        ) {
             Ok(_) => None,
             Err(error) => {
                 eprintln!("validate: ERROR: completed cell results were not added to the series: {error}");
@@ -16664,7 +17653,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // Whole-run CPU, taken once in THIS process (a worker thread would see only
     // its own accounting, exactly as a bash subshell's `times` would).
     let (cpu_user, cpu_sys) = validate_runtime::process_cpu_seconds();
-    let (executed_tests, filtered_tests) = libtest_counts(&outcomes);
+    let (executed_tests, passed_tests, filtered_tests) = libtest_counts(&outcomes);
     if executed_tests.is_none() {
         eprintln!(
             "validate: WARNING: libtest counts are UNKNOWN for this run. A ledger row with \
@@ -16676,7 +17665,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // The parent still supplies exact base and pin evidence, but its historical
     // per-node coverage parser reads printable banners. Rebuild coverage from
     // dagrun's structured producer results so stdout cannot qualify a node.
-    let receipt = receipt_evidence(parent.as_deref(), &root, &log_path, &commit);
+    let receipt = receipt_evidence(tool_root.as_deref(), &root, &log_path, &commit);
     let coverage = typed_test_node_coverage(&plan.planned_test_nodes, &outcomes);
 
     let behind_ahead = sh("git", &["rev-list", "--left-right", "--count", "origin/main...HEAD"])
@@ -16689,7 +17678,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // Observed, not inferred: did the pin gate actually run and pass in THIS run?
     let pin_gate_passed = outcomes.iter().any(|o| o.tag == PIN_GATE_TAG && o.ok);
     let lock_admitted =
-        canonical_validate_lock_admission(parent.as_deref(), &commit, &host).is_ok();
+        canonical_validate_lock_admission(tool_root.as_deref(), &commit, &host).is_ok();
     let ctx = LedgerCtx {
         started_at,
         host: host.clone(),
@@ -16728,6 +17717,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         cpu_sys,
         retry_rounds: u64::try_from(retry_rounds).expect("retry round count fits u64"),
         executed_tests,
+        passed_tests,
         filtered_tests,
     };
     if let (Some(a), Some(l)) = (peak_active, peak_live) {
@@ -16766,8 +17756,12 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         // This is below the interrupted run's ledger write. Keep the checkout
         // lock held while the generated files are replaced, so a second local
         // validate cannot begin against the tree between those two operations.
-        let scorecard_writeback =
-            local_scorecard_writeback(&root, &e2e_result_root, nesting.nested);
+        let scorecard_writeback = local_scorecard_writeback(
+            &root,
+            &e2e_result_root,
+            nesting.nested,
+            args.allow_local_off_the_record_run,
+        );
         drop(run_record);
         let _ = std::fs::remove_dir_all(&tmp);
         let mut detail = vec![
@@ -16792,6 +17786,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         s.nodes_skipped = skipped.len();
         s.nodes_host_inapplicable = plan.host_inapplicable.len();
         s.executed_tests = executed_tests;
+        s.selection_mode = Some(plan.selection_mode.into());
         s.wall_s = Some(wall);
         s.jobs = Some(jobs);
         s.log = Some(log_path);
@@ -16817,7 +17812,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         let floor = match mode {
             CompatMode::Sabre => Some(validate_corpus::SABRE_COMPAT_EXPECTED),
             CompatMode::Rr => Some(validate_corpus::RR_COMPAT_EXPECTED),
-            _ => None,
+            CompatMode::Strict | CompatMode::PortableStrict | CompatMode::E9patch => None,
         };
         if let Some(f) = floor {
             if passed < f {
@@ -16959,14 +17954,21 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
 
     // Receipt production is itself an enforcement path (validate.sh:1846).
     //
-    // Every profile plans `pre.reverie_pin` and every lane node depends on it, so
-    // in principle a green cannot happen without it. This asserts that anyway: if
-    // a future fast path, cache branch, or early return ever bypasses the pin
-    // gate, it must not emit PASS merely because the tests it did select happened
-    // to pass. The archival pin is not a testing exemption, and "the DAG makes it
-    // impossible" is a structural argument, not an observation of this run.
+    // Every receipt-producing profile plans `pre.reverie_pin` and every lane
+    // node depends on it, so in principle a green receipt cannot happen without
+    // it. This asserts that anyway: if a future fast path, cache branch, or early
+    // return ever bypasses the pin gate, it must not emit PASS merely because the
+    // tests it did select happened to pass. An off-the-record selected subgraph
+    // is the explicit exception: it cannot write a ledger row or receipt, and
+    // the external workflow already depends on the preflight result. The
+    // archival pin is not a testing exemption, and "the DAG makes it impossible"
+    // is a structural argument, not an observation of a receipt-producing run.
     let mut pin_gate_bypassed = false;
-    if exit_code == 0 && !pin_gate_passed {
+    if pin_gate_blocks_pass(
+        exit_code,
+        pin_gate_passed,
+        args.allow_local_off_the_record_run,
+    ) {
         eprintln!(
             "validate: ERROR: this path produced a PASS without a passing {PIN_GATE_TAG} gate; \
              refusing a passing receipt."
@@ -16981,21 +17983,12 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // that node executed work. The value comes from the typed compatibility
     // outcomes, never from the nested process's printable summary.
     if nesting.nested {
-        let nested_counts = compat_measured
-            .and_then(|count| i64::try_from(count).ok())
-            .map(|count| (count, 0))
-            .or_else(|| executed_tests.zip(filtered_tests));
-        match nested_counts {
-            Some((executed, filtered)) => {
-                if let Err(error) = publish_structured_test_counts(executed, filtered) {
-                    eprintln!("validate: ERROR: {error}");
-                    exit_code = 1;
-                }
-            }
-            None => {
-                eprintln!(
-                    "validate: ERROR: nested validation produced no structured executed-test count"
-                );
+        match compat_test_results(&outcomes, &attempts)
+            .and_then(|results| publish_structured_test_results(&results))
+        {
+            Ok(()) => {}
+            Err(error) => {
+                eprintln!("validate: ERROR: {error}");
                 exit_code = 1;
             }
         }
@@ -17175,8 +18168,12 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // lock remains held here, so another direct validate cannot start between
     // receipt finalization and this write-back. ci-hub additionally writes the
     // completed results back to the checkout that invoked the isolated run.
-    let scorecard_writeback =
-        local_scorecard_writeback(&root, &e2e_result_root, nesting.nested);
+    let scorecard_writeback = local_scorecard_writeback(
+        &root,
+        &e2e_result_root,
+        nesting.nested,
+        args.allow_local_off_the_record_run,
+    );
 
     // Read the individual results before removing the disposable build root: a
     // caller may deliberately place E2E_RESULT_ROOT there. The scheduler is
@@ -17313,7 +18310,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     }
     match executed_tests {
         Some(n) => detail.push(format!(
-            "{n} test(s) executed, {} filtered (aggregated from typed step outcomes)",
+            "{n} test(s) executed, {} passed, {} filtered (aggregated from typed step outcomes)",
+            passed_tests.map(|p| p.to_string()).unwrap_or_else(|| "unknown".into()),
             filtered_tests.map(|f| f.to_string()).unwrap_or_else(|| "unknown".into())
         )),
         None => detail.push(
@@ -17352,6 +18350,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     s.nodes_skipped = skipped.len();
     s.nodes_host_inapplicable = plan.host_inapplicable.len();
     s.executed_tests = executed_tests;
+    s.selection_mode = Some(plan.selection_mode.into());
     s.wall_s = Some(wall);
     s.jobs = Some(jobs);
     s.log = Some(log_path);
@@ -17384,7 +18383,13 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
 /// that unrepresentable — orphan detection (`getppid() == 1`) and a lifetime
 /// deadline — and the Python harness additionally tears its own child's process
 /// group down in a `finally`.
-fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSummary {
+fn stop_test_seam(
+    root: &Path,
+    profile: &str,
+    parent: Option<&Path>,
+    tool_root: Option<&Path>,
+    off_the_record: bool,
+) -> RunSummary {
     let started_at = utc_now();
     let started = std::time::Instant::now();
     let prior_failure = env_flag("VALIDATE_STOP_TEST_PRIOR_FAILURE", "1");
@@ -17397,6 +18402,10 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
         filtered_tests: None,
         test_results: None,
         returncode: Some(if ok { 0 } else { 1 }),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
         reason: if ok { String::new() } else { "stop-test synthetic failure".into() },
         aborted: false,
     };
@@ -17438,7 +18447,7 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     let wall = started.elapsed().as_secs_f64();
     let ledger = ledger_path(root);
     let host = short_hostname();
-    let lock_admitted = canonical_validate_lock_admission(parent, &commit, &host).is_ok();
+    let lock_admitted = canonical_validate_lock_admission(tool_root, &commit, &host).is_ok();
     let ctx = LedgerCtx {
         started_at,
         host,
@@ -17472,6 +18481,7 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
         cpu_sys,
         retry_rounds: 0,
         executed_tests: None,
+        passed_tests: None,
         filtered_tests: None,
     };
     // `suite_complete: false` — a fixture that ran two synthetic gates must never
@@ -17480,23 +18490,25 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     // The fixture plans exactly the synthetic gates it ran, withholds nothing,
     // and leaves nothing unaccounted.
     let planned_tags: BTreeSet<String> = outcomes.iter().map(|o| o.tag.clone()).collect();
-    write_ledger(
-        &ledger,
-        &ctx,
-        &outcomes,
-        &[],
-        &[],
-        &[],
-        &planned_tags,
-        wall,
-        exit_code,
-        "",
-        false,
-        serde_json::json!({}),
-        None,
-    );
+    if !off_the_record {
+        write_ledger(
+            &ledger,
+            &ctx,
+            &outcomes,
+            &[],
+            &[],
+            &[],
+            &planned_tags,
+            wall,
+            exit_code,
+            "",
+            false,
+            serde_json::json!({}),
+            None,
+        );
+    }
 
-    let detail = match exit {
+    let mut detail = match exit {
         validate_runtime::StopTestExit::Signalled => vec![format!(
             "stop-path fixture: stopped by SIG{}; recorded as {}",
             interruption.clone().unwrap_or_default(),
@@ -17518,6 +18530,12 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
                 .into(),
         ],
     };
+    if off_the_record {
+        detail.push(
+            "stop-path fixture ran OFF THE RECORD: no ledger row, receipt, scorecard, or label was published"
+                .into(),
+        );
+    }
     let mut s = RunSummary::new(
         if interruption.is_some() { Verdict::Interrupted } else { Verdict::Fail },
         exit_code,
@@ -17528,7 +18546,9 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     s.nodes_failed = outcomes.iter().filter(|o| !o.ok).count();
     s.wall_s = Some(wall);
     s.cpu_wall = Some((wall, cpu_user, cpu_sys));
-    s.ledger = Some(ledger);
+    if !off_the_record {
+        s.ledger = Some(ledger);
+    }
     s
 }
 
@@ -17536,11 +18556,10 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
 mod e2e_attempt_tests {
     use super::*;
 
-    #[test]
-    fn only_manifest_harness_steps_receive_the_retry_attempt() {
-        let mut manifest = step_with_caps(
-            "quick",
-            "e2e_verify",
+    fn manifest_step(job: &str) -> Step {
+        let mut step = step_with_caps(
+            "e2e",
+            job,
             "fixture",
             "target/debug/test-harness run --lane portable --ci-only".into(),
             Vec::new(),
@@ -17548,42 +18567,90 @@ mod e2e_attempt_tests {
             30,
             64 * 1024 * 1024,
         );
-        assert_eq!(
-            validation_step_identity(&manifest),
-            ValidationStepIdentity::ManifestRun
-        );
-        set_manifest_attempt(&mut manifest, 2);
-        assert_eq!(
-            manifest
-                .env
-                .get(validate_plan::E2E_ATTEMPT_ENV)
-                .map(String::as_str),
-            Some("2")
-        );
+        step.manifest = Some(DagManifest {
+            lane: "portable".into(),
+            category: "applications".into(),
+        });
+        step
+    }
 
-        let mut unrelated = step_with_caps(
+    fn ordinary_step(job: &str) -> Step {
+        step_with_caps(
             "test",
-            "unit",
+            job,
             "fixture",
             "cargo test".into(),
             Vec::new(),
             30,
             30,
             64 * 1024 * 1024,
-        );
-        set_manifest_attempt(&mut unrelated, 2);
-        assert!(!unrelated.env.contains_key(validate_plan::E2E_ATTEMPT_ENV));
+        )
+    }
 
-        let mut relabelled = step_with_caps(
-            "fixture",
-            "custom_manifest_runner",
-            "fixture",
-            "./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane portable"
-                .into(),
-            Vec::new(),
-            30,
-            30,
-            64 * 1024 * 1024,
+    fn outcome(tag: &str, ok: bool, aborted: bool) -> StepOutcome {
+        StepOutcome {
+            tag: tag.into(),
+            ok,
+            duration_s: 0.0,
+            summary: String::new(),
+            executed_tests: None,
+            filtered_tests: None,
+            test_results: None,
+            returncode: Some(if ok { 0 } else { 1 }),
+            oomed: false,
+            oom_kills: 0,
+            timed_out: false,
+            cpu_timed_out: false,
+            reason: if ok { String::new() } else { "fixture failure".into() },
+            aborted,
+        }
+    }
+
+    fn assert_only_ordinary(keep: BTreeSet<String>, ordinary: &str, source: &str) {
+        assert_eq!(keep, BTreeSet::from([ordinary.to_string()]), "source={source}");
+    }
+
+    #[test]
+    fn manifest_harness_steps_do_not_receive_an_outer_attempt() {
+        let manifest = manifest_step("manifest_applications");
+        assert_eq!(validation_step_identity(&manifest), ValidationStepIdentity::ManifestRun);
+        assert!(!manifest.env.contains_key("E2E_ATTEMPT"));
+
+        let ordinary = ordinary_step("unit");
+        assert_eq!(validation_step_identity(&ordinary), ValidationStepIdentity::Other);
+        assert!(!ordinary.env.contains_key("E2E_ATTEMPT"));
+    }
+
+    #[test]
+    fn manifest_harness_steps_never_enter_an_outer_retry_from_any_source() {
+        let manifest = manifest_step("manifest_applications");
+        let ordinary = ordinary_step("unit");
+        let manifest_tag = manifest.tag();
+        let ordinary_tag = ordinary.tag();
+        let cfg = DagConfig { steps: vec![manifest, ordinary], ..Default::default() };
+
+        let failed_by_tag = BTreeMap::from([
+            (manifest_tag.clone(), outcome(&manifest_tag, false, false)),
+            (ordinary_tag.clone(), outcome(&ordinary_tag, false, false)),
+        ]);
+        let failed_attempts = vec![
+            reported_attempt(failed_by_tag.get(&manifest_tag).unwrap(), 1),
+            reported_attempt(failed_by_tag.get(&ordinary_tag).unwrap(), 1),
+        ];
+        assert_only_ordinary(
+            retry_candidate_tags(
+                &cfg,
+                &[
+                    (manifest_tag.clone(), "always-eligible".into()),
+                    (ordinary_tag.clone(), "always-eligible".into()),
+                ],
+                &[],
+                &failed_by_tag,
+                &BTreeSet::new(),
+                &failed_attempts,
+            ),
+            &ordinary_tag,
+            "reported failure/blocked",
         );
         assert_eq!(
             validation_step_identity(&relabelled),
@@ -17597,22 +18664,65 @@ mod e2e_attempt_tests {
             validation_step_identity(&relabelled),
             ValidationStepIdentity::ManifestRun
         );
-        set_manifest_attempt(&mut relabelled, 1);
-        assert_eq!(
-            relabelled
-                .env
-                .get(validate_plan::E2E_ATTEMPT_ENV)
-                .map(String::as_str),
-            Some("1")
+
+        assert_only_ordinary(
+            retry_candidate_tags(
+                &cfg,
+                &[],
+                &[manifest_tag.clone(), ordinary_tag.clone()],
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                &[],
+            ),
+            &ordinary_tag,
+            "dependency-skipped",
         );
-        let relabelled_cfg = DagConfig {
-            steps: vec![relabelled],
-            ..Default::default()
-        };
-        assert!(!retry_attempt_available(
-            &relabelled_cfg,
-            &[unreported_attempt("fixture.custom_manifest_runner".into(), 1)],
-            "fixture.custom_manifest_runner"
-        ));
+
+        let aborted_by_tag = BTreeMap::from([
+            (manifest_tag.clone(), outcome(&manifest_tag, false, true)),
+            (ordinary_tag.clone(), outcome(&ordinary_tag, false, true)),
+        ]);
+        assert_only_ordinary(
+            retry_candidate_tags(
+                &cfg,
+                &[],
+                &[],
+                &aborted_by_tag,
+                &BTreeSet::new(),
+                &[],
+            ),
+            &ordinary_tag,
+            "aborted by_tag",
+        );
+
+        assert_only_ordinary(
+            retry_candidate_tags(
+                &cfg,
+                &[],
+                &[],
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                &[],
+            ),
+            &ordinary_tag,
+            "derived unreported",
+        );
+
+        let completed_by_tag = BTreeMap::from([
+            (manifest_tag.clone(), outcome(&manifest_tag, true, false)),
+            (ordinary_tag.clone(), outcome(&ordinary_tag, true, false)),
+        ]);
+        assert_only_ordinary(
+            retry_candidate_tags(
+                &cfg,
+                &[],
+                &[],
+                &completed_by_tag,
+                &BTreeSet::from([manifest_tag, ordinary_tag.clone()]),
+                &[],
+            ),
+            &ordinary_tag,
+            "latest_unreported",
+        );
     }
 }

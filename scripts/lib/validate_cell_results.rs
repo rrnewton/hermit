@@ -8,6 +8,7 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
+use hermit_manifest_plan::canonical_verdict::InfrastructureError;
 use hermit_manifest_plan::canonical_verdict::Verdict as VerificationVerdict;
 use hermit_manifest_plan::canonical_verdict::VerificationReport;
 use hermit_manifest_plan::ledger::CellIdentity;
@@ -19,6 +20,7 @@ use hermit_manifest_plan::ledger::ComparedLogCounts;
 use hermit_manifest_plan::ledger::ComparisonSpec;
 use hermit_manifest_plan::ledger::ComparisonTier;
 use hermit_manifest_plan::ledger::RequiredNullable;
+use hermit_manifest_plan::runner::outcome_after_retries;
 use serde_json::Value;
 use sha2::Digest;
 use sha2::Sha256;
@@ -136,6 +138,15 @@ fn canonical_report(
     // `VerificationReport` owns the complete current top-level report. The
     // ledger types additionally deny unknown comparison/count fields, which
     // preserves schema 7's exact shape without a second hard-coded key list.
+    let report = VerificationReport::from_current_json_value(value.clone())?;
+    if report.verdict == VerificationVerdict::InfrastructureError {
+        return Err(match report.infrastructure_error.as_ref() {
+            Some(InfrastructureError::SkidOvershoot { count }) => format!(
+                "recorded infrastructure_error: {count} HERMIT_SKID_OVERSHOOT report(s)"
+            ),
+            None => unreachable!("typed report parser requires an infrastructure error"),
+        });
+    }
     let comparison = value
         .get("comparison")
         .cloned()
@@ -149,7 +160,6 @@ fn canonical_report(
             .ok_or("incomplete cell comparison: missing `compared_log_messages`")?,
     )
     .map_err(|error| format!("incomplete cell comparison counts: {error}"))?;
-    let report = VerificationReport::from_current_json_value(value)?;
     if !comparison.is_canonical_bitwise_info_v1(&compared_log_messages) {
         return Ok(None);
     }
@@ -548,7 +558,7 @@ pub fn retain(
     let mut selected = Vec::new();
     let mut identities = BTreeSet::new();
     let mut observations = BTreeSet::new();
-    let mut terminal_rows = BTreeMap::new();
+    let mut attempt_rows: BTreeMap<CellIdentity, Vec<(u64, Value)>> = BTreeMap::new();
     for (file, line_number, row) in read_result_rows(result_root)? {
             if row.get("schema").and_then(Value::as_u64) != Some(4)
                 || string(&row, "hermit_sha")? != commit
@@ -581,23 +591,32 @@ pub fn retain(
             if identities.insert(key.clone()) {
                 selected.push(id);
             }
-            if terminal_rows
-                .get(&key)
-                .is_none_or(|(seen, _): &(u64, Value)| attempt > *seen)
-            {
-                terminal_rows.insert(key, (attempt, row));
-            }
+            attempt_rows.entry(key).or_default().push((attempt, row));
     }
-    let mut cells = terminal_rows
+    let mut cells = attempt_rows
         .into_iter()
-        .map(|(identity, (_, row))| {
+        .map(|(identity, mut rows)| {
+            rows.sort_by_key(|(attempt, _)| *attempt);
+            let outcome = outcome_after_retries(rows.iter().map(|(attempt, row)| {
+                Ok((*attempt, string(row, "outcome")?))
+            }).collect::<Result<Vec<_>, String>>()?)?;
+            let row = rows
+                .iter()
+                .rev()
+                .find(|(_, row)| row.get("outcome").and_then(Value::as_str) == Some(outcome))
+                .map(|(_, row)| row)
+                .ok_or_else(|| {
+                    format!(
+                        "cell result history selected {outcome} without a matching row for {identity:?}"
+                    )
+                })?;
             Ok(LedgerCellResult {
                 lane: identity.lane,
                 category: identity.category,
                 test: identity.test,
                 mode: identity.mode,
                 backend: identity.backend,
-                cell_verdict: cell_verdict(&row)?,
+                cell_verdict: cell_verdict(row)?,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -714,6 +733,7 @@ mod tests {
             "verified": matched,
             "verdict": verdict,
             "bitwise_parity": matched,
+            "infrastructure_error": null,
             "comparison": {
                 "strictness": "canonical",
                 "display_name": "BitwiseInfoV1",
@@ -1019,7 +1039,7 @@ mod tests {
     }
 
     #[test]
-    fn retains_terminal_attempt_without_rejecting_preserved_history() {
+    fn retains_recovered_retry_without_rejecting_preserved_history() {
         let root = fixture_root();
         let results = root.join("results");
         let commit = "abababababababababababababababababababab";
@@ -1060,6 +1080,46 @@ mod tests {
     }
 
     #[test]
+    fn product_failure_remains_red_when_the_retry_has_an_infrastructure_error() {
+        let root = fixture_root();
+        let results = root.join("results");
+        let commit = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+        let mut first = result_row("validate-product-then-infrastructure", commit);
+        first["attempt"] = Value::from(1);
+        first["outcome"] = Value::String("FAIL".into());
+        let diverged: Value = serde_json::from_str(&report("diverged", "info")).unwrap();
+        replace_report(&mut first, &diverged);
+        let mut second = result_row("validate-product-then-infrastructure", commit);
+        second["attempt"] = Value::from(2);
+        second["outcome"] = Value::String("ERROR".into());
+        second["reason"] = Value::String("runner timed out before producing evidence".into());
+        append_result_row(&results, &first);
+        append_result_row(&results, &second);
+
+        let retained = retain(&root, &results, commit, &expected(&first)).unwrap();
+        assert_eq!(
+            retained.evidence["cells"][0]["cell_verdict"]["state"],
+            "compared-and-diverged"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retained_retry_history_refuses_a_missing_first_attempt_by_name() {
+        let root = fixture_root();
+        let results = root.join("results");
+        let commit = "dededededededededededededededededededede";
+        let mut row = result_row("validate-missing-first-attempt", commit);
+        row["attempt"] = Value::from(2);
+        write_result(&results, &row);
+
+        let error = retain(&root, &results, commit, &expected(&row)).unwrap_err();
+        assert!(error.contains("attempt 2"), "{error}");
+        assert!(error.contains("expected 1"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn refuses_mixed_bucket_run_ids() {
         let root = fixture_root();
         let results = root.join("results");
@@ -1080,6 +1140,38 @@ mod tests {
         row["reason"] = Value::String("SaBRe interception path was incomplete".into());
         let verdict = cell_verdict(&row).unwrap();
         assert!(matches!(verdict, CellVerdict::UnavailableWithReason { .. }));
+    }
+
+    #[test]
+    fn infrastructure_error_preserves_its_cause_with_or_without_a_comparison() {
+        for retain_comparison in [true, false] {
+            let mut row = result_row(
+                "infrastructure-row",
+                "3434343434343434343434343434343434343434",
+            );
+            row["outcome"] = Value::String("ERROR".into());
+            row["reason"] = Value::String(
+                "verification recorded 2 HERMIT_SKID_OVERSHOOT report(s)".into(),
+            );
+            let mut infrastructure: Value =
+                serde_json::from_str(&report("matched", "info")).unwrap();
+            infrastructure["verified"] = Value::Bool(false);
+            infrastructure["bitwise_parity"] = Value::Bool(false);
+            infrastructure["verdict"] = Value::String("infrastructure_error".into());
+            infrastructure["infrastructure_error"] =
+                serde_json::json!({"kind": "skid_overshoot", "count": 2});
+            if !retain_comparison {
+                infrastructure["comparison"] = Value::Null;
+                infrastructure["compared_log_messages"] = Value::Null;
+            }
+            replace_report(&mut row, &infrastructure);
+
+            let CellVerdict::UnavailableWithReason { reason, .. } = cell_verdict(&row).unwrap()
+            else {
+                panic!("infrastructure error became product evidence")
+            };
+            assert!(reason.contains("2 HERMIT_SKID_OVERSHOOT"), "{reason}");
+        }
     }
 
     #[test]

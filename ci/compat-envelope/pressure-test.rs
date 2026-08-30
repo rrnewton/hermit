@@ -56,6 +56,7 @@ use hermit_manifest_plan::host_capability::HostCapability;
 use hermit_manifest_plan::runner::AttemptResult;
 use hermit_manifest_plan::runner::CELL_RESULT_SCHEMA;
 use hermit_manifest_plan::runner::CellResult;
+use hermit_manifest_plan::runner::cell_result_after_retries;
 use hermit_manifest_plan::runner::E2E_RUN_INDEX_ENV;
 use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::ObservedResult;
@@ -152,11 +153,11 @@ fn establish_pressure_cgroups(run_timeout_s: i64) -> Result<BoxedCgroups, String
 const USAGE: &str = r#"Hermit compatibility pressure test
 
 Ordinary `validate` reruns the committed green compatibility cells and fails on
-regressions. This tool either probes currently red cells or repeats enabled
-green cells to measure flakiness. Every check runs under safe-ci resource and
-time limits and retains its raw evidence under ignored/. Red cells remain red
-unless a later reviewed scorecard change deliberately promotes them; repeated
-green results never edit the scorecard.
+regressions. This tool probes currently red cells by default and can repeat
+either red or explicitly selected green cells. Every check runs under safe-ci
+resource and time limits and retains its raw evidence under ignored/. Red cells
+remain red unless a later reviewed scorecard change deliberately promotes them;
+repeated results never edit the scorecard.
 
 Usage: ci/compat-envelope/pressure-test.rs COMMAND [OPTIONS]
 
@@ -174,10 +175,10 @@ Commands:
       is ignored/compat-envelope/pressure-<SHA>-<time>. A red chaos cell whose
       manifest declares no seeds remains red but is unavailable: exact requests
       refuse it, while batches report and omit it rather than inventing a run.
-      Add --repetitions N to an exact currently green cell to run N independent
-      boxed checks against the same clean committed source. Use --green with
-      --repetitions to select every enabled green cell in one shared-build DAG;
-      --mode and --sample may narrow that green population. Existing resource
+      Add --repetitions N to repeat every selected red cell in independent boxed
+      checks against the same clean committed source. Use --green with
+      --repetitions to select enabled green cells instead; an exact cell, --mode,
+      and --sample may narrow either population. Existing resource
       caps allow at most four manifest guests at once and at most one KVM guest.
       This reports per-cell flakiness; it never edits or demotes the scorecard.
       Only unfiltered --green covers the complete current green set; an exact
@@ -202,24 +203,25 @@ Exact-cell options (run and plan):
   --mode MODE              verify, replay, chaos, or naked
   --backend BACKEND        ptrace, dbt, kvm, sabre, liteinst, or native
   --cell-timeout SECONDS   Tighter cap for each selected cell; requires either
-                           an exact cell or --sample
-  --repetitions COUNT      Repeat one exact currently green cell in independent
-                           boxed jobs. COUNT must be positive. Plan and run
+                           an exact cell, --sample, or a repeated batch
+  --repetitions COUNT      Repeat each selected red cell in independent boxed
+                           jobs, or selected green cells with --green. COUNT must
+                           be positive. Plan and run
                            require a clean commit. At most four manifest guests
                            run at once, and KVM remains limited to one.
   --run-id-prefix ID       Bind each retained result to this physical invocation.
                            Accepted only with one exact repeated cell; letters,
                            digits, '.', '_', and '-' only.
 
-Bounded-batch options (run and plan):
+Selection and bounded-batch options (run and plan):
   --sample COUNT           Seeded random sample of red cells. Without --mode,
                            samples verify, replay, and chaos; custom and naked
                            are omitted. Sampling draws only from cells whose
                            manifests provide executable commands. With --green
                            and --repetitions, sample the enabled green cells.
-  --green                  With --repetitions, select all enabled green cells
-                           instead of one exact cell. Optional --mode and
-                           --sample filters are retained in run.json. A sample
+  --green                  With --repetitions, select enabled green cells instead
+                           of red cells. Exact --test/--mode/--backend, --mode,
+                           and --sample filters are retained in run.json. A sample
                            records selected/eligible counts and its seed in
                            run.json and summary.json; it is subset evidence,
                            not a full-population result.
@@ -241,11 +243,17 @@ Examples:
   ./ci/compat-envelope/pressure-test.rs run \
     --sample 10 --seed 42 --cell-timeout 60
 
+  # Repeat every executable red verify cell twice with one shared build.
+  ./ci/compat-envelope/pressure-test.rs plan \
+    --results ignored/compat-envelope/repeated-red-verify \
+    --mode verify --repetitions 2 --cell-timeout 60
+
   # Check one committed green cell 100 times under the same boxed limits.
   # The DAG admits at most four manifest guests at once (one for KVM).
   ./ci/compat-envelope/pressure-test.rs run \
     --test backend-parity-c/fork-exec-pipeline \
-    --mode verify --backend ptrace --repetitions 100 --cell-timeout 120
+    --mode verify --backend ptrace --green \
+    --repetitions 100 --cell-timeout 120
 
   # Check every enabled green cell once with one shared build.
   ./ci/compat-envelope/pressure-test.rs run \
@@ -265,8 +273,8 @@ How it runs:
   budgets from the typed manifest tool. The in-memory graph then reuses the
   canonical Hermit/resource build commands from ci/dag/portable.json without
   recursively running the full validation metadata audit. Fixture preparation
-  is serialized. Every selected red cell, or every selected green-cell
-  repetition, then runs in its own safe-ci cgroup. Existing resource caps admit
+  is serialized. Every selected-cell repetition then runs in its own safe-ci
+  cgroup. Existing resource caps admit
   four manifest guests at once and one KVM guest. A failure, timeout, OOM, or missing result does not
   intentionally stop later selected checks.
   The combined crash/error bucket contains remaining nonzero harness exits,
@@ -341,12 +349,16 @@ impl CellSelection {
         self.test.is_some() && self.mode.is_some() && self.backend.is_some()
     }
 
-    fn repeats_green_cell(&self) -> bool {
+    fn repeats_cells(&self) -> bool {
         self.repetitions.is_some()
     }
 
+    fn selects_green_population(&self) -> bool {
+        self.green
+    }
+
     fn uses_shared_preparation(&self) -> bool {
-        !self.is_exact() || self.repeats_green_cell()
+        !self.is_exact() || self.repeats_cells()
     }
 
     fn run_count(&self) -> usize {
@@ -358,7 +370,17 @@ impl CellSelection {
     }
 
     fn allows_dirty_source(&self) -> bool {
-        self.is_exact() && !self.repeats_green_cell()
+        self.is_exact() && !self.repeats_cells()
+    }
+
+    /// Repetitions of a SET of cells rather than of one named cell.
+    ///
+    /// Distinct from [`Self::is_exact`] with repetitions, which repeats a single
+    /// `--test/--mode/--backend` cell, and from a bare batch, which probes every
+    /// selected cell once. This is the shape a stability question needs: many
+    /// cells, each run several times.
+    fn repeats_batch(&self) -> bool {
+        self.repetitions.is_some() && !self.is_exact()
     }
 }
 
@@ -376,9 +398,6 @@ fn validate_repetition_selection(selection: &CellSelection) -> Result<(), String
         return Err("--repetitions must be positive".into());
     }
     if selection.is_exact() {
-        if selection.green {
-            return Err("--green cannot be combined with an exact cell".into());
-        }
         if selection.sample.is_some() || selection.seed.is_some() {
             return Err("an exact repeated cell cannot be combined with --sample or --seed".into());
         }
@@ -396,13 +415,29 @@ fn validate_repetition_selection(selection: &CellSelection) -> Result<(), String
         }
         return Ok(());
     }
-    if !selection.green {
-        return Err(
-            "--repetitions requires either an exact --test/--mode/--backend cell or --green".into(),
-        );
-    }
+    // A RED BATCH MAY REPEAT TOO, and the machinery was always generic: the plan
+    // writer expands every tracked cell through `repetition_numbers`, with
+    // nothing green-specific in it. Only this check stood in the way, so the
+    // whole red population could be probed ONCE each or one red cell repeated,
+    // and never many red cells repeated -- which is exactly the shape a
+    // stability question needs. Reaching it meant one invocation per cell, an
+    // ad-hoc loop around a tool that already knew how to schedule and bound the
+    // work itself.
+    // ⚠️ KEEP THIS EVEN THOUGH THE CLI CANNOT REACH IT. Through the command line
+    // an earlier check refuses any selection naming some of
+    // --test/--mode/--backend but not all, so every partial shape is rejected
+    // before arriving here -- measured on all four of them. That made this look
+    // like dead code and it was briefly removed; `self-test` immediately failed
+    // with "repeated selection accepted partial exact cell", because it
+    // exercises this validation DIRECTLY. The function carries its own contract
+    // and must refuse on its own terms rather than relying on a caller that
+    // happens to check first.
     if selection.test.is_some() || selection.backend.is_some() {
-        return Err("a repeated green batch accepts only an optional --mode filter".into());
+        return Err(
+            "a repeated batch accepts only an optional --mode filter; name a full \
+             --test/--mode/--backend cell to repeat exactly one"
+                .into(),
+        );
     }
     if selection.run_id_prefix.is_some() {
         return Err("--run-id-prefix is limited to one exact repeated cell".into());
@@ -950,6 +985,12 @@ struct RunMetadata {
     #[serde(default)]
     eligible_cells: usize,
     cells: Vec<CellId>,
+}
+
+impl RunMetadata {
+    fn is_exact(&self) -> bool {
+        self.test.is_some() && self.mode.is_some() && self.backend.is_some()
+    }
 }
 
 fn default_pressure_jobs() -> i64 {
@@ -1584,10 +1625,17 @@ fn result_options(
             "an exact-cell selection requires --test, --mode, and --backend together".into(),
         );
     }
+    // A REPEATED BATCH MAY CARRY IT TOO. The per-cell cap is the bound that
+    // actually stops a hung repetition -- the whole-run bound is a wall-clock
+    // backstop whose firing means this one did not do its job -- so refusing it
+    // on the one selection that reaches the whole population left that
+    // population runnable only WITHOUT its inner bound. The original
+    // restriction was about not silently capping a set the caller did not
+    // choose; a caller who asked for repetitions has chosen one.
     if selection.cell_timeout_seconds.is_some()
-        && !(selection.is_exact() || selection.sample.is_some())
+        && !(selection.is_exact() || selection.sample.is_some() || selection.repeats_batch())
     {
-        return Err("--cell-timeout requires an exact cell or --sample".into());
+        return Err("--cell-timeout requires an exact cell, --sample, or a repeated batch".into());
     }
     if selection.sample.is_some() && selection.is_exact() {
         return Err(
@@ -1991,7 +2039,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 && selection.mode.is_none()
                 && !matches!(cell.id.mode.as_str(), "verify" | "replay" | "chaos"));
         match cell.status.as_str() {
-            "red" if selected && !selection.repeats_green_cell() => {
+            "red" if selected && !selection.selects_green_population() => {
                 let budget = budgets
                     .get(&(
                         cell.id.test.clone(),
@@ -2016,7 +2064,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 }
             }
             "red" => {}
-            "green" if selected && selection.repeats_green_cell() && cell.enabled => {
+            "green" if selected && selection.selects_green_population() && cell.enabled => {
                 let budget = budgets
                     .get(&(
                         cell.id.test.clone(),
@@ -2073,7 +2121,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 selection.mode.as_deref(),
                 selection.backend.as_deref(),
             ) {
-                if selection.repeats_green_cell() {
+                if selection.selects_green_population() {
                     format!(
                         "{test}/{mode}/{backend} is not an enabled green tracked cell; use the scorecard or manifest CLI to inspect it"
                     )
@@ -2083,12 +2131,12 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                     )
                 }
             } else if let Some(mode) = selection.mode.as_deref() {
-                if selection.repeats_green_cell() {
+                if selection.selects_green_population() {
                     format!("tracked scorecard has no enabled green cells for mode `{mode}`")
                 } else {
                     format!("tracked scorecard has no red cells for mode `{mode}`")
                 }
-            } else if selection.repeats_green_cell() {
+            } else if selection.selects_green_population() {
                 "tracked scorecard has no enabled green cells".into()
             } else {
                 "tracked scorecard has no red cells".into()
@@ -2098,7 +2146,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
     let eligible_cells = selected_cells.len();
     if let Some(count) = selection.sample {
         if count > selected_cells.len() {
-            return Err(if selection.repeats_green_cell() {
+            return Err(if selection.selects_green_population() {
                 format!(
                     "--sample {count} exceeds the {} enabled green cells in the selected population",
                     selected_cells.len()
@@ -2793,8 +2841,13 @@ fn write_plan_after_scorecard_check(
                 group: "cell".into(),
                 job: slug,
                 desc: if let Some(number) = repetition {
+                    let population = if selection.selects_green_population() {
+                        "green"
+                    } else {
+                        "red"
+                    };
                     format!(
-                        "Repeat green cell {}/{}/{}@{} ({number}/{})",
+                        "Repeat {population} cell {}/{}/{}@{} ({number}/{})",
                         cell.test,
                         cell.mode,
                         cell.backend,
@@ -2843,9 +2896,11 @@ fn write_plan_after_scorecard_check(
     steps.push(Step {
         group: "pressure".into(),
         job: "summarize".into(),
-        desc: if selection.repeats_green_cell() {
+        desc: if selection.selects_green_population() {
             "Wait for every repeated green-cell check before reading retained runner evidence"
                 .into()
+        } else if selection.repeats_cells() {
+            "Wait for every repeated red-cell check before reading retained runner evidence".into()
         } else {
             "Wait for every red-cell attempt before reading retained runner evidence".into()
         },
@@ -3108,7 +3163,7 @@ fn validate_run_contract(
         return Err("dirty pressure results are accepted only for one exact red cell".into());
     }
     if metadata.source_tree_dirty && metadata.repetitions.is_some() {
-        return Err("repeated green-cell results require a clean committed source tree".into());
+        return Err("repeated-cell results require a clean committed source tree".into());
     }
     if metadata.sample.is_some() != metadata.seed.is_some() {
         return Err("retained sampled run must record both --sample and its seed".into());
@@ -3575,6 +3630,7 @@ fn classify_result(
         || (mode == "verify"
             && matches!(verification_verdict, Some("matched" | "diverged"))
             && !verification_logs_retained)
+        || (row_valid && verification_verdict == Some("infrastructure_error"))
     {
         "infrastructure-error"
     } else if row_valid && mode == "verify" && verification_verdict == Some("diverged") {
@@ -3629,10 +3685,44 @@ fn top_level_repeated_result_description(
     infrastructure_errors: usize,
     total: usize,
 ) -> &'static str {
-    if metadata.green {
-        repeated_batch_result_description(passes, infrastructure_errors, total)
-    } else {
+    if metadata.is_exact() {
         repeated_result_description(passes, infrastructure_errors, total)
+    } else {
+        repeated_batch_result_description(passes, infrastructure_errors, total)
+    }
+}
+
+fn summary_heading(metadata: &RunMetadata) -> &'static str {
+    if metadata.repetitions.is_some() {
+        if metadata.green {
+            "# Repeated green-cell results"
+        } else {
+            "# Repeated red-cell results"
+        }
+    } else {
+        "# Red-cell pressure-test results"
+    }
+}
+
+fn repeated_summary_line(
+    metadata: &RunMetadata,
+    passes: usize,
+    infrastructure_errors: usize,
+    total: usize,
+) -> String {
+    let result =
+        top_level_repeated_result_description(metadata, passes, infrastructure_errors, total);
+    if metadata.is_exact() {
+        if result == "incomplete" {
+            format!(
+                "Repeated result: {passes}/{total} passed; incomplete because {infrastructure_errors} check(s) have no trustworthy result."
+            )
+        } else {
+            format!("Repeated result: {passes}/{total} passed; {result}.")
+        }
+    } else {
+        let population = if metadata.green { "green" } else { "red" };
+        format!("Repeated {population}-cell batch: {passes}/{total} passed; {result}.")
     }
 }
 
@@ -3807,10 +3897,7 @@ fn read_verification_report(
         .map_err(|e| format!("incomplete canonical verification report {}: {e}", path.display()))?;
     match (canonical.verdict, canonical.verified) {
         (Verdict::Matched, true)
-        | (
-            Verdict::Diverged | Verdict::NoResult,
-            false,
-        ) => {}
+        | (Verdict::Diverged | Verdict::NoResult | Verdict::InfrastructureError, false) => {}
         (verdict, verified) => {
             return Err(format!(
                 "inconsistent verification report {}: verdict={verdict} verified={verified}",
@@ -3818,8 +3905,10 @@ fn read_verification_report(
             ));
         }
     }
-    if canonical.verdict != Verdict::NoResult
-        && canonical.comparison.is_none()
+    if !matches!(
+        canonical.verdict,
+        Verdict::NoResult | Verdict::InfrastructureError
+    ) && canonical.comparison.is_none()
     {
         return Err(format!(
             "terminal verification report {} has no comparison object",
@@ -3832,12 +3921,14 @@ fn read_verification_report(
             path.display()
         ));
     }
-    canonical.require_canonical_comparison().map_err(|error| {
-        format!(
-            "verification report {} cannot support a product verdict: {error}",
-            path.display()
-        )
-    })?;
+    if canonical.verdict != Verdict::InfrastructureError || canonical.comparison.is_some() {
+        canonical.require_canonical_comparison().map_err(|error| {
+            format!(
+                "verification report {} cannot support a product verdict: {error}",
+                path.display()
+            )
+        })?;
+    }
     if canonical.verdict == Verdict::Matched {
         canonical.require_canonical_match().map_err(|error| {
             format!(
@@ -3846,7 +3937,18 @@ fn read_verification_report(
             )
         })?;
     }
-    if canonical.verdict != Verdict::Diverged
+    if canonical.verdict == Verdict::InfrastructureError
+        && canonical.infrastructure_error.is_none()
+    {
+        return Err(format!(
+            "verification report {} names infrastructure_error without its cause",
+            path.display()
+        ));
+    }
+    if !matches!(
+        canonical.verdict,
+        Verdict::Diverged | Verdict::InfrastructureError
+    )
         && (canonical.first_divergent_scheduler_turn.is_some()
             || canonical.first_divergent_virtual_nanoseconds.is_some()
             || canonical.first_divergent_record.is_some()
@@ -4025,7 +4127,7 @@ fn summarize(
                             .iter()
                             .map(|row| result_artifact_dir(results, row))
                             .collect::<Result<Vec<_>, _>>();
-                        let row = result_rows.last().expect("nonempty result rows");
+                        let row = cell_result_after_retries(&result_rows)?;
                         let row_matches = result_row_matches_cell(
                             row,
                             &evidence_run_id,
@@ -4037,7 +4139,7 @@ fn summarize(
                         let runner_completed =
                             runner_observed_terminal_attempt(runner, harness_status);
                         match artifact_dirs {
-                            Ok(artifact_dirs)
+                            Ok(_)
                                 if identities_match
                                     && row_matches
                                     && (proven_oom || runner_completed) =>
@@ -4053,7 +4155,7 @@ fn summarize(
                                             row.failure_class,
                                             row.attempt,
                                             Some(invocation),
-                                            artifact_dirs.last().cloned(),
+                                            Some(result_artifact_dir(results, row)?),
                                         )
                                     }
                                     Err(error) => {
@@ -4270,12 +4372,11 @@ fn summarize(
                 passing.push(display_id(cell));
             }
             // ⚠️ AN EARLIER ATTEMPT THAT DIVERGED IS STILL AN OBSERVATION.
-            // The row above reports the TERMINAL attempt, which is what the
-            // harness exit describes. An attempt before it that located a
-            // divergence is emitted as its own row carrying the same repetition
-            // and its own attempt ordinal, so the observation is recorded instead
-            // of being dropped when a retry happens to pass. A flake is exactly
-            // "diverged, then passed".
+            // The row above reports the framework-selected cell result: a passing
+            // retry is green, while a product failure stays red if every retry
+            // fails. Any other attempt that located a divergence is emitted as its
+            // own row carrying the same repetition and its own attempt ordinal, so
+            // the observation is not dropped when a retry happens to pass.
             //
             // ⚠️ THIS CANNOT MOVE A STATUS. These rows only add observations, and
             // observations feed `measurement`; `status` is owned by a different
@@ -4286,6 +4387,9 @@ fn summarize(
                         &result_rows_for_history,
                         terminal.attempt,
                     ) {
+                        if earlier_row.attempt == attempt {
+                            continue;
+                        }
                         if let Some(recorded_result) = earlier_row.result {
                             if earlier_row.failure_class != recorded_result.failure_class() {
                                 return Err(format!(
@@ -4388,11 +4492,7 @@ fn summarize(
             }));
         }
     }
-    if metadata.repetitions.is_some() {
-        println!("# Repeated green-cell results");
-    } else {
-        println!("# Red-cell pressure-test results");
-    }
+    println!("{}", summary_heading(&metadata));
     println!();
     println!(
         "Metric: current pre-basic-sanity manifest contract. Verify uses the legacy stripped comparison unless that cell's verification report says bitwise_parity=true; this is not the Milestone 2 strict-default metric."
@@ -4458,20 +4558,13 @@ fn summarize(
         println!();
     }
     let mut repeated_cells = Vec::new();
-    let repeated_result = if metadata.repetitions.is_some() && !metadata.green {
+    let repeated_result = if metadata.repetitions.is_some() && metadata.is_exact() {
         let result =
             top_level_repeated_result_description(&metadata, totals[0], totals[6], totals[7]);
-        if result == "incomplete" {
-            println!(
-                "Repeated result: {}/{} passed; incomplete because {} check(s) have no trustworthy result.",
-                totals[0], totals[7], totals[6]
-            );
-        } else {
-            println!(
-                "Repeated result: {}/{} passed; {result}.",
-                totals[0], totals[7]
-            );
-        }
+        println!(
+            "{}",
+            repeated_summary_line(&metadata, totals[0], totals[6], totals[7])
+        );
         repeated_cells.push(json!({
             "cell": &metadata.cells[0],
             "passes": totals[0],
@@ -4500,8 +4593,8 @@ fn summarize(
         let result =
             top_level_repeated_result_description(&metadata, totals[0], totals[6], totals[7]);
         println!(
-            "Repeated green-cell batch: {}/{} passed; {result}.",
-            totals[0], totals[7]
+            "{}",
+            repeated_summary_line(&metadata, totals[0], totals[6], totals[7])
         );
         Some(result)
     } else {
@@ -4553,7 +4646,7 @@ fn summarize(
     }
     if metadata.repetitions.is_some() && totals[0] != totals[7] {
         return Err(format!(
-            "only {}/{} repeated green-cell checks passed; the retained summary classifies every non-pass",
+            "only {}/{} repeated checks passed; the retained summary classifies every non-pass",
             totals[0], totals[7]
         ));
     }
@@ -4831,6 +4924,7 @@ fn fixture_attempt(outcome: &str, status: i32) -> AttemptResult {
         signal: None,
         timed_out: false,
         duration_ms: 1,
+        cpu_usage_usec: Some(1),
         observation_sha256: None,
         argv: vec!["hermit".into(), "run".into()],
         guest_argv: vec!["fixture".into()],
@@ -4888,9 +4982,18 @@ fn self_test(root: &Path) -> Result<(), String> {
                 earlier.len()
             ));
         }
-        let terminal = all.last().ok_or("a terminal row must still be selected")?;
-        if terminal.attempt != 2 || terminal.outcome != "PASS" {
-            return Err("the terminal retry must remain the cell's reported row".into());
+        let reported = cell_result_after_retries(&all)?;
+        if reported.attempt != 2 || reported.outcome != "PASS" {
+            return Err("a passing retry must remain the cell's reported row".into());
+        }
+        let mut product_then_infrastructure = all.clone();
+        product_then_infrastructure[1].outcome = "ERROR".into();
+        let reported = cell_result_after_retries(&product_then_infrastructure)?;
+        if reported.attempt != 1 || reported.outcome != "FAIL" {
+            return Err(
+                "a product failure must remain the reported result when its retry has an infrastructure error"
+                    .into(),
+            );
         }
         let both_clean = format!(
             "{}\n{}\n",
@@ -5087,6 +5190,10 @@ fn self_test(root: &Path) -> Result<(), String> {
     two_repetitions.repetitions = Some(2);
     validate_repetition_selection(&two_repetitions)
         .map_err(|e| format!("two repeated checks were refused: {e}"))?;
+    let mut exact_green_repetitions = repeated_selection_contract.clone();
+    exact_green_repetitions.green = true;
+    validate_repetition_selection(&exact_green_repetitions)
+        .map_err(|e| format!("explicit exact green repetition was refused: {e}"))?;
     if CellSelection::default().scheduler_jobs() != default_jobs() {
         return Err("pressure scheduler default diverged from the host-adaptive validate policy".into());
     }
@@ -5775,6 +5882,16 @@ fn self_test(root: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot read tracked cells for repetition bracket: {e}"))?;
     let tracked: TrackedCells = serde_json::from_str(&tracked_text)
         .map_err(|e| format!("cannot parse tracked cells for repetition bracket: {e}"))?;
+    let expected_red_ids: BTreeSet<_> = unfiltered
+        .selected
+        .iter()
+        .map(|tracked| tracked.id.clone())
+        .collect();
+    let expected_unavailable_red_ids: BTreeSet<_> = unfiltered
+        .unavailable
+        .iter()
+        .map(|tracked| tracked.id.clone())
+        .collect();
     let green_id = tracked
         .cells
         .iter()
@@ -5788,27 +5905,35 @@ fn self_test(root: &Path) -> Result<(), String> {
         .id
         .clone();
     let repeated_selection = CellSelection {
-        test: Some(green_id.test.clone()),
-        mode: Some(green_id.mode.clone()),
-        backend: Some(green_id.backend.clone()),
+        test: Some(exact_id.test.clone()),
+        mode: Some(exact_id.mode.clone()),
+        backend: Some(exact_id.backend.clone()),
         repetitions: Some(3),
         run_id_prefix: Some("validate-one-pid100".into()),
         run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
         ..CellSelection::default()
     };
     let repeated_cells = pressure_cells(root, &repeated_selection)?;
-    if repeated_cells.selected.len() != 1 || repeated_cells.selected[0].id != green_id {
-        return Err("exact repeated selection did not retain its enabled green cell".into());
+    if repeated_cells.selected.len() != 1 || repeated_cells.selected[0].id != exact_id {
+        return Err("exact repeated selection did not retain its requested red cell".into());
     }
-    let repeated_red_selection = CellSelection {
-        test: Some(exact_id.test.clone()),
-        mode: Some(exact_id.mode.clone()),
-        backend: Some(exact_id.backend.clone()),
+    let implicit_green_selection = CellSelection {
+        test: Some(green_id.test.clone()),
+        mode: Some(green_id.mode.clone()),
+        backend: Some(green_id.backend.clone()),
         repetitions: Some(3),
         ..CellSelection::default()
     };
-    if pressure_cells(root, &repeated_red_selection).is_ok() {
-        return Err("repeated green-cell selection accepted a red cell".into());
+    if pressure_cells(root, &implicit_green_selection).is_ok() {
+        return Err("repeated red-cell selection accepted an unrequested green cell".into());
+    }
+    let exact_green_selection = CellSelection {
+        green: true,
+        ..implicit_green_selection
+    };
+    let exact_green_cells = pressure_cells(root, &exact_green_selection)?;
+    if exact_green_cells.selected.len() != 1 || exact_green_cells.selected[0].id != green_id {
+        return Err("explicit --green exact repetition lost its requested green cell".into());
     }
 
     let repeated_results = scratch.join("repeated-plan");
@@ -5818,7 +5943,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         &repeated_results.join("dag.json"),
         &repeated_selection,
     )?;
-    if repeated_metadata.cells != [green_id.clone()]
+    if repeated_metadata.cells != [exact_id.clone()]
         || repeated_metadata.repetitions != Some(3)
         || repeated_metadata.run_id_prefix.as_deref() != Some("validate-one-pid100")
     {
@@ -5840,12 +5965,12 @@ fn self_test(root: &Path) -> Result<(), String> {
     .map_err(|e| format!("cannot parse second-invocation DAG: {e}"))?;
     let first_run_ids: BTreeSet<_> = (1..=3)
         .map(|number| {
-            cell_evidence_run_id(&green_id, Some(number), Some("validate-one-pid100"))
+            cell_evidence_run_id(&exact_id, Some(number), Some("validate-one-pid100"))
         })
         .collect();
     let second_run_ids: BTreeSet<_> = (1..=3)
         .map(|number| {
-            cell_evidence_run_id(&green_id, Some(number), Some("validate-two-pid200"))
+            cell_evidence_run_id(&exact_id, Some(number), Some("validate-two-pid200"))
         })
         .collect();
     if !first_run_ids.is_disjoint(&second_run_ids)
@@ -5910,7 +6035,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         .map(|step| step.job.clone())
         .collect();
     let expected_repeated_jobs: BTreeSet<_> = (1..=3)
-        .map(|number| cell_run_slug(&green_id, Some(number)))
+        .map(|number| cell_run_slug(&exact_id, Some(number)))
         .collect();
     if repeated_cell_steps.len() != 3
         || repeated_jobs != expected_repeated_jobs
@@ -6081,9 +6206,32 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err("repeated exact ptrace setup refused its direct Hermit build".into());
     }
 
+    let red_batch_selection = CellSelection {
+        repetitions: Some(2),
+        run_timeout_seconds: Some(1_000_000),
+        ..CellSelection::default()
+    };
+    let selected_red_batch = pressure_cells(root, &red_batch_selection)?;
+    let selected_red_ids: BTreeSet<_> = selected_red_batch
+        .selected
+        .iter()
+        .map(|tracked| tracked.id.clone())
+        .collect();
+    let unavailable_red_ids: BTreeSet<_> = selected_red_batch
+        .unavailable
+        .iter()
+        .map(|tracked| tracked.id.clone())
+        .collect();
+    if selected_red_ids != expected_red_ids
+        || unavailable_red_ids != expected_unavailable_red_ids
+        || selected_red_batch.eligible_cells != expected_red_ids.len()
+    {
+        return Err("repeated red batch did not retain the complete red population".into());
+    }
+
     let green_batch_selection = CellSelection {
         green: true,
-        repetitions: Some(1),
+        repetitions: Some(2),
         run_timeout_seconds: Some(1_000_000),
         ..CellSelection::default()
     };
@@ -6169,7 +6317,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         &green_batch_selection,
     )?;
     if !green_batch_metadata.green
-        || green_batch_metadata.repetitions != Some(1)
+        || green_batch_metadata.repetitions != Some(2)
         || green_batch_metadata.eligible_cells != expected_green_ids.len()
         || green_batch_metadata
             .cells
@@ -6179,6 +6327,40 @@ fn self_test(root: &Path) -> Result<(), String> {
             != expected_green_ids
     {
         return Err("green batch metadata did not bind the complete selected population".into());
+    }
+    let mut red_batch_result_metadata = green_batch_metadata.clone();
+    red_batch_result_metadata.green = false;
+    if !repeated_metadata.is_exact()
+        || green_batch_metadata.is_exact()
+        || top_level_repeated_result_description(&repeated_metadata, 1, 0, 2) != "flaky"
+        || top_level_repeated_result_description(&red_batch_result_metadata, 1, 0, 2)
+            != "one or more repeated checks failed"
+    {
+        return Err(
+            "repeated exact and batch results were classified by color instead of shape".into(),
+        );
+    }
+    let exact_red_heading = summary_heading(&repeated_metadata);
+    let exact_red_result = repeated_summary_line(&repeated_metadata, 1, 0, 2);
+    let red_batch_heading = summary_heading(&red_batch_result_metadata);
+    let red_batch_result = repeated_summary_line(&red_batch_result_metadata, 1, 0, 2);
+    let green_batch_heading = summary_heading(&green_batch_metadata);
+    let green_batch_result = repeated_summary_line(&green_batch_metadata, 1, 0, 2);
+    if exact_red_heading != "# Repeated red-cell results"
+        || exact_red_result != "Repeated result: 1/2 passed; flaky."
+        || red_batch_heading != "# Repeated red-cell results"
+        || red_batch_result
+            != "Repeated red-cell batch: 1/2 passed; one or more repeated checks failed."
+        || green_batch_heading != "# Repeated green-cell results"
+        || green_batch_result
+            != "Repeated green-cell batch: 1/2 passed; one or more repeated checks failed."
+    {
+        return Err(format!(
+            "repeated summary rendering mislabeled an exact red, red batch, or green batch: \
+             exact={exact_red_heading:?}/{exact_red_result:?} \
+             red_batch={red_batch_heading:?}/{red_batch_result:?} \
+             green_batch={green_batch_heading:?}/{green_batch_result:?}"
+        ));
     }
     let green_batch_dag_text = fs::read_to_string(green_batch_results.join("dag.json"))
         .map_err(|e| format!("cannot read green-batch DAG: {e}"))?;
@@ -6250,7 +6432,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         .map(|cell| cell.test.as_str())
         .collect::<BTreeSet<_>>()
         .len();
-    if green_batch_cell_count != expected_green_ids.len()
+    let expected_green_cell_runs = expected_green_ids.len() * green_batch_selection.run_count();
+    if green_batch_cell_count != expected_green_cell_runs
         || green_batch_preparation_count != green_test_count
         || green_batch_dag
             .steps
@@ -6289,7 +6472,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         .collect();
     if audit_dag(
         &missing_green_artifact,
-        expected_green_ids.len(),
+        expected_green_cell_runs,
         green_batch_metadata.run_timeout_seconds,
         &green_batch_timeouts,
     )
@@ -6551,6 +6734,17 @@ fn self_test(root: &Path) -> Result<(), String> {
             true,
         ),
         classify_result(
+            runner_ok,
+            Some(122),
+            "ERROR",
+            true,
+            Some("verification recorded 2 HERMIT_SKID_OVERSHOOT report(s)"),
+            "verify",
+            Some("infrastructure_error"),
+            true,
+            true,
+        ),
+        classify_result(
             runner_timeout,
             Some(INCOMPLETE_ATTEMPT_STATUS),
             "NO_RESULT",
@@ -6684,6 +6878,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             "determinism-failure",
             "replay-failure",
             "crash-error",
+            "infrastructure-error",
             "timeout",
             "infrastructure-error",
             "timeout",
@@ -6788,6 +6983,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         error_kind: None,
         timeout_seconds: 20,
         duration_ms: Some(19_000),
+        cpu_usage_usec: Some(1_000),
         runtime: None,
         log_level: Some("info".into()),
         effective_args: vec!["run".into()],
@@ -7093,6 +7289,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         error_kind: None,
         timeout_seconds: 20,
         duration_ms: Some(1_000),
+        cpu_usage_usec: Some(1_000),
         runtime: None,
         log_level: Some("info".into()),
         effective_args: vec!["run".into()],

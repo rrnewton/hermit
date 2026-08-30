@@ -129,6 +129,28 @@ def find_parent_adapter() -> Path | None:
     return None
 VALIDATE = ROOT / "scripts" / "validate.rs"
 TEST_ROOTS: list[Path] = []
+OUTER_VALIDATE_ENV = (
+    "DEV_HERMIT_PARENT",
+    "DEV_HERMIT_TOOL_ROOT",
+    "CI_HUB_APPLY_LOCAL_LABEL",
+    "CI_HUB_VALIDATE_PRODUCER",
+    "CI_HUB_VALIDATE_CONCURRENT",
+    "CI_HUB_VALIDATE_LOCK_OWNER_PID",
+    "CI_HUB_VALIDATE_LOCK_OWNER_FILE",
+    "CI_HUB_VALIDATE_RUN_NUMBER",
+    "E2E_RUN_ID",
+    "VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON",
+)
+
+
+def test_env_without_outer_validate() -> dict[str, str]:
+    env = os.environ.copy()
+    # These children exercise validate's stop and cleanup paths, not the outer
+    # launcher's split-root or admission contract. Each case supplies the exact
+    # parent/ledger/authority inputs it owns.
+    for name in OUTER_VALIDATE_ENV:
+        env.pop(name, None)
+    return env
 
 
 def stop_test_env(
@@ -139,13 +161,14 @@ def stop_test_env(
     forged_owner: bool = False,
 ) -> dict[str, str]:
     TEST_ROOTS.append(tmpdir)
-    env = os.environ.copy()
+    env = test_env_without_outer_validate()
     env.update(
         HERMIT_VALIDATE_STOP_TEST_MODE="1",
         HERMIT_VALIDATE_LEDGER=str(ledger),
         DEV_HERMIT_PARENT=str(ROOT.parent),
         VALIDATE_SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS="1",
         VALIDATE_STOP_TEST_TMP_ROOT=str(tmpdir / "validation"),
+        DAGRUN_LOG_DIR=str(tmpdir / "dagrun-evidence"),
         TMPDIR=str(tmpdir),
     )
     if lock_proven:
@@ -190,6 +213,28 @@ def stop_test_env(
             CI_HUB_VALIDATE_LOCK_OWNER_FILE=str(owner_file),
         )
     return env
+
+
+def assert_stop_test_never_started_dagrun(tmpdir: Path, output: str) -> None:
+    assert not (tmpdir / "dagrun-evidence").exists(), output
+    assert "[dagrun]" not in output and "[scheduler]" not in output, output
+
+
+def check_stop_test_env_does_not_inherit_outer_validate() -> None:
+    saved = os.environ.copy()
+    try:
+        os.environ.update({name: "/outer/value" for name in OUTER_VALIDATE_ENV})
+        os.environ.update(E2E_RUN_ID="outer-run-id", CI_HUB_VALIDATE_RUN_NUMBER="4242")
+        with tempfile.TemporaryDirectory(prefix="validate-stop-env-") as tmp:
+            tmpdir = Path(tmp)
+            env = stop_test_env(tmpdir, tmpdir / "ledger.jsonl")
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+    assert env["DEV_HERMIT_PARENT"] == str(ROOT.parent), env
+    for name in set(OUTER_VALIDATE_ENV) - {"DEV_HERMIT_PARENT"}:
+        assert name not in env, (name, env[name])
 
 
 # HOW LONG A HOOK MAY TAKE TO SIGNAL READY, AND WHY IT IS NOT 10 SECONDS.
@@ -461,6 +506,8 @@ def assert_schema5_contract(row: dict, *, admitted: bool = False) -> None:
     assert row["schema_version"] == 5, row
     assert row["repo"] == "hermit", row
     assert row["producer"] == "hermit-validate-rs", row
+    assert row["run_id"] is None, row
+    assert "run_number" not in row, row
     # Exercise write_ledger itself, not only validate.rs's synthetic helper.
     # A real outer failure positively knows there are no failed lane substeps;
     # gates that established no failure must omit the collection entirely.
@@ -523,13 +570,16 @@ def run_signal(
             process.send_signal(sig)
             rc = process.wait(timeout=EXIT_TIMEOUT_SECONDS)
 
+        rendered = log.read_text(errors="replace")
+        assert_stop_test_never_started_dagrun(tmpdir, rendered)
+
         rows = [json.loads(line) for line in ledger.read_text().splitlines()] if ledger.exists() else []
         if not expect_record:
             assert not rows, (sig.name, rows)
             assert rc == -sig.value, (sig.name, rc)
             return
 
-        assert rc == NO_RESULT_EXIT_CODE, (sig.name, rc, log.read_text(errors="replace"))
+        assert rc == NO_RESULT_EXIT_CODE, (sig.name, rc, rendered)
         assert len(rows) == 1, (sig.name, rows)
         row = rows[0]
         assert_schema5_contract(row, admitted=lock_proven)
@@ -571,6 +621,28 @@ def run_incomplete_exit() -> None:
         assert row["interruption_signal"] is None, row
 
 
+def run_off_record_incomplete_exit() -> None:
+    """The early stop-test seam must preserve off-record evidence isolation."""
+    with tempfile.TemporaryDirectory(prefix="validate-stop-off-record-") as tmp:
+        tmpdir = Path(tmp)
+        ledger = tmpdir / "ledger.jsonl"
+        env = stop_test_env(tmpdir, ledger)
+        env.update(VALIDATE_STOP_TEST_EXIT_EARLY="1")
+        process = subprocess.run(
+            [str(VALIDATE), "--allow-local-off-the-record-run", "quick"],
+            cwd=ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        output = process.stdout.decode(errors="replace")
+        assert process.returncode == 1, output
+        assert not ledger.exists() or not ledger.read_bytes(), output
+        assert "OFF THE RECORD" in output, output
+        assert "ledger:" not in output, output
+
+
 def run_canonical_adapter_contract(*, refuse: bool) -> None:
     """Production-shaped writes use the parent adapter, never a raw shadow."""
     with tempfile.TemporaryDirectory(prefix="validate-canonical-adapter-") as tmp:
@@ -600,7 +672,7 @@ def run_canonical_adapter_contract(*, refuse: bool) -> None:
                 )
         raw_shadow = parent / "ignored" / "validate-run-ledger.jsonl"
         raw_before = raw_shadow.read_bytes() if raw_shadow.exists() else None
-        env = os.environ.copy()
+        env = test_env_without_outer_validate()
         env.update(
             HERMIT_VALIDATE_STOP_TEST_MODE="1",
             DEV_HERMIT_PARENT=str(parent),
@@ -781,6 +853,7 @@ def main(argv: list[str] | None = None) -> None:
     os.environ.pop("HERMIT_VALIDATE_ACTIVE", None)
 
     run_final_validate_status_contract()
+    check_stop_test_env_does_not_inherit_outer_validate()
     check_signal_refusal_does_not_skip_incomplete_exit()
 
     unevaluated: list[str] = []
@@ -789,6 +862,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     if signal_unevaluated is not None:
         unevaluated.append(signal_unevaluated)
+    run_off_record_incomplete_exit()
     # ⚠️ SKIP ONLY WHAT CANNOT BE EVALUATED, AND KEEP GOING.
     # An earlier version let NoParentAdapter propagate out of main(), which
     # abandoned the four steps below it -- refuse=True, the cleanup race and the

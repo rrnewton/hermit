@@ -75,6 +75,7 @@ trap 'exit 130' INT TERM
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/../.." && pwd)
 hermit_bin=${HERMIT_BIN:-$repo_root/target/release/hermit}
+VERIFICATION_REPORT_BIN=${VERIFICATION_REPORT_BIN:-$(dirname -- "$hermit_bin")/verification-report}
 kernel_image=${KERNEL_IMAGE:-/boot/vmlinuz}
 output_dir=${OUTPUT_DIR:-$repo_root/target/qemu-strict-l2-userspace}
 phase_timeout_seconds=${QEMU_L2_PHASE_TIMEOUT_SECONDS:-360}
@@ -97,6 +98,8 @@ if [[ -z $qemu_bin ]]; then
 fi
 
 [[ -x $hermit_bin ]] || fail "Hermit release binary not found: $hermit_bin"
+[[ -x $VERIFICATION_REPORT_BIN ]] || fail \
+  "typed verification-report reader not found: $VERIFICATION_REPORT_BIN"
 [[ -n $qemu_bin && -x $qemu_bin ]] || fail "qemu-system-x86_64 not found; set QEMU_BIN"
 [[ -r $kernel_image ]] || fail "kernel image is not readable: $kernel_image"
 if [[ ! $phase_timeout_seconds =~ ^[1-9][0-9]*$ ]]; then
@@ -150,10 +153,12 @@ run_scenario() {
   local boot_stderr=$run_dir/boot.stderr
   local verifier_stdout=$run_dir/verifier.stdout
   local verifier_stderr=$run_dir/verifier.stderr
+  local verify_report=$run_dir/verify.json
 
   guest_command_for "$initramfs_image"
   local boot_command=("$hermit_bin" --log info run --strict -- "${guest_command[@]}")
-  local verify_command=("$hermit_bin" --log info run --strict --verify -- "${guest_command[@]}")
+  local verify_command=("$hermit_bin" --log info run --strict --verify \
+    --verify-json "$verify_report" -- "${guest_command[@]}")
 
   printf '\n=== scenario: %s ===\n' "$name"
   printf 'kernel=%s\ninitramfs=%s\nartifacts=%s\n' \
@@ -237,8 +242,8 @@ run_scenario() {
   if ((status != 0)); then
     fail "[$name] strict L2 verification exited with status $status"
   fi
-  grep -Fq ':: Success: deterministic. Determinism verified.' "$verifier_stderr" || \
-    fail "[$name] Hermit exited successfully without the L2 verification marker"
+  "$VERIFICATION_REPORT_BIN" matched "$verify_report" || \
+    fail "[$name] typed verification report did not match"
   stop_active_group
 
   printf '[%s] QEMU strict L2 userspace program passed.\n' "$name"

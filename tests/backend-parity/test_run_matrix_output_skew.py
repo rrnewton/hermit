@@ -217,7 +217,28 @@ def main() -> int:
         prior = os.environ.get("DAGRUN_TEST_COUNTS_PATH")
         os.environ["DAGRUN_TEST_COUNTS_PATH"] = str(counts)
         try:
-            rm.write_structured_test_counts(27, 0)
+            rm.write_structured_test_results(
+                [
+                    {
+                        "test_name": "passes",
+                        "backend": "dbt",
+                        "result": "PASS",
+                    },
+                    {
+                        "test_name": "fails",
+                        "backend": "dbt",
+                        "result": "FAIL",
+                    },
+                    {
+                        "test_name": "configured-gap",
+                        "backend": "dbt",
+                        "result": "GAP",
+                    },
+                ],
+                2,
+                1,
+                "strict",
+            )
         finally:
             if prior is None:
                 os.environ.pop("DAGRUN_TEST_COUNTS_PATH", None)
@@ -225,8 +246,24 @@ def main() -> int:
                 os.environ["DAGRUN_TEST_COUNTS_PATH"] = prior
         check(
             json.loads(counts.read_text(encoding="utf-8"))
-            == {"schema": 1, "executed_tests": 27, "filtered_tests": 0},
-            "structured DBT count records 27 executed cases",
+            == {
+                "schema": 2,
+                "executed_tests": 2,
+                "filtered_tests": 1,
+                "results": [
+                    {
+                        "id": "backend-parity/passes [dbt/strict]",
+                        "result": "pass",
+                        "attempts": 1,
+                    },
+                    {
+                        "id": "backend-parity/fails [dbt/strict]",
+                        "result": "fail",
+                        "attempts": 1,
+                    },
+                ],
+            },
+            "structured DBT results retain an exact pass/fail total",
         )
         check(
             not list(workdir.glob("counts.json.tmp.*")),

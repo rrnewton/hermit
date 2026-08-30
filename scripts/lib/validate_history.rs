@@ -50,6 +50,18 @@ pub struct CacheHit {
     pub producer: String,
 }
 
+/// The adapter executable comes from the immutable tooling checkout, while
+/// `ledger` continues to name canonical shared state. Older direct callers
+/// without a tool root retain the historical parent-relative behavior.
+pub fn canonical_ledger_adapter(ledger: &Path, tool_root: Option<&Path>) -> Option<std::path::PathBuf> {
+    let state_root = ledger.parent()?;
+    Some(
+        tool_root
+            .unwrap_or(state_root)
+            .join("ci-hub/ledger/validate_rows.py"),
+    )
+}
+
 /// Read the one logical ledger into rows, skipping unparseable lines.
 ///
 /// In an admitted dev-hermit run, `ledger` is the parent's logical `ledger/`
@@ -63,8 +75,12 @@ pub fn read_rows(ledger: &Path) -> Vec<serde_json::Value> {
         .filter(|value| !value.is_empty())
         .is_some_and(|value| Path::new(&value) == ledger);
     let text = if !explicit && ledger.file_name().is_some_and(|name| name == "ledger") {
-        let Some(parent) = ledger.parent() else { return Vec::new() };
-        let adapter = parent.join("ci-hub/ledger/validate_rows.py");
+        let configured_tool_root = std::env::var_os("DEV_HERMIT_TOOL_ROOT")
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from);
+        let Some(adapter) = canonical_ledger_adapter(ledger, configured_tool_root.as_deref()) else {
+            return Vec::new();
+        };
         let Ok(output) = Command::new("python3").arg(&adapter).arg("rows").output() else {
             eprintln!(
                 "validate: warning: cannot launch canonical ledger reader {}",

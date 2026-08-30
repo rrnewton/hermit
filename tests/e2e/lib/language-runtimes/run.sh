@@ -11,14 +11,19 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 cd "$ROOT_DIR"
 
 HERMIT_BIN=${HERMIT_BIN:-target/debug/hermit}
+VERIFICATION_REPORT_BIN=${VERIFICATION_REPORT_BIN:-$(dirname -- "$HERMIT_BIN")/verification-report}
 RUNTIME_TIMEOUT=${HERMIT_LANGUAGE_RUNTIME_TIMEOUT:-180s}
 BACKEND=${HERMIT_LANGUAGE_RUNTIME_BACKEND:-ptrace}
 BUILD_DIR=target/language-runtime-e2e
 SENTINEL=language-runtime-e2e
-readonly ROOT_DIR HERMIT_BIN RUNTIME_TIMEOUT BACKEND BUILD_DIR SENTINEL
+readonly ROOT_DIR HERMIT_BIN VERIFICATION_REPORT_BIN RUNTIME_TIMEOUT BACKEND BUILD_DIR SENTINEL
 
 if [[ ! -x $HERMIT_BIN ]]; then
   echo "Hermit binary is not executable: $HERMIT_BIN" >&2
+  exit 1
+fi
+if [[ ! -x $VERIFICATION_REPORT_BIN ]]; then
+  echo "typed verification-report reader is not executable: $VERIFICATION_REPORT_BIN" >&2
   exit 1
 fi
 
@@ -42,6 +47,7 @@ function run_l2 {
   shift 3
   local strict_output="$BUILD_DIR/$slug.strict.log"
   local verify_output="$BUILD_DIR/$slug.verify.log"
+  local verify_report="$BUILD_DIR/$slug.verify.json"
 
   printf '==> %s: %s category probe (--strict)\n' "$label" "$BACKEND"
   if ! timeout --foreground --kill-after=10s "$RUNTIME_TIMEOUT" \
@@ -65,8 +71,9 @@ function run_l2 {
 
   printf '==> %s: %s L2 (--strict --verify)\n' "$label" "$BACKEND"
   if ! timeout --foreground --kill-after=10s "$RUNTIME_TIMEOUT" \
-      "$HERMIT_BIN" --log=off --backend "$BACKEND" run \
-      --strict --verify --no-virtualize-cpuid --max-timeslice=disabled \
+      "$HERMIT_BIN" --log=info --backend "$BACKEND" run \
+      --strict --verify --verify-json "$verify_report" \
+      --no-virtualize-cpuid --max-timeslice=disabled \
       --base-env=minimal --env="HERMIT_RUNTIME_SENTINEL=$SENTINEL" -- \
       "$program" "$@" >"$verify_output" 2>&1; then
     cat "$verify_output" >&2
@@ -75,8 +82,8 @@ function run_l2 {
   fi
 
   cat "$verify_output"
-  if ! grep -q "Determinism verified" "$verify_output"; then
-    echo "FAIL: $label exited zero without Hermit's verification marker" >&2
+  if ! "$VERIFICATION_REPORT_BIN" matched "$verify_report"; then
+    echo "FAIL: $label typed verification report did not match" >&2
     return 1
   fi
   printf 'PASS: %s reached %s L2 with all four categories\n' "$label" "$BACKEND"

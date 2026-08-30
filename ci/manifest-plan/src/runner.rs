@@ -7,6 +7,7 @@ use std::fs::{self};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
@@ -26,6 +27,7 @@ use serde_json::Value as JsonValue;
 use sha2::Digest;
 use sha2::Sha256;
 
+use crate::canonical_verdict::InfrastructureError;
 use crate::canonical_verdict::Verdict;
 pub use crate::canonical_verdict::VerificationReport;
 pub use crate::canonical_verdict::VerificationRuntime;
@@ -928,6 +930,13 @@ pub struct AttemptResult {
     pub timed_out: bool,
     #[serde(default)]
     pub duration_ms: u128,
+    /// CPU consumed by the launched process and the descendants it reaped.
+    ///
+    /// This comes from `wait4` at the same point that owns the process. It is
+    /// not inferred from wall time and remains attributable when cells execute
+    /// concurrently or move their work outside the enclosing DAG cgroup.
+    #[serde(default)]
+    pub cpu_usage_usec: Option<u64>,
     pub observation_sha256: Option<String>,
     pub argv: Vec<String>,
     pub guest_argv: Vec<String>,
@@ -1053,6 +1062,12 @@ pub struct CellResult {
     /// cell never ran; a measured zero remains a valid sub-millisecond result.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u128>,
+    /// CPU consumed by this cell's preparation and launched attempts.
+    ///
+    /// Null when the cell never reached execution or the runner could not
+    /// obtain a complete measurement. A measured zero remains a real value.
+    #[serde(default)]
+    pub cpu_usage_usec: Option<u64>,
     /// Runtime totals from the first attempt that produced them.
     pub runtime: Option<VerificationRuntime>,
     pub log_level: Option<String>,
@@ -1257,22 +1272,6 @@ impl RunContext {
                 std::process::id()
             )
         });
-        let attempt = std::env::var("E2E_ATTEMPT")
-            .ok()
-            .map(|value| {
-                value
-                    .parse::<u64>()
-                    .ok()
-                    .filter(|attempt| (1..=MAX_ATTEMPTS_PER_CELL).contains(attempt))
-                    .ok_or_else(|| {
-                        format!(
-                            "E2E_ATTEMPT must be between 1 and {MAX_ATTEMPTS_PER_CELL}, got \
-                             {value:?}"
-                        )
-                    })
-            })
-            .transpose()?
-            .unwrap_or(1);
         let run_index = std::env::var(E2E_RUN_INDEX_ENV)
             .ok()
             .map(|value| {
@@ -1346,7 +1345,7 @@ impl RunContext {
             machine_shortname,
             kernel_version,
             host_capabilities,
-            attempt,
+            attempt: 1,
             run_index,
             source_sha,
             source_dirty,
@@ -1371,6 +1370,105 @@ impl RunContext {
 
 /// One initial execution plus one retry, scoped to one selected cell.
 pub const MAX_ATTEMPTS_PER_CELL: u64 = 2;
+
+/// Select the outcome that the framework reports for one cell's complete
+/// attempt history.
+///
+/// A passing retry makes the cell pass, while the appended rows still retain
+/// the failure it recovered from. If no attempt passes, any product failure
+/// keeps the cell failed even when a later attempt ends in an infrastructure
+/// error. A history containing only infrastructure errors remains an error.
+/// Host-inapplicable is terminal and cannot be mixed with executed attempts.
+pub fn outcome_after_retries<'a>(
+    attempts: impl IntoIterator<Item = (u64, &'a str)>,
+) -> Result<&'static str, String> {
+    let mut expected_attempt = 1;
+    let mut saw_pass = false;
+    let mut saw_failure = false;
+    let mut saw_error = false;
+    let mut saw_host_inapplicable = false;
+
+    for (attempt, outcome) in attempts {
+        if attempt > MAX_ATTEMPTS_PER_CELL {
+            return Err(format!(
+                "cell result attempt {attempt} exceeds the shared maximum of {MAX_ATTEMPTS_PER_CELL}"
+            ));
+        }
+        if attempt != expected_attempt {
+            return Err(format!(
+                "cell result attempt {attempt} does not follow the preceding attempts; expected {expected_attempt}"
+            ));
+        }
+        if saw_pass || saw_host_inapplicable {
+            return Err(format!(
+                "cell result attempt {attempt} follows terminal outcome {}",
+                if saw_pass {
+                    "PASS"
+                } else {
+                    "HOST-INAPPLICABLE"
+                }
+            ));
+        }
+        match outcome {
+            "PASS" => saw_pass = true,
+            "FAIL" => saw_failure = true,
+            "ERROR" => saw_error = true,
+            "HOST-INAPPLICABLE" => saw_host_inapplicable = true,
+            other => {
+                return Err(format!(
+                    "cell result attempt {attempt} has unknown outcome {other:?}"
+                ));
+            }
+        }
+        expected_attempt += 1;
+    }
+
+    if expected_attempt == 1 {
+        return Err("cell result has no attempts".into());
+    }
+    if saw_host_inapplicable && (saw_failure || saw_error) {
+        return Err("HOST-INAPPLICABLE cannot be mixed with executed cell attempts".into());
+    }
+    Ok(if saw_pass {
+        "PASS"
+    } else if saw_failure {
+        "FAIL"
+    } else if saw_error {
+        "ERROR"
+    } else {
+        "HOST-INAPPLICABLE"
+    })
+}
+
+/// Return the framework result row that carries the outcome selected by
+/// [`outcome_after_retries`]. All attempt rows remain in `results.jsonl`; this
+/// row is the one used for the cell's JUnit and summary entry.
+pub fn cell_result_after_retries(results: &[CellResult]) -> Result<&CellResult, String> {
+    let outcome = outcome_after_retries(
+        results
+            .iter()
+            .map(|result| (result.attempt, result.outcome.as_str())),
+    )?;
+    results
+        .iter()
+        .rev()
+        .find(|result| result.outcome == outcome)
+        .ok_or_else(|| format!("cell result history selected {outcome} without a matching row"))
+}
+
+/// Return both the selected result row and the number of attempts in its
+/// validated history. The selected row keeps its own ordinal and artifact;
+/// the separate count is what structured summaries report.
+pub fn cell_result_and_attempts_after_retries(
+    results: &[CellResult],
+) -> Result<(&CellResult, u64), String> {
+    let selected = cell_result_after_retries(results)?;
+    let attempts = results
+        .last()
+        .map(|result| result.attempt)
+        .ok_or_else(|| "cell result has no attempts".to_string())?;
+    Ok((selected, attempts))
+}
 
 fn command_text(program: &str, args: &[&str]) -> Result<String, String> {
     let output = Command::new(program)
@@ -1401,6 +1499,7 @@ pub fn prepare_test(
         dir,
         Instant::now() + Duration::from_secs(cell.timeout_seconds),
     )
+    .map(|(guest, _cpu_usage_usec)| guest)
 }
 
 fn prepare_test_until(
@@ -1408,8 +1507,9 @@ fn prepare_test_until(
     cell: &SelectedCell,
     dir: &Path,
     deadline: Instant,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, u64), String> {
     prepare_dirs(&context.root, dir)?;
+    let mut cpu_usage_usec = 0u64;
     if context.prebuilt && cell.test.program.is_some() {
         let source = context
             .build_root
@@ -1447,7 +1547,16 @@ fn prepare_test_until(
                 args.push(context.root.join(program).to_string_lossy().into_owned());
                 args.push("-o".into());
                 args.push(output.to_string_lossy().into_owned());
-                run_preparation(context, dir, "cc", &args, deadline, cell.timeout_seconds)?;
+                cpu_usage_usec = cpu_usage_usec
+                    .checked_add(run_preparation(
+                        context,
+                        dir,
+                        "cc",
+                        &args,
+                        deadline,
+                        cell.timeout_seconds,
+                    )?)
+                    .ok_or_else(|| "cell CPU usage overflowed u64".to_string())?;
             }
             require_executable_program(&output, &dir.join("captures"))?;
             vec![output.to_string_lossy().into_owned()]
@@ -1467,7 +1576,16 @@ fn prepare_test_until(
                 args.push(context.root.join(program).to_string_lossy().into_owned());
                 args.push("-o".into());
                 args.push(output.to_string_lossy().into_owned());
-                run_preparation(context, dir, "rustc", &args, deadline, cell.timeout_seconds)?;
+                cpu_usage_usec = cpu_usage_usec
+                    .checked_add(run_preparation(
+                        context,
+                        dir,
+                        "rustc",
+                        &args,
+                        deadline,
+                        cell.timeout_seconds,
+                    )?)
+                    .ok_or_else(|| "cell CPU usage overflowed u64".to_string())?;
             }
             require_executable_program(&output, &dir.join("captures"))?;
             vec![output.to_string_lossy().into_owned()]
@@ -1475,14 +1593,16 @@ fn prepare_test_until(
         (Some(program), None) if program.ends_with(".sh") => {
             let path = context.root.join(program).to_string_lossy().into_owned();
             if !context.prebuilt {
-                run_preparation(
-                    context,
-                    dir,
-                    &path,
-                    &["--prepare".into()],
-                    deadline,
-                    cell.timeout_seconds,
-                )?;
+                cpu_usage_usec = cpu_usage_usec
+                    .checked_add(run_preparation(
+                        context,
+                        dir,
+                        &path,
+                        &["--prepare".into()],
+                        deadline,
+                        cell.timeout_seconds,
+                    )?)
+                    .ok_or_else(|| "cell CPU usage overflowed u64".to_string())?;
             }
             vec![path, "--run".into()]
         }
@@ -1500,7 +1620,7 @@ fn prepare_test_until(
     if context.isolated_workdir.is_some() || supports_test_workdir(&cell.id.mode, backend) {
         resolve_repo_guest_args(&context.root, &mut guest);
     }
-    Ok(guest)
+    Ok((guest, cpu_usage_usec))
 }
 
 fn resolve_repo_guest_args(root: &Path, argv: &mut [String]) {
@@ -1604,7 +1724,7 @@ fn run_preparation(
     args: &[String],
     deadline: Instant,
     cell_timeout_seconds: u64,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let captures = dir.join("captures");
     if remaining_cell_time(deadline).is_zero() {
         return Err(with_diagnostic(
@@ -1638,7 +1758,7 @@ fn run_preparation(
             &captures,
         ));
     }
-    Ok(())
+    Ok(output.cpu_usage_usec)
 }
 
 pub fn build_spec(
@@ -2042,6 +2162,27 @@ fn execute_spec_until(
                             // this point is the invocation's pre-stamped
                             // no-result record or otherwise unrelated, and
                             // cannot supersede the refusal classification.
+                        } else if report.verdict == Verdict::InfrastructureError {
+                            let comparison_error = report
+                                .comparison
+                                .as_ref()
+                                .and_then(|_| report.require_canonical_comparison().err());
+                            if let Some(error) = comparison_error {
+                                outcome = "ERROR".into();
+                                error_kind = Some("incomplete-verification-evidence".into());
+                                reason = Some(error);
+                            } else {
+                                outcome = "ERROR".into();
+                                error_kind = Some("infrastructure".into());
+                                reason = Some(match report.infrastructure_error.as_ref() {
+                                    Some(InfrastructureError::SkidOvershoot { count }) => format!(
+                                        "verification recorded {count} HERMIT_SKID_OVERSHOOT report(s)"
+                                    ),
+                                    None => unreachable!(
+                                        "typed report parser requires an infrastructure error"
+                                    ),
+                                });
+                            }
                         } else if report.verdict == Verdict::NoResult
                             && matches!(
                                 report.no_result_reason,
@@ -2111,6 +2252,7 @@ fn execute_spec_until(
         signal: std::os::unix::process::ExitStatusExt::signal(&output.status),
         timed_out: output.timed_out,
         duration_ms: started.elapsed().as_millis(),
+        cpu_usage_usec: Some(output.cpu_usage_usec),
         observation_sha256: None,
         argv: spec.argv.clone(),
         guest_argv: spec.guest_argv.clone(),
@@ -2170,6 +2312,50 @@ fn normalize_ptrace_golden(hermit: &str, directory: &Path) -> Result<(), String>
 struct ProcessOutput {
     status: ExitStatus,
     timed_out: bool,
+    cpu_usage_usec: u64,
+}
+
+/// Add two complete CPU measurements, refusing missing or overflowing input.
+pub fn checked_add_cpu_usage(total: Option<u64>, usage: Option<u64>) -> Option<u64> {
+    total.and_then(|total| usage.and_then(|usage| total.checked_add(usage)))
+}
+
+fn rusage_cpu_usage_usec(usage: &libc::rusage) -> Result<u64, String> {
+    fn timeval_usec(value: libc::timeval) -> Option<u64> {
+        let seconds = u64::try_from(value.tv_sec).ok()?;
+        let microseconds = u64::try_from(value.tv_usec).ok()?;
+        (microseconds < 1_000_000)
+            .then_some(seconds.checked_mul(1_000_000)?.checked_add(microseconds)?)
+    }
+
+    let user = timeval_usec(usage.ru_utime)
+        .ok_or_else(|| "wait4 returned an invalid user CPU duration".to_string())?;
+    let system = timeval_usec(usage.ru_stime)
+        .ok_or_else(|| "wait4 returned an invalid system CPU duration".to_string())?;
+    user.checked_add(system)
+        .ok_or_else(|| "wait4 CPU usage overflowed u64".to_string())
+}
+
+fn wait4_process(pid: u32, options: libc::c_int) -> Result<Option<(ExitStatus, u64)>, String> {
+    loop {
+        let mut status = 0;
+        let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
+        let waited = unsafe { libc::wait4(pid as libc::pid_t, &mut status, options, &mut usage) };
+        if waited == 0 {
+            return Ok(None);
+        }
+        if waited == pid as libc::pid_t {
+            return Ok(Some((
+                ExitStatus::from_raw(status),
+                rusage_cpu_usage_usec(&usage)?,
+            )));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(format!("wait4({pid}) failed: {error}"));
+    }
 }
 
 fn execute_process(
@@ -2199,26 +2385,29 @@ fn execute_process(
             Ok(())
         });
     }
-    let mut child = command
+    let child = command
         .spawn()
         .map_err(|e| format!("cannot execute {program}: {e}"))?;
+    let pid = child.id();
     loop {
-        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+        if let Some((status, cpu_usage_usec)) = wait4_process(pid, libc::WNOHANG)? {
             return Ok(ProcessOutput {
                 status,
                 timed_out: false,
+                cpu_usage_usec,
             });
         }
         if Instant::now() >= deadline {
             unsafe {
-                libc::kill(-(child.id() as i32), libc::SIGTERM);
+                libc::kill(-(pid as i32), libc::SIGTERM);
             }
             let grace = Instant::now() + Duration::from_secs(10);
             loop {
-                if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                if let Some((status, cpu_usage_usec)) = wait4_process(pid, libc::WNOHANG)? {
                     return Ok(ProcessOutput {
                         status,
                         timed_out: true,
+                        cpu_usage_usec,
                     });
                 }
                 if Instant::now() >= grace {
@@ -2227,12 +2416,14 @@ fn execute_process(
                 thread::sleep(Duration::from_millis(20));
             }
             unsafe {
-                libc::kill(-(child.id() as i32), libc::SIGKILL);
+                libc::kill(-(pid as i32), libc::SIGKILL);
             }
-            let status = child.wait().map_err(|e| e.to_string())?;
+            let (status, cpu_usage_usec) = wait4_process(pid, 0)?
+                .ok_or_else(|| format!("blocking wait4({pid}) returned no child"))?;
             return Ok(ProcessOutput {
                 status,
                 timed_out: true,
+                cpu_usage_usec,
             });
         }
         thread::sleep(Duration::from_millis(20));
@@ -2253,6 +2444,7 @@ fn cell_timeout_attempt(
         signal: None,
         timed_out: true,
         duration_ms: duration.as_millis(),
+        cpu_usage_usec: None,
         observation_sha256: None,
         argv: spec.argv.clone(),
         guest_argv: spec.guest_argv.clone(),
@@ -2384,6 +2576,21 @@ fn failure_class(
     }
 }
 
+/// Apply a failed chaos population assertion without erasing an attempt-level
+/// infrastructure result. A timeout or unavailable verification report means
+/// the population was not fully measured; it is not a product failure merely
+/// because the incomplete sample also missed `min_passes`.
+fn apply_failed_chaos_assertion(
+    outcome: &mut String,
+    reason: &mut Option<String>,
+    assertion_reason: String,
+) {
+    if outcome != "ERROR" {
+        *outcome = "FAIL".into();
+        *reason = Some(assertion_reason);
+    }
+}
+
 pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult, String> {
     let dir = cell_artifact_dir(context, cell);
     let started = Instant::now();
@@ -2391,7 +2598,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
     let binary_before = fs::read(&context.hermit_bin)
         .ok()
         .map(|bytes| hex_digest(&bytes));
-    let guest = prepare_test_until(context, cell, &dir, deadline)?;
+    let (guest, preparation_cpu_usage_usec) = prepare_test_until(context, cell, &dir, deadline)?;
     let mode = cell.test.modes.get(&cell.id.mode).unwrap();
     let mut attempts = Vec::new();
     match cell.id.mode.as_str() {
@@ -2556,10 +2763,13 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
                 .min_normalized_entropy
                 .is_some_and(|minimum| normalized_entropy < minimum)
         {
-            outcome = "FAIL".into();
-            reason = Some(format!(
-                "chaos distinct={distinct} passes={pass_count} failures={failure_count} normalized_entropy={normalized_entropy:.4}"
-            ));
+            apply_failed_chaos_assertion(
+                &mut outcome,
+                &mut reason,
+                format!(
+                    "chaos distinct={distinct} passes={pass_count} failures={failure_count} normalized_entropy={normalized_entropy:.4}"
+                ),
+            );
         }
     }
     let execution_path = match summarize_sabre_path_evidence(&attempts) {
@@ -2610,6 +2820,11 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
     }
     let result = observed_result(&cell.id.mode, &outcome, &attempts, error_kind.as_deref());
     let failure_class = failure_class(&outcome, result, error_kind.as_deref());
+    let cpu_usage_usec = attempts
+        .iter()
+        .try_fold(preparation_cpu_usage_usec, |total, attempt| {
+            checked_add_cpu_usage(Some(total), attempt.cpu_usage_usec)
+        });
     Ok(CellResult {
         artifact_dir: dir.display().to_string(),
         schema: CELL_RESULT_SCHEMA,
@@ -2640,6 +2855,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         error_kind,
         timeout_seconds: cell.timeout_seconds,
         duration_ms: Some(started.elapsed().as_millis()),
+        cpu_usage_usec,
         runtime: attempts.iter().find_map(|attempt| attempt.runtime.clone()),
         log_level: (cell.id.mode != "naked").then(|| "info".into()),
         effective_args: literal_argv.iter().skip(1).cloned().collect(),
@@ -2714,6 +2930,7 @@ pub fn infrastructure_error_result(
         error_kind: Some("infrastructure".into()),
         timeout_seconds: cell.timeout_seconds,
         duration_ms: None,
+        cpu_usage_usec: None,
         runtime: None,
         log_level: (cell.id.mode != "naked").then(|| "info".into()),
         effective_args: Vec::new(),
@@ -2780,6 +2997,7 @@ pub fn host_inapplicable_result(
         error_kind: None,
         timeout_seconds: cell.timeout_seconds,
         duration_ms: None,
+        cpu_usage_usec: None,
         runtime: None,
         log_level: None,
         effective_args: Vec::new(),
@@ -3450,6 +3668,91 @@ mod tests {
     }
     use crate::ci_selection::CiDisabledResult;
 
+    #[test]
+    fn retry_outcome_preserves_recovery_and_product_failure() {
+        assert_eq!(
+            outcome_after_retries([(1, "FAIL"), (2, "PASS")]).unwrap(),
+            "PASS"
+        );
+        assert_eq!(
+            outcome_after_retries([(1, "ERROR"), (2, "PASS")]).unwrap(),
+            "PASS"
+        );
+        assert_eq!(
+            outcome_after_retries([(1, "FAIL"), (2, "ERROR")]).unwrap(),
+            "FAIL"
+        );
+        assert_eq!(
+            outcome_after_retries([(1, "ERROR"), (2, "ERROR")]).unwrap(),
+            "ERROR"
+        );
+        assert_eq!(
+            outcome_after_retries([(1, "HOST-INAPPLICABLE")]).unwrap(),
+            "HOST-INAPPLICABLE"
+        );
+    }
+
+    #[test]
+    fn retry_outcome_refuses_malformed_history_by_name() {
+        for (attempts, named) in [
+            (vec![], "no attempts"),
+            (vec![(2, "FAIL")], "expected 1"),
+            (
+                vec![(1, "PASS"), (2, "FAIL")],
+                "follows terminal outcome PASS",
+            ),
+            (
+                vec![(1, "HOST-INAPPLICABLE"), (2, "ERROR")],
+                "follows terminal outcome HOST-INAPPLICABLE",
+            ),
+            (vec![(1, "UNKNOWN")], "unknown outcome \"UNKNOWN\""),
+            (
+                vec![(1, "FAIL"), (2, "ERROR"), (3, "PASS")],
+                "exceeds the shared maximum of 2",
+            ),
+        ] {
+            let error = outcome_after_retries(attempts).unwrap_err();
+            assert!(error.contains(named), "{error:?} did not name {named:?}");
+        }
+    }
+
+    #[test]
+    fn selected_retry_row_keeps_its_ordinal_while_summary_keeps_history_count() {
+        let mut first = cell_result_that_located_nothing();
+        first.outcome = "FAIL".into();
+        first.attempt = 1;
+
+        let mut infrastructure = first.clone();
+        infrastructure.outcome = "ERROR".into();
+        infrastructure.attempt = 2;
+        let product_then_infrastructure = [first.clone(), infrastructure];
+        let (selected, attempts) =
+            cell_result_and_attempts_after_retries(&product_then_infrastructure).unwrap();
+        assert_eq!(
+            (selected.outcome.as_str(), selected.attempt, attempts),
+            ("FAIL", 1, 2)
+        );
+
+        let mut recovered = first.clone();
+        recovered.outcome = "PASS".into();
+        recovered.attempt = 2;
+        let recovered_history = [first, recovered];
+        let (selected, attempts) =
+            cell_result_and_attempts_after_retries(&recovered_history).unwrap();
+        assert_eq!(
+            (selected.outcome.as_str(), selected.attempt, attempts),
+            ("PASS", 2, 2)
+        );
+
+        let peer = cell_result_that_located_nothing();
+        let (selected, attempts) =
+            cell_result_and_attempts_after_retries(std::slice::from_ref(&peer)).unwrap();
+        assert_eq!(
+            (selected.outcome.as_str(), selected.attempt, attempts),
+            ("PASS", 1, 1)
+        );
+    }
+
     fn recipe(ci: bool) -> TestRecipe {
         let disabled = BTreeMap::from([
             ("dbt".into(), "not qualified".into()),
@@ -3841,6 +4144,47 @@ mod tests {
     }
 
     #[test]
+    fn wait4_cpu_usage_moves_with_descendant_work() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-cpu-usage-bracket-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let measure = |label: &str, script: &str| {
+            execute_process(
+                &root,
+                "/bin/sh",
+                &["-c".into(), script.into()],
+                &BTreeMap::new(),
+                &root.join(format!("{label}.stdout")),
+                &root.join(format!("{label}.stderr")),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .unwrap()
+        };
+        let low = measure("low", ":");
+        let high = measure("high", "head -c 134217728 /dev/zero | sha256sum >/dev/null");
+        assert!(low.status.success());
+        assert!(high.status.success());
+        assert!(
+            high.cpu_usage_usec > low.cpu_usage_usec.saturating_add(10_000),
+            "adding 128 MiB of descendant hashing did not move CPU usage: low={} high={}",
+            low.cpu_usage_usec,
+            high.cpu_usage_usec
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cpu_usage_aggregation_refuses_missing_or_overflowing_measurements() {
+        assert_eq!(checked_add_cpu_usage(Some(2), Some(3)), Some(5));
+        assert_eq!(checked_add_cpu_usage(Some(2), None), None);
+        assert_eq!(checked_add_cpu_usage(None, Some(3)), None);
+        assert_eq!(checked_add_cpu_usage(Some(u64::MAX), Some(1)), None);
+    }
+
+    #[test]
     fn repeated_invocations_share_one_outer_cell_deadline() {
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-cell-deadline-{}",
@@ -3908,6 +4252,13 @@ mod tests {
             duration_ms < 2_000,
             "three independent one-second bounds would take longer: {duration_ms}ms"
         );
+        let attempt_cpu_usage_usec = result.attempts.iter().try_fold(0u64, |total, attempt| {
+            checked_add_cpu_usage(Some(total), attempt.cpu_usage_usec)
+        });
+        assert_eq!(
+            result.cpu_usage_usec, attempt_cpu_usage_usec,
+            "the cell CPU figure must sum every process-owned attempt measurement"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3968,6 +4319,7 @@ mod tests {
         assert!(result.binary_sha256.is_none());
         assert_eq!(result.error_kind, None);
         assert_eq!(result.duration_ms, None);
+        assert_eq!(result.cpu_usage_usec, None);
         let results = root.join("results.jsonl");
         append_result(&results, &result).unwrap();
         assert!(
@@ -3978,6 +4330,10 @@ mod tests {
         assert!(
             row.get("duration_ms").is_none(),
             "a cell that never executed must not publish a measured zero wall time"
+        );
+        assert!(
+            row["cpu_usage_usec"].is_null(),
+            "a cell that never executed must publish null rather than a measured zero CPU time"
         );
         let mut measured_zero = result.clone();
         measured_zero.duration_ms = Some(0);
@@ -5010,6 +5366,7 @@ backends_disabled:
             error_kind: None,
             timeout_seconds: 1,
             duration_ms: Some(1),
+            cpu_usage_usec: Some(1),
             runtime: None,
             log_level: None,
             effective_args: Vec::new(),
@@ -5128,6 +5485,7 @@ backends_disabled:
             signal: None,
             timed_out: false,
             duration_ms: 1,
+            cpu_usage_usec: Some(1),
             observation_sha256: Some("a".into()),
             argv: vec![
                 "hermit".into(),
@@ -5344,19 +5702,13 @@ backends_disabled:
         assert!(narrowed["normalized_entropy"].as_f64().unwrap() < 0.82);
     }
 
-    fn nonzero_with_canonical_receipt(mode: &str) -> AttemptResult {
-        let dir = std::env::temp_dir().join(format!(
-            "hermit-runner-status-bracket-{}-{mode}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let verdict = dir.join("verdict.json");
-        let report = serde_json::to_string(&VerificationReport {
+    fn canonical_verification_report() -> VerificationReport {
+        VerificationReport {
             verified: true,
             bitwise_parity: true,
             verdict: Verdict::Matched,
             no_result_reason: None,
+            infrastructure_error: None,
             comparison: Some(crate::canonical_verdict::ComparisonReport {
                 strictness: crate::canonical_verdict::LogCompareStrictness::Canonical,
                 display_name: Some("BitwiseInfoV1".into()),
@@ -5389,8 +5741,18 @@ backends_disabled:
             first_divergent_syscall: None,
             first_divergent_left_message: None,
             first_divergent_right_message: None,
-        })
-        .unwrap();
+        }
+    }
+
+    fn nonzero_with_canonical_receipt(mode: &str) -> AttemptResult {
+        let dir = std::env::temp_dir().join(format!(
+            "hermit-runner-status-bracket-{}-{mode}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let verdict = dir.join("verdict.json");
+        let report = serde_json::to_string(&canonical_verification_report()).unwrap();
         let spec = CellRunSpec {
             id: CellId {
                 test: "fixture/status".into(),
@@ -5465,6 +5827,64 @@ backends_disabled:
         let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
         result
+    }
+
+    #[test]
+    fn skid_overshoot_receipt_is_an_infrastructure_error_with_comparison_evidence() {
+        let mut report = canonical_verification_report();
+        report.verified = false;
+        report.bitwise_parity = false;
+        report.verdict = Verdict::InfrastructureError;
+        report.infrastructure_error = Some(InfrastructureError::SkidOvershoot { count: 2 });
+        let report = serde_json::to_string(&report).unwrap();
+
+        let result = attempt_from_script(
+            "ptrace",
+            "printf %s \"$1\" > \"$2\"; exit 122",
+            Some(&report),
+        );
+
+        assert_eq!(result.outcome, "ERROR");
+        assert_eq!(result.error_kind.as_deref(), Some("infrastructure"));
+        assert_eq!(result.status, Some(122));
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("2 HERMIT_SKID_OVERSHOOT")),
+            "infrastructure error must retain the recorded count: {result:?}"
+        );
+        assert!(
+            result
+                .verification_report
+                .as_deref()
+                .is_some_and(|json| json.contains("\"comparison\":{")),
+            "infrastructure error must retain the completed comparison: {result:?}"
+        );
+
+        let mut before_comparison = canonical_verification_report();
+        before_comparison.verified = false;
+        before_comparison.bitwise_parity = false;
+        before_comparison.verdict = Verdict::InfrastructureError;
+        before_comparison.infrastructure_error =
+            Some(InfrastructureError::SkidOvershoot { count: 1 });
+        before_comparison.comparison = None;
+        before_comparison.compared_log_messages = None;
+        let before_comparison = serde_json::to_string(&before_comparison).unwrap();
+        let result = attempt_from_script(
+            "ptrace",
+            "printf %s \"$1\" > \"$2\"; exit 122",
+            Some(&before_comparison),
+        );
+        assert_eq!(result.outcome, "ERROR");
+        assert_eq!(result.error_kind.as_deref(), Some("infrastructure"));
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("1 HERMIT_SKID_OVERSHOOT")),
+            "comparison-null infrastructure error must retain its cause: {result:?}"
+        );
     }
 
     /// A backend this runner could not start and a backend that ran but recorded
@@ -5635,6 +6055,35 @@ backends_disabled:
         assert_eq!(chaos.status, Some(7));
     }
 
+    #[test]
+    fn chaos_assertion_does_not_relabel_an_incomplete_population_as_a_product_failure() {
+        let mut outcome = "ERROR".to_string();
+        let mut reason = Some("seed-31 timed out before producing a comparison".to_string());
+        apply_failed_chaos_assertion(
+            &mut outcome,
+            &mut reason,
+            "chaos distinct=8 passes=31 failures=1 normalized_entropy=0.9180".into(),
+        );
+        assert_eq!(outcome, "ERROR");
+        assert_eq!(
+            reason.as_deref(),
+            Some("seed-31 timed out before producing a comparison")
+        );
+
+        let mut outcome = "PASS".to_string();
+        let mut reason = None;
+        apply_failed_chaos_assertion(
+            &mut outcome,
+            &mut reason,
+            "chaos distinct=6 passes=32 failures=0 normalized_entropy=0.7000".into(),
+        );
+        assert_eq!(outcome, "FAIL");
+        assert_eq!(
+            reason.as_deref(),
+            Some("chaos distinct=6 passes=32 failures=0 normalized_entropy=0.7000")
+        );
+    }
+
     fn no_result_with_exit_status(
         status: i32,
         reason: crate::canonical_verdict::NoResultReason,
@@ -5800,6 +6249,85 @@ backends_disabled:
             &cell_dir.join("captures"),
         );
         assert!(empty.contains("no output was captured"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preparation_uses_the_named_cells_wall_deadline() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-preparation-timeout-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let cell_dir = root.join("cell");
+        fs::create_dir_all(cell_dir.join("captures")).unwrap();
+        let context = RunContext {
+            root: root.clone(),
+            hermit_bin: root.join("hermit"),
+            result_root: root.join("results"),
+            build_root: root.join("build"),
+            run_id: "fixture".into(),
+            machine_shortname: "fixture-host".into(),
+            kernel_version: "7.1.3-fixture".into(),
+            host_capabilities: fixture_host_capabilities(),
+            attempt: 1,
+            run_index: None,
+            source_sha: "0".repeat(40),
+            binary_build_sha: None,
+            source_dirty: false,
+            prebuilt: false,
+            keep_logs: false,
+            run_verify_strict: false,
+            record_verify_strict: false,
+            scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
+            isolated_workdir: None,
+        };
+        let test = recipe(true);
+        let cell = SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: test.id.clone(),
+                mode: "verify".into(),
+                backend: Some("ptrace".into()),
+            },
+            test,
+            enabled: true,
+            timeout_seconds: 1,
+        };
+
+        let error = run_preparation(
+            &context,
+            &cell_dir,
+            "/bin/sh",
+            &["-c".into(), "sleep 60".into()],
+            Instant::now() + Duration::from_secs(1),
+            cell.timeout_seconds,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("cell exceeded 1 s during fixture preparation"),
+            "{error}"
+        );
+        let result = infrastructure_error_result(&context, &cell, error);
+        assert_eq!(result.test, "fixture/test");
+        assert_eq!(result.error_kind.as_deref(), Some("infrastructure"));
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("cell exceeded 1 s during fixture preparation")
+        );
+
+        run_preparation(
+            &context,
+            &cell_dir,
+            "/bin/sh",
+            &["-c".into(), "true".into()],
+            Instant::now() + Duration::from_secs(1),
+            cell.timeout_seconds,
+        )
+        .expect("healthy fixture preparation must finish silently under the same bound");
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -92,16 +92,30 @@ fn has_cmd(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Locate `ci-hub`: `$CI_HUB_APPLY_LOCAL_LABEL`, else
-/// `$DEV_HERMIT_PARENT/ci-hub/ci-hub` (validate.sh:1647-1652).
-fn ci_hub_path() -> Option<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("CI_HUB_APPLY_LOCAL_LABEL") {
-        if !p.is_empty() {
-            return Some(std::path::PathBuf::from(p));
-        }
+/// Locate `ci-hub` in the executable checkout. The historical explicit path
+/// and parent-relative forms remain only for callers that do not supply the
+/// admitted launcher's tool root.
+fn ci_hub_path_from(
+    explicit: Option<String>,
+    tool_root: Option<String>,
+    parent: Option<String>,
+) -> Option<std::path::PathBuf> {
+    if let Some(root) = tool_root.filter(|path| !path.is_empty()) {
+        return Some(std::path::PathBuf::from(root).join("ci-hub").join("ci-hub"));
     }
-    let parent = std::env::var("DEV_HERMIT_PARENT").ok().filter(|p| !p.is_empty())?;
+    if let Some(path) = explicit.filter(|path| !path.is_empty()) {
+        return Some(std::path::PathBuf::from(path));
+    }
+    let parent = parent.filter(|path| !path.is_empty())?;
     Some(std::path::PathBuf::from(parent).join("ci-hub").join("ci-hub"))
+}
+
+fn ci_hub_path() -> Option<std::path::PathBuf> {
+    ci_hub_path_from(
+        std::env::var("CI_HUB_APPLY_LOCAL_LABEL").ok(),
+        std::env::var("DEV_HERMIT_TOOL_ROOT").ok(),
+        std::env::var("DEV_HERMIT_PARENT").ok(),
+    )
 }
 
 /// Resolve the PR: `$PR_NUMBER`, else ask `gh` (through `with-proxy` when
@@ -138,7 +152,7 @@ fn apply_local_label_args(pr: &str) -> [&str; 5] {
 /// Always returns; never fails the run.
 pub fn publish() -> Publication {
     let Some(ci_hub) = ci_hub_path() else {
-        let msg = "the ci-hub receipt publisher is unavailable (no CI_HUB_APPLY_LOCAL_LABEL and no DEV_HERMIT_PARENT)";
+        let msg = "the ci-hub receipt publisher is unavailable (no CI_HUB_APPLY_LOCAL_LABEL, DEV_HERMIT_TOOL_ROOT, or DEV_HERMIT_PARENT)";
         eprintln!("⚠️  counted validation recorded, but {msg}; not applying locally-validated");
         return Publication::Unavailable(msg.into());
     };
@@ -180,6 +194,19 @@ pub fn publish() -> Publication {
 /// planted a real `locally-validated` label would itself be the authorization it
 /// claims to test.
 pub fn self_test() -> Result<String, String> {
+    let split = ci_hub_path_from(
+        Some("/caller-selected".into()),
+        Some("/tool-root".into()),
+        Some("/state-root".into()),
+    );
+    if split.as_deref() != Some(std::path::Path::new("/tool-root/ci-hub/ci-hub")) {
+        return Err("receipt: publisher did not prefer the executable tool root".into());
+    }
+    if ci_hub_path_from(Some("/explicit/ci-hub".into()), None, None).as_deref()
+        != Some(std::path::Path::new("/explicit/ci-hub"))
+    {
+        return Err("receipt: legacy explicit publisher path was treated as a root".into());
+    }
     // The canonical consumer deliberately has no caller-selected ledger path.
     // Reintroducing `--ledger` would let this producer point the verifier at a
     // retired or forged shadow and recreate the drift this bracket closes.

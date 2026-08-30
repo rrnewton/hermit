@@ -64,11 +64,12 @@
 #
 # Environment:
 #   DAGRUN_BIN   override the runner executable (mirrors run-dag.sh).
-#   RUN_NODE_JOBS        outer concurrency across the selected nodes (default 1:
-#                        one node at a time, preserving the historical serial
-#                        shim semantics). Inner per-node parallelism (cargo /
-#                        nextest -j) comes from each node's jobs_flag in the DAG,
-#                        independent of this.
+#   RUN_NODE_JOBS        optional outer-concurrency override across selected
+#                        nodes. When unset, constructed-plan runs leave `-j`
+#                        unset and use validate's host-adaptive default. The
+#                        local-only edited-command path keeps its historical
+#                        one-node default. Inner per-node parallelism (cargo /
+#                        nextest -j) comes from each node's jobs_flag in the DAG.
 #   RUN_NODE_PERF_DIR    directory for per-step + whole-run resource-usage CSVs
 #                        (default ignored/ci/perf/run-node/<lane>). CI uploads it
 #                        as a per-shard performance artifact.
@@ -130,9 +131,13 @@ if ((${#append[@]} == 0)); then
             exit 2
             ;;
     esac
-    jobs=${RUN_NODE_JOBS:-1}
     extra=(--allow-local-off-the-record-run --selected "$sel" \
-        --ignore-selected-deps --no-label-pr -j "$jobs" --verbose)
+        --ignore-selected-deps --no-label-pr --verbose)
+    scheduler_width=validate-default
+    if [[ -n ${RUN_NODE_JOBS:-} ]]; then
+        extra+=(-j "$RUN_NODE_JOBS")
+        scheduler_width=-j$RUN_NODE_JOBS
+    fi
     if [[ -n ${GITHUB_ACTIONS:-} || -n ${CI:-} ]]; then
         extra+=(--allow-cgroup-failure \
             --skip-inner-dirty-working-tree-and-rebase-freshness-checks)
@@ -140,7 +145,7 @@ if ((${#append[@]} == 0)); then
     if [[ -n ${RUN_NODE_PRINT_ONLY:-} ]]; then
         extra+=(--show-plan)
     fi
-    echo "run-node.sh: lane=$lane nodes=$sel -j$jobs via validate's constructed plan" >&2
+    echo "run-node.sh: lane=$lane nodes=$sel scheduler-width=$scheduler_width via validate's constructed plan" >&2
     exec ./scripts/validate.rs "${profile[@]}" "${extra[@]}"
 fi
 

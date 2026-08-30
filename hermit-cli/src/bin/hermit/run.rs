@@ -35,6 +35,7 @@ use hermit::Context;
 use hermit::DetConfig;
 use hermit::Error;
 use hermit::Shebang;
+use hermit::SkidOvershootError;
 use hermit::happens_before::DebugInfoResolver;
 use hermit::happens_before::describe_anchor;
 use hermit::happens_before::load_program;
@@ -75,6 +76,8 @@ use super::verify::verification_log_level;
 use super::verify::verification_runtime_from_summaries;
 use super::verify::write_pending_verification_json;
 use super::verify::write_report_json;
+use super::verify::write_skid_overshoot_verification_json;
+use super::verify::write_skid_overshoot_without_comparison_json;
 use super::verify::write_verification_json;
 
 const TMP_DIR: &str = "/tmp";
@@ -3665,9 +3668,26 @@ impl RunOpts {
 
         eprintln!(":: {}", "Run1...".yellow().bold());
 
-        let mut out1: Output = match run1_options.run_verify(log1_file, global) {
-            Ok(output) => output,
+        let (mut out1, skid_overshoots_run1) = match run1_options.run_verify(log1_file, global) {
+            Ok(result) => result,
             Err(error) => {
+                if let Some(overshoot) = error.downcast_ref::<SkidOvershootError>()
+                    && let Some(path) = &self.verify_json
+                {
+                    let summary1 = read_verify_summary(summary1_file.path());
+                    if let Err(report_error) = write_skid_overshoot_without_comparison_json(
+                        path,
+                        overshoot.count(),
+                        verification_runtime_from_summaries(summary1.as_ref(), None),
+                        None,
+                    ) {
+                        eprintln!(
+                            "WARNING: could not record the skid overshoot in {}: {}",
+                            path.display(),
+                            report_error
+                        );
+                    }
+                }
                 if self.keep_logs {
                     retain_verification_logs([("run 1", log1_path)])?;
                 }
@@ -3705,6 +3725,21 @@ impl RunOpts {
         }
 
         if !self.verify_allow.satisfies(out1.status) {
+            if skid_overshoots_run1 > 0 {
+                if let Some(path) = &self.verify_json {
+                    let summary1 = read_verify_summary(summary1_file.path());
+                    write_skid_overshoot_without_comparison_json(
+                        path,
+                        skid_overshoots_run1,
+                        verification_runtime_from_summaries(summary1.as_ref(), None),
+                        Some(out1.status),
+                    )?;
+                }
+                if self.keep_logs {
+                    retain_verification_logs([("run 1", log1_path)])?;
+                }
+                return Err(Error::new(SkidOvershootError::new(skid_overshoots_run1)));
+            }
             let status = describe_exit_status(out1.status);
             eprintln!(
                 "First run errored during --verify, not continuing to a second.\nExit status: {status}\nStdout:\n{}\nStderr:\n{}",
@@ -3748,6 +3783,16 @@ impl RunOpts {
         }
 
         let summary1 = take_verify_summary_before_next_run(summary1_file.path())?;
+        if skid_overshoots_run1 > 0
+            && let Some(path) = &self.verify_json
+        {
+            write_skid_overshoot_without_comparison_json(
+                path,
+                skid_overshoots_run1,
+                verification_runtime_from_summaries(summary1.as_ref(), None),
+                Some(out1.status),
+            )?;
+        }
 
         // ⚠️ THE TWO RUNS MUST START FROM IDENTICAL fd STATE, AND WITHOUT THIS
         // THEY DO NOT. Both runs inherit hermit's OWN stderr, so a guest that
@@ -3786,9 +3831,27 @@ impl RunOpts {
         restore_standard_fd_status_flags(fd_flags_before_run1);
 
         eprintln!(":: {}", "Run2...".yellow().bold());
-        let mut out2 = match run2_options.run_verify(log2_file, global) {
-            Ok(output) => output,
+        let (mut out2, skid_overshoots_run2) = match run2_options.run_verify(log2_file, global) {
+            Ok(result) => result,
             Err(error) => {
+                if let Some(overshoot) = error.downcast_ref::<SkidOvershootError>()
+                    && let Some(path) = &self.verify_json
+                {
+                    let summary2 = read_verify_summary(summary2_path);
+                    let count = skid_overshoots_run1.saturating_add(overshoot.count());
+                    if let Err(report_error) = write_skid_overshoot_without_comparison_json(
+                        path,
+                        count,
+                        verification_runtime_from_summaries(summary1.as_ref(), summary2.as_ref()),
+                        Some(out1.status),
+                    ) {
+                        eprintln!(
+                            "WARNING: could not record the skid overshoot in {}: {}",
+                            path.display(),
+                            report_error
+                        );
+                    }
+                }
                 if self.keep_logs {
                     retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
                 }
@@ -3850,6 +3913,17 @@ impl RunOpts {
         };
         let failure_message = "Failure: nondeterministic.";
         let summary2 = read_verify_summary(summary2_path);
+        let skid_overshoots = skid_overshoots_run1.saturating_add(skid_overshoots_run2);
+        if skid_overshoots > 0
+            && let Some(path) = &self.verify_json
+        {
+            write_skid_overshoot_without_comparison_json(
+                path,
+                skid_overshoots,
+                verification_runtime_from_summaries(summary1.as_ref(), summary2.as_ref()),
+                Some(out1.status),
+            )?;
+        }
         let mut outcome = compare_two_runs(
             ComparedRun {
                 output: &out1,
@@ -3874,7 +3948,14 @@ impl RunOpts {
         // whether or not the runs matched, and independent of the guest's own
         // exit status.
         if let Some(path) = &self.verify_json {
-            write_verification_json(path, &outcome)?;
+            if skid_overshoots > 0 {
+                write_skid_overshoot_verification_json(path, &outcome, skid_overshoots)?;
+            } else {
+                write_verification_json(path, &outcome)?;
+            }
+        }
+        if skid_overshoots > 0 {
+            return Err(Error::new(SkidOvershootError::new(skid_overshoots)));
         }
         announce_verification_outcome(&outcome, success_message, failure_message);
 
@@ -3917,7 +3998,7 @@ impl RunOpts {
             Backend::Liteinst => {
                 Some("LiteInst host hybrid (reverie-liteinst patch runtime + ptrace Detcore Tool)")
             }
-            _ => None,
+            Backend::Ptrace | Backend::Dbt | Backend::Sabre | Backend::E9patch => None,
         };
         if let Some(backend_banner) = backend_banner {
             eprintln!(":: Backend: {backend_banner}");
@@ -4030,7 +4111,11 @@ impl RunOpts {
         Ok((container, identity_sources))
     }
 
-    pub fn run_verify(&self, log_file: fs::File, global: &GlobalOpts) -> Result<Output, Error> {
+    pub fn run_verify(
+        &self,
+        log_file: fs::File,
+        global: &GlobalOpts,
+    ) -> Result<(Output, u64), Error> {
         if self.no_namespace {
             // Verify initializes a process-global tracing subscriber for each run. Keep a plain
             // child-process boundary between runs, but do not configure any namespaces or mounts.
@@ -4254,7 +4339,7 @@ impl RunOpts {
         &self,
         log_file: &mut Option<fs::File>,
         global: &GlobalOpts,
-    ) -> Result<Output, Error> {
+    ) -> Result<(Output, u64), Error> {
         // HACK: Use interior mutability to workaround not being able to pass
         // `log_file` by value. Guaranteed by caller to never panic.
         let log_file = log_file.take().unwrap();
@@ -4281,12 +4366,13 @@ impl RunOpts {
         let config = self.effective_det_config();
         self.save_config_to_disk()?;
 
-        hermit::run_with_output_backend(
+        hermit::run_with_output_backend_timeout_and_skid_overshoots(
             command,
             config,
             self.summary,
             &self.summary_json,
             self.runtime_backend(),
+            None,
         )
     }
 }
