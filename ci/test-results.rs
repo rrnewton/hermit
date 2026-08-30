@@ -161,7 +161,20 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::process::Command;
+
     use super::*;
+
+    fn repository_root() -> PathBuf {
+        let source = PathBuf::from(file!());
+        let source = if source.is_absolute() {
+            source
+        } else {
+            env::current_dir().unwrap().join(source)
+        };
+        source.parent().unwrap().parent().unwrap().to_path_buf()
+    }
 
     #[test]
     fn writer_constructs_the_shared_type() {
@@ -266,5 +279,29 @@ mod tests {
                 .unwrap_err()
                 .contains("retained schema 1 has no current write path")
         );
+    }
+
+    #[test]
+    fn shell_producers_and_consumers_keep_the_typed_channel_controls() {
+        let root = repository_root();
+        for script in [
+            "ci/write-structured-test-counts.sh",
+            "scripts/test-fail-closed.sh",
+            "scripts/progress-report.sh",
+            "scripts/compat-map.sh",
+        ] {
+            let output = Command::new("bash")
+                .arg(root.join(script))
+                .arg("--self-test")
+                .current_dir(&root)
+                .output()
+                .unwrap_or_else(|error| panic!("cannot run {script} --self-test: {error}"));
+            assert!(
+                output.status.success(),
+                "{script} --self-test failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
     }
 }
