@@ -57,141 +57,11 @@ use std::time::Duration;
 
 // ------------------------------------------------------------------ environmental blocks
 
-/// ⚠️ THIS IS NO LONGER ENVIRONMENTAL-ONLY. Owner directive 2026-08-26 made EVERY
-/// cell always eligible for retry rather than opt-in. The per-cell limit below
-/// is the policy.
-///
-/// Why the opt-in had to go, measured: across all 106 recorded runs carrying
-/// `retried_nodes`, 12 rows had a retry and ALL 12 were granted on the
-/// environmental ground. The registry ground has never once granted a retry, and
-/// the registry itself holds a single cell measured 22 days ago -- a cell earned
-/// retry by having already been retried.
-///
-/// Owner ruling 2026-08-26: every failed cell gets exactly one retry attempt.
-/// The manifest runner owns the shared total so the harness and outer scheduler
-/// cannot silently drift to different budgets.
+/// Owner ruling 2026-08-26: every failed manifest cell gets exactly one retry.
+/// The manifest runner owns that retry; validate uses the same bound only when
+/// proving both cell attempts fit inside the enclosing node deadline.
 pub const MAX_ATTEMPTS_PER_CELL: usize =
     hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL as usize;
-
-pub const RETRIES_PER_CELL: usize = MAX_ATTEMPTS_PER_CELL - 1;
-
-/// Derive the lane-round backstop from the work it encloses.
-///
-/// Every retry round grants at least one selected cell one of its remaining
-/// retries. There are `cell_count * RETRIES_PER_CELL` such grants in the whole
-/// lane, so that product is an enclosing bound rather than an unrelated number.
-pub fn lane_round_backstop(cell_count: usize) -> usize {
-    cell_count.saturating_mul(RETRIES_PER_CELL)
-}
-
-// ------------------------------------------------------------------ measured-unstable nodes
-
-/// Path of the registry naming nodes with MEASURED instability, if one is reachable.
-///
-/// `VALIDATE_FLAKY_CELL_REGISTRY` names it outright; otherwise the parent
-/// workspace's `ci-hub/validate/flaky-cells.json` is used. That file already
-/// exists, already carries the project's rule for membership — "Add a cell ONLY
-/// with a measured pass/fail sample and its provenance; do not list a cell on
-/// suspicion" — and is already consumed by `ci-hub/validate/flake_class.py` to
-/// reclassify a recorded red. Reading the SAME file here is what stops the
-/// read-side taxonomy and the write-side retry policy from drifting apart.
-fn flaky_cell_registry_path(parent: Option<&Path>) -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var("VALIDATE_FLAKY_CELL_REGISTRY") {
-        if !explicit.is_empty() {
-            return Some(PathBuf::from(explicit));
-        }
-    }
-    let candidate = parent?.join("ci-hub/validate/flaky-cells.json");
-    candidate.is_file().then_some(candidate)
-}
-
-/// Node tags whose failure is retry-eligible because instability was MEASURED.
-///
-/// Returns an EMPTY set when no registry is reachable — a standalone hermit
-/// checkout with no parent widens nothing, and only the environmental classes
-/// below remain eligible. That is the safe direction: an unreachable registry
-/// must not silently grant a blanket retry policy.
-///
-/// A ONE-SIDED SAMPLE IS REFUSED, and that refusal is the load-bearing part.
-/// The flakiness investigation measured identities that fail EVERY time for a
-/// structural reason: at SHA 0f1f6cd0, eight DBT identities reported `no_result`
-/// 5 runs out of 5 because DBT never publishes a terminal verify report, and
-/// `dbt-unsupported-syscall/ptrace` was pre-comparison `no_result` 5/5. Those
-/// are 100% reproducible, so retrying them costs two runs and returns the
-/// same answer. An entry recording `observed_pass: 0` describes exactly that
-/// shape, so it is rejected here with its numbers named rather than silently
-/// granted a retry budget.
-///
-/// The registry's entries are cell names (`command_strict_verify`). A DAG node's
-/// tag is `group.job` (`test.command_strict_verify`), so both spellings are
-/// accepted: an entry matches a tag outright, or matches its `job` half.
-pub fn measured_unstable_nodes(parent: Option<&Path>) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    let Some(path) = flaky_cell_registry_path(parent) else {
-        return out;
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return out;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-        eprintln!(
-            "validate: WARNING: {} is not readable JSON; no node is retry-eligible on measured \
-             instability. Environmental classification is unaffected.",
-            path.display()
-        );
-        return out;
-    };
-    let Some(cells) = value.get("cells").and_then(|c| c.as_array()) else {
-        return out;
-    };
-    for cell in cells {
-        let Some(name) = cell.get("cell").and_then(|c| c.as_str()) else {
-            continue;
-        };
-        // An entry without a measured sample is not evidence, and the registry's
-        // own rule already forbids it. Refuse it here too rather than trusting
-        // that every future editor read the comment.
-        let passes = cell.get("observed_pass").and_then(serde_json::Value::as_u64);
-        let fails = cell.get("observed_fail").and_then(serde_json::Value::as_u64);
-        let (Some(passes), Some(fails)) = (passes, fails) else {
-            eprintln!(
-                "validate: WARNING: flaky-cell registry entry {name:?} has no observed_pass/\
-                 observed_fail sample; NOT treating it as retry-eligible."
-            );
-            continue;
-        };
-        if passes == 0 || fails == 0 {
-            eprintln!(
-                "validate: WARNING: flaky-cell registry entry {name:?} is {passes} pass / {fails} \
-                 fail, which is a one-sided sample rather than measured instability; NOT treating \
-                 it as retry-eligible."
-            );
-            continue;
-        }
-        let measured_at = cell
-            .get("measured_at")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown date");
-        out.insert(
-            name.to_string(),
-            format!("{passes} pass / {fails} fail, measured {measured_at}"),
-        );
-    }
-    out
-}
-
-/// The registry's measured detail for `tag`, or `None` when it names no such node.
-pub fn measured_unstable_detail(
-    registry: &BTreeMap<String, String>,
-    tag: &str,
-) -> Option<String> {
-    if let Some(reason) = registry.get(tag) {
-        return Some(reason.clone());
-    }
-    // `group.job` -> `job`, so a registry written in cell names still matches.
-    let job = tag.split_once('.').map(|(_, job)| job)?;
-    registry.get(job).cloned()
-}
 
 /// The closed environmental-block values emitted by this classifier.
 ///
@@ -1643,23 +1513,10 @@ pub fn enter_cleanup_critical_section() {
 /// registers a FAKE peer record held by a short-lived child of this process, which
 /// cannot authorize anything.
 pub fn self_test() -> Result<String, String> {
-    if RETRIES_PER_CELL != 1 || MAX_ATTEMPTS_PER_CELL != 2 {
+    if MAX_ATTEMPTS_PER_CELL != 2 {
         return Err(format!(
-            "retry policy: expected one initial attempt plus exactly one retry, got \
-             RETRIES_PER_CELL={RETRIES_PER_CELL} MAX_ATTEMPTS_PER_CELL={MAX_ATTEMPTS_PER_CELL}"
-        ));
-    }
-    if lane_round_backstop(0) != 0
-        || lane_round_backstop(1) != RETRIES_PER_CELL
-        || lane_round_backstop(67) != 67 * RETRIES_PER_CELL
-    {
-        return Err(format!(
-            "retry policy: the lane-round backstop is not derived from selected cells times \
-             RETRIES_PER_CELL={} (0 -> {}, 1 -> {}, 67 -> {})",
-            RETRIES_PER_CELL,
-            lane_round_backstop(0),
-            lane_round_backstop(1),
-            lane_round_backstop(67),
+            "manifest retry policy: expected one initial cell attempt plus exactly one retry, \
+             got MAX_ATTEMPTS_PER_CELL={MAX_ATTEMPTS_PER_CELL}"
         ));
     }
 
