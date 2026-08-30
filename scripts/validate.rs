@@ -2240,6 +2240,55 @@ cleared-caps refusal names {} starved step(s)",
                 "full-plan bracket: privileged build did not assert the artifact and prebuild the exact downstream test binaries".into(),
             );
         }
+        if ["test.cli", "test.hermit_modes"]
+            .iter()
+            .any(|forbidden| privileged_build.deps.iter().any(|dep| dep == forbidden))
+        {
+            return Err(format!(
+                "full-plan bracket: privileged build depends on portable test success: {:?}",
+                privileged_build.deps
+            ));
+        }
+        assert_fused_shared_integration_test_resources(
+            &full.cfg.steps,
+            &full.cfg.resource_caps,
+        )?;
+        let mut missing_shared_demand = full.cfg.steps.clone();
+        missing_shared_demand
+            .iter_mut()
+            .find(|step| step.tag() == "test.cli")
+            .expect("portable cli exists")
+            .hint
+            .resources
+            .remove("integration_test_binaries.cli");
+        let mut missing_shared_cap = full.cfg.resource_caps.clone();
+        missing_shared_cap.remove("integration_test_binaries.hermit_modes");
+        if assert_fused_shared_integration_test_resources(
+            &missing_shared_demand,
+            &full.cfg.resource_caps,
+        )
+        .is_ok()
+            || assert_fused_shared_integration_test_resources(&full.cfg.steps, &missing_shared_cap)
+                .is_ok()
+        {
+            return Err("full-plan bracket: missing shared-test resource demand/cap was accepted".into());
+        }
+        let mut selected = Plan {
+            cfg: full.cfg.clone(),
+            profile: "full".into(),
+            ..Default::default()
+        };
+        select_constructed_steps(
+            &mut selected,
+            "privileged-test.cli_kvm,privileged-test.pmu_buck_chaos_cases",
+            false,
+        )?;
+        let tags: BTreeSet<String> = selected.cfg.steps.iter().map(Step::tag).collect();
+        if ["test.cli", "test.hermit_modes"].iter().any(|tag| tags.contains(*tag)) {
+            return Err(format!(
+                "full-plan bracket: selected privileged tests acquired a portable-test dependency: {tags:?}"
+            ));
+        }
         let cpuid = full
             .cfg
             .steps
@@ -2323,6 +2372,17 @@ cleared-caps refusal names {} starved step(s)",
         let sequential = build_plan(&root, &sequential_args, &tmp)?;
         if sequential.second.is_none() {
             return Err("full-plan bracket: --sequential-lanes did not preserve the fallback".into());
+        }
+        let sequential_has_shared_resource = std::iter::once(&sequential.cfg)
+            .chain(sequential.second.iter())
+            .any(|cfg| {
+                cfg.resource_caps
+                    .keys()
+                    .chain(cfg.steps.iter().flat_map(|step| step.hint.resources.keys()))
+                    .any(|resource| resource.starts_with(FUSED_INTEGRATION_TEST_RESOURCE_PREFIX))
+            });
+        if sequential_has_shared_resource {
+            return Err("full-plan bracket: fused shared-test resources leaked into the sequential plan".into());
         }
         let portable_tests = test_nodes_of(&validate_plan::lane_config(&root, "portable")?);
         let privileged_tests = test_nodes_of(&validate_plan::lane_config(&root, "privileged")?);
@@ -5173,6 +5233,91 @@ fn test_nodes_of(cfg: &DagConfig) -> BTreeSet<String> {
         .collect()
 }
 
+const EXPECTED_FUSED_SHARED_INTEGRATION_TESTS: [(&str, &str, &str); 2] = [
+    ("cli", "test.cli", "privileged-test.cli_kvm"),
+    ("hermit_modes", "test.hermit_modes", "privileged-test.pmu_buck_chaos_cases"),
+];
+const FUSED_INTEGRATION_TEST_RESOURCE_PREFIX: &str = "integration_test_binaries.";
+const FUSED_INTEGRATION_TEST_BUILDER: &str = "privileged-build.privileged_tests";
+
+fn assert_fused_shared_integration_test_consumers(steps: &[Step]) -> Result<(), String> {
+    let mut by_binary: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for step in steps {
+        for binary in step.integration_test_binaries.iter().flatten() {
+            by_binary.entry(binary).or_default().push(step.tag());
+        }
+    }
+    by_binary.retain(|_, consumers| {
+        consumers.sort();
+        consumers.iter().any(|tag| tag.starts_with("privileged-"))
+            && consumers.iter().any(|tag| !tag.starts_with("privileged-"))
+    });
+    if by_binary.len() != EXPECTED_FUSED_SHARED_INTEGRATION_TESTS.len()
+        || EXPECTED_FUSED_SHARED_INTEGRATION_TESTS.iter().any(|(binary, portable, privileged)| {
+            by_binary.get(binary) != Some(&vec![(*privileged).into(), (*portable).into()])
+        })
+    {
+        return Err(format!(
+            "fused shared integration-test consumers changed: expected={EXPECTED_FUSED_SHARED_INTEGRATION_TESTS:?}, actual={by_binary:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn add_fused_shared_integration_test_resources(
+    steps: &mut [Step],
+) -> Result<BTreeMap<String, i64>, String> {
+    assert_fused_shared_integration_test_consumers(steps)?;
+    let mut caps = BTreeMap::new();
+    for (binary, portable, privileged) in EXPECTED_FUSED_SHARED_INTEGRATION_TESTS {
+        let resource = format!("{FUSED_INTEGRATION_TEST_RESOURCE_PREFIX}{binary}");
+        caps.insert(resource.clone(), 1);
+        for tag in [portable, privileged, FUSED_INTEGRATION_TEST_BUILDER] {
+            let step = steps
+                .iter_mut()
+                .find(|step| step.tag() == tag)
+                .ok_or_else(|| format!("fused shared-test resource lost {tag}"))?;
+            if step.hint.resources.insert(resource.clone(), 1).is_some() {
+                return Err(format!("fused shared-test resource already declared by {tag}"));
+            }
+        }
+    }
+    Ok(caps)
+}
+
+fn assert_fused_shared_integration_test_resources(
+    steps: &[Step],
+    caps: &BTreeMap<String, i64>,
+) -> Result<(), String> {
+    assert_fused_shared_integration_test_consumers(steps)?;
+    let resource_count = caps
+        .keys()
+        .chain(steps.iter().flat_map(|step| step.hint.resources.keys()))
+        .filter(|resource| resource.starts_with(FUSED_INTEGRATION_TEST_RESOURCE_PREFIX))
+        .collect::<BTreeSet<_>>()
+        .len();
+    if resource_count != EXPECTED_FUSED_SHARED_INTEGRATION_TESTS.len() {
+        return Err(format!("fused shared integration-test resource count changed: {resource_count}"));
+    }
+    for (binary, portable, privileged) in EXPECTED_FUSED_SHARED_INTEGRATION_TESTS {
+        let resource = format!("{FUSED_INTEGRATION_TEST_RESOURCE_PREFIX}{binary}");
+        let expected = vec![
+            (FUSED_INTEGRATION_TEST_BUILDER.to_string(), 1),
+            (privileged.to_string(), 1),
+            (portable.to_string(), 1),
+        ];
+        let mut actual: Vec<(String, i64)> = steps
+            .iter()
+            .filter_map(|step| step.hint.resources.get(&resource).map(|n| (step.tag(), *n)))
+            .collect();
+        actual.sort();
+        if caps.get(&resource) != Some(&1) || actual != expected {
+            return Err(format!("fused shared-test resource {resource} has cap={:?}, demanders={actual:?}; expected cap=1, demanders={expected:?}", caps.get(&resource)));
+        }
+    }
+    Ok(())
+}
+
 /// Add one final node that checks the complete fresh result set and prints the
 /// compatibility table. The existing bucket exits remain authoritative: in
 /// particular, preserving their node identity keeps environmental retry and
@@ -5721,6 +5866,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
     if !removed.is_empty() {
         eprintln!("validate: fused lanes; deduped {} identical node(s): {}", removed.len(), removed.join(", "));
     }
+    let mut shared_test_resource_caps = BTreeMap::new();
     if lanes.len() == 2 {
         // The artifact barrier waits for both initial Cargo producers, verifies
         // binary and resource identities, then publishes a content-addressed
@@ -5756,6 +5902,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
                 artifact.cmd, artifact.deps
             ));
         }
+        shared_test_resource_caps = add_fused_shared_integration_test_resources(&mut steps)?;
         let privileged_build = steps
             .iter_mut()
             .find(|s| s.tag() == consumer)
@@ -5769,7 +5916,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         }
         for dependency in [producer, "build.liteinst_runtime_release"] {
             if !privileged_build.deps.iter().any(|d| d == dependency) {
-                privileged_build.deps.push(dependency.to_string());
+                privileged_build.deps.push(dependency.into());
             }
         }
         privileged_build.deps.sort();
@@ -5798,7 +5945,6 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // artifact -- a check that passes while measuring the wrong thing,
         // which is worse than failing loudly. Zero binaries still fails.
         privileged_build.cmd = "./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null || exit 1; CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run || exit 1; newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"".to_string();
-
         let cpuid = steps
             .iter_mut()
             .find(|s| s.tag() == "privileged-cpuid.faulting")
@@ -5841,6 +5987,14 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             }
             fused.resource_caps.insert(r.clone(), *n);
         }
+    }
+    for (resource, capacity) in shared_test_resource_caps {
+        if fused.resource_caps.insert(resource.clone(), capacity).is_some() {
+            return Err(format!("fused shared-test resource cap already exists: {resource}"));
+        }
+    }
+    if lanes.len() == 2 {
+        assert_fused_shared_integration_test_resources(&steps, &fused.resource_caps)?;
     }
     let cfg = validate_plan::config_from_base(&fused, steps, "fused lanes");
     Ok(Plan {
@@ -8957,6 +9111,28 @@ mod nextest_timeout_tests {
     fn nextest_uses_the_manifest_default_and_named_overrides() {
         let config = include_str!("../.config/nextest.toml");
         let manifest = include_str!("../tests/e2e/manifests/defaults.yaml");
+        let manifest_timeout_stanzas = [
+            "- filter: test(/(^|::)every_record_container_site_classifies_a_child_fault_by_name$/)\n    timeout_seconds: 45",
+            "- filter: test(/(^|::)run_timeout_fallback_fires_when_the_unwind_does_not_finish$/)\n    timeout_seconds: 30",
+            "- filter: binary(=container_init_deadline)\n    timeout_seconds: 30",
+        ];
+        let manifest_timeouts_match = |source: &str| {
+            manifest_timeout_stanzas
+                .iter()
+                .all(|stanza| source.contains(stanza))
+        };
+        assert!(manifest_timeouts_match(manifest));
+        for wrong_timeout in [44, 30] {
+            let mutated = manifest.replacen(
+                "timeout_seconds: 45",
+                &format!("timeout_seconds: {wrong_timeout}"),
+                1,
+            );
+            assert!(
+                !manifest_timeouts_match(&mutated),
+                "source-audit timeout mutation 45->{wrong_timeout} escaped the ratchet"
+            );
+        }
         let timeouts: Vec<&str> = config
             .lines()
             .map(str::trim)
@@ -8966,11 +9142,11 @@ mod nextest_timeout_tests {
             timeouts,
             vec![
                 "slow-timeout = { period = \"15s\", terminate-after = 1, grace-period = \"2s\" }",
-                "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
+                "slow-timeout = { period = \"45s\", terminate-after = 1, grace-period = \"2s\" }",
                 "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
                 "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
             ],
-            "the per-test timeout must stay at 15s with exactly three justified 30s overrides"
+            "the per-test timeout must stay at 15s with one justified 45s override and two justified 30s overrides"
         );
         for required in [
             "test(/(^|::)every_record_container_site_classifies_a_child_fault_by_name$/)",
@@ -8982,7 +9158,11 @@ mod nextest_timeout_tests {
         }
         for required in [
             "12 separate Hermit processes",
-            "25.98-26.30s while passing",
+            "85 attempts",
+            "64 passed",
+            "21 timed out",
+            "29.935s",
+            "45s is 1.50x",
         ] {
             assert!(config.contains(required), "nextest config lost {required}");
             assert!(manifest.contains(required), "manifest lost {required}");
