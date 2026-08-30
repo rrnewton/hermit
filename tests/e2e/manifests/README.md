@@ -279,6 +279,7 @@ Use the load-bearing entrypoints:
 cargo run -p hermit-manifest-plan -- --format text
 target/debug/test-harness validate
 target/debug/test-harness plan --format json
+target/debug/test-harness expected-plan > ci/expected-e2e-plan.json
 target/debug/test-harness audit-gaps --format json
 target/debug/test-harness build --lane portable --ci-only
 target/debug/test-harness run --lane portable
