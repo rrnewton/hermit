@@ -74,7 +74,7 @@ strict_result() { # <result-file> <command-status>
     printf 'ABORTED at exit %s after %s passed; first failure: %s' \
       "$command_status" "$TEST_RESULTS_PASSED" "$TEST_RESULTS_FIRST_FAILURE"
   else
-    printf 'ABORTED at exit %s before an individual test completed (%s passed)' \
+    printf 'ABORTED at exit %s after %s passed; no typed individual-test failure was recorded' \
       "$command_status" "$TEST_RESULTS_PASSED"
   fi
 }
@@ -105,6 +105,9 @@ self_test() {
   [[ $second == '3 passed, 0 failed, 4 filtered' ]] || return 1
   [[ $(strict_result "$scratch/results.json" 0) == \
     'passed (3 enabled, 4 filtered)' ]] || return 1
+  [[ $(strict_result "$scratch/results.json" 7) == \
+    'ABORTED at exit 7 after 3 passed; no typed individual-test failure was recorded' ]] \
+    || return 1
   [[ $(sha256sum "$scratch/fixed-human.log") == "$fixed_log_hash" ]] || return 1
 
   rm -f -- "$scratch/results.json"
