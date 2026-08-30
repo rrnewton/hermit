@@ -9865,7 +9865,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .ok_or("retry bounds: privileged lane is absent")?;
     for (tag, expected) in [
         ("test.pmu_buck_chaos_cases", 6usize),
-        ("test.cli_kvm", 21usize),
+        ("test.cli_kvm", 24usize),
     ] {
         let step = privileged
             .steps
