@@ -32,10 +32,7 @@ test:
           ptrace: true
           liteinst: false
         ci_disabled_reason:
-          liteinst:
-            result: determinism-failure
-            evidence: "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout"
-            reason: Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population.
+          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -219,7 +216,10 @@ test:
         backends_disabled:
           native: The existing random-device test owns the native-variation assertion
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          kvm: true
+          sabre: false
         backends_enabled:
           - ptrace
           - kvm
@@ -227,7 +227,8 @@ test:
         backends_disabled:
           dbt: DBT wedges when the guest execs a new program image, and this script ends in `exec hexdump`. Measured 2026-08-24 - the run never exits and emits zero DETLOG records after "[dbt backend] Detcore Tool active"; a cell timeout then misreports it as "failed to launch drrun". Note DBT refuses execveat legibly with ENOSYS (tests/c/dbt_execveat_unsupported.c passes), so it is execve specifically that hangs
           liteinst: The preload runtime cannot survive the hexdump script's post-start exec
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
       replay:
         ci: false
         backends_enabled: []
@@ -902,10 +903,7 @@ test:
           liteinst: false
           sabre: true
         ci_disabled_reason:
-          liteinst:
-            result: determinism-failure
-            evidence: "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout"
-            reason: Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population.
+          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -1272,8 +1270,10 @@ test:
           native: Native execution removes all eighteen sanitizers together and is a negative control, not a green cell
         ci_disabled_reason: 'NOT-EXERCISED: native execution removes every sanitizer under test and fails the guest assertions.'
       verify:
-        ci: false
-        ci_disabled_reason: 'MEASURED-BUT-NOT-QUALIFIED: The one-guest assertions pass, but canonical comparison with syscall I/O-buffer hashing enabled intermittently diverges on live procfs bytes that are intentionally outside the sanitizer contract (mountinfo first, then smaps after mount identities were normalized). This tuple remains enabled for manual diagnostic execution, where the guest assertions can be inspected without claiming a canonical pass, but is quarantined from required CI; accepting matched-without-I/O or exempting the cell from canonical admission would weaken the comparator.'
+        ci:
+          ptrace: false
+        ci_disabled_reason:
+          ptrace: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
         compare_io_buffers: false
         compare_io_buffers_disabled_reason: The guest asserts sanitizer-specific invariants for sixteen procfs files that legitimately retain process, virtual-time, topology, or host data; comparing their raw whole-file bytes would manufacture flakes.
         rcb_time: false
@@ -1590,8 +1590,11 @@ test:
         - -O0
     modes:
       verify:
-        ci: false
-        ci_disabled_reason: 'MEASURED-BUT-NOT-QUALIFIED: ptrace canonical verification passed while SaBRe canonical verification diverged on both glibc TLS guards even though AT_RANDOM matched. Measured three times at Hermit 7c102994680aa334196b0dee28554dbfe5a441c2; the current port records a fresh focused rerun in its review. Keep both backends enabled for explicit runs, and enable CI only after deterministic startup bytes reach glibc before guard initialization.'
+        ci:
+          ptrace: true
+          sabre: false
+        ci_disabled_reason:
+          sabre: {"result": "determinism-failure", "evidence": "Generated scorecard ci/compat-envelope/cells.json at Hermit 5b811757980b9cab599206c047560a7962176a6b retains historical results determinism-failure at Hermit 90e46cba9ad83550205f3c9cd232ae222c6b6173; retained first divergent record positions: 117, 117, 117.", "reason": "Historical canonical verification diverged at recorded positions. The later clean observations do not erase that retained failure, so this backend remains excluded pending separate qualification."}
         backends_enabled:
           - ptrace
           - sabre

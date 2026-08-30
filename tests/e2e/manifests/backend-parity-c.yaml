@@ -23,10 +23,7 @@ test:
           ptrace: true
           liteinst: false
         ci_disabled_reason:
-          liteinst:
-            result: determinism-failure
-            evidence: "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout"
-            reason: Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population.
+          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -94,10 +91,7 @@ test:
           ptrace: true
           liteinst: false
         ci_disabled_reason:
-          liteinst:
-            result: determinism-failure
-            evidence: "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout"
-            reason: Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population.
+          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -168,10 +162,7 @@ test:
           ptrace: true
           liteinst: false
         ci_disabled_reason:
-          liteinst:
-            result: determinism-failure
-            evidence: 17107307a33b6f6383c1b7bc2acb364b162b6c8c
-            reason: LiteInst parses host-assigned /proc/self/maps inode digit widths while ptrace PMU counting is active; a 12-RCB (120ns) initial drift accumulates to 672 RCBs (6,720ns), causing guest-visible virtual-time divergence under canonical verification at scheduler turn 10.
+          liteinst: {"result": "determinism-failure", "evidence": "17107307a33b6f6383c1b7bc2acb364b162b6c8c", "reason": "LiteInst parses host-assigned /proc/self/maps inode digit widths while ptrace PMU counting is active; a 12-RCB (120ns) initial drift accumulates to 672 RCBs (6,720ns), causing guest-visible virtual-time divergence under canonical verification at scheduler turn 10."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -1113,10 +1104,7 @@ test:
           ptrace: true
           liteinst: false
         ci_disabled_reason:
-          liteinst:
-            result: determinism-failure
-            evidence: "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout"
-            reason: Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population.
+          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -1682,10 +1670,7 @@ test:
           ptrace: true
           liteinst: false
         ci_disabled_reason:
-          liteinst:
-            result: determinism-failure
-            evidence: "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout"
-            reason: Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population.
+          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -1811,8 +1796,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip.'
+        ci: true
         backends_enabled:
           - ptrace
           - dbt
@@ -2122,8 +2106,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but liteinst FAIL (exit 1), sabre FAIL (exit 1). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip.'
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -2371,8 +2354,11 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but sabre FAIL (exit 1). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip.'
+        ci:
+          ptrace: true
+          sabre: false
+        ci_disabled_reason:
+          sabre: {"result": "determinism-failure", "evidence": "Generated scorecard ci/compat-envelope/cells.json at Hermit 5b811757980b9cab599206c047560a7962176a6b retains historical results determinism-failure at Hermit 90e46cba9ad83550205f3c9cd232ae222c6b6173; retained first divergent record positions: 26, 26, 26.", "reason": "Historical canonical verification diverged at recorded positions. The later clean observations do not erase that retained failure, so this backend remains excluded pending separate qualification."}
         backends_enabled:
           - ptrace
           - sabre
@@ -2806,8 +2792,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
-        ci_disabled_reason: 'MEASURED-BUT-NOT-QUALIFIED: ptrace PASSES canonical verification and the other backends have never been measured. Ported from the retired backend-parity-c.toml, deleted when this registry migrated to YAML schema 2; the original registration disabled every non-ptrace backend with a HOST excuse -- cmake absent on the authoring host, KVM not completing a guest there, LiteInst preload handshake failing -- which is a statement about one developer box, not a measurement. ptrace was measured for this port at hermit e69c0a62cecef9aa44e3810ae88c06ad24155048 (debug build): hermit run --strict --verify --verify-strict reported verified=true, verdict=matched, bitwise_parity=true, strictness=canonical, compare_logs=true, record_envelope=all_records_v1, 266/266 INFO messages compared, exit 0. Natively the same guest DIFFERS between runs because the ephemeral port varies, so the pass is a real determinization result rather than a constant. ci stays false because that is ONE sample on a debug build, and this guest binds loopback sockets and branches on epoll readiness order -- the class most likely to be load-sensitive. Enabling it needs repeat qualification, not this single run.'
+        ci: true
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -2997,10 +2982,7 @@ test:
           ptrace: true
           liteinst: false
         ci_disabled_reason:
-          liteinst:
-            result: determinism-failure
-            evidence: "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout"
-            reason: Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population.
+          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -3254,10 +3236,7 @@ test:
           ptrace: true
           liteinst: false
         ci_disabled_reason:
-          liteinst:
-            result: determinism-failure
-            evidence: "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout"
-            reason: Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population.
+          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -3757,8 +3736,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip.'
+        ci: true
         backends_enabled:
           - ptrace
           - dbt
@@ -3824,10 +3802,7 @@ test:
           ptrace: true
           liteinst: false
         ci_disabled_reason:
-          liteinst:
-            result: determinism-failure
-            evidence: "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout"
-            reason: Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population.
+          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -4016,8 +3991,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip.'
+        ci: true
         backends_enabled:
           - ptrace
           - dbt
@@ -4082,8 +4056,7 @@ test:
         - -D_GNU_SOURCE
     modes:
       verify:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip.'
+        ci: true
         backends_enabled:
           - ptrace
           - dbt
@@ -4211,10 +4184,7 @@ test:
           ptrace: true
           liteinst: false
         ci_disabled_reason:
-          liteinst:
-            result: determinism-failure
-            evidence: 17107307a33b6f6383c1b7bc2acb364b162b6c8c
-            reason: LiteInst parses host-assigned /proc/self/maps inode digit widths while ptrace PMU counting is active; a 12-RCB (120ns) initial drift accumulates to 672 RCBs (6,720ns), causing guest-visible virtual-time divergence under canonical verification at scheduler turn 10.
+          liteinst: {"result": "determinism-failure", "evidence": "17107307a33b6f6383c1b7bc2acb364b162b6c8c", "reason": "LiteInst parses host-assigned /proc/self/maps inode digit widths while ptrace PMU counting is active; a 12-RCB (120ns) initial drift accumulates to 672 RCBs (6,720ns), causing guest-visible virtual-time divergence under canonical verification at scheduler turn 10."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -4280,10 +4250,7 @@ test:
           ptrace: true
           liteinst: false
         ci_disabled_reason:
-          liteinst:
-            result: determinism-failure
-            evidence: "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout"
-            reason: Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population.
+          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -4655,8 +4622,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip.'
+        ci: true
         backends_enabled:
           - ptrace
           - dbt
@@ -4718,8 +4684,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip.'
+        ci: true
         backends_enabled:
           - ptrace
           - dbt
@@ -4781,8 +4746,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip.'
+        ci: true
         backends_enabled:
           - ptrace
           - dbt
@@ -4844,8 +4808,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip.'
+        ci: true
         backends_enabled:
           - ptrace
           - dbt
@@ -4907,8 +4870,12 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip.'
+        ci:
+          ptrace: true
+          dbt: false
+          kvm: true
+        ci_disabled_reason:
+          dbt: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
         backends_enabled:
           - ptrace
           - dbt
@@ -4970,8 +4937,12 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip.'
+        ci:
+          ptrace: true
+          dbt: false
+          kvm: true
+        ci_disabled_reason:
+          dbt: {"result": "determinism-failure", "evidence": "Published parent series at dev-hermit 90a55d8190dd2551179a9394be3504ee89a6a5a9 retains pressure-test results pass and determinism-failure for Detcore tree 077a5d847f6541daa5ef145536a7065868e9d3ab; first divergent record 80 and syscall 32.", "reason": "Published canonical verification at the same Detcore tree contains both passing and divergent observations. The 20 clean repetitions in this campaign do not erase the retained divergence, so this backend remains excluded pending separate qualification."}
         backends_enabled:
           - ptrace
           - dbt
@@ -5033,8 +5004,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip.'
+        ci: true
         backends_enabled:
           - ptrace
           - dbt
@@ -5103,10 +5073,7 @@ test:
           ptrace: true
           liteinst: false
         ci_disabled_reason:
-          liteinst:
-            result: determinism-failure
-            evidence: "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout"
-            reason: Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population.
+          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -5244,10 +5211,7 @@ test:
           ptrace: true
           liteinst: false
         ci_disabled_reason:
-          liteinst:
-            result: determinism-failure
-            evidence: "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout"
-            reason: Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population.
+          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -5318,10 +5282,7 @@ test:
           ptrace: true
           liteinst: false
         ci_disabled_reason:
-          liteinst:
-            result: determinism-failure
-            evidence: e73e7ba0bf56fbbfefffa304f7622c67aac6ea88
-            reason: LiteInst parses host-assigned /proc/self/maps inode digit widths while ptrace PMU counting is active; the resulting 672-RCB (6,720ns) virtual-time divergence caused canonical verification to fail at scheduler turn 10.
+          liteinst: {"result": "determinism-failure", "evidence": "e73e7ba0bf56fbbfefffa304f7622c67aac6ea88", "reason": "LiteInst parses host-assigned /proc/self/maps inode digit widths while ptrace PMU counting is active; the resulting 672-RCB (6,720ns) virtual-time divergence caused canonical verification to fail at scheduler turn 10."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -5466,10 +5427,7 @@ test:
           ptrace: true
           liteinst: false
         ci_disabled_reason:
-          liteinst:
-            result: determinism-failure
-            evidence: "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout"
-            reason: Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population.
+          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -5540,10 +5498,7 @@ test:
           ptrace: true
           liteinst: false
         ci_disabled_reason:
-          liteinst:
-            result: determinism-failure
-            evidence: "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout"
-            reason: Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population.
+          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -5614,10 +5569,7 @@ test:
           ptrace: true
           liteinst: false
         ci_disabled_reason:
-          liteinst:
-            result: determinism-failure
-            evidence: "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout"
-            reason: Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population.
+          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -5816,8 +5768,11 @@ test:
         - -pthread
     modes:
       verify:
-        ci: false
-        ci_disabled_reason: 'NOT-MEASURED: this cell landed on main in 0d622ba2 after this PR''s 72-cell enablement pass measured the bucket, so there is no measured result here to justify enabling it. Enable it in a follow-up that measures it rather than inheriting an unmeasured default.'
+        ci:
+          ptrace: true
+          dbt: false
+        ci_disabled_reason:
+          dbt: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit", "result": "infrastructure-error"}
         backends_enabled:
           - ptrace
           - dbt
@@ -5882,8 +5837,11 @@ test:
         - -D_GNU_SOURCE
     modes:
       verify:
-        ci: false
-        ci_disabled_reason: 'NOT-MEASURED: this cell landed on main in b48aff99 after this PR''s 72-cell enablement pass measured the bucket, so there is no measured result here to justify enabling it. Enable it in a follow-up that measures it rather than inheriting an unmeasured default.'
+        ci:
+          ptrace: true
+          dbt: false
+        ci_disabled_reason:
+          dbt: {"result": "determinism-failure", "evidence": "Generated scorecard ci/compat-envelope/cells.json at Hermit 5b811757980b9cab599206c047560a7962176a6b retains historical results determinism-failure at Hermit 90e46cba9ad83550205f3c9cd232ae222c6b6173; retained first divergent record positions: 492, 366, 374.", "reason": "Historical canonical verification diverged at recorded positions. The later clean observations do not erase that retained failure, so this backend remains excluded pending separate qualification."}
         backends_enabled:
           - ptrace
           - dbt
@@ -5952,10 +5910,7 @@ test:
           ptrace: true
           dbt: false
         ci_disabled_reason:
-          dbt:
-            result: unavailable
-            evidence: hermit-cli/src/bin/hermit/run.rs:2163
-            reason: DBT exits successfully after both guest executions, but its dedicated path emits no terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without reporting it green.
+          dbt: {"result": "unavailable", "evidence": "hermit-cli/src/bin/hermit/run.rs:2163", "reason": "DBT exits successfully after both guest executions, but its dedicated path emits no terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without reporting it green."}
         backends_enabled:
           - ptrace
           - dbt
@@ -6091,10 +6046,7 @@ test:
           ptrace: true
           liteinst: false
         ci_disabled_reason:
-          liteinst:
-            result: determinism-failure
-            evidence: "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout"
-            reason: Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population.
+          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -6224,10 +6176,7 @@ test:
           ptrace: true
           liteinst: false
         ci_disabled_reason:
-          liteinst:
-            result: determinism-failure
-            evidence: "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout"
-            reason: Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population.
+          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -6293,10 +6242,7 @@ test:
           ptrace: true
           liteinst: false
         ci_disabled_reason:
-          liteinst:
-            result: determinism-failure
-            evidence: "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout"
-            reason: Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population.
+          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst

@@ -19,7 +19,9 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          sabre: false
         backends_enabled:
           - ptrace
           - sabre
@@ -27,7 +29,8 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
       naked:
         ci: false
         backends_enabled: []
@@ -146,7 +149,9 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          sabre: false
         backends_enabled:
           - ptrace
           - sabre
@@ -154,7 +159,8 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
       naked:
         ci: false
         backends_enabled: []
@@ -328,7 +334,9 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          sabre: false
         backends_enabled:
           - ptrace
           - sabre
@@ -336,7 +344,8 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
       naked:
         ci: false
         backends_enabled: []
@@ -684,7 +693,9 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          sabre: false
         backends_enabled:
           - ptrace
           - sabre
@@ -692,7 +703,8 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
       naked:
         ci: false
         backends_enabled: []
