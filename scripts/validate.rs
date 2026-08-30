@@ -111,6 +111,7 @@ use sha2::Digest;
 use sha2::Sha256;
 use dagrun::cgroup::aggregate_slice_max_cpus;
 use dagrun::cgroup::is_in_scope;
+use dagrun::io::dag_from_json;
 use dagrun::model::CmdType;
 use dagrun::model::DagConfig;
 use dagrun::model::DagManifest;
@@ -154,6 +155,9 @@ const LEDGER_PRODUCER: &str = "hermit-validate-rs";
 /// and the fail-closed assertion that requires it cannot drift apart.
 const PIN_GATE_TAG: &str = "pre.reverie_pin";
 const MANIFEST_AUDIT_COMMAND: &str = "target/debug/test-harness validate";
+const REQUALIFICATION_PLACEHOLDER_TAG: &str = "requalify.cell";
+const REQUALIFICATION_RESULT_ROOT_PLACEHOLDER: &str = "validate-requalification-results";
+const REQUALIFICATION_RUN_ID_PLACEHOLDER: &str = "validate-requalification-run-id";
 const QUICK_E2E_VERIFY_TIMEOUT_S: i64 = 1800;
 const PINNED_ROOT_FETCH_TAG: &str = "setup.pinned_root_fetch";
 const PINNED_ROOT_FETCH_COMMAND: &str = "seed=(); if [ -n \"${CARGO_HOME:-}\" ]; then seed=(--seed-cargo \"$CARGO_HOME\"); fi; ./ci/hermetic/run-split-validate.sh --fetch-only \"${seed[@]}\"";
@@ -6873,6 +6877,318 @@ fn nextest_setup_node(
         .ok_or_else(|| "portable DAG lost setup.nextest".to_string())
 }
 
+/// Replace a prefix inside pressure-test's single-quoted path/value words with
+/// one runtime environment expression. Pressure owns the exact commands and
+/// their quoting; validate changes only the two invocation-scoped values that
+/// cannot exist until the outer run is admitted.
+fn replace_pressure_quoted_prefix(
+    command: &str,
+    prefix: &str,
+    runtime_expression: &str,
+) -> Result<(String, usize), String> {
+    if prefix.contains('\'') {
+        return Err(format!(
+            "requalification pressure-plan placeholder contains a quote: {prefix:?}"
+        ));
+    }
+    let needle = format!("'{prefix}");
+    let mut rest = command;
+    let mut rewritten = String::with_capacity(command.len());
+    let mut replacements = 0usize;
+    while let Some(start) = rest.find(&needle) {
+        rewritten.push_str(&rest[..start]);
+        let suffix_start = start + needle.len();
+        let after_prefix = &rest[suffix_start..];
+        let end = after_prefix.find('\'').ok_or_else(|| {
+            format!(
+                "requalification pressure-plan command has an unterminated quoted placeholder: {command}"
+            )
+        })?;
+        let suffix = &after_prefix[..end];
+        rewritten.push('"');
+        rewritten.push_str(runtime_expression);
+        rewritten.push_str(suffix);
+        rewritten.push('"');
+        rest = &after_prefix[end + 1..];
+        replacements += 1;
+    }
+    rewritten.push_str(rest);
+    Ok((rewritten, replacements))
+}
+
+fn requalification_identity_field<'a>(
+    identity: &'a serde_json::Value,
+    field: &str,
+) -> Result<&'a str, String> {
+    identity
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("selected requalification cell has no {field}: {identity}"))
+}
+
+/// Ask pressure-test for its canonical exact-cell steps without running them.
+/// The returned commands are templates: the outer validate supplies its own
+/// retained result root and run ID when the ONE outer scheduler executes them.
+fn pressure_requalification_config(
+    root: &Path,
+    tmp: &Path,
+    test: &str,
+    mode: &str,
+    backend: &str,
+) -> Result<DagConfig, String> {
+    let staging = tempfile::Builder::new()
+        .prefix(REQUALIFICATION_RESULT_ROOT_PLACEHOLDER)
+        .tempdir_in(tmp)
+        .map_err(|error| {
+            format!(
+                "cannot create pressure-plan staging directory under {}: {error}",
+                tmp.display()
+            )
+        })?;
+    let results = staging.path().join("results");
+    let output = Command::new(root.join("ci/compat-envelope/pressure-test.rs"))
+        .args([
+            "plan",
+            "--results",
+            &results.to_string_lossy(),
+            "--test",
+            test,
+            "--mode",
+            mode,
+            "--backend",
+            backend,
+            "--green",
+            "--repetitions",
+            "1",
+            "--run-id-prefix",
+            REQUALIFICATION_RUN_ID_PLACEHOLDER,
+            "--jobs",
+            "1",
+        ])
+        // A plan cannot publish anything, but removing the parent here keeps
+        // pressure-test's standalone publisher unreachable if that command's
+        // implementation ever grows another post-plan path.
+        .env_remove(PARENT_ENV)
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("cannot construct the exact pressure plan: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "pressure-test could not construct the exact green-cell plan ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let metadata_path = results.join("run.json");
+    let metadata: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&metadata_path)
+            .map_err(|error| format!("cannot read {}: {error}", metadata_path.display()))?,
+    )
+    .map_err(|error| format!("invalid pressure metadata {}: {error}", metadata_path.display()))?;
+    let cells = metadata["cells"]
+        .as_array()
+        .ok_or_else(|| format!("pressure metadata has no selected cells: {metadata}"))?;
+    if metadata["green"] != true
+        || metadata["repetitions"] != 1
+        || metadata["run_id_prefix"] != REQUALIFICATION_RUN_ID_PLACEHOLDER
+        || cells.len() != 1
+        || cells[0]["test"] != test
+        || cells[0]["mode"] != mode
+        || cells[0]["backend"] != backend
+    {
+        return Err(format!(
+            "pressure-test returned a different requalification selection: {metadata}"
+        ));
+    }
+
+    let dag_path = results.join("dag.json");
+    let mut cfg = dag_from_json(
+        &std::fs::read_to_string(&dag_path)
+            .map_err(|error| format!("cannot read {}: {error}", dag_path.display()))?,
+    )
+    .map_err(|error| format!("invalid pressure DAG {}: {error}", dag_path.display()))?;
+    let result_prefix = results
+        .to_str()
+        .ok_or_else(|| format!("pressure result path is not UTF-8: {}", results.display()))?;
+    let result_expression =
+        "${E2E_RESULT_ROOT:?E2E_RESULT_ROOT is required for --requalify-cell}";
+    let run_id_expression =
+        "${E2E_RUN_ID:?E2E_RUN_ID is required for --requalify-cell}-pid$$";
+    let mut result_replacements = 0usize;
+    let mut run_id_replacements = 0usize;
+    for step in &mut cfg.steps {
+        let (rewritten, replaced_results) =
+            replace_pressure_quoted_prefix(&step.cmd, result_prefix, result_expression)?;
+        let (rewritten, replaced_run_ids) = replace_pressure_quoted_prefix(
+            &rewritten,
+            REQUALIFICATION_RUN_ID_PLACEHOLDER,
+            run_id_expression,
+        )?;
+        step.cmd = rewritten;
+        result_replacements += replaced_results;
+        run_id_replacements += replaced_run_ids;
+    }
+    if result_replacements == 0
+        || run_id_replacements != 1
+        || cfg.steps.iter().any(|step| {
+            step.cmd.contains(result_prefix)
+                || step.cmd.contains(REQUALIFICATION_RUN_ID_PLACEHOLDER)
+        })
+    {
+        return Err(format!(
+            "pressure DAG handoff was incomplete: result replacements={result_replacements}, run-id replacements={run_id_replacements}"
+        ));
+    }
+    Ok(cfg)
+}
+
+/// Replace the fail-closed placeholder with pressure-test's selected build,
+/// preparation, cell, and terminal steps. Nothing here executes a DAG: the
+/// resulting steps are consumed by validate's one outer scheduler invocation.
+fn attach_pressure_requalification_config(
+    plan: &mut Plan,
+    mut pressure: DagConfig,
+    identity: &serde_json::Value,
+) -> Result<(), String> {
+    let placeholders = plan
+        .cfg
+        .steps
+        .iter()
+        .filter(|step| step.tag() == REQUALIFICATION_PLACEHOLDER_TAG)
+        .count();
+    if placeholders != 1 {
+        return Err(format!(
+            "requalification plan expected one {REQUALIFICATION_PLACEHOLDER_TAG} placeholder, found {placeholders}"
+        ));
+    }
+    plan.cfg.steps.retain(|step| {
+        !matches!(
+            step.tag().as_str(),
+            REQUALIFICATION_PLACEHOLDER_TAG | validate_plan::MANIFEST_PLAN_PRODUCER_TAG
+        )
+    });
+
+    let cells = pressure
+        .steps
+        .iter()
+        .filter(|step| step.group == "cell")
+        .count();
+    let summaries = pressure
+        .steps
+        .iter()
+        .filter(|step| step.tag() == "pressure.summarize")
+        .count();
+    if cells != 1 || summaries != 1 {
+        return Err(format!(
+            "pressure requalification handoff must contain one cell and one pressure.summarize step; found cells={cells}, summaries={summaries}"
+        ));
+    }
+    if pressure.steps.iter().any(|step| {
+        step.cmd.contains("pressure-test.rs")
+            || step.cmd.contains("run_dag_boxed_deadline")
+            || step.cmd.contains("dagrun run")
+    }) {
+        return Err(
+            "pressure requalification handoff contains the standalone pressure runner or another nested scheduler command"
+                .into(),
+        );
+    }
+
+    let test = requalification_identity_field(identity, "test")?;
+    let mode = requalification_identity_field(identity, "mode")?;
+    let backend = requalification_identity_field(identity, "backend")?;
+    let pressure_quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+    let mut saw_exact_cell = false;
+    for step in &mut pressure.steps {
+        if step.group != "cell" {
+            continue;
+        }
+        for token in [
+            format!("--test {}", pressure_quote(test)),
+            format!("--mode {}", pressure_quote(mode)),
+            format!("--backend {}", pressure_quote(backend)),
+        ] {
+            if !step.cmd.contains(&token) {
+                return Err(format!(
+                    "pressure cell {} lost selected identity token {token}",
+                    step.tag()
+                ));
+            }
+        }
+        step.cmd = format!(
+            "case \"${{E2E_RUN_ID:?E2E_RUN_ID is required for --requalify-cell}}\" in \
+             *[!A-Za-z0-9._@:-]*) echo 'validate: E2E_RUN_ID contains a path or shell-unsafe character' >&2; exit 2;; esac; {}",
+            step.cmd
+        );
+        saw_exact_cell = true;
+    }
+    if !saw_exact_cell {
+        return Err("pressure requalification handoff contains no selected cell".into());
+    }
+
+    // Retain pressure-test's selected steps, including its manifest-plan build,
+    // byte-for-byte apart from invocation-scoped values and the outer preflight
+    // edge. The placeholder plan's producer is removed above so there is still
+    // exactly one producer with this tag.
+    let existing_tags: BTreeSet<String> = plan.cfg.steps.iter().map(Step::tag).collect();
+    let pressure_tags: BTreeSet<String> = pressure.steps.iter().map(Step::tag).collect();
+    for step in &mut pressure.steps {
+        if step.deps.is_empty() && existing_tags.contains(PIN_GATE_TAG) {
+            step.deps.push(PIN_GATE_TAG.into());
+        }
+        if step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG {
+            step.hint.resources.insert("cargo_writer".into(), 1);
+        }
+        for dependency in &step.deps {
+            if !existing_tags.contains(dependency) && !pressure_tags.contains(dependency) {
+                return Err(format!(
+                    "pressure requalification step {} depends on absent {dependency}",
+                    step.tag()
+                ));
+            }
+        }
+    }
+    let duplicate = pressure_tags
+        .iter()
+        .find(|tag| existing_tags.contains(*tag));
+    if let Some(tag) = duplicate {
+        return Err(format!(
+            "pressure requalification handoff duplicates outer step {tag}"
+        ));
+    }
+
+    for (resource, capacity) in pressure.resource_caps {
+        plan.cfg
+            .resource_caps
+            .entry(resource)
+            .and_modify(|current| *current = (*current).max(capacity))
+            .or_insert(capacity);
+    }
+    plan.cfg.steps.extend(pressure.steps);
+    plan.cfg.description = "targeted cell requalification".into();
+    Ok(())
+}
+
+fn materialize_requalification_plan(
+    plan: &mut Plan,
+    root: &Path,
+    tmp: &Path,
+    test: &str,
+    mode: &str,
+    backend: &str,
+) -> Result<(), String> {
+    let identity = plan
+        .cell_evidence_expected
+        .as_ref()
+        .and_then(|expected| expected.first())
+        .cloned()
+        .ok_or("requalification plan lost its exact expected cell")?;
+    let pressure = pressure_requalification_config(root, tmp, test, mode, backend)?;
+    attach_pressure_requalification_config(plan, pressure, &identity)
+}
+
 /// Build the execution plan for the selected level/mode.
 fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
     let with_proxy = has_cmd("with-proxy");
@@ -7117,10 +7433,13 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         });
     }
 
-    // One-cell canonical requalification. The pressure runner already owns the
-    // exact-cell build/run mechanics and resource declarations; validate wraps
-    // it as one boxed gate and retains its typed result as schema 7. This plan
-    // is never suite-complete and therefore cannot grant whole-run authority.
+    // One-cell canonical requalification. Pressure-test owns the exact-cell
+    // selection and step construction, but validate owns execution: after the
+    // ordinary plan transformations, `materialize_requalification_plan`
+    // replaces this fail-closed placeholder with pressure's typed build,
+    // preparation, cell, and terminal steps. The result is one outer DAG and
+    // one scheduler. This plan is never suite-complete and therefore cannot
+    // grant whole-run authority.
     if let Some(Focused::RequalifyCell { test, mode, backend }) = &args.focused {
         let matches = validate_cell_results::expected_plan(root)?
             .into_iter()
@@ -7134,42 +7453,23 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
                 matches.len()
             ));
         };
-        // The outer validate publishes these rows after all attempts finish.
-        // Suppress pressure-test's standalone publisher here so one physical
-        // cell run cannot appear twice under two producer names.
-        let command = format!(
-            "env -u DEV_HERMIT_PARENT ./ci/compat-envelope/pressure-test.rs run --results \"$E2E_RESULT_ROOT\" \
-             --test {} --mode {} --backend {} --repetitions 1 \
-             --run-id-prefix \"$E2E_RUN_ID-pid$$\" --jobs 1",
-            validate_plan::shell_quote(test),
-            validate_plan::shell_quote(mode),
-            validate_plan::shell_quote(backend),
-        );
         let mut steps = pre;
-        // The pressure runner performs its own exact manifest/scorecard check
-        // after building test-harness. The ordinary gate.manifest assumes that
-        // binary was already built by a lane node, which this focused path does
-        // not have; retaining it would make every cold targeted run exit 127.
+        // Pressure plan construction performs its exact manifest/scorecard
+        // selection before these steps reach the scheduler. Retain validate's
+        // canonical manifest-plan producer for the generated cell, but omit the
+        // ordinary whole-manifest audit: this path measures one named cell.
         steps.retain(|step| step.tag() != gate);
-        let mut requalification = step_with_caps(
+        steps.push(step_with_caps(
             "requalify",
             "cell",
-            "Targeted canonical cell requalification",
-            command,
+            "Fail closed if the targeted cell plan was not materialized",
+            "echo 'validate: internal error: requalification plan was not materialized' >&2; exit 125"
+                .into(),
             vec![PIN_GATE_TAG.into()],
-            3600,
-            7200,
-            16 * 1024 * 1024 * 1024,
-        );
-        // The nested pressure plan may need its release-Hermit build, whose
-        // declared worker width is eight. Giving the wrapper only the default
-        // one CPU makes dagrun refuse before the selected cell can start.
-        requalification.hint.preferred_inner_jobs = Some(8);
-        // pressure-test owns the nested scheduler width through its explicit
-        // `--jobs 1`. An ordinary `-j` jobs flag would make the outer runner
-        // append `-j 8` to this command, which pressure-test does not accept.
-        requalification.jobs_flag = Some(String::new());
-        steps.push(requalification);
+            30,
+            30,
+            256 * 1024 * 1024,
+        ));
         let cfg = validate_plan::config_from(steps, "targeted cell requalification");
         return Ok(Plan {
             planned_test_nodes: BTreeSet::new(),
@@ -13947,43 +14247,289 @@ fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
         "--no-label-pr".into(),
     ])
     .map_err(|code| format!("requalification plan: CLI refused with exit {code}"))?;
-    let plan = build_plan(root, &args, &std::env::temp_dir().join("validate-requalification-plan"))?;
+    let fixture = tempfile::Builder::new()
+        .prefix("validate-requalification-plan-")
+        .tempdir()
+        .map_err(|error| format!("requalification plan: cannot create fixture: {error}"))?;
+    let mut plan = build_plan(root, &args, fixture.path())?;
     if plan.suite_complete
         || plan.selection_mode != "targeted"
         || plan.cell_evidence_expected.as_ref().map(Vec::len) != Some(1)
     {
         return Err("requalification plan: targeted evidence was mistaken for a full suite".into());
     }
-    let step = plan
+    let placeholder = plan
         .cfg
         .steps
         .iter()
-        .find(|step| step.tag() == "requalify.cell")
-        .ok_or("requalification plan: exact cell step is absent")?;
-    if step.hint.preferred_inner_jobs != Some(8) {
-        return Err(
-            "requalification plan: wrapper cannot admit the nested release build's eight workers"
-                .into(),
-        );
+        .find(|step| step.tag() == REQUALIFICATION_PLACEHOLDER_TAG)
+        .ok_or("requalification plan: fail-closed placeholder is absent")?;
+    if !placeholder.cmd.contains("was not materialized") {
+        return Err("requalification plan: placeholder is not fail-closed".into());
     }
-    if step.jobs_flag.as_deref() != Some("") {
-        return Err(
-            "requalification plan: outer scheduler can append an unsupported -j flag".into(),
-        );
+
+    let pressure = pressure_requalification_config(
+        root,
+        fixture.path(),
+        "applications/timed-progress-bar",
+        "verify",
+        "ptrace",
+    )?;
+    let identity = plan
+        .cell_evidence_expected
+        .as_ref()
+        .and_then(|expected| expected.first())
+        .cloned()
+        .ok_or("requalification plan: exact expected cell disappeared")?;
+
+    // The handoff is structural and fail-closed: if pressure's selected cell
+    // disappears, validate refuses instead of running only builds and calling
+    // that a requalification.
+    let mut missing_cell = pressure.clone();
+    missing_cell.steps.retain(|step| step.group != "cell");
+    let mut broken_plan = build_plan(root, &args, fixture.path())?;
+    let broken = attach_pressure_requalification_config(
+        &mut broken_plan,
+        missing_cell,
+        &identity,
+    )
+    .err()
+    .ok_or("requalification plan: missing pressure cell was accepted")?;
+    if !broken.contains("one cell") {
+        return Err(format!(
+            "requalification plan: missing-cell refusal was not specific: {broken}"
+        ));
     }
-    for token in [
-        "env -u DEV_HERMIT_PARENT ./ci/compat-envelope/pressure-test.rs run",
-        "--test applications/timed-progress-bar",
-        "--mode verify",
-        "--backend ptrace",
-        "--repetitions 1",
-        "--run-id-prefix \"$E2E_RUN_ID-pid$$\"",
-    ] {
-        if !step.cmd.contains(token) {
-            return Err(format!("requalification plan: command omitted {token}"));
+
+    attach_pressure_requalification_config(&mut plan, pressure, &identity)?;
+    if plan
+        .cfg
+        .steps
+        .iter()
+        .any(|step| step.tag() == REQUALIFICATION_PLACEHOLDER_TAG)
+    {
+        return Err("requalification plan: fail-closed placeholder survived materialization".into());
+    }
+    if plan.cfg.steps.iter().any(|step| {
+        step.cmd.contains("pressure-test.rs run")
+            || step.cmd.contains("run_dag_boxed_deadline")
+            || step.cmd.contains("dagrun run")
+    }) {
+        return Err("requalification plan: a generated node still starts a second scheduler".into());
+    }
+    let cell = plan
+        .cfg
+        .steps
+        .iter()
+        .find(|step| step.group == "cell")
+        .ok_or("requalification plan: exact pressure cell is absent")?;
+    if cell.manifest.is_some()
+        || !cell.cmd.contains("--test 'applications/timed-progress-bar'")
+        || !cell.cmd.contains("--mode 'verify'")
+        || !cell.cmd.contains("--backend 'ptrace'")
+        || !cell.cmd.contains("${E2E_RESULT_ROOT:?")
+        || !cell.cmd.contains("${E2E_RUN_ID:?")
+    {
+        return Err(format!(
+            "requalification plan: selected pressure cell lost its pressure-owned identity or runtime handoff: {cell:?}"
+        ));
+    }
+
+    // Execute the actual pressure-generated cell command through validate's
+    // outer scheduler. The test double replaces only test-harness itself; the
+    // pressure-owned shell wrapper, result paths, run ID, status transition,
+    // and terminal dependency are the production command.
+    let execution_root = fixture.path().join("execution");
+    let result_root = execution_root.join("results");
+    let calls = execution_root.join("harness-calls");
+    let run_ids = execution_root.join("run-ids");
+    let harness = execution_root.join("test-harness");
+    std::fs::create_dir_all(result_root.join("prepare/applications-timed-progress-bar"))
+        .map_err(|error| format!("requalification plan: cannot prepare execution fixture: {error}"))?;
+    std::fs::write(
+        result_root.join("prepare/applications-timed-progress-bar/status"),
+        "0\n",
+    )
+    .map_err(|error| format!("requalification plan: cannot seed preparation status: {error}"))?;
+    std::fs::write(
+        &harness,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$PRESSURE_PROBE_CALLS"
+printf '%s\n' "${E2E_RUN_ID:?}" >> "$PRESSURE_PROBE_RUN_IDS"
+result= junit=
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --results) result=$2; shift 2 ;;
+        --junit) junit=$2; shift 2 ;;
+        *) shift ;;
+    esac
+done
+[[ -n $result ]] || { echo "probe saw no --results" >&2; exit 92; }
+mkdir -p "$(dirname -- "$result")"
+printf '%s\n' '{"probe":true}' > "$result"
+if [[ -n $junit ]]; then
+    mkdir -p "$(dirname -- "$junit")"
+    printf '%s\n' '<testsuite tests="1" failures="0"/>' > "$junit"
+fi
+if [[ -n ${DAGRUN_TEST_COUNTS_PATH:-} ]]; then
+    printf '%s\n' '{"schema":2,"executed_tests":1,"filtered_tests":0,"results":[{"id":"requalification-probe","result":"pass","attempts":1}]}' > "$DAGRUN_TEST_COUNTS_PATH"
+fi
+"#,
+    )
+    .and_then(|()| {
+        std::fs::set_permissions(&harness, std::fs::Permissions::from_mode(0o755))
+    })
+    .map_err(|error| format!("requalification plan: cannot create harness probe: {error}"))?;
+
+    let cell_tag = cell.tag();
+    let mut execution = plan.cfg.clone();
+    execution.steps.retain(|step| {
+        step.tag() == cell_tag || step.tag() == "pressure.summarize"
+    });
+    let execution_tags: BTreeSet<String> = execution.steps.iter().map(Step::tag).collect();
+    for step in &mut execution.steps {
+        step.deps.retain(|dependency| execution_tags.contains(dependency));
+        if step.tag() == cell_tag {
+            let replacement = validate_plan::shell_quote(&harness.to_string_lossy());
+            let replaced = step.cmd.replacen("target/debug/test-harness", &replacement, 1);
+            if replaced == step.cmd {
+                return Err(
+                    "requalification plan: selected pressure command lost test-harness"
+                        .into(),
+                );
+            }
+            step.cmd = replaced;
         }
     }
-    println!("  requalification plan: one exact selected cell, schema-7 eligible, never full authority");
+
+    let prior_result_root = std::env::var_os("E2E_RESULT_ROOT");
+    let prior_run_id = std::env::var_os("E2E_RUN_ID");
+    let prior_calls = std::env::var_os("PRESSURE_PROBE_CALLS");
+    let prior_run_ids = std::env::var_os("PRESSURE_PROBE_RUN_IDS");
+    let restore_environment = || {
+        for (name, prior) in [
+            ("E2E_RESULT_ROOT", prior_result_root.as_ref()),
+            ("E2E_RUN_ID", prior_run_id.as_ref()),
+            ("PRESSURE_PROBE_CALLS", prior_calls.as_ref()),
+            ("PRESSURE_PROBE_RUN_IDS", prior_run_ids.as_ref()),
+        ] {
+            match prior {
+                Some(value) => unsafe { std::env::set_var(name, value) },
+                None => unsafe { std::env::remove_var(name) },
+            }
+        }
+    };
+
+    // SAFETY: validate's self-test is single-threaded here and restores every
+    // value immediately after each scheduler execution.
+    unsafe {
+        std::env::set_var("E2E_RESULT_ROOT", &result_root);
+        std::env::set_var("E2E_RUN_ID", "validate-self-test@machine:1");
+        std::env::set_var("PRESSURE_PROBE_CALLS", &calls);
+        std::env::set_var("PRESSURE_PROBE_RUN_IDS", &run_ids);
+    }
+    let positive = run_lane_once(
+        &execution,
+        1,
+        true,
+        0,
+        None,
+        &execution_root.join("positive.log"),
+        None,
+        false,
+    );
+    restore_environment();
+    let retained = result_root
+        .join("cells")
+        .join(cell_tag.trim_start_matches("cell."))
+        .join("results.jsonl");
+    let observed_run_id = std::fs::read_to_string(&run_ids).unwrap_or_default();
+    if !positive.ok
+        || !positive.complete
+        || !positive.skipped.is_empty()
+        || positive.outcomes.len() != 2
+        || !retained.is_file()
+        || !observed_run_id
+            .trim()
+            .starts_with("validate-self-test@machine:1-pid")
+        || !observed_run_id.trim().ends_with(cell_tag.trim_start_matches("cell."))
+    {
+        return Err(format!(
+            "requalification plan: outer scheduler did not execute the selected pressure cell and terminal step exactly once: ok={} complete={} outcomes={:?} skipped={:?} retained={} run_id={observed_run_id:?}",
+            positive.ok,
+            positive.complete,
+            positive
+                .outcomes
+                .iter()
+                .map(|outcome| outcome.tag.as_str())
+                .collect::<Vec<_>>(),
+            positive.skipped,
+            retained.display(),
+        ));
+    }
+
+    let broken_root = execution_root.join("missing-run-id-results");
+    std::fs::create_dir_all(broken_root.join("prepare/applications-timed-progress-bar"))
+        .and_then(|()| {
+            std::fs::write(
+                broken_root.join("prepare/applications-timed-progress-bar/status"),
+                "0\n",
+            )
+        })
+        .map_err(|error| {
+            format!("requalification plan: cannot prepare broken execution fixture: {error}")
+        })?;
+    let broken_calls = execution_root.join("broken-harness-calls");
+    let broken_run_ids = execution_root.join("broken-run-ids");
+    // SAFETY: same single-threaded bracket and restoration as the positive run.
+    unsafe {
+        std::env::set_var("E2E_RESULT_ROOT", &broken_root);
+        std::env::remove_var("E2E_RUN_ID");
+        std::env::set_var("PRESSURE_PROBE_CALLS", &broken_calls);
+        std::env::set_var("PRESSURE_PROBE_RUN_IDS", &broken_run_ids);
+    }
+    let negative = run_lane_once(
+        &execution,
+        1,
+        true,
+        0,
+        None,
+        &execution_root.join("negative.log"),
+        None,
+        false,
+    );
+    restore_environment();
+    if negative.ok
+        || negative.complete
+        || negative
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.tag == cell_tag)
+            .is_none_or(|outcome| outcome.ok)
+        || !negative
+            .skipped
+            .iter()
+            .any(|tag| tag == "pressure.summarize")
+        || broken_calls.exists()
+    {
+        return Err(format!(
+            "requalification plan: missing E2E_RUN_ID did not fail the selected outer cell before the harness: ok={} complete={} outcomes={:?} skipped={:?} harness_ran={}",
+            negative.ok,
+            negative.complete,
+            negative
+                .outcomes
+                .iter()
+                .map(|outcome| (outcome.tag.as_str(), outcome.ok))
+                .collect::<Vec<_>>(),
+            negative.skipped,
+            broken_calls.exists(),
+        ));
+    }
+
+    println!(
+        "  requalification plan: pressure selected one exact green cell; validate's outer scheduler executed that cell and its terminal step, no nested runner remained, and a missing run ID refused before the harness; schema-7 eligible, never full authority"
+    );
     Ok(())
 }
 
@@ -16832,6 +17378,28 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
                 &plan.profile,
                 "pinned-root plan construction",
                 vec![error],
+            );
+        }
+    }
+
+    if let Some(Focused::RequalifyCell {
+        test,
+        mode,
+        backend,
+    }) = &args.focused
+    {
+        if let Err(error) =
+            materialize_requalification_plan(&mut plan, &root, &tmp, test, mode, backend)
+        {
+            return RunSummary::refused(
+                2,
+                &plan.profile,
+                "targeted pressure-plan construction",
+                vec![
+                    error,
+                    "no cell ran: validate refused rather than invoking a second scheduler or substituting a different selection"
+                        .into(),
+                ],
             );
         }
     }
