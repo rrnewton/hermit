@@ -27,8 +27,10 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 shards="ci/portable-shards.json"
+workflow=".github/workflows/ci-portable.yml"
 command -v jq >/dev/null 2>&1 || { echo "check-shard-coverage.sh: jq is required" >&2; exit 2; }
 [[ -f $shards ]] || { echo "check-shard-coverage.sh: missing $shards" >&2; exit 2; }
+[[ -f $workflow ]] || { echo "check-shard-coverage.sh: missing $workflow" >&2; exit 2; }
 
 # Ask the same plan constructor the runner uses. The command is inert, may run
 # inside validate, and emits its JSON as the first stdout line.
@@ -90,6 +92,7 @@ fi
 dependency_misses() {
     local selected_json=$1
     local supplied_json=$2
+    local source_plan=${3:-$plan_json}
     jq -r --argjson selected "$selected_json" --argjson supplied "$supplied_json" '
     [
       .dags[].steps[]
@@ -98,8 +101,65 @@ dependency_misses() {
       | select(. as $dependency | ($supplied | index($dependency)) == null)
     ]
     | unique[]
-' <<<"$plan_json"
+' <<<"$source_plan"
 }
+
+# Pin both directions of the dependency guard with a synthetic hosted group.
+# The live plan below caught a real omission after build.workspace became a
+# predecessor of a check assigned to the pre-build checks job. A guard that only
+# happens to reject today's map can silently decay when its jq selection changes;
+# this fixture requires the missing edge to be named and the supplied edge to
+# clear without relying on any current node identity.
+dependency_fixture='{"dags":[{"steps":[{"tag":"check.fixture","deps":["build.fixture"]}]}]}'
+fixture_missing=$(dependency_misses '["check.fixture"]' '["check.fixture"]' "$dependency_fixture")
+if [[ $fixture_missing != build.fixture ]]; then
+    echo "check-shard-coverage.sh: FAIL — dependency guard did not name a planted missing predecessor" >&2
+    status=1
+fi
+fixture_clear=$(dependency_misses \
+    '["check.fixture"]' '["check.fixture","build.fixture"]' "$dependency_fixture")
+if [[ -n $fixture_clear ]]; then
+    echo "check-shard-coverage.sh: FAIL — dependency guard rejected a planted supplied predecessor" >&2
+    status=1
+fi
+
+workflow_step_body() {
+    local step_name=$1 workflow_text=$2
+    awk -v marker="      - name: $step_name" '
+        $0 == marker { in_step = 1; next }
+        in_step && /^      - name:/ { exit }
+        in_step { print }
+    ' <<<"$workflow_text"
+}
+
+debug_artifact_contract() {
+    local workflow_text=$1 pack_step unpack_step
+    local archive_member='            target/debug/verification-report \'
+    pack_step=$(workflow_step_body "Pack debug prebuilt tree" "$workflow_text")
+    unpack_step=$(workflow_step_body "Unpack debug tree" "$workflow_text")
+    grep -Fqx '          test -x target/debug/verification-report' <<<"$pack_step" &&
+        grep -Fqx "$archive_member" <<<"$pack_step" &&
+        grep -Fqx '          test -x target/debug/verification-report' <<<"$unpack_step"
+}
+
+# check.backend_parity_suites runs target/debug/verification-report after the
+# debug tree crosses a job boundary. Guard all three parts of that contract:
+# producer existence, archive membership, and executable consumer assertion.
+# The mutation bracket proves the guard rejects the original omission instead
+# of passing merely because the binary is mentioned somewhere in the workflow.
+workflow_text=$(<"$workflow")
+if ! debug_artifact_contract "$workflow_text"; then
+    echo "check-shard-coverage.sh: FAIL — debug artifact must transport executable target/debug/verification-report" >&2
+    status=1
+fi
+omitted_artifact=${workflow_text/$'            target/debug/verification-report \\\n'/}
+if [[ $omitted_artifact == "$workflow_text" ]]; then
+    echo "check-shard-coverage.sh: FAIL — artifact omission fixture did not remove verification-report" >&2
+    status=1
+elif debug_artifact_contract "$omitted_artifact"; then
+    echo "check-shard-coverage.sh: FAIL — artifact guard accepted a planted missing verification-report member" >&2
+    status=1
+fi
 
 check_dependencies() {
     local label=$1 selected_json=$2 supplied_json=$3 missing
