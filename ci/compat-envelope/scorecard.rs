@@ -152,6 +152,18 @@ struct ObservationProjection {
     /// Where the authoritative rows live. Recorded so a stale projection can be
     /// re-derived without anyone having to remember.
     source: String,
+    /// A commit in the Git repository containing `source` whose JSONL shard
+    /// population and bytes produced this projection.
+    ///
+    /// Historical projection blocks predate this field and remain readable.
+    /// Every new projection records it so staleness can be distinguished from
+    /// an incorrect projection.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_object_id"
+    )]
+    source_commit: Option<String>,
     /// When this projection was last refreshed from that source.
     refreshed_at: String,
     /// How many series rows the refresh actually read.
@@ -4543,23 +4555,18 @@ fn project_observations(
     let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
     let before = tracked.clone();
 
-    let (rows, mut skipped) = read_series_rows(series_root)?;
-    if rows.is_empty() && !skipped.is_empty() {
-        return Err(format!(
-            "every series row was unreadable, so the projection determined nothing:\n{}",
-            skipped
-                .iter()
-                .map(|line| format!("  {line}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ));
-    }
+    // Resolve and verify the source once, then parse only the captured commit
+    // bytes. A later worktree mutation cannot change the rows while leaving the
+    // recorded commit behind.
+    let snapshot = snapshot_series_source(series_root)?;
+    let rows = read_series_rows(&snapshot)?;
     let projection = apply_series_rows(root, &mut tracked, &rows)?;
-    skipped.extend(projection.skipped.iter().cloned());
+    let skipped = &projection.skipped;
 
     let rows_read = rows.len() as u64;
     tracked.projection = Some(ObservationProjection {
         source: series_root.display().to_string(),
+        source_commit: Some(snapshot.source_commit.clone()),
         refreshed_at: refreshed_at.to_string(),
         rows_read,
         pre_series_corpus: projection.pre_series_corpus,
@@ -4574,11 +4581,12 @@ fn project_observations(
 
     println!(
         "compatibility scorecard: projected {} cell(s) from {} comparison row(s) \
-         representing {} run(s); read {rows_read} series row(s) under {}",
+         representing {} run(s); read {rows_read} canonical series row(s) under {} at {}",
         projection.cells,
         projection.rows,
         projection.runs,
-        series_root.display()
+        series_root.display(),
+        snapshot.source_commit
     );
     if rows_read == 0 {
         println!(
@@ -4586,7 +4594,7 @@ fn project_observations(
              evidence rather than a projection."
         );
     }
-    for line in &skipped {
+    for line in skipped {
         println!("  skipped {line}");
     }
     Ok(())
@@ -4709,6 +4717,21 @@ fn is_object_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn deserialize_optional_object_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if let Some(value) = &value {
+        if !is_object_id(value) {
+            return Err(serde::de::Error::custom(format!(
+                "source_commit must be a lowercase 40-hex object id, got {value:?}"
+            )));
+        }
+    }
+    Ok(value)
 }
 
 fn series_provenance(producer: SeriesProducer) -> ObservationProvenance {
@@ -4973,45 +4996,250 @@ fn apply_series_rows(
     })
 }
 
-/// Read every series shard under `series_root`.
+#[derive(Debug)]
+struct SeriesSourceSnapshot {
+    source_commit: String,
+    shards: Vec<SeriesSourceShard>,
+}
+
+#[derive(Debug)]
+struct SeriesSourceShard {
+    display_path: PathBuf,
+    bytes: Vec<u8>,
+}
+
+/// Capture the committed series source once and verify that the worktree is an
+/// exact view of it.
 ///
-/// A line that does not parse is NAMED AND SKIPPED rather than aborting the
-/// refresh or vanishing: one malformed row should not deny the projection every
-/// other row supports, and a row that disappears without a word is how a thin
-/// projection gets mistaken for a complete one.
-fn read_series_rows(series_root: &Path) -> Result<(Vec<SeriesRow>, Vec<String>), String> {
-    if !series_root.exists() {
+/// The returned bytes come from the resolved commit, not from a later worktree
+/// read. Consequently a mutation after this function returns cannot change the
+/// rows while leaving `source_commit` unchanged. The worktree comparison still
+/// matters: it refuses a caller that points at changed, missing, or untracked
+/// JSONL shards instead of silently projecting a different tree than the one
+/// visible to the caller.
+fn snapshot_series_source(series_root: &Path) -> Result<SeriesSourceSnapshot, String> {
+    let canonical = fs::canonicalize(series_root).map_err(|e| {
+        format!(
+            "series root {} does not exist or cannot be resolved: {e}. An unreachable source is \
+             REFUSED rather than treated as an empty one -- those are different facts, and only \
+             one of them is a statement about the cells.",
+            series_root.display()
+        )
+    })?;
+    if !canonical.is_dir() {
         return Err(format!(
-            "series root {} does not exist. An unreachable source is REFUSED rather than \
-             treated as an empty one -- those are different facts, and only one of them is \
-             a statement about the cells.",
+            "series root {} is not a directory",
             series_root.display()
         ));
     }
-    let mut shards: Vec<PathBuf> = Vec::new();
-    collect_shards(series_root, &mut shards)?;
-    shards.sort();
-    let mut rows = Vec::new();
-    let mut skipped = Vec::new();
-    for shard in shards {
-        let text = fs::read_to_string(&shard)
-            .map_err(|e| format!("cannot read series shard {}: {e}", shard.display()))?;
+
+    let top = Command::new("git")
+        .args(["--no-replace-objects", "rev-parse", "--show-toplevel"])
+        .current_dir(&canonical)
+        .output()
+        .map_err(|e| {
+            format!(
+                "cannot locate Git repository for {}: {e}",
+                canonical.display()
+            )
+        })?;
+    if !top.status.success() {
+        return Err(format!(
+            "series root {} is not inside a Git repository; a projection without a source commit is refused",
+            canonical.display()
+        ));
+    }
+    let repository_text = std::str::from_utf8(&top.stdout)
+        .map_err(|e| format!("Git repository path is not UTF-8: {e}"))?
+        .trim();
+    let repository = fs::canonicalize(repository_text).map_err(|e| {
+        format!(
+            "cannot resolve Git repository {} for series root {}: {e}",
+            repository_text,
+            canonical.display()
+        )
+    })?;
+    let relative_root = canonical.strip_prefix(&repository).map_err(|_| {
+        format!(
+            "series root {} is outside its reported Git repository {}",
+            canonical.display(),
+            repository.display()
+        )
+    })?;
+    let source_commit = git_no_replace_rev_parse(&repository, "HEAD^{commit}")?;
+    if !is_object_id(&source_commit) {
+        return Err(format!(
+            "series source commit must be a lowercase 40-hex object id, got {source_commit:?}"
+        ));
+    }
+
+    let listed = Command::new("git")
+        .args([
+            "--no-replace-objects",
+            "ls-tree",
+            "-rz",
+            "--name-only",
+            &source_commit,
+            "--",
+        ])
+        .arg(relative_root)
+        .current_dir(&repository)
+        .output()
+        .map_err(|e| format!("cannot list series source at {source_commit}: {e}"))?;
+    if !listed.status.success() {
+        return Err(format!(
+            "git ls-tree failed for series source {} at {source_commit}",
+            canonical.display()
+        ));
+    }
+    let committed_shards: BTreeSet<PathBuf> = listed
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            std::str::from_utf8(path)
+                .map(PathBuf::from)
+                .map_err(|e| format!("series source contains a non-UTF-8 path: {e}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .collect();
+
+    let mut worktree_paths = Vec::new();
+    collect_shards(&canonical, &mut worktree_paths)?;
+    let worktree_shards: BTreeSet<PathBuf> = worktree_paths
+        .into_iter()
+        .map(|path| {
+            path.strip_prefix(&repository)
+                .map(Path::to_path_buf)
+                .map_err(|_| {
+                    format!(
+                        "series shard {} is outside its reported Git repository {}",
+                        path.display(),
+                        repository.display()
+                    )
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    if let Some(path) = worktree_shards.difference(&committed_shards).next() {
+        return Err(format!(
+            "series source is not represented exactly by commit {source_commit}; worktree-only JSONL shard {} is absent from that commit",
+            path.display()
+        ));
+    }
+    if let Some(path) = committed_shards.difference(&worktree_shards).next() {
+        return Err(format!(
+            "series source is not represented exactly by commit {source_commit}; committed JSONL shard {} is missing from the worktree",
+            path.display()
+        ));
+    }
+
+    let mut shards = Vec::with_capacity(committed_shards.len());
+    for relative_shard in committed_shards {
+        let committed = Command::new("git")
+            .args([
+                "--no-replace-objects",
+                "show",
+                &format!("{source_commit}:{}", relative_shard.display()),
+            ])
+            .current_dir(&repository)
+            .output()
+            .map_err(|e| {
+                format!(
+                    "cannot read series shard {} from source commit {source_commit}: {e}",
+                    relative_shard.display()
+                )
+            })?;
+        if !committed.status.success() {
+            return Err(format!(
+                "git show failed for series shard {} at source commit {source_commit}",
+                relative_shard.display()
+            ));
+        }
+        let worktree_path = repository.join(&relative_shard);
+        let working = fs::read(&worktree_path)
+            .map_err(|e| format!("cannot read series shard {}: {e}", worktree_path.display()))?;
+        if committed.stdout != working {
+            return Err(format!(
+                "series source is not represented exactly by commit {source_commit}; worktree shard {} differs from the committed snapshot",
+                relative_shard.display()
+            ));
+        }
+        let within_source = relative_shard.strip_prefix(relative_root).map_err(|_| {
+            format!(
+                "committed series shard {} is outside source root {}",
+                relative_shard.display(),
+                relative_root.display()
+            )
+        })?;
+        shards.push(SeriesSourceShard {
+            display_path: series_root.join(within_source),
+            bytes: committed.stdout,
+        });
+    }
+    Ok(SeriesSourceSnapshot {
+        source_commit,
+        shards,
+    })
+}
+
+/// Parse the captured commit bytes into one canonical row per `event_id`.
+///
+/// Malformed input refuses the whole projection. Repeated event IDs with the
+/// same semantic JSON body collapse to one row; differing bodies under one ID
+/// are contradictory evidence and refuse instead of depending on traversal
+/// order.
+fn read_series_rows(snapshot: &SeriesSourceSnapshot) -> Result<Vec<SeriesRow>, String> {
+    let mut canonical: BTreeMap<String, (JsonValue, SeriesRow, String)> = BTreeMap::new();
+    for shard in &snapshot.shards {
+        if !shard.bytes.is_empty() && !shard.bytes.ends_with(b"\n") {
+            return Err(format!(
+                "series shard {} in source commit {} is truncated: every nonempty shard must end in a newline",
+                shard.display_path.display(),
+                snapshot.source_commit
+            ));
+        }
+        let text = std::str::from_utf8(&shard.bytes).map_err(|e| {
+            format!(
+                "series shard {} in source commit {} is not UTF-8: {e}",
+                shard.display_path.display(),
+                snapshot.source_commit
+            )
+        })?;
         for (index, line) in text.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
-            match serde_json::from_str::<SeriesRow>(line) {
-                Ok(mut row) => {
-                    row.source = format!("{}:{}", shard.display(), index + 1);
-                    rows.push(row);
+            let source = format!("{}:{}", shard.display_path.display(), index + 1);
+            let value: JsonValue = serde_json::from_str(line)
+                .map_err(|why| format!("malformed series row at {source}: {why}"))?;
+            let row: SeriesRow = serde_json::from_value(value.clone())
+                .map_err(|why| format!("malformed series row at {source}: {why}"))?;
+            row.validate_for_read()
+                .map_err(|why| format!("invalid series row at {source}: {why}"))?;
+            if let Some((previous_value, _, previous_source)) = canonical.get(&row.event_id) {
+                if previous_value == &value {
+                    continue;
                 }
-                Err(why) => {
-                    skipped.push(format!("{}:{}: {why}", shard.display(), index + 1));
-                }
+                return Err(format!(
+                    "conflicting series rows share event_id {:?}: {previous_source} and {source}",
+                    row.event_id
+                ));
             }
+            canonical.insert(row.event_id.clone(), (value, row, source));
         }
     }
-    Ok((rows, skipped))
+    Ok(canonical
+        .into_values()
+        .map(|(_, mut row, source)| {
+            row.source = source;
+            row
+        })
+        .collect())
 }
 
 fn collect_shards(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -5100,6 +5328,20 @@ fn git_rev_parse(root: &Path, revision: &str) -> Result<String, String> {
         .map_err(|e| format!("cannot read HEAD: {e}"))?;
     if !output.status.success() {
         return Err(format!("git rev-parse {revision} failed"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn git_no_replace_rev_parse(root: &Path, revision: &str) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(["--no-replace-objects", "rev-parse", revision])
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("cannot read revision without replacement objects: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git --no-replace-objects rev-parse {revision} failed"
+        ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
@@ -10087,6 +10329,7 @@ red/`measured-and-passed` count is **0**.",
         schema: SCHEMA,
         projection: Some(ObservationProjection {
             source: "fixture-series".into(),
+            source_commit: Some("a".repeat(40)),
             refreshed_at: "fixture-stamp".into(),
             rows_read: 7,
             pre_series_corpus: false,
@@ -10133,15 +10376,231 @@ red/`measured-and-passed` count is **0**.",
     // An unreachable source and an empty one are different facts. Only the
     // second is a statement about the cells, so the first is refused outright
     // rather than folded into "zero rows".
-    if read_series_rows(Path::new("/nonexistent/series/root")).is_ok() {
+    if snapshot_series_source(Path::new("/nonexistent/series/root")).is_ok() {
         return Err("an unreachable series root was read as an empty series".into());
     }
+
+    // The projection source is ONE immutable snapshot: resolve a commit,
+    // capture its bytes, prove the worktree matches, and never reread the
+    // mutable worktree while parsing. The fixture also pins canonical event
+    // identity, loud malformed-input refusal, and exact shard population.
+    let source_fixture =
+        tempfile::tempdir().map_err(|e| format!("cannot create series snapshot fixture: {e}"))?;
+    let source_repo = source_fixture.path();
+    git_ok(source_repo, &["init", "--quiet"])?;
+    let source_dir = source_repo.join("series/hermit/fixture");
+    fs::create_dir_all(&source_dir)
+        .map_err(|e| format!("cannot create series snapshot fixture: {e}"))?;
+    let first_shard = source_dir.join("2026-08-a.jsonl");
+    let second_shard = source_dir.join("2026-08-b.jsonl");
+    let mut source_row = series_row(
+        "fixture/boundary/verify/ptrace",
+        SeriesOutcome::Passed,
+        SeriesProducer::Validate,
+        1,
+        Some(fixture_detcore_tree.clone()),
+        None,
+    );
+    source_row.event_id = "fixture-source-event".into();
+    source_row.source.clear();
+    let source_json = serde_json::to_string(&source_row)
+        .map_err(|e| format!("cannot encode series snapshot fixture: {e}"))?;
+    fs::write(&first_shard, format!("{source_json}\n"))
+        .map_err(|e| format!("cannot write first series snapshot shard: {e}"))?;
+    fs::write(&second_shard, format!("  {source_json}  \n"))
+        .map_err(|e| format!("cannot write duplicate series snapshot shard: {e}"))?;
+    let commit_source = |message: &str| -> Result<(), String> {
+        git_ok(source_repo, &["add", "series"])?;
+        git_ok(
+            source_repo,
+            &[
+                "-c",
+                "user.name=scorecard fixture",
+                "-c",
+                "user.email=scorecard@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                message,
+            ],
+        )
+    };
+    commit_source("identical duplicate rows")?;
+
+    let source_snapshot = snapshot_series_source(&source_repo.join("series"))?;
+    let expected_source_commit = git_rev_parse(source_repo, "HEAD^{commit}")?;
+    if source_snapshot.source_commit != expected_source_commit {
+        return Err(format!(
+            "series snapshot recorded {} instead of resolved commit {expected_source_commit}",
+            source_snapshot.source_commit
+        ));
+    }
+
+    let mut replacement_row = source_row.clone();
+    replacement_row.event_id = "fixture-replacement-event".into();
+    let replacement_json = serde_json::to_string(&replacement_row)
+        .map_err(|e| format!("cannot encode replacement-ref series row: {e}"))?;
+    fs::write(&first_shard, format!("{replacement_json}\n"))
+        .map_err(|e| format!("cannot write replacement-ref series shard: {e}"))?;
+    fs::write(&second_shard, format!("{replacement_json}\n"))
+        .map_err(|e| format!("cannot write replacement-ref duplicate shard: {e}"))?;
+    commit_source("replacement tree")?;
+    let replacement_commit = git_rev_parse(source_repo, "HEAD^{commit}")?;
+    git_ok(
+        source_repo,
+        &[
+            "--no-replace-objects",
+            "reset",
+            "--hard",
+            "--quiet",
+            &expected_source_commit,
+        ],
+    )?;
+    git_ok(
+        source_repo,
+        &["replace", &expected_source_commit, &replacement_commit],
+    )?;
+    let replacement_guarded = snapshot_series_source(&source_repo.join("series"))?;
+    let replacement_guarded_rows = read_series_rows(&replacement_guarded)?;
+    if replacement_guarded.source_commit != expected_source_commit
+        || replacement_guarded_rows.len() != 1
+        || replacement_guarded_rows[0].event_id != source_row.event_id
+    {
+        return Err(
+            "series snapshot followed a Git replacement ref instead of the recorded commit"
+                .into(),
+        );
+    }
+    let replacement_ref = format!("refs/replace/{expected_source_commit}");
+    git_ok(source_repo, &["update-ref", "-d", &replacement_ref])?;
+
+    fs::write(&first_shard, "{worktree mutated after snapshot}\n")
+        .map_err(|e| format!("cannot mutate snapshotted series shard: {e}"))?;
+    let captured_rows = read_series_rows(&source_snapshot)?;
+    if captured_rows.len() != 1 || captured_rows[0].event_id != source_row.event_id {
+        return Err(format!(
+            "immutable snapshot did not collapse identical event IDs to one captured row: {:?}",
+            captured_rows
+                .iter()
+                .map(|row| row.event_id.as_str())
+                .collect::<Vec<_>>()
+        ));
+    }
+    let dirty_error = snapshot_series_source(&source_repo.join("series"))
+        .expect_err("a changed worktree shard was accepted as its committed snapshot");
+    if !dirty_error.contains("differs from the committed snapshot")
+        || !dirty_error.contains("2026-08-a.jsonl")
+    {
+        return Err(format!(
+            "changed-shard refusal did not name the mismatch and shard: {dirty_error}"
+        ));
+    }
+
+    let mut conflicting_row = source_row.clone();
+    conflicting_row.emitted_at = "2026-08-27T05:00:01Z".into();
+    let conflicting_json = serde_json::to_string(&conflicting_row)
+        .map_err(|e| format!("cannot encode conflicting series row: {e}"))?;
+    fs::write(&first_shard, format!("{source_json}\n"))
+        .map_err(|e| format!("cannot restore first series snapshot shard: {e}"))?;
+    fs::write(&second_shard, format!("{conflicting_json}\n"))
+        .map_err(|e| format!("cannot write conflicting series snapshot shard: {e}"))?;
+    commit_source("conflicting duplicate rows")?;
+    let conflicting_snapshot = snapshot_series_source(&source_repo.join("series"))?;
+    let conflicting_error = read_series_rows(&conflicting_snapshot)
+        .expect_err("conflicting rows under one event_id were collapsed");
+    if !conflicting_error.contains("conflicting series rows")
+        || !conflicting_error.contains("fixture-source-event")
+        || !conflicting_error.contains("2026-08-a.jsonl:1")
+        || !conflicting_error.contains("2026-08-b.jsonl:1")
+    {
+        return Err(format!(
+            "conflicting event_id refusal did not name both rows: {conflicting_error}"
+        ));
+    }
+
+    fs::write(&second_shard, "{not valid json}\n")
+        .map_err(|e| format!("cannot write malformed series snapshot shard: {e}"))?;
+    commit_source("malformed row")?;
+    let malformed_snapshot = snapshot_series_source(&source_repo.join("series"))?;
+    let malformed_error = read_series_rows(&malformed_snapshot)
+        .expect_err("a malformed committed series row was skipped");
+    if !malformed_error.contains("malformed series row")
+        || !malformed_error.contains("2026-08-b.jsonl:1")
+    {
+        return Err(format!(
+            "malformed-row refusal did not identify its source: {malformed_error}"
+        ));
+    }
+
+    fs::write(&second_shard, &source_json)
+        .map_err(|e| format!("cannot write truncated series snapshot shard: {e}"))?;
+    commit_source("truncated row")?;
+    let truncated_snapshot = snapshot_series_source(&source_repo.join("series"))?;
+    let truncated_error = read_series_rows(&truncated_snapshot)
+        .expect_err("a nonempty shard without a trailing newline was accepted");
+    if !truncated_error.contains("must end in a newline")
+        || !truncated_error.contains("2026-08-b.jsonl")
+    {
+        return Err(format!(
+            "truncated-shard refusal did not identify its source: {truncated_error}"
+        ));
+    }
+
+    let mut invalid_row = source_row.clone();
+    invalid_row.series.kernel_version = None;
+    let invalid_json = serde_json::to_string(&invalid_row)
+        .map_err(|e| format!("cannot encode invalid series row: {e}"))?;
+    fs::write(&second_shard, format!("{invalid_json}\n"))
+        .map_err(|e| format!("cannot write invalid series snapshot shard: {e}"))?;
+    commit_source("read-invalid row")?;
+    let invalid_snapshot = snapshot_series_source(&source_repo.join("series"))?;
+    let invalid_error = read_series_rows(&invalid_snapshot)
+        .expect_err("a row rejected by the shared read boundary was admitted");
+    if !invalid_error.contains("invalid series row")
+        || !invalid_error.contains("2026-08-b.jsonl:1")
+        || !invalid_error.contains("missing kernel_version")
+    {
+        return Err(format!(
+            "read-invalid row refusal did not identify its source and reason: {invalid_error}"
+        ));
+    }
+
+    fs::write(&second_shard, format!("{source_json}\n"))
+        .map_err(|e| format!("cannot restore duplicate series snapshot shard: {e}"))?;
+    commit_source("restore canonical rows")?;
+    let untracked_shard = source_dir.join("untracked.jsonl");
+    fs::write(&untracked_shard, format!("{source_json}\n"))
+        .map_err(|e| format!("cannot write untracked series snapshot shard: {e}"))?;
+    let untracked_error = snapshot_series_source(&source_repo.join("series"))
+        .expect_err("an untracked JSONL shard entered the source population");
+    if !untracked_error.contains("worktree-only JSONL shard")
+        || !untracked_error.contains("untracked.jsonl")
+    {
+        return Err(format!(
+            "untracked-shard refusal did not identify the population mismatch: {untracked_error}"
+        ));
+    }
+
     // A legacy file with no `projection` key must still load -- the demotion is
     // additive, and a hard requirement would strand every checked-in scorecard.
     let legacy: TrackedCells = serde_json::from_str(r#"{"schema":6,"cells":[]}"#)
         .map_err(|e| format!("legacy scorecard without a projection block no longer loads: {e}"))?;
     if legacy.projection.is_some() {
         return Err("absent projection block deserialized as present".into());
+    }
+    let historical_projection: ObservationProjection = serde_json::from_str(
+        r#"{"source":"s","refreshed_at":"t","rows_read":3,"pre_series_corpus":false}"#,
+    )
+    .map_err(|e| format!("historical projection without source_commit no longer loads: {e}"))?;
+    if historical_projection.source_commit.is_some() {
+        return Err("historical projection invented a source_commit".into());
+    }
+    if serde_json::from_str::<ObservationProjection>(
+        r#"{"source":"s","source_commit":"not-a-commit","refreshed_at":"t","rows_read":3,"pre_series_corpus":false}"#,
+    )
+    .is_ok()
+    {
+        return Err("ObservationProjection accepted a malformed source_commit".into());
     }
     // ⚠️ THE SAME LOAD-BEARING REFUSAL AS THE OBSERVED-POSITIONS SCHEMA. Without
     // `deny_unknown_fields` a projection block carrying a misspelled or future
