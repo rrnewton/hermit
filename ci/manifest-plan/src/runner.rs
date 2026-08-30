@@ -846,6 +846,10 @@ impl ObservedResult {
             "crash-error" => Ok(Self::CrashError),
             "timeout" => Ok(Self::Timeout),
             "oom" => Ok(Self::Oom),
+            "sandbox-denied" => Err(
+                "pressure summary contains a sandbox-denied operation; refusing to store it as product behavior"
+                    .into(),
+            ),
             "infrastructure-error" => Err(
                 "pressure summary contains an infrastructure error; refusing to store it as product behavior"
                     .into(),
