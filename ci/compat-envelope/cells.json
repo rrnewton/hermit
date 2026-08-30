@@ -2,6 +2,7 @@
   "schema": 6,
   "projection": {
     "source": "../../series",
+    "source_commit": "f009825e2b0089daf786a9d4686caa3b1d8b27b2",
     "refreshed_at": "2026-08-27T09:23:50Z",
     "rows_read": 9,
     "pre_series_corpus": true
