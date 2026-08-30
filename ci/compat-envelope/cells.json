@@ -2,9 +2,9 @@
   "schema": 7,
   "projection": {
     "source": "series",
-    "source_commit": "7c583a46fa8a6062ba428f0937c9dcc5d0d41d29",
+    "source_commit": "cd6583f954c3490aafa82718f8bbb180e2a11670",
     "source_tree": "1ffda0c98cc55fd9630c8a2da2f0bb7b8008ed05",
-    "refreshed_at": "2026-08-30T21:18:27Z",
+    "refreshed_at": "2026-08-30T23:21:21Z",
     "rows_read": 15317,
     "pre_series_corpus": true
   },
