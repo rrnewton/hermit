@@ -57,12 +57,12 @@ Commands:
       Print the derived compatibility table.
   check
       Refuse if SCORECARD.md or ci/compat-envelope/cells.json is stale.
-  update [--allow-green-removal REASON] [--allow-cell-removal]
-      Rewrite the two tracked files. Green regressions and cell deletion are
+  update [--allow-selected-removal REASON] [--allow-cell-removal]
+      Rewrite the two tracked files. Selected-cell removal and cell deletion are
       refused unless the matching explicit flag is present.
   update-observations --summary FILE
-      Merge one completed clean pressure-test summary into the red cells'
-      checked-in observations. This never changes which cells are green.
+      Merge one completed clean pressure-test summary into the not-selected cells'
+      checked-in observations. This never changes which cells are selected.
   observe-results --results DIR
       Merge the canonical comparison results from ONE validate result directory
       into the cells' checked-in observations, under the `validate` provenance
@@ -73,7 +73,7 @@ Commands:
       Import clean canonical comparisons retained on HEAD's history. A retained
       divergence position is imported only after current results classify it as
       FRESH, DRIFTED, WRONG, or UNCHECKABLE. This reads existing results; it does
-      not execute a guest and it never changes scorecard colour.
+      not execute a guest and it never changes scorecard membership.
   project-observations --series-root DIR --refreshed-at STAMP
       Re-derive observations and last_tested from comparison rows in the series
       store. Rows that produced no comparison are named and skipped. REFUSES to
@@ -91,8 +91,8 @@ Commands:
   --help
       Show this text.
 
-Green means that the cell is selected by ci/expected-e2e-plan.json. Everything
-else in the manifest is red until it is measured, promoted into the selected
+Selected means that the cell is listed in ci/expected-e2e-plan.json. Everything
+else in the manifest is not-selected until it is measured, promoted into the selected
 plan, and passes validate.
 "#;
 
@@ -181,14 +181,14 @@ struct TrackedCell {
     status: CellStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ci_disabled_reason: Option<CiDisabledReasonData>,
-    /// Why the green-removal ratchet was OVERRIDDEN for this cell, verbatim from
-    /// `update --allow-green-removal <reason>`.
+    /// Why the selected-removal ratchet was OVERRIDDEN for this cell, verbatim from
+    /// `update --allow-selected-removal <reason>`.
     ///
     /// ⚠️ THIS EXISTS BECAUSE THE OVERRIDE USED TO LEAVE NO TRACE. The ratchet at
-    /// the top of [`tracked_from`] does refuse a green -> red move -- measured, it
-    /// names the cell and exits 2. But `--allow-green-removal` was a bare flag
+    /// the top of [`tracked_from`] does refuse a selected -> not-selected move -- measured, it
+    /// names the cell and exits 2. But `--allow-selected-removal` was a bare flag
     /// typed into a shell, so once it was used nothing in the tree recorded that
-    /// it had been. A reviewer reading the diff saw a cell flip green -> red and
+    /// it had been. A reviewer reading the diff saw a cell leave the selected plan and
     /// could not tell "the generator was run normally" from "the generator
     /// refused and the author told it not to". Both readings produce byte-
     /// identical output, which is what made the guard's override invisible rather
@@ -200,10 +200,15 @@ struct TrackedCell {
     /// `ci_disabled_reason` field. Two conventions, two places, and no gate reads
     /// either. This field is the one place that travels with the cell.
     ///
-    /// CLEARED when the cell is green again, so it describes the CURRENT
+    /// CLEARED when the cell is selected again, so it describes the CURRENT
     /// override and never accumulates history a reader would have to date.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    green_removal_reason: Option<String>,
+    #[serde(
+        default,
+        rename = "selected_removal_reason",
+        alias = "green_removal_reason",
+        skip_serializing_if = "Option::is_none"
+    )]
+    selected_removal_reason: Option<String>,
     /// Why this cell is [`CellStatus::NotApplicable`], verbatim from the
     /// manifest. Present exactly when the status is `NotApplicable`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -246,10 +251,11 @@ struct CiDisabledReasonData {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
 enum CellStatus {
-    Green,
-    Red,
+    #[serde(rename = "selected", alias = "green")]
+    Selected,
+    #[serde(rename = "not-selected", alias = "red")]
+    NotSelected,
     /// The backend is not enabled for this test and mode, so the cell was never
     /// asked to do anything and cannot have failed.
     ///
@@ -269,8 +275,8 @@ enum CellStatus {
 impl CellStatus {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Green => "green",
-            Self::Red => "red",
+            Self::Selected => "selected",
+            Self::NotSelected => "not-selected",
             Self::NotApplicable => "not-applicable",
         }
     }
@@ -1267,7 +1273,7 @@ impl ResultRow {
                 })?;
             report.require_canonical_match().map_err(|error| {
                 format!(
-                    "attempt {} cannot support a green result: {error}",
+                    "attempt {} cannot support a passing result: {error}",
                     index + 1
                 )
             })?;
@@ -1409,7 +1415,7 @@ impl ResultRow {
             match self.outcome.as_str() {
                 "PASS" => report.require_canonical_match().map_err(|error| {
                     format!(
-                        "attempt {} cannot support a green result: {error}",
+                        "attempt {} cannot support a passing result: {error}",
                         index + 1
                     )
                 })?,
@@ -1948,7 +1954,7 @@ fn run() -> Result<(), String> {
             );
         }
         "update" => {
-            let mut allow_green_removal: Option<String> = None;
+            let mut allow_selected_removal: Option<String> = None;
             let mut allow_cell_removal = false;
             let mut args = args;
             while let Some(arg) = args.next() {
@@ -1957,10 +1963,10 @@ fn run() -> Result<(), String> {
                     // flag with a separate --reason. A bare flag can be used
                     // without one; this cannot, so the justification is not
                     // something the author may forget to supply.
-                    "--allow-green-removal" => {
+                    "--allow-selected-removal" | "--allow-green-removal" => {
                         let reason = args.next().ok_or_else(|| {
-                            "--allow-green-removal requires a reason: \
-                             --allow-green-removal \"why this transition is correct\". \
+                            "--allow-selected-removal requires a reason: \
+                             --allow-selected-removal \"why this transition is correct\". \
                              The reason is written into ci/compat-envelope/cells.json next to \
                              each cell it moves, so the override is visible in the diff instead \
                              of living only in the shell history of whoever ran it."
@@ -1968,16 +1974,16 @@ fn run() -> Result<(), String> {
                         })?;
                         if reason.trim().is_empty() || reason.starts_with("--") {
                             return Err(format!(
-                                "--allow-green-removal needs a reason, got `{reason}`"
+                                "--allow-selected-removal needs a reason, got `{reason}`"
                             ));
                         }
-                        allow_green_removal = Some(reason);
+                        allow_selected_removal = Some(reason);
                     }
                     "--allow-cell-removal" => allow_cell_removal = true,
                     _ => return Err(format!("unknown update option `{arg}`\n\n{USAGE}")),
                 }
             }
-            update_tracked(&root, allow_green_removal.as_deref(), allow_cell_removal)?;
+            update_tracked(&root, allow_selected_removal.as_deref(), allow_cell_removal)?;
         }
         "update-observations" => {
             let mut summary = None;
@@ -2295,7 +2301,7 @@ fn render_scorecard(derived: &Derived) -> String {
 
     // This is the same derived count printed in the summary table below. Keep
     // the prose on the value rather than restating a hand-maintained snapshot:
-    // the old literal still said manifest-disabled cells were red after
+    // the old literal still said manifest-disabled cells were not-selected after
     // `NotApplicable` became a separate status.
     let na_total = derived
         .population
@@ -2307,20 +2313,20 @@ fn render_scorecard(derived: &Derived) -> String {
         "# Compatibility scorecard\n\n\
 This table is derived from the manifest, not from a separately maintained parent-workspace CSV. \
 `./ci/compat-envelope/scorecard.rs check` verifies it.\n\n\
-**Green** means the cell is SELECTED: it is listed in `ci/expected-e2e-plan.json` and is therefore \
-required to pass by ordinary validation. **Red** means an enabled cell is not selected: measured \
-failure, unavailable, or not yet run all remain red until the cell is promoted into the regression \
+**Selected** means the cell is listed in `ci/expected-e2e-plan.json` and is therefore \
+required to pass by ordinary validation. **Not selected** means an enabled cell is not selected: measured \
+failure, unavailable, or not yet run all remain not-selected until the cell is promoted into the regression \
 plan and passes. The summary table below classifies the current **{na_total}** manifest-disabled \
-combinations as **Not applicable**, not red or omitted: a cell that cannot run cannot pass or fail.\n\n\
-**Green does not mean measured, and it does not mean passing.** Selection, measurement, and result \
-are three separate facts, and the Green column below reports only the first of them. Green is a \
+combinations as **Not applicable**, not not-selected or omitted: a cell that cannot run cannot pass or fail.\n\n\
+**Selected does not mean measured, and it does not mean passing.** Selection, measurement, and result \
+are three separate facts, and the Selected column below reports only the first of them. Selection is a \
 statement about what the plan REQUIRES, not about what has been OBSERVED. Whether a result was ever \
-seen is a per-cell `measurement` field in `ci/compat-envelope/cells.json`, independent of colour \
-and reading `never-measured`, `measured-and-passed`, or `diverged`; a cell can be green and \
-`never-measured`, or red and `measured-and-passed`. The generated Status and measurement section \
+seen is a per-cell `measurement` field in `ci/compat-envelope/cells.json`, independent of membership \
+and reading `never-measured`, `measured-and-passed`, or `diverged`; a cell can be selected and \
+`never-measured`, or not-selected and `measured-and-passed`. The generated Status and measurement section \
 below states whether those combinations are present today and quotes their exact current counts. \
 To count what has actually run, count that field -- do not count this table. Conflating the three \
-has repeatedly produced project-status reports that quoted the Green total as a number of passing \
+has repeatedly produced project-status reports that quoted the Selected total as a number of passing \
 tests, which it has never been.\n\n\
 Every selected `verify` cell, and every seed in a selected `chaos` cell, runs the same backend \
 twice. The manifest runner adds `--verify-strict` when the selected Hermit binary supports it, and \
@@ -2329,7 +2335,7 @@ accepts a result only when the typed report says `verified=true`, `verdict=match
 `record_envelope`, and both INFO-message counts are nonzero. Bare `--verify` remains a Stripped \
 comparison when invoked directly and does not satisfy \
 this regression plan. These same-backend results do not establish cross-backend parity.\n\n\
-| Backend | Green | Red | Not applicable | Total |\n\
+| Backend | Selected | Not selected | Not applicable | Total |\n\
 | --- | ---: | ---: | ---: | ---: |\n",
     );
     let mut green_total = 0usize;
@@ -2392,20 +2398,20 @@ this regression plan. These same-backend results do not establish cross-backend 
         .collect();
     out.push_str(&format!(
         "## Denominator, and why the percentage is not comparable across changes to it\n\n\
-Green is **{green_total} of {total}**, which is **{percent:.2}%** — over THIS population and no \
+Selected is **{green_total} of {total}**, which is **{percent:.2}%** — over THIS population and no \
 other. The population is every combination the manifest declares, and it is composed of:\n\n\
 - backends: {}\n\
 - modes: {}\n\n\
 ⚠️ **{na} of those {total} cells are NOT APPLICABLE** — their backend is not enabled for their \
 mode, so they were never asked to run and cannot pass or fail. Over the {applicable} cells that \
-CAN run, green is **{applicable_percent:.2}%**.\n\n\
-⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same {green_total} green cells \
+CAN run, selected is **{applicable_percent:.2}%**.\n\n\
+⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same {green_total} selected cells \
 measured against a smaller denominator. Nothing was fixed to produce it; it is what the first \
 figure always meant once the cells that cannot run are excluded. Quote both or neither, and never \
 compare one against the other as though something moved.\n\n\
 ⚠️ **Adding or removing a backend or mode changes this denominator and therefore the percentage, \
-without anything about the product changing.** Removing a backend whose cells are mostly red \
-RAISES the reported figure; adding honest red cells LOWERS it. Neither is progress. Before \
+without anything about the product changing.** Removing a backend whose cells are mostly not-selected \
+RAISES the reported figure; adding honest not-selected cells LOWERS it. Neither is progress. Before \
 comparing this percentage against an earlier one, diff the two lists above: if they differ, the \
 numbers are not comparable and the difference is not a result.\n\n",
         ordered
@@ -2428,14 +2434,14 @@ numbers are not comparable and the difference is not a result.\n\n",
     ));
     out.push_str(
         "The mode view makes the current order of work explicit: expand `verify` first, then \
-`replay`, then `chaos`. Each backend cell is `green / total`; an em dash means that mode does \
-not exist for that backend. The summary columns use the same Green, Red, and Not applicable \
+`replay`, then `chaos`. Each backend cell is `selected / total`; an em dash means that mode does \
+not exist for that backend. The summary columns use the same Selected, Not selected, and Not applicable \
 statuses as the table above.\n\n| Mode",
     );
     for backend in &ordered {
         out.push_str(&format!(" | `{backend}`"));
     }
-    out.push_str(" | Green | Red | Not applicable | Total |\n| ---");
+    out.push_str(" | Selected | Not selected | Not applicable | Total |\n| ---");
     for _ in &ordered {
         out.push_str(" | ---:");
     }
@@ -2488,9 +2494,9 @@ Until a cell actually compares a fresh ptrace log with the corresponding backend
 reports no cross-backend parity number.\n\n\
 ## Ptrace by manifest category\n\n\
 This view uses the same Basic Sanity Milestone 1 contracts as the tables above, but makes the ptrace \
-workload mix visible. Each entry is `green / total`; `custom` commands are not part of this \
+workload mix visible. Each entry is `selected / total`; `custom` commands are not part of this \
 denominator.\n\n\
-| Manifest category | Verify | Replay | Chaos | Green | Total |\n\
+| Manifest category | Verify | Replay | Chaos | Selected | Total |\n\
 | --- | ---: | ---: | ---: | ---: | ---: |\n",
     );
     let categories: BTreeSet<&str> = derived
@@ -2535,10 +2541,10 @@ denominator.\n\n\
         .filter(|id| id.mode == "custom")
         .count();
     out.push_str(&format!(
-        "Ordinary full validation executes {} selected regression cells: the {green_total} green \
+        "Ordinary full validation executes {} selected regression cells: the {green_total} selected \
 compatibility cells above (including {chaos} chaos-mode race-exposure checks), and {custom} \
 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for \
-all of them; a failing green cell is a regression, not permission to move it to red.\n",
+all of them; a failing selected cell is a regression, not permission to remove it from the selected plan.\n",
         derived.selected.len()
     ));
     out
@@ -2546,8 +2552,8 @@ all of them; a failing green cell is a regression, not permission to move it to 
 
 fn render_measurement_section(tracked: &TrackedCells) -> String {
     let statuses = [
-        CellStatus::Green,
-        CellStatus::Red,
+        CellStatus::Selected,
+        CellStatus::NotSelected,
         CellStatus::NotApplicable,
     ];
     let measurements = [
@@ -2568,8 +2574,9 @@ fn render_measurement_section(tracked: &TrackedCells) -> String {
     // table. An import changed one count to zero while leaving the prose saying
     // both combinations were present. Derive the claims through the table's
     // own count so another import changes both together.
-    let green_never_measured = count(CellStatus::Green, MeasurementState::NeverMeasured);
-    let red_measured_and_passed = count(CellStatus::Red, MeasurementState::MeasuredAndPassed);
+    let green_never_measured = count(CellStatus::Selected, MeasurementState::NeverMeasured);
+    let red_measured_and_passed =
+        count(CellStatus::NotSelected, MeasurementState::MeasuredAndPassed);
 
     let mut out = String::from(
         "\n## Status and measurement\n\n\
@@ -2581,8 +2588,8 @@ recorded last test still matches `HEAD:detcore`.\n\n",
     );
     out.push_str(&format!(
         "The count table includes all **{}** tracked cells; no row is omitted. The current \
-green/`never-measured` count is **{green_never_measured}**, and the current \
-red/`measured-and-passed` count is **{red_measured_and_passed}**. These values use the same counts \
+selected/`never-measured` count is **{green_never_measured}**, and the current \
+not-selected/`measured-and-passed` count is **{red_measured_and_passed}**. These values use the same counts \
 printed in the table below.\n\n",
         tracked.cells.len(),
     ));
@@ -2643,7 +2650,7 @@ and measurement remain visible together.\n\n\
 fn tracked_from(
     derived: &Derived,
     existing: Option<TrackedCells>,
-    allow_green_removal: Option<&str>,
+    allow_selected_removal: Option<&str>,
     allow_cell_removal: bool,
 ) -> Result<TrackedCells, String> {
     let mut previous = BTreeMap::new();
@@ -2678,23 +2685,23 @@ fn tracked_from(
     let regressed: Vec<_> = previous
         .values()
         .filter(|cell| {
-            cell.status == CellStatus::Green
+            cell.status == CellStatus::Selected
                 && derived.population.contains(&cell.id)
                 && !derived.green.contains(&cell.id)
         })
         .map(|cell| cell.id.clone())
         .collect();
-    if !regressed.is_empty() && allow_green_removal.is_none() {
+    if !regressed.is_empty() && allow_selected_removal.is_none() {
         return Err(format!(
-            "refusing to move {} green cell(s) to red; first is {}. Fix the regression, or use \
-             --allow-green-removal <reason> only at an explicit compatibility-standard transition",
+            "refusing to remove {} selected cell(s) from the plan; first is {}. Fix the regression, or use \
+             --allow-selected-removal <reason> only at an explicit compatibility-standard transition",
             regressed.len(),
             display_id(&regressed[0])
         ));
     }
     // The override is recorded ON the cells it was used for, so it lands in the
     // same diff hunk as the status flip a reviewer is reading.
-    let overridden: BTreeSet<_> = if allow_green_removal.is_some() {
+    let overridden: BTreeSet<_> = if allow_selected_removal.is_some() {
         regressed.iter().cloned().collect()
     } else {
         BTreeSet::new()
@@ -2717,9 +2724,9 @@ fn tracked_from(
             let status = if !enabled {
                 CellStatus::NotApplicable
             } else if derived.green.contains(&id) {
-                CellStatus::Green
+                CellStatus::Selected
             } else {
-                CellStatus::Red
+                CellStatus::NotSelected
             };
             let ci_disabled_reason = derived.ci_disabled_reasons.get(&id).cloned();
             let not_applicable_reason = derived.not_applicable_reasons.get(&id).cloned();
@@ -2727,14 +2734,14 @@ fn tracked_from(
             // carried forward while the cell stays outside the selected plan,
             // and dropped the moment it is selected again. Result-derived red
             // is not an override: the check is still selected and required.
-            let green_removal_reason = if derived.green.contains(&id) {
+            let selected_removal_reason = if derived.green.contains(&id) {
                 None
             } else if overridden.contains(&id) {
-                allow_green_removal.map(str::to_string)
+                allow_selected_removal.map(str::to_string)
             } else {
                 previous
                     .get(&id)
-                    .and_then(|cell| cell.green_removal_reason.clone())
+                    .and_then(|cell| cell.selected_removal_reason.clone())
             };
             let mut cell = TrackedCell {
                 id,
@@ -2745,7 +2752,7 @@ fn tracked_from(
                 last_tested,
                 observations,
                 measurement: MeasurementState::NeverMeasured,
-                green_removal_reason,
+                selected_removal_reason,
             };
             cell.measurement = derive_measurement(&cell);
             cell
@@ -3079,14 +3086,14 @@ fn read_generated_files(root: &Path) -> Result<GeneratedFiles, String> {
 fn check_tracked(root: &Path) -> Result<Derived, String> {
     let derived = derive(root)?;
     // ORDER MATTERS, AND IT IS THE FIX FOR A MISDIRECTING FAILURE. `tracked_from` runs FIRST
-    // because it is the only step that can name a SEMANTIC cause -- a green cell regressing to
-    // red, or a tracked cell disappearing. `compare_file(SCORECARD)` can only ever say "stale;
+    // because it is the only step that can name a SEMANTIC cause -- a selected cell leaving the
+    // plan, or a tracked cell disappearing. `compare_file(SCORECARD)` can only ever say "stale;
     // run `update`". Both files derive from the plan, so a plan edit makes BOTH fail at once;
     // with the comparison first, the operator was told to run `update`, and `update` then
-    // refused the green regression. Measured 2026-08-25: dropping one green cell from
+    // refused the selection regression. Measured 2026-08-25: dropping one selected cell from
     // ci/expected-e2e-plan.json produced `check` -> "SCORECARD.md is stale; run update" and
-    // `update` -> "refusing to move 1 green cell(s) to red". Following the instruction the tool
-    // itself printed could not clear it; the real remedy, --allow-green-removal, was named
+    // `update` -> "refusing to remove 1 selected cell(s) from the plan". Following the instruction the tool
+    // itself printed could not clear it; the real remedy, --allow-selected-removal, was named
     // nowhere in the message the operator actually saw. Deleting a cell already reported its own
     // cause correctly, because that path has no SCORECARD.md difference to mask it -- which is
     // why this looked intermittent rather than ordered.
@@ -3128,7 +3135,7 @@ fn compare_file(path: &Path, expected: &str) -> Result<(), String> {
 
 fn update_tracked(
     root: &Path,
-    allow_green_removal: Option<&str>,
+    allow_selected_removal: Option<&str>,
     allow_cell_removal: bool,
 ) -> Result<(), String> {
     let derived = derive(root)?;
@@ -3136,7 +3143,7 @@ fn update_tracked(
     let mut cells = tracked_from(
         &derived,
         existing.clone(),
-        allow_green_removal,
+        allow_selected_removal,
         allow_cell_removal,
     )?;
     refresh_measurement(&mut cells);
@@ -3153,7 +3160,7 @@ fn update_tracked(
     fs::write(root.join(CELLS), encoded_cells(&cells)?)
         .map_err(|e| format!("cannot write {CELLS}: {e}"))?;
     // NOT APPLICABLE IS REPORTED SEPARATELY, NOT FOLDED INTO RED. This line is
-    // the number people quote; leaving it as "population minus green" is exactly
+    // the number people quote; leaving it as "population minus selected" is exactly
     // how 4,940 never-applicable cells were read as failures.
     let not_applicable = derived
         .population
@@ -3161,16 +3168,16 @@ fn update_tracked(
         .filter(|id| !derived.enabled.contains(*id))
         .count();
     println!(
-        "compatibility scorecard: wrote {} green / {} red / {} not-applicable / {} total",
+        "compatibility scorecard: wrote {} selected / {} not-selected / {} not-applicable / {} total",
         cells
             .cells
             .iter()
-            .filter(|cell| cell.status == CellStatus::Green)
+            .filter(|cell| cell.status == CellStatus::Selected)
             .count(),
         cells
             .cells
             .iter()
-            .filter(|cell| cell.status == CellStatus::Red)
+            .filter(|cell| cell.status == CellStatus::NotSelected)
             .count(),
         not_applicable,
         derived.population.len()
@@ -3313,7 +3320,7 @@ fn render_evidence_coverage(root: &Path) -> Result<String, String> {
         .count();
 
     let mut out = String::new();
-    out.push_str("\nRecorded evidence (not part of the green/red verdict)\n");
+    out.push_str("\nRecorded evidence (not part of scorecard membership)\n");
     out.push_str(&format!(
         "  cells with a recorded last test : {stamped} of {total}\n"
     ));
@@ -3321,7 +3328,7 @@ fn render_evidence_coverage(root: &Path) -> Result<String, String> {
         out.push_str(concat!(
             "      the remainder have NO RECORD, which is not the same as never tested:\n",
              "      only the explicit fold commands write it, and validate runs only\n",
-            "      the selected plan, so red cells stay blank until a pressure-test\n",
+            "      the selected plan, so not-selected cells stay blank until a pressure-test\n",
             "      campaign covers them.\n",
         ));
     }
@@ -3525,7 +3532,7 @@ fn apply_pressure_summary(
             continue;
         };
         // REFUSAL REMOVED BY OWNER RULING. This used to refuse any row whose
-        // cell was green, on the grounds that "ordinary validate owns green
+        // cell was selected, on the grounds that "ordinary validate owns selected
         // evidence". Two things were wrong with it. It made the producer and
         // consumer contradict each other outright -- `--repetitions` only
         // repeats GREEN cells, so the one command that can produce a
@@ -3533,7 +3540,7 @@ fn apply_pressure_summary(
         // first row. And it treated a pressure result that disagrees with
         // validate as a collision to be prevented, when it is the most
         // interesting thing the pressure test can produce: stressing a cell
-        // harder and finding it red where validate called it green is the
+        // harder and finding it not-selected where validate called it selected is the
         // system working. Disagreement is surfaced by `show` instead of being
         // refused here.
         let result = match ObservedResult::parse(&row.result) {
@@ -3697,7 +3704,7 @@ fn apply_pressure_summary(
     {
         // Every row here is a cell the pressure test actually exercised,
         // whatever its result, so it gets the same stamp the validate fold
-        // applies. This is the ONLY writer that reaches red cells.
+        // applies. This is the ONLY writer that reaches not-selected cells.
         tracked.cells[index].last_tested = Some(LastTested {
             hermit_sha: summary.hermit_sha.clone(),
             detcore_tree: summary.detcore_tree.clone(),
@@ -6446,10 +6453,10 @@ fn self_test() -> Result<(), String> {
     };
     let population = BTreeSet::from([chaos_id.clone()]);
     if !selected_green(&BTreeSet::from([chaos_id.clone()]), &population).contains(&chaos_id) {
-        return Err("a selected chaos cell was structurally excluded from green".into());
+        return Err("a selected chaos cell was structurally excluded from selection".into());
     }
     if selected_green(&BTreeSet::new(), &population).contains(&chaos_id) {
-        return Err("an unselected chaos cell was accepted as green".into());
+        return Err("an unselected chaos cell was accepted into the selected set".into());
     }
     let visible_reason = CiDisabledReasonData {
         result: Some("determinism-failure".into()),
@@ -6473,22 +6480,24 @@ fn self_test() -> Result<(), String> {
     let mut measured_red = visible_tracked.clone();
     measured_red.cells[0].measurement = MeasurementState::MeasuredAndPassed;
     let measured_section = render_measurement_section(&measured_red);
-    let current_counts = "The current green/`never-measured` count is **0**, and the current \
-red/`measured-and-passed` count is **1**.";
+    let current_counts = "The current selected/`never-measured` count is **0**, and the current \
+not-selected/`measured-and-passed` count is **1**.";
     if !measured_section.contains(current_counts)
-        || !measured_section.contains("| `red` | 0 | 1 | 0 | 0 | 0 | 1 |")
+        || !measured_section.contains("| `not-selected` | 0 | 1 | 0 | 0 | 0 | 1 |")
     {
         return Err(
-            "measurement prose did not use the same green/never-measured and red/measured-and-passed counts as its table"
+            "measurement prose did not use the same selected/never-measured and not-selected/measured-and-passed counts as its table"
                 .into(),
         );
     }
     let measured_row = format!(
-        "| `{}` | `{}` | `{}` | `red` | `measured-and-passed` |",
+        "| `{}` | `{}` | `{}` | `not-selected` | `measured-and-passed` |",
         id.test, id.mode, id.backend
     );
     if !measured_section.contains(&measured_row) {
-        return Err("measurement display did not show red and measured-and-passed together".into());
+        return Err(
+            "measurement display did not show not-selected and measured-and-passed together".into(),
+        );
     }
     let unmeasured_section = render_measurement_section(&visible_tracked);
     if unmeasured_section.contains(&measured_row) {
@@ -6497,8 +6506,8 @@ red/`measured-and-passed` count is **1**.";
         );
     }
     if !unmeasured_section.contains(
-        "The current green/`never-measured` count is **0**, and the current \
-red/`measured-and-passed` count is **0**.",
+        "The current selected/`never-measured` count is **0**, and the current \
+not-selected/`measured-and-passed` count is **0**.",
     ) {
         return Err("measurement prose kept a stale cross-combination count".into());
     }
@@ -6515,7 +6524,7 @@ red/`measured-and-passed` count is **0**.",
     };
     let status_section = render_scorecard(&not_applicable);
     if !status_section.contains(
-        "current **1** manifest-disabled combinations as **Not applicable**, not red or omitted",
+        "current **1** manifest-disabled combinations as **Not applicable**, not not-selected or omitted",
     ) || !status_section.contains("| `ptrace` | 0 | 0 | 1 | 1 |")
         || !status_section.contains("| `verify` | 0 / 1 | 0 | 0 | 1 | 1 |")
     {
@@ -6523,21 +6532,54 @@ red/`measured-and-passed` count is **0**.",
             "status prose and tables did not use the same manifest-disabled count".into(),
         );
     }
-    let old_green = TrackedCells {
+    let old_selected = TrackedCells {
         schema: SCHEMA,
         projection: None,
         cells: vec![TrackedCell {
             id: id.clone(),
             enabled: true,
-            status: CellStatus::Green,
+            status: CellStatus::Selected,
             ci_disabled_reason: None,
             not_applicable_reason: None,
             last_tested: None,
             observations: Vec::new(),
             measurement: MeasurementState::NeverMeasured,
-            green_removal_reason: None,
+            selected_removal_reason: None,
         }],
     };
+    // Schema 6 predates the terminology fix. Read both legacy spellings and
+    // always emit the truthful current names so an existing checkout can run
+    // `update` without a manual migration or a schema bump.
+    let mut legacy_value = serde_json::to_value(&old_selected)
+        .map_err(|e| format!("cannot encode legacy-status compatibility fixture: {e}"))?;
+    let legacy_cell = legacy_value["cells"][0]
+        .as_object_mut()
+        .ok_or("legacy-status compatibility fixture lost its cell object")?;
+    legacy_cell.insert("status".into(), JsonValue::String("green".into()));
+    legacy_cell.insert(
+        "green_removal_reason".into(),
+        JsonValue::String("legacy compatibility reason".into()),
+    );
+    let legacy_selected: TrackedCells = serde_json::from_value(legacy_value)
+        .map_err(|e| format!("legacy green status no longer parses: {e}"))?;
+    if legacy_selected.cells[0].status != CellStatus::Selected
+        || legacy_selected.cells[0].selected_removal_reason.as_deref()
+            != Some("legacy compatibility reason")
+    {
+        return Err("legacy green status or green_removal_reason changed meaning".into());
+    }
+    let migrated_text = encoded_cells(&legacy_selected)?;
+    if !migrated_text.contains("\"status\": \"selected\"")
+        || !migrated_text.contains("\"selected_removal_reason\": \"legacy compatibility reason\"")
+        || migrated_text.contains("green_removal_reason")
+    {
+        return Err("legacy status migration did not emit only the current names".into());
+    }
+    let legacy_not_selected: CellStatus = serde_json::from_str("\"red\"")
+        .map_err(|e| format!("legacy red status no longer parses: {e}"))?;
+    if legacy_not_selected != CellStatus::NotSelected {
+        return Err("legacy red status changed meaning".into());
+    }
     let regressed = Derived {
         population: BTreeSet::from([id.clone()]),
         enabled: BTreeSet::from([id.clone()]),
@@ -6546,8 +6588,8 @@ red/`measured-and-passed` count is **0**.",
         selected: BTreeSet::new(),
         green: BTreeSet::new(),
     };
-    if tracked_from(&regressed, Some(old_green), None, false).is_ok() {
-        return Err("negative ratchet bracket accepted green-to-red movement".into());
+    if tracked_from(&regressed, Some(legacy_selected), None, false).is_ok() {
+        return Err("negative ratchet bracket accepted selected-cell removal".into());
     }
     let intentional = TrackedCells {
         schema: SCHEMA,
@@ -6555,13 +6597,13 @@ red/`measured-and-passed` count is **0**.",
         cells: vec![TrackedCell {
             id: id.clone(),
             enabled: true,
-            status: CellStatus::Green,
+            status: CellStatus::Selected,
             ci_disabled_reason: None,
             not_applicable_reason: None,
             last_tested: None,
             observations: Vec::new(),
             measurement: MeasurementState::NeverMeasured,
-            green_removal_reason: None,
+            selected_removal_reason: None,
         }],
     };
     let overridden = tracked_from(
@@ -6576,19 +6618,19 @@ red/`measured-and-passed` count is **0**.",
     // guard refusing is only half of it; a reviewer must be able to see, from the
     // tracked file alone, that the refusal was overridden and why.
     match overridden.cells.iter().find(|cell| cell.id == id) {
-        Some(cell) if cell.green_removal_reason.as_deref() == Some("self-test") => {}
+        Some(cell) if cell.selected_removal_reason.as_deref() == Some("self-test") => {}
         Some(cell) => {
             return Err(format!(
-                "green-removal override did not record its reason on {}; got {:?}",
+                "selected-removal override did not record its reason on {}; got {:?}",
                 display_id(&id),
-                cell.green_removal_reason
+                cell.selected_removal_reason
             ));
         }
-        None => return Err("green-removal override dropped the cell entirely".into()),
+        None => return Err("selected-removal override dropped the cell entirely".into()),
     }
-    // And it must CLEAR once the cell is green again, or the file accumulates
+    // And it must CLEAR once the cell is selected again, or the file accumulates
     // stale justifications that read as live ones.
-    let back_to_green = Derived {
+    let back_to_selected = Derived {
         population: BTreeSet::from([id.clone()]),
         enabled: BTreeSet::from([id.clone()]),
         ci_disabled_reasons: BTreeMap::new(),
@@ -6596,12 +6638,12 @@ red/`measured-and-passed` count is **0**.",
         selected: BTreeSet::new(),
         green: BTreeSet::from([id.clone()]),
     };
-    let recovered = tracked_from(&back_to_green, Some(overridden), None, false)
+    let recovered = tracked_from(&back_to_selected, Some(overridden), None, false)
         .map_err(|e| format!("recovery after an override was refused: {e}"))?;
     if let Some(cell) = recovered.cells.iter().find(|cell| cell.id == id) {
-        if cell.status == CellStatus::Green && cell.green_removal_reason.is_some() {
+        if cell.status == CellStatus::Selected && cell.selected_removal_reason.is_some() {
             return Err(format!(
-                "green cell {} still carries a green-removal reason",
+                "selected cell {} still carries a selected-removal reason",
                 display_id(&id)
             ));
         }
@@ -6613,13 +6655,13 @@ red/`measured-and-passed` count is **0**.",
         cells: vec![TrackedCell {
             id: id.clone(),
             enabled: false,
-            status: CellStatus::Red,
+            status: CellStatus::NotSelected,
             ci_disabled_reason: None,
             not_applicable_reason: None,
             last_tested: None,
             observations: Vec::new(),
             measurement: MeasurementState::NeverMeasured,
-            green_removal_reason: None,
+            selected_removal_reason: None,
         }],
     };
     // ⚠️ THE FIXTURE CARRIES ALL FOUR COORDINATES, NOT TWO. It used to hardcode
@@ -7367,13 +7409,13 @@ red/`measured-and-passed` count is **0**.",
             cells: vec![TrackedCell {
                 id: validate_id.clone(),
                 enabled: true,
-                status: CellStatus::Red,
+                status: CellStatus::NotSelected,
                 ci_disabled_reason: None,
                 not_applicable_reason: None,
                 last_tested: None,
                 observations: Vec::new(),
                 measurement: MeasurementState::NeverMeasured,
-                green_removal_reason: None,
+                selected_removal_reason: None,
             }],
         },
         uncheckable_summary,
@@ -7395,13 +7437,13 @@ red/`measured-and-passed` count is **0**.",
         cells: vec![TrackedCell {
             id: dbt_id.clone(),
             enabled: true,
-            status: CellStatus::Red,
+            status: CellStatus::NotSelected,
             ci_disabled_reason: None,
             not_applicable_reason: None,
             last_tested: None,
             observations: Vec::new(),
             measurement: MeasurementState::NeverMeasured,
-            green_removal_reason: None,
+            selected_removal_reason: None,
         }],
     };
     let mut dbt_row = pressure_at(
@@ -7482,13 +7524,13 @@ red/`measured-and-passed` count is **0**.",
         cells: vec![TrackedCell {
             id: validate_id.clone(),
             enabled: true,
-            status: CellStatus::Red,
+            status: CellStatus::NotSelected,
             ci_disabled_reason: None,
             not_applicable_reason: None,
             last_tested: None,
             observations: Vec::new(),
             measurement: MeasurementState::NeverMeasured,
-            green_removal_reason: None,
+            selected_removal_reason: None,
         }],
     };
     let uncheckable_rows = BTreeMap::from([(
@@ -7537,13 +7579,13 @@ red/`measured-and-passed` count is **0**.",
             cells: vec![TrackedCell {
                 id: validate_id.clone(),
                 enabled: true,
-                status: CellStatus::Red,
+                status: CellStatus::NotSelected,
                 ci_disabled_reason: None,
                 not_applicable_reason: None,
                 last_tested: None,
                 observations: Vec::new(),
                 measurement: MeasurementState::NeverMeasured,
-                green_removal_reason: None,
+                selected_removal_reason: None,
             }],
         },
         pressure_summary("sha-1", "tree-1", Vec::new()),
@@ -7563,7 +7605,7 @@ red/`measured-and-passed` count is **0**.",
         green: BTreeSet::new(),
     };
     if retained_import_cells(&red_import_fixture) != BTreeSet::from([validate_id.clone()]) {
-        return Err("an enabled red cell was excluded from retained import".into());
+        return Err("an enabled not-selected cell was excluded from retained import".into());
     }
 
     let rows = BTreeMap::from([(
@@ -8112,13 +8154,13 @@ red/`measured-and-passed` count is **0**.",
     let bare_cell = |id: &CellId| TrackedCell {
         id: id.clone(),
         enabled: true,
-        status: CellStatus::Red,
+        status: CellStatus::NotSelected,
         ci_disabled_reason: None,
         not_applicable_reason: None,
         last_tested: None,
         observations: Vec::new(),
         measurement: MeasurementState::NeverMeasured,
-        green_removal_reason: None,
+        selected_removal_reason: None,
     };
     let coordinate_less_row = |id: &CellId, outcome: &str| {
         let mut row = validate_row.clone();
@@ -9312,14 +9354,14 @@ red/`measured-and-passed` count is **0**.",
     // the most informative thing a pressure test can report: stressing a cell
     // harder than validate did and finding it red.
     let mut green_target = observed.clone();
-    green_target.cells[0].status = CellStatus::Green;
+    green_target.cells[0].status = CellStatus::Selected;
     let green_outcome =
         apply_pressure_summary(&mut green_target, &first, "sha-1", "tree-1", &depth_fixture)
-            .map_err(|e| format!("green-cell admission bracket failed: {e}"))?;
+            .map_err(|e| format!("selected-cell admission bracket failed: {e}"))?;
     if green_outcome.rows != 1 || !green_outcome.skipped.is_empty() {
-        return Err("a green cell was not admitted on equal terms with a red one".into());
+        return Err("a selected cell was not admitted on equal terms with a not-selected one".into());
     }
-    if green_target.cells[0].status != CellStatus::Green {
+    if green_target.cells[0].status != CellStatus::Selected {
         return Err("folding pressure evidence changed a cell's status".into());
     }
 
@@ -9386,7 +9428,7 @@ red/`measured-and-passed` count is **0**.",
             not_applicable_reason: None,
             last_tested: None,
             measurement: MeasurementState::NeverMeasured,
-            green_removal_reason: None,
+            selected_removal_reason: None,
             observations,
         };
         // ⚠️ DERIVE IT HERE RATHER THAN HARDCODING, or this helper builds rows
@@ -9412,17 +9454,17 @@ red/`measured-and-passed` count is **0**.",
     let with_evidence = TrackedCells {
         schema: SCHEMA,
         projection: None,
-        cells: vec![boundary_cell(vec![sample.clone()], CellStatus::Red)],
+        cells: vec![boundary_cell(vec![sample.clone()], CellStatus::NotSelected)],
     };
     let evidence_dropped = TrackedCells {
         schema: SCHEMA,
         projection: None,
-        cells: vec![boundary_cell(Vec::new(), CellStatus::Red)],
+        cells: vec![boundary_cell(Vec::new(), CellStatus::NotSelected)],
     };
     let ratchet_moved = TrackedCells {
         schema: SCHEMA,
         projection: None,
-        cells: vec![boundary_cell(vec![sample.clone()], CellStatus::Green)],
+        cells: vec![boundary_cell(vec![sample.clone()], CellStatus::Selected)],
     };
     if enforce_writer_boundary(&with_evidence, &evidence_dropped, Writer::Update).is_ok() {
         return Err("writer boundary allowed `update` to drop measured observations".into());
@@ -9584,7 +9626,7 @@ red/`measured-and-passed` count is **0**.",
             MeasurementState::Diverged,
         ),
     ] {
-        let cell = boundary_cell(observations, CellStatus::Red);
+        let cell = boundary_cell(observations, CellStatus::NotSelected);
         if cell.measurement != expected {
             return Err(format!(
                 "measurement derivation: expected `{}` for the {label} case, got `{}`",
@@ -9597,7 +9639,7 @@ red/`measured-and-passed` count is **0**.",
     // ⚠️ A CRASH IS NOT A DIVERGENCE. Reading a non-verdict as a product failure
     // is how an infrastructure hiccup becomes a false regression, so this is
     // asserted separately rather than left implicit in the table above.
-    let crashed = boundary_cell(vec![crashed_observation()], CellStatus::Red);
+    let crashed = boundary_cell(vec![crashed_observation()], CellStatus::NotSelected);
     if crashed.measurement == MeasurementState::Diverged
         || crashed.measurement == MeasurementState::DivergedUnlocated
     {
@@ -9605,7 +9647,7 @@ red/`measured-and-passed` count is **0**.",
     }
 
     // THE REFUSAL: a stored value that disagrees with the row's own evidence.
-    let mut lying = boundary_cell(vec![diverged_observation(true)], CellStatus::Red);
+    let mut lying = boundary_cell(vec![diverged_observation(true)], CellStatus::NotSelected);
     lying.measurement = MeasurementState::MeasuredAndPassed;
     let lying_cells = TrackedCells {
         schema: SCHEMA,
@@ -9629,7 +9671,7 @@ red/`measured-and-passed` count is **0**.",
         projection: None,
         cells: vec![boundary_cell(
             vec![diverged_observation(true)],
-            CellStatus::Red,
+            CellStatus::NotSelected,
         )],
     };
     if enforce_writer_boundary(&honest, &honest, Writer::Observations).is_err() {
@@ -9647,7 +9689,7 @@ red/`measured-and-passed` count is **0**.",
         schema: SCHEMA,
         projection: None,
         cells: vec![
-            boundary_cell(vec![sample.clone()], CellStatus::Red),
+            boundary_cell(vec![sample.clone()], CellStatus::NotSelected),
             TrackedCell {
                 id: CellId {
                     lane: "portable".into(),
@@ -9657,13 +9699,13 @@ red/`measured-and-passed` count is **0**.",
                     backend: "ptrace".into(),
                 },
                 enabled: true,
-                status: CellStatus::Red,
+                status: CellStatus::NotSelected,
                 ci_disabled_reason: None,
                 not_applicable_reason: None,
                 last_tested: None,
                 observations: Vec::new(),
                 measurement: MeasurementState::NeverMeasured,
-                green_removal_reason: None,
+                selected_removal_reason: None,
             },
         ],
     };
@@ -9689,7 +9731,7 @@ red/`measured-and-passed` count is **0**.",
     let with_located = TrackedCells {
         schema: SCHEMA,
         projection: None,
-        cells: vec![boundary_cell(vec![located.clone()], CellStatus::Red)],
+        cells: vec![boundary_cell(vec![located.clone()], CellStatus::NotSelected)],
     };
     // A series row must CREATE an observation; rewriting only observations
     // already present leaves the exact target cell reading `never-measured`.
@@ -9765,7 +9807,7 @@ red/`measured-and-passed` count is **0**.",
     let mut projected_from_series = TrackedCells {
         schema: SCHEMA,
         projection: None,
-        cells: vec![boundary_cell(Vec::new(), CellStatus::Green)],
+        cells: vec![boundary_cell(Vec::new(), CellStatus::Selected)],
     };
     let projection_rows = vec![
         series_row(
@@ -9845,7 +9887,7 @@ red/`measured-and-passed` count is **0**.",
     let mut preserve_newer = TrackedCells {
         schema: SCHEMA,
         projection: None,
-        cells: vec![boundary_cell(Vec::new(), CellStatus::Green)],
+        cells: vec![boundary_cell(Vec::new(), CellStatus::Selected)],
     };
     preserve_newer.cells[0].last_tested = Some(current_last_tested.clone());
     let mut older_row = series_row(
@@ -9883,7 +9925,7 @@ red/`measured-and-passed` count is **0**.",
     let mut preserve_import = TrackedCells {
         schema: SCHEMA,
         projection: None,
-        cells: vec![boundary_cell(vec![imported_observation], CellStatus::Green)],
+        cells: vec![boundary_cell(vec![imported_observation], CellStatus::Selected)],
     };
     let current_validate_row = series_row(
         "fixture/boundary/verify/ptrace",
@@ -9911,7 +9953,7 @@ red/`measured-and-passed` count is **0**.",
     let mut no_comparison = TrackedCells {
         schema: SCHEMA,
         projection: None,
-        cells: vec![boundary_cell(Vec::new(), CellStatus::Green)],
+        cells: vec![boundary_cell(Vec::new(), CellStatus::Selected)],
     };
     let no_result = series_row(
         "fixture/boundary/verify/ptrace",
@@ -9938,7 +9980,7 @@ red/`measured-and-passed` count is **0**.",
     let mut exact_mapping = TrackedCells {
         schema: SCHEMA,
         projection: None,
-        cells: vec![boundary_cell(Vec::new(), CellStatus::Green)],
+        cells: vec![boundary_cell(Vec::new(), CellStatus::Selected)],
     };
     let mut legacy_schema = series_row(
         "fixture/boundary/verify/ptrace",
@@ -10030,7 +10072,7 @@ red/`measured-and-passed` count is **0**.",
     let coordinates_blanked = TrackedCells {
         schema: SCHEMA,
         projection: None,
-        cells: vec![boundary_cell(vec![sample.clone()], CellStatus::Red)],
+        cells: vec![boundary_cell(vec![sample.clone()], CellStatus::NotSelected)],
     };
     match enforce_projection_preserves_evidence(&with_located, &coordinates_blanked, 0) {
         Ok(()) => {
@@ -10091,7 +10133,7 @@ red/`measured-and-passed` count is **0**.",
             rows_read: 7,
             pre_series_corpus: false,
         }),
-        cells: vec![boundary_cell(vec![sample.clone()], CellStatus::Red)],
+        cells: vec![boundary_cell(vec![sample.clone()], CellStatus::NotSelected)],
     };
     let projection_dropped = TrackedCells {
         projection: None,
@@ -10319,7 +10361,7 @@ red/`measured-and-passed` count is **0**.",
     }
 
     println!(
-        "compatibility scorecard self-test: retained-comparison FRESH/DRIFTED/WRONG/UNCHECKABLE, provenance, distinct-evidence, result, selected-chaos, status-measurement-display, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, recovered-no-result, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, empty-result command, source-identity, writer-boundary, projection, path-independence, infrastructure-refusal, and divergence-without-a-comparison brackets pass"
+        "compatibility scorecard self-test: retained-comparison FRESH/DRIFTED/WRONG/UNCHECKABLE, provenance, distinct-evidence, result, selected-chaos, status-measurement-display, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, recovered-no-result, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, selected-admission, validate-observation, empty-result command, source-identity, writer-boundary, projection, path-independence, infrastructure-refusal, and divergence-without-a-comparison brackets pass"
     );
     Ok(())
 }

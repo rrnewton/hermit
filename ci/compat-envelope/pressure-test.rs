@@ -304,9 +304,17 @@ struct TrackedCell {
     enabled: bool,
     status: String,
     /// Why a `not-applicable` cell is not applicable, verbatim from the
-    /// manifest. Absent for `green` and `red`.
+    /// manifest. Absent for `selected` and `not-selected`.
     #[serde(default)]
     not_applicable_reason: Option<String>,
+}
+
+fn is_selected_status(status: &str) -> bool {
+    matches!(status, "selected" | "green")
+}
+
+fn is_not_selected_status(status: &str) -> bool {
+    matches!(status, "not-selected" | "red")
 }
 
 struct PressureCells {
@@ -2134,7 +2142,10 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 && selection.mode.is_none()
                 && !matches!(cell.id.mode.as_str(), "verify" | "replay" | "chaos"));
         match cell.status.as_str() {
-            "red" if selected && !selection.selects_green_population() => {
+            status if is_not_selected_status(status)
+                && selected
+                && !selection.selects_green_population() =>
+            {
                 let budget = budgets
                     .get(&(
                         cell.id.test.clone(),
@@ -2151,15 +2162,20 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                     selected_cells.push(cell);
                 } else if selection.is_exact() {
                     return Err(format!(
-                        "{}/{}/{} is red but unavailable: its manifest declares no chaos seeds, so there is no guest command to run",
+                        "{}/{}/{} is not-selected but unavailable: its manifest declares no chaos seeds, so there is no guest command to run",
                         cell.id.test, cell.id.mode, cell.id.backend
                     ));
                 } else {
                     unavailable.push(cell);
                 }
             }
-            "red" => {}
-            "green" if selected && selection.selects_green_population() && cell.enabled => {
+            status if is_not_selected_status(status) => {}
+            status
+                if is_selected_status(status)
+                    && selected
+                    && selection.selects_green_population()
+                    && cell.enabled =>
+            {
                 let budget = budgets
                     .get(&(
                         cell.id.test.clone(),
@@ -2174,13 +2190,13 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                     })?;
                 if budget.attempts.is_none() {
                     return Err(format!(
-                        "{}/{}/{} is green but its manifest has no executable attempt recipe",
+                        "{}/{}/{} is selected but its manifest has no executable attempt recipe",
                         cell.id.test, cell.id.mode, cell.id.backend
                     ));
                 }
                 selected_cells.push(cell);
             }
-            "green" => {}
+            status if is_selected_status(status) => {}
             // NOT APPLICABLE IS NOT A CANDIDATE, AND SAYING SO IS THE POINT. The
             // backend is not enabled for this mode, so there is nothing to
             // pressure-test: repeating a cell that was never asked to run
@@ -5890,6 +5906,15 @@ fn self_test(root: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot read tracked cells for repetition bracket: {e}"))?;
     let tracked: TrackedCells = serde_json::from_str(&tracked_text)
         .map_err(|e| format!("cannot parse tracked cells for repetition bracket: {e}"))?;
+    if !is_selected_status("selected")
+        || !is_selected_status("green")
+        || !is_not_selected_status("not-selected")
+        || !is_not_selected_status("red")
+        || is_selected_status("not-selected")
+        || is_not_selected_status("selected")
+    {
+        return Err("tracked status compatibility changed selection membership".into());
+    }
     let expected_red_ids: BTreeSet<_> = unfiltered
         .selected
         .iter()
@@ -5905,7 +5930,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         .iter()
         .find(|tracked| {
             tracked.enabled
-                && tracked.status == "green"
+                && is_selected_status(&tracked.status)
                 && tracked.id.mode == "verify"
                 && tracked.id.backend == "ptrace"
         })
@@ -6246,7 +6271,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     let expected_green_ids: BTreeSet<_> = tracked
         .cells
         .iter()
-        .filter(|tracked| tracked.enabled && tracked.status == "green")
+        .filter(|tracked| tracked.enabled && is_selected_status(&tracked.status))
         .map(|tracked| tracked.id.clone())
         .collect();
     let selected_green_batch = pressure_cells(root, &green_batch_selection)?;
