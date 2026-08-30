@@ -18,13 +18,6 @@ mod rust_script_prelude;
 #[path = "../../scripts/lib/safe_ci_scope.rs"]
 mod safe_ci_scope;
 
-// This standalone script needs only the shared environmental classifier. The
-// rest of validate_runtime stays compiled here so this cannot drift into a
-// copied second implementation, but its validate-driver-only API is unused.
-#[allow(dead_code)]
-#[path = "../../scripts/lib/validate_runtime.rs"]
-mod validate_runtime;
-
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::env;
@@ -63,6 +56,9 @@ use hermit_manifest_plan::canonical_verdict::RuntimeStats;
 use hermit_manifest_plan::canonical_verdict::VerificationReport;
 use hermit_manifest_plan::canonical_verdict::VerificationRuntime;
 use hermit_manifest_plan::canonical_verdict::Verdict;
+use hermit_manifest_plan::environmental_block::EnvBlockClass;
+use hermit_manifest_plan::environmental_block::EnvBlockObservation;
+use hermit_manifest_plan::environmental_block::environmental_block_observation;
 use hermit_manifest_plan::host_capability::CapabilityVerdict;
 use hermit_manifest_plan::host_capability::HostCapability;
 use hermit_manifest_plan::runner::AttemptResult;
@@ -76,8 +72,6 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use serde_json::json;
-use validate_runtime::EnvBlockObservation;
-use validate_runtime::environmental_block_observation;
 
 const TRACKED_CELLS: &str = "ci/compat-envelope/cells.json";
 const PORTABLE_DAG: &str = "ci/dag/portable.json";
@@ -3743,7 +3737,7 @@ fn classify_result(
         // operation. Keep it out of every product-failure bucket. Only the
         // BPFJailer class is a sandbox denial; the other shared environmental
         // classes stay infrastructure errors rather than being mislabeled.
-        if class == "bpfjailer-banner" {
+        if class == EnvBlockClass::BpfjailerBanner {
             "sandbox-denied"
         } else {
             "infrastructure-error"
@@ -3791,6 +3785,41 @@ fn classify_result(
     } else {
         "infrastructure-error"
     }
+}
+
+fn reconcile_recorded_result(
+    recorded_result: Option<ObservedResult>,
+    failure_class: Option<FailureClass>,
+    derived_result: &'static str,
+) -> Result<&'static str, String> {
+    let Some(recorded_result) = recorded_result else {
+        return Ok(derived_result);
+    };
+    if failure_class != recorded_result.failure_class() {
+        return Err(format!(
+            "framework result {} carries failure_class {:?}, expected {:?}",
+            recorded_result.as_str(),
+            failure_class,
+            recorded_result.failure_class()
+        ));
+    }
+    if matches!(
+        recorded_result,
+        ObservedResult::SandboxDenied | ObservedResult::InfrastructureError
+    ) {
+        // The framework owns the exact captured attempt output and serialized
+        // this non-product result beside the checkout SHA. The outer retained
+        // runner log remains corroborating evidence, not a second authority
+        // that reconstructs the result from human-readable output.
+        return Ok(recorded_result.as_str());
+    }
+    if recorded_result.as_str() != derived_result {
+        return Err(format!(
+            "framework result {} disagrees with pressure consistency check {derived_result}",
+            recorded_result.as_str()
+        ));
+    }
+    Ok(recorded_result.as_str())
 }
 
 fn repeated_result_description(
@@ -4482,22 +4511,9 @@ fn summarize(
             // authority that reconstructs a current result after execution.
             let mut result = derived_result;
             if row_valid && evidence_errors.is_empty() {
-                if let Some(recorded_result) = recorded_result {
-                    if recorded_result.as_str() != derived_result {
-                        evidence_errors.push(format!(
-                            "framework result {} disagrees with pressure consistency check {derived_result}",
-                            recorded_result.as_str()
-                        ));
-                    } else if failure_class != recorded_result.failure_class() {
-                        evidence_errors.push(format!(
-                            "framework result {} carries failure_class {:?}, expected {:?}",
-                            recorded_result.as_str(),
-                            failure_class,
-                            recorded_result.failure_class()
-                        ));
-                    } else {
-                        result = recorded_result.as_str();
-                    }
+                match reconcile_recorded_result(recorded_result, failure_class, derived_result) {
+                    Ok(recorded) => result = recorded,
+                    Err(error) => evidence_errors.push(error),
                 }
             }
             if !evidence_errors.is_empty() {
@@ -5133,7 +5149,7 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
             !observations.get(*tag).is_some_and(|row| {
                 row.output_log_available
                     && row.environmental_block_observation
-                        == EnvBlockObservation::Denied("bpfjailer-banner")
+                        == EnvBlockObservation::Denied(EnvBlockClass::BpfjailerBanner)
                     && classify_result(
                         *row,
                         Some(1),
@@ -5264,7 +5280,7 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
         .copied()
         .ok_or("captured BPFJailer outcome was not retained")?;
     if captured_runner.environmental_block_observation
-        != EnvBlockObservation::Denied("bpfjailer-banner")
+        != EnvBlockObservation::Denied(EnvBlockClass::BpfjailerBanner)
         || classify_result(
             captured_runner,
             Some(1),
@@ -7073,12 +7089,14 @@ fn self_test(root: &Path) -> Result<(), String> {
     };
     let runner_sandbox_denied = RunnerEvidence {
         ok: false,
-        environmental_block_observation: EnvBlockObservation::Denied("bpfjailer-banner"),
+        environmental_block_observation: EnvBlockObservation::Denied(
+            EnvBlockClass::BpfjailerBanner,
+        ),
         ..runner_ok
     };
     let runner_proxy_denied = RunnerEvidence {
         ok: false,
-        environmental_block_observation: EnvBlockObservation::Denied("proxy-egress"),
+        environmental_block_observation: EnvBlockObservation::Denied(EnvBlockClass::ProxyEgress),
         ..runner_ok
     };
     let first_repetition_tag = format!("cell.{}", cell_run_slug(&green_id, Some(1)));
@@ -7484,6 +7502,116 @@ fn self_test(root: &Path) -> Result<(), String> {
         Some(INCOMPLETE_ATTEMPT_STATUS),
     ) {
         return Err("matching retained result-row identity was refused".into());
+    }
+    let current_sandbox_runner_results = scratch.join("current-sandbox-runner");
+    let current_sandbox_output_dir =
+        current_sandbox_runner_results.join(RUNNER_STEP_OUTPUT_DIR);
+    fs::create_dir_all(&current_sandbox_output_dir)
+        .map_err(|e| format!("cannot create current sandbox runner fixture: {e}"))?;
+    let current_sandbox_tag = format!("cell.{sample_slug}");
+    let current_sandbox_output_log = PathBuf::from(RUNNER_STEP_OUTPUT_DIR)
+        .join(format!("{}.log", sanitize_step_tag(&current_sandbox_tag)));
+    fs::write(
+        current_sandbox_runner_results.join(&current_sandbox_output_log),
+        include_str!("testdata/bpfjailer-pytest-denial.log"),
+    )
+    .map_err(|e| format!("cannot write current sandbox runner output: {e}"))?;
+    fs::write(
+        current_sandbox_runner_results.join("runner-outcomes.json"),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&json!({
+                "schema": 2,
+                "scheduler_passes": 1,
+                "outcomes": [{
+                    "tag": current_sandbox_tag,
+                    "ok": false,
+                    "duration_s": 1.0,
+                    "returncode": 1,
+                    "reason": "failed",
+                    "aborted": false,
+                    "output_log": current_sandbox_output_log,
+                }],
+            }))
+            .map_err(|e| format!("cannot encode current sandbox runner fixture: {e}"))?
+        ),
+    )
+    .map_err(|e| format!("cannot write current sandbox runner fixture: {e}"))?;
+    let current_sandbox_runner = load_retained_runner_evidence(&current_sandbox_runner_results)?
+        .and_then(|evidence| evidence.get(&current_sandbox_tag).copied())
+        .ok_or("current sandbox runner fixture was not retained")?;
+    let current_sandbox_results = scratch.join("current-sandbox-results.jsonl");
+    let mut current_sandbox_row = result_row.clone();
+    current_sandbox_row.outcome = "ERROR".into();
+    current_sandbox_row.result = Some(ObservedResult::SandboxDenied);
+    current_sandbox_row.failure_class = Some(FailureClass::UnderstoodInfrastructureFailure);
+    current_sandbox_row.error_kind = Some("incomplete-verification-evidence".into());
+    current_sandbox_row.attempts[0].outcome = "ERROR".into();
+    current_sandbox_row.attempts[0].status = Some(1);
+    current_sandbox_row.attempts[0].stderr =
+        include_str!("testdata/bpfjailer-pytest-denial.log").into();
+    fs::write(
+        &current_sandbox_results,
+        format!(
+            "{}\n",
+            serde_json::to_string(&current_sandbox_row)
+                .map_err(|e| format!("cannot encode current sandbox result fixture: {e}"))?
+        ),
+    )
+    .map_err(|e| format!("cannot write current sandbox result fixture: {e}"))?;
+    let current_sandbox_rows = read_result_rows(&current_sandbox_results)?;
+    let current_sandbox_row = current_sandbox_rows
+        .first()
+        .ok_or("current sandbox result fixture was not retained")?;
+    if !result_row_matches_cell(
+        current_sandbox_row,
+        &sample_slug,
+        &sample_metadata,
+        &sample_a,
+        true,
+        Some(1),
+    ) {
+        return Err(
+            "current-schema sandbox result was not bound to the exact run SHA and cell identity"
+                .into(),
+        );
+    }
+    let retained_bpf_result = classify_result(
+        current_sandbox_runner,
+        Some(1),
+        &current_sandbox_row.outcome,
+        true,
+        current_sandbox_row.reason.as_deref(),
+        &current_sandbox_row.mode,
+        Some("no_result"),
+        false,
+        false,
+    );
+    if retained_bpf_result != "sandbox-denied"
+        || reconcile_recorded_result(
+            current_sandbox_row.result,
+            current_sandbox_row.failure_class,
+            retained_bpf_result,
+        )? != "sandbox-denied"
+    {
+        return Err(
+            "current-schema producer result plus retained BPF output did not require sandbox-denied"
+                .into(),
+        );
+    }
+    let mut wrongly_typed_product = current_sandbox_row.clone();
+    wrongly_typed_product.result = Some(ObservedResult::CrashError);
+    wrongly_typed_product.failure_class = Some(FailureClass::ProductFailure);
+    let disagreement = reconcile_recorded_result(
+        wrongly_typed_product.result,
+        wrongly_typed_product.failure_class,
+        retained_bpf_result,
+    )
+    .expect_err("a product result that disagrees with retained BPF evidence was accepted");
+    if !disagreement.contains("crash-error") || !disagreement.contains("sandbox-denied") {
+        return Err(format!(
+            "current-schema sandbox disagreement did not fail by name: {disagreement}"
+        ));
     }
     let appended_results = scratch.join("appended-results.jsonl");
     let mut first_row = result_row.clone();
