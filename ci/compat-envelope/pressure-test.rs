@@ -56,6 +56,7 @@ use hermit_manifest_plan::host_capability::HostCapability;
 use hermit_manifest_plan::runner::AttemptResult;
 use hermit_manifest_plan::runner::CELL_RESULT_SCHEMA;
 use hermit_manifest_plan::runner::CellResult;
+use hermit_manifest_plan::runner::cell_result_and_attempts_after_retries;
 use hermit_manifest_plan::runner::cell_result_after_retries;
 use hermit_manifest_plan::runner::E2E_RUN_INDEX_ENV;
 use serde::Deserialize;
@@ -3747,11 +3748,12 @@ fn classify_result(
 fn repeated_result_description(
     passes: usize,
     infrastructure_errors: usize,
+    retried: usize,
     total: usize,
 ) -> &'static str {
     if total == 0 || infrastructure_errors > 0 {
         "incomplete"
-    } else if passes == total {
+    } else if passes == total && retried == 0 {
         "passed every repetition"
     } else if passes == 0 {
         "failed every repetition"
@@ -3763,14 +3765,15 @@ fn repeated_result_description(
 fn repeated_batch_result_description(
     passes: usize,
     infrastructure_errors: usize,
+    retried: usize,
     total: usize,
 ) -> &'static str {
     if total == 0 || infrastructure_errors > 0 {
         "incomplete"
-    } else if passes == total {
+    } else if passes == total && retried == 0 {
         "passed every repeated check"
     } else {
-        "one or more repeated checks failed"
+        "one or more repeated checks failed or required a retry"
     }
 }
 
@@ -3778,13 +3781,71 @@ fn top_level_repeated_result_description(
     metadata: &RunMetadata,
     passes: usize,
     infrastructure_errors: usize,
+    retried: usize,
     total: usize,
 ) -> &'static str {
     if metadata.is_exact() {
-        repeated_result_description(passes, infrastructure_errors, total)
+        repeated_result_description(passes, infrastructure_errors, retried, total)
     } else {
-        repeated_batch_result_description(passes, infrastructure_errors, total)
+        repeated_batch_result_description(passes, infrastructure_errors, retried, total)
     }
+}
+
+fn retained_attempt_count(
+    result_rows: &[CellResult],
+    slug: &str,
+    metadata: &RunMetadata,
+    cell: &CellId,
+    expected_required: bool,
+    runner: RunnerEvidence,
+    harness_status: Option<i32>,
+) -> Result<usize, String> {
+    if result_rows.iter().all(|row| {
+        result_row_identity_and_invocation_match(row, slug, metadata, cell, expected_required)
+    }) {
+        if let Some(row) = result_rows.last() {
+            return usize::try_from(row.attempt).map_err(|_| {
+                format!("terminal result attempt {} does not fit usize", row.attempt)
+            });
+        }
+    }
+    Ok(usize::from(
+        runner_observed_terminal_attempt(runner, harness_status)
+            || is_proven_timeout_attempt(runner, harness_status)
+            || is_proven_oom_attempt(runner, harness_status),
+    ))
+}
+
+fn repetition_passed(terminal_result: &str, result_rows: &[CellResult]) -> bool {
+    terminal_result == "pass"
+        && !result_rows.is_empty()
+        && result_rows.iter().all(|row| row.outcome == "PASS")
+}
+
+fn repeated_run_has_unacceptable_product_result(
+    repetitions: Option<usize>,
+    repeated_red: bool,
+    passes: usize,
+    retried: usize,
+    total: usize,
+) -> bool {
+    repetitions.is_some() && !repeated_red && (total == 0 || passes != total || retried > 0)
+}
+
+fn repeated_cell_summary(
+    cell: &CellId,
+    passes: usize,
+    retried: usize,
+    total: usize,
+    result: &str,
+) -> JsonValue {
+    json!({
+        "cell": cell,
+        "passes": passes,
+        "retried_repetitions": retried,
+        "total": total,
+        "result": result,
+    })
 }
 
 fn summary_heading(metadata: &RunMetadata) -> &'static str {
@@ -3803,10 +3864,16 @@ fn repeated_summary_line(
     metadata: &RunMetadata,
     passes: usize,
     infrastructure_errors: usize,
+    retried: usize,
     total: usize,
 ) -> String {
-    let result =
-        top_level_repeated_result_description(metadata, passes, infrastructure_errors, total);
+    let result = top_level_repeated_result_description(
+        metadata,
+        passes,
+        infrastructure_errors,
+        retried,
+        total,
+    );
     if metadata.is_exact() {
         if result == "incomplete" {
             format!(
@@ -4124,7 +4191,12 @@ fn summarize(
     }
 
     let mut by_backend: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
-    let mut by_cell: BTreeMap<CellId, BTreeMap<String, usize>> = BTreeMap::new();
+    let mut repeated_passes = BTreeMap::<CellId, usize>::new();
+    let mut repeated_infrastructure_errors = BTreeMap::<CellId, usize>::new();
+    let mut repeated_totals = BTreeMap::<CellId, usize>::new();
+    let mut retried_by_cell = BTreeMap::<CellId, usize>::new();
+    let mut retried_repetitions = 0usize;
+    let mut attempted = 0usize;
     let mut passing = Vec::new();
     let mut rows = Vec::new();
     for cell in &metadata.cells {
@@ -4218,7 +4290,7 @@ fn summarize(
                             .iter()
                             .map(|row| result_artifact_dir(results, row))
                             .collect::<Result<Vec<_>, _>>();
-                        let row = cell_result_after_retries(&result_rows)?;
+                        let (row, _) = cell_result_and_attempts_after_retries(&result_rows)?;
                         let row_matches = result_row_matches_cell(
                             row,
                             &evidence_run_id,
@@ -4360,16 +4432,40 @@ fn summarize(
                 verification_logs.len() == 2,
                 evidence_errors.is_empty(),
             );
+            let retained_attempts = retained_attempt_count(
+                &result_rows_for_history,
+                &evidence_run_id,
+                &metadata,
+                cell,
+                expected.get(cell).copied().unwrap_or(false),
+                runner,
+                harness_status,
+            )?;
+            attempted = attempted
+                .checked_add(retained_attempts)
+                .ok_or("pressure attempt count overflowed usize")?;
             *by_backend
                 .entry(cell.backend.clone())
                 .or_default()
                 .entry(result.to_string())
                 .or_default() += 1;
-            *by_cell
-                .entry(cell.clone())
-                .or_default()
-                .entry(result.to_string())
-                .or_default() += 1;
+            if metadata.repetitions.is_some() {
+                *repeated_totals.entry(cell.clone()).or_default() += 1;
+                if repetition_passed(result, &result_rows_for_history) {
+                    *repeated_passes.entry(cell.clone()).or_default() += 1;
+                }
+                if result == "infrastructure-error" {
+                    *repeated_infrastructure_errors
+                        .entry(cell.clone())
+                        .or_default() += 1;
+                }
+                if retained_attempts > 1 {
+                    retried_repetitions = retried_repetitions
+                        .checked_add(1)
+                        .ok_or("pressure retried-repetition count overflowed usize")?;
+                    *retried_by_cell.entry(cell.clone()).or_default() += 1;
+                }
+            }
             if result == "pass" && metadata.repetitions.is_none() {
                 passing.push(display_id(cell));
             }
@@ -4472,6 +4568,10 @@ fn summarize(
     println!("{}", summary_heading(&metadata));
     println!();
     println!(
+        "Final-result denominator: one framework-selected result per selected cell repetition; `attempted` counts every retained harness attempt."
+    );
+    println!();
+    println!(
         "Metric: current pre-basic-sanity manifest contract. Verify uses the legacy stripped comparison unless that cell's verification report says bitwise_parity=true; this is not the Milestone 2 strict-default metric."
     );
     println!();
@@ -4535,43 +4635,64 @@ fn summarize(
         println!();
     }
     let mut repeated_cells = Vec::new();
+    let repeated_pass_count: usize = repeated_passes.values().sum();
+    let repeated_total_count: usize = repeated_totals.values().sum();
     let repeated_result = if metadata.repetitions.is_some() && metadata.is_exact() {
-        let result =
-            top_level_repeated_result_description(&metadata, totals[0], totals[6], totals[7]);
+        let cell = &metadata.cells[0];
+        let passes = repeated_passes.get(cell).copied().unwrap_or(0);
+        let infrastructure_errors = repeated_infrastructure_errors
+            .get(cell)
+            .copied()
+            .unwrap_or(0);
+        let retried = retried_by_cell.get(cell).copied().unwrap_or(0);
+        let total = repeated_totals.get(cell).copied().unwrap_or(0);
+        let result = top_level_repeated_result_description(
+            &metadata,
+            passes,
+            infrastructure_errors,
+            retried,
+            total,
+        );
         println!(
             "{}",
-            repeated_summary_line(&metadata, totals[0], totals[6], totals[7])
+            repeated_summary_line(&metadata, passes, infrastructure_errors, retried, total)
         );
-        repeated_cells.push(json!({
-            "cell": &metadata.cells[0],
-            "passes": totals[0],
-            "total": totals[7],
-            "result": result,
-        }));
+        repeated_cells.push(repeated_cell_summary(cell, passes, retried, total, result));
         Some(result)
     } else if metadata.repetitions.is_some() {
         println!("| Cell | Passed repetitions | Result |");
         println!("| --- | ---: | --- |");
         for cell in &metadata.cells {
-            let counts = by_cell.get(cell).cloned().unwrap_or_default();
-            let passes = counts.get("pass").copied().unwrap_or(0);
-            let infrastructure_errors = counts.get("infrastructure-error").copied().unwrap_or(0);
-            let total: usize = counts.values().sum();
-            let result = repeated_result_description(passes, infrastructure_errors, total);
+            let passes = repeated_passes.get(cell).copied().unwrap_or(0);
+            let infrastructure_errors = repeated_infrastructure_errors
+                .get(cell)
+                .copied()
+                .unwrap_or(0);
+            let retried = retried_by_cell.get(cell).copied().unwrap_or(0);
+            let total = repeated_totals.get(cell).copied().unwrap_or(0);
+            let result =
+                repeated_result_description(passes, infrastructure_errors, retried, total);
             println!("| `{}` | {passes}/{total} | {result} |", display_id(cell));
-            repeated_cells.push(json!({
-                "cell": cell,
-                "passes": passes,
-                "total": total,
-                "result": result,
-            }));
+            repeated_cells.push(repeated_cell_summary(cell, passes, retried, total, result));
         }
         println!();
-        let result =
-            top_level_repeated_result_description(&metadata, totals[0], totals[6], totals[7]);
+        let infrastructure_errors: usize = repeated_infrastructure_errors.values().sum();
+        let result = top_level_repeated_result_description(
+            &metadata,
+            repeated_pass_count,
+            infrastructure_errors,
+            retried_repetitions,
+            repeated_total_count,
+        );
         println!(
             "{}",
-            repeated_summary_line(&metadata, totals[0], totals[6], totals[7])
+            repeated_summary_line(
+                &metadata,
+                repeated_pass_count,
+                infrastructure_errors,
+                retried_repetitions,
+                repeated_total_count,
+            )
         );
         Some(result)
     } else {
@@ -4603,9 +4724,10 @@ fn summarize(
         "jobs": metadata.jobs,
         "eligible_cells": (metadata.eligible_cells != 0).then_some(metadata.eligible_cells),
         "selected_cells": metadata.cells.len(),
+        "retried_repetitions": retried_repetitions,
         "repeated_result": repeated_result,
         "repeated_cells": repeated_cells,
-        "attempted": rows.len(),
+        "attempted": attempted,
         "pass_candidates": passing,
         "rows": rows,
     });
@@ -4621,10 +4743,17 @@ fn summarize(
             totals[6]
         ));
     }
-    if metadata.repetitions.is_some() && totals[0] != totals[7] {
+    let repeated_red = metadata.repetitions.is_some() && !metadata.green;
+    if repeated_run_has_unacceptable_product_result(
+        metadata.repetitions,
+        repeated_red,
+        repeated_pass_count,
+        retried_repetitions,
+        repeated_total_count,
+    ) {
         return Err(format!(
-            "only {}/{} repeated checks passed; the retained summary classifies every non-pass",
-            totals[0], totals[7]
+            "only {}/{} repeated green-cell checks passed cleanly; {} repetition(s) required a retry, and the retained summary classifies every non-pass",
+            repeated_pass_count, repeated_total_count, retried_repetitions
         ));
     }
     Ok(())
@@ -6288,8 +6417,8 @@ fn self_test(root: &Path) -> Result<(), String> {
     )?;
     if !one_cell_mode_metadata.green
         || one_cell_mode_metadata.cells.len() != 1
-        || top_level_repeated_result_description(&one_cell_mode_metadata, 1, 0, 2)
-            != "one or more repeated checks failed"
+        || top_level_repeated_result_description(&one_cell_mode_metadata, 1, 0, 0, 2)
+            != "one or more repeated checks failed or required a retry"
     {
         return Err(
             "a one-cell mode-filtered green batch was described as an exact flaky cell".into(),
@@ -6312,8 +6441,8 @@ fn self_test(root: &Path) -> Result<(), String> {
     )?;
     if !one_cell_sample_metadata.green
         || one_cell_sample_metadata.cells.len() != 1
-        || top_level_repeated_result_description(&one_cell_sample_metadata, 1, 0, 2)
-            != "one or more repeated checks failed"
+        || top_level_repeated_result_description(&one_cell_sample_metadata, 1, 0, 0, 2)
+            != "one or more repeated checks failed or required a retry"
     {
         return Err("a one-cell sampled green batch was described as an exact flaky cell".into());
     }
@@ -6340,28 +6469,28 @@ fn self_test(root: &Path) -> Result<(), String> {
     red_batch_result_metadata.green = false;
     if !repeated_metadata.is_exact()
         || green_batch_metadata.is_exact()
-        || top_level_repeated_result_description(&repeated_metadata, 1, 0, 2) != "flaky"
-        || top_level_repeated_result_description(&red_batch_result_metadata, 1, 0, 2)
-            != "one or more repeated checks failed"
+        || top_level_repeated_result_description(&repeated_metadata, 1, 0, 0, 2) != "flaky"
+        || top_level_repeated_result_description(&red_batch_result_metadata, 1, 0, 0, 2)
+            != "one or more repeated checks failed or required a retry"
     {
         return Err(
             "repeated exact and batch results were classified by color instead of shape".into(),
         );
     }
     let exact_red_heading = summary_heading(&repeated_metadata);
-    let exact_red_result = repeated_summary_line(&repeated_metadata, 1, 0, 2);
+    let exact_red_result = repeated_summary_line(&repeated_metadata, 1, 0, 0, 2);
     let red_batch_heading = summary_heading(&red_batch_result_metadata);
-    let red_batch_result = repeated_summary_line(&red_batch_result_metadata, 1, 0, 2);
+    let red_batch_result = repeated_summary_line(&red_batch_result_metadata, 1, 0, 0, 2);
     let green_batch_heading = summary_heading(&green_batch_metadata);
-    let green_batch_result = repeated_summary_line(&green_batch_metadata, 1, 0, 2);
+    let green_batch_result = repeated_summary_line(&green_batch_metadata, 1, 0, 0, 2);
     if exact_red_heading != "# Repeated red-cell results"
         || exact_red_result != "Repeated result: 1/2 passed; flaky."
         || red_batch_heading != "# Repeated red-cell results"
         || red_batch_result
-            != "Repeated red-cell batch: 1/2 passed; one or more repeated checks failed."
+            != "Repeated red-cell batch: 1/2 passed; one or more repeated checks failed or required a retry."
         || green_batch_heading != "# Repeated green-cell results"
         || green_batch_result
-            != "Repeated green-cell batch: 1/2 passed; one or more repeated checks failed."
+            != "Repeated green-cell batch: 1/2 passed; one or more repeated checks failed or required a retry."
     {
         return Err(format!(
             "repeated summary rendering mislabeled an exact red, red batch, or green batch: \
@@ -6904,13 +7033,22 @@ fn self_test(root: &Path) -> Result<(), String> {
             "failure bucketing changed unexpectedly: {classifications:?}"
         ));
     }
-    if repeated_result_description(2, 0, 2) != "passed every repetition"
-        || repeated_result_description(1, 0, 2) != "flaky"
-        || repeated_result_description(0, 0, 2) != "failed every repetition"
-        || repeated_result_description(1, 1, 2) != "incomplete"
-        || repeated_result_description(0, 2, 2) != "incomplete"
-        || repeated_batch_result_description(1, 0, 2) != "one or more repeated checks failed"
-        || repeated_batch_result_description(1, 1, 2) != "incomplete"
+    if repeated_result_description(2, 0, 0, 2) != "passed every repetition"
+        || repeated_result_description(2, 0, 1, 2) != "flaky"
+        || repeated_result_description(1, 0, 0, 2) != "flaky"
+        || repeated_result_description(0, 0, 0, 2) != "failed every repetition"
+        || repeated_result_description(1, 1, 0, 2) != "incomplete"
+        || repeated_result_description(0, 2, 0, 2) != "incomplete"
+        || repeated_batch_result_description(2, 0, 1, 2)
+            != "one or more repeated checks failed or required a retry"
+        || repeated_batch_result_description(1, 0, 0, 2)
+            != "one or more repeated checks failed or required a retry"
+        || repeated_batch_result_description(1, 1, 0, 2) != "incomplete"
+        || repeated_run_has_unacceptable_product_result(Some(2), true, 1, 0, 2)
+        || repeated_run_has_unacceptable_product_result(Some(2), true, 2, 1, 2)
+        || !repeated_run_has_unacceptable_product_result(Some(2), false, 1, 0, 2)
+        || !repeated_run_has_unacceptable_product_result(Some(2), false, 2, 1, 2)
+        || repeated_run_has_unacceptable_product_result(None, false, 0, 0, 1)
     {
         return Err(
             "repeated result confused missing evidence with trustworthy pass/failure outcomes"
@@ -6956,6 +7094,48 @@ fn self_test(root: &Path) -> Result<(), String> {
         eligible_cells: 1,
         cells: vec![sample_a.clone()],
     };
+    if retained_attempt_count(
+        &[],
+        &sample_slug,
+        &sample_metadata,
+        &sample_a,
+        true,
+        runner_ok,
+        Some(0),
+    )? != 1
+        || retained_attempt_count(
+            &[],
+            &sample_slug,
+            &sample_metadata,
+            &sample_a,
+            true,
+            runner_timeout,
+            Some(INCOMPLETE_ATTEMPT_STATUS),
+        )? != 1
+        || retained_attempt_count(
+            &[],
+            &sample_slug,
+            &sample_metadata,
+            &sample_a,
+            true,
+            runner_ok,
+            Some(PREPARATION_FAILED_STATUS),
+        )? != 0
+        || retained_attempt_count(
+            &[],
+            &sample_slug,
+            &sample_metadata,
+            &sample_a,
+            true,
+            runner_ok,
+            None,
+        )? != 0
+    {
+        return Err(
+            "attempt counting did not distinguish a begun harness attempt from a cell that never ran"
+                .into(),
+        );
+    }
     let sample_artifact_dir = scratch
         .join("runs")
         .join(&sample_slug)
@@ -7089,6 +7269,53 @@ fn self_test(root: &Path) -> Result<(), String> {
             "two appended result observations were not retained independently: {appended:?}"
         ));
     }
+    if retained_attempt_count(
+        &appended,
+        &sample_slug,
+        &sample_metadata,
+        &sample_a,
+        true,
+        runner_ok,
+        Some(0),
+    )? != 2
+    {
+        return Err("the terminal attempt ordinal did not count both executions".into());
+    }
+    let unlocated_retry = [result_row.clone(), second_row.clone()];
+    if !earlier_attempts_that_located(&unlocated_retry, 2).is_empty()
+        || retained_attempt_count(
+            &unlocated_retry,
+            &sample_slug,
+            &sample_metadata,
+            &sample_a,
+            true,
+            runner_ok,
+            Some(0),
+        )? != 2
+    {
+        return Err(
+            "a retry without divergence coordinates was mistaken for one execution".into(),
+        );
+    }
+    if repetition_passed("pass", &appended) {
+        return Err(
+            "a repetition that failed before its selected pass was counted as cleanly passed"
+                .into(),
+        );
+    }
+    let mut one_pass = second_row.clone();
+    one_pass.attempt = 1;
+    if !repetition_passed("pass", &[one_pass]) {
+        return Err("a one-attempt passing repetition was not counted as passed".into());
+    }
+    let retry_summary = repeated_cell_summary(&sample_a, 1, 1, 2, "flaky");
+    if retry_summary["passes"] != 1
+        || retry_summary["retried_repetitions"] != 1
+        || retry_summary["total"] != 2
+        || retry_summary["result"] != "flaky"
+    {
+        return Err("repeated-cell JSON lost pass, retry, total, or result accounting".into());
+    }
     let nested_results = scratch.join("series-layout");
     let nested_cell = nested_results
         .join("cells")
@@ -7211,6 +7438,20 @@ fn self_test(root: &Path) -> Result<(), String> {
         Some(INCOMPLETE_ATTEMPT_STATUS),
     ) {
         return Err("foreign retained result-row identity was accepted".into());
+    }
+    result_row.attempt = 2;
+    let mixed_identity_retry = [first_row.clone(), result_row.clone()];
+    if retained_attempt_count(
+        &mixed_identity_retry,
+        &sample_slug,
+        &sample_metadata,
+        &sample_a,
+        true,
+        runner_ok,
+        Some(0),
+    )? != 1
+    {
+        return Err("a foreign retained retry changed the selected cell's attempt count".into());
     }
     let first_repetition_slug = cell_run_slug(&green_id, Some(1));
     let second_repetition_slug = cell_run_slug(&green_id, Some(2));
