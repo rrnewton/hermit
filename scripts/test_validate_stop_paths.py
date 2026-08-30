@@ -137,6 +137,8 @@ OUTER_VALIDATE_ENV = (
     "CI_HUB_VALIDATE_CONCURRENT",
     "CI_HUB_VALIDATE_LOCK_OWNER_PID",
     "CI_HUB_VALIDATE_LOCK_OWNER_FILE",
+    "CI_HUB_VALIDATE_RUN_NUMBER",
+    "E2E_RUN_ID",
     "VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON",
 )
 
@@ -222,6 +224,7 @@ def check_stop_test_env_does_not_inherit_outer_validate() -> None:
     saved = os.environ.copy()
     try:
         os.environ.update({name: "/outer/value" for name in OUTER_VALIDATE_ENV})
+        os.environ.update(E2E_RUN_ID="outer-run-id", CI_HUB_VALIDATE_RUN_NUMBER="4242")
         with tempfile.TemporaryDirectory(prefix="validate-stop-env-") as tmp:
             tmpdir = Path(tmp)
             env = stop_test_env(tmpdir, tmpdir / "ledger.jsonl")
@@ -503,6 +506,8 @@ def assert_schema5_contract(row: dict, *, admitted: bool = False) -> None:
     assert row["schema_version"] == 5, row
     assert row["repo"] == "hermit", row
     assert row["producer"] == "hermit-validate-rs", row
+    assert row["run_id"] is None, row
+    assert "run_number" not in row, row
     # Exercise write_ledger itself, not only validate.rs's synthetic helper.
     # A real outer failure positively knows there are no failed lane substeps;
     # gates that established no failure must omit the collection entirely.
