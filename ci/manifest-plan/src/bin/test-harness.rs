@@ -22,6 +22,7 @@ use hermit_manifest_plan::runner::Selection;
 use hermit_manifest_plan::runner::append_result;
 use hermit_manifest_plan::runner::cell_result_after_retries;
 use hermit_manifest_plan::runner::cell_result_and_attempts_after_retries;
+use hermit_manifest_plan::runner::checked_add_cpu_usage;
 use hermit_manifest_plan::runner::host_inapplicable_result;
 use hermit_manifest_plan::runner::infrastructure_error_result;
 use hermit_manifest_plan::runner::prepare_result_path;
@@ -175,6 +176,19 @@ fn structured_test_results_from_rows(
         rows,
     )
 }
+
+fn accumulate_cell_cpu_usage(
+    total: &mut Option<u64>,
+    measurements: &mut usize,
+    outcome: &str,
+    usage: Option<u64>,
+) {
+    if outcome != "HOST-INAPPLICABLE" {
+        *measurements += 1;
+        *total = checked_add_cpu_usage(*total, usage);
+    }
+}
+
 fn host_inapplicable_reason(
     requires: &[String],
     verdicts: &HostCapabilities,
@@ -1282,6 +1296,11 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     let mut indexed_results = Vec::new();
     let mut attempt_results = vec![Vec::new(); cells.len()];
     let mut failed = false;
+    // Sum the producer-owned CPU measurement from EVERY executed observation,
+    // including a failed row that is retried. This is specifically cell CPU;
+    // the harness process itself remains in the enclosing DAG cgroup.
+    let mut cell_cpu_usage_usec = Some(0u64);
+    let mut cpu_measurements = 0usize;
     let expected = cells.len();
     for_each_parallel(
         expected,
@@ -1309,6 +1328,12 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             );
         },
         |index, mut result: CellResult, will_retry| {
+            accumulate_cell_cpu_usage(
+                &mut cell_cpu_usage_usec,
+                &mut cpu_measurements,
+                &result.outcome,
+                result.cpu_usage_usec,
+            );
             // Publish before announcing the outcome. After a visible PASS line,
             // the complete typed row is already present even if the containing
             // bucket is killed before its JUnit/summary epilogue. The worker
@@ -1430,6 +1455,9 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         .iter()
         .filter(|result| result.outcome == "HOST-INAPPLICABLE")
         .count();
+    let cell_cpu_usage_usec = (cpu_measurements > 0)
+        .then_some(cell_cpu_usage_usec)
+        .flatten();
     if let Some(path) = std::env::var_os("DAGRUN_TEST_COUNTS_PATH") {
         let path = PathBuf::from(path);
         if let Err(error) =
@@ -1454,6 +1482,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         "failed": results.iter().filter(|result| result.outcome == "FAIL").count(),
         "errors": results.iter().filter(|result| result.outcome == "ERROR").count(),
         "host_inapplicable": host_inapplicable,
+        "cell_cpu_usage_usec": cell_cpu_usage_usec,
         "host_inapplicable_cells": results
             .iter()
             .filter(|result| result.outcome == "HOST-INAPPLICABLE")
@@ -1489,6 +1518,7 @@ mod tests {
 
     use super::HostCapability;
     use super::HostCapabilityVerdict;
+    use super::accumulate_cell_cpu_usage;
     use super::audit_privileged_unboxed_guard;
     use super::command_jobs;
     use super::for_each_parallel;
@@ -1497,6 +1527,26 @@ mod tests {
     use super::run_with_retry;
     use super::scheduled_worker_capacity;
     use super::structured_test_results_from_rows;
+
+    #[test]
+    fn cell_cpu_summary_includes_retries_and_refuses_incomplete_measurements() {
+        let mut total = Some(0);
+        let mut measurements = 0;
+        accumulate_cell_cpu_usage(&mut total, &mut measurements, "FAIL", Some(3));
+        accumulate_cell_cpu_usage(&mut total, &mut measurements, "PASS", Some(4));
+        accumulate_cell_cpu_usage(
+            &mut total,
+            &mut measurements,
+            "HOST-INAPPLICABLE",
+            Some(100),
+        );
+        assert_eq!(measurements, 2);
+        assert_eq!(total, Some(7));
+
+        accumulate_cell_cpu_usage(&mut total, &mut measurements, "ERROR", None);
+        assert_eq!(measurements, 3);
+        assert_eq!(total, None);
+    }
 
     #[test]
     fn structured_test_results_are_machine_readable_and_exact_on_failure() {
