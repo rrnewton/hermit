@@ -39,11 +39,13 @@ max-threads = 1
 
 # This source-audit test deliberately runs all six named `record` container
 # sites under both injected child-fault classes: 12 separate Hermit processes.
-# Three complete validation runs measured it at 25.98-26.30s while passing, so
-# 30s covers that observed work without widening any other test's 15s limit.
+# Across 85 attempts, 64 passed and 21 timed out at the old 30s threshold; the
+# longest passing attempt was 29.935s. 45s is 1.50x that passing maximum and
+# changes only this test's threshold. This threshold change requires
+# adversarial review.
 [[profile.default.overrides]]
 filter = "test(/(^|::)every_record_container_site_classifies_a_child_fault_by_name$/)"
-slow-timeout = { period = "30s", terminate-after = 1, grace-period = "2s" }
+slow-timeout = { period = "45s", terminate-after = 1, grace-period = "2s" }
 
 # This cell forces hermit's `--timeout` SIGALRM fallback to fire, so its runtime
 # is a SUM OF TWO DELIBERATE CONSTANTS, not a measurement that might drift: the
