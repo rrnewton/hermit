@@ -70,22 +70,157 @@ function verify_archive_roundtrip {
     printf '%s:%s:%s\n' "$PROGRAM" "$archive_digest" "$payload_digest"
 }
 
+function published_localhost_port {
+    local port_file=$1
+    local -a lines=()
+    local port
+
+    mapfile -t lines <"$port_file"
+    if ((${#lines[@]} != 1)); then
+        printf 'expected exactly one published localhost port, found %s\n' \
+            "${#lines[@]}" >&2
+        return 1
+    fi
+    port=${lines[0]}
+    if [[ ! $port =~ ^[0-9]+$ ]] || ((${#port} > 5)); then
+        printf 'published localhost port is invalid: %q\n' "$port" >&2
+        return 1
+    fi
+    port=$((10#$port))
+    if ((port == 0 || port > 65535)); then
+        printf 'published localhost port is invalid: %q\n' "${lines[0]}" >&2
+        return 1
+    fi
+    printf '%s\n' "$port"
+}
+
+function wait_for_published_localhost_port {
+    local port_file=$1
+    local server_pid=$2
+    local attempts=${3:-100}
+    local attempt
+
+    for ((attempt = 0; attempt < attempts; attempt++)); do
+        if [[ -s $port_file ]]; then
+            published_localhost_port "$port_file"
+            return
+        fi
+        if ! kill -0 "$server_pid" 2>/dev/null; then
+            printf 'localhost server exited before publishing its port\n' >&2
+            return 1
+        fi
+        sleep 0.01
+    done
+    printf 'timed out waiting for localhost server to publish its port\n' >&2
+    return 1
+}
+
+function require_live_localhost_server {
+    local server_pid=$1
+    local server_port=$2
+
+    if ! kill -0 "$server_pid" 2>/dev/null; then
+        printf 'localhost server exited after publishing port %s\n' "$server_port" >&2
+        return 1
+    fi
+}
+
+function test_published_localhost_port {
+    local got
+    local failures=0
+    local name name_value value
+
+    printf '32768\n' >"$WORK_DIR/valid.port"
+    got=$(published_localhost_port "$WORK_DIR/valid.port")
+    if [[ $got != 32768 ]]; then
+        printf 'localhost-port self-test: expected 32768, got %q\n' "$got" >&2
+        failures=$((failures + 1))
+    fi
+
+    : >"$WORK_DIR/missing.port"
+    if published_localhost_port "$WORK_DIR/missing.port" \
+        >"$WORK_DIR/missing.out" 2>"$WORK_DIR/missing.err"; then
+        printf 'localhost-port self-test: missing port was accepted\n' >&2
+        failures=$((failures + 1))
+    elif ! grep -Fq 'found 0' "$WORK_DIR/missing.err"; then
+        printf 'localhost-port self-test: missing-port diagnostic was not explicit\n' >&2
+        failures=$((failures + 1))
+    fi
+
+    printf '32768\n32769\n' >"$WORK_DIR/multiple.port"
+    if published_localhost_port "$WORK_DIR/multiple.port" \
+        >"$WORK_DIR/ambiguous.out" 2>"$WORK_DIR/ambiguous.err"; then
+        printf 'localhost-port self-test: multiple ports were accepted\n' >&2
+        failures=$((failures + 1))
+    elif ! grep -Fq 'found 2' "$WORK_DIR/ambiguous.err"; then
+        printf 'localhost-port self-test: multiple-port diagnostic was not explicit\n' >&2
+        failures=$((failures + 1))
+    fi
+
+    for name_value in \
+        'zero:0' \
+        'nondecimal:not-a-port' \
+        'too-large:65536' \
+        'overflow:18446744073709551617'; do
+        name=${name_value%%:*}
+        value=${name_value#*:}
+        printf '%s\n' "$value" >"$WORK_DIR/$name.port"
+        if published_localhost_port "$WORK_DIR/$name.port" \
+            >"$WORK_DIR/$name.out" 2>"$WORK_DIR/$name.err"; then
+            printf 'localhost-port self-test: %s port was accepted\n' "$name" >&2
+            failures=$((failures + 1))
+        elif ! grep -Fq 'published localhost port is invalid' "$WORK_DIR/$name.err"; then
+            printf 'localhost-port self-test: %s diagnostic was not explicit\n' "$name" >&2
+            failures=$((failures + 1))
+        fi
+    done
+
+    if wait_for_published_localhost_port "$WORK_DIR/never-created.port" "$$" 1 \
+        >"$WORK_DIR/timeout.out" 2>"$WORK_DIR/timeout.err"; then
+        printf 'localhost-port self-test: timeout was accepted\n' >&2
+        failures=$((failures + 1))
+    elif ! grep -Fq 'timed out waiting' "$WORK_DIR/timeout.err"; then
+        printf 'localhost-port self-test: timeout diagnostic was not explicit\n' >&2
+        failures=$((failures + 1))
+    fi
+
+    (:) &
+    local dead_pid=$!
+    wait "$dead_pid"
+    if wait_for_published_localhost_port "$WORK_DIR/dead-before.port" "$dead_pid" 1 \
+        >"$WORK_DIR/dead-before.out" 2>"$WORK_DIR/dead-before.err"; then
+        printf 'localhost-port self-test: dead server before publication was accepted\n' >&2
+        failures=$((failures + 1))
+    elif ! grep -Fq 'exited before publishing' "$WORK_DIR/dead-before.err"; then
+        printf 'localhost-port self-test: dead-before diagnostic was not explicit\n' >&2
+        failures=$((failures + 1))
+    fi
+
+    printf '32768\n' >"$WORK_DIR/dead-after.port"
+    if require_live_localhost_server "$dead_pid" 32768 \
+        >"$WORK_DIR/dead-after.out" 2>"$WORK_DIR/dead-after.err"; then
+        printf 'localhost-port self-test: dead server after publication was accepted\n' >&2
+        failures=$((failures + 1))
+    elif ! grep -Fq 'exited after publishing port 32768' "$WORK_DIR/dead-after.err"; then
+        printf 'localhost-port self-test: dead-after diagnostic was not explicit\n' >&2
+        failures=$((failures + 1))
+    fi
+
+    if ((failures != 0)); then
+        return 1
+    fi
+    printf 'localhost-port self-test: PASS\n'
+}
+
 function fetch_localhost_payload {
     (
         local client=$1
-        local nc_bin nc_help
         local response_bytes
+        local server_bin="$FIXTURE_ROOT/localhost-http-server"
+        local port_file="$WORK_DIR/server.port"
         local server_pid=
         local server_status=0
         local status=0
-        # PORT 0 IS AN ALLOCATION; A LITERAL IS NOT. The kernel hands back a free
-        # port and holds it bound, so two concurrent runs of this same program
-        # cannot land on the same one. The literal 18765 collided with itself:
-        # nothing checked it was free, so a second run either failed to bind or,
-        # worse, talked to the first run's server. The compared value is a sha256
-        # of the downloaded payload, so the port never reaches it and varying it
-        # cannot manufacture a divergence.
-        local -a nc_args=(--send-only -l 127.0.0.1 0)
 
         trap 'if [[ -n $server_pid ]]; then kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; fi' EXIT
         prepare_archive_fixture
@@ -96,40 +231,31 @@ function fetch_localhost_payload {
             cat "$WORK_DIR/source/payload.txt"
         } >"$WORK_DIR/response.http"
 
-        if [[ -x /usr/bin/ncat ]]; then
-            nc_bin=/usr/bin/ncat
-        else
-            nc_help=$(/usr/bin/nc -h 2>&1 || true)
-            if grep -q -- '--send-only' <<<"$nc_help"; then
-                nc_bin=/usr/bin/nc
-            else
-                printf 'wget/curl localhost fixture requires Ncat --send-only\n' >&2
-                return 1
-            fi
-        fi
-        nc_help=$("$nc_bin" -h 2>&1 || true)
-        if ! grep -q -- '--send-only' <<<"$nc_help"; then
-            printf '%s does not advertise required --send-only support\n' "$nc_bin" >&2
+        if [[ ! -x $server_bin ]]; then
+            printf 'localhost server fixture is missing or not executable: %s\n' "$server_bin" >&2
             return 1
         fi
 
-        "$nc_bin" "${nc_args[@]}" \
-            <"$WORK_DIR/response.http" >"$WORK_DIR/server.log" 2>&1 &
+        # Never inspect the socket table inside the measured verification run.
+        # RUN1562's `ss -p` setup exited before wget/curl because guest PID
+        # attribution was absent; comparing socket tables let the clients run but
+        # made host netlink bytes diverge. Historical `--verify` could also miss
+        # content-only divergence. The process that binds port 0 therefore owns
+        # getsockname(2), publishes its own decimal port, and serves the response.
+        "$server_bin" "$port_file" "$WORK_DIR/response.http" \
+            >"$WORK_DIR/server.log" 2>&1 &
         server_pid=$!
-
-        # Yield one deterministic logical interval so Ncat reaches listen(2)
-        # before the client connects, without a second readiness process.
-        sleep 0.1
-        # Read the port the kernel actually assigned. This also CONFIRMS the bind,
-        # which the sleep alone only assumes.
         local server_port=''
-        server_port=$(ss -ltnpH 2>/dev/null \
-            | grep -F "pid=${server_pid}," \
-            | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2)
-        if [[ ! $server_port =~ ^[1-9][0-9]*$ ]]; then
-            printf 'could not read the kernel-assigned port for ncat pid %s\\n' "$server_pid" >&2
+        if ! server_port=$(wait_for_published_localhost_port "$port_file" "$server_pid"); then
             kill "$server_pid" 2>/dev/null || true
             wait "$server_pid" 2>/dev/null || true
+            cat "$WORK_DIR/server.log" >&2
+            return 1
+        fi
+        if ! require_live_localhost_server "$server_pid" "$server_port"; then
+            wait "$server_pid" 2>/dev/null || true
+            server_pid=
+            cat "$WORK_DIR/server.log" >&2
             return 1
         fi
         if [[ $client == wget ]]; then
@@ -165,6 +291,9 @@ function fetch_localhost_payload {
 }
 
 case "$PROGRAM" in
+    --self-test-localhost-port)
+        test_published_localhost_port
+        ;;
     gzip-roundtrip)
         prepare_archive_fixture
         gzip -n -c "$WORK_DIR/source/payload.txt" >"$WORK_DIR/archive.gz"
