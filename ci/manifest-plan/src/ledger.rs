@@ -322,6 +322,21 @@ impl ComparisonSpec {
         &self,
         compared_log_messages: &RequiredNullable<ComparedLogCounts>,
     ) -> bool {
+        self.is_canonical_bitwise_info_v1_for_time_policy(true, compared_log_messages)
+    }
+
+    /// Whether this is the complete canonical BitwiseInfoV1 comparison for the
+    /// producer's declared virtual-time policy.
+    ///
+    /// Independent verify and chaos runs require virtual time. Record/replay
+    /// deliberately compares one recording with its replay without virtual
+    /// time, so receipt readers must bind the expected value to the cell mode
+    /// rather than either deleting this field or accepting both values.
+    pub fn is_canonical_bitwise_info_v1_for_time_policy(
+        &self,
+        expected_virtualize_time: bool,
+        compared_log_messages: &RequiredNullable<ComparedLogCounts>,
+    ) -> bool {
         let RequiredNullable::Value(counts) = compared_log_messages else {
             return false;
         };
@@ -330,7 +345,7 @@ impl ComparisonSpec {
             && self.compare_logs
             && self.compare_io_buffers == Some(true)
             && self.record_envelope.as_deref() == Some("all_records_v1")
-            && self.virtualize_time == Some(true)
+            && self.virtualize_time == Some(expected_virtualize_time)
             && self.log_scope == ComparedLogScope::Info
             && !self.strip_lines
             && self.canonicalize_addresses
@@ -588,6 +603,16 @@ mod tests {
         );
         assert_eq!(comparison.virtualize_time, Some(true));
         assert!(comparison.is_canonical_bitwise_info_v1(&compared_log_messages));
+        let mut replay_comparison = comparison.clone();
+        replay_comparison.virtualize_time = Some(false);
+        assert!(
+            replay_comparison
+                .is_canonical_bitwise_info_v1_for_time_policy(false, &compared_log_messages)
+        );
+        assert!(!replay_comparison.is_canonical_bitwise_info_v1(&compared_log_messages));
+        assert!(
+            !comparison.is_canonical_bitwise_info_v1_for_time_policy(false, &compared_log_messages)
+        );
         let CellVerdict::ComparedAndMatched {
             comparison: older_comparison,
             compared_log_messages: older_counts,
