@@ -67,6 +67,16 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 
 Ordinary full validation executes 307 selected regression cells: the 304 green compatibility cells above (including 5 chaos-mode race-exposure checks), and 3 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
 
+### Selected custom commands outside the comparable denominator
+
+These rows are part of the selected regression denominator even though they are not rows in `ci/compat-envelope/cells.json`. Their exact identities come from `ci/expected-e2e-plan.json`; `scorecard.rs check` refuses any selected row that is not accounted for by either this table or the comparable green cells above.
+
+| Lane | Category | Test | Mode | Backend |
+| --- | --- | --- | --- | --- |
+| `portable` | `backend-parity-c` | `backend-parity-c/environment-and-workdir` | `custom` | `ptrace` |
+| `portable` | `system-utils` | `system-utils/clock-determinism` | `custom` | `liteinst` |
+| `portable` | `system-utils` | `system-utils/clock-determinism` | `custom` | `ptrace` |
+
 ## Status and measurement
 
 The table above reports status. This table reports the separate `measurement` field derived from observations stored in `ci/compat-envelope/cells.json`; it does not change status or which cells ordinary validation selects. Retained history that has not been imported is not counted here. A stored measurement does not establish that it describes current code; `show` reports whether the recorded last test still matches `HEAD:detcore`.
