@@ -159,6 +159,48 @@ pub struct SeriesRuntime {
     pub wall_time_max_ms: Option<f64>,
 }
 
+/// Producer-owned evidence for one inner invocation that did not produce a
+/// canonical comparison. The containing series row identifies the outer cell
+/// attempt; this retains the typed process disposition used to distinguish a
+/// timeout from an unavailable result without inferring from duration or
+/// backend.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeriesNoVerdictKind {
+    NotRun,
+    FirstRunRejected,
+    InfrastructureError,
+    MissingReportTimeout,
+    NoncanonicalMatch,
+    NoncanonicalDivergence,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesAttemptDisposition {
+    pub index: String,
+    pub kind: SeriesNoVerdictKind,
+    pub attempt_outcome: String,
+    pub disposition: SeriesOutcome,
+    #[serde(default)]
+    pub error_kind: Option<String>,
+    #[serde(default)]
+    pub status: Option<i32>,
+    #[serde(default)]
+    pub signal: Option<i32>,
+    pub timed_out: bool,
+    #[serde(default)]
+    pub verification_report_sha256: Option<String>,
+}
+
+/// Exact source-row identity and its non-comparison dispositions.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesNoVerdictEvidence {
+    pub evidence_sha256: String,
+    pub attempts: Vec<SeriesAttemptDisposition>,
+}
+
 fn one_run() -> u64 {
     1
 }
@@ -179,6 +221,12 @@ pub struct SeriesPayload {
     /// rows.
     #[serde(default)]
     pub failure_class: Option<FailureClass>,
+    /// Present on newly emitted comparison-mode rows that produced no complete
+    /// canonical product verdict. Historical v3 rows predate this optional
+    /// evidence and remain readable, but consumers must not infer the missing
+    /// facts from duration, backend, or exit status alone.
+    #[serde(default)]
+    pub no_verdict_evidence: Option<SeriesNoVerdictEvidence>,
     pub run_index: u64,
     #[serde(default)]
     pub attempt: Option<u64>,
@@ -259,7 +307,8 @@ impl SeriesRow {
         }
         self.validate_common()?;
         self.validate_host_facts()?;
-        self.validate_classification()
+        self.validate_classification()?;
+        self.require_current_no_verdict_evidence()
     }
 
     /// Validate a stored row before a reader uses its contents.
@@ -411,6 +460,224 @@ impl SeriesRow {
                 return Err("first_divergent_messages must contain at least one message".into());
             }
         }
+        if let Some(evidence) = &self.series.no_verdict_evidence {
+            self.validate_no_verdict_evidence(evidence)?;
+        }
+        Ok(())
+    }
+
+    fn validate_no_verdict_evidence(
+        &self,
+        evidence: &SeriesNoVerdictEvidence,
+    ) -> Result<(), String> {
+        if !is_sha256(&evidence.evidence_sha256) {
+            return Err(format!(
+                "no_verdict_evidence.evidence_sha256 must be lowercase 64-hex, got {:?}",
+                evidence.evidence_sha256
+            ));
+        }
+        if self.schema != SeriesSchema::V3 {
+            return Err("no_verdict_evidence is supported only by stress-series/v3".into());
+        }
+        let attempt = self
+            .series
+            .attempt
+            .ok_or("no_verdict_evidence requires an explicit outer attempt")?;
+        let mode = self.series.cell.rsplit('/').nth(1).unwrap_or_default();
+        if !matches!(mode, "verify" | "replay" | "chaos") {
+            return Err("no_verdict_evidence is valid only for comparison modes".into());
+        }
+        if attempt == 0 || self.series.num_runs != 1 || self.series.last_run_index.is_some() {
+            return Err(
+                "no_verdict_evidence must identify one uncollapsed positive outer attempt".into(),
+            );
+        }
+        if self.producer == SeriesProducer::Validate && attempt != self.series.run_index {
+            return Err("validate no_verdict_evidence outer attempt must equal run_index".into());
+        }
+        if matches!(
+            self.series.outcome,
+            SeriesOutcome::Passed | SeriesOutcome::Diverged | SeriesOutcome::Skipped
+        ) {
+            return Err(format!(
+                "outcome {} cannot carry no_verdict_evidence",
+                self.series.outcome.as_str()
+            ));
+        }
+        if evidence.attempts.is_empty() {
+            return Err("no_verdict_evidence.attempts must be nonempty".into());
+        }
+        let mut indices = std::collections::BTreeSet::new();
+        let mut saw_timeout = false;
+        for disposition in &evidence.attempts {
+            if disposition.index.trim().is_empty() || !indices.insert(&disposition.index) {
+                return Err(
+                    "no_verdict_evidence attempt indices must be nonempty and unique".into(),
+                );
+            }
+            if disposition
+                .error_kind
+                .as_ref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                return Err("no_verdict_evidence error_kind must be nonempty when present".into());
+            }
+            if disposition.status.is_some_and(|status| status < 0)
+                || disposition.signal.is_some_and(|signal| signal <= 0)
+                || (disposition.status.is_some() && disposition.signal.is_some())
+            {
+                return Err("no_verdict_evidence status/signal disposition is invalid".into());
+            }
+            if disposition
+                .verification_report_sha256
+                .as_ref()
+                .is_some_and(|sha| !is_sha256(sha))
+            {
+                return Err(
+                    "no_verdict_evidence verification_report_sha256 must be lowercase 64-hex"
+                        .into(),
+                );
+            }
+            let has_nonzero_process_disposition = matches!(
+                (disposition.status, disposition.signal),
+                (Some(status), None) if status > 0
+            ) || matches!(
+                (disposition.status, disposition.signal),
+                (None, Some(signal)) if signal > 0
+            );
+            match disposition.kind {
+                SeriesNoVerdictKind::NotRun => {
+                    let expected = if disposition.timed_out {
+                        SeriesOutcome::Timeout
+                    } else {
+                        SeriesOutcome::NoResult
+                    };
+                    if disposition.attempt_outcome != "ERROR"
+                        || disposition.disposition != expected
+                        || disposition
+                            .error_kind
+                            .as_ref()
+                            .is_none_or(|value| value.trim().is_empty())
+                        || !has_nonzero_process_disposition
+                        || disposition.verification_report_sha256.is_none()
+                    {
+                        return Err(
+                            "not_run evidence must carry attempt outcome ERROR, an error_kind, a verification report, exactly one nonzero status or signal, and a matching typed disposition"
+                                .into(),
+                        );
+                    }
+                    saw_timeout |= disposition.timed_out;
+                }
+                SeriesNoVerdictKind::FirstRunRejected => {
+                    if disposition.attempt_outcome != "FAIL"
+                        || disposition.disposition != SeriesOutcome::NoResult
+                        || disposition.timed_out
+                        || disposition.error_kind.is_some()
+                        || disposition.status.is_none_or(|status| status <= 0)
+                        || disposition.signal.is_some()
+                        || disposition.verification_report_sha256.is_none()
+                    {
+                        return Err(
+                            "first_run_rejected evidence must carry attempt outcome FAIL, no error_kind, a nonzero status without signal, timed_out=false, a verification report, and no_result disposition"
+                                .into(),
+                        );
+                    }
+                }
+                SeriesNoVerdictKind::NoncanonicalMatch => {
+                    let status_is_valid = disposition
+                        .status
+                        .is_some_and(|status| status >= 0 && (mode == "chaos" || status == 0));
+                    if disposition.attempt_outcome != "PASS"
+                        || disposition.disposition != SeriesOutcome::NoResult
+                        || disposition.timed_out
+                        || disposition.error_kind.is_some()
+                        || !status_is_valid
+                        || disposition.signal.is_some()
+                        || disposition.verification_report_sha256.is_none()
+                    {
+                        return Err(
+                            "noncanonical_match evidence must carry attempt outcome PASS, no error_kind, a valid status without signal, timed_out=false, a verification report, and no_result disposition"
+                                .into(),
+                        );
+                    }
+                }
+                SeriesNoVerdictKind::NoncanonicalDivergence => {
+                    if disposition.attempt_outcome != "FAIL"
+                        || disposition.disposition != SeriesOutcome::NoResult
+                        || disposition.timed_out
+                        || disposition.error_kind.is_some()
+                        || !has_nonzero_process_disposition
+                        || disposition.verification_report_sha256.is_none()
+                    {
+                        return Err(
+                            "noncanonical_divergence evidence must carry attempt outcome FAIL, no error_kind, exactly one nonzero status or signal, timed_out=false, a verification report, and no_result disposition"
+                                .into(),
+                        );
+                    }
+                }
+                SeriesNoVerdictKind::InfrastructureError => {
+                    if disposition.attempt_outcome != "ERROR"
+                        || disposition.disposition != SeriesOutcome::Errored
+                        || disposition.timed_out
+                        || !has_nonzero_process_disposition
+                        || disposition.verification_report_sha256.is_none()
+                    {
+                        return Err(
+                            "infrastructure_error evidence must carry attempt outcome ERROR, a verification report, exactly one nonzero status or signal, timed_out=false, and errored disposition"
+                                .into(),
+                        );
+                    }
+                }
+                SeriesNoVerdictKind::MissingReportTimeout => {
+                    if disposition.attempt_outcome != "ERROR"
+                        || disposition.disposition != SeriesOutcome::Timeout
+                        || !disposition.timed_out
+                        || disposition
+                            .error_kind
+                            .as_ref()
+                            .is_none_or(|value| value.trim().is_empty())
+                        || !has_nonzero_process_disposition
+                        || disposition.verification_report_sha256.is_some()
+                    {
+                        return Err(
+                            "missing_report_timeout evidence must carry attempt outcome ERROR, an error_kind, no verification report, exactly one nonzero status or signal, timed_out=true, and timeout disposition"
+                                .into(),
+                        );
+                    }
+                    saw_timeout = true;
+                }
+            }
+        }
+        if self.series.result == Some(ObservedResult::Timeout) && !saw_timeout {
+            return Err("timeout result has no timed-out attempt disposition".into());
+        }
+        if saw_timeout
+            && self.series.result.is_some()
+            && self.series.result != Some(ObservedResult::Timeout)
+        {
+            return Err(format!(
+                "timed-out attempt disposition contradicts result {:?}",
+                self.series.result
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_current_no_verdict_evidence(&self) -> Result<(), String> {
+        let mode = self.series.cell.rsplit('/').nth(1).unwrap_or_default();
+        let requires_evidence = matches!(
+            self.series.outcome,
+            SeriesOutcome::NoResult | SeriesOutcome::Timeout | SeriesOutcome::Errored
+        );
+        if matches!(mode, "verify" | "replay" | "chaos")
+            && requires_evidence
+            && self.series.no_verdict_evidence.is_none()
+        {
+            return Err(format!(
+                "new comparison-mode {} row must carry no_verdict_evidence",
+                self.series.outcome.as_str()
+            ));
+        }
         Ok(())
     }
 
@@ -526,6 +793,13 @@ fn is_object_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn valid_cell(value: &str) -> bool {
     let mut parts = value.rsplitn(3, '/');
     let backend = parts.next().unwrap_or_default();
@@ -561,6 +835,7 @@ mod tests {
                 outcome: SeriesOutcome::Passed,
                 result: Some(ObservedResult::Pass),
                 failure_class: None,
+                no_verdict_evidence: None,
                 run_index: 1,
                 attempt: None,
                 num_runs: 1,
@@ -591,6 +866,29 @@ mod tests {
                 ])),
             },
         }
+    }
+
+    fn no_verdict_row() -> SeriesRow {
+        let mut fixture = row(SeriesSchema::V3);
+        fixture.series.outcome = SeriesOutcome::NoResult;
+        fixture.series.result = None;
+        fixture.series.failure_class = Some(FailureClass::NoResult);
+        fixture.series.attempt = Some(1);
+        fixture.series.no_verdict_evidence = Some(SeriesNoVerdictEvidence {
+            evidence_sha256: "b".repeat(64),
+            attempts: vec![SeriesAttemptDisposition {
+                index: "1".into(),
+                kind: SeriesNoVerdictKind::NotRun,
+                attempt_outcome: "ERROR".into(),
+                disposition: SeriesOutcome::NoResult,
+                error_kind: Some("incomplete-verification-evidence".into()),
+                status: Some(125),
+                signal: None,
+                timed_out: false,
+                verification_report_sha256: Some("c".repeat(64)),
+            }],
+        });
+        fixture
     }
 
     #[test]
@@ -761,6 +1059,176 @@ mod tests {
         assert_eq!(
             retained_v2.validate_for_write().unwrap_err(),
             "new rows must use stress-series/v3, got stress-series/v2"
+        );
+    }
+
+    #[test]
+    fn current_no_verdict_rows_require_exact_uncollapsed_evidence() {
+        let fixture = no_verdict_row();
+        fixture.validate_for_read().unwrap();
+        fixture.validate_for_write().unwrap();
+
+        let mut legacy = fixture.clone();
+        legacy.series.no_verdict_evidence = None;
+        legacy.validate_for_read().unwrap();
+        assert!(
+            legacy
+                .validate_for_write()
+                .unwrap_err()
+                .contains("must carry no_verdict_evidence")
+        );
+
+        let mut collapsed = fixture.clone();
+        collapsed.series.num_runs = 2;
+        collapsed.series.last_run_index = Some(2);
+        assert!(
+            collapsed
+                .validate_for_read()
+                .unwrap_err()
+                .contains("one uncollapsed positive outer attempt")
+        );
+
+        let mut missing_attempt = fixture;
+        missing_attempt.series.attempt = None;
+        assert!(
+            missing_attempt
+                .validate_for_read()
+                .unwrap_err()
+                .contains("explicit outer attempt")
+        );
+
+        let mut mismatched_attempt = no_verdict_row();
+        mismatched_attempt.series.attempt = Some(2);
+        assert!(
+            mismatched_attempt
+                .validate_for_read()
+                .unwrap_err()
+                .contains("outer attempt must equal run_index")
+        );
+
+        let mut v2 = no_verdict_row();
+        v2.schema = SeriesSchema::V2;
+        assert!(
+            v2.validate_for_read()
+                .unwrap_err()
+                .contains("supported only by stress-series/v3")
+        );
+    }
+
+    #[test]
+    fn no_verdict_timeout_disposition_is_typed_and_contradictions_refuse() {
+        let mut timeout = no_verdict_row();
+        timeout.series.outcome = SeriesOutcome::Timeout;
+        timeout.series.result = Some(ObservedResult::Timeout);
+        let disposition = &mut timeout
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0];
+        disposition.disposition = SeriesOutcome::Timeout;
+        disposition.status = None;
+        disposition.signal = Some(15);
+        disposition.timed_out = true;
+        timeout.validate_for_write().unwrap();
+
+        let mut missing_timeout = timeout.clone();
+        missing_timeout
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0]
+            .timed_out = false;
+        assert!(
+            missing_timeout
+                .validate_for_read()
+                .unwrap_err()
+                .contains("not_run evidence must carry")
+        );
+
+        let mut invented_result = no_verdict_row();
+        invented_result.series.result = Some(ObservedResult::CrashError);
+        assert!(
+            invented_result
+                .validate_for_read()
+                .unwrap_err()
+                .contains("result=Some(CrashError)")
+        );
+
+        for status in [Some(0), None] {
+            let mut incomplete = no_verdict_row();
+            let disposition = &mut incomplete
+                .series
+                .no_verdict_evidence
+                .as_mut()
+                .unwrap()
+                .attempts[0];
+            disposition.status = status;
+            disposition.signal = None;
+            assert!(
+                incomplete
+                    .validate_for_read()
+                    .unwrap_err()
+                    .contains("exactly one nonzero status or signal")
+            );
+        }
+
+        let mut historical_errored = row(SeriesSchema::V3);
+        historical_errored.series.outcome = SeriesOutcome::Errored;
+        historical_errored.series.result = Some(ObservedResult::CrashError);
+        historical_errored.series.failure_class = Some(FailureClass::ProductFailure);
+        historical_errored.validate_for_read().unwrap();
+        assert!(
+            historical_errored
+                .validate_for_write()
+                .unwrap_err()
+                .contains("must carry no_verdict_evidence")
+        );
+
+        historical_errored.series.attempt = Some(1);
+        historical_errored.series.no_verdict_evidence = Some(SeriesNoVerdictEvidence {
+            evidence_sha256: "e".repeat(64),
+            attempts: vec![SeriesAttemptDisposition {
+                index: "1".into(),
+                kind: SeriesNoVerdictKind::FirstRunRejected,
+                attempt_outcome: "FAIL".into(),
+                disposition: SeriesOutcome::NoResult,
+                error_kind: None,
+                status: Some(125),
+                signal: None,
+                timed_out: false,
+                verification_report_sha256: Some("f".repeat(64)),
+            }],
+        });
+        historical_errored.validate_for_write().unwrap();
+
+        let mut noncanonical = no_verdict_row();
+        let disposition = &mut noncanonical
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0];
+        disposition.kind = SeriesNoVerdictKind::NoncanonicalMatch;
+        disposition.attempt_outcome = "PASS".into();
+        disposition.error_kind = None;
+        disposition.status = Some(0);
+        noncanonical.validate_for_write().unwrap();
+
+        let mut noncanonical_nonzero = noncanonical;
+        noncanonical_nonzero
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0]
+            .status = Some(1);
+        assert!(
+            noncanonical_nonzero
+                .validate_for_read()
+                .unwrap_err()
+                .contains("noncanonical_match evidence")
         );
     }
 }
