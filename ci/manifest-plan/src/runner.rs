@@ -7,6 +7,7 @@ use std::fs::{self};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
@@ -815,6 +816,13 @@ pub struct AttemptResult {
     pub timed_out: bool,
     #[serde(default)]
     pub duration_ms: u128,
+    /// CPU consumed by the launched process and the descendants it reaped.
+    ///
+    /// This comes from `wait4` at the same point that owns the process. It is
+    /// not inferred from wall time and remains attributable when cells execute
+    /// concurrently or move their work outside the enclosing DAG cgroup.
+    #[serde(default)]
+    pub cpu_usage_usec: Option<u64>,
     pub observation_sha256: Option<String>,
     pub argv: Vec<String>,
     pub guest_argv: Vec<String>,
@@ -939,6 +947,12 @@ pub struct CellResult {
     /// cell never ran; a measured zero remains a valid sub-millisecond result.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u128>,
+    /// CPU consumed by this cell's preparation and launched attempts.
+    ///
+    /// Null when the cell never reached execution or the runner could not
+    /// obtain a complete measurement. A measured zero remains a real value.
+    #[serde(default)]
+    pub cpu_usage_usec: Option<u64>,
     /// Runtime totals from the first attempt that produced them.
     pub runtime: Option<VerificationRuntime>,
     pub log_level: Option<String>,
@@ -1287,6 +1301,7 @@ pub fn prepare_test(
         dir,
         Instant::now() + Duration::from_secs(cell.timeout_seconds),
     )
+    .map(|(guest, _cpu_usage_usec)| guest)
 }
 
 fn prepare_test_until(
@@ -1294,8 +1309,9 @@ fn prepare_test_until(
     cell: &SelectedCell,
     dir: &Path,
     deadline: Instant,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, u64), String> {
     prepare_dirs(&context.root, dir)?;
+    let mut cpu_usage_usec = 0u64;
     if context.prebuilt && cell.test.program.is_some() {
         let source = context
             .build_root
@@ -1333,7 +1349,16 @@ fn prepare_test_until(
                 args.push(context.root.join(program).to_string_lossy().into_owned());
                 args.push("-o".into());
                 args.push(output.to_string_lossy().into_owned());
-                run_preparation(context, dir, "cc", &args, deadline, cell.timeout_seconds)?;
+                cpu_usage_usec = cpu_usage_usec
+                    .checked_add(run_preparation(
+                        context,
+                        dir,
+                        "cc",
+                        &args,
+                        deadline,
+                        cell.timeout_seconds,
+                    )?)
+                    .ok_or_else(|| "cell CPU usage overflowed u64".to_string())?;
             }
             require_executable_program(&output, &dir.join("captures"))?;
             vec![output.to_string_lossy().into_owned()]
@@ -1353,7 +1378,16 @@ fn prepare_test_until(
                 args.push(context.root.join(program).to_string_lossy().into_owned());
                 args.push("-o".into());
                 args.push(output.to_string_lossy().into_owned());
-                run_preparation(context, dir, "rustc", &args, deadline, cell.timeout_seconds)?;
+                cpu_usage_usec = cpu_usage_usec
+                    .checked_add(run_preparation(
+                        context,
+                        dir,
+                        "rustc",
+                        &args,
+                        deadline,
+                        cell.timeout_seconds,
+                    )?)
+                    .ok_or_else(|| "cell CPU usage overflowed u64".to_string())?;
             }
             require_executable_program(&output, &dir.join("captures"))?;
             vec![output.to_string_lossy().into_owned()]
@@ -1361,14 +1395,16 @@ fn prepare_test_until(
         (Some(program), None) if program.ends_with(".sh") => {
             let path = context.root.join(program).to_string_lossy().into_owned();
             if !context.prebuilt {
-                run_preparation(
-                    context,
-                    dir,
-                    &path,
-                    &["--prepare".into()],
-                    deadline,
-                    cell.timeout_seconds,
-                )?;
+                cpu_usage_usec = cpu_usage_usec
+                    .checked_add(run_preparation(
+                        context,
+                        dir,
+                        &path,
+                        &["--prepare".into()],
+                        deadline,
+                        cell.timeout_seconds,
+                    )?)
+                    .ok_or_else(|| "cell CPU usage overflowed u64".to_string())?;
             }
             vec![path, "--run".into()]
         }
@@ -1386,7 +1422,7 @@ fn prepare_test_until(
     if context.isolated_workdir.is_some() || supports_test_workdir(&cell.id.mode, backend) {
         resolve_repo_guest_args(&context.root, &mut guest);
     }
-    Ok(guest)
+    Ok((guest, cpu_usage_usec))
 }
 
 fn resolve_repo_guest_args(root: &Path, argv: &mut [String]) {
@@ -1490,7 +1526,7 @@ fn run_preparation(
     args: &[String],
     deadline: Instant,
     cell_timeout_seconds: u64,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let captures = dir.join("captures");
     if remaining_cell_time(deadline).is_zero() {
         return Err(with_diagnostic(
@@ -1524,7 +1560,7 @@ fn run_preparation(
             &captures,
         ));
     }
-    Ok(())
+    Ok(output.cpu_usage_usec)
 }
 
 pub fn build_spec(
@@ -2018,6 +2054,7 @@ fn execute_spec_until(
         signal: std::os::unix::process::ExitStatusExt::signal(&output.status),
         timed_out: output.timed_out,
         duration_ms: started.elapsed().as_millis(),
+        cpu_usage_usec: Some(output.cpu_usage_usec),
         observation_sha256: None,
         argv: spec.argv.clone(),
         guest_argv: spec.guest_argv.clone(),
@@ -2077,6 +2114,50 @@ fn normalize_ptrace_golden(hermit: &str, directory: &Path) -> Result<(), String>
 struct ProcessOutput {
     status: ExitStatus,
     timed_out: bool,
+    cpu_usage_usec: u64,
+}
+
+/// Add two complete CPU measurements, refusing missing or overflowing input.
+pub fn checked_add_cpu_usage(total: Option<u64>, usage: Option<u64>) -> Option<u64> {
+    total.and_then(|total| usage.and_then(|usage| total.checked_add(usage)))
+}
+
+fn rusage_cpu_usage_usec(usage: &libc::rusage) -> Result<u64, String> {
+    fn timeval_usec(value: libc::timeval) -> Option<u64> {
+        let seconds = u64::try_from(value.tv_sec).ok()?;
+        let microseconds = u64::try_from(value.tv_usec).ok()?;
+        (microseconds < 1_000_000)
+            .then_some(seconds.checked_mul(1_000_000)?.checked_add(microseconds)?)
+    }
+
+    let user = timeval_usec(usage.ru_utime)
+        .ok_or_else(|| "wait4 returned an invalid user CPU duration".to_string())?;
+    let system = timeval_usec(usage.ru_stime)
+        .ok_or_else(|| "wait4 returned an invalid system CPU duration".to_string())?;
+    user.checked_add(system)
+        .ok_or_else(|| "wait4 CPU usage overflowed u64".to_string())
+}
+
+fn wait4_process(pid: u32, options: libc::c_int) -> Result<Option<(ExitStatus, u64)>, String> {
+    loop {
+        let mut status = 0;
+        let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
+        let waited = unsafe { libc::wait4(pid as libc::pid_t, &mut status, options, &mut usage) };
+        if waited == 0 {
+            return Ok(None);
+        }
+        if waited == pid as libc::pid_t {
+            return Ok(Some((
+                ExitStatus::from_raw(status),
+                rusage_cpu_usage_usec(&usage)?,
+            )));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(format!("wait4({pid}) failed: {error}"));
+    }
 }
 
 fn execute_process(
@@ -2106,26 +2187,29 @@ fn execute_process(
             Ok(())
         });
     }
-    let mut child = command
+    let child = command
         .spawn()
         .map_err(|e| format!("cannot execute {program}: {e}"))?;
+    let pid = child.id();
     loop {
-        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+        if let Some((status, cpu_usage_usec)) = wait4_process(pid, libc::WNOHANG)? {
             return Ok(ProcessOutput {
                 status,
                 timed_out: false,
+                cpu_usage_usec,
             });
         }
         if Instant::now() >= deadline {
             unsafe {
-                libc::kill(-(child.id() as i32), libc::SIGTERM);
+                libc::kill(-(pid as i32), libc::SIGTERM);
             }
             let grace = Instant::now() + Duration::from_secs(10);
             loop {
-                if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                if let Some((status, cpu_usage_usec)) = wait4_process(pid, libc::WNOHANG)? {
                     return Ok(ProcessOutput {
                         status,
                         timed_out: true,
+                        cpu_usage_usec,
                     });
                 }
                 if Instant::now() >= grace {
@@ -2134,12 +2218,14 @@ fn execute_process(
                 thread::sleep(Duration::from_millis(20));
             }
             unsafe {
-                libc::kill(-(child.id() as i32), libc::SIGKILL);
+                libc::kill(-(pid as i32), libc::SIGKILL);
             }
-            let status = child.wait().map_err(|e| e.to_string())?;
+            let (status, cpu_usage_usec) = wait4_process(pid, 0)?
+                .ok_or_else(|| format!("blocking wait4({pid}) returned no child"))?;
             return Ok(ProcessOutput {
                 status,
                 timed_out: true,
+                cpu_usage_usec,
             });
         }
         thread::sleep(Duration::from_millis(20));
@@ -2160,6 +2246,7 @@ fn cell_timeout_attempt(
         signal: None,
         timed_out: true,
         duration_ms: duration.as_millis(),
+        cpu_usage_usec: None,
         observation_sha256: None,
         argv: spec.argv.clone(),
         guest_argv: spec.guest_argv.clone(),
@@ -2232,7 +2319,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
     let binary_before = fs::read(&context.hermit_bin)
         .ok()
         .map(|bytes| hex_digest(&bytes));
-    let guest = prepare_test_until(context, cell, &dir, deadline)?;
+    let (guest, preparation_cpu_usage_usec) = prepare_test_until(context, cell, &dir, deadline)?;
     let mode = cell.test.modes.get(&cell.id.mode).unwrap();
     let mut attempts = Vec::new();
     match cell.id.mode.as_str() {
@@ -2451,6 +2538,11 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         outcome = "ERROR".into();
         reason = Some("Hermit binary changed while the cell was executing".into());
     }
+    let cpu_usage_usec = attempts
+        .iter()
+        .try_fold(preparation_cpu_usage_usec, |total, attempt| {
+            checked_add_cpu_usage(Some(total), attempt.cpu_usage_usec)
+        });
     Ok(CellResult {
         artifact_dir: dir.display().to_string(),
         schema: CELL_RESULT_SCHEMA,
@@ -2479,6 +2571,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         error_kind,
         timeout_seconds: cell.timeout_seconds,
         duration_ms: Some(started.elapsed().as_millis()),
+        cpu_usage_usec,
         runtime: attempts.iter().find_map(|attempt| attempt.runtime.clone()),
         log_level: (cell.id.mode != "naked").then(|| "info".into()),
         effective_args: literal_argv.iter().skip(1).cloned().collect(),
@@ -2551,6 +2644,7 @@ pub fn infrastructure_error_result(
         error_kind: Some("infrastructure".into()),
         timeout_seconds: cell.timeout_seconds,
         duration_ms: None,
+        cpu_usage_usec: None,
         runtime: None,
         log_level: (cell.id.mode != "naked").then(|| "info".into()),
         effective_args: Vec::new(),
@@ -2615,6 +2709,7 @@ pub fn host_inapplicable_result(
         error_kind: None,
         timeout_seconds: cell.timeout_seconds,
         duration_ms: None,
+        cpu_usage_usec: None,
         runtime: None,
         log_level: None,
         effective_args: Vec::new(),
@@ -3717,6 +3812,47 @@ mod tests {
     }
 
     #[test]
+    fn wait4_cpu_usage_moves_with_descendant_work() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-cpu-usage-bracket-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let measure = |label: &str, script: &str| {
+            execute_process(
+                &root,
+                "/bin/sh",
+                &["-c".into(), script.into()],
+                &BTreeMap::new(),
+                &root.join(format!("{label}.stdout")),
+                &root.join(format!("{label}.stderr")),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .unwrap()
+        };
+        let low = measure("low", ":");
+        let high = measure("high", "head -c 134217728 /dev/zero | sha256sum >/dev/null");
+        assert!(low.status.success());
+        assert!(high.status.success());
+        assert!(
+            high.cpu_usage_usec > low.cpu_usage_usec.saturating_add(10_000),
+            "adding 128 MiB of descendant hashing did not move CPU usage: low={} high={}",
+            low.cpu_usage_usec,
+            high.cpu_usage_usec
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cpu_usage_aggregation_refuses_missing_or_overflowing_measurements() {
+        assert_eq!(checked_add_cpu_usage(Some(2), Some(3)), Some(5));
+        assert_eq!(checked_add_cpu_usage(Some(2), None), None);
+        assert_eq!(checked_add_cpu_usage(None, Some(3)), None);
+        assert_eq!(checked_add_cpu_usage(Some(u64::MAX), Some(1)), None);
+    }
+
+    #[test]
     fn repeated_invocations_share_one_outer_cell_deadline() {
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-cell-deadline-{}",
@@ -3782,6 +3918,13 @@ mod tests {
             duration_ms < 2_000,
             "three independent one-second bounds would take longer: {duration_ms}ms"
         );
+        let attempt_cpu_usage_usec = result.attempts.iter().try_fold(0u64, |total, attempt| {
+            checked_add_cpu_usage(Some(total), attempt.cpu_usage_usec)
+        });
+        assert_eq!(
+            result.cpu_usage_usec, attempt_cpu_usage_usec,
+            "the cell CPU figure must sum every process-owned attempt measurement"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3837,6 +3980,7 @@ mod tests {
         assert!(result.binary_sha256.is_none());
         assert_eq!(result.error_kind, None);
         assert_eq!(result.duration_ms, None);
+        assert_eq!(result.cpu_usage_usec, None);
         let results = root.join("results.jsonl");
         append_result(&results, &result).unwrap();
         assert!(
@@ -3847,6 +3991,10 @@ mod tests {
         assert!(
             row.get("duration_ms").is_none(),
             "a cell that never executed must not publish a measured zero wall time"
+        );
+        assert!(
+            row["cpu_usage_usec"].is_null(),
+            "a cell that never executed must publish null rather than a measured zero CPU time"
         );
         let mut measured_zero = result.clone();
         measured_zero.duration_ms = Some(0);
@@ -4828,6 +4976,7 @@ backends_disabled:
             error_kind: None,
             timeout_seconds: 1,
             duration_ms: Some(1),
+            cpu_usage_usec: Some(1),
             runtime: None,
             log_level: None,
             effective_args: Vec::new(),
@@ -4946,6 +5095,7 @@ backends_disabled:
             signal: None,
             timed_out: false,
             duration_ms: 1,
+            cpu_usage_usec: Some(1),
             observation_sha256: Some("a".into()),
             argv: vec![
                 "hermit".into(),
@@ -5485,6 +5635,85 @@ backends_disabled:
             &cell_dir.join("captures"),
         );
         assert!(empty.contains("no output was captured"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preparation_uses_the_named_cells_wall_deadline() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-preparation-timeout-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let cell_dir = root.join("cell");
+        fs::create_dir_all(cell_dir.join("captures")).unwrap();
+        let context = RunContext {
+            root: root.clone(),
+            hermit_bin: root.join("hermit"),
+            result_root: root.join("results"),
+            build_root: root.join("build"),
+            run_id: "fixture".into(),
+            machine_shortname: "fixture-host".into(),
+            kernel_version: "7.1.3-fixture".into(),
+            host_capabilities: fixture_host_capabilities(),
+            attempt: 1,
+            run_index: None,
+            source_sha: "0".repeat(40),
+            binary_build_sha: None,
+            source_dirty: false,
+            prebuilt: false,
+            keep_logs: false,
+            run_verify_strict: false,
+            record_verify_strict: false,
+            scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
+            isolated_workdir: None,
+        };
+        let test = recipe(true);
+        let cell = SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: test.id.clone(),
+                mode: "verify".into(),
+                backend: Some("ptrace".into()),
+            },
+            test,
+            enabled: true,
+            timeout_seconds: 1,
+        };
+
+        let error = run_preparation(
+            &context,
+            &cell_dir,
+            "/bin/sh",
+            &["-c".into(), "sleep 60".into()],
+            Instant::now() + Duration::from_secs(1),
+            cell.timeout_seconds,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("cell exceeded 1 s during fixture preparation"),
+            "{error}"
+        );
+        let result = infrastructure_error_result(&context, &cell, error);
+        assert_eq!(result.test, "fixture/test");
+        assert_eq!(result.error_kind.as_deref(), Some("infrastructure"));
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("cell exceeded 1 s during fixture preparation")
+        );
+
+        run_preparation(
+            &context,
+            &cell_dir,
+            "/bin/sh",
+            &["-c".into(), "true".into()],
+            Instant::now() + Duration::from_secs(1),
+            cell.timeout_seconds,
+        )
+        .expect("healthy fixture preparation must finish silently under the same bound");
         fs::remove_dir_all(root).unwrap();
     }
 

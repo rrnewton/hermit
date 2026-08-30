@@ -51,6 +51,12 @@ The path is deliberately direct:
    cell `duration_ms`, the `timeout_seconds` used for that attempt, literal
    argv, explicit environment, working directory, and pasteable shell command.
    A retry adds another row; it does not replace the earlier observation.
+   `attempts[].cpu_usage_usec` records `wait4` user-plus-system CPU for that
+   launched child and descendants it reaped. The row-level `cpu_usage_usec`
+   adds preparation and every launched attempt with checked arithmetic; it is
+   null when execution did not occur or any required measurement is incomplete.
+   The bucket `summary.json` field `cell_cpu_usage_usec` likewise sums every
+   emitted applicable row, including failed rows followed by retries.
 4. The final `scorecard.compatibility` node requires a clean, exact-HEAD PASS
    row for every selected cell and prints the table.
 5. The checked-in table and cell identities must still equal what the manifest

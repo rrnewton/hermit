@@ -418,6 +418,20 @@ fn run() -> Result<(), String> {
     }
     let report =
         TestResults::current(parsed.executed_tests, parsed.filtered_tests, parsed.results)?;
+    if let Some(expected) = match env::var("NEXTEST_EXPECTED_EXECUTED") {
+        Ok(value) => Some(parse_u64(value, "NEXTEST_EXPECTED_EXECUTED")?),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err("nextest-test-results NEXTEST_EXPECTED_EXECUTED is not UTF-8".into());
+        }
+    } {
+        if report.executed_tests != expected {
+            return Err(format!(
+                "nextest-test-results: expected {expected} tests to execute, saw {}; refusing because the selected set changed",
+                report.executed_tests
+            ));
+        }
+    }
     if output != "-" {
         report.write_current(Path::new(&output))?;
     }
