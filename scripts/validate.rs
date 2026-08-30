@@ -124,6 +124,9 @@ use hermit_manifest_plan::runner::Population;
 use hermit_manifest_plan::runner::Selection;
 use hermit_manifest_plan::runner::E2E_KERNEL_VERSION_ENV;
 use hermit_manifest_plan::runner::E2E_MACHINE_SHORTNAME_ENV;
+use hermit_manifest_plan::service_result::FinalValidateStatus;
+use hermit_manifest_plan::service_result::ScorecardWriteback;
+use hermit_manifest_plan::service_result::ValidationServiceResult;
 
 use validate_plan::CompatMode;
 use validate_plan::CompatDisposition;
@@ -431,8 +434,10 @@ fn usage() -> &'static str {
      \x20 FINAL_VALIDATE_STATUS: PASSED          exit 0\n\
      \x20 FINAL_VALIDATE_STATUS: FAILED          exit 1\n\
      \x20 FINAL_VALIDATE_STATUS: COULD_NOT_RUN   exit 75\n\
-     The line is validate's last output. Readers take the last occurrence and\n\
-     require the exit code to agree; no line means validate died before reporting.\n\
+     The line is validate's last output and reports the validation verdict. A\n\
+     post-verdict scorecard write-back failure preserves that line and exits 75;\n\
+     current readers distinguish the two through ValidationServiceResult. No line\n\
+     means validate died before reporting.\n\
      Help, --show-plan, and --probe-host-capability do not attempt validation and\n\
      therefore do not emit a final validate status.\n\
      \n\
@@ -1350,7 +1355,7 @@ fn self_test() -> Result<(), String> {
     let lines = run_summary_lines(&writeback_failed, std::time::Instant::now());
     if (writeback_failed.verdict, writeback_failed.exit_code)
         != (Verdict::Pass, COULD_NOT_RUN_EXIT_CODE)
-        || lines.last().map(String::as_str) != Some("FINAL_VALIDATE_STATUS: COULD_NOT_RUN")
+        || lines.last().map(String::as_str) != Some("FINAL_VALIDATE_STATUS: PASSED")
         || !lines.iter().any(|line| line.contains("validation verdict above is unchanged"))
     {
         return Err(format!(
@@ -1359,6 +1364,74 @@ fn self_test() -> Result<(), String> {
              verdict={:?} command_exit={} lines={lines:?}",
             writeback_failed.verdict,
             writeback_failed.exit_code,
+        ));
+    }
+    let writeback_result_dir = tempfile::tempdir()
+        .map_err(|error| format!("summary: cannot create write-back result fixture: {error}"))?;
+    let writeback_result_path = writeback_result_dir.path().join("result.json");
+    write_validation_service_result(&writeback_result_path, &writeback_failed)?;
+    let writeback_result = ValidationServiceResult::from_json_slice(
+        &std::fs::read(&writeback_result_path)
+            .map_err(|error| format!("summary: cannot read write-back result: {error}"))?,
+    )?;
+    if writeback_result.final_validate_status != FinalValidateStatus::Passed
+        || writeback_result.exit_code != i32::from(COULD_NOT_RUN_EXIT_CODE)
+        || writeback_result.scorecard_writeback
+            != Some(ScorecardWriteback::Failed {
+                error: "fixture refusal".into(),
+            })
+    {
+        return Err(format!(
+            "summary: scorecard write-back refusal did not preserve the validation verdict and carry its own typed failure: {writeback_result:?}"
+        ));
+    }
+    let mut genuine_could_not_run =
+        RunSummary::new(Verdict::NoResult, COULD_NOT_RUN_EXIT_CODE, "self-test", Vec::new());
+    genuine_could_not_run.nodes_executed = 1;
+    let could_not_run_path = writeback_result_dir.path().join("could-not-run.json");
+    write_validation_service_result(&could_not_run_path, &genuine_could_not_run)?;
+    let could_not_run = ValidationServiceResult::from_json_slice(
+        &std::fs::read(&could_not_run_path)
+            .map_err(|error| format!("summary: cannot read could-not-run result: {error}"))?,
+    )?;
+    if could_not_run.final_validate_status != FinalValidateStatus::CouldNotRun
+        || could_not_run.exit_code != i32::from(COULD_NOT_RUN_EXIT_CODE)
+        || could_not_run.scorecard_writeback.is_some()
+        || run_summary_lines(&genuine_could_not_run, std::time::Instant::now())
+            .last()
+            .map(String::as_str)
+            != Some("FINAL_VALIDATE_STATUS: COULD_NOT_RUN")
+    {
+        return Err(format!(
+            "summary: genuine could-not-run collapsed into a write-back failure: {could_not_run:?}"
+        ));
+    }
+    let service_result_dir = tempfile::tempdir()
+        .map_err(|error| format!("summary: cannot create service-result fixture: {error}"))?;
+    let service_result_path = service_result_dir.path().join("result.json");
+    let mut service_summary = RunSummary::new(Verdict::Pass, 0, "full", Vec::new());
+    service_summary.nodes_executed = 76;
+    service_summary.executed_tests = Some(2129);
+    write_validation_service_result(&service_result_path, &service_summary)?;
+    let service_result = ValidationServiceResult::from_json_slice(
+        &std::fs::read(&service_result_path)
+            .map_err(|error| format!("summary: cannot read service result: {error}"))?,
+    )?;
+    if service_result.final_validate_status != FinalValidateStatus::Passed
+        || service_result.exit_code != 0
+        || service_result.executed_nodes != 76
+        || service_result.executed_tests != Some(2129)
+        || service_result.scorecard_writeback.is_some()
+    {
+        return Err(format!(
+            "summary: framework service result lost typed status or counts: {service_result:?}"
+        ));
+    }
+    let overwrite_error = write_validation_service_result(&service_result_path, &service_summary)
+        .expect_err("a second writer must not replace the first service result");
+    if !overwrite_error.contains("without replacing an existing result") {
+        return Err(format!(
+            "summary: service-result collision did not fail by name: {overwrite_error}"
         ));
     }
     let exe = std::env::current_exe()
@@ -4111,12 +4184,17 @@ fn record_scorecard_writeback(
 ) {
     let Some(writeback) = writeback else { return };
     let detail = match writeback {
-        Ok(()) =>
-            "scorecard write-back completed; review the generated SCORECARD.md and ci/compat-envelope/cells.json changes before committing".into(),
+        Ok(()) => {
+            summary.scorecard_writeback = Some(ScorecardWriteback::Completed);
+            "scorecard write-back completed; review the generated SCORECARD.md and ci/compat-envelope/cells.json changes before committing".into()
+        }
         Err(error) => {
             if summary.exit_code == 0 {
                 summary.exit_code = COULD_NOT_RUN_EXIT_CODE;
             }
+            summary.scorecard_writeback = Some(ScorecardWriteback::Failed {
+                error: error.clone(),
+            });
             format!(
                 "scorecard write-back FAILED after validation evidence was finalized: {error}; the validation verdict above is unchanged"
             )
@@ -14800,47 +14878,19 @@ enum Verdict {
 }
 
 const FINAL_VALIDATE_STATUS_PREFIX: &str = "FINAL_VALIDATE_STATUS: ";
-const FAILED_EXIT_CODE: u8 = 1;
 const COULD_NOT_RUN_EXIT_CODE: u8 = NO_RESULT_EXIT_CODE as u8;
+const VALIDATE_SERVICE_RESULT_PATH_ENV: &str = "VALIDATE_SERVICE_RESULT_PATH";
 
-/// The machine-readable result of an actual validation attempt.
-///
-/// Help, host-capability queries and `--show-plan` do not attempt validation, so
-/// they do not emit this contract. Every path that does attempt validation maps
-/// to exactly one of these three values and to exactly one exit code.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum FinalValidateStatus {
-    Passed,
-    Failed,
-    CouldNotRun,
-}
-
-impl FinalValidateStatus {
-    fn for_verdict(verdict: Verdict) -> Option<Self> {
-        match verdict {
-            Verdict::Pass | Verdict::SelfTest | Verdict::CacheHit => Some(Self::Passed),
-            Verdict::Fail => Some(Self::Failed),
-            Verdict::NoResult | Verdict::Refused | Verdict::Interrupted => {
-                Some(Self::CouldNotRun)
-            }
-            Verdict::PlanOnly | Verdict::Help => None,
+fn final_validate_status(verdict: Verdict) -> Option<FinalValidateStatus> {
+    match verdict {
+        Verdict::Pass | Verdict::SelfTest | Verdict::CacheHit => {
+            Some(FinalValidateStatus::Passed)
         }
-    }
-
-    fn word(self) -> &'static str {
-        match self {
-            Self::Passed => "PASSED",
-            Self::Failed => "FAILED",
-            Self::CouldNotRun => "COULD_NOT_RUN",
+        Verdict::Fail => Some(FinalValidateStatus::Failed),
+        Verdict::NoResult | Verdict::Refused | Verdict::Interrupted => {
+            Some(FinalValidateStatus::CouldNotRun)
         }
-    }
-
-    fn exit_code(self) -> u8 {
-        match self {
-            Self::Passed => 0,
-            Self::Failed => FAILED_EXIT_CODE,
-            Self::CouldNotRun => COULD_NOT_RUN_EXIT_CODE,
-        }
+        Verdict::PlanOnly | Verdict::Help => None,
     }
 }
 
@@ -14915,6 +14965,7 @@ struct RunSummary {
     /// status-line ordering contract.
     epilogue: Vec<String>,
     profile: String,
+    selection_mode: Option<String>,
     commit: String,
     nodes_executed: usize,
     nodes_failed: usize,
@@ -14923,6 +14974,8 @@ struct RunSummary {
     /// Counted separately from `nodes_executed` and `nodes_skipped` so the
     /// one-line accounting can never read as though everything planned ran.
     nodes_host_inapplicable: usize,
+    /// Aggregate from typed step outcomes. `None` is unknown, never zero.
+    executed_tests: Option<i64>,
     /// Individual test ids that failed and then passed, with the retry grants
     /// that followed their failed attempts. Rendered even on a green run.
     flaky: Vec<TestIdRetry>,
@@ -14949,12 +15002,15 @@ struct RunSummary {
     /// receipt unciteable). `None` on a path that stopped before cleanup; `main`
     /// then measures live rather than printing nothing.
     cpu_wall: Option<(f64, f64, f64)>,
+    /// Bookkeeping performed after the validation verdict was finalized.
+    /// Failure remains a loud command error but cannot rewrite that verdict.
+    scorecard_writeback: Option<ScorecardWriteback>,
 }
 
 impl RunSummary {
     fn new(verdict: Verdict, exit_code: u8, profile: &str, detail: Vec<String>) -> Self {
-        let exit_code = FinalValidateStatus::for_verdict(verdict)
-            .map(FinalValidateStatus::exit_code)
+        let exit_code = final_validate_status(verdict)
+            .map(|status| u8::try_from(status.exit_code()).expect("fixed exit fits u8"))
             .unwrap_or(exit_code);
         RunSummary {
             verdict,
@@ -14962,11 +15018,13 @@ impl RunSummary {
             detail,
             epilogue: Vec::new(),
             profile: profile.to_string(),
+            selection_mode: None,
             commit: git_sha(),
             nodes_executed: 0,
             nodes_failed: 0,
             nodes_skipped: 0,
             nodes_host_inapplicable: 0,
+            executed_tests: None,
             flaky: Vec::new(),
             failed_ids: Vec::new(),
             failed_nodes_without_test_ids: Vec::new(),
@@ -14977,6 +15035,7 @@ impl RunSummary {
             log: None,
             ledger: None,
             cpu_wall: None,
+            scorecard_writeback: None,
         }
     }
     /// Admission control declined. `what` names the gate, `why` the reason.
@@ -15441,8 +15500,8 @@ fn run_summary_lines(s: &RunSummary, started: std::time::Instant) -> Vec<String>
     if s.verdict == Verdict::Help {
         return Vec::new();
     }
-    let validation_exit_code = FinalValidateStatus::for_verdict(s.verdict)
-        .map(FinalValidateStatus::exit_code)
+    let validation_exit_code = final_validate_status(s.verdict)
+        .map(|status| u8::try_from(status.exit_code()).expect("fixed exit fits u8"))
         .unwrap_or(s.exit_code);
     let mut lines = vec![
         String::new(),
@@ -15582,14 +15641,12 @@ fn run_summary_lines(s: &RunSummary, started: std::time::Instant) -> Vec<String>
         validate_runtime::cpu_wall_line(human_duration, wall, user, sys, host_cpus)
     ));
     lines.extend(s.epilogue.iter().cloned());
-    if let Some(mut status) = FinalValidateStatus::for_verdict(s.verdict) {
-        if status.exit_code() != s.exit_code {
-            status = FinalValidateStatus::CouldNotRun;
-        }
+    if let Some(status) = final_validate_status(s.verdict) {
         // LAST by contract. A wrapper, guest, fixture or quoted diagnostic may
-        // have written an earlier lookalike to the same channel; readers use the
-        // last occurrence and require its value to agree with the exit code.
-        lines.push(format!("{FINAL_VALIDATE_STATUS_PREFIX}{}", status.word()));
+        // have written an earlier lookalike to the same channel. This line is the
+        // validation verdict; the versioned result records a distinct post-verdict
+        // write-back failure when the command exit does not match that verdict.
+        lines.push(format!("{FINAL_VALIDATE_STATUS_PREFIX}{}", status.as_str()));
     }
     lines
 }
@@ -15598,6 +15655,62 @@ fn print_run_summary(s: &RunSummary, started: std::time::Instant) {
     for line in run_summary_lines(s, started) {
         println!("{line}");
     }
+}
+
+fn write_validation_service_result(path: &Path, summary: &RunSummary) -> Result<(), String> {
+    use std::io::Write;
+
+    let Some(status) = final_validate_status(summary.verdict) else {
+        return Ok(());
+    };
+    let result = ValidationServiceResult {
+        schema_version: hermit_manifest_plan::service_result::SCHEMA_VERSION,
+        commit: summary.commit.clone(),
+        profile: summary.profile.clone(),
+        selection_mode: summary.selection_mode.clone(),
+        final_validate_status: status,
+        exit_code: i32::from(summary.exit_code),
+        executed_nodes: u64::try_from(summary.nodes_executed)
+            .map_err(|_| "validation-service-result-executed_nodes exceeds u64".to_string())?,
+        executed_tests: summary.executed_tests,
+        scorecard_writeback: summary.scorecard_writeback.clone(),
+    }
+    .validated()?;
+    let bytes = serde_json::to_vec(&result)
+        .map_err(|error| format!("cannot encode validation service result: {error}"))?;
+    let parent = path.parent().ok_or_else(|| {
+        format!(
+            "cannot publish validation service result to {}: path has no parent",
+            path.display()
+        )
+    })?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
+        format!(
+            "cannot create validation service result beside {}: {error}",
+            path.display()
+        )
+    })?;
+    temporary
+        .write_all(&[bytes.as_slice(), b"\n"].concat())
+        .and_then(|()| temporary.flush())
+        .map_err(|error| format!("cannot write validation service result: {error}"))?;
+    temporary.persist_noclobber(path).map_err(|error| {
+        format!(
+            "cannot publish validation service result to {} without replacing an existing result: {error}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn publish_validation_service_result(
+    path: Option<&Path>,
+    summary: &RunSummary,
+) -> Result<(), String> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    write_validation_service_result(path, summary)
 }
 
 /// `--probe-host-capability <name>`: report THIS machine's verdict for one
@@ -15920,12 +16033,19 @@ fn main() -> ExitCode {
     if let Some(code) = probe_host_capability_query() {
         return ExitCode::from(code);
     }
+    // This belongs to the one process admitted by ci-hub. Nested validator
+    // invocations must not inherit authority to publish a competing result.
+    let service_result_path = std::env::var_os(VALIDATE_SERVICE_RESULT_PATH_ENV).map(PathBuf::from);
+    std::env::remove_var(VALIDATE_SERVICE_RESULT_PATH_ENV);
     install_stop_handlers();
     let started = std::time::Instant::now();
 
     // The durable log outlives `run` so the summary lands INSIDE it.
     let mut durable: Option<DurableLog> = None;
     let summary = run(&mut durable);
+    if let Err(error) = publish_validation_service_result(service_result_path.as_deref(), &summary) {
+        eprintln!("validate: ERROR: {error}");
+    }
     print_run_summary(&summary, started);
     if let Some(d) = durable.take() {
         d.finish();
@@ -16757,6 +16877,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                     ),
                 ],
             );
+            s.selection_mode = Some(plan.selection_mode.into());
             s.ledger = Some(ledger.clone());
             return s;
         }
@@ -17222,6 +17343,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         s.nodes_failed = outcomes.iter().filter(|o| outcome_is_failure(o)).count();
         s.nodes_skipped = skipped.len();
         s.nodes_host_inapplicable = plan.host_inapplicable.len();
+        s.selection_mode = Some(plan.selection_mode.into());
         s.wall_s = Some(wall);
         s.jobs = Some(jobs);
         s.log = Some(log_path);
@@ -17775,6 +17897,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     s.individual_test_results_complete = individual_test_results_complete;
     s.nodes_skipped = skipped.len();
     s.nodes_host_inapplicable = plan.host_inapplicable.len();
+    s.executed_tests = executed_tests;
+    s.selection_mode = Some(plan.selection_mode.into());
     s.wall_s = Some(wall);
     s.jobs = Some(jobs);
     s.log = Some(log_path);
