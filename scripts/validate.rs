@@ -18641,8 +18641,8 @@ mod e2e_attempt_tests {
             retry_candidate_tags(
                 &cfg,
                 &[
-                    (manifest_tag.clone(), "always-eligible".into()),
-                    (ordinary_tag.clone(), "always-eligible".into()),
+                    (manifest_tag.clone(), RetryClass::AlwaysEligible, None),
+                    (ordinary_tag.clone(), RetryClass::AlwaysEligible, None),
                 ],
                 &[],
                 &failed_by_tag,
@@ -18651,6 +18651,23 @@ mod e2e_attempt_tests {
             ),
             &ordinary_tag,
             "reported failure/blocked",
+        );
+
+        // A command that happens to invoke the manifest harness is still an
+        // ordinary step until the typed manifest metadata identifies it as a
+        // manifest run. Keep this guard beside the retry-source assertions: a
+        // label or command-string heuristic would silently change which cells
+        // receive an outer retry.
+        let mut relabelled = step_with_caps(
+            "fixture",
+            "custom_manifest_runner",
+            "fixture",
+            "./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane portable"
+                .into(),
+            Vec::new(),
+            30,
+            30,
+            64 * 1024 * 1024,
         );
         assert_eq!(
             validation_step_identity(&relabelled),
