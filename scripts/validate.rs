@@ -1546,6 +1546,19 @@ fn self_test() -> Result<(), String> {
     if parse_argv(&["--run-timeout".into()]).is_ok() {
         return Err("run-timeout parser accepted a missing value".into());
     }
+    if effective_run_timeout(None, Some(1619), true).is_some() {
+        return Err(
+            "plan-only invocation inherited an enclosing validation's execution timeout".into(),
+        );
+    }
+    if effective_run_timeout(Some(600), Some(1619), true) != Some(600)
+        || effective_run_timeout(None, Some(1619), false) != Some(1619)
+        || effective_run_timeout(Some(600), Some(1619), false) != Some(600)
+    {
+        return Err(
+            "explicit plan audit or real execution lost its timeout selection semantics".into(),
+        );
+    }
     if scope_grace_s(600) != 60 || 600 + scope_grace_s(600) >= 720 {
         return Err("run-timeout scope backstop no longer satisfies 600 < 660 < 720".into());
     }
@@ -2116,6 +2129,22 @@ cleared-caps refusal names {} starved step(s)",
         let full_args = parse_argv(&["full".into(), "--no-label-pr".into()])
             .map_err(|rc| format!("full-plan bracket: parser refused positive form rc={rc}"))?;
         let full = build_plan(&root, &full_args, &tmp)?;
+        let inherited_timeout_violations = steps_violating_run_timeout(&full.cfg, 1619);
+        if !inherited_timeout_violations
+            .iter()
+            .any(|(tag, timeout)| tag == "check.lint_checks" && *timeout == 2400)
+        {
+            return Err(format!(
+                "full-plan bracket: the inherited-timeout fixture no longer contains the raw \
+                 check.lint_checks 2400s declaration: {inherited_timeout_violations:?}"
+            ));
+        }
+        if steps_violating_run_timeout(&full.cfg, 1).is_empty() {
+            return Err(
+                "full-plan bracket: an impossible real execution timeout no longer refuses"
+                    .into(),
+            );
+        }
         if full.second.is_some() {
             return Err("full-plan bracket: default full plan is still sequential".into());
         }
@@ -3820,6 +3849,27 @@ fn default_jobs() -> i64 {
 /// establishing the configured 600 < 660 portion of the nesting ladder.
 fn scope_grace_s(run_timeout_s: i64) -> i64 {
     60.max(run_timeout_s / 10)
+}
+
+/// A plan-only invocation executes no nodes and establishes no run deadline.
+///
+/// In particular, it may be called from a node of an enclosing validation and
+/// inherit that run's timeout environment. Applying the inherited execution
+/// budget to the raw, pre-wrapping plan makes an inert inventory query refuse
+/// even though the enclosing execution has already clamped its runnable nodes
+/// to the time remaining. An explicit `--run-timeout` still audits the raw plan
+/// by request. Real executions keep the timeout unchanged and still fail closed
+/// on an impossible budget.
+fn effective_run_timeout(
+    explicit: Option<i64>,
+    inherited: Option<i64>,
+    show_plan: bool,
+) -> Option<i64> {
+    if show_plan {
+        explicit
+    } else {
+        explicit.or(inherited)
+    }
 }
 
 /// The wall ceiling every node must fit inside, DERIVED from the seconds left on
@@ -16068,9 +16118,11 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // Anchor the logical run before locks, freshness checks, plan construction, cgroup re-exec,
     // durable-log setup, and registration.  A nested focused payload inherits the enclosing
     // safe-ci step's scheduler-owned epoch; a top-level run owns its epoch here.
-    let run_timeout = args
-        .run_timeout
-        .or_else(|| env_positive("HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS"));
+    let run_timeout = effective_run_timeout(
+        args.run_timeout,
+        env_positive("HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS"),
+        args.show_plan,
+    );
     let deadline_ns = if args.show_plan {
         None
     } else {
@@ -16417,9 +16469,12 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // The whole-run budget is the first boundary able to stop cumulative cost
     // while preserving evidence. Per-node caps cannot bound a sequence of legal
     // nodes, and the hosted job kill discards the diagnostic tail.
-    // Refuse an inverted ladder before even `--show-plan` succeeds. A node with
-    // an allowance at least as large as the run budget can only be cut by the
-    // less-specific outer clock, losing attribution to the node.
+    // Refuse an inverted ladder for every execution. A node with an allowance
+    // at least as large as the run budget can only be cut by the less-specific
+    // outer clock, losing attribution to the node. `--show-plan` has no run
+    // deadline and executes nothing, so an inherited execution budget is not
+    // applicable to its raw, pre-wrapping plan. An explicit `--run-timeout`
+    // still asks to audit that prospective ladder.
     if let Some(secs) = run_timeout {
         let mut bad = steps_violating_run_timeout(&plan.cfg, secs);
         if let Some(second) = &plan.second {
