@@ -20,7 +20,7 @@ mod rust_script_prelude;
 
 fn usage() {
     println!(
-        "usage:\n  test-results.rs write OUTPUT_OR_DASH EXECUTED FILTERED [ID pass|fail ATTEMPTS]...\n  test-results.rs read INPUT\n  test-results.rs summary INPUT"
+        "usage:\n  structured-test-results.rs write OUTPUT_OR_DASH EXECUTED FILTERED [ID pass|fail ATTEMPTS]...\n  structured-test-results.rs read INPUT\n  structured-test-results.rs summary INPUT"
     );
 }
 

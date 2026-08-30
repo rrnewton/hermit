@@ -73,7 +73,7 @@ self_test_typed_results() {
   # shellcheck disable=SC2016 # `$` is part of the stable test identity.
   test_results=('suite$passes' pass 1)
   DAGRUN_TEST_COUNTS_PATH="$scratch/results.json" write_current_test_results 1 || return 1
-  canonical=$("$repository/ci/test-results.rs" read "$scratch/results.json") || return 1
+  canonical=$("$repository/ci/structured-test-results.rs" read "$scratch/results.json") || return 1
   jq -e '
     .executed_tests == 2
     and .filtered_tests == 3
