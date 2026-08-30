@@ -95,12 +95,20 @@ mod validate_super; // Normalizes and audits extracted Cargo tests/synthetic arg
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
+use std::io::Read;
+use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitCode;
+use sha2::Digest;
+use sha2::Sha256;
 use dagrun::cgroup::aggregate_slice_max_cpus;
 use dagrun::cgroup::is_in_scope;
 use dagrun::model::CmdType;
@@ -191,6 +199,13 @@ fn validation_step_identity(step: &Step) -> ValidationStepIdentity {
 const LEDGER_ENV: &str = "HERMIT_VALIDATE_LEDGER";
 const PARENT_ENV: &str = "DEV_HERMIT_PARENT";
 const TOOL_ROOT_ENV: &str = "DEV_HERMIT_TOOL_ROOT";
+const TOOL_AUTHORITY_ENV: &str = "DEV_HERMIT_TOOL_AUTHORITY";
+const TOOL_CONTENT_SHA256_ENV: &str = "DEV_HERMIT_TOOL_CONTENT_SHA256";
+const TOOL_PARENT_SHA_ENV: &str = "DEV_HERMIT_TOOL_PARENT_SHA";
+const TOOL_HERMIT_SHA_ENV: &str = "DEV_HERMIT_TOOL_HERMIT_SHA";
+const TOOL_AGENT_UTILS_SHA_ENV: &str = "DEV_HERMIT_TOOL_AGENT_UTILS_SHA";
+const TOOL_BOOTSTRAP_SHA256_ENV: &str = "DEV_HERMIT_TOOL_BOOTSTRAP_SHA256";
+const TOOL_AUTHORITY_SCHEMA: &str = "dev-hermit-tool-authority-v1";
 const OWN_SCOPE_DEADLINE_ENV: &str = "HERMIT_VALIDATE_SCOPE_DEADLINE_MONOTONIC_NS";
 const NESTED_SCOPE_SELF_TEST_ENV: &str = "HERMIT_VALIDATE_NESTED_SCOPE_SELF_TEST";
 const SUMMARY_EPILOGUE_SELF_TEST_ENV: &str = "HERMIT_VALIDATE_SUMMARY_EPILOGUE_SELF_TEST";
@@ -4551,6 +4566,702 @@ fn find_parent(root: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Capability emitted by the installed immutable wrapper after it has retained
+/// both directories and verified the frozen bytes. This is deliberately a
+/// same-UID provenance contract, not a privilege boundary against a process
+/// that can already replace or impersonate that installed wrapper.
+#[derive(Debug)]
+struct ImmutableToolAuthority {
+    holder_pid: u32,
+    authority_fd: u32,
+    target_fd: u32,
+    target_root: PathBuf,
+    target_dev: u64,
+    target_ino: u64,
+    root_fd: u32,
+    root_dev: u64,
+    root_ino: u64,
+    state_fd: u32,
+    state_root: PathBuf,
+    state_dev: u64,
+    state_ino: u64,
+    content_sha256: String,
+    parent_sha: String,
+    hermit_sha: String,
+    agent_utils_sha: String,
+    bootstrap_sha256: String,
+}
+
+fn lowercase_hex(value: &str, digits: usize) -> bool {
+    value.len() == digits
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
+fn proc_fd_path(path: &Path) -> Option<(u32, u32)> {
+    let components: Vec<&[u8]> = path.as_os_str().as_bytes().split(|byte| *byte == b'/').collect();
+    if components.len() != 5
+        || !components[0].is_empty()
+        || components[1] != b"proc"
+        || components[3] != b"fd"
+    {
+        return None;
+    }
+    let parse = |value: &[u8]| -> Option<u32> {
+        if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(value).ok()?.parse().ok()
+    };
+    let pid = parse(components[2])?;
+    let fd = parse(components[4])?;
+    (pid > 0).then_some((pid, fd))
+}
+
+fn authority_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<String, String> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("immutable tool authority has no string {field}"))
+}
+
+fn authority_u64(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<u64, String> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("immutable tool authority has no integer {field}"))
+}
+
+fn read_immutable_tool_authority(
+    authority_path: &Path,
+    tool_root: &Path,
+    state_root: &Path,
+) -> Result<ImmutableToolAuthority, String> {
+    let (authority_pid, authority_fd_from_path) = proc_fd_path(authority_path).ok_or_else(|| {
+        format!(
+            "{TOOL_AUTHORITY_ENV} must be an exact /proc/<pid>/fd/<fd> capability"
+        )
+    })?;
+    let (root_pid, root_fd_from_path) = proc_fd_path(tool_root).ok_or_else(|| {
+        format!("{TOOL_ROOT_ENV} authority must be an exact /proc/<pid>/fd/<fd> capability")
+    })?;
+    if authority_pid != root_pid {
+        return Err("immutable tool root and authority are owned by different holders".into());
+    }
+
+    let mut authority_file = std::fs::File::open(authority_path).map_err(|error| {
+        format!(
+            "cannot open immutable tool authority {}: {error}",
+            authority_path.display()
+        )
+    })?;
+    let authority_metadata = authority_file
+        .metadata()
+        .map_err(|error| format!("cannot inspect immutable tool authority: {error}"))?;
+    if !authority_metadata.is_file()
+        || authority_metadata.nlink() != 0
+        || authority_metadata.mode() & 0o222 != 0
+    {
+        return Err(
+            "immutable tool authority must be one anonymous read-only regular file".into(),
+        );
+    }
+    let seals = unsafe { libc::fcntl(authority_file.as_raw_fd(), libc::F_GET_SEALS) };
+    let required_seals = libc::F_SEAL_SEAL
+        | libc::F_SEAL_SHRINK
+        | libc::F_SEAL_GROW
+        | libc::F_SEAL_WRITE;
+    if seals < 0 || seals & required_seals != required_seals {
+        return Err("immutable tool authority is not completely sealed".into());
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut authority_file)
+        .take(4097)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read immutable tool authority: {error}"))?;
+    if bytes.len() > 4096 {
+        return Err("immutable tool authority exceeds 4096 bytes".into());
+    }
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("immutable tool authority is not valid JSON: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or("immutable tool authority must be one JSON object")?;
+    let expected_fields: BTreeSet<&str> = [
+        "agent_utils_sha",
+        "authority_fd",
+        "bootstrap_sha256",
+        "content_sha256",
+        "hermit_sha",
+        "holder_pid",
+        "parent_sha",
+        "root_dev",
+        "root_fd",
+        "root_ino",
+        "schema",
+        "state_dev",
+        "state_fd",
+        "state_ino",
+        "state_root",
+        "target_dev",
+        "target_fd",
+        "target_ino",
+        "target_root",
+    ]
+    .into_iter()
+    .collect();
+    let observed_fields: BTreeSet<&str> = object.keys().map(String::as_str).collect();
+    if observed_fields != expected_fields {
+        return Err("immutable tool authority fields are incomplete or unknown".into());
+    }
+    if authority_string(object, "schema")? != TOOL_AUTHORITY_SCHEMA {
+        return Err("immutable tool authority has an unsupported schema".into());
+    }
+
+    let narrow_u32 = |field: &str| -> Result<u32, String> {
+        u32::try_from(authority_u64(object, field)?)
+            .map_err(|_| format!("immutable tool authority {field} is out of range"))
+    };
+    let authority = ImmutableToolAuthority {
+        holder_pid: narrow_u32("holder_pid")?,
+        authority_fd: narrow_u32("authority_fd")?,
+        target_fd: narrow_u32("target_fd")?,
+        target_root: PathBuf::from(authority_string(object, "target_root")?),
+        target_dev: authority_u64(object, "target_dev")?,
+        target_ino: authority_u64(object, "target_ino")?,
+        root_fd: narrow_u32("root_fd")?,
+        root_dev: authority_u64(object, "root_dev")?,
+        root_ino: authority_u64(object, "root_ino")?,
+        state_fd: narrow_u32("state_fd")?,
+        state_root: PathBuf::from(authority_string(object, "state_root")?),
+        state_dev: authority_u64(object, "state_dev")?,
+        state_ino: authority_u64(object, "state_ino")?,
+        content_sha256: authority_string(object, "content_sha256")?,
+        parent_sha: authority_string(object, "parent_sha")?,
+        hermit_sha: authority_string(object, "hermit_sha")?,
+        agent_utils_sha: authority_string(object, "agent_utils_sha")?,
+        bootstrap_sha256: authority_string(object, "bootstrap_sha256")?,
+    };
+    if authority.holder_pid != authority_pid
+        || authority.authority_fd != authority_fd_from_path
+        || authority.root_fd != root_fd_from_path
+    {
+        return Err("immutable tool authority does not name the supplied descriptors".into());
+    }
+    let descriptor_ids: BTreeSet<u32> = [
+        authority.authority_fd,
+        authority.target_fd,
+        authority.root_fd,
+        authority.state_fd,
+    ]
+    .into_iter()
+    .collect();
+    if descriptor_ids.len() != 4 {
+        return Err(
+            "immutable tool authority conflates target, executable, state, or record descriptors"
+                .into(),
+        );
+    }
+    for (label, value, digits) in [
+        ("content digest", authority.content_sha256.as_str(), 64),
+        ("parent SHA", authority.parent_sha.as_str(), 40),
+        ("Hermit SHA", authority.hermit_sha.as_str(), 40),
+        ("agent-utils SHA", authority.agent_utils_sha.as_str(), 40),
+        ("bootstrap digest", authority.bootstrap_sha256.as_str(), 64),
+    ] {
+        if !lowercase_hex(value, digits) {
+            return Err(format!("immutable tool authority has an invalid {label}"));
+        }
+    }
+
+    let held_target = PathBuf::from(format!(
+        "/proc/{}/fd/{}",
+        authority.holder_pid, authority.target_fd
+    ));
+    let target_metadata = std::fs::metadata(&held_target)
+        .map_err(|error| format!("cannot inspect cached target descriptor: {error}"))?;
+    if !target_metadata.is_dir()
+        || target_metadata.mode() & 0o222 != 0
+        || target_metadata.nlink() < 1
+        || (target_metadata.dev(), target_metadata.ino())
+            != (authority.target_dev, authority.target_ino)
+    {
+        return Err("cached target descriptor identity does not match its authority".into());
+    }
+    let resolved_target = std::fs::canonicalize(&authority.target_root).map_err(|error| {
+        format!(
+            "cannot resolve cached target authority {}: {error}",
+            authority.target_root.display()
+        )
+    })?;
+    if !authority.target_root.is_absolute()
+        || resolved_target != authority.target_root
+        || authority.target_root.file_name() != Some(OsStr::new(&authority.parent_sha))
+        || authority.target_root.parent().and_then(Path::file_name) != Some(OsStr::new("trees"))
+    {
+        return Err("cached target authority does not name canonical trees/<parent-sha>".into());
+    }
+    let live_target_metadata = std::fs::symlink_metadata(&resolved_target)
+        .map_err(|error| format!("cannot inspect canonical cached target: {error}"))?;
+    if !live_target_metadata.is_dir()
+        || (live_target_metadata.dev(), live_target_metadata.ino())
+            != (authority.target_dev, authority.target_ino)
+    {
+        return Err("cached target pathname no longer names the retained authority".into());
+    }
+    let held_target_path = std::fs::read_link(&held_target)
+        .map_err(|error| format!("cannot read cached target descriptor: {error}"))?;
+    if held_target_path != authority.target_root {
+        return Err("cached target descriptor no longer names its canonical path".into());
+    }
+
+    let root_metadata = std::fs::metadata(tool_root)
+        .map_err(|error| format!("cannot inspect retained immutable tool root: {error}"))?;
+    if !root_metadata.is_dir()
+        || (root_metadata.dev(), root_metadata.ino()) != (authority.root_dev, authority.root_ino)
+    {
+        return Err("immutable tool root descriptor identity does not match its authority".into());
+    }
+
+    let resolved_state = std::fs::canonicalize(state_root).map_err(|error| {
+        format!(
+            "cannot resolve canonical {PARENT_ENV} {}: {error}",
+            state_root.display()
+        )
+    })?;
+    if resolved_state != authority.state_root {
+        return Err(format!(
+            "canonical {PARENT_ENV} {} does not match immutable tool authority state root {}",
+            resolved_state.display(),
+            authority.state_root.display()
+        ));
+    }
+    let held_state = PathBuf::from(format!(
+        "/proc/{}/fd/{}",
+        authority.holder_pid, authority.state_fd
+    ));
+    let held_state_metadata = std::fs::metadata(&held_state)
+        .map_err(|error| format!("cannot inspect retained state-root descriptor: {error}"))?;
+    if !held_state_metadata.is_dir()
+        || (held_state_metadata.dev(), held_state_metadata.ino())
+            != (authority.state_dev, authority.state_ino)
+    {
+        return Err("retained state-root descriptor identity does not match its authority".into());
+    }
+    let live_state_metadata = std::fs::metadata(&resolved_state)
+        .map_err(|error| format!("cannot inspect canonical state root: {error}"))?;
+    if (live_state_metadata.dev(), live_state_metadata.ino())
+        != (authority.state_dev, authority.state_ino)
+    {
+        return Err("canonical state-root pathname no longer names the retained authority".into());
+    }
+    let held_state_target = std::fs::read_link(&held_state)
+        .map_err(|error| format!("cannot read retained state-root descriptor: {error}"))?;
+    if held_state_target != authority.state_root {
+        return Err("retained state-root descriptor no longer names its canonical path".into());
+    }
+    let directory_identities: BTreeSet<(u64, u64)> = [
+        (authority.target_dev, authority.target_ino),
+        (authority.root_dev, authority.root_ino),
+        (authority.state_dev, authority.state_ino),
+    ]
+    .into_iter()
+    .collect();
+    if directory_identities.len() != 3 {
+        return Err(
+            "immutable tool authority conflates target, executable, or state identity".into(),
+        );
+    }
+
+    Ok(authority)
+}
+
+fn digest_length(hasher: &mut Sha256, value: usize) {
+    hasher.update(u64::try_from(value).unwrap_or(u64::MAX).to_be_bytes());
+}
+
+fn digest_tool_entry(
+    path: &Path,
+    relative: &[u8],
+    hasher: &mut Sha256,
+) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect immutable tool entry {}: {error}", path.display()))?;
+    let mode = metadata.mode() & 0o7777;
+    let file_type = metadata.file_type();
+    if file_type.is_dir() {
+        if mode & 0o222 != 0 || metadata.nlink() < 1 {
+            return Err(format!("immutable tool directory is writable or unlinked: {}", path.display()));
+        }
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|error| format!("cannot retain immutable tool directory {}: {error}", path.display()))?;
+        let held_metadata = held
+            .metadata()
+            .map_err(|error| format!("cannot inspect retained tool directory: {error}"))?;
+        if !held_metadata.is_dir()
+            || (held_metadata.dev(), held_metadata.ino()) != (metadata.dev(), metadata.ino())
+        {
+            return Err(format!("immutable tool directory changed before hashing: {}", path.display()));
+        }
+        hasher.update(b"d");
+        digest_length(hasher, relative.len());
+        hasher.update(relative);
+        hasher.update(mode.to_be_bytes());
+        let mut entries = std::fs::read_dir(path)
+            .map_err(|error| format!("cannot list immutable tool directory {}: {error}", path.display()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot list immutable tool directory {}: {error}", path.display()))?;
+        entries.sort_by(|left, right| {
+            left.file_name()
+                .as_os_str()
+                .as_bytes()
+                .cmp(right.file_name().as_os_str().as_bytes())
+        });
+        for entry in entries {
+            let name = entry.file_name();
+            let name_bytes = name.as_os_str().as_bytes();
+            let mut child_relative = relative.to_vec();
+            if !child_relative.is_empty() {
+                child_relative.push(b'/');
+            }
+            child_relative.extend_from_slice(name_bytes);
+            if matches!(
+                child_relative.as_slice(),
+                b".git" | b"hermit/.git" | b"hermit/agent-utils/.git"
+            ) {
+                continue;
+            }
+            digest_tool_entry(&entry.path(), &child_relative, hasher)?;
+        }
+        let after = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("cannot recheck immutable tool directory: {error}"))?;
+        if (after.dev(), after.ino()) != (held_metadata.dev(), held_metadata.ino()) {
+            return Err(format!("immutable tool directory changed while hashing: {}", path.display()));
+        }
+    } else if file_type.is_file() {
+        if mode & 0o222 != 0 || metadata.nlink() != 1 {
+            return Err(format!("immutable tool file is writable or multiply linked: {}", path.display()));
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|error| format!("cannot open immutable tool file {}: {error}", path.display()))?;
+        let held_metadata = file
+            .metadata()
+            .map_err(|error| format!("cannot inspect retained tool file: {error}"))?;
+        if !held_metadata.is_file()
+            || (held_metadata.dev(), held_metadata.ino(), held_metadata.len())
+                != (metadata.dev(), metadata.ino(), metadata.len())
+        {
+            return Err(format!("immutable tool file changed before hashing: {}", path.display()));
+        }
+        hasher.update(b"f");
+        digest_length(hasher, relative.len());
+        hasher.update(relative);
+        hasher.update(mode.to_be_bytes());
+        hasher.update(metadata.len().to_be_bytes());
+        let mut observed = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = file
+                .read(&mut buffer)
+                .map_err(|error| format!("cannot read immutable tool file {}: {error}", path.display()))?;
+            if count == 0 {
+                break;
+            }
+            observed = observed.saturating_add(count as u64);
+            hasher.update(&buffer[..count]);
+        }
+        let after = file
+            .metadata()
+            .map_err(|error| format!("cannot recheck retained tool file: {error}"))?;
+        if observed != metadata.len()
+            || (after.dev(), after.ino(), after.len())
+                != (held_metadata.dev(), held_metadata.ino(), held_metadata.len())
+        {
+            return Err(format!("immutable tool file changed while hashing: {}", path.display()));
+        }
+    } else if file_type.is_symlink() {
+        let target = std::fs::read_link(path)
+            .map_err(|error| format!("cannot read immutable tool symlink {}: {error}", path.display()))?;
+        let target = target.as_os_str().as_bytes();
+        hasher.update(b"l");
+        digest_length(hasher, relative.len());
+        hasher.update(relative);
+        hasher.update(mode.to_be_bytes());
+        digest_length(hasher, target.len());
+        hasher.update(target);
+    } else {
+        return Err(format!("immutable tool has unsupported entry type at {}", path.display()));
+    }
+    Ok(())
+}
+
+fn immutable_tool_content_sha256(root: &Path) -> Result<String, String> {
+    let metadata = std::fs::metadata(root)
+        .map_err(|error| format!("cannot inspect immutable tool root {}: {error}", root.display()))?;
+    if !metadata.is_dir() || metadata.mode() & 0o222 != 0 {
+        return Err("immutable tool root must be one read-only directory".into());
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"dev-hermit-tool-content-v1\0");
+    let mut entries = std::fs::read_dir(root)
+        .map_err(|error| format!("cannot list immutable tool root: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot list immutable tool root: {error}"))?;
+    entries.sort_by(|left, right| {
+        left.file_name()
+            .as_os_str()
+            .as_bytes()
+            .cmp(right.file_name().as_os_str().as_bytes())
+    });
+    for entry in entries {
+        let name = entry.file_name();
+        let relative = name.as_os_str().as_bytes();
+        // Git metadata is not executable authority and is never consulted on
+        // this admission path. Exclude only the three repository roots the
+        // producer materializes; a nested `.git` anywhere else remains part of
+        // the digest and cannot be smuggled in as a generic exception.
+        if relative == b".git" {
+            continue;
+        }
+        digest_tool_entry(&entry.path(), relative, &mut hasher)?;
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn configured_authority_tool_root(
+    supplied: &Path,
+    state_root: &Path,
+) -> Result<PathBuf, String> {
+    let authority_value = std::env::var_os(TOOL_AUTHORITY_ENV)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("immutable tool authority is incomplete: {TOOL_AUTHORITY_ENV} is absent"))?;
+    let authority_path = PathBuf::from(authority_value);
+    if !authority_path.is_absolute() {
+        return Err(format!("{TOOL_AUTHORITY_ENV} must be absolute"));
+    }
+    let authority = read_immutable_tool_authority(&authority_path, supplied, state_root)?;
+    let required_environment = [
+        (TOOL_CONTENT_SHA256_ENV, authority.content_sha256.as_str()),
+        (TOOL_PARENT_SHA_ENV, authority.parent_sha.as_str()),
+        (TOOL_HERMIT_SHA_ENV, authority.hermit_sha.as_str()),
+        (TOOL_AGENT_UTILS_SHA_ENV, authority.agent_utils_sha.as_str()),
+        (TOOL_BOOTSTRAP_SHA256_ENV, authority.bootstrap_sha256.as_str()),
+    ];
+    for (name, expected) in required_environment {
+        let observed = std::env::var(name)
+            .map_err(|_| format!("immutable tool authority is incomplete: {name} is absent"))?;
+        if observed != expected {
+            return Err(format!("{name} does not match immutable tool authority"));
+        }
+    }
+    if !supplied.join("ci-hub").is_dir() {
+        return Err(format!(
+            "explicit {TOOL_ROOT_ENV} {} has no ci-hub directory",
+            supplied.display()
+        ));
+    }
+    let observed_digest = immutable_tool_content_sha256(supplied)?;
+    if observed_digest != authority.content_sha256 {
+        return Err(format!(
+            "immutable tool content digest is {observed_digest}, expected {}",
+            authority.content_sha256
+        ));
+    }
+    Ok(supplied.to_path_buf())
+}
+
+struct SelfTestToolAuthority {
+    _target: std::fs::File,
+    _root: std::fs::File,
+    _state: std::fs::File,
+    _authority: std::fs::File,
+    tool_root: PathBuf,
+    authority_path: PathBuf,
+    content_sha256: String,
+}
+
+fn make_self_test_tree_read_only(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("tool authority self-test cannot inspect tree: {error}"))?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        for entry in std::fs::read_dir(path)
+            .map_err(|error| format!("tool authority self-test cannot list tree: {error}"))?
+        {
+            let entry = entry.map_err(|error| {
+                format!("tool authority self-test cannot read directory entry: {error}")
+            })?;
+            make_self_test_tree_read_only(&entry.path())?;
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555))
+            .map_err(|error| format!("tool authority self-test cannot freeze directory: {error}"))?;
+    } else if metadata.is_file() {
+        let mode = if metadata.mode() & 0o111 != 0 { 0o555 } else { 0o444 };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .map_err(|error| format!("tool authority self-test cannot freeze file: {error}"))?;
+    }
+    Ok(())
+}
+
+fn create_self_test_tool_authority(
+    root: &Path,
+    state_root: &Path,
+    target_root: &Path,
+    content_override: Option<&str>,
+    wrong_root_inode: bool,
+    wrong_target_inode: bool,
+    target_fd_override: Option<&std::fs::File>,
+) -> Result<SelfTestToolAuthority, String> {
+    let target_file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(target_root)
+        .map_err(|error| format!("tool authority self-test cannot retain target: {error}"))?;
+    let root_file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root)
+        .map_err(|error| format!("tool authority self-test cannot retain root: {error}"))?;
+    let resolved_state = std::fs::canonicalize(state_root)
+        .map_err(|error| format!("tool authority self-test cannot resolve state: {error}"))?;
+    let state_file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&resolved_state)
+        .map_err(|error| format!("tool authority self-test cannot retain state: {error}"))?;
+    let name = std::ffi::CString::new("dev-hermit-tool-authority")
+        .map_err(|error| format!("tool authority self-test memfd name failed: {error}"))?;
+    let raw_authority = unsafe {
+        libc::memfd_create(
+            name.as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if raw_authority < 0 {
+        return Err(format!(
+            "tool authority self-test cannot create memfd: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut authority_file = unsafe { std::fs::File::from_raw_fd(raw_authority) };
+    let root_metadata = root_file
+        .metadata()
+        .map_err(|error| format!("tool authority self-test cannot inspect root: {error}"))?;
+    let state_metadata = state_file
+        .metadata()
+        .map_err(|error| format!("tool authority self-test cannot inspect state: {error}"))?;
+    let target_metadata = target_file
+        .metadata()
+        .map_err(|error| format!("tool authority self-test cannot inspect target: {error}"))?;
+    let digest = immutable_tool_content_sha256(root)?;
+    let recorded_digest = content_override.unwrap_or(&digest);
+    let holder_pid = std::process::id();
+    let root_fd = u32::try_from(root_file.as_raw_fd())
+        .map_err(|_| "tool authority self-test root fd is negative")?;
+    let state_fd = u32::try_from(state_file.as_raw_fd())
+        .map_err(|_| "tool authority self-test state fd is negative")?;
+    let target_fd = u32::try_from(
+        target_fd_override
+            .unwrap_or(&target_file)
+            .as_raw_fd(),
+    )
+    .map_err(|_| "tool authority self-test target fd is negative")?;
+    let authority_fd = u32::try_from(authority_file.as_raw_fd())
+        .map_err(|_| "tool authority self-test authority fd is negative")?;
+    let record = serde_json::json!({
+        "schema": TOOL_AUTHORITY_SCHEMA,
+        "holder_pid": holder_pid,
+        "authority_fd": authority_fd,
+        "target_fd": target_fd,
+        "target_root": target_root,
+        "target_dev": target_metadata.dev(),
+        "target_ino": target_metadata.ino() + if wrong_target_inode { 1 } else { 0 },
+        "root_fd": root_fd,
+        "root_dev": root_metadata.dev(),
+        "root_ino": root_metadata.ino() + if wrong_root_inode { 1 } else { 0 },
+        "state_fd": state_fd,
+        "state_root": resolved_state,
+        "state_dev": state_metadata.dev(),
+        "state_ino": state_metadata.ino(),
+        "content_sha256": recorded_digest,
+        "parent_sha": "1111111111111111111111111111111111111111",
+        "hermit_sha": "2222222222222222222222222222222222222222",
+        "agent_utils_sha": "3333333333333333333333333333333333333333",
+        "bootstrap_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+    });
+    let mut encoded = serde_json::to_vec(&record)
+        .map_err(|error| format!("tool authority self-test cannot encode record: {error}"))?;
+    encoded.push(b'\n');
+    authority_file
+        .write_all(&encoded)
+        .map_err(|error| format!("tool authority self-test cannot write record: {error}"))?;
+    authority_file
+        .set_permissions(std::fs::Permissions::from_mode(0o400))
+        .map_err(|error| format!("tool authority self-test cannot freeze record: {error}"))?;
+    let seals = libc::F_SEAL_SEAL
+        | libc::F_SEAL_SHRINK
+        | libc::F_SEAL_GROW
+        | libc::F_SEAL_WRITE;
+    if unsafe { libc::fcntl(authority_file.as_raw_fd(), libc::F_ADD_SEALS, seals) } != 0 {
+        return Err(format!(
+            "tool authority self-test cannot seal record: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(SelfTestToolAuthority {
+        tool_root: PathBuf::from(format!("/proc/{holder_pid}/fd/{root_fd}")),
+        authority_path: PathBuf::from(format!("/proc/{holder_pid}/fd/{authority_fd}")),
+        content_sha256: digest,
+        _target: target_file,
+        _root: root_file,
+        _state: state_file,
+        _authority: authority_file,
+    })
+}
+
+fn install_self_test_tool_authority(authority: &SelfTestToolAuthority) {
+    // SAFETY: callers use this only inside validate's single-threaded self-test
+    // and restore every value before returning.
+    unsafe {
+        std::env::set_var(TOOL_ROOT_ENV, &authority.tool_root);
+        std::env::set_var(TOOL_AUTHORITY_ENV, &authority.authority_path);
+        std::env::set_var(TOOL_CONTENT_SHA256_ENV, &authority.content_sha256);
+        std::env::set_var(
+            TOOL_PARENT_SHA_ENV,
+            "1111111111111111111111111111111111111111",
+        );
+        std::env::set_var(
+            TOOL_HERMIT_SHA_ENV,
+            "2222222222222222222222222222222222222222",
+        );
+        std::env::set_var(
+            TOOL_AGENT_UTILS_SHA_ENV,
+            "3333333333333333333333333333333333333333",
+        );
+        std::env::set_var(
+            TOOL_BOOTSTRAP_SHA256_ENV,
+            "4444444444444444444444444444444444444444444444444444444444444444",
+        );
+    }
+}
+
 /// Resolve executable ci-hub code separately from the canonical parent that
 /// owns locks, ledgers, and other shared state.
 ///
@@ -4572,6 +5283,14 @@ fn configured_tool_root(parent: Option<&Path>) -> Result<Option<PathBuf>, String
             "{TOOL_ROOT_ENV} must be absolute, got {}",
             supplied.display()
         ));
+    }
+    let authority_requested = std::env::var_os(TOOL_AUTHORITY_ENV).is_some()
+        || std::env::var_os(TOOL_CONTENT_SHA256_ENV).is_some();
+    if authority_requested {
+        let state_root = parent.ok_or_else(|| {
+            format!("explicit {TOOL_ROOT_ENV} has no canonical {PARENT_ENV} to bind to")
+        })?;
+        return configured_authority_tool_root(&supplied, state_root).map(Some);
     }
     let resolved = std::fs::canonicalize(&supplied).map_err(|error| {
         format!(
@@ -12742,6 +13461,10 @@ fn tool_root_split_bracket() -> Result<(), String> {
     ));
     let state_root = root.join("state-root");
     let tool_root = root.join("tool-root");
+    let frozen_root = root.join("frozen-root");
+    let target_root = root.join(
+        "cache/trees/1111111111111111111111111111111111111111",
+    );
     let other_root = root.join("other-root");
     let fake_root = root.join("fake-root");
     let checkout = root.join("checkout");
@@ -12776,7 +13499,7 @@ fn tool_root_split_bracket() -> Result<(), String> {
     .and_then(|_| {
         std::fs::write(
             state_root.join("ci-hub/ci-hub"),
-            "#!/bin/sh\nroot=$(CDPATH= cd -- \"$(dirname \"$0\")/..\" && pwd)\n: > \"$root/authority-called\"\nexit 23\n",
+            "#!/bin/sh\n: > \"$DEV_HERMIT_PARENT/authority-called\"\nexit 23\n",
         )
     })
     .and_then(|_| {
@@ -12812,8 +13535,57 @@ fn tool_root_split_bracket() -> Result<(), String> {
         &["clone", state_root.to_str().unwrap(), other_root.to_str().unwrap()],
     )?;
 
+    std::fs::create_dir_all(frozen_root.join("ci-hub/validate"))
+        .and_then(|_| std::fs::create_dir_all(frozen_root.join("ci-hub/ledger")))
+        .and_then(|_| {
+            std::fs::copy(
+                state_root.join("ci-hub/ci-hub"),
+                frozen_root.join("ci-hub/ci-hub"),
+            )
+        })
+        .and_then(|_| {
+            std::fs::copy(
+                state_root.join("ci-hub/validate/finalize_receipt.py"),
+                frozen_root.join("ci-hub/validate/finalize_receipt.py"),
+            )
+        })
+        .and_then(|_| {
+            std::fs::copy(
+                state_root.join("ci-hub/ledger/validate_rows.py"),
+                frozen_root.join("ci-hub/ledger/validate_rows.py"),
+            )
+        })
+        .map_err(|error| format!("tool-root split: cannot create frozen fixture: {error}"))?;
+    std::fs::set_permissions(
+        frozen_root.join("ci-hub/ci-hub"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .map_err(|error| format!("tool-root split: cannot chmod frozen fixture: {error}"))?;
+    make_self_test_tree_read_only(&frozen_root)?;
+    std::fs::create_dir_all(&target_root)
+        .map_err(|error| format!("tool-root split: cannot create cached target: {error}"))?;
+    std::fs::set_permissions(&target_root, std::fs::Permissions::from_mode(0o555))
+        .map_err(|error| format!("tool-root split: cannot freeze cached target: {error}"))?;
+
     let saved_tool_root = std::env::var_os(TOOL_ROOT_ENV);
     let saved_ledger = std::env::var_os(LEDGER_ENV);
+    let saved_parent = std::env::var_os(PARENT_ENV);
+    let authority_environment = [
+        TOOL_AUTHORITY_ENV,
+        TOOL_CONTENT_SHA256_ENV,
+        TOOL_PARENT_SHA_ENV,
+        TOOL_HERMIT_SHA_ENV,
+        TOOL_AGENT_UTILS_SHA_ENV,
+        TOOL_BOOTSTRAP_SHA256_ENV,
+    ];
+    let saved_authority_environment: Vec<(&str, Option<std::ffi::OsString>)> = authority_environment
+        .iter()
+        .map(|name| (*name, std::env::var_os(name)))
+        .collect();
+    for name in authority_environment {
+        // SAFETY: validate's self-test is single-threaded and restores these values.
+        unsafe { std::env::remove_var(name) };
+    }
     // SAFETY: validate's self-test is single-threaded and restores this value.
     unsafe { std::env::set_var(TOOL_ROOT_ENV, "relative/tool-root") };
     if !configured_tool_root(Some(&state_root))
@@ -12854,30 +13626,230 @@ fn tool_root_split_bracket() -> Result<(), String> {
     if resolved != std::fs::canonicalize(&tool_root).map_err(|error| error.to_string())? {
         return Err("tool-root split: explicit tool root resolved to another checkout".into());
     }
+
+    let valid_authority = create_self_test_tool_authority(
+        &frozen_root,
+        &state_root,
+        &target_root,
+        None,
+        false,
+        false,
+        None,
+    )?;
+    install_self_test_tool_authority(&valid_authority);
+    let retained_root = configured_tool_root(Some(&state_root))?
+        .ok_or("tool-root split: producer-authorized root disappeared")?;
+    if retained_root != valid_authority.tool_root {
+        return Err(
+            "tool-root split: producer-authorized root was detached from its retained descriptor"
+                .into(),
+        );
+    }
+
+    // An ordinary directory with identical bytes is not the descriptor-backed
+    // capability the producer authorized.
+    unsafe { std::env::set_var(TOOL_ROOT_ENV, &frozen_root) };
+    if !configured_tool_root(Some(&state_root))
+        .is_err_and(|error| error.contains("must be an exact /proc/<pid>/fd/<fd> capability"))
+    {
+        return Err("tool-root split: pathname-only immutable root did not refuse".into());
+    }
+    install_self_test_tool_authority(&valid_authority);
+
+    unsafe { std::env::remove_var(TOOL_CONTENT_SHA256_ENV) };
+    if !configured_tool_root(Some(&state_root))
+        .is_err_and(|error| error.contains("authority is incomplete"))
+    {
+        return Err("tool-root split: incomplete immutable authority did not refuse".into());
+    }
+    install_self_test_tool_authority(&valid_authority);
+
+    unsafe {
+        std::env::set_var(
+            TOOL_PARENT_SHA_ENV,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+    };
+    if !configured_tool_root(Some(&state_root))
+        .is_err_and(|error| error.contains("does not match immutable tool authority"))
+    {
+        return Err("tool-root split: wrong authority parent SHA did not refuse".into());
+    }
+    install_self_test_tool_authority(&valid_authority);
+
+    let copied_authority = root.join("copied-authority.json");
+    std::fs::copy(&valid_authority.authority_path, &copied_authority)
+        .and_then(|_| {
+            std::fs::set_permissions(
+                &copied_authority,
+                std::fs::Permissions::from_mode(0o444),
+            )
+        })
+        .map_err(|error| format!("tool-root split: cannot copy authority fixture: {error}"))?;
+    unsafe { std::env::set_var(TOOL_AUTHORITY_ENV, &copied_authority) };
+    if !configured_tool_root(Some(&state_root))
+        .is_err_and(|error| error.contains("must be an exact /proc/<pid>/fd/<fd> capability"))
+    {
+        return Err("tool-root split: copied authority record did not refuse".into());
+    }
+    install_self_test_tool_authority(&valid_authority);
+
+    let other_fd = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&other_root)
+        .map_err(|error| format!("tool-root split: cannot retain wrong root: {error}"))?;
+    let wrong_target_authority = create_self_test_tool_authority(
+        &frozen_root,
+        &state_root,
+        &target_root,
+        None,
+        false,
+        false,
+        Some(&other_fd),
+    )?;
+    install_self_test_tool_authority(&wrong_target_authority);
+    if !configured_tool_root(Some(&state_root))
+        .is_err_and(|error| error.contains("target descriptor identity does not match"))
+    {
+        return Err("tool-root split: wrong target descriptor did not refuse".into());
+    }
+    install_self_test_tool_authority(&valid_authority);
+
+    let wrong_root = PathBuf::from(format!(
+        "/proc/{}/fd/{}",
+        std::process::id(),
+        other_fd.as_raw_fd()
+    ));
+    unsafe { std::env::set_var(TOOL_ROOT_ENV, &wrong_root) };
+    if !configured_tool_root(Some(&state_root))
+        .is_err_and(|error| error.contains("does not name the supplied descriptors"))
+    {
+        return Err("tool-root split: replaced root descriptor did not refuse".into());
+    }
+    install_self_test_tool_authority(&valid_authority);
+
+    let wrong_inode_authority = create_self_test_tool_authority(
+        &frozen_root,
+        &state_root,
+        &target_root,
+        None,
+        true,
+        false,
+        None,
+    )?;
+    install_self_test_tool_authority(&wrong_inode_authority);
+    if !configured_tool_root(Some(&state_root))
+        .is_err_and(|error| error.contains("root descriptor identity does not match"))
+    {
+        return Err("tool-root split: wrong root inode authority did not refuse".into());
+    }
+
+    let wrong_target_inode_authority = create_self_test_tool_authority(
+        &frozen_root,
+        &state_root,
+        &target_root,
+        None,
+        false,
+        true,
+        None,
+    )?;
+    install_self_test_tool_authority(&wrong_target_inode_authority);
+    if !configured_tool_root(Some(&state_root))
+        .is_err_and(|error| error.contains("target descriptor identity does not match"))
+    {
+        return Err("tool-root split: wrong target inode authority did not refuse".into());
+    }
+
+    let wrong_digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let wrong_digest_authority = create_self_test_tool_authority(
+        &frozen_root,
+        &state_root,
+        &target_root,
+        Some(wrong_digest),
+        false,
+        false,
+        None,
+    )?;
+    install_self_test_tool_authority(&wrong_digest_authority);
+    unsafe { std::env::set_var(TOOL_CONTENT_SHA256_ENV, wrong_digest) };
+    if !configured_tool_root(Some(&state_root))
+        .is_err_and(|error| error.contains("immutable tool content digest is"))
+    {
+        return Err("tool-root split: wrong content digest authority did not refuse".into());
+    }
+
+    let replaceable_state = root.join("replaceable-state");
+    let retained_state = root.join("retained-state");
+    std::fs::create_dir(&replaceable_state)
+        .map_err(|error| format!("tool-root split: cannot create replaceable state: {error}"))?;
+    let state_authority = create_self_test_tool_authority(
+        &frozen_root,
+        &replaceable_state,
+        &target_root,
+        None,
+        false,
+        false,
+        None,
+    )?;
+    install_self_test_tool_authority(&state_authority);
+    std::fs::rename(&replaceable_state, &retained_state)
+        .and_then(|_| std::fs::create_dir(&replaceable_state))
+        .map_err(|error| format!("tool-root split: cannot replace state pathname: {error}"))?;
+    if !configured_tool_root(Some(&replaceable_state))
+        .is_err_and(|error| error.contains("state-root pathname no longer names"))
+    {
+        return Err("tool-root split: replaced state-root pathname did not refuse".into());
+    }
+    std::fs::remove_dir(&replaceable_state)
+        .and_then(|_| std::fs::rename(&retained_state, &replaceable_state))
+        .map_err(|error| format!("tool-root split: cannot restore state pathname: {error}"))?;
+
+    let retained_target = root.join("cache/trees/retained-target");
+    std::fs::rename(&target_root, &retained_target)
+        .and_then(|_| std::fs::create_dir(&target_root))
+        .and_then(|_| {
+            std::fs::set_permissions(&target_root, std::fs::Permissions::from_mode(0o555))
+        })
+        .map_err(|error| format!("tool-root split: cannot replace target pathname: {error}"))?;
+    install_self_test_tool_authority(&valid_authority);
+    if !configured_tool_root(Some(&state_root))
+        .is_err_and(|error| error.contains("target pathname no longer names"))
+    {
+        return Err("tool-root split: replaced target pathname did not refuse".into());
+    }
+    std::fs::remove_dir(&target_root)
+        .and_then(|_| std::fs::rename(&retained_target, &target_root))
+        .map_err(|error| format!("tool-root split: cannot restore target pathname: {error}"))?;
+
+    install_self_test_tool_authority(&valid_authority);
+    let effective_tool_root = &valid_authority.tool_root;
+    unsafe { std::env::set_var(PARENT_ENV, &state_root) };
     if validate_history::canonical_ledger_adapter(
         &state_root.join("ledger"),
-        Some(&tool_root),
-    ) != Some(tool_root.join("ci-hub/ledger/validate_rows.py"))
+        Some(effective_tool_root),
+    ) != Some(effective_tool_root.join("ci-hub/ledger/validate_rows.py"))
     {
         return Err("tool-root split: ledger adapter resolved through the state root".into());
     }
-    let tool_authority_marker = tool_root.join("authority-called");
-    let authority = canonical_validate_lock_admission(Some(&tool_root), "fixture", "fixture-host");
+    let tool_authority_marker = state_root.join("authority-called");
+    let authority =
+        canonical_validate_lock_admission(Some(effective_tool_root), "fixture", "fixture-host");
     if authority.is_ok() || !tool_authority_marker.is_file() {
         return Err(
             "tool-root split: authority did not execute exclusively from the tool root".into(),
         );
     }
 
-    let receipt = receipt_evidence(Some(&tool_root), &checkout, &log, "fixture");
-    if receipt.base_sha != serde_json::json!("tool-root")
+    let receipt = receipt_evidence(Some(effective_tool_root), &checkout, &log, "fixture");
+    if receipt.base_sha != serde_json::json!("frozen-root")
         || receipt.base_tree != serde_json::json!("tool-tree")
     {
         return Err("tool-root split: receipt finalizer did not execute from the tool root".into());
     }
 
     let refusal = product_front_door_refusal(
-        &tool_root,
+        effective_tool_root,
         &checkout,
         "fixture",
         "full --no-label-pr",
@@ -12885,7 +13857,10 @@ fn tool_root_split_bracket() -> Result<(), String> {
         false,
     )
     .ok_or("tool-root split: product front door omitted refusal")?;
-    let tool_launcher = tool_root.join("ci-hub/ci-hub").to_string_lossy().into_owned();
+    let tool_launcher = effective_tool_root
+        .join("ci-hub/ci-hub")
+        .to_string_lossy()
+        .into_owned();
     let state_launcher = state_root.join("ci-hub/ci-hub").to_string_lossy().into_owned();
     if !refusal.contains(&tool_launcher) || refusal.contains(&state_launcher) {
         return Err("tool-root split: remediation named the state root instead of tool root".into());
@@ -12896,7 +13871,7 @@ fn tool_root_split_bracket() -> Result<(), String> {
     // rooted under canonical state.
     unsafe { std::env::remove_var(LEDGER_ENV) };
     let rows = validate_history::read_rows(&state_root.join("ledger"));
-    if rows.len() != 1 || rows[0]["adapter_root"] != "tool-root" {
+    if rows.len() != 1 || rows[0]["adapter_root"] != "frozen-root" {
         return Err("tool-root split: canonical ledger adapter executed from state root".into());
     }
 
@@ -12908,10 +13883,21 @@ fn tool_root_split_bracket() -> Result<(), String> {
         Some(value) => unsafe { std::env::set_var(LEDGER_ENV, value) },
         None => unsafe { std::env::remove_var(LEDGER_ENV) },
     }
+    match saved_parent {
+        Some(value) => unsafe { std::env::set_var(PARENT_ENV, value) },
+        None => unsafe { std::env::remove_var(PARENT_ENV) },
+    }
+    for (name, value) in saved_authority_environment {
+        match value {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+    }
 
+    let _ = Command::new("chmod").args(["-R", "u+w"]).arg(&root).status();
     let _ = std::fs::remove_dir_all(&root);
     println!(
-        "  tool-root split: authority, receipt finalizer, and remediation use executable code; state remains separate"
+        "  tool-root split: sealed descriptor authority, digest, receipt finalizer, and remediation preserve immutable code/state separation"
     );
     Ok(())
 }
