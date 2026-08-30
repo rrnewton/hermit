@@ -13,8 +13,99 @@
 use std::fmt;
 use std::sync::OnceLock;
 
+use serde::Deserialize;
+use serde::Serialize;
+
+/// Delimits the machine-readable record appended to a human DETLOG message.
+///
+/// The human text remains available to people and historical readers. Current
+/// verification consumes the JSON after this delimiter for event class and
+/// position rather than recovering those facts from prose.
+pub const RECORD_SEPARATOR: &str = " DETLOG_RECORD=";
+
+/// Current schema written beside each structured DETLOG event.
+pub const RECORD_SCHEMA: u32 = 1;
+
+/// Producer-owned facts needed by log comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DetLogEvent {
+    /// A deterministic record outside the syscall-specific classes below.
+    Other,
+    /// A syscall entered but not yet completed.
+    Syscall,
+    /// A completed syscall, carrying Detcore's own counter.
+    SyscallResult {
+        /// Number of syscalls completed by guest threads at this point.
+        finished_syscall_number: u64,
+    },
+    /// A scheduler turn committed to the guest.
+    SchedulerCommit {
+        /// Detcore's scheduler turn number.
+        scheduler_turn: u64,
+        /// Committed virtual time at this turn, in nanoseconds.
+        virtual_nanoseconds: u64,
+        /// Whether this turn is host-timing-sensitive internal I/O polling.
+        internal_io_poll: bool,
+        /// Whether this turn reads the guest runtime's `/proc/self/maps`.
+        runtime_maps_read: bool,
+    },
+    /// Per-turn committed-time bookkeeping excluded from deterministic comparison.
+    SchedulerCommittedTime,
+    /// The scheduler found no runnable thread and took its established kick path.
+    SchedulerEmptyQueueKick,
+}
+
+/// Versioned serialized form appended to the human log record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DetLogRecord {
+    /// Serialized record schema.
+    pub schema: u32,
+    /// Closed event payload.
+    pub event: DetLogEvent,
+}
+
+impl DetLogRecord {
+    /// Construct a record in the current schema.
+    pub fn new(event: DetLogEvent) -> Self {
+        Self {
+            schema: RECORD_SCHEMA,
+            event,
+        }
+    }
+
+    /// Split a human record from its producer-owned structured suffix.
+    ///
+    /// An absent suffix is the historical format. Once the delimiter is
+    /// present, malformed JSON or another schema is an error rather than an
+    /// invitation to fall back to the human text.
+    pub fn split(message: &str) -> Result<(&str, Option<Self>), String> {
+        let Some((human, encoded)) = message.rsplit_once(RECORD_SEPARATOR) else {
+            return Ok((message, None));
+        };
+        let record: Self = serde_json::from_str(encoded)
+            .map_err(|error| format!("malformed DETLOG record: {error}"))?;
+        if record.schema != RECORD_SCHEMA {
+            return Err(format!(
+                "unsupported DETLOG record schema {}; expected {}",
+                record.schema, RECORD_SCHEMA
+            ));
+        }
+        Ok((human, Some(record)))
+    }
+}
+
+/// Serialize one event for appending to its human log message.
+#[doc(hidden)]
+pub fn record_suffix(event: DetLogEvent) -> String {
+    let encoded = serde_json::to_string(&DetLogRecord::new(event))
+        .expect("DETLOG record serialization cannot fail");
+    format!("{RECORD_SEPARATOR}{encoded}")
+}
+
 /// A process-local sink for deterministic INFO records.
-pub type DetlogForwarder = for<'a> fn(fmt::Arguments<'a>);
+pub type DetlogForwarder = for<'a> fn(&str, fmt::Arguments<'a>);
 
 static FORWARDER: OnceLock<DetlogForwarder> = OnceLock::new();
 
@@ -35,21 +126,27 @@ pub fn forwarding_enabled() -> bool {
 
 /// Emits one deterministic record through tracing and the process-local sink.
 #[doc(hidden)]
-pub fn emit_forwarded(message: fmt::Arguments<'_>) {
-    tracing::info!("DETLOG {}", message);
-    FORWARDER.get().expect("forwarder disappeared")(message);
+pub fn emit_forwarded(record_suffix: &str, message: fmt::Arguments<'_>) {
+    tracing::info!("DETLOG {}{}", message, record_suffix);
+    FORWARDER.get().expect("forwarder disappeared")(record_suffix, message);
 }
 
 /// Macro used to encapsulate tracing should-be-deterministic information.
 /// This is currently at the INFO log level.
 #[macro_export]
 macro_rules! detlog {
-    ($($arg:tt)+) => {{
-        if $crate::detlog::forwarding_enabled() {
-            $crate::detlog::emit_forwarded(format_args!($($arg)+));
-        } else {
-            tracing::info!("DETLOG {}", format_args!($($arg)+));
+    (event = $event:expr; $($arg:tt)+) => {{
+        if $crate::detlog::forwarding_enabled() || ::tracing::enabled!(::tracing::Level::INFO) {
+            let record_suffix = $crate::detlog::record_suffix($event);
+            if $crate::detlog::forwarding_enabled() {
+                $crate::detlog::emit_forwarded(&record_suffix, format_args!($($arg)+));
+            } else {
+                ::tracing::info!("DETLOG {}{}", format_args!($($arg)+), record_suffix);
+            }
         }
+    }};
+    ($($arg:tt)+) => {{
+        $crate::detlog!(event = $crate::detlog::DetLogEvent::Other; $($arg)+);
     }};
 }
 
@@ -84,8 +181,14 @@ macro_rules! detlog_observed {
 /// set to DEBUG.
 #[macro_export]
 macro_rules! detlog_debug {
+    (event = $event:expr; $($arg:tt)+) => {{
+        if ::tracing::enabled!(::tracing::Level::DEBUG) {
+            let record_suffix = $crate::detlog::record_suffix($event);
+            ::tracing::debug!("DETLOG {}{}", format_args!($($arg)+), record_suffix);
+        }
+    }};
     ($($arg:tt)+) => {{
-        tracing::debug!("DETLOG {}", format!($($arg)+));
+        $crate::detlog_debug!(event = $crate::detlog::DetLogEvent::Other; $($arg)+);
     }};
 }
 
@@ -95,9 +198,40 @@ mod tests {
     use tracing::span;
     use tracing::subscriber::Interest;
 
+    use super::DetLogEvent;
+    use super::DetLogRecord;
+    use super::RECORD_SEPARATOR;
+    use super::record_suffix;
+
     #[test]
     fn test_detlog() {
         detlog!("Hello : {}. From {:?}", "World", 31337);
+    }
+
+    #[test]
+    fn structured_record_round_trips_and_refuses_an_incomplete_current_shape() {
+        let suffix = record_suffix(DetLogEvent::SyscallResult {
+            finished_syscall_number: 37,
+        });
+        let line = format!("INFO detcore: DETLOG finish syscall #999{suffix}");
+        let (human, record) = DetLogRecord::split(&line).unwrap();
+        assert_eq!(human, "INFO detcore: DETLOG finish syscall #999");
+        assert_eq!(
+            record.unwrap().event,
+            DetLogEvent::SyscallResult {
+                finished_syscall_number: 37
+            }
+        );
+
+        let missing_number = format!(
+            "INFO detcore: DETLOG finish syscall #999{RECORD_SEPARATOR}{{\"schema\":1,\"event\":{{\"kind\":\"syscall_result\"}}}}"
+        );
+        assert!(
+            DetLogRecord::split(&missing_number)
+                .unwrap_err()
+                .contains("finished_syscall_number"),
+            "an incomplete current record must fail by field name"
+        );
     }
 
     /// Minimal subscriber that reports every callsite as enabled.

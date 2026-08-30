@@ -99,10 +99,11 @@ impl Write for RawStderr {
     }
 }
 
-fn forward_detlog(message: std::fmt::Arguments<'_>) {
+fn forward_detlog(record_suffix: &str, message: std::fmt::Arguments<'_>) {
     let mut stderr = RawStderr;
     let _ = stderr.write_all(b"INFO detcore: DETLOG ");
     let _ = stderr.write_fmt(message);
+    let _ = stderr.write_all(record_suffix.as_bytes());
     let _ = stderr.write_all(b"\n");
 }
 

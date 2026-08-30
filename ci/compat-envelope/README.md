@@ -181,6 +181,16 @@ Because `--series-root` is resolved from the current directory, a checkout under
   --series-root ../series --refreshed-at STAMP                         # series
 ```
 
+`project-observations` records the exact commit whose series rows it
+projected. It snapshots the committed JSONL shard population and bytes, then
+refuses a worktree with changed, missing, or untracked shards. Git replacement
+refs are ignored so the recorded object ID and read tree cannot disagree.
+Malformed rows or shards without their final newline, read-invalid rows, and
+conflicting bodies under one `event_id` are also refusals. Semantically
+identical repeats of an event collapse to one canonical row, which is what
+`rows_read` counts. Projection blocks written before `source_commit` existed
+remain readable.
+
 `observe-results` walks every `results.jsonl` under `DIR`, so several runs fold
 in one invocation — which is how a validate-side range widens beyond a point.
 Local validation runs it only after ledger and receipt publication, so the
