@@ -508,11 +508,13 @@ jobs:
           # not depend on that mutable Cargo output directory.
           install -Dm755 target/debug/deps/libdetcore_dbt.so \
             target/install_pkg/rsrcs/libdetcore_dbt.so
+          test -x target/debug/verification-report
           test -x target/ci/bin/cargo-nextest
           tar --zstd -cf "$DEBUG_TARBALL" \
             target/debug/hermit \
             target/debug/test-harness \
             target/debug/hermit-manifest-plan \
+            target/debug/verification-report \
             target/debug/deps/libdetcore_dbt.so \
             target/install_pkg/rsrcs/libdetcore_dbt.so \
             target/ci/bin/cargo-nextest \
@@ -766,6 +768,7 @@ jobs:
           tar --zstd -xf "$DEBUG_TARBALL"
           rm -f "$DEBUG_TARBALL"
           test -x target/debug/hermit
+          test -x target/debug/verification-report
           test -f target/debug/deps/libdetcore_dbt.so
           test -f target/install_pkg/rsrcs/libdetcore_dbt.so
           test -x target/ci/bin/cargo-nextest
