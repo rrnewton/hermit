@@ -47,6 +47,7 @@ use std::io;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::path::PathBuf;
@@ -1280,19 +1281,76 @@ pub fn registry_dir(parent: Option<&Path>) -> PathBuf {
 /// Only a TOP-LEVEL, non-stop-test driver registers, which is what keeps parked
 /// fixtures and nested payloads out of every peer count by construction rather
 /// than by filtering.
-pub fn register_run(dir: &Path, profile: &str, checkout: &Path) -> Option<RunRecord> {
-    std::fs::create_dir_all(dir).ok()?;
+fn register_run_with_hooks(
+    dir: &Path,
+    profile: &str,
+    checkout: &Path,
+    after_open: impl FnOnce(&Path),
+    write_record: impl FnOnce(&mut File, &[u8]) -> io::Result<()>,
+) -> Result<RunRecord, String> {
+    std::fs::create_dir_all(dir).map_err(|error| {
+        format!(
+            "cannot create live-run registry directory {}: {error}",
+            dir.display()
+        )
+    })?;
     let pid = std::process::id();
     let path = dir.join(format!("{pid}.run"));
-    let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()?;
-    if !flock_nb(file.as_raw_fd()) {
-        return None;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        // Do not truncate until this process owns the record's flock. A
+        // contender must not erase the live holder's published identity.
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|error| format!("cannot open live-run record {}: {error}", path.display()))?;
+    after_open(&path);
+    match flock_nb_result(file.as_raw_fd()) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(format!(
+                "cannot lock live-run record {}: another process holds it",
+                path.display()
+            ));
+        }
+        Err(error) => {
+            return Err(format!(
+                "cannot lock live-run record {}: {error}",
+                path.display()
+            ));
+        }
     }
-    let _ = std::fs::write(
-        &path,
-        format!("pid={pid}\nprofile={profile}\ncheckout={}\n", checkout.display()),
-    );
-    Some(RunRecord { _file: file, path })
+    let opened = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect locked live-run record {}: {error}", path.display()))?;
+    let published = std::fs::metadata(&path).map_err(|error| {
+        format!(
+            "locked live-run record {} is no longer published: {error}; refusing rather than \
+             running with an undiscoverable registration",
+            path.display()
+        )
+    })?;
+    if opened.dev() != published.dev() || opened.ino() != published.ino() {
+        return Err(format!(
+            "locked live-run record {} no longer names the opened inode; refusing rather than \
+             running with an undiscoverable registration",
+            path.display()
+        ));
+    }
+    let contents = format!("pid={pid}\nprofile={profile}\ncheckout={}\n", checkout.display());
+    if let Err(error) = file.set_len(0).and_then(|()| write_record(&mut file, contents.as_bytes())) {
+        // Remove the unpublished record while its flock is still held. Leaving a
+        // partial record behind would make a later census manufacture a peer.
+        let _ = std::fs::remove_file(&path);
+        return Err(format!("cannot write live-run record {}: {error}", path.display()));
+    }
+    Ok(RunRecord { _file: file, path })
+}
+
+pub fn register_run(dir: &Path, profile: &str, checkout: &Path) -> Result<RunRecord, String> {
+    register_run_with_hooks(dir, profile, checkout, |_| {}, |file, contents| {
+        file.write_all(contents)
+    })
 }
 
 /// A peer top-level validate observed by the monitor.
@@ -2232,7 +2290,48 @@ pub fn self_test() -> Result<String, String> {
     // A LIVE record: registered by this process, then observed from a census that
     // does NOT exclude us, so the liveness path is exercised for real.
     let held = register_run(&reg, "self-test", &sandbox)
-        .ok_or("registry: registering a free slot must succeed")?;
+        .map_err(|error| format!("registry: registering a free slot must succeed: {error}"))?;
+    let lock_error = match register_run(&reg, "self-test", &sandbox) {
+        Ok(_) => return Err("registry: a second registration for the held record succeeded".into()),
+        Err(error) => error,
+    };
+    if !lock_error.contains("cannot lock live-run record") {
+        return Err(format!(
+            "registry: a held record named the wrong registration failure: {lock_error}"
+        ));
+    }
+
+    // Deterministically force the create-before-flock interleaving: census sees
+    // the just-created path as unlocked and reaps it before registration claims
+    // the flock. Registration must then refuse the unlinked descriptor rather
+    // than return success with a record no peer can discover.
+    let race_reg = sandbox.join("create-before-flock-runs");
+    let mut race_census = None;
+    let race_error = match register_run_with_hooks(
+        &race_reg,
+        "self-test",
+        &sandbox,
+        |_path| {
+            let mut race_prev = BTreeMap::new();
+            race_census = Some(census_peers(&race_reg, -1, &mut race_prev));
+        },
+        |file, contents| file.write_all(contents),
+    ) {
+        Ok(_) => {
+            return Err(
+                "registry: create-before-flock race returned an undiscoverable registration".into(),
+            );
+        }
+        Err(error) => error,
+    };
+    if race_census != Some(PeerCensus { live: 0, cpu_active: 0, stale_reaped: 1 })
+        || !race_error.contains("no longer published")
+    {
+        return Err(format!(
+            "registry: create-before-flock race was not detected: census={race_census:?} \
+             error={race_error}"
+        ));
+    }
     let c = census_peers(&reg, -1, &mut prev);
     if c.live != 1 || c.stale_reaped != 0 {
         return Err(format!("registry: a live holder must be counted live, got {c:?}"));
@@ -2260,6 +2359,29 @@ pub fn self_test() -> Result<String, String> {
     if c3.live != 0 {
         return Err(format!("registry: a finished peer must stop counting, got {c3:?}"));
     }
+
+    // A write failure is not a missing peer or a zero-peer observation. Inject
+    // one at the write boundary and require the registration error to survive to
+    // the caller rather than being converted to absence.
+    let write_failure_reg = sandbox.join("write-failure-runs");
+    let write_error = match register_run_with_hooks(
+        &write_failure_reg,
+        "self-test",
+        &sandbox,
+        |_| {},
+        |_file, _contents| Err(io::Error::new(io::ErrorKind::WriteZero, "planted write refusal")),
+    ) {
+        Ok(_) => return Err("registry: a failed record write registered successfully".into()),
+        Err(error) => error,
+    };
+    if !write_error.contains("cannot write live-run record") {
+        return Err(format!(
+            "registry: a failed record write named the wrong registration stage: {write_error}"
+        ));
+    }
+    if write_failure_reg.join(format!("{}.run", std::process::id())).exists() {
+        return Err("registry: a failed record write left a partial record behind".into());
+    }
     let _ = std::fs::remove_dir_all(&sandbox);
 
     Ok(format!(
@@ -2271,6 +2393,7 @@ pub fn self_test() -> Result<String, String> {
          2 fire / 2 silent, nesting 1 ancestor-accept / 3 refuse, invocation lock \
          {lock_accept} accept (incl. the sequential re-claim) / {lock_refuse} concurrent-refuse / \
          {lock_safety_refuse} safety-refuse, \
-         registry census 1 live / 1 stale-reaped / 1 cpu-active"
+         registry registration 1 success / 1 lock-refuse / 1 write-refuse / 1 \
+         create-before-flock race-refuse, census 1 live / 1 stale-reaped / 1 cpu-active"
     ))
 }

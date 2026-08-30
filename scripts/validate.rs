@@ -15735,7 +15735,25 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let run_record = if nesting.nested {
         None
     } else {
-        validate_runtime::register_run(&registry, &plan.profile, &root)
+        match validate_runtime::register_run(&registry, &plan.profile, &root) {
+            Ok(record) => Some(record),
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&tmp);
+                let mut summary = RunSummary::refused(
+                    COULD_NOT_RUN_EXIT_CODE,
+                    &plan.profile,
+                    "box-wide live-run registration",
+                    vec![
+                        error,
+                        "concurrency accounting is required evidence; refusing rather than \
+                         running unregistered and reporting zero peers"
+                            .into(),
+                    ],
+                );
+                summary.log = Some(log_path.clone());
+                return summary;
+            }
+        }
     };
     let monitor = if nesting.nested {
         None
