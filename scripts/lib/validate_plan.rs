@@ -63,9 +63,21 @@ use crate::validate_corpus::CorpusPaths;
 /// through `with-proxy`, so it needs more than a trivial ceiling but must not
 /// inherit a lane-sized one.
 const PREFLIGHT_TIMEOUT_S: i64 = 900;
-/// CPU budget for preflight. These gates are I/O-bound (clone, fetch, a small
-/// rustc); a tight CPU ceiling catches a spin without flaking under host load.
+/// CPU budget for the lightweight preflight checks. They are I/O-bound (clone,
+/// fetch, a small rustc); a tight CPU ceiling catches a spin without flaking
+/// under host load.
 const PREFLIGHT_CPU_TIMEOUT_S: i64 = 300;
+/// CPU budget for the manifest audit under an isolated operational cache.
+///
+/// Measured 2026-08-30 at Hermit 44668c4a: the exact single-job command used by
+/// `gate.manifest` completed in 443.93 CPU seconds / 479.84 wall seconds with a
+/// fresh `XDG_CACHE_HOME` (625196 KiB / 610.5 MiB peak RSS), versus 100.65 CPU
+/// seconds warm.
+/// Run 1577 killed that same cold path at the former 300-second CPU cap while
+/// rust-script was compiling `scripts/validate.rs --self-test`. Keep the wall
+/// and memory ceilings unchanged and widen only this CPU-heavy audit; the two
+/// lightweight preflight checks retain the tighter 300-second spin detector.
+const MANIFEST_AUDIT_CPU_TIMEOUT_S: i64 = 600;
 /// Memory ceiling for a preflight gate. `git submodule update --recursive` on
 /// this tree peaks well under a GiB; 2 GiB leaves headroom without being a
 /// non-cap.
@@ -401,10 +413,64 @@ pub fn preflight_nodes(root: &Path, with_proxy: bool) -> Vec<Step> {
             "target/debug/test-harness validate".to_string(),
             vec![MANIFEST_PLAN_PRODUCER_TAG.to_string()],
             PREFLIGHT_TIMEOUT_S,
-            PREFLIGHT_CPU_TIMEOUT_S,
+            MANIFEST_AUDIT_CPU_TIMEOUT_S,
             PREFLIGHT_MEM_BYTES,
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_audit_uses_its_measured_cold_cache_cpu_budget_only() {
+        let nodes = preflight_nodes(Path::new("/repo"), false);
+        let expected = vec![
+            ("pre.submodules".to_string(), 900, 300, Some(2_147_483_648)),
+            ("pre.reverie_pin".to_string(), 900, 300, Some(2_147_483_648)),
+            ("setup.manifest_plan".to_string(), 180, 7200, Some(2_147_483_648)),
+            ("gate.manifest".to_string(), 900, 600, Some(2_147_483_648)),
+        ];
+        let check = |candidate: &[Step]| {
+            let observed = candidate
+                .iter()
+                .map(|step| {
+                    (
+                        step.tag(),
+                        step.timeout,
+                        step.cpu_timeout,
+                        step.hint.hard_mem_max_bytes,
+                    )
+                })
+                .collect::<Vec<_>>();
+            (observed == expected).then_some(()).ok_or(observed)
+        };
+
+        assert_eq!(check(&nodes), Ok(()));
+
+        let mut lowered_gate = nodes.clone();
+        lowered_gate
+            .iter_mut()
+            .find(|step| step.tag() == "gate.manifest")
+            .expect("gate.manifest exists")
+            .cpu_timeout = 300;
+        assert!(
+            check(&lowered_gate).is_err(),
+            "restoring the measured audit's inadequate 300-second CPU cap must fail"
+        );
+
+        let mut widened_neighbor = nodes;
+        widened_neighbor
+            .iter_mut()
+            .find(|step| step.tag() == "pre.reverie_pin")
+            .expect("pre.reverie_pin exists")
+            .cpu_timeout = 600;
+        assert!(
+            check(&widened_neighbor).is_err(),
+            "widening a neighboring lightweight preflight cap must fail"
+        );
+    }
 }
 
 /// Remove a lane's duplicate manifest-plan producer and bind its consumers to
