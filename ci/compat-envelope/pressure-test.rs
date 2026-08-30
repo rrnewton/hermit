@@ -73,7 +73,7 @@ const PORTABLE_DAG: &str = "ci/dag/portable.json";
 /// schema N". That is a fail-closed refusal rather than silent misreading, but
 /// it takes the pressure test offline entirely, and nothing in either file
 /// points at the other -- which is how it was missed when 5 became 6.
-const TRACKED_CELLS_SCHEMA: u64 = 6;
+const TRACKED_CELLS_SCHEMA: u64 = 7;
 const RUN_SCHEMA: u64 = 3;
 const SUMMARY_SCHEMA: u64 = 4;
 const REQUIRED_BUILD_TAGS: [&str; 5] = [
@@ -297,6 +297,21 @@ struct CellId {
 struct TrackedCells {
     schema: u64,
     cells: Vec<TrackedCell>,
+}
+
+fn load_tracked_cells(root: &Path) -> Result<TrackedCells, String> {
+    let path = root.join(TRACKED_CELLS);
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let tracked: TrackedCells = serde_json::from_str(&text)
+        .map_err(|error| format!("invalid JSON in {}: {error}", path.display()))?;
+    if tracked.schema != TRACKED_CELLS_SCHEMA {
+        return Err(format!(
+            "unsupported tracked cell schema {}",
+            tracked.schema
+        ));
+    }
+    Ok(tracked)
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1999,17 +2014,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
         return Err("--sample must be positive".into());
     }
     let budgets = load_budgets(root)?;
-    let path = root.join(TRACKED_CELLS);
-    let text =
-        fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let tracked: TrackedCells = serde_json::from_str(&text)
-        .map_err(|e| format!("invalid JSON in {}: {e}", path.display()))?;
-    if tracked.schema != TRACKED_CELLS_SCHEMA {
-        return Err(format!(
-            "unsupported tracked cell schema {}",
-            tracked.schema
-        ));
-    }
+    let tracked = load_tracked_cells(root)?;
     let mut seen = BTreeSet::new();
     let mut selected_cells = Vec::new();
     let mut unavailable = Vec::new();
@@ -4949,6 +4954,13 @@ fn fixture_attempt(outcome: &str, status: i32) -> AttemptResult {
 }
 
 fn self_test(root: &Path) -> Result<(), String> {
+    // Read the real checked-in scorecard before building synthetic fixtures.
+    // A scorecard schema bump must take this consumer offline immediately and
+    // cheaply rather than only after the long self-test has run.
+    let tracked = load_tracked_cells(root)?;
+    if tracked.cells.is_empty() {
+        return Err("tracked cells are empty".into());
+    }
     safe_ci_scope::self_test()?;
     if series_run_index("a-cell-repetition-0004") != 4
         || series_run_index("a-cell-with-no-suffix") != 0
@@ -5803,10 +5815,6 @@ fn self_test(root: &Path) -> Result<(), String> {
     // recorded as red. The invariant is unchanged -- such a cell must stay out
     // of the executable population, and an exact request for it must be refused
     // WITH THE MANIFEST'S OWN REASON rather than a bare "not red".
-    let tracked_text = fs::read_to_string(root.join(TRACKED_CELLS))
-        .map_err(|e| format!("cannot read tracked cells: {e}"))?;
-    let tracked: TrackedCells = serde_json::from_str(&tracked_text)
-        .map_err(|e| format!("invalid tracked cells: {e}"))?;
     let not_applicable = tracked
         .cells
         .iter()
