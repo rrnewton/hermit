@@ -78,20 +78,51 @@ rr_status="inventory-only"
 rr_pass=""
 rr_fail=""
 rr_filtered=""
+rr_exit=""
+rr_reason=""
 
-load_rr_results() { # <result-file>
-    local result_file=$1
+load_rr_results() { # <result-file> <command-status>
+    local result_file=$1 command_status=${2:-0}
     if ! load_test_results "$result_file"; then
         rr_status="unknown"
         rr_pass=""
         rr_fail=""
         rr_filtered=""
+        rr_exit=$command_status
+        rr_reason="typed test result unavailable"
         return 1
     fi
-    rr_status="executed"
+    if ((command_status == 0 && TEST_RESULTS_FAILED == 0)); then
+        rr_status="executed"
+        rr_reason=""
+    elif ((command_status == 0)); then
+        rr_status="unknown"
+        rr_reason="exit 0 disagrees with $TEST_RESULTS_FAILED typed failure(s)"
+    else
+        rr_status="aborted"
+        rr_reason="command exited nonzero"
+    fi
     rr_pass=$TEST_RESULTS_PASSED
     rr_fail=$TEST_RESULTS_FAILED
     rr_filtered=$TEST_RESULTS_FILTERED
+    rr_exit=$command_status
+}
+
+rr_result_summary() { # <catalogued-case-count>
+    local case_count=$1
+    if [[ $rr_status == executed ]]; then
+        printf 'executed: %s passed, %s failed, %s filtered (of %d cases)' \
+            "${rr_pass:-?}" "${rr_fail:-?}" "${rr_filtered:-?}" "$case_count"
+    elif [[ $rr_status == aborted ]]; then
+        printf 'ABORTED at exit %s after %s passed; %s failed, %s filtered (of %d cases)' \
+            "${rr_exit:-?}" "${rr_pass:-?}" "${rr_fail:-?}" "${rr_filtered:-?}" \
+            "$case_count"
+    elif [[ $rr_status == unknown ]]; then
+        printf 'unknown: %s; command exit %s (of %d cases)' \
+            "$rr_reason" "${rr_exit:-?}" "$case_count"
+    else
+        printf '%d cases catalogued (inventory-only; run with --run-rr or' "$case_count"
+    fi
 }
 
 self_test_typed_results() {
@@ -105,23 +136,51 @@ self_test_typed_results() {
     DAGRUN_TEST_COUNTS_PATH="$scratch/results.json" \
         "$repo_root/ci/write-structured-test-counts.sh" 2 7 \
             'rr_suite$passes' pass 1 'rr_suite$fails' fail 1 || return 1
-    load_rr_results "$scratch/results.json" || return 1
-    [[ $rr_status == executed && $rr_pass == 1 && $rr_fail == 1 && $rr_filtered == 7 ]] \
+    load_rr_results "$scratch/results.json" 1 || return 1
+    [[ $rr_status == aborted && $rr_pass == 1 && $rr_fail == 1 \
+        && $rr_filtered == 7 && $rr_exit == 1 \
+        && $rr_reason == 'command exited nonzero' ]] || return 1
+    [[ $(rr_result_summary 212) == \
+        'ABORTED at exit 1 after 1 passed; 1 failed, 7 filtered (of 212 cases)' ]] \
         || return 1
+
+    load_rr_results "$scratch/results.json" 0 || return 1
+    [[ $rr_status == unknown && $rr_pass == 1 && $rr_fail == 1 \
+        && $rr_filtered == 7 && $rr_exit == 0 \
+        && $rr_reason == 'exit 0 disagrees with 1 typed failure(s)' ]] || return 1
 
     # shellcheck disable=SC2016 # `$` is part of the stable test identity.
     DAGRUN_TEST_COUNTS_PATH="$scratch/results.json" \
         "$repo_root/ci/write-structured-test-counts.sh" 3 4 \
             'rr_suite$one' pass 1 'rr_suite$two' pass 1 'rr_suite$three' pass 1 \
         || return 1
-    load_rr_results "$scratch/results.json" || return 1
+    load_rr_results "$scratch/results.json" 0 || return 1
     [[ $rr_status == executed && $rr_pass == 3 && $rr_fail == 0 && $rr_filtered == 4 ]] \
+        || return 1
+    load_rr_results "$scratch/results.json" 7 || return 1
+    [[ $rr_status == aborted && $rr_pass == 3 && $rr_fail == 0 \
+        && $rr_filtered == 4 && $rr_exit == 7 ]] || return 1
+    [[ $(rr_result_summary 212) == \
+        'ABORTED at exit 7 after 3 passed; 0 failed, 4 filtered (of 212 cases)' ]] \
+        || return 1
+
+    DAGRUN_TEST_COUNTS_PATH="$scratch/results.json" \
+        "$repo_root/ci/write-structured-test-counts.sh" 0 0 || return 1
+    load_rr_results "$scratch/results.json" 100 || return 1
+    [[ $rr_status == aborted && $rr_pass == 0 && $rr_fail == 0 \
+        && $rr_filtered == 0 && $rr_exit == 100 ]] || return 1
+    [[ $(rr_result_summary 212) == \
+        'ABORTED at exit 100 after 0 passed; 0 failed, 0 filtered (of 212 cases)' ]] \
         || return 1
     [[ $(sha256sum "$scratch/fixed-human.log") == "$fixed_log_hash" ]] || return 1
 
     rm -f -- "$scratch/results.json"
-    load_rr_results "$scratch/results.json" >/dev/null 2>&1 || missing_status=$?
-    [[ $missing_status != 0 && $rr_status == unknown ]] || return 1
+    load_rr_results "$scratch/results.json" 9 >/dev/null 2>&1 || missing_status=$?
+    [[ $missing_status != 0 && $rr_status == unknown && $rr_exit == 9 \
+        && $rr_reason == 'typed test result unavailable' ]] || return 1
+    [[ $(rr_result_summary 212) == \
+        'unknown: typed test result unavailable; command exit 9 (of 212 cases)' ]] \
+        || return 1
     printf 'compat-map: typed rr result self-test PASS\n'
 }
 
@@ -317,9 +376,9 @@ if [[ $run_rr -eq 1 && $rr_count -gt 0 ]]; then
     ( cd "$repo_root" && DAGRUN_TEST_COUNTS_PATH="$rr_results" \
         timeout 1800 ./ci/run-nextest-counted.sh -p hermit --test rr_suite -- --ignored ) \
         >"$rr_log" 2>&1 || rr_exit=$?
-    load_rr_results "$rr_results" || true
+    load_rr_results "$rr_results" "$rr_exit" || true
     if [[ $rr_status == unknown ]]; then
-        log "rr suite produced no readable typed test result (exit $rr_exit)"
+        log "rr suite result is unknown ($rr_reason; command exit $rr_exit)"
     fi
     rm -f -- "$rr_log" "$rr_results"
 fi
@@ -371,9 +430,15 @@ build_json() {
     printf '\n      ]\n'
     printf '    },\n'
     printf '    "rr_tests": {"status": %s, "case_count": %d' "$(json_str "$rr_status")" "$rr_count"
-    if [[ $rr_status == executed ]]; then
+    if [[ $rr_status == executed || $rr_status == aborted ]]; then
         printf ', "passed": %s, "failed": %s, "filtered": %s' \
             "${rr_pass:-null}" "${rr_fail:-null}" "${rr_filtered:-null}"
+        if [[ $rr_status == aborted ]]; then
+            printf ', "command_exit": %s' "${rr_exit:-null}"
+        fi
+    elif [[ $rr_status == unknown ]]; then
+        printf ', "reason": %s, "command_exit": %s' \
+            "$(json_str "$rr_reason")" "${rr_exit:-null}"
     fi
     printf '},\n'
     printf '    "oss_apps": {"status": "inventory-only", "count": %d, "items": [' "$oss_count"
@@ -436,13 +501,8 @@ if [[ ${#sysbin_detail[@]} -gt 0 ]]; then
 fi
 hr
 echo "Other buckets"
-if [[ $rr_status == executed ]]; then
-    printf '  rr tests   %s: %s passed, %s failed, %s filtered (of %d cases)\n' \
-        "$rr_status" "${rr_pass:-?}" "${rr_fail:-?}" "${rr_filtered:-?}" "$rr_count"
-elif [[ $rr_status == unknown ]]; then
-    printf '  rr tests   unknown: typed test result unavailable (of %d cases)\n' "$rr_count"
-else
-    printf '  rr tests   %d cases catalogued (inventory-only; run with --run-rr or\n' "$rr_count"
+printf '  rr tests   %s\n' "$(rr_result_summary "$rr_count")"
+if [[ $rr_status == inventory-only ]]; then
     # shellcheck disable=SC2016  # backticks are a literal hint, not a command substitution
     printf '             `./ci/run-nextest-counted.sh -p hermit --test rr_suite -- --ignored`)\n'
 fi
