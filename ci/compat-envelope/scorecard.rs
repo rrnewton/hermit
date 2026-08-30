@@ -1787,6 +1787,7 @@ struct Derived {
     not_applicable_reasons: BTreeMap<CellId, String>,
     selected: BTreeSet<CellId>,
     green: BTreeSet<CellId>,
+    selected_custom: BTreeSet<CellId>,
 }
 
 fn retained_import_cells(derived: &Derived) -> BTreeSet<CellId> {
@@ -1920,10 +1921,7 @@ fn run() -> Result<(), String> {
         "check" => {
             no_more(&mut args)?;
             let derived = check_tracked_with_lock(&root)?;
-            println!(
-                "compatibility scorecard: tracked table and {} cells are current",
-                derived.population.len()
-            );
+            println!("{}", tracked_current_summary(&derived));
         }
         "update" => {
             let mut allow_green_removal: Option<String> = None;
@@ -2088,10 +2086,7 @@ fn run() -> Result<(), String> {
             no_more(&mut args)?;
             self_test()?;
             let derived = check_tracked_with_lock(&root)?;
-            println!(
-                "compatibility scorecard: tracked table and {} cells are current",
-                derived.population.len()
-            );
+            println!("{}", tracked_current_summary(&derived));
         }
         _ => return Err(format!("unknown command `{command}`\n\n{USAGE}")),
     }
@@ -2214,7 +2209,7 @@ fn derive(root: &Path) -> Result<Derived, String> {
             not_applicable_reasons.insert(id, reason);
         }
     }
-    let selected: BTreeSet<CellId> = expected.cells.into_iter().collect();
+    let selected = unique_cell_ids("expected E2E plan", expected.cells)?;
     if selected.is_empty() {
         return Err("expected E2E plan is empty".into());
     }
@@ -2232,7 +2227,7 @@ fn derive(root: &Path) -> Result<Derived, String> {
             ));
         }
     }
-    let green = selected_green(&selected, &population);
+    let (green, selected_custom) = selected_partition(&selected, &population)?;
     Ok(Derived {
         population,
         enabled,
@@ -2240,6 +2235,7 @@ fn derive(root: &Path) -> Result<Derived, String> {
         not_applicable_reasons,
         selected,
         green,
+        selected_custom,
     })
 }
 
@@ -2249,6 +2245,67 @@ fn selected_green(selected: &BTreeSet<CellId>, population: &BTreeSet<CellId>) ->
         .filter(|id| population.contains(*id))
         .cloned()
         .collect()
+}
+
+fn unique_cell_ids(label: &str, rows: Vec<CellId>) -> Result<BTreeSet<CellId>, String> {
+    let physical = rows.len();
+    let mut unique = BTreeSet::new();
+    let mut duplicates = BTreeSet::new();
+    for id in rows {
+        if !unique.insert(id.clone()) {
+            duplicates.insert(id);
+        }
+    }
+    if !duplicates.is_empty() {
+        let names = duplicates
+            .iter()
+            .map(display_id)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "{label} contains {physical} physical rows but only {} unique identities; duplicate identities: {names}",
+            unique.len()
+        ));
+    }
+    Ok(unique)
+}
+
+/// Account for every selected row without forcing nonuniform custom commands
+/// into the comparable `cells.json` matrix.
+fn selected_partition(
+    selected: &BTreeSet<CellId>,
+    population: &BTreeSet<CellId>,
+) -> Result<(BTreeSet<CellId>, BTreeSet<CellId>), String> {
+    let comparable = selected_green(selected, population);
+    let custom: BTreeSet<_> = selected
+        .iter()
+        .filter(|id| id.mode == "custom")
+        .cloned()
+        .collect();
+    if let Some(id) = custom.intersection(&comparable).next() {
+        return Err(format!(
+            "selected custom command also entered the comparable cells.json denominator: {}",
+            display_id(id)
+        ));
+    }
+    let accounted: BTreeSet<_> = comparable.union(&custom).cloned().collect();
+    if let Some(id) = selected.difference(&accounted).next() {
+        return Err(format!(
+            "selected plan row is neither a comparable cells.json cell nor a custom command: {}",
+            display_id(id)
+        ));
+    }
+    Ok((comparable, custom))
+}
+
+fn tracked_current_summary(derived: &Derived) -> String {
+    format!(
+        "compatibility scorecard: tracked table and {} comparable cells are current; selected regression denominator {} = {} comparable + {} custom",
+        derived.population.len(),
+        derived.selected.len(),
+        derived.green.len(),
+        derived.selected_custom.len()
+    )
 }
 
 fn read_json<T: for<'a> Deserialize<'a>>(path: &Path) -> Result<T, String> {
@@ -2507,11 +2564,7 @@ denominator.\n\n\
         .iter()
         .filter(|id| id.mode == "chaos")
         .count();
-    let custom = derived
-        .selected
-        .iter()
-        .filter(|id| id.mode == "custom")
-        .count();
+    let custom = derived.selected_custom.len();
     out.push_str(&format!(
         "Ordinary full validation executes {} selected regression cells: the {green_total} green \
 compatibility cells above (including {chaos} chaos-mode race-exposure checks), and {custom} \
@@ -2519,6 +2572,23 @@ explicit custom commands outside the comparable denominator. A passing validate 
 all of them; a failing green cell is a regression, not permission to move it to red.\n",
         derived.selected.len()
     ));
+    if !derived.selected_custom.is_empty() {
+        out.push_str(
+            "\n### Selected custom commands outside the comparable denominator\n\n\
+These rows are part of the selected regression denominator even though they are not rows in \
+`ci/compat-envelope/cells.json`. Their exact identities come from \
+`ci/expected-e2e-plan.json`; `scorecard.rs check` refuses any selected row that is not accounted \
+for by either this table or the comparable green cells above.\n\n\
+| Lane | Category | Test | Mode | Backend |\n\
+| --- | --- | --- | --- | --- |\n",
+        );
+        for id in &derived.selected_custom {
+            out.push_str(&format!(
+                "| `{}` | `{}` | `{}` | `{}` | `{}` |\n",
+                id.lane, id.category, id.test, id.mode, id.backend
+            ));
+        }
+    }
     out
 }
 
@@ -6710,11 +6780,105 @@ fn self_test() -> Result<(), String> {
         ..id.clone()
     };
     let population = BTreeSet::from([chaos_id.clone()]);
-    if !selected_green(&BTreeSet::from([chaos_id.clone()]), &population).contains(&chaos_id) {
+    let custom = |category: &str, test: &str, backend: &str| CellId {
+        lane: "portable".into(),
+        category: category.into(),
+        test: test.into(),
+        mode: "custom".into(),
+        backend: backend.into(),
+    };
+    let custom_ids = BTreeSet::from([
+        custom(
+            "backend-parity-c",
+            "backend-parity-c/environment-and-workdir",
+            "ptrace",
+        ),
+        custom("system-utils", "system-utils/clock-determinism", "liteinst"),
+        custom("system-utils", "system-utils/clock-determinism", "ptrace"),
+    ]);
+    let duplicate_fixture = |duplicate_mode: &str| {
+        let mut rows = (0..307)
+            .map(|index| CellId {
+                lane: "portable".into(),
+                category: "fixture".into(),
+                test: format!("fixture/test-{index:03}"),
+                mode: if index == 0 {
+                    duplicate_mode.into()
+                } else {
+                    "verify".into()
+                },
+                backend: "ptrace".into(),
+            })
+            .collect::<Vec<_>>();
+        rows.push(rows[0].clone());
+        rows
+    };
+    for mode in ["verify", "custom"] {
+        let rows = duplicate_fixture(mode);
+        let duplicate = display_id(&rows[0]);
+        let error = unique_cell_ids("fixture expected plan", rows)
+            .expect_err("308 physical rows with 307 identities must be refused");
+        if !error.contains("308 physical rows but only 307 unique identities")
+            || !error.contains(&duplicate)
+        {
+            return Err(format!(
+                "duplicate {mode} refusal did not name its count and identity: {error}"
+            ));
+        }
+    }
+    let mut selected = custom_ids.clone();
+    selected.insert(chaos_id.clone());
+    let (green, selected_custom) = selected_partition(&selected, &population)?;
+    if green != BTreeSet::from([chaos_id.clone()]) {
         return Err("a selected chaos cell was structurally excluded from green".into());
+    }
+    if selected_custom != custom_ids {
+        return Err(
+            "selected custom commands were not kept outside the comparable denominator".into(),
+        );
+    }
+    let selected_fixture = Derived {
+        population: population.clone(),
+        enabled: population.clone(),
+        ci_disabled_reasons: BTreeMap::new(),
+        not_applicable_reasons: BTreeMap::new(),
+        selected,
+        green,
+        selected_custom: selected_custom.clone(),
+    };
+    let rendered = render_scorecard(&selected_fixture);
+    for id in &selected_custom {
+        let row = format!(
+            "| `{}` | `{}` | `{}` | `custom` | `{}` |",
+            id.lane, id.category, id.test, id.backend
+        );
+        if !rendered.contains(&row) {
+            return Err(format!("scorecard omitted selected custom command {row}"));
+        }
+    }
+    if tracked_current_summary(&selected_fixture)
+        != "compatibility scorecard: tracked table and 1 comparable cells are current; selected regression denominator 4 = 1 comparable + 3 custom"
+    {
+        return Err("check summary did not expose the exact selected denominator".into());
     }
     if selected_green(&BTreeSet::new(), &population).contains(&chaos_id) {
         return Err("an unselected chaos cell was accepted as green".into());
+    }
+    let unaccounted = CellId {
+        mode: "future-mode".into(),
+        ..id.clone()
+    };
+    if selected_partition(&BTreeSet::from([unaccounted]), &population).is_ok() {
+        return Err("selected denominator accepted a row in neither existing category".into());
+    }
+    let custom_id = selected_custom.iter().next().unwrap().clone();
+    if selected_partition(
+        &BTreeSet::from([custom_id.clone()]),
+        &BTreeSet::from([custom_id]),
+    )
+    .is_ok()
+    {
+        return Err("selected denominator counted a custom command as comparable".into());
     }
     let visible_reason = CiDisabledReasonData {
         result: Some("determinism-failure".into()),
@@ -6728,6 +6892,7 @@ fn self_test() -> Result<(), String> {
         not_applicable_reasons: BTreeMap::new(),
         selected: BTreeSet::new(),
         green: BTreeSet::new(),
+        selected_custom: BTreeSet::new(),
     };
     let visible_tracked = tracked_from(&visible_red, None, Some("self-test"), false)?;
     if visible_tracked.cells[0].ci_disabled_reason.as_ref() != Some(&visible_reason)
@@ -6777,6 +6942,7 @@ red/`measured-and-passed` count is **0**.",
         )]),
         selected: BTreeSet::new(),
         green: BTreeSet::new(),
+        selected_custom: BTreeSet::new(),
     };
     let status_section = render_scorecard(&not_applicable);
     if !status_section.contains(
@@ -6810,6 +6976,7 @@ red/`measured-and-passed` count is **0**.",
         not_applicable_reasons: BTreeMap::new(),
         selected: BTreeSet::new(),
         green: BTreeSet::new(),
+        selected_custom: BTreeSet::new(),
     };
     if tracked_from(&regressed, Some(old_green), None, false).is_ok() {
         return Err("negative ratchet bracket accepted green-to-red movement".into());
@@ -6860,6 +7027,7 @@ red/`measured-and-passed` count is **0**.",
         not_applicable_reasons: BTreeMap::new(),
         selected: BTreeSet::new(),
         green: BTreeSet::from([id.clone()]),
+        selected_custom: BTreeSet::new(),
     };
     let recovered = tracked_from(&back_to_green, Some(overridden), None, false)
         .map_err(|e| format!("recovery after an override was refused: {e}"))?;
@@ -7826,6 +7994,7 @@ red/`measured-and-passed` count is **0**.",
         not_applicable_reasons: BTreeMap::new(),
         selected: BTreeSet::new(),
         green: BTreeSet::new(),
+        selected_custom: BTreeSet::new(),
     };
     if retained_import_cells(&red_import_fixture) != BTreeSet::from([validate_id.clone()]) {
         return Err("an enabled red cell was excluded from retained import".into());
@@ -10430,6 +10599,7 @@ red/`measured-and-passed` count is **0**.",
         not_applicable_reasons: BTreeMap::new(),
         selected: BTreeSet::from([boundary_id.clone()]),
         green: BTreeSet::new(),
+        selected_custom: BTreeSet::new(),
     };
     let rederived = tracked_from(&derived_fixture, Some(stamped.clone()), None, false)?;
     if rederived.projection != stamped.projection {

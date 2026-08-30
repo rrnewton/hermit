@@ -81,9 +81,11 @@ the Rust test IDs or E2E cells inside those nodes; `coverage.json` records the
 E2E population after a full run, while exact per-plan Rust test-ID enumeration
 remains unavailable.
 
-`SCORECARD.md` reports the current regression-cell count. Explicit custom
-commands remain required validation checks even though they are outside this
-uniform comparable denominator.
+`SCORECARD.md` reports the current regression-cell count and lists the exact
+selected custom commands separately. Explicit custom commands remain required
+validation checks even though they are outside this uniform comparable
+denominator. `scorecard.rs check` refuses unless every selected row is accounted
+for by either the comparable green cells or that custom-command list.
 
 The Basic Sanity Milestone 1 `verify` cells run each selected backend twice against
 itself. Bare `--verify` still uses the legacy Stripped comparator. These cells

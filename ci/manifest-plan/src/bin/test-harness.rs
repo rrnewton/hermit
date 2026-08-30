@@ -491,6 +491,66 @@ fn run_manifest_plan(root: &Path) {
     }
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PlanCellIdentity {
+    lane: String,
+    category: String,
+    test: String,
+    mode: String,
+    backend: String,
+}
+
+impl PlanCellIdentity {
+    fn from_json(row: &JsonValue) -> Result<Self, String> {
+        let field = |name: &str| {
+            row.get(name)
+                .and_then(JsonValue::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| format!("plan row has no string `{name}`: {row}"))
+        };
+        Ok(Self {
+            lane: field("lane")?,
+            category: field("category")?,
+            test: field("test")?,
+            mode: field("mode")?,
+            backend: field("backend")?,
+        })
+    }
+
+    fn display(&self) -> String {
+        format!(
+            "{}/{}/{}/{}@{}",
+            self.lane, self.category, self.test, self.mode, self.backend
+        )
+    }
+}
+
+fn unique_plan_rows(label: &str, rows: Vec<JsonValue>) -> Result<BTreeSet<String>, String> {
+    let physical = rows.len();
+    let mut identities = BTreeSet::new();
+    let mut duplicates = BTreeSet::new();
+    let mut normalized = BTreeSet::new();
+    for row in rows {
+        let identity = PlanCellIdentity::from_json(&row)?;
+        if !identities.insert(identity.clone()) {
+            duplicates.insert(identity);
+        }
+        normalized.insert(serde_json::to_string(&row).map_err(|error| error.to_string())?);
+    }
+    if !duplicates.is_empty() {
+        let names = duplicates
+            .iter()
+            .map(PlanCellIdentity::display)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "{label} contains {physical} physical rows but only {} unique identities; duplicate identities: {names}",
+            identities.len()
+        ));
+    }
+    Ok(normalized)
+}
+
 fn audit_expected_plan(root: &Path, manifests: &ManifestSet) -> usize {
     let cells = manifests
         .select(&Selection {
@@ -522,14 +582,15 @@ fn audit_expected_plan(root: &Path, manifests: &ManifestSet) -> usize {
         .collect::<Vec<_>>();
     let expected: serde_json::Value =
         serde_json::from_slice(&fs::read(root.join("ci/expected-e2e-plan.json")).unwrap()).unwrap();
-    let expected = expected["cells"].as_array().cloned().unwrap_or_default();
-    let normalize = |values: Vec<serde_json::Value>| {
-        values
-            .into_iter()
-            .map(|v| serde_json::to_string(&v).unwrap())
-            .collect::<BTreeSet<_>>()
-    };
-    if normalize(actual) != normalize(expected) {
+    let expected = expected["cells"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| fail("ci/expected-e2e-plan.json has no cells array"));
+    let actual =
+        unique_plan_rows("manifest required selection", actual).unwrap_or_else(|error| fail(error));
+    let expected =
+        unique_plan_rows("ci/expected-e2e-plan.json", expected).unwrap_or_else(|error| fail(error));
+    if actual != expected {
         fail("required E2E plan changed; update ci/expected-e2e-plan.json in the same review");
     }
     cells.len()
@@ -1530,6 +1591,37 @@ mod tests {
     use super::run_with_retry;
     use super::scheduled_worker_capacity;
     use super::structured_test_results_from_rows;
+    use super::unique_plan_rows;
+
+    fn duplicate_plan_fixture(mode: &str) -> Vec<serde_json::Value> {
+        let mut rows = (0..307)
+            .map(|index| {
+                serde_json::json!({
+                    "lane": "portable",
+                    "category": "fixture",
+                    "test": format!("fixture/test-{index:03}"),
+                    "mode": if index == 0 { mode } else { "verify" },
+                    "backend": "ptrace",
+                })
+            })
+            .collect::<Vec<_>>();
+        rows.push(rows[0].clone());
+        rows
+    }
+
+    #[test]
+    fn expected_plan_refuses_duplicate_comparable_and_custom_rows_before_set_comparison() {
+        for mode in ["verify", "custom"] {
+            let rows = duplicate_plan_fixture(mode);
+            let error = unique_plan_rows("fixture expected plan", rows)
+                .expect_err("308 physical rows with 307 identities must be refused");
+            assert!(
+                error.contains("308 physical rows but only 307 unique identities"),
+                "{error}"
+            );
+            assert!(error.contains(&format!("fixture/test-000/{mode}@ptrace")));
+        }
+    }
 
     #[test]
     fn cell_cpu_summary_includes_retries_and_refuses_incomplete_measurements() {
