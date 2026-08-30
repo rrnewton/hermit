@@ -125,22 +125,23 @@ compile of that same git dependency in 8.78s with no network.
 ### Where the phase node sets come from
 
 They are **not invented here.** `ci/portable-shards.json` partitions the
-non-manifest DAG nodes, and GitHub CI runs that partition as separate jobs. The
+constructed portable plan, and GitHub CI runs that partition as separate jobs. The
 split script reads the same keys with the same `jq` expressions as
-`.github/workflows/ci-portable.yml`. On a default full run it then reads the
-`e2e.manifest_*` nodes directly from `ci/dag/portable.json`, in DAG order, and
-counts the selected portable cell population from `ci/expected-e2e-plan.json`
-at runtime. It exact-compares the combined build/test selection with every DAG
-node and rejects missing, extra or duplicate identities. `--shards` remains an
+`.github/workflows/ci-portable.yml`, including the `e2e.manifest_*` and final
+result nodes. On a default full run it counts the selected portable cell
+population from `ci/expected-e2e-plan.json` at runtime. It exact-compares the
+combined build/test selection with every node in validate's constructed plan
+and rejects missing, extra or duplicate identities. `--shards` remains an
 explicit partial/debug mode and skips the manifest population.
 
 Two things worth knowing before touching this:
 
 - **The partition is the shard map, not the `group` field.**
-  `build.e2e_artifact` has group `build` but lives in the `integration` shard,
-  so it is test-side; `setup.manifest_plan`, `setup.nextest`, `e2e.metadata` and
-  `e2e.audit_compile_backend_parity_c` are not group `build` but are build-side.
-  Partitioning on `group` misplaces five nodes.
+  `test.strict_compat` has group `test` but runs after its other test-node
+  predecessors in a separate hosted job; `setup.manifest_plan`,
+  `setup.nextest`, `e2e.metadata` and `e2e.audit_compile_backend_parity_c` are
+  not group `build` but execute before the remaining test side. Partitioning on
+  `group` therefore does not reproduce the hosted grouping.
 - **GitHub's split is for wall clock, not for network.** Its shard jobs have
   full network and restore a cargo cache with `Swatinem/rust-cache`; the
   prebuilt tarball carries only binaries, not `target/debug/deps`, so the shards

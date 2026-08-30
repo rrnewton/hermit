@@ -46,12 +46,11 @@
 #
 # THE PARTITION IS THE SHARD MAP, NOT THE `group` FIELD. A naive implementation
 # gets this wrong in both directions:
-#   * build.e2e_artifact has group "build" but lives in the `integration` SHARD,
-#     so it is TEST-side.
-#   * setup.manifest_plan, setup.nextest, e2e.metadata and
-#     e2e.audit_compile_backend_parity_c are NOT group "build", but they are in
-#     build_debug_nodes, so they are BUILD-side.
-# Partitioning on `group` would misplace five nodes. Read the map.
+#   * the strict compatibility node has group "test" but runs after its other
+#     test-node predecessors in a separate hosted job;
+#   * preflight, check, setup, and E2E audit nodes are not group "build", but
+#     they execute before the remaining test side.
+# Read the map rather than reconstructing either partition from tag prefixes.
 #
 # HOW THIS DIFFERS FROM GITHUB, STATED PLAINLY. GitHub's split is for WALL CLOCK
 # -- build once, fan out -- not for network. Its shard jobs have full network
@@ -133,17 +132,32 @@ FETCH_MANIFESTS=(
     exit 2
 }
 
-# The SAME jq expressions ci-portable.yml uses, so the two cannot disagree.
-build_nodes=$(jq -r '(.preflight_nodes + .build_debug_nodes + .build_dbt_nodes + .build_aux_nodes)|join(",")' "$MAP")
+# Read the same assignment fields ci-portable.yml uses. This whole-split path
+# groups the hosted preflight and check jobs with the build jobs before running
+# the remaining test, E2E, and final steps.
+build_nodes=$(jq -r '(
+    .preflight_nodes
+  + .check_nodes
+  + .build_debug_nodes
+  + .build_dbt_nodes
+  + .build_aux_nodes
+)|join(",")' "$MAP")
 
 if [[ -n "$shards" ]]; then
     shard_nodes=$(jq -r --arg sel "$shards" \
         '($sel|split(",")) as $s
-         | [ (.debug_shards[], .release_shards[]) | select(.slug as $x | $s | index($x)) | .nodes[] ]
+         | ([ (.debug_shards[], .release_shards[])
+                | select(.slug as $x | $s | index($x))
+                | .nodes[] ]
+            + (if ($s | index("strict-compat")) == null
+               then []
+               else .strict_compat_nodes
+               end))
          | join(",")' "$MAP")
     [[ -n "$shard_nodes" ]] || {
         echo "run-split-validate: no shard matched '$shards'. Known slugs:" >&2
         jq -r '(.debug_shards[], .release_shards[]).slug | "  " + .' "$MAP" >&2
+        jq -r 'select((.strict_compat_nodes // []) | length > 0) | "  strict-compat"' "$MAP" >&2
         exit 2
     }
     test_nodes=$shard_nodes
@@ -151,6 +165,7 @@ else
     shard_nodes=$(jq -r '[ (.debug_shards[], .release_shards[]).nodes[] ]|join(",")' "$MAP")
     test_nodes=$(jq -r '[
         (.debug_shards[], .release_shards[]).nodes[],
+        .strict_compat_nodes[],
         .e2e_nodes[],
         .final_nodes[]
     ]|join(",")' "$MAP")
@@ -162,11 +177,13 @@ shard_node_count=$(tr ',' '\n' <<<"$shard_nodes" | wc -l)
 # run.
 e2e_nodes=""
 e2e_node_count=0
+strict_compat_node_count=0
 final_node_count=0
 e2e_cell_count=0
 if [[ -z "$shards" ]]; then
     e2e_nodes=$(jq -er '.e2e_nodes | if length > 0 then join(",") else error("no e2e.manifest_* steps") end' "$MAP")
     e2e_node_count=$(tr ',' '\n' <<<"$e2e_nodes" | wc -l)
+    strict_compat_node_count=$(jq -er '.strict_compat_nodes | if length > 0 then length else error("no strict compatibility steps") end' "$MAP")
     final_node_count=$(jq -er '.final_nodes | if length > 0 then length else error("no final steps") end' "$MAP")
     e2e_cell_count=$(jq -er '
         [.cells[] | select(.lane == "portable")] as $portable
@@ -214,7 +231,11 @@ fi
 if [[ $do_offline -eq 1 ]]; then
     echo "== OFFLINE phase (pinned root, NO network): build then test, in one place"
     echo "     build-side: $build_node_count node(s)"
-    echo "     test-side:  $test_node_count node(s) ($shard_node_count shard + $e2e_node_count manifest + $final_node_count final)"
+    if [[ -n "$shards" ]]; then
+        echo "     test-side:  $test_node_count selected node(s)"
+    else
+        echo "     test-side:  $test_node_count node(s) ($shard_node_count shard + $strict_compat_node_count strict compatibility + $e2e_node_count manifest + $final_node_count final)"
+    fi
     if [[ -n "$e2e_nodes" ]]; then
         echo "     e2e cells:  $e2e_cell_count selected portable cell(s)"
     fi

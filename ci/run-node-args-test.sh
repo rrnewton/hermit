@@ -122,10 +122,24 @@ else
         fail "the real ${#long_sel}-byte preflight selection was refused: exit $long_status.
   This is the selection ci-portable.yml passes, so a failure here reddens the whole job.
   Output: $long_output"
+    elif [[ $long_output != *"scheduler-width=validate-default"* ]]; then
+        fail "the constructed-plan path did not inherit validate's scheduler width. Output: $long_output"
     else
         printf 'run-node-args-test: ok — a %d-byte CI selection reaches the constructed plan\n' \
             "${#long_sel}"
     fi
+fi
+
+override_output=$(run_local env RUN_NODE_PRINT_ONLY=1 RUN_NODE_JOBS=3 \
+    VALIDATE_SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS=1 \
+    "$RUN_NODE" "$LANE" "$NODE" 2>&1)
+override_status=$?
+if ((override_status != 0)); then
+    fail "the explicit scheduler-width override was refused: exit $override_status. Output: $override_output"
+elif [[ $override_output != *"scheduler-width=-j3"* ]]; then
+    fail "the explicit scheduler-width override was not forwarded. Output: $override_output"
+else
+    printf 'run-node-args-test: ok — RUN_NODE_JOBS explicitly overrides validate default\n'
 fi
 
 # The append case. RUN_NODE_PRINT_ONLY stops before execution, so this asserts
@@ -243,4 +257,4 @@ if ((failures > 0)); then
     printf 'run-node-args-test: %d check(s) FAILED\n' "$failures" >&2
     exit 1
 fi
-printf 'run-node-args-test: OK — 5 reasoned refusals, 1 usage check, 1 real CI selection, 1 single-node edit, lane CPU budget carried, no unexplained drift\n'
+printf 'run-node-args-test: OK — 5 reasoned refusals, 1 usage check, 1 real CI selection, scheduler-width default and override, 1 single-node edit, lane CPU budget carried, no unexplained drift\n'

@@ -16,13 +16,21 @@ fi
 
 readonly PROGRAM=$1
 readonly FIXTURE_ROOT=${REAL_COMPAT_FIXTURES:-/tmp/hermit-real-compat-fixtures}
-readonly WORK_DIR="/tmp/hermit-real-compat-$PROGRAM"
+# A real allocation, not a name derived from the program. The old
+# "/tmp/hermit-real-compat-$PROGRAM" was the same directory for every concurrent
+# run of one program, and the two lines below made that MUTUALLY DESTRUCTIVE
+# rather than merely shared: the second run's `rm -rf` deleted the first run's
+# tree mid-flight, and whichever finished first deleted it again from its EXIT
+# trap. Measured over ten concurrent pairs of `curl-localhost`: seven pairs had
+# at least one side fail. `mktemp -d` creates the directory itself, so the
+# `rm -rf`/`mkdir` that opened the window are gone with it, and the trap now
+# only ever removes this run's own tree.
+WORK_DIR="$(mktemp -d "/tmp/hermit-real-compat-$PROGRAM.XXXXXXXX")"
+readonly WORK_DIR
 export LC_ALL=C
 export TZ=UTC
 umask 022
 
-rm -rf "$WORK_DIR"
-mkdir -p "$WORK_DIR"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
 function write_assembly_fixture {
@@ -70,7 +78,14 @@ function fetch_localhost_payload {
         local server_pid=
         local server_status=0
         local status=0
-        local -a nc_args=(--send-only -l 127.0.0.1 18765)
+        # PORT 0 IS AN ALLOCATION; A LITERAL IS NOT. The kernel hands back a free
+        # port and holds it bound, so two concurrent runs of this same program
+        # cannot land on the same one. The literal 18765 collided with itself:
+        # nothing checked it was free, so a second run either failed to bind or,
+        # worse, talked to the first run's server. The compared value is a sha256
+        # of the downloaded payload, so the port never reaches it and varying it
+        # cannot manufacture a divergence.
+        local -a nc_args=(--send-only -l 127.0.0.1 0)
 
         trap 'if [[ -n $server_pid ]]; then kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; fi' EXIT
         prepare_archive_fixture
@@ -105,14 +120,26 @@ function fetch_localhost_payload {
         # Yield one deterministic logical interval so Ncat reaches listen(2)
         # before the client connects, without a second readiness process.
         sleep 0.1
+        # Read the port the kernel actually assigned. This also CONFIRMS the bind,
+        # which the sleep alone only assumes.
+        local server_port=''
+        server_port=$(ss -ltnpH 2>/dev/null \
+            | grep -F "pid=${server_pid}," \
+            | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2)
+        if [[ ! $server_port =~ ^[1-9][0-9]*$ ]]; then
+            printf 'could not read the kernel-assigned port for ncat pid %s\\n' "$server_pid" >&2
+            kill "$server_pid" 2>/dev/null || true
+            wait "$server_pid" 2>/dev/null || true
+            return 1
+        fi
         if [[ $client == wget ]]; then
             /usr/bin/wget --quiet \
                 --output-document="$WORK_DIR/output/payload.txt" \
-                http://127.0.0.1:18765/payload.txt || status=$?
+                http://127.0.0.1:$server_port/payload.txt || status=$?
         else
             /usr/bin/curl --fail --silent --show-error \
                 --output "$WORK_DIR/output/payload.txt" \
-                http://127.0.0.1:18765/payload.txt || status=$?
+                http://127.0.0.1:$server_port/payload.txt || status=$?
         fi
 
         if ((status != 0)); then
@@ -295,7 +322,11 @@ import java.util.concurrent.FutureTask;
 
 class Compat {
     public static void main(String[] args) throws Exception {
-        Path path = Paths.get("/tmp/hermit-real-compat-java/data.txt");
+        // The work directory arrives as argv rather than being spelled out: the
+        // heredoc is quoted, so $WORK_DIR cannot be interpolated here, and the
+        // literal it used to hold silently stopped tracking the real directory
+        // the moment that stopped being a fixed name.
+        Path path = Paths.get(args[0], "data.txt");
         Files.write(path, Arrays.asList("gamma", "alpha", "beta"), StandardCharsets.UTF_8);
         List<String> lines = new ArrayList<>(Files.readAllLines(path));
         Collections.sort(lines);
@@ -317,7 +348,7 @@ EOF
         javac -J-Xint -J-XX:+UseSerialGC -J-XX:ActiveProcessorCount=1 \
             -d "$WORK_DIR" "$WORK_DIR/Compat.java"
         java -Xint -XX:+UseSerialGC -XX:ActiveProcessorCount=1 \
-            -cp "$WORK_DIR" Compat
+            -cp "$WORK_DIR" Compat "$WORK_DIR"
         ;;
     git)
         if [[ -x /usr/local/bin/git.meta.real ]]; then

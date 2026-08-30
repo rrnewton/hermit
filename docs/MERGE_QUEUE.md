@@ -6,7 +6,7 @@ but neither is a required main-branch status check.
 
 The advisory `merge-gate-v4` job passes when either:
 
-- the authoritative jobs in the latest `.github/workflows/ci-portable.yml` and
+- the diagnostic aggregate jobs in the latest `.github/workflows/ci-portable.yml` and
   `.github/workflows/ci-privileged.yml` runs for the exact pull request head
   both completed successfully; or
 - the pull request has the `locally-validated` label and an exact-head receipt
@@ -95,10 +95,11 @@ backfill a validated head.
 Use `./scripts/validate.rs --no-label-pr` or `VALIDATE_LABEL_PR=0 ./scripts/validate.rs`
 when a green run must not update GitHub.
 
-The label is an alternate merge admission signal, not a partial-test waiver.
+The label is an exact-head local validation signal, not a partial-test waiver.
 Apply it only through a full green validator run on the exact pull request head.
-Without that local receipt, the hosted leg requires both the portable and
-privileged jobs to pass. A hosted failure is never overridden by local evidence.
+Without that local receipt, the advisory merge-gate can report green only when
+both hosted jobs pass. It retains a hosted failure as a red diagnostic, but that
+red does not override qualifying local evidence or block a direct fast-forward.
 
 ## Validation-evidence trail
 

@@ -1895,6 +1895,8 @@ fn self_test() -> Result<(), String> {
     // Completeness is what a self-certifying driver is least able to check about
     // itself, so its refusal predicate is bracketed here rather than assumed.
     verdict_refusal_bracket()?;
+    pin_gate_receipt_bracket()?;
+    scorecard_writeback_scope_bracket()?;
     host_capability_bracket(&root)?;
     coverage_schema_bracket()?;
     cell_results_schema_bracket()?;
@@ -4003,13 +4005,19 @@ fn append_validate_series(
 }
 
 /// Merge one top-level validate's completed per-cell rows into the tracked
-/// scorecard files. Nested validates leave this to their outer run.
+/// scorecard files. Nested and off-the-record validates leave the tracked view
+/// untouched; only a receipt-producing top-level run owns that projection.
+fn should_write_scorecard(nested: bool, off_the_record: bool) -> bool {
+    !nested && !off_the_record
+}
+
 fn local_scorecard_writeback(
     root: &Path,
     result_root: &Path,
     nested: bool,
+    off_the_record: bool,
 ) -> Option<Result<(), String>> {
-    if nested {
+    if !should_write_scorecard(nested, off_the_record) {
         return None;
     }
     let script = root.join("ci/compat-envelope/scorecard.rs");
@@ -5726,7 +5734,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             .iter()
             .find(|s| s.tag() == debug_producer)
             .ok_or_else(|| format!("fused debug producer disappeared: {debug_producer}"))?;
-        let expected_fat_build = "./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit";
+        let expected_fat_build = "./ci/run-with-reverie-dbt-budget.sh cargo build --locked -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit";
         if portable_build.cmd != expected_fat_build {
             return Err(format!(
                 "fused debug producer command drifted; re-prove the artifact barrier: {}",
@@ -7027,6 +7035,16 @@ fn exit_code_with_execution_completeness(exit_code: u8, execution_complete: bool
     if execution_complete { exit_code } else { exit_code.max(1) }
 }
 
+/// A missing pin gate invalidates a passing receipt, not an explicitly
+/// off-the-record selected run. Selected hosted jobs inherit the exact commit
+/// and a successful preflight through the external workflow dependency, and
+/// they are already forbidden from writing a ledger row or publishing a
+/// receipt. Turning a completed selected step into failure here would discard
+/// its result without strengthening any evidence claim.
+fn pin_gate_blocks_pass(exit_code: u8, pin_gate_passed: bool, off_the_record: bool) -> bool {
+    exit_code == 0 && !pin_gate_passed && !off_the_record
+}
+
 /// Fast exit 127 is useful missing-artifact guidance only in `--only`, whose
 /// documented contract deliberately drops build dependencies. It is never a
 /// verdict override and is not inferred for full or other focused profiles.
@@ -7561,6 +7579,43 @@ fn verdict_refusal_bracket() -> Result<(), String> {
     println!(
         "  verdict refusals: 3 positive(s) fire (0-measured+spine, 0-executed, spine-with-full-matrix), \
          2 negative(s) inert (complete run, unknown counts)"
+    );
+    Ok(())
+}
+
+/// Both sides of [`pin_gate_blocks_pass`], using only planted booleans.
+fn pin_gate_receipt_bracket() -> Result<(), String> {
+    if !pin_gate_blocks_pass(0, false, false) {
+        return Err("pin gate: a receipt-producing pass without the gate was accepted".into());
+    }
+    for (exit_code, pin_gate_passed, off_the_record, label) in [
+        (0, true, false, "receipt-producing pass with gate"),
+        (1, false, false, "existing failure without gate"),
+        (0, false, true, "off-the-record selected pass without gate"),
+    ] {
+        if pin_gate_blocks_pass(exit_code, pin_gate_passed, off_the_record) {
+            return Err(format!("pin gate: {label} was incorrectly refused"));
+        }
+    }
+    println!(
+        "  pin gate: receipt-producing pass requires the observed gate; off-the-record selected pass does not claim a receipt"
+    );
+    Ok(())
+}
+
+fn scorecard_writeback_scope_bracket() -> Result<(), String> {
+    if !should_write_scorecard(false, false)
+        || should_write_scorecard(true, false)
+        || should_write_scorecard(false, true)
+        || should_write_scorecard(true, true)
+    {
+        return Err(
+            "scorecard write-back: only a receipt-producing top-level run may update the tracked projection"
+                .into(),
+        );
+    }
+    println!(
+        "  scorecard write-back: receipt-producing top-level run only; nested and off-the-record runs inert"
     );
     Ok(())
 }
@@ -9033,6 +9088,38 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             .map_err(|e| format!("retry bounds: invalid {field} in {line:?}: {e}"))
     }
 
+    fn require_live_nextest_output(tag: &str, command: &str) -> Result<(), String> {
+        let Some(wrapper) = command.find("run-nextest-counted.sh") else {
+            return Ok(());
+        };
+        let invocation = &command[wrapper..];
+        if invocation.contains(">\"$log\" 2>&1")
+            || invocation.contains("cat \"$log\"")
+            || invocation.contains("sed -n 's/^running ")
+        {
+            return Err(format!(
+                "retry bounds: {tag} buffers or reparses run-nextest-counted output; test events \
+                 must remain live and exact counts must be checked by the wrapper"
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_expected_nextest_count(
+        tag: &str,
+        command: &str,
+        expected: usize,
+    ) -> Result<(), String> {
+        let declaration = format!("NEXTEST_EXPECTED_EXECUTED={expected}");
+        if !command.contains(&declaration) {
+            return Err(format!(
+                "retry bounds: {tag} must require exactly {expected} executed tests through \
+                 {declaration}"
+            ));
+        }
+        Ok(())
+    }
+
     let nextest = std::fs::read_to_string(root.join(".config/nextest.toml"))
         .map_err(|e| format!("retry bounds: cannot read nextest config: {e}"))?;
     let manifest_defaults =
@@ -9077,13 +9164,62 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .max()
         .ok_or("retry bounds: no declared nextest cap")?;
 
-    let smallest_enclosing_deadline_s = ["portable", "privileged"]
+    let lane_configs = ["portable", "privileged"]
         .into_iter()
-        .map(|lane| validate_plan::lane_config(root, lane).map(|cfg| cfg.default_step_timeout))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
+        .map(|lane| validate_plan::lane_config(root, lane).map(|cfg| (lane, cfg)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let smallest_enclosing_deadline_s = lane_configs
+        .iter()
+        .map(|(_, cfg)| cfg.default_step_timeout)
         .min()
         .ok_or("retry bounds: no enclosing lane deadline")?;
+    let mut streamed_nextest_nodes = 0usize;
+    for (_, cfg) in &lane_configs {
+        for step in cfg
+            .steps
+            .iter()
+            .filter(|step| step.cmd.contains("run-nextest-counted.sh"))
+        {
+            require_live_nextest_output(&step.tag(), &step.cmd)?;
+            streamed_nextest_nodes += 1;
+        }
+    }
+    let privileged = lane_configs
+        .iter()
+        .find(|(lane, _)| *lane == "privileged")
+        .map(|(_, cfg)| cfg)
+        .ok_or("retry bounds: privileged lane is absent")?;
+    for (tag, expected) in [
+        ("test.pmu_buck_chaos_cases", 6usize),
+        ("test.cli_kvm", 21usize),
+    ] {
+        let step = privileged
+            .steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .ok_or_else(|| format!("retry bounds: exact-count node {tag} is absent"))?;
+        require_expected_nextest_count(tag, &step.cmd, expected)?;
+    }
+    let buffered_mutation =
+        "./ci/run-nextest-counted.sh -p fixture >\"$log\" 2>&1 || status=$?; cat \"$log\"";
+    let buffered_error = require_live_nextest_output("test.fixture", buffered_mutation)
+        .expect_err("buffered nextest output mutation must be refused");
+    if !buffered_error.contains("test.fixture") || !buffered_error.contains("must remain live") {
+        return Err(format!(
+            "retry bounds: buffered-output mutation did not fail by node name: {buffered_error}"
+        ));
+    }
+    let count_error = require_expected_nextest_count(
+        "test.fixture",
+        "./ci/run-nextest-counted.sh -p fixture",
+        7,
+    )
+    .expect_err("missing exact-count declaration mutation must be refused");
+    if !count_error.contains("test.fixture") || !count_error.contains("exactly 7") {
+        return Err(format!(
+            "retry bounds: exact-count mutation did not fail by node name: {count_error}"
+        ));
+    }
     let attempts = validate_runtime::MAX_ATTEMPTS_PER_CELL as i64;
     let default_with_grace_s = DEFAULT_TEST_CAP_S + NEXTEST_TERMINATION_GRACE_S;
     let largest_nextest_with_grace_s = largest_nextest_cap_s + NEXTEST_TERMINATION_GRACE_S;
@@ -9120,9 +9256,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             tightest_manifest_headroom_s = tightest_manifest_headroom_s.min(headroom_s);
             Ok(())
         };
-    for lane in ["portable", "privileged"] {
-        let cfg = validate_plan::lane_config(root, lane)
-            .map_err(|e| format!("retry bounds: cannot load {lane} lane: {e}"))?;
+    for (lane, cfg) in &lane_configs {
         for step in cfg
             .steps
             .iter()
@@ -9148,7 +9282,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
                 step.timeout,
                 Selection {
                     population: Some(Population::Required),
-                    lane: Some(lane.into()),
+                    lane: Some((*lane).into()),
                     category: Some(category.clone()),
                     ..Default::default()
                 },
@@ -9185,7 +9319,8 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         ));
     }
     Ok(format!(
-        "retry bounds: non-manifest retries receive separate node deadlines; default nextest \
+        "retry bounds: {streamed_nextest_nodes} nextest node(s) keep test events live; \
+         non-manifest retries receive separate node deadlines; default nextest \
          cap including grace={default_with_grace_s}s and largest nextest cap including grace=\
          {largest_nextest_with_grace_s}s are below the smallest enclosing lane deadline of \
          {smallest_enclosing_deadline_s}s; {checked_manifest_nodes} manifest node(s) fit both \
@@ -15491,7 +15626,12 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // the invocation lock: it never runs a gate, and a leaked fixture must never
     // wedge a real run.
     if validate_runtime::stop_test_requested() {
-        return stop_test_seam(&root, &profile_name, parent.as_deref());
+        return stop_test_seam(
+            &root,
+            &profile_name,
+            parent.as_deref(),
+            args.allow_local_off_the_record_run,
+        );
     }
 
     if args.allow_local_off_the_record_run {
@@ -16539,8 +16679,12 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         // This is below the interrupted run's ledger write. Keep the checkout
         // lock held while the generated files are replaced, so a second local
         // validate cannot begin against the tree between those two operations.
-        let scorecard_writeback =
-            local_scorecard_writeback(&root, &e2e_result_root, nesting.nested);
+        let scorecard_writeback = local_scorecard_writeback(
+            &root,
+            &e2e_result_root,
+            nesting.nested,
+            args.allow_local_off_the_record_run,
+        );
         drop(run_record);
         let _ = std::fs::remove_dir_all(&tmp);
         let mut detail = vec![
@@ -16723,14 +16867,21 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
 
     // Receipt production is itself an enforcement path (validate.sh:1846).
     //
-    // Every profile plans `pre.reverie_pin` and every lane node depends on it, so
-    // in principle a green cannot happen without it. This asserts that anyway: if
-    // a future fast path, cache branch, or early return ever bypasses the pin
-    // gate, it must not emit PASS merely because the tests it did select happened
-    // to pass. The archival pin is not a testing exemption, and "the DAG makes it
-    // impossible" is a structural argument, not an observation of this run.
+    // Every receipt-producing profile plans `pre.reverie_pin` and every lane
+    // node depends on it, so in principle a green receipt cannot happen without
+    // it. This asserts that anyway: if a future fast path, cache branch, or early
+    // return ever bypasses the pin gate, it must not emit PASS merely because the
+    // tests it did select happened to pass. An off-the-record selected subgraph
+    // is the explicit exception: it cannot write a ledger row or receipt, and
+    // the external workflow already depends on the preflight result. The
+    // archival pin is not a testing exemption, and "the DAG makes it impossible"
+    // is a structural argument, not an observation of a receipt-producing run.
     let mut pin_gate_bypassed = false;
-    if exit_code == 0 && !pin_gate_passed {
+    if pin_gate_blocks_pass(
+        exit_code,
+        pin_gate_passed,
+        args.allow_local_off_the_record_run,
+    ) {
         eprintln!(
             "validate: ERROR: this path produced a PASS without a passing {PIN_GATE_TAG} gate; \
              refusing a passing receipt."
@@ -16930,8 +17081,12 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // lock remains held here, so another direct validate cannot start between
     // receipt finalization and this write-back. ci-hub additionally writes the
     // completed results back to the checkout that invoked the isolated run.
-    let scorecard_writeback =
-        local_scorecard_writeback(&root, &e2e_result_root, nesting.nested);
+    let scorecard_writeback = local_scorecard_writeback(
+        &root,
+        &e2e_result_root,
+        nesting.nested,
+        args.allow_local_off_the_record_run,
+    );
 
     // Read the individual results before removing the disposable build root: a
     // caller may deliberately place E2E_RESULT_ROOT there. The scheduler is
@@ -17138,7 +17293,12 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
 /// that unrepresentable — orphan detection (`getppid() == 1`) and a lifetime
 /// deadline — and the Python harness additionally tears its own child's process
 /// group down in a `finally`.
-fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSummary {
+fn stop_test_seam(
+    root: &Path,
+    profile: &str,
+    parent: Option<&Path>,
+    off_the_record: bool,
+) -> RunSummary {
     let started_at = utc_now();
     let started = std::time::Instant::now();
     let prior_failure = env_flag("VALIDATE_STOP_TEST_PRIOR_FAILURE", "1");
@@ -17239,23 +17399,25 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     // The fixture plans exactly the synthetic gates it ran, withholds nothing,
     // and leaves nothing unaccounted.
     let planned_tags: BTreeSet<String> = outcomes.iter().map(|o| o.tag.clone()).collect();
-    write_ledger(
-        &ledger,
-        &ctx,
-        &outcomes,
-        &[],
-        &[],
-        &[],
-        &planned_tags,
-        wall,
-        exit_code,
-        "",
-        false,
-        serde_json::json!({}),
-        None,
-    );
+    if !off_the_record {
+        write_ledger(
+            &ledger,
+            &ctx,
+            &outcomes,
+            &[],
+            &[],
+            &[],
+            &planned_tags,
+            wall,
+            exit_code,
+            "",
+            false,
+            serde_json::json!({}),
+            None,
+        );
+    }
 
-    let detail = match exit {
+    let mut detail = match exit {
         validate_runtime::StopTestExit::Signalled => vec![format!(
             "stop-path fixture: stopped by SIG{}; recorded as {}",
             interruption.clone().unwrap_or_default(),
@@ -17277,6 +17439,12 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
                 .into(),
         ],
     };
+    if off_the_record {
+        detail.push(
+            "stop-path fixture ran OFF THE RECORD: no ledger row, receipt, scorecard, or label was published"
+                .into(),
+        );
+    }
     let mut s = RunSummary::new(
         if interruption.is_some() { Verdict::Interrupted } else { Verdict::Fail },
         exit_code,
@@ -17287,7 +17455,9 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     s.nodes_failed = outcomes.iter().filter(|o| !o.ok).count();
     s.wall_s = Some(wall);
     s.cpu_wall = Some((wall, cpu_user, cpu_sys));
-    s.ledger = Some(ledger);
+    if !off_the_record {
+        s.ledger = Some(ledger);
+    }
     s
 }
 

@@ -88,6 +88,26 @@ assert report["executed_tests"] == 2
 assert report["filtered_tests"] == 11
 PYEOF
 
+    got=$(DAGRUN_TEST_COUNTS_PATH="$scratch/expected-counts.json" \
+        NEXTEST_EXPECTED_EXECUTED=2 emit_libtest_count "$scratch/events.jsonl" 0)
+    expected=$'running 2 tests\ntest result: ok. 2 passed; 0 failed; 0 ignored; 7 filtered out'
+    [[ $got == "$expected" ]] || return 1
+    cmp -s "$scratch/expected-counts.json" "$scratch/counts.json" || return 1
+
+    status=0
+    DAGRUN_TEST_COUNTS_PATH="$scratch/wrong-counts.json" \
+        NEXTEST_EXPECTED_EXECUTED=3 emit_libtest_count "$scratch/events.jsonl" 0 \
+        >"$scratch/wrong-count.stdout" 2>"$scratch/wrong-count.stderr" || status=$?
+    [[ $status == 2 ]] || return 1
+    grep -q 'expected 3 tests to execute, saw 2' "$scratch/wrong-count.stderr" || return 1
+    [[ ! -e $scratch/wrong-counts.json ]] || return 1
+
+    status=0
+    NEXTEST_EXPECTED_EXECUTED=unknown emit_libtest_count "$scratch/events.jsonl" 0 \
+        >/dev/null 2>"$scratch/invalid-count.stderr" || status=$?
+    [[ $status == 2 ]] || return 1
+    grep -q 'NEXTEST_EXPECTED_EXECUTED' "$scratch/invalid-count.stderr" || return 1
+
     printf '%s\n' \
         '{"type":"suite","event":"started","test_count":1,"nextest":{"crate":"suite","test_binary":"suite","kind":"lib"}}' \
         '{"type":"test","event":"started","name":"suite::suite$fails"}' \
@@ -139,7 +159,7 @@ PYEOF
     grep -q 'unsupported test event "future"' "$scratch/refusal" || return 1
     [[ ! -e $scratch/refused.json ]] || return 1
 
-    printf 'run-nextest-counted: self-test PASS (4 positive, 1 refusal)\n'
+    printf 'run-nextest-counted: self-test PASS (5 positive, 3 refusal)\n'
 }
 
 if [[ ${1:-} == --self-test ]]; then

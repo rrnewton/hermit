@@ -1,8 +1,10 @@
 name: CI (GitHub-managed portable)
 
-# Authoritative full-lane parallel fan-out of the portable CI DAG.
+# Manually dispatched diagnostic fan-out of the constructed portable plan.
+# Local full validation remains the landing authority; this workflow reports
+# additional evidence and a hosted red does not block a qualifying local green.
 #
-# WHY: the authoritative `regular` job in ci-portable.yml runs the entire 46-node
+# WHY: the former serial `regular` job ran the entire 46-node
 # portable DAG on ONE ubuntu-latest runner with outer concurrency 1 (serial
 # nodes). Its measured wall (dag-perf-regular @c7531a83) is ~32 min: total
 # node-work 1918s ~= wall 1920s, i.e. the ~2.7x core usage is entirely WITHIN
@@ -16,14 +18,10 @@ name: CI (GitHub-managed portable)
 # assigned DAG nodes via ci/run-node.sh against the prebuilt tree. Wall time
 # becomes max(build stage, slowest single shard) instead of the serial sum.
 #
-# The release backends compile in ONE build-release job (build.dbt_release +
-# build.sabre_release + build.liteinst_runtime_release). An earlier
-# build-dbt-cache -> build-dbt -> build-aux split chased a <10-min-per-build-job
-# target but was a net loss: it re-compiled detcore-dbt twice and shuttled
-# target/release through two extra artifact round-trips, turning one ~9.4-min node
-# into ~18 min across three serial jobs (benchmarks/ci-dag-portable_20260802).
-# build.dbt_release alone is ~10-12 min cold on a 4-core hosted runner, so the
-# per-job target is met by a warm cargo cache, not by fragmenting the compile.
+# The debug and release producers run independently. A short follow-up job
+# downloads both trees, runs the constructed artifact publisher, and then runs
+# its dependent LiteInst producer. That preserves the local DAG edges without
+# rebuilding either predecessor in the workflow file.
 #
 # CORRESPONDENCE (fail-closed): ci/check-shard-coverage.sh asks validate for its
 # constructed portable-only plan and asserts that ci/portable-shards.json assigns
@@ -36,10 +34,8 @@ on:
   workflow_dispatch:
 
 concurrency:
-  # QUEUE-DEPTH-1 on main: all main pushes share one group (github.ref) and
-  # cancel-in-progress:false lets the RUNNING job finish while a newer main push
-  # supersedes only the older PENDING run. merge_group runs get a unique head_sha
-  # group. NOTHING here cancels an in-progress run.
+  # Manual runs for one ref share a group. cancel-in-progress:false lets the
+  # running diagnostic finish while GitHub supersedes only an older pending run.
   group: portable-${{ github.event.merge_group.head_sha || github.ref }}
   cancel-in-progress: false
 
@@ -65,6 +61,12 @@ env:
   RUSTFLAGS: -D warnings -C link-arg=-llzma
   RUSTDOCFLAGS: -D warnings
   DETCORE_TEST_RUST_LOG: "off"
+  # Selected validate invocations otherwise choose a per-process temporary
+  # fixture root. Bind one workspace path so build.manifest_guests can publish
+  # its output and later selected manifest steps can consume those same files.
+  E2E_BUILD_ROOT: ${{ github.workspace }}/ignored/e2e/build
+  MANIFEST_PLAN_ARTIFACT: hermit-manifest-plan-${{ github.run_id }}
+  MANIFEST_PLAN_TARBALL: hermit-manifest-plan.tgz
   DEBUG_ARTIFACT: hermit-debug-${{ github.run_id }}
   DEBUG_TARBALL: hermit-portable-debug.tzst
   RELEASE_DBT_ARTIFACT: hermit-release-dbt-${{ github.run_id }}
@@ -92,6 +94,7 @@ jobs:
       build_release: ${{ steps.sel.outputs.build_release }}
       run_debug_shards: ${{ steps.sel.outputs.run_debug_shards }}
       run_release_shards: ${{ steps.sel.outputs.run_release_shards }}
+      run_strict_compat: ${{ steps.sel.outputs.run_strict_compat }}
       run_e2e: ${{ steps.sel.outputs.run_e2e }}
       cell_backends: ${{ steps.sel.outputs.cell_backends }}
       debug_matrix: ${{ steps.sel.outputs.debug_matrix }}
@@ -122,6 +125,7 @@ jobs:
               echo "build_release=true"
               echo "run_debug_shards=true"
               echo "run_release_shards=true"
+              echo "run_strict_compat=true"
               echo "run_e2e=true"
               echo "cell_backends=ALL"
               echo "debug_matrix=$dbg"
@@ -160,28 +164,42 @@ jobs:
             ci/portable-shards.json)
           run_dbg=$(jq -e '.include|length>0' <<<"$dbg" >/dev/null 2>&1 && echo true || echo false)
           run_rel=$(jq -e '.include|length>0' <<<"$rel" >/dev/null 2>&1 && echo true || echo false)
+          run_strict=$(jq -r \
+            'if (.nodes | index("test.strict_compat")) == null then "false" else "true" end' \
+            <<<"$sel_json")
+          if [[ "$run_strict" == "true" ]]; then
+            dbg=$(jq -c '{include: [ .debug_shards[] | {slug, nodes: (.nodes|join(","))} ]}' ci/portable-shards.json)
+            run_dbg=true
+          fi
           build_debug=$(jq -r '.build.debug' <<<"$sel_json")
           build_release=$(jq -r 'if (.build.dbt or .build.aux) then "true" else "false" end' <<<"$sel_json")
           if [[ -n "$backends" ]]; then run_e2e=true; else run_e2e=false; fi
-          # E2E steps consume BOTH prebuilt trees, so force their builds on.
-          if [[ "$run_e2e" == "true" ]]; then build_debug=true; build_release=true; fi
+          # Every selected test job that needs a release tree consumes the
+          # constructed build.e2e_artifact result. Producing it requires both
+          # initial build trees, so keep those predecessor jobs together for
+          # any test fan-out instead of letting selection cut the build edge.
+          if [[ "$run_dbg" == "true" || "$run_rel" == "true" || "$run_strict" == "true" || "$run_e2e" == "true" || "$build_release" == "true" ]]; then
+            build_debug=true
+            build_release=true
+          fi
           {
             echo "decision=$decision"
             echo "build_debug=$build_debug"
             echo "build_release=$build_release"
             echo "run_debug_shards=$run_dbg"
             echo "run_release_shards=$run_rel"
+            echo "run_strict_compat=$run_strict"
             echo "run_e2e=$run_e2e"
             echo "cell_backends=$backends"
             echo "debug_matrix=$dbg"
             echo "release_matrix=$rel"
           } >> "$GITHUB_OUTPUT"
-          echo "selection: decision=$decision debug_shards=$run_dbg release_shards=$run_rel e2e=$run_e2e backends=[$backends] build_debug=$build_debug build_release=$build_release" >&2
+          echo "selection: decision=$decision debug_shards=$run_dbg release_shards=$run_rel strict_compat=$run_strict e2e=$run_e2e backends=[$backends] build_debug=$build_debug build_release=$build_release" >&2
 
   # ---------------------------------------------------------------- plan (cheap)
   # Fail-closed integrity guard over the shard map itself. Runs UNCONDITIONALLY
   # (it has no `needs: select`) so a corrupt ci/portable-shards.json reds the
-  # required `regular` gate even on a skip/selective run. The shard MATRICES are
+  # `regular` diagnostic even on a skip/selective run. The shard MATRICES are
   # now derived by the `select` job (full or affected-test-filtered); this job no
   # longer emits them, it only verifies the map every downstream matrix is cut
   # from is internally consistent and covers the DAG.
@@ -189,6 +207,9 @@ jobs:
     name: Verify shard/DAG coverage
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      constructed_step_count: ${{ steps.coverage.outputs.constructed_step_count }}
+      selected_cell_count: ${{ steps.coverage.outputs.selected_cell_count }}
     steps:
       - uses: actions/checkout@v4
       - name: Initialize dagrun submodule
@@ -198,6 +219,7 @@ jobs:
           RUSTFLAGS: ""
         run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
       - name: Fail-closed shard/DAG coverage guard
+        id: coverage
         env:
           RUSTFLAGS: ""
         run: ./ci/check-shard-coverage.sh
@@ -207,9 +229,9 @@ jobs:
           echo "debug shards:";   jq -r '.debug_shards[]   | "  - \(.slug): \(.nodes|join(", "))"' ci/portable-shards.json
           echo "release shards:"; jq -r '.release_shards[] | "  - \(.slug) (needs \(.needs)): \(.nodes|join(", "))"' ci/portable-shards.json
 
-  # ------------------------------------------------------- preflight (no build)
+  # --------------------------------------------------- constructed preflight
   preflight:
-    name: Preflight (fmt + abstraction + portability)
+    name: Preflight (submodules + pin + manifest)
     needs: select
     # Selective runs still execute preflight (fmt + abstraction + portability):
     # select-tests always pins these as always-on PREFLIGHT nodes. Only a
@@ -219,6 +241,11 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          # gate.manifest runs the scorecard self-test, whose comparison control
+          # reads HEAD^. A depth-one checkout makes that committed check
+          # unanswerable even though its selected command is otherwise unchanged.
+          fetch-depth: 2
       # The constructed preflight starts with pre.submodules, which verifies
       # every recorded submodule without repairing it. Materialize that exact
       # recorded set before asking the gate to inspect it.
@@ -271,6 +298,21 @@ jobs:
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
         run: ./ci/run-node.sh portable "$(jq -r '.preflight_nodes|join(",")' ci/portable-shards.json)"
+      - name: Pack manifest plan tools
+        run: |
+          set -euo pipefail
+          test -x target/debug/test-harness
+          test -x target/debug/hermit-manifest-plan
+          tar -czf "$MANIFEST_PLAN_TARBALL" \
+            target/debug/test-harness \
+            target/debug/hermit-manifest-plan
+      - name: Upload manifest plan tools
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.MANIFEST_PLAN_ARTIFACT }}
+          path: ${{ env.MANIFEST_PLAN_TARBALL }}
+          if-no-files-found: error
+          retention-days: 1
       - name: Upload preflight node performance report
         if: always()
         uses: actions/upload-artifact@v4
@@ -280,10 +322,57 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  # The remaining constructed checks depend on gate.manifest as an ordering
+  # edge, not on a build artifact. Run them after preflight in a separate job so
+  # one diagnostic failure cannot prevent build and test jobs from measuring.
+  checks:
+    name: Preflight checks (fmt + abstraction + portability)
+    needs: [select, preflight]
+    if: needs.select.outputs.decision != 'skip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # make lint-checks contains history-aware pin and record-floor checks.
+          # Give those unchanged commands the same reachable history they use
+          # locally instead of discovering another shallow-checkout difference
+          # after the private authority becomes available.
+          fetch-depth: 0
+      - name: Initialize submodules
+        run: git submodule update --init --recursive
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liblzma-dev
+      - name: Rust components
+        run: rustup component add clippy rustfmt
+      - name: Install rust-script (checks)
+        env:
+          RUSTFLAGS: ""
+        run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
+      - name: Run preflight check nodes
+        env:
+          # Let gh authenticate with this repository's read-only token. The two
+          # pinned authority checks still fail visibly because that token cannot
+          # read the private rrnewton/dev-hermit repository; no broader secret is
+          # configured or requested here.
+          GH_TOKEN: ${{ github.token }}
+          RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
+        run: ./ci/run-node.sh portable "$(jq -r '.check_nodes|join(",")' ci/portable-shards.json)"
+      - name: Upload preflight check performance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-node-perf-checks
+          path: ${{ runner.temp }}/run-node-perf
+          if-no-files-found: warn
+          retention-days: 14
+
   # ------------------------------------------------------------ build (debug)
   build-debug:
     name: Build debug workspace + guests once
-    needs: select
+    needs: [select, preflight]
     if: needs.select.outputs.build_debug != 'false'
     runs-on: ubuntu-latest
     # The selected debug DAG has a 1560s critical path after e2e.metadata's
@@ -311,7 +400,7 @@ jobs:
           sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
       - name: Rust components
         run: rustup component add clippy rustfmt
-      # e2e.metadata runs `test-harness validate`, which shells out to
+      # gate.manifest runs `test-harness validate`, which shells out to
       # tests/manifest-cli.rs -- one of fifteen tracked entrypoints carrying
       # `#!/usr/bin/env -S rust-script --force`. Without the interpreter that
       # exec fails 127 and run_audit reported it as "self-test failed", i.e. an
@@ -332,6 +421,18 @@ jobs:
             exit 1
           fi
           echo "rust-script resolved: $(command -v rust-script) $(rust-script --version)"
+      - name: Download manifest plan tools
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.MANIFEST_PLAN_ARTIFACT }}
+          path: .
+      - name: Unpack manifest plan tools
+        run: |
+          set -euo pipefail
+          tar -xzf "$MANIFEST_PLAN_TARBALL"
+          rm -f "$MANIFEST_PLAN_TARBALL"
+          test -x target/debug/test-harness
+          test -x target/debug/hermit-manifest-plan
       # Group the debug-build step tags; validate supplies their commands,
       # dependencies, and resource policy from the constructed plan.
       - name: Run debug build nodes
@@ -407,11 +508,13 @@ jobs:
           # not depend on that mutable Cargo output directory.
           install -Dm755 target/debug/deps/libdetcore_dbt.so \
             target/install_pkg/rsrcs/libdetcore_dbt.so
+          test -x target/debug/verification-report
           test -x target/ci/bin/cargo-nextest
           tar --zstd -cf "$DEBUG_TARBALL" \
             target/debug/hermit \
             target/debug/test-harness \
             target/debug/hermit-manifest-plan \
+            target/debug/verification-report \
             target/debug/deps/libdetcore_dbt.so \
             target/install_pkg/rsrcs/libdetcore_dbt.so \
             target/ci/bin/cargo-nextest \
@@ -425,21 +528,16 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # ---------------------- build (release: dbt + sabre + liteinst, ONE warm pass)
-  # Consolidated from the former build-dbt-cache -> build-dbt -> build-aux serial
-  # chain (see the WHAT note above). Runs every release build node in one
-  # cargo-warm job, packs target/ ONCE, and publishes both the DBT install package
-  # (RELEASE_DBT_ARTIFACT, consumed by the debug shards) and the full release tree
-  # (RELEASE_ARTIFACT, consumed by the release/e2e/sabre shards). Both artifacts
-  # carry the identical prebuilt tree, so downstream consumers are unchanged.
+  # ------------------------------------------ build (release DBT + SaBRe base)
+  # Run the constructed release producer independently of the debug producer.
+  # A later job downloads both outputs before running the constructed artifact
+  # publisher and its dependent LiteInst producer.
   build-release:
-    name: Build release backends once (dbt + sabre + liteinst)
-    needs: select
+    name: Build release Hermit + DBT + SaBRe
+    needs: [select, preflight]
     if: needs.select.outputs.build_release != 'false'
     runs-on: ubuntu-latest
-    # runtime_release -> liteinst_runtime_release is a 2100s selected-DAG path.
-    # Keep the hosted job outside it plus at least 300s of workflow overhead.
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Initialize dagrun submodule
@@ -460,17 +558,102 @@ jobs:
         env:
           RUSTFLAGS: ""
         run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
-      # Group the release-build step tags; validate supplies their commands,
-      # dependencies, and resource policy from the constructed plan.
-      - name: Run release build nodes (dbt + sabre + liteinst)
+      - name: Run release build node
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
-        run: ./ci/run-node.sh portable "$(jq -r '(.build_dbt_nodes + .build_aux_nodes)|join(",")' ci/portable-shards.json)"
+        run: ./ci/run-node.sh portable "$(jq -r '.build_dbt_nodes|join(",")' ci/portable-shards.json)"
       - name: Upload release-build node performance report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: run-node-perf-build-release
+          path: ${{ runner.temp }}/run-node-perf
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Pack release prerequisite tree
+        run: |
+          set -euo pipefail
+          tar --zstd -cf "$RELEASE_TARBALL" \
+            --exclude='target/release/deps' \
+            --exclude='target/release/build' \
+            --exclude='target/release/incremental' \
+            --exclude='target/release/.fingerprint' \
+            --exclude='target/release/examples' \
+            target/release \
+            target/ci \
+            target/install_pkg
+          ls -lh "$RELEASE_TARBALL"
+      - name: Upload release prerequisite tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.RELEASE_DBT_ARTIFACT }}
+          path: ${{ env.RELEASE_TARBALL }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # ------------------------------------- publish artifact + build LiteInst
+  # This is the literal contraction of
+  #   build.workspace + build.runtime_release -> build.e2e_artifact
+  #   build.e2e_artifact -> build.liteinst_runtime_release
+  # The two predecessor trees arrive as artifacts; the selected constructed
+  # steps retain their internal edge and provide the final release tree.
+  build-complete:
+    name: Publish E2E artifact + build LiteInst runtime
+    needs: [select, build-debug, build-release]
+    if: needs.select.outputs.build_release != 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize dagrun submodule
+        run: git submodule update --init agent-utils
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: portable-parallel-release
+          save-if: false
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake file g++ gcc git jq libelf-dev libunwind-dev liblzma-dev make pkg-config python3-full zlib1g-dev zstd
+      - name: Install rust-script
+        env:
+          RUSTFLAGS: ""
+        run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
+      - name: Download debug prerequisite tree
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.DEBUG_ARTIFACT }}
+          path: .
+      - name: Download release prerequisite tree
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.RELEASE_DBT_ARTIFACT }}
+          path: .
+      - name: Unpack prerequisite trees
+        run: |
+          set -euo pipefail
+          tar --zstd -xf "$DEBUG_TARBALL"
+          rm -f "$DEBUG_TARBALL"
+          tar --zstd -xf "$RELEASE_TARBALL"
+          rm -f "$RELEASE_TARBALL"
+          test -x target/debug/hermit
+          test -x target/release/hermit
+          test -x target/install_pkg/rsrcs/dynamorio/bin64/drrun
+      - name: Run artifact and LiteInst build nodes
+        env:
+          RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
+        run: ./ci/run-node.sh portable "$(jq -r '.build_aux_nodes|join(",")' ci/portable-shards.json)"
+      - name: Verify constructed E2E artifact
+        run: ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null
+      - name: Upload completed-build node performance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-node-perf-build-complete
           path: ${{ runner.temp }}/run-node-perf
           if-no-files-found: warn
           retention-days: 14
@@ -487,13 +670,6 @@ jobs:
             target/ci \
             target/install_pkg
           ls -lh "$RELEASE_TARBALL"
-      - name: Upload DBT install package (debug shards)
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.RELEASE_DBT_ARTIFACT }}
-          path: ${{ env.RELEASE_TARBALL }}
-          if-no-files-found: error
-          retention-days: 1
       - name: Upload full release prebuilt tree (release + e2e + sabre)
         uses: actions/upload-artifact@v4
         with:
@@ -505,18 +681,16 @@ jobs:
   # ------------------------------------------------- test shards (debug-backed)
   test-debug:
     name: "test: ${{ matrix.slug }}"
-    needs: [select, build-debug, build-release]
-    # build-release is legitimately SKIPPED when the selected debug shards need no
-    # DBT runtime (build.dbt=false). A bare custom `if` would still inherit the
-    # implicit success() over every need and skip this job; the explicit status
-    # checks let it run when build-release was skipped, while still skipping (and
-    # letting `regular` fail closed) if build-debug or a to-be-run build-release
-    # actually FAILED.
+    needs: [select, build-debug, build-release, build-complete]
+    # Selection forces all three producer jobs whenever any debug shard runs.
+    # State that contract here so a later condition drift cannot run a shard
+    # without the completed constructed artifact.
     if: >-
       !cancelled()
       && needs.select.outputs.run_debug_shards != 'false'
       && needs.build-debug.result == 'success'
-      && (needs.build-release.result == 'success' || needs.build-release.result == 'skipped')
+      && needs.build-release.result == 'success'
+      && needs.build-complete.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -579,15 +753,14 @@ jobs:
         with:
           name: ${{ env.DEBUG_ARTIFACT }}
           path: .
-      # The DBT runtime (drrun + libreverie_dbt_client.so) lives only in the
-      # release package. A selective run reaches this job with build-release
-      # skipped ONLY when the tool proved no selected debug shard needs DBT
-      # (build.dbt=false), so the package is downloaded and asserted only then.
-      - name: Download dbt install package
-        if: needs.build-release.result == 'success'
+      # The completed release tree carries the DBT and LiteInst runtimes plus
+      # the constructed E2E artifact. A selective run may skip it only when the
+      # selector proved the chosen debug shard needs none of those outputs.
+      - name: Download completed release tree
+        if: needs.build-complete.result == 'success'
         uses: actions/download-artifact@v4
         with:
-          name: ${{ env.RELEASE_DBT_ARTIFACT }}
+          name: ${{ env.RELEASE_ARTIFACT }}
           path: .
       - name: Unpack debug tree
         run: |
@@ -595,6 +768,7 @@ jobs:
           tar --zstd -xf "$DEBUG_TARBALL"
           rm -f "$DEBUG_TARBALL"
           test -x target/debug/hermit
+          test -x target/debug/verification-report
           test -f target/debug/deps/libdetcore_dbt.so
           test -f target/install_pkg/rsrcs/libdetcore_dbt.so
           test -x target/ci/bin/cargo-nextest
@@ -614,8 +788,8 @@ jobs:
           install -Dm755 target/ci/bin/cargo-nextest \
             "${CARGO_HOME:-$HOME/.cargo}/bin/cargo-nextest"
           cargo nextest --version
-      - name: Unpack dbt install package
-        if: needs.build-release.result == 'success'
+      - name: Unpack completed release tree
+        if: needs.build-complete.result == 'success'
         run: |
           set -euo pipefail
           tar --zstd -xf "$RELEASE_TARBALL"
@@ -623,6 +797,7 @@ jobs:
           test -x target/ci/hermit-strict
           test -x target/install_pkg/rsrcs/dynamorio/bin64/drrun
           test -f target/install_pkg/rsrcs/libreverie_dbt_client.so
+          ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null
       - name: Run shard nodes (${{ matrix.slug }})
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
@@ -636,10 +811,71 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  # test.strict_compat depends on results from several debug shards. Keep it in
+  # a later job so the hosted grouping preserves those constructed edges.
+  strict-compat:
+    name: Portable strict compatibility
+    needs: [select, build-debug, build-complete, test-debug]
+    if: needs.select.outputs.run_strict_compat != 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize submodules
+        run: git submodule update --init --recursive
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: portable-parallel-debug
+          save-if: false
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
+      - name: Install rust-script
+        env:
+          RUSTFLAGS: ""
+        run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
+      - name: Enable unprivileged user and mount namespaces
+        run: |
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
+      - name: Download debug prebuilt tree
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.DEBUG_ARTIFACT }}
+          path: .
+      - name: Download full release prebuilt tree
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.RELEASE_ARTIFACT }}
+          path: .
+      - name: Unpack prebuilt trees
+        run: |
+          set -euo pipefail
+          tar --zstd -xf "$DEBUG_TARBALL"; rm -f "$DEBUG_TARBALL"
+          tar --zstd -xf "$RELEASE_TARBALL"; rm -f "$RELEASE_TARBALL"
+          test -x target/debug/test-harness
+          test -x target/ci/hermit-strict
+          ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null
+      - name: Run strict compatibility node
+        env:
+          RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
+        run: ./ci/run-node.sh portable "$(jq -r '.strict_compat_nodes|join(",")' ci/portable-shards.json)"
+      - name: Upload strict-compat node performance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-node-perf-strict-compat
+          path: ${{ runner.temp }}/run-node-perf
+          if-no-files-found: warn
+          retention-days: 14
+
   # ----------------------------------------------- test shards (release-backed)
   test-release:
     name: "test: ${{ matrix.slug }}"
-    needs: [select, build-release]
+    needs: [select, build-complete]
     if: needs.select.outputs.run_release_shards != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -702,6 +938,7 @@ jobs:
           tar --zstd -xf "$RELEASE_TARBALL"
           rm -f "$RELEASE_TARBALL"
           test -x target/release/hermit
+          ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null
       - name: Run shard nodes (${{ matrix.slug }})
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
@@ -718,7 +955,7 @@ jobs:
   # ------------------------------------------------------------- e2e steps
   e2e:
     name: "e2e step: ${{ matrix.slug }}"
-    needs: [select, build-debug, build-release]
+    needs: [select, build-debug, build-complete]
     if: needs.select.outputs.run_e2e != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -763,8 +1000,7 @@ jobs:
           tar --zstd -xf "$RELEASE_TARBALL"; rm -f "$RELEASE_TARBALL"
           test -x target/debug/hermit
           test -x target/release/hermit
-      - name: Publish verified immutable Hermit E2E artifact
-        run: ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path target/install_pkg
+          ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null
       - name: Run constructed step (${{ matrix.node }})
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
@@ -778,18 +1014,21 @@ jobs:
           set -euo pipefail
           job=${NODE#e2e.}
           out="$E2E_RESULT_ROOT/portable/$job"
-          captures="ignored/e2e/runs/$E2E_RUN_ID"
+          captures="$E2E_RESULT_ROOT/runs/$E2E_RUN_ID"
           stage="ignored/parity/$SLUG/parity-v1"
           artifact="parity-v1-${{ github.run_id }}-${{ github.run_attempt }}-portable-$SLUG.tar.zst"
 
-          test -s "$out/results.jsonl"
+          # A constructed --allow-empty bucket writes an empty results file;
+          # the final scorecard still verifies the complete selected population.
+          test -f "$out/results.jsonl"
           test -s "$out/junit.xml"
-          test -d "$captures"
           mkdir -p "$stage/captures"
           cp "$out/results.jsonl" "$stage/results.jsonl"
           cp "$out/junit.xml" "$stage/junit.xml"
           cp "$out/summary.json" "$stage/summary.json"
-          cp -a "$captures/." "$stage/captures/"
+          if [[ -d "$captures" ]]; then
+            cp -a "$captures/." "$stage/captures/"
+          fi
           jq -n \
             --arg repository_sha "$GITHUB_SHA" \
             --arg lane portable \
@@ -816,11 +1055,11 @@ jobs:
           compression-level: 0
 
   # These known-red exec probes stay visible and publish structured evidence,
-  # but do not taint the required portable result while SaBRe's private
+  # but do not taint the portable diagnostic result while SaBRe's private
   # coordinator socket cannot survive guest exec.
   sabre_non_gated_parity:
     name: SaBRe non-gating exec diagnostics
-    needs: [select, build-debug, build-release]
+    needs: [select, build-debug, build-complete]
     if: needs.select.outputs.build_release != 'false'
     continue-on-error: true
     runs-on: ubuntu-latest
@@ -859,6 +1098,7 @@ jobs:
           test -x target/release/hermit
           test -x target/debug/test-harness
           test -x target/install_pkg/rsrcs/sabre
+          ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null
       - name: Run known-red SaBRe exec probes
         run: |
           set -euo pipefail
@@ -891,19 +1131,24 @@ jobs:
           retention-days: 14
 
   # ------------------------------------- gate + reduce per-cell transport evidence
-  # Stable required-check name. This job fails closed over the complete parallel
-  # graph and is the only portable result merge-gate needs to query. It also
-  # folds in the former reduce-e2e reduction to keep the gate critical path one
-  # queued stage shorter.
+  # Stable diagnostic name. This job fails closed over the complete parallel
+  # graph so a green summary cannot hide a missing selected shard. No branch
+  # rule or landing path requires it. It also folds in the former reduce-e2e
+  # reduction to keep the diagnostic critical path one queued stage shorter.
   regular:
-    name: Regular tests (GitHub-managed portable)
+    name: >-
+      Portable diagnostic (${{ needs.plan.outputs.constructed_step_count || 'unknown' }}
+      constructed steps; ${{ needs.plan.outputs.selected_cell_count || 'unknown' }} selected cells)
     needs:
       - select
       - plan
       - preflight
+      - checks
       - build-debug
       - build-release
+      - build-complete
       - test-debug
+      - strict-compat
       - test-release
       - e2e
     if: always()
@@ -932,7 +1177,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: parity-v1-${{ github.run_id }}-${{ github.run_attempt }}-*
-          path: transport
+          path: ignored/transport
           merge-multiple: true
       - name: Verify completeness, checksums, and archive paths
         if: needs.select.outputs.run_e2e != 'false'
@@ -940,7 +1185,7 @@ jobs:
           EXPECTED: ${{ needs.build-debug.outputs.e2e_count }}
         run: |
           set -euo pipefail
-          actual=$(find transport -maxdepth 1 -name '*.tar.zst' -type f | wc -l)
+          actual=$(find ignored/transport -maxdepth 1 -name '*.tar.zst' -type f | wc -l)
           [[ "$EXPECTED" =~ ^[0-9]+$ && "$actual" -eq "$EXPECTED" ]] || {
             echo "expected $EXPECTED parity archives, found $actual" >&2
             exit 1
@@ -964,7 +1209,7 @@ jobs:
             mkdir -p "ignored/reduced/results/portable/$job"
             cp "$stage/results.jsonl" "ignored/reduced/results/portable/$job/results.jsonl"
             cp "$stage/junit.xml" "ignored/reduced/results/portable/$job/junit.xml"
-          done < <(find transport -maxdepth 1 -name '*.tar.zst' -type f -print0 | sort -z)
+          done < <(find ignored/transport -maxdepth 1 -name '*.tar.zst' -type f -print0 | sort -z)
 
           find ignored/reduced/expanded -path '*/parity-v1/results.jsonl' -type f -print0 |
             sort -z | xargs -0 cat > ignored/reduced/results.jsonl
@@ -1005,10 +1250,10 @@ jobs:
           jq . <<< "$RESULTS"
           # A job is acceptable only if it SUCCEEDED or was intentionally
           # deselected (skipped) by affected-test selection. A `failure` or
-          # `cancelled` in ANY required job still fails closed — selection can
+          # `cancelled` in ANY selected job still fails closed — selection can
           # remove a job from the run, never mask a real failure. `select` itself
           # is in this set: if it dies it reports `failure`, not `skipped`, so a
-          # broken selection job reds the gate instead of silently skipping tests.
+          # broken selection job reds the diagnostic instead of silently skipping tests.
           jq -e 'all(.[]; .result == "success" or .result == "skipped")' <<< "$RESULTS"
 
   # ------------------------------------------------------------- cleanup
@@ -1028,6 +1273,7 @@ jobs:
         with:
           script: |
             const names = new Set([
+              `hermit-manifest-plan-${context.runId}`,
               `hermit-debug-${context.runId}`,
               `hermit-release-dbt-${context.runId}`,
               `hermit-release-${context.runId}`,

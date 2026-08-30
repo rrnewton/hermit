@@ -571,6 +571,28 @@ def run_incomplete_exit() -> None:
         assert row["interruption_signal"] is None, row
 
 
+def run_off_record_incomplete_exit() -> None:
+    """The early stop-test seam must preserve off-record evidence isolation."""
+    with tempfile.TemporaryDirectory(prefix="validate-stop-off-record-") as tmp:
+        tmpdir = Path(tmp)
+        ledger = tmpdir / "ledger.jsonl"
+        env = stop_test_env(tmpdir, ledger)
+        env.update(VALIDATE_STOP_TEST_EXIT_EARLY="1")
+        process = subprocess.run(
+            [str(VALIDATE), "--allow-local-off-the-record-run", "quick"],
+            cwd=ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        output = process.stdout.decode(errors="replace")
+        assert process.returncode == 1, output
+        assert not ledger.exists() or not ledger.read_bytes(), output
+        assert "OFF THE RECORD" in output, output
+        assert "ledger:" not in output, output
+
+
 def run_canonical_adapter_contract(*, refuse: bool) -> None:
     """Production-shaped writes use the parent adapter, never a raw shadow."""
     with tempfile.TemporaryDirectory(prefix="validate-canonical-adapter-") as tmp:
@@ -789,6 +811,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     if signal_unevaluated is not None:
         unevaluated.append(signal_unevaluated)
+    run_off_record_incomplete_exit()
     # ⚠️ SKIP ONLY WHAT CANNOT BE EVALUATED, AND KEEP GOING.
     # An earlier version let NoParentAdapter propagate out of main(), which
     # abandoned the four steps below it -- refuse=True, the cleanup race and the

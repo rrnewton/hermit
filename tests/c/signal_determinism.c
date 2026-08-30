@@ -47,7 +47,9 @@ static volatile sig_atomic_t nonrestartable_deliveries;
 static volatile sig_atomic_t nonrestartable_handler_failed;
 
 static void write_message(const char* message, size_t length) {
-  (void)write(STDOUT_FILENO, message, length);
+  if (write(STDOUT_FILENO, message, length) != (ssize_t)length) {
+    _exit(2);
+  }
 }
 
 static int signal_is_blocked(int signal_number) {
