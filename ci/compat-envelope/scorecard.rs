@@ -6907,11 +6907,34 @@ const RECORDED_ROOT: &str = "/repo";
 
 fn rewrite_recorded_root(value: &mut String, root: &str) {
     fn delimiter(character: char) -> bool {
-        character.is_whitespace()
-            || matches!(
-                character,
-                '=' | ':' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | '<' | '>' | '"' | '\''
-            )
+        matches!(
+            character,
+            '\u{0009}'..='\u{000d}'
+                | '\u{0020}'
+                | '\u{0085}'
+                | '\u{00a0}'
+                | '\u{1680}'
+                | '\u{2000}'..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '='
+                | ':'
+                | ';'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | ','
+                | '<'
+                | '>'
+                | '"'
+                | '\''
+        )
     }
 
     let mut rewritten = String::with_capacity(value.len());
@@ -12370,6 +12393,29 @@ red/`measured-and-passed` count is **0**.",
         return Err(format!(
             "encoded cells still name the producing worktree {foreign_root}"
         ));
+    }
+    for delimiter in [
+        " ", "\t", "\n", "\r", "\u{000b}", "\u{000c}", "\u{00a0}", "\u{2003}",
+    ] {
+        let mut value = format!("{delimiter}{foreign_root}/nested");
+        rewrite_recorded_root(&mut value, foreign_root);
+        if value != format!("{delimiter}{RECORDED_ROOT}/nested") {
+            return Err(format!(
+                "path normalisation did not recognise explicit whitespace delimiter {:?}",
+                delimiter
+            ));
+        }
+    }
+    for control in ['\u{001c}', '\u{001d}', '\u{001e}', '\u{001f}'] {
+        let original = format!("{control}{foreign_root}/nested");
+        let mut value = original.clone();
+        rewrite_recorded_root(&mut value, foreign_root);
+        if value != original {
+            return Err(format!(
+                "path normalisation treated control U+{:04X} as a delimiter",
+                control as u32
+            ));
+        }
     }
     if !encoded.contains(RECORDED_ROOT) {
         return Err(format!(
