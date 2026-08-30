@@ -535,7 +535,20 @@ struct CanonicalComparison {
 struct ObservedInvocation {
     hermit_sha: String,
     run_id: String,
-    result: ObservedResult,
+    /// Outer framework attempt. The entries in `attempts` are Hermit
+    /// invocations inside this one cell attempt and do not identify retries of
+    /// the cell itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attempt: Option<u64>,
+    /// Identity of the complete framework row when one exists. Pressure-test
+    /// summaries predate this field and therefore leave it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    evidence_sha256: Option<String>,
+    /// `None` is a measured no-verdict: the framework ran the cell but did not
+    /// produce a trustworthy product result. Keeping the invocation preserves
+    /// that fact without inventing a crash, divergence, or pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result: Option<ObservedResult>,
     argv: Vec<String>,
     guest_argv: Vec<String>,
     env: BTreeMap<String, String>,
@@ -882,6 +895,12 @@ struct ResultRow {
     classification: String,
     outcome: String,
     #[serde(default)]
+    result: Option<ObservedResult>,
+    #[serde(default)]
+    failure_class: Option<FailureClass>,
+    #[serde(default)]
+    error_kind: Option<String>,
+    #[serde(default)]
     timeout_seconds: u64,
     log_level: Option<String>,
     effective_args: Vec<String>,
@@ -926,9 +945,11 @@ enum ValidateRowEvidence {
     },
     NotRun {
         reason: String,
+        result: Option<ObservedResult>,
     },
     Unavailable {
         reason: String,
+        result: Option<ObservedResult>,
     },
 }
 
@@ -1031,10 +1052,89 @@ impl ResultRow {
         Ok(())
     }
 
+    /// Validate the producer-owned outcome classification when this retained
+    /// row carries it. Schema-4 rows written before these fields existed remain
+    /// readable only when both are absent.
+    fn validate_recorded_classification(&self) -> Result<(), String> {
+        if self.result.is_none() && self.failure_class.is_none() {
+            return Ok(());
+        }
+        match self.outcome.as_str() {
+            "PASS" => {
+                if self.result != Some(ObservedResult::Pass) || self.failure_class.is_some() {
+                    return Err(format!(
+                        "PASS row must carry result=pass and no failure_class, got result={:?} failure_class={:?}",
+                        self.result, self.failure_class
+                    ));
+                }
+            }
+            "FAIL" => {
+                let result = self
+                    .result
+                    .ok_or("FAIL row has no observed result; the failure kind was lost")?;
+                let expected = result
+                    .failure_class()
+                    .ok_or_else(|| format!("FAIL row cannot carry passing result {result:?}"))?;
+                if self.failure_class != Some(expected) {
+                    return Err(format!(
+                        "observed result {} requires failure_class {:?}, got {:?}",
+                        result.as_str(),
+                        expected,
+                        self.failure_class
+                    ));
+                }
+            }
+            "ERROR" => {
+                if self.result.is_some() {
+                    return Err(format!(
+                        "ERROR row must not carry a product observation, got {:?}",
+                        self.result
+                    ));
+                }
+                if !matches!(
+                    self.failure_class,
+                    Some(
+                        FailureClass::UnderstoodInfrastructureFailure
+                            | FailureClass::UnderstoodPrerequisiteFailure
+                            | FailureClass::NoResult
+                    )
+                ) {
+                    return Err(format!(
+                        "ERROR row must carry a non-product failure_class, got {:?}",
+                        self.failure_class
+                    ));
+                }
+            }
+            "HOST-INAPPLICABLE" => {
+                if self.result.is_some()
+                    || self.failure_class != Some(FailureClass::UnderstoodPrerequisiteFailure)
+                {
+                    return Err(format!(
+                        "HOST-INAPPLICABLE row must carry understood_prerequisite_failure and no observed result, got result={:?} failure_class={:?}",
+                        self.result, self.failure_class
+                    ));
+                }
+            }
+            other => return Err(format!("unknown cell outcome {other:?}")),
+        }
+        Ok(())
+    }
+
+    /// Return only a result proved by the typed outer disposition. A timeout is
+    /// observable even when no canonical comparison completed. Other
+    /// unavailable rows remain result-less until their producer supplies a
+    /// trustworthy class; an exit status alone is not enough to call a crash.
+    fn no_verdict_result(&self) -> Option<ObservedResult> {
+        self.attempts
+            .iter()
+            .any(|attempt| attempt.get("timed_out").and_then(JsonValue::as_bool) == Some(true))
+            .then_some(ObservedResult::Timeout)
+    }
+
     /// Return the typed reason when this FAIL records only completed first
     /// runs rejected before comparison. Such a row is execution evidence, but
-    /// not product-behavior evidence: it must be named and skipped rather than
-    /// forced through the canonical-comparison path.
+    /// not product-behavior evidence: it must be named and retained as a
+    /// measured no-verdict rather than forced through the comparison path.
     fn typed_no_result_reason(&self) -> Result<Option<String>, String> {
         if self.outcome != "FAIL" || !matches!(self.mode.as_str(), "verify" | "replay" | "chaos") {
             return Ok(None);
@@ -1448,6 +1548,8 @@ impl ResultRow {
     /// not independently selectable seed results.
     fn comparison_evidence(&self) -> Result<ValidateRowEvidence, String> {
         self.require_provenance()?;
+        self.validate_recorded_classification()?;
+        let no_verdict_result = self.no_verdict_result();
         let mut left_info_messages = BTreeSet::new();
         let mut right_info_messages = BTreeSet::new();
         let mut divergence_positions = Vec::new();
@@ -1678,10 +1780,15 @@ impl ResultRow {
                         }
                         let status = attempt.get("status").and_then(JsonValue::as_i64);
                         let signal = attempt.get("signal").and_then(JsonValue::as_i64);
+                        let timed_out = attempt
+                            .get("timed_out")
+                            .and_then(JsonValue::as_bool)
+                            .ok_or_else(|| {
+                                format!("attempt {} omitted its timeout state", index + 1)
+                            })?;
                         let disposition = matches!((status, signal), (Some(status), None) if status != 0)
                             || matches!((status, signal), (None, Some(_)));
                         if attempt.get("outcome").and_then(JsonValue::as_str) != Some("ERROR")
-                            || attempt.get("timed_out").and_then(JsonValue::as_bool) != Some(true)
                             || attempt
                                 .get("error_kind")
                                 .and_then(JsonValue::as_str)
@@ -1693,13 +1800,22 @@ impl ResultRow {
                                 index + 1
                             ));
                         }
-                        saw_not_run = true;
-                        unavailable.get_or_insert_with(|| {
-                            format!(
-                                "NO_RESULT: attempt {} did not complete its first run",
-                                index + 1
-                            )
-                        });
+                        if timed_out {
+                            saw_not_run = true;
+                            unavailable.get_or_insert_with(|| {
+                                format!(
+                                    "NO_RESULT: attempt {} did not complete its first run",
+                                    index + 1
+                                )
+                            });
+                        } else {
+                            unavailable.get_or_insert_with(|| {
+                                format!(
+                                    "NO_RESULT: attempt {} did not produce a comparison (status={status:?}, signal={signal:?})",
+                                    index + 1
+                                )
+                            });
+                        }
                     }
                     Some(canonical_verdict::NoResultReason::FirstRunRejected { .. }) => {
                         saw_no_result = true;
@@ -1771,10 +1887,14 @@ impl ResultRow {
                 reason: unavailable.clone().unwrap_or_else(|| {
                     "NO_RESULT: no attempt completed a canonical comparison".into()
                 }),
+                result: no_verdict_result,
             });
         }
         if let Some(reason) = unavailable {
-            return Ok(ValidateRowEvidence::Unavailable { reason });
+            return Ok(ValidateRowEvidence::Unavailable {
+                reason,
+                result: no_verdict_result,
+            });
         }
         if !DivergenceCoordinates::from_row(self).is_empty() {
             return Err("matched row carries a divergence coordinate".into());
@@ -1782,6 +1902,7 @@ impl ResultRow {
         if !saw_canonical_match {
             return Ok(ValidateRowEvidence::Unavailable {
                 reason: "cell emitted no typed verification report".into(),
+                result: no_verdict_result,
             });
         }
         if self.outcome != "PASS" {
@@ -1790,6 +1911,7 @@ impl ResultRow {
                     "cell outcome was {} despite matched comparison evidence",
                     self.outcome
                 ),
+                result: no_verdict_result,
             });
         }
         Ok(ValidateRowEvidence::Matched {
@@ -3835,7 +3957,9 @@ fn apply_pressure_summary(
         let mut observed_invocation = ObservedInvocation {
             hermit_sha: summary.hermit_sha.clone(),
             run_id: invocation.run_id,
-            result,
+            attempt: None,
+            evidence_sha256: None,
+            result: Some(result),
             argv: invocation.argv,
             guest_argv: invocation.guest_argv,
             env: invocation.env,
@@ -3893,10 +4017,10 @@ struct ValidateFold {
     unlocated: usize,
     /// Rows that determined no product result: an infrastructure `ERROR`, a
     /// completed FAIL/no_result before comparison, or another non-PASS/non-FAIL
-    /// outcome. Counted separately because nothing was compared, so there is no
-    /// product behaviour to record, and folding one as an observation would
-    /// assert a measurement that never happened. Counting it is what keeps the
-    /// run from reading all-green.
+    /// outcome. Counted separately because no canonical product result was
+    /// established. Its exact invocation is still measured evidence and is
+    /// retained with no product result; counting it separately is what keeps
+    /// the run from reading all-green.
     ///
     /// ⚠️ NAMED, NOT JUST COUNTED, following `apply_pressure_summary` -- the sibling
     /// writer already prints every row it drops with its cell and reason, on the
@@ -3967,11 +4091,27 @@ fn apply_validate_results(
                 .then(left.evidence_identity.cmp(&right.evidence_identity))
         });
         let mut distinct = Vec::with_capacity(classified.len());
-        let mut identities_by_attempt = BTreeMap::<(String, u64), String>::new();
+        let mut identities_by_attempt =
+            BTreeMap::<(String, u64), (String, Option<String>)>::new();
         for (candidate, evidence) in classified {
             let key = (candidate.row.run_id.clone(), candidate.row.attempt);
-            if let Some(identity) = identities_by_attempt.get(&key) {
-                if identity == &candidate.evidence_identity {
+            let classification_identity = (candidate.row.result.is_some()
+                || candidate.row.failure_class.is_some())
+            .then(|| {
+                serde_json::to_string(&serde_json::json!({
+                    "result": candidate.row.result,
+                    "failure_class": candidate.row.failure_class,
+                    "error_kind": &candidate.row.error_kind,
+                }))
+                .map_err(|error| format!("cannot encode row classification: {error}"))
+            })
+            .transpose()?;
+            if let Some((identity, classification)) = identities_by_attempt.get(&key) {
+                if identity == &candidate.evidence_identity
+                    && (classification.is_none()
+                        || classification_identity.is_none()
+                        || classification == &classification_identity)
+                {
                     continue;
                 }
                 return Err(format!(
@@ -3981,88 +4121,60 @@ fn apply_validate_results(
                     candidate.row.attempt
                 ));
             }
-            identities_by_attempt.insert(key, candidate.evidence_identity.clone());
+            identities_by_attempt.insert(
+                key,
+                (candidate.evidence_identity.clone(), classification_identity),
+            );
             distinct.push((candidate, evidence));
         }
-        let classified = distinct;
-        let mut attempts_by_run = BTreeMap::<String, BTreeMap<u64, bool>>::new();
-        for (candidate, evidence) in &classified {
-            let canonical = matches!(
-                evidence,
-                ValidateRowEvidence::Matched { .. } | ValidateRowEvidence::Diverged { .. }
-            );
-            attempts_by_run
-                .entry(candidate.row.run_id.clone())
-                .or_default()
-                .insert(candidate.row.attempt, canonical);
-        }
-        for (candidate, evidence) in &classified {
-            let ValidateRowEvidence::NotRun { reason } = evidence else {
-                continue;
-            };
-            let has_later_canonical = attempts_by_run[&candidate.row.run_id]
-                .iter()
-                .any(|(attempt, canonical)| *attempt > candidate.row.attempt && *canonical);
-            if !has_later_canonical {
-                return Err(format!("{} {reason}", display_id(id)));
-            }
-        }
-        for (candidate, evidence) in classified {
+        for (candidate, evidence) in distinct {
             let row = &candidate.row;
             let located_nothing = row.first_divergent_scheduler_turn.is_none()
                 && row.first_divergent_virtual_nanoseconds.is_none()
                 && row.first_divergent_record.is_none()
                 && row.first_divergent_syscall.is_none();
-            let (result, left_info_messages, right_info_messages) = match evidence {
+            let (result, comparison, unavailable_reason) = match evidence {
                 ValidateRowEvidence::Matched {
                     left_info_messages,
                     right_info_messages,
                 } => (
-                    ObservedResult::Pass,
-                    left_info_messages,
-                    right_info_messages,
+                    Some(ObservedResult::Pass),
+                    Some((left_info_messages, right_info_messages)),
+                    None,
                 ),
                 ValidateRowEvidence::Diverged {
                     left_info_messages,
                     right_info_messages,
                 } => (
-                    if row.mode == "replay" {
+                    Some(if row.mode == "replay" {
                         ObservedResult::ReplayFailure
                     } else {
                         ObservedResult::DeterminismFailure
-                    },
-                    left_info_messages,
-                    right_info_messages,
+                    }),
+                    Some((left_info_messages, right_info_messages)),
+                    None,
                 ),
-                ValidateRowEvidence::NotRun { reason } => {
-                    fold.errored.push(format!(
-                        "{} (outcome={}, reason={reason})",
-                        display_id(id),
-                        row.outcome,
-                    ));
-                    continue;
-                }
-                ValidateRowEvidence::Unavailable { reason } => {
-                    // No product observation and no `last_tested`: a mixed row
-                    // is one cell measurement, not a bag of independently
-                    // admissible sibling attempts.
-                    fold.errored.push(format!(
-                        "{} (outcome={}, reason={reason})",
-                        display_id(id),
-                        row.outcome,
-                    ));
-                    continue;
+                ValidateRowEvidence::NotRun { reason, result }
+                | ValidateRowEvidence::Unavailable { reason, result } => {
+                    (result, None, Some(reason))
                 }
             };
-            // Stamp only after the whole row established a product result.
-            // Doing this before classification made a timed-out population look
-            // freshly measured even though no scorecard observation was stored.
+            if let Some(reason) = &unavailable_reason {
+                fold.errored.push(format!(
+                    "{} (outcome={}, reason={reason})",
+                    display_id(id),
+                    row.outcome,
+                ));
+            }
+            // A no-verdict is still a measurement. Stamp it and retain its exact
+            // invocation, but do not manufacture a canonical comparison or a
+            // product result that the producer did not establish.
             updated.cells[index].last_tested = Some(LastTested {
                 hermit_sha: hermit_sha.to_string(),
                 detcore_tree: detcore_tree.to_string(),
                 depth: depth.clone(),
             });
-            if result == ObservedResult::Pass && !located_nothing {
+            if result == Some(ObservedResult::Pass) && !located_nothing {
                 return Err(format!(
                     "{} reports a canonical match yet carries a divergence position",
                     display_id(id)
@@ -4095,7 +4207,10 @@ fn apply_validate_results(
                     display_id(id)
                 ));
             }
-            if !result.carries_divergence_position() && !located_nothing {
+            if comparison.is_some()
+                && result.is_none_or(|result| !result.carries_divergence_position())
+                && !located_nothing
+            {
                 return Err(format!(
                     "{} reports {} yet carries a divergence position",
                     display_id(id),
@@ -4106,6 +4221,7 @@ fn apply_validate_results(
             let position = observations.iter().position(|observation| {
                 observation.detcore_tree.as_deref() == Some(detcore_tree)
                     && observation.provenance == ObservationProvenance::Validate
+                    && observation.event_ids.is_empty()
             });
             let observation = match position {
                 Some(position) => &mut observations[position],
@@ -4128,30 +4244,38 @@ fn apply_validate_results(
                 }
             };
             observation.hermit_shas.insert(hermit_sha.to_string());
-            observation.results.insert(result);
-            let hermit_depth = depth.get("hermit").ok_or_else(|| {
-                format!("{} observation has no Hermit source depth", display_id(id))
-            })?;
-            observation
-                .canonical_comparisons
-                .insert(CanonicalComparison {
-                    hermit_sha: row.hermit_sha.clone(),
-                    hermit_commits: hermit_depth.commits,
-                    hermit_first_parent: hermit_depth.first_parent,
-                    run_id: row.run_id.clone(),
-                    evidence_sha256: candidate.evidence_identity.clone(),
-                    result,
-                    left_info_messages,
-                    right_info_messages,
-                });
+            if let Some(result) = result {
+                observation.results.insert(result);
+            }
+            if let Some((left_info_messages, right_info_messages)) = comparison {
+                let hermit_depth = depth.get("hermit").ok_or_else(|| {
+                    format!("{} observation has no Hermit source depth", display_id(id))
+                })?;
+                observation
+                    .canonical_comparisons
+                    .insert(CanonicalComparison {
+                        hermit_sha: row.hermit_sha.clone(),
+                        hermit_commits: hermit_depth.commits,
+                        hermit_first_parent: hermit_depth.first_parent,
+                        run_id: row.run_id.clone(),
+                        evidence_sha256: candidate.evidence_identity.clone(),
+                        result: result.expect("canonical evidence has a result"),
+                        left_info_messages,
+                        right_info_messages,
+                    });
+            }
             // Record the invocation, exactly as the pressure path does. Without
             // it a validate-sourced bound would have strictly WORSE provenance
             // than a pressure-sourced one: no per-run record, no run_id, and no
             // pasteable command to reproduce the divergence it reports.
-            let inserted = if store_invocation {
+            let inserted = if store_invocation || unavailable_reason.is_some() {
                 observation.invocations.insert(ObservedInvocation {
                     hermit_sha: row.hermit_sha.clone(),
                     run_id: row.run_id.clone(),
+                    attempt: unavailable_reason.as_ref().map(|_| row.attempt),
+                    evidence_sha256: unavailable_reason
+                        .as_ref()
+                        .map(|_| candidate.evidence_identity.clone()),
                     result,
                     argv: row.argv.clone(),
                     guest_argv: row.guest_argv.clone(),
@@ -4185,12 +4309,14 @@ fn apply_validate_results(
                     .cmp(&right.detcore_tree)
                     .then(left.provenance.cmp(&right.provenance))
             });
-            if result == ObservedResult::Pass {
-                fold.passed += 1;
-            } else if located_nothing || !store_positions {
-                fold.unlocated += 1;
-            } else {
-                fold.located += 1;
+            if unavailable_reason.is_none() {
+                if result == Some(ObservedResult::Pass) {
+                    fold.passed += 1;
+                } else if located_nothing || !store_positions {
+                    fold.unlocated += 1;
+                } else {
+                    fold.located += 1;
+                }
             }
         }
     }
@@ -4289,10 +4415,10 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
         println!(
             "  ⚠️ {} row(s) DETERMINED NOTHING -- an infrastructure ERROR, a completed \
              FAIL/no_result before comparison, or another non-PASS non-FAIL outcome. \
-             NOTHING WAS COMPARED for them, so this run is NOT all-green -- and it is \
-             NOT a product failure either. No observation was stored, because there \
-             is no product behaviour to store. Re-run these cells; do not read this \
-             as a result.",
+             NO CANONICAL PRODUCT RESULT WAS ADMITTED for them, so this run is NOT \
+             all-green -- and it is NOT a product failure either. Their exact run and \
+             attempt were stored as measured no-verdict; no pass, divergence, or crash \
+             was invented. Re-run these cells; do not read this as a product result.",
             fold.errored.len()
         );
         for cell in &fold.errored {
@@ -4908,6 +5034,25 @@ fn validate_observation_identity_namespace(cells: &TrackedCells) -> Result<(), S
                     "{id} has no Detcore tree and not exactly one valid recorded Hermit identity"
                 ));
             }
+            for invocation in &observation.invocations {
+                match (invocation.attempt, invocation.evidence_sha256.as_deref()) {
+                    (None, None) if invocation.result.is_some() => {}
+                    (Some(attempt), Some(evidence_sha256)) if attempt > 0 => {
+                        require_sha256("validate-row evidence", evidence_sha256)
+                            .map_err(|error| format!("{id} {error}"))?;
+                    }
+                    (None, None) => {
+                        return Err(format!(
+                            "{id} has a result-less invocation without exact outer-attempt evidence identity"
+                        ));
+                    }
+                    _ => {
+                        return Err(format!(
+                            "{id} has an incomplete validate-row invocation identity"
+                        ));
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -5191,12 +5336,10 @@ fn apply_series_rows(
                 .canonical_comparisons
                 .iter()
                 .map(|row| (&row.hermit_sha, &row.run_id, row.result))
-                .chain(
-                    observation
-                        .invocations
-                        .iter()
-                        .map(|row| (&row.hermit_sha, &row.run_id, row.result)),
-                )
+                .chain(observation.invocations.iter().filter_map(|row| {
+                    row.result
+                        .map(|result| (&row.hermit_sha, &row.run_id, result))
+                }))
             {
                 runs.entry((hermit_sha.clone(), run_id.clone()))
                     .or_default()
@@ -5946,14 +6089,9 @@ fn read_retained_results(
                 candidate.path.display()
             )
         })? {
-            ValidateRowEvidence::NotRun { reason } => {
-                return Err(format!(
-                    "malformed retained evidence for {} at {}: {reason}",
-                    display_id(&id),
-                    candidate.path.display()
-                ));
+            ValidateRowEvidence::NotRun { .. } | ValidateRowEvidence::Unavailable { .. } => {
+                continue;
             }
-            ValidateRowEvidence::Unavailable { .. } => continue,
             ValidateRowEvidence::Matched { .. } | ValidateRowEvidence::Diverged { .. } => {}
         }
         let rank = *history
@@ -6879,6 +7017,13 @@ fn self_test() -> Result<(), String> {
             backend: Some(id.backend.clone()),
             classification: "required".into(),
             outcome: outcome.into(),
+            result: Some(if outcome == "PASS" {
+                ObservedResult::Pass
+            } else {
+                ObservedResult::DeterminismFailure
+            }),
+            failure_class: (outcome != "PASS").then_some(FailureClass::ProductFailure),
+            error_kind: None,
             timeout_seconds: 15,
             log_level: Some("info".into()),
             effective_args: vec!["run".into()],
@@ -6961,6 +7106,16 @@ fn self_test() -> Result<(), String> {
             row,
         }
     };
+    let current_identity = candidate("PASS").row;
+    let mut legacy_identity = current_identity.clone();
+    legacy_identity.result = None;
+    legacy_identity.failure_class = None;
+    if current_identity.evidence_identity()? != legacy_identity.evidence_identity()? {
+        return Err(
+            "adding producer-owned result classification changed the retained evidence identity"
+                .into(),
+        );
+    }
     verify_candidate_set(
         &expected,
         BTreeMap::from([(id.clone(), vec![candidate("PASS")])]),
@@ -7637,7 +7792,7 @@ red/`measured-and-passed` count is **0**.",
         || observation.invocations.len() != 5
         || !observation.invocations.iter().any(|invocation| {
             invocation.hermit_sha == "sha-doc"
-                && invocation.result == ObservedResult::Pass
+                && invocation.result == Some(ObservedResult::Pass)
                 && invocation.run_id == "fixture-pass"
                 && invocation.argv == ["hermit", "run"]
                 && invocation.guest_argv == ["fixture"]
@@ -7780,6 +7935,9 @@ red/`measured-and-passed` count is **0**.",
         backend: Some(validate_id.backend.clone()),
         classification: "required".into(),
         outcome: "FAIL".into(),
+        result: Some(ObservedResult::DeterminismFailure),
+        failure_class: Some(FailureClass::ProductFailure),
+        error_kind: None,
         timeout_seconds: 15,
         log_level: Some("info".into()),
         effective_args: vec!["run".into()],
@@ -8577,6 +8735,24 @@ red/`measured-and-passed` count is **0**.",
                 })
         })
     };
+    let has_current_no_verdict = |cells: &TrackedCells| {
+        cells.cells.iter().any(|cell| {
+            cell.id == verify_id
+                && cell
+                    .last_tested
+                    .as_ref()
+                    .is_some_and(|last| last.hermit_sha == fixture_head)
+                && cell.observations.iter().any(|observation| {
+                    observation.hermit_shas.contains(&fixture_head)
+                        && observation.results.is_empty()
+                        && observation.invocations.iter().any(|invocation| {
+                            invocation.run_id == "result-command-verify"
+                                && invocation.attempt == Some(1)
+                                && invocation.result.is_none()
+                        })
+                })
+        })
+    };
     let restore_generated = || -> Result<(), String> {
         fs::write(
             result_command_root.join(SCORECARD),
@@ -8660,20 +8836,20 @@ red/`measured-and-passed` count is **0**.",
 
     let mut verify_row = replay_row;
     verify_row.run_id = "result-command-verify".into();
-    verify_row.mode = verify_id.mode;
+    verify_row.mode = verify_id.mode.clone();
     write_result_row(&verify_row)?;
     let unavailable = run_result_command("observe-results", None)?;
     let unavailable_stdout = String::from_utf8_lossy(&unavailable.stdout);
     if !unavailable.status.success()
         || !unavailable_stdout.contains("DETERMINED NOTHING")
         || unavailable_stdout.contains("expected result for an all-green run")
-        || read_generated_files(&result_command_root)? != result_command_before
+        || !has_current_no_verdict(&read_json(&result_command_root.join(CELLS))?)
     {
         return Err(
-            "observe-results did not name and withhold verify evidence with real time unchanged"
-                .into(),
+            "observe-results did not name and retain verify evidence as measured-no-verdict".into(),
         );
     }
+    restore_generated()?;
 
     for (staged_clean, unrelated_clean, allowed) in [
         (true, true, true),
@@ -8877,6 +9053,28 @@ red/`measured-and-passed` count is **0**.",
         row.mode = id.mode.clone();
         row.backend = Some(id.backend.clone());
         row.outcome = outcome.to_string();
+        match outcome {
+            "PASS" => {
+                row.result = Some(ObservedResult::Pass);
+                row.failure_class = None;
+                row.error_kind = None;
+            }
+            "FAIL" => {
+                row.result = Some(ObservedResult::DeterminismFailure);
+                row.failure_class = Some(FailureClass::ProductFailure);
+                row.error_kind = None;
+            }
+            "ERROR" => {
+                row.result = None;
+                row.failure_class = Some(FailureClass::UnderstoodInfrastructureFailure);
+                row.error_kind = Some("infrastructure".into());
+            }
+            _ => {
+                row.result = None;
+                row.failure_class = None;
+                row.error_kind = None;
+            }
+        }
         row.first_divergent_scheduler_turn = None;
         row.first_divergent_virtual_nanoseconds = None;
         row.first_divergent_record = None;
@@ -8991,7 +9189,8 @@ red/`measured-and-passed` count is **0**.",
     // A cell retry can recover after the first Hermit invocation completed
     // without reaching a comparison. The no-result attempt is real execution
     // evidence, but it has no product result or INFO-message counts to store.
-    // Name it, skip it, and retain the later canonical PASS.
+    // Name and retain it as measured no-verdict alongside the later canonical
+    // PASS.
     let mut no_result_report = canonical_verdict::VerificationReport::no_result();
     no_result_report.no_result_reason = Some(canonical_verdict::NoResultReason::FirstRunRejected {
         exit_code: Some(1),
@@ -9012,6 +9211,9 @@ red/`measured-and-passed` count is **0**.",
     no_result_row.run_id = "fixture-recovered-no-result".into();
     no_result_row.attempt = 1;
     no_result_row.outcome = "FAIL".into();
+    no_result_row.result = Some(ObservedResult::CrashError);
+    no_result_row.failure_class = Some(FailureClass::ProductFailure);
+    no_result_row.error_kind = None;
     no_result_row.first_divergent_scheduler_turn = None;
     no_result_row.first_divergent_virtual_nanoseconds = None;
     no_result_row.first_divergent_record = None;
@@ -9023,6 +9225,9 @@ red/`measured-and-passed` count is **0**.",
     recovered_pass_row.run_id = no_result_row.run_id.clone();
     recovered_pass_row.attempt = 2;
     recovered_pass_row.outcome = "PASS".into();
+    recovered_pass_row.result = Some(ObservedResult::Pass);
+    recovered_pass_row.failure_class = None;
+    recovered_pass_row.error_kind = None;
     recovered_pass_row.first_divergent_scheduler_turn = None;
     recovered_pass_row.first_divergent_virtual_nanoseconds = None;
     recovered_pass_row.first_divergent_record = None;
@@ -9115,6 +9320,9 @@ red/`measured-and-passed` count is **0**.",
     not_run_row.run_id = "fixture-recovered-not-run".into();
     not_run_row.attempt = 1;
     not_run_row.outcome = "ERROR".into();
+    not_run_row.result = None;
+    not_run_row.failure_class = Some(FailureClass::NoResult);
+    not_run_row.error_kind = Some("incomplete-verification-evidence".into());
     not_run_row.first_divergent_scheduler_turn = None;
     not_run_row.first_divergent_virtual_nanoseconds = None;
     not_run_row.first_divergent_record = None;
@@ -9142,15 +9350,23 @@ red/`measured-and-passed` count is **0**.",
             || tracked.cells[0].measurement != MeasurementState::MeasuredAndPassed
             || tracked.cells[0].last_tested.is_none()
             || tracked.cells[0].observations.len() != 1
-            || tracked.cells[0].observations[0].results != BTreeSet::from([ObservedResult::Pass])
+            || tracked.cells[0].observations[0].results
+                != BTreeSet::from([ObservedResult::Pass, ObservedResult::Timeout])
+            || tracked.cells[0].observations[0].invocations.len() != 2
+            || tracked.cells[0].observations[0]
+                .invocations
+                .iter()
+                .filter_map(|invocation| invocation.attempt)
+                .collect::<BTreeSet<_>>()
+                != BTreeSet::from([1])
         {
             return Err(format!(
-                "recovered NotRun {label} did not retain only the later canonical PASS: {fold:?}"
+                "recovered NotRun {label} did not retain the timeout and later canonical PASS: {fold:?}"
             ));
         }
     }
 
-    for (label, rows) in [
+    for (label, rows, expected_measurement, expected_results, expected_runs) in [
         ("terminal", vec![not_run_row.clone()]),
         (
             "after-match",
@@ -9175,12 +9391,40 @@ red/`measured-and-passed` count is **0**.",
                 unrelated
             }],
         ),
-    ] {
-        let error = fold_fixture_rows(rows)
-            .expect_err("terminal or unrelated NotRun evidence was accepted");
-        if !error.contains("did not complete its first run") {
+    ]
+    .into_iter()
+    .map(|(label, rows)| {
+        let expected_measurement = if label == "terminal" {
+            MeasurementState::MeasuredNoVerdict
+        } else {
+            MeasurementState::MeasuredAndPassed
+        };
+        let expected_results = if label == "terminal" {
+            BTreeSet::from([ObservedResult::Timeout])
+        } else {
+            BTreeSet::from([ObservedResult::Pass, ObservedResult::Timeout])
+        };
+        let expected_runs = if label == "terminal" { 1 } else { 2 };
+        (
+            label,
+            rows,
+            expected_measurement,
+            expected_results,
+            expected_runs,
+        )
+    }) {
+        let (tracked, fold) = fold_fixture_rows(rows)
+            .map_err(|error| format!("{label} NotRun evidence was refused: {error}"))?;
+        if fold.errored.len() != 1
+            || !fold.errored[0].contains("did not complete its first run")
+            || tracked.cells[0].measurement != expected_measurement
+            || tracked.cells[0].last_tested.is_none()
+            || tracked.cells[0].observations.len() != 1
+            || tracked.cells[0].observations[0].results != expected_results
+            || tracked.cells[0].observations[0].invocations.len() != expected_runs
+        {
             return Err(format!(
-                "{label} NotRun refusal did not name the missing first run: {error}"
+                "{label} NotRun evidence was not retained as measured no-verdict: {fold:?}"
             ));
         }
     }
@@ -9189,11 +9433,13 @@ red/`measured-and-passed` count is **0**.",
     mixed_terminal
         .attempts
         .push(no_result_row.attempts[0].clone());
-    if !fold_fixture_rows(vec![mixed_terminal])
-        .expect_err("mixed terminal NotRun evidence was accepted")
-        .contains("did not complete its first run")
+    let (tracked, fold) = fold_fixture_rows(vec![mixed_terminal])?;
+    if fold.errored.len() != 1
+        || !fold.errored[0].contains("did not complete its first run")
+        || tracked.cells[0].measurement != MeasurementState::MeasuredNoVerdict
+        || tracked.cells[0].observations[0].results != BTreeSet::from([ObservedResult::Timeout])
     {
-        return Err("mixed terminal NotRun refusal did not name the missing first run".into());
+        return Err("mixed terminal NotRun was not retained as measured no-verdict".into());
     }
 
     let mut later_divergence = validate_row.clone();
@@ -9205,7 +9451,7 @@ red/`measured-and-passed` count is **0**.",
         || tracked.cells[0].last_tested.is_none()
         || tracked.cells[0].observations.len() != 1
         || tracked.cells[0].observations[0].results
-            != BTreeSet::from([ObservedResult::DeterminismFailure])
+            != BTreeSet::from([ObservedResult::DeterminismFailure, ObservedResult::Timeout])
     {
         return Err(format!(
             "a later canonical divergence did not remain sticky after NotRun: {fold:?}"
@@ -9324,6 +9570,9 @@ red/`measured-and-passed` count is **0**.",
         row.run_id = format!("fixture-run1550-{label}");
         row.mode = "chaos".into();
         row.outcome = "ERROR".into();
+        row.result = None;
+        row.failure_class = Some(FailureClass::NoResult);
+        row.error_kind = Some("incomplete-verification-evidence".into());
         row.first_divergent_scheduler_turn = None;
         row.first_divergent_virtual_nanoseconds = None;
         row.first_divergent_record = None;
@@ -9333,11 +9582,14 @@ red/`measured-and-passed` count is **0**.",
         let (tracked, fold) = fold_fixture_row(row)?;
         if fold.errored.len() != 1
             || fold.reads_all_green()
-            || !tracked.cells[0].observations.is_empty()
-            || tracked.cells[0].last_tested.is_some()
+            || tracked.cells[0].measurement != MeasurementState::MeasuredNoVerdict
+            || tracked.cells[0].observations.len() != 1
+            || tracked.cells[0].observations[0].results
+                != BTreeSet::from([ObservedResult::Timeout])
+            || tracked.cells[0].last_tested.is_none()
         {
             return Err(format!(
-                "run1550-style {label} evidence was not withheld as one unavailable cell: {fold:?}"
+                "run1550-style {label} evidence was not retained as one timeout no-verdict: {fold:?}"
             ));
         }
     }
@@ -9346,17 +9598,107 @@ red/`measured-and-passed` count is **0**.",
     all_not_run.run_id = "fixture-all-not-run".into();
     all_not_run.mode = "chaos".into();
     all_not_run.outcome = "ERROR".into();
+    all_not_run.result = None;
+    all_not_run.failure_class = Some(FailureClass::NoResult);
+    all_not_run.error_kind = Some("incomplete-verification-evidence".into());
     all_not_run.first_divergent_scheduler_turn = None;
     all_not_run.first_divergent_virtual_nanoseconds = None;
     all_not_run.first_divergent_record = None;
     all_not_run.first_divergent_syscall = None;
     all_not_run.attempts = vec![timed_out_no_result.clone()];
     bind_row_to_first_attempt(&mut all_not_run);
-    if !fold_fixture_row(all_not_run)
-        .expect_err("standalone NotRun evidence was accepted")
-        .contains("did not complete its first run")
+    let (tracked, fold) = fold_fixture_row(all_not_run)?;
+    if fold.errored.len() != 1
+        || !fold.errored[0].contains("did not complete its first run")
+        || tracked.cells[0].measurement != MeasurementState::MeasuredNoVerdict
+        || tracked.cells[0].observations[0].results != BTreeSet::from([ObservedResult::Timeout])
     {
-        return Err("standalone NotRun refusal did not name the missing first run".into());
+        return Err("standalone NotRun was not retained as measured no-verdict".into());
+    }
+
+    // A non-timeout NotRun such as KVM exit 125 is still a measured
+    // no-verdict, but its exit status does not establish a crash or timeout.
+    // Keep it named and retain the exact invocation with no invented result.
+    let mut kvm_unavailable = not_run_row.clone();
+    kvm_unavailable.run_id = "fixture-kvm-exit-125".into();
+    kvm_unavailable.attempts[0]["timed_out"] = JsonValue::Bool(false);
+    kvm_unavailable.attempts[0]["status"] = serde_json::json!(125);
+    kvm_unavailable.attempts[0]["signal"] = JsonValue::Null;
+    let (tracked, fold) = fold_fixture_row(kvm_unavailable)?;
+    if fold.errored.len() != 1
+        || !fold.errored[0].contains("status=Some(125)")
+        || tracked.cells[0].measurement != MeasurementState::MeasuredNoVerdict
+        || !tracked.cells[0].observations[0].results.is_empty()
+        || tracked.cells[0].observations[0].invocations.len() != 1
+        || tracked.cells[0].observations[0]
+            .invocations
+            .iter()
+            .next()
+            .is_none_or(|invocation| {
+                invocation.result.is_some()
+                    || invocation.attempt != Some(1)
+                    || invocation.evidence_sha256.is_none()
+            })
+    {
+        return Err(
+            "KVM exit 125 was classified as a product result instead of unavailable".into(),
+        );
+    }
+
+    // One well-formed no-verdict row must not suppress a good neighboring
+    // cell. Both identities survive one atomic fold.
+    let no_verdict_id = CellId {
+        test: "fixture/no-verdict-neighbor".into(),
+        ..unlocated_id.clone()
+    };
+    let mut no_verdict_neighbor = not_run_row.clone();
+    no_verdict_neighbor.test = no_verdict_id.test.clone();
+    let pass_neighbor = recovered_pass_row.clone();
+    let neighbor_rows = BTreeMap::from([
+        (
+            unlocated_id.clone(),
+            vec![ResultCandidate {
+                evidence_identity: pass_neighbor.evidence_identity()?,
+                path: PathBuf::from("fixture/pass-results.jsonl"),
+                row: pass_neighbor,
+            }],
+        ),
+        (
+            no_verdict_id.clone(),
+            vec![ResultCandidate {
+                evidence_identity: no_verdict_neighbor.evidence_identity()?,
+                path: PathBuf::from("fixture/no-verdict-results.jsonl"),
+                row: no_verdict_neighbor,
+            }],
+        ),
+    ]);
+    let mut neighbor_tracked = TrackedCells {
+        schema: SCHEMA,
+        projection: None,
+        cells: vec![bare_cell(&unlocated_id), bare_cell(&no_verdict_id)],
+    };
+    let neighbor_fold = apply_validate_results(
+        &mut neighbor_tracked,
+        &neighbor_rows,
+        "sha-1",
+        "tree-1",
+        &depth_fixture,
+        true,
+        true,
+    )?;
+    refresh_measurement(&mut neighbor_tracked);
+    if neighbor_fold.passed != 1
+        || neighbor_fold.errored.len() != 1
+        || neighbor_tracked.cells[0].measurement != MeasurementState::MeasuredAndPassed
+        || neighbor_tracked.cells[1].measurement != MeasurementState::MeasuredNoVerdict
+        || neighbor_tracked
+            .cells
+            .iter()
+            .any(|cell| cell.last_tested.is_none() || cell.observations.len() != 1)
+    {
+        return Err(format!(
+            "a no-verdict row suppressed its good neighbor: {neighbor_fold:?}"
+        ));
     }
 
     for (label, outcome, attempts) in [
@@ -9375,6 +9717,11 @@ red/`measured-and-passed` count is **0**.",
         row.run_id = format!("fixture-{label}");
         row.mode = "chaos".into();
         row.outcome = outcome.into();
+        if outcome == "ERROR" {
+            row.result = None;
+            row.failure_class = Some(FailureClass::NoResult);
+            row.error_kind = Some("incomplete-verification-evidence".into());
+        }
         row.attempts = attempts;
         let (tracked, fold) = fold_fixture_row(row)?;
         if fold.located != 1
@@ -9396,6 +9743,14 @@ red/`measured-and-passed` count is **0**.",
         let mut row = validate_row.clone();
         row.run_id = format!("fixture-all-match-{outcome}");
         row.outcome = outcome.into();
+        if outcome == "PASS" {
+            row.result = Some(ObservedResult::Pass);
+            row.failure_class = None;
+        } else {
+            row.result = Some(ObservedResult::CrashError);
+            row.failure_class = Some(FailureClass::ProductFailure);
+        }
+        row.error_kind = None;
         row.first_divergent_scheduler_turn = None;
         row.first_divergent_virtual_nanoseconds = None;
         row.first_divergent_record = None;
@@ -9408,8 +9763,10 @@ red/`measured-and-passed` count is **0**.",
                 && (tracked.cells[0].observations.len() != 1
                     || tracked.cells[0].last_tested.is_none()))
             || (outcome == "FAIL"
-                && (!tracked.cells[0].observations.is_empty()
-                    || tracked.cells[0].last_tested.is_some()))
+                && (tracked.cells[0].measurement != MeasurementState::MeasuredNoVerdict
+                    || tracked.cells[0].observations.len() != 1
+                    || !tracked.cells[0].observations[0].results.is_empty()
+                    || tracked.cells[0].last_tested.is_none()))
         {
             return Err(format!(
                 "all-match outer {outcome} was classified incorrectly: {fold:?}"
@@ -9430,6 +9787,9 @@ red/`measured-and-passed` count is **0**.",
     mixed_missing_report.run_id = "fixture-match-plus-missing-timeout-report".into();
     mixed_missing_report.mode = "chaos".into();
     mixed_missing_report.outcome = "ERROR".into();
+    mixed_missing_report.result = None;
+    mixed_missing_report.failure_class = Some(FailureClass::NoResult);
+    mixed_missing_report.error_kind = Some("incomplete-verification-evidence".into());
     mixed_missing_report.first_divergent_scheduler_turn = None;
     mixed_missing_report.first_divergent_virtual_nanoseconds = None;
     mixed_missing_report.first_divergent_record = None;
@@ -9438,15 +9798,19 @@ red/`measured-and-passed` count is **0**.",
         vec![validate_attempt("PASS"), timed_out_without_report.clone()];
     let (tracked, fold) = fold_fixture_row(mixed_missing_report)?;
     if fold.errored.len() != 1
-        || !tracked.cells[0].observations.is_empty()
-        || tracked.cells[0].last_tested.is_some()
+        || tracked.cells[0].measurement != MeasurementState::MeasuredNoVerdict
+        || tracked.cells[0].observations[0].results != BTreeSet::from([ObservedResult::Timeout])
+        || tracked.cells[0].last_tested.is_none()
     {
-        return Err("a timed-out missing report was not named and withheld".into());
+        return Err("a timed-out missing report was not named and retained".into());
     }
     timed_out_without_report["timed_out"] = JsonValue::Bool(false);
     let mut unexplained_missing = validate_row.clone();
     unexplained_missing.run_id = "fixture-unexplained-missing-report".into();
     unexplained_missing.outcome = "ERROR".into();
+    unexplained_missing.result = None;
+    unexplained_missing.failure_class = Some(FailureClass::NoResult);
+    unexplained_missing.error_kind = Some("incomplete-verification-evidence".into());
     unexplained_missing.first_divergent_scheduler_turn = None;
     unexplained_missing.first_divergent_virtual_nanoseconds = None;
     unexplained_missing.first_divergent_record = None;
@@ -9512,6 +9876,13 @@ red/`measured-and-passed` count is **0**.",
     malformed_report.attempts[0]["verification_report_sha256"] =
         JsonValue::String(format!("{:x}", Sha256::digest(b"{")));
     assert_recovered_refuses(malformed_report, "unreadable verification report");
+
+    let mut contradictory_outer_class = no_result_row.clone();
+    contradictory_outer_class.outcome = "ERROR".into();
+    assert_recovered_refuses(
+        contradictory_outer_class,
+        "ERROR row must not carry a product observation",
+    );
 
     let mut not_run = no_result_row.clone();
     replace_embedded_report(
@@ -9615,6 +9986,14 @@ red/`measured-and-passed` count is **0**.",
         let mut missing_counts = validate_row.clone();
         missing_counts.run_id = format!("fixture-{outcome}-missing-counts");
         missing_counts.outcome = outcome.into();
+        if outcome == "PASS" {
+            missing_counts.result = Some(ObservedResult::Pass);
+            missing_counts.failure_class = None;
+        } else {
+            missing_counts.result = Some(ObservedResult::DeterminismFailure);
+            missing_counts.failure_class = Some(FailureClass::ProductFailure);
+        }
+        missing_counts.error_kind = None;
         missing_counts.first_divergent_scheduler_turn = None;
         missing_counts.first_divergent_virtual_nanoseconds = None;
         missing_counts.first_divergent_record = None;
@@ -9663,13 +10042,16 @@ red/`measured-and-passed` count is **0**.",
             true,
         )
         .map_err(|error| format!("a weaker {field} comparison failed the fold: {error}"))?;
+        refresh_measurement(&mut weak_tracked);
         if weak_fold.errored.len() != 1
             || weak_fold.reads_all_green()
-            || !weak_tracked.cells[0].observations.is_empty()
-            || weak_tracked.cells[0].last_tested.is_some()
+            || weak_tracked.cells[0].measurement != MeasurementState::MeasuredNoVerdict
+            || weak_tracked.cells[0].observations.len() != 1
+            || !weak_tracked.cells[0].observations[0].results.is_empty()
+            || weak_tracked.cells[0].last_tested.is_none()
         {
             return Err(format!(
-                "a comparison with weakened {field} was not named and withheld from scorecard evidence"
+                "a comparison with weakened {field} was not named and retained as measured-no-verdict"
             ));
         }
     }
@@ -9725,10 +10107,13 @@ red/`measured-and-passed` count is **0**.",
             errored_fold.located, errored_fold.unlocated
         ));
     }
-    if !errored.cells[0].observations.is_empty() {
+    if errored.cells[0].measurement != MeasurementState::MeasuredNoVerdict
+        || errored.cells[0].observations.len() != 1
+        || !errored.cells[0].observations[0].results.is_empty()
+        || errored.cells[0].last_tested.is_none()
+    {
         return Err(
-            "an infrastructure ERROR stored an observation; a cell nothing compared must not \
-             gain a measurement"
+            "an infrastructure ERROR was not retained as a measured no-verdict without a product result"
                 .into(),
         );
     }
@@ -9769,10 +10154,13 @@ red/`measured-and-passed` count is **0**.",
     .map_err(|e| format!("an infrastructure ERROR with retained coordinates was refused: {e}"))?;
     if retained_comparison_error_fold.errored.len() != 1
         || !retained_comparison_error_fold.errored[0].contains("HERMIT_SKID_OVERSHOOT")
-        || !retained_comparison_error.cells[0].observations.is_empty()
+        || retained_comparison_error.cells[0].observations.len() != 1
+        || !retained_comparison_error.cells[0].observations[0]
+            .results
+            .is_empty()
     {
         return Err(format!(
-            "an infrastructure ERROR with retained comparison evidence was not named and excluded from product observations: {:?}",
+            "an infrastructure ERROR with retained comparison evidence was not named and retained without a product result: {:?}",
             retained_comparison_error_fold.errored
         ));
     }
@@ -9842,9 +10230,14 @@ red/`measured-and-passed` count is **0**.",
                 other_fold.errored
             ));
         }
-        if !other.cells[0].observations.is_empty() {
+        refresh_measurement(&mut other);
+        if other.cells[0].measurement != MeasurementState::MeasuredNoVerdict
+            || other.cells[0].observations.len() != 1
+            || !other.cells[0].observations[0].results.is_empty()
+            || other.cells[0].last_tested.is_none()
+        {
             return Err(format!(
-                "a coordinate-less {outcome} stored an observation; nothing was compared"
+                "a coordinate-less {outcome} was not retained as measured-no-verdict"
             ));
         }
     }
@@ -10093,6 +10486,9 @@ red/`measured-and-passed` count is **0**.",
         backend: None,
         classification: "required".into(),
         outcome: "PASS".into(),
+        result: Some(ObservedResult::Pass),
+        failure_class: None,
+        error_kind: None,
         timeout_seconds: 15,
         log_level: None,
         effective_args: Vec::new(),
@@ -11585,6 +11981,33 @@ red/`measured-and-passed` count is **0**.",
         );
     }
 
+    // A result-less invocation is valid only when it names the exact outer
+    // attempt and complete result row that produced the measured no-verdict.
+    // Otherwise making `result` optional would also make a damaged historical
+    // invocation silently indistinguishable from intentional no-verdict data.
+    let mut missing_no_verdict_identity = passed.clone();
+    let invocation = missing_no_verdict_identity.cells[0].observations[0]
+        .invocations
+        .iter()
+        .next()
+        .cloned()
+        .ok_or("PASS fixture has no invocation")?;
+    missing_no_verdict_identity.cells[0].observations[0]
+        .invocations
+        .clear();
+    missing_no_verdict_identity.cells[0].observations[0]
+        .invocations
+        .insert(ObservedInvocation {
+            result: None,
+            ..invocation
+        });
+    if !validate_observation_identity_namespace(&missing_no_verdict_identity)
+        .expect_err("a result-less invocation without row identity was accepted")
+        .contains("without exact outer-attempt evidence identity")
+    {
+        return Err("result-less invocation refusal did not name its missing identity".into());
+    }
+
     // ── PATH-INDEPENDENCE BRACKET ──────────────────────────────────────────
     // The encoded artifact must not name the worktree that produced it, and it
     // must not name the worktree ENCODING it either. Both legs are required:
@@ -11603,7 +12026,9 @@ red/`measured-and-passed` count is **0**.",
     let mut fixture = ObservedInvocation {
         hermit_sha: "fixture-sha".into(),
         run_id: "fixture-run".into(),
-        result: ObservedResult::Pass,
+        attempt: None,
+        evidence_sha256: None,
+        result: Some(ObservedResult::Pass),
         argv: vec![format!("{foreign_root}/target/debug/hermit"), "run".into()],
         guest_argv: vec!["/bin/true".into()],
         env: foreign_env.clone(),
