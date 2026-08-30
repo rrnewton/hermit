@@ -34,11 +34,15 @@ set -uo pipefail
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$script_dir/.." && pwd)
 
+# shellcheck source=scripts/lib/test_results.sh
+source "$repo_root/scripts/lib/test_results.sh"
+
 HERMIT_BIN=${HERMIT_BIN:-"$repo_root/target/debug/hermit"}
 CASE_TIMEOUT=${CASE_TIMEOUT_SECONDS:-30}
 emit_json=0
 json_out=""
 run_rr=0
+self_test=0
 
 usage() {
     cat <<'EOF'
@@ -49,6 +53,7 @@ Options:
                     (instead of the human summary).
   --out FILE        Also write the JSON report to FILE.
   --run-rr          Additionally execute the rr suite (slow; off by default).
+  --self-test       Exercise typed rr result consumption without running Hermit.
   -h, --help        Show this help.
 
 Environment:
@@ -62,11 +67,68 @@ while [[ $# -gt 0 ]]; do
         --json) emit_json=1 ;;
         --out) shift; json_out=${1:-} ;;
         --run-rr) run_rr=1 ;;
+        --self-test) self_test=1 ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'error: unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
     shift
 done
+
+rr_status="inventory-only"
+rr_pass=""
+rr_fail=""
+rr_filtered=""
+
+load_rr_results() { # <result-file>
+    local result_file=$1
+    if ! load_test_results "$result_file"; then
+        rr_status="unknown"
+        rr_pass=""
+        rr_fail=""
+        rr_filtered=""
+        return 1
+    fi
+    rr_status="executed"
+    rr_pass=$TEST_RESULTS_PASSED
+    rr_fail=$TEST_RESULTS_FAILED
+    rr_filtered=$TEST_RESULTS_FILTERED
+}
+
+self_test_typed_results() {
+    local scratch fixed_log_hash='' missing_status=0
+    scratch=$(mktemp -d)
+    trap 'rm -rf -- "$scratch"' RETURN
+    printf 'test result: ok. 999 passed; 0 failed; 0 ignored\n' >"$scratch/fixed-human.log"
+    fixed_log_hash=$(sha256sum "$scratch/fixed-human.log")
+
+    # shellcheck disable=SC2016 # `$` is part of the stable test identity.
+    DAGRUN_TEST_COUNTS_PATH="$scratch/results.json" \
+        "$repo_root/ci/write-structured-test-counts.sh" 2 7 \
+            'rr_suite$passes' pass 1 'rr_suite$fails' fail 1 || return 1
+    load_rr_results "$scratch/results.json" || return 1
+    [[ $rr_status == executed && $rr_pass == 1 && $rr_fail == 1 && $rr_filtered == 7 ]] \
+        || return 1
+
+    # shellcheck disable=SC2016 # `$` is part of the stable test identity.
+    DAGRUN_TEST_COUNTS_PATH="$scratch/results.json" \
+        "$repo_root/ci/write-structured-test-counts.sh" 3 4 \
+            'rr_suite$one' pass 1 'rr_suite$two' pass 1 'rr_suite$three' pass 1 \
+        || return 1
+    load_rr_results "$scratch/results.json" || return 1
+    [[ $rr_status == executed && $rr_pass == 3 && $rr_fail == 0 && $rr_filtered == 4 ]] \
+        || return 1
+    [[ $(sha256sum "$scratch/fixed-human.log") == "$fixed_log_hash" ]] || return 1
+
+    rm -f -- "$scratch/results.json"
+    load_rr_results "$scratch/results.json" >/dev/null 2>&1 || missing_status=$?
+    [[ $missing_status != 0 && $rr_status == unknown ]] || return 1
+    printf 'compat-map: typed rr result self-test PASS\n'
+}
+
+if [[ $self_test -eq 1 ]]; then
+    self_test_typed_results
+    exit
+fi
 
 log() { [[ $emit_json -eq 1 ]] || printf '%s\n' "$*" >&2; }
 
@@ -246,19 +308,20 @@ rr_suite_file="$repo_root/hermit-cli/tests/rr_suite.rs"
 rr_count=0
 [[ -f $rr_suite_file ]] && rr_count=$(grep -cE 'rr_test!\(' "$rr_suite_file" 2>/dev/null || echo 0)
 
-rr_status="inventory-only"
-rr_pass=""
-rr_fail=""
 if [[ $run_rr -eq 1 && $rr_count -gt 0 ]]; then
     log "Running rr suite (this is slow)..."
     rr_log=$(mktemp)
-    ( cd "$repo_root" && timeout 1800 cargo test -p hermit --test rr_suite -- --ignored ) \
-        >"$rr_log" 2>&1
-    line=$(grep -E 'test result:' "$rr_log" | tail -1)
-    rr_pass=$(sed -nE 's/.* ([0-9]+) passed.*/\1/p' <<<"$line")
-    rr_fail=$(sed -nE 's/.* ([0-9]+) failed.*/\1/p' <<<"$line")
-    rr_status="executed"
-    rm -f "$rr_log"
+    rr_results=$(mktemp)
+    rm -f -- "$rr_results"
+    rr_exit=0
+    ( cd "$repo_root" && DAGRUN_TEST_COUNTS_PATH="$rr_results" \
+        timeout 1800 ./ci/run-nextest-counted.sh -p hermit --test rr_suite -- --ignored ) \
+        >"$rr_log" 2>&1 || rr_exit=$?
+    load_rr_results "$rr_results" || true
+    if [[ $rr_status == unknown ]]; then
+        log "rr suite produced no readable typed test result (exit $rr_exit)"
+    fi
+    rm -f -- "$rr_log" "$rr_results"
 fi
 
 # OSS apps: detect integration tests.
@@ -309,7 +372,8 @@ build_json() {
     printf '    },\n'
     printf '    "rr_tests": {"status": %s, "case_count": %d' "$(json_str "$rr_status")" "$rr_count"
     if [[ $rr_status == executed ]]; then
-        printf ', "passed": %s, "failed": %s' "${rr_pass:-null}" "${rr_fail:-null}"
+        printf ', "passed": %s, "failed": %s, "filtered": %s' \
+            "${rr_pass:-null}" "${rr_fail:-null}" "${rr_filtered:-null}"
     fi
     printf '},\n'
     printf '    "oss_apps": {"status": "inventory-only", "count": %d, "items": [' "$oss_count"
@@ -373,12 +437,14 @@ fi
 hr
 echo "Other buckets"
 if [[ $rr_status == executed ]]; then
-    printf '  rr tests   %s: %s passed, %s failed (of %d cases)\n' \
-        "$rr_status" "${rr_pass:-?}" "${rr_fail:-?}" "$rr_count"
+    printf '  rr tests   %s: %s passed, %s failed, %s filtered (of %d cases)\n' \
+        "$rr_status" "${rr_pass:-?}" "${rr_fail:-?}" "${rr_filtered:-?}" "$rr_count"
+elif [[ $rr_status == unknown ]]; then
+    printf '  rr tests   unknown: typed test result unavailable (of %d cases)\n' "$rr_count"
 else
     printf '  rr tests   %d cases catalogued (inventory-only; run with --run-rr or\n' "$rr_count"
     # shellcheck disable=SC2016  # backticks are a literal hint, not a command substitution
-    printf '             `cargo test -p hermit --test rr_suite -- --ignored`)\n'
+    printf '             `./ci/run-nextest-counted.sh -p hermit --test rr_suite -- --ignored`)\n'
 fi
 printf '  oss apps   %d catalogued (inventory-only): %s\n' "$oss_count" "${oss_apps[*]:-none}"
 hr
