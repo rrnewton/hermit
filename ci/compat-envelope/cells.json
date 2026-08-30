@@ -1252,10 +1252,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -1315,7 +1312,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "infrastructure-error",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit"
       },
       "observations": [],
       "measurement": "never-measured"
@@ -1329,7 +1328,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "infrastructure-error",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit"
       },
       "observations": [],
       "measurement": "never-measured"
@@ -1343,7 +1344,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "infrastructure-error",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit"
       },
       "last_tested": {
         "hermit_sha": "4cd48cbe035d681819a50f4efae3415af6597064",
@@ -11547,10 +11550,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -11608,10 +11608,7 @@
       "mode": "verify",
       "backend": "kvm",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -11681,10 +11678,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -13031,7 +13025,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
+        "result": "determinism-failure",
+        "evidence": "Published parent series at dev-hermit 90a55d8190dd2551179a9394be3504ee89a6a5a9 retains pressure-test results pass and determinism-failure for Detcore tree 077a5d847f6541daa5ef145536a7065868e9d3ab; first divergent record 80 and syscall 32.",
+        "reason": "Published canonical verification at the same Detcore tree contains both passing and divergent observations. The 20 clean repetitions in this campaign do not erase the retained divergence, so this backend remains excluded pending separate qualification."
       },
       "observations": [
         {
@@ -13103,10 +13099,7 @@
       "mode": "verify",
       "backend": "kvm",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -13176,10 +13169,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -25527,7 +25517,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
+        "result": "determinism-failure",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"
       },
       "observations": [
         {
@@ -25612,10 +25604,7 @@
       "mode": "verify",
       "backend": "kvm",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -25685,10 +25674,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -32493,10 +32479,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -32554,10 +32537,7 @@
       "mode": "verify",
       "backend": "kvm",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -32627,10 +32607,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -32832,10 +32809,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -32893,10 +32867,7 @@
       "mode": "verify",
       "backend": "kvm",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -32966,10 +32937,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -34269,7 +34237,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "NOT-MEASURED: this cell landed on main in b48aff99 after this PR's 72-cell enablement pass measured the bucket, so there is no measured result here to justify enabling it. Enable it in a follow-up that measures it rather than inheriting an unmeasured default."
+        "result": "determinism-failure",
+        "evidence": "Generated scorecard ci/compat-envelope/cells.json at Hermit 5b811757980b9cab599206c047560a7962176a6b retains historical results determinism-failure at Hermit 90e46cba9ad83550205f3c9cd232ae222c6b6173; retained first divergent record positions: 492, 366, 374.",
+        "reason": "Historical canonical verification diverged at recorded positions. The later clean observations do not erase that retained failure, so this backend remains excluded pending separate qualification."
       },
       "last_tested": {
         "hermit_sha": "90e46cba9ad83550205f3c9cd232ae222c6b6173",
@@ -34733,10 +34703,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-MEASURED: this cell landed on main in b48aff99 after this PR's 72-cell enablement pass measured the bucket, so there is no measured result here to justify enabling it. Enable it in a follow-up that measures it rather than inheriting an unmeasured default."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -41541,10 +41508,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -41602,10 +41566,7 @@
       "mode": "verify",
       "backend": "kvm",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -41675,10 +41636,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -55986,10 +55944,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -56071,10 +56026,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -61862,10 +61814,7 @@
       "mode": "verify",
       "backend": "liteinst",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but liteinst FAIL (exit 1), sabre FAIL (exit 1). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -61923,10 +61872,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but liteinst FAIL (exit 1), sabre FAIL (exit 1). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -61984,10 +61930,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but liteinst FAIL (exit 1), sabre FAIL (exit 1). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -62177,10 +62120,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -62238,10 +62178,7 @@
       "mode": "verify",
       "backend": "kvm",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -62311,10 +62248,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -69119,10 +69053,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -69204,10 +69135,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -71629,10 +71557,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but sabre FAIL (exit 1). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -71692,7 +71617,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but sabre FAIL (exit 1). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
+        "result": "determinism-failure",
+        "evidence": "Generated scorecard ci/compat-envelope/cells.json at Hermit 5b811757980b9cab599206c047560a7962176a6b retains historical results determinism-failure at Hermit 90e46cba9ad83550205f3c9cd232ae222c6b6173; retained first divergent record positions: 26, 26, 26.",
+        "reason": "Historical canonical verification diverged at recorded positions. The later clean observations do not erase that retained failure, so this backend remains excluded pending separate qualification."
       },
       "last_tested": {
         "hermit_sha": "90e46cba9ad83550205f3c9cd232ae222c6b6173",
@@ -77925,10 +77852,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -77986,10 +77910,7 @@
       "mode": "verify",
       "backend": "kvm",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -78059,10 +77980,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -79356,10 +79274,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -79417,10 +79332,7 @@
       "mode": "verify",
       "backend": "kvm",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -79490,10 +79402,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -86402,7 +86311,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "NOT-MEASURED: this cell landed on main in 0d622ba2 after this PR's 72-cell enablement pass measured the bucket, so there is no measured result here to justify enabling it. Enable it in a follow-up that measures it rather than inheriting an unmeasured default."
+        "result": "infrastructure-error",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit"
       },
       "observations": [],
       "measurement": "never-measured"
@@ -86438,10 +86349,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "NOT-MEASURED: this cell landed on main in 0d622ba2 after this PR's 72-cell enablement pass measured the bucket, so there is no measured result here to justify enabling it. Enable it in a follow-up that measures it rather than inheriting an unmeasured default."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -87771,10 +87679,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "MEASURED-BUT-NOT-QUALIFIED: ptrace PASSES canonical verification and the other backends have never been measured. Ported from the retired backend-parity-c.toml, deleted when this registry migrated to YAML schema 2; the original registration disabled every non-ptrace backend with a HOST excuse -- cmake absent on the authoring host, KVM not completing a guest there, LiteInst preload handshake failing -- which is a statement about one developer box, not a measurement. ptrace was measured for this port at hermit e69c0a62cecef9aa44e3810ae88c06ad24155048 (debug build): hermit run --strict --verify --verify-strict reported verified=true, verdict=matched, bitwise_parity=true, strictness=canonical, compare_logs=true, record_envelope=all_records_v1, 266/266 INFO messages compared, exit 0. Natively the same guest DIFFERS between runs because the ephemeral port varies, so the pass is a real determinization result rather than a constant. ci stays false because that is ONE sample on a debug build, and this guest binds loopback sockets and branches on epoll readiness order -- the class most likely to be load-sensitive. Enabling it needs repeat qualification, not this single run."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -108312,7 +108217,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "infrastructure-error",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit"
       },
       "observations": [],
       "measurement": "never-measured"
@@ -108468,10 +108375,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -108553,10 +108457,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -108614,10 +108515,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -110856,10 +110754,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -110941,10 +110836,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -111002,10 +110894,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -112399,10 +112288,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -112484,10 +112370,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -112545,10 +112428,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -114787,10 +114667,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -114872,10 +114749,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -114933,10 +114807,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -116218,10 +116089,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -116303,10 +116171,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -116364,10 +116229,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -116593,13 +116455,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 passed ptrace, but SaBRe timed out twice in Run1 at the 15-second cell cap with no comparison and less than 75 ms CPU; preserve whole-test-group qualification by holding this sibling."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -116680,13 +116536,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "timeout",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 timed out both SaBRe attempts in Run1 at the 15-second cell cap with no comparison and less than 75 ms CPU, showing no progress in the pinned-root child-lifecycle path."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "last_tested": {
         "hermit_sha": "6976687a0b2d0f7660324e8ef787bd882b9627b5",
         "detcore_tree": "077a5d847f6541daa5ef145536a7065868e9d3ab",
@@ -118913,10 +118763,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -118998,10 +118845,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -119061,7 +118905,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "crash-error",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites"
       },
       "observations": [],
       "measurement": "never-measured"
@@ -121241,7 +121087,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "infrastructure-error",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit"
       },
       "observations": [
         {
@@ -122076,7 +121924,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "infrastructure-error",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit"
       },
       "observations": [],
       "measurement": "never-measured"
@@ -122112,10 +121962,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -122173,10 +122020,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -122598,13 +122442,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 passed ptrace, but SaBRe timed out twice in Run1 at the 15-second cell cap with no comparison and less than 75 ms CPU; preserve whole-test-group qualification by holding this sibling."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -122685,13 +122523,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "timeout",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 timed out both SaBRe attempts in Run1 at the 15-second cell cap with no comparison and less than 75 ms CPU, showing no progress in the pinned-root child-lifecycle path."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "last_tested": {
         "hermit_sha": "6976687a0b2d0f7660324e8ef787bd882b9627b5",
         "detcore_tree": "077a5d847f6541daa5ef145536a7065868e9d3ab",
@@ -122932,13 +122764,7 @@
       "mode": "verify",
       "backend": "kvm",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 failed both KVM attempts before comparison because the pinned-root PIE/glibc guest raised exception vector 13 at 0x1014dac, so no canonical comparison ran."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "last_tested": {
         "hermit_sha": "6976687a0b2d0f7660324e8ef787bd882b9627b5",
         "detcore_tree": "077a5d847f6541daa5ef145536a7065868e9d3ab",
@@ -123033,13 +122859,7 @@
       "mode": "verify",
       "backend": "liteinst",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 passed LiteInst, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -123120,13 +122940,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 passed ptrace, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -123207,13 +123021,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 passed SaBRe, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -131101,10 +130909,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -131186,10 +130991,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -131247,10 +131049,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -133489,10 +133288,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -133574,10 +133370,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -133635,10 +133428,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -133864,13 +133654,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 passed ptrace, but SaBRe timed out twice in Run1 at the 15-second cell cap with no comparison and less than 75 ms CPU; preserve whole-test-group qualification by holding this sibling."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -133951,13 +133735,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "timeout",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 timed out both SaBRe attempts in Run1 at the 15-second cell cap with no comparison and less than 75 ms CPU, showing no progress in the pinned-root child-lifecycle path."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "last_tested": {
         "hermit_sha": "6976687a0b2d0f7660324e8ef787bd882b9627b5",
         "detcore_tree": "077a5d847f6541daa5ef145536a7065868e9d3ab",
@@ -136271,10 +136049,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -136334,7 +136109,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "crash-error",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites"
       },
       "observations": [],
       "measurement": "never-measured"
@@ -156796,10 +156573,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -156859,7 +156633,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "crash-error",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites"
       },
       "observations": [],
       "measurement": "never-measured"
@@ -166269,10 +166045,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -166354,10 +166127,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -166415,10 +166185,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -166608,10 +166375,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -166693,10 +166457,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -166754,10 +166515,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -166947,10 +166705,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -167032,10 +166787,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -167093,10 +166845,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -167298,13 +167047,7 @@
       "mode": "verify",
       "backend": "kvm",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 failed both KVM attempts before comparison because the pinned-root PIE/glibc guest raised exception vector 13 at 0x1014dac, so no canonical comparison ran."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "last_tested": {
         "hermit_sha": "6976687a0b2d0f7660324e8ef787bd882b9627b5",
         "detcore_tree": "077a5d847f6541daa5ef145536a7065868e9d3ab",
@@ -167411,13 +167154,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 passed ptrace, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -167498,13 +167235,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 passed SaBRe, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -167717,10 +167448,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -167802,10 +167530,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -167863,10 +167588,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -168056,10 +167778,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -168141,10 +167860,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -168202,10 +167918,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -176399,13 +176112,7 @@
       "mode": "verify",
       "backend": "kvm",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 failed both KVM attempts before comparison because the pinned-root PIE/glibc guest raised exception vector 13 at 0x1014dac, so no canonical comparison ran."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "last_tested": {
         "hermit_sha": "6976687a0b2d0f7660324e8ef787bd882b9627b5",
         "detcore_tree": "077a5d847f6541daa5ef145536a7065868e9d3ab",
@@ -176500,13 +176207,7 @@
       "mode": "verify",
       "backend": "liteinst",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 passed LiteInst, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -176587,13 +176288,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 passed ptrace, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -176674,13 +176369,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 passed SaBRe, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -185655,10 +185344,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -185718,7 +185404,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "crash-error",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites"
       },
       "observations": [],
       "measurement": "never-measured"
@@ -185900,7 +185588,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "crash-error",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: verify exited with status 125 before producing a terminal comparison"
       },
       "observations": [],
       "measurement": "never-measured"
@@ -186068,13 +185758,7 @@
       "mode": "verify",
       "backend": "kvm",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 failed both KVM attempts before comparison because the pinned-root PIE/glibc guest raised exception vector 13 at 0x1014dac, so no canonical comparison ran."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "last_tested": {
         "hermit_sha": "6976687a0b2d0f7660324e8ef787bd882b9627b5",
         "detcore_tree": "077a5d847f6541daa5ef145536a7065868e9d3ab",
@@ -186169,13 +185853,7 @@
       "mode": "verify",
       "backend": "liteinst",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 passed LiteInst, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -186256,13 +185934,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 passed ptrace, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -186343,13 +186015,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 passed SaBRe, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -186574,13 +186240,7 @@
       "mode": "verify",
       "backend": "kvm",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 failed both KVM attempts before comparison because the pinned-root PIE/glibc guest raised exception vector 13 at 0x1014dac, so no canonical comparison ran."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "last_tested": {
         "hermit_sha": "6976687a0b2d0f7660324e8ef787bd882b9627b5",
         "detcore_tree": "077a5d847f6541daa5ef145536a7065868e9d3ab",
@@ -186675,13 +186335,7 @@
       "mode": "verify",
       "backend": "liteinst",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 passed LiteInst, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -186762,13 +186416,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 passed ptrace, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -186849,13 +186497,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 passed SaBRe, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -187080,13 +186722,7 @@
       "mode": "verify",
       "backend": "kvm",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 failed both KVM attempts before comparison because the pinned-root PIE/glibc guest raised exception vector 13 at 0x1014dac, so no canonical comparison ran."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "last_tested": {
         "hermit_sha": "6976687a0b2d0f7660324e8ef787bd882b9627b5",
         "detcore_tree": "077a5d847f6541daa5ef145536a7065868e9d3ab",
@@ -187181,13 +186817,7 @@
       "mode": "verify",
       "backend": "liteinst",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 passed LiteInst, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -187268,13 +186898,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 passed ptrace, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -187355,13 +186979,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 passed SaBRe, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -194711,10 +194329,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -194796,10 +194411,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -194857,10 +194469,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -195050,10 +194659,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -195135,10 +194741,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -195196,10 +194799,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -195389,10 +194989,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -195474,10 +195071,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -195535,10 +195129,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -195728,10 +195319,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -195813,10 +195401,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -195874,10 +195459,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -202099,13 +201681,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 passed ptrace, but SaBRe timed out twice in Run1 at the 15-second cell cap with no comparison and less than 75 ms CPU; preserve whole-test-group qualification by holding this sibling."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -202186,13 +201762,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "timeout",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 timed out both SaBRe attempts in Run1 at the 15-second cell cap with no comparison and less than 75 ms CPU, showing no progress in the pinned-root child-lifecycle path."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "last_tested": {
         "hermit_sha": "6976687a0b2d0f7660324e8ef787bd882b9627b5",
         "detcore_tree": "077a5d847f6541daa5ef145536a7065868e9d3ab",
@@ -206528,10 +206098,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -206591,7 +206158,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "determinism-failure",
+        "evidence": "Generated scorecard ci/compat-envelope/cells.json at Hermit 5b811757980b9cab599206c047560a7962176a6b retains historical results determinism-failure, crash-error at Hermit 90e46cba9ad83550205f3c9cd232ae222c6b6173; retained first divergent record positions: 118, 198.",
+        "reason": "Historical canonical verification diverged at recorded positions. The later clean observations do not erase that retained failure, so this backend remains excluded pending separate qualification."
       },
       "last_tested": {
         "hermit_sha": "90e46cba9ad83550205f3c9cd232ae222c6b6173",
@@ -212549,10 +212118,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -212612,7 +212178,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "determinism-failure",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"
       },
       "observations": [
         {
@@ -216776,10 +216344,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -216861,10 +216426,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -216922,10 +216484,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -217115,10 +216674,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -217200,10 +216756,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -217261,10 +216814,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -217454,10 +217004,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -217539,10 +217086,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -217600,10 +217144,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -220481,10 +220022,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -220544,7 +220082,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "determinism-failure",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"
       },
       "observations": [
         {
@@ -221855,13 +221395,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 passed ptrace, but SaBRe timed out twice in Run1 at the 15-second cell cap with no comparison and less than 75 ms CPU; preserve whole-test-group qualification by holding this sibling."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -221942,13 +221476,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "timeout",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 timed out both SaBRe attempts in Run1 at the 15-second cell cap with no comparison and less than 75 ms CPU, showing no progress in the pinned-root child-lifecycle path."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "last_tested": {
         "hermit_sha": "6976687a0b2d0f7660324e8ef787bd882b9627b5",
         "detcore_tree": "077a5d847f6541daa5ef145536a7065868e9d3ab",
@@ -222177,10 +221705,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -222262,10 +221787,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -222323,10 +221845,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -222552,13 +222071,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "unavailable",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 passed ptrace, but SaBRe timed out twice in Run1 at the 15-second cell cap with no comparison and less than 75 ms CPU; preserve whole-test-group qualification by holding this sibling."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -222639,13 +222152,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "result": "timeout",
-        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
-        "reason": "RUN1573 timed out both SaBRe attempts in Run1 at the 15-second cell cap with no comparison and less than 75 ms CPU, showing no progress in the pinned-root child-lifecycle path."
-      },
-      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
+      "status": "green",
       "last_tested": {
         "hermit_sha": "6976687a0b2d0f7660324e8ef787bd882b9627b5",
         "detcore_tree": "077a5d847f6541daa5ef145536a7065868e9d3ab",
@@ -222874,10 +222381,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -222959,10 +222463,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -223020,10 +222521,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -229429,10 +228927,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -229492,7 +228987,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "crash-error",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites"
       },
       "observations": [],
       "measurement": "never-measured"
@@ -229674,7 +229171,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "determinism-failure",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"
       },
       "observations": [
         {
@@ -235919,10 +235418,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -236004,10 +235500,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -236065,10 +235558,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -236258,10 +235748,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -236343,10 +235830,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -236404,10 +235888,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -236599,7 +236080,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "determinism-failure",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"
       },
       "observations": [
         {
@@ -236695,10 +236178,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -236758,7 +236238,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "timeout",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a timeout; this cell did not pass every repetition cleanly. Retained detail: cell exceeded 15 s before attempt 1 started"
       },
       "observations": [
         {
@@ -236949,10 +236431,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -237034,10 +236513,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -237095,10 +236571,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -237326,7 +236799,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "crash-error",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: verify exited with status 125 before producing a terminal comparison"
       },
       "observations": [],
       "measurement": "never-measured"
@@ -243546,10 +243021,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -243609,7 +243081,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "determinism-failure",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"
       },
       "observations": [
         {
@@ -248020,10 +247494,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -248083,7 +247554,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "determinism-failure",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"
       },
       "observations": [
         {
@@ -251636,10 +251109,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -251699,7 +251169,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "crash-error",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites"
       },
       "observations": [],
       "measurement": "never-measured"
@@ -252959,10 +252431,7 @@
       "mode": "verify",
       "backend": "liteinst",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -253020,10 +252489,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -253083,7 +252549,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "timeout",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a timeout; this cell did not pass every repetition cleanly. Retained detail: cell exceeded 15 s before attempt 1 started"
       },
       "observations": [
         {
@@ -258363,7 +257831,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "crash-error",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: verify exited with status 125 before producing a terminal comparison"
       },
       "observations": [],
       "measurement": "never-measured"
@@ -258377,7 +257847,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "crash-error",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: verify exited with status 125 before producing a terminal comparison"
       },
       "observations": [],
       "measurement": "never-measured"
@@ -259833,10 +259305,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -259918,10 +259387,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -259979,10 +259445,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -260172,10 +259635,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -260257,10 +259717,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -260318,10 +259775,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -266505,10 +265959,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -266590,10 +266041,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -266651,10 +266099,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -269028,10 +268473,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -269113,10 +268555,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -269174,10 +268613,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -269367,10 +268803,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -269452,10 +268885,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -269513,10 +268943,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -269706,10 +269133,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -269791,10 +269215,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -269852,10 +269273,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -276039,10 +275457,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -276124,10 +275539,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -276185,10 +275597,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -276414,10 +275823,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -276477,7 +275883,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "determinism-failure",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"
       },
       "observations": [
         {
@@ -283249,7 +282657,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "determinism-failure",
+        "evidence": "Generated scorecard ci/compat-envelope/cells.json at Hermit 5b811757980b9cab599206c047560a7962176a6b retains historical results determinism-failure at Hermit 90e46cba9ad83550205f3c9cd232ae222c6b6173; retained first divergent record positions: 171, 171.",
+        "reason": "Historical canonical verification diverged at recorded positions. The later clean observations do not erase that retained failure, so this backend remains excluded pending separate qualification."
       },
       "last_tested": {
         "hermit_sha": "90e46cba9ad83550205f3c9cd232ae222c6b6173",
@@ -283771,10 +283181,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -284012,10 +283419,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -284075,7 +283479,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "determinism-failure",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"
       },
       "observations": [
         {
@@ -293022,10 +292428,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -293107,10 +292510,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -293168,10 +292568,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -294453,10 +293850,7 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -294538,10 +293932,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -294599,10 +293990,7 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "All enabled backends passed 3/3 at e12c472d and 20/20 at 5b811757, but the DBT cell cannot honor ordinary validation's required hermetic /test workdir; keep this whole group unselected until DBT supports it."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -303354,10 +302742,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -303417,7 +302802,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "determinism-failure",
+        "evidence": "Generated scorecard ci/compat-envelope/cells.json at Hermit 5b811757980b9cab599206c047560a7962176a6b retains historical results determinism-failure, crash-error at Hermit 90e46cba9ad83550205f3c9cd232ae222c6b6173; retained first divergent record positions: 16, 16.",
+        "reason": "Historical canonical verification diverged at recorded positions. The later clean observations do not erase that retained failure, so this backend remains excluded pending separate qualification."
       },
       "last_tested": {
         "hermit_sha": "90e46cba9ad83550205f3c9cd232ae222c6b6173",
@@ -313878,7 +313265,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "determinism-failure",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"
       },
       "observations": [
         {
@@ -314006,10 +313395,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -314069,7 +313455,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "crash-error",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites"
       },
       "observations": [],
       "measurement": "never-measured"
@@ -325191,10 +324579,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -325254,7 +324639,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "determinism-failure",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"
       },
       "observations": [
         {
@@ -326779,10 +326166,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -326842,7 +326226,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "determinism-failure",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"
       },
       "observations": [
         {
@@ -329300,10 +328686,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -329363,7 +328746,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "determinism-failure",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"
       },
       "observations": [
         {
@@ -340688,10 +340073,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -340751,7 +340133,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "crash-error",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites"
       },
       "observations": [],
       "measurement": "never-measured"
@@ -344213,7 +343597,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "determinism-failure",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"
       },
       "observations": [
         {
@@ -344297,10 +343683,7 @@
       "mode": "verify",
       "backend": "kvm",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -344358,10 +343741,7 @@
       "mode": "verify",
       "backend": "liteinst",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -344419,10 +343799,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -344482,7 +343859,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "determinism-failure",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"
       },
       "observations": [
         {
@@ -360901,7 +360280,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "infrastructure-error",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit"
       },
       "observations": [],
       "measurement": "never-measured"
@@ -361095,7 +360476,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "crash-error",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: verify exited with status 125 before producing a terminal comparison"
       },
       "observations": [],
       "measurement": "never-measured"
@@ -361289,7 +360672,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "infrastructure-error",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit"
       },
       "observations": [],
       "measurement": "never-measured"
@@ -361483,7 +360868,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "infrastructure-error",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit"
       },
       "observations": [],
       "measurement": "never-measured"
@@ -369432,10 +368819,7 @@
       "mode": "verify",
       "backend": "kvm",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -369505,10 +368889,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -369568,7 +368949,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "crash-error",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites"
       },
       "observations": [],
       "measurement": "never-measured"
@@ -385308,7 +384691,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "MEASURED-BUT-NOT-QUALIFIED: The one-guest assertions pass, but canonical comparison with syscall I/O-buffer hashing enabled intermittently diverges on live procfs bytes that are intentionally outside the sanitizer contract (mountinfo first, then smaps after mount identities were normalized). This tuple remains enabled for manual diagnostic execution, where the guest assertions can be inspected without claiming a canonical pass, but is quarantined from required CI; accepting matched-without-I/O or exempting the cell from canonical admission would weaken the comparator."
+        "result": "determinism-failure",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"
       },
       "observations": [
         {
@@ -396386,10 +395771,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "MEASURED-BUT-NOT-QUALIFIED: ptrace canonical verification passed while SaBRe canonical verification diverged on both glibc TLS guards even though AT_RANDOM matched. Measured three times at Hermit 7c102994680aa334196b0dee28554dbfe5a441c2; the current port records a fresh focused rerun in its review. Keep both backends enabled for explicit runs, and enable CI only after deterministic startup bytes reach glibc before guard initialization."
-      },
+      "status": "green",
       "observations": [
         {
           "event_ids": [
@@ -396449,7 +395831,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "MEASURED-BUT-NOT-QUALIFIED: ptrace canonical verification passed while SaBRe canonical verification diverged on both glibc TLS guards even though AT_RANDOM matched. Measured three times at Hermit 7c102994680aa334196b0dee28554dbfe5a441c2; the current port records a fresh focused rerun in its review. Keep both backends enabled for explicit runs, and enable CI only after deterministic startup bytes reach glibc before guard initialization."
+        "result": "determinism-failure",
+        "evidence": "Generated scorecard ci/compat-envelope/cells.json at Hermit 5b811757980b9cab599206c047560a7962176a6b retains historical results determinism-failure at Hermit 90e46cba9ad83550205f3c9cd232ae222c6b6173; retained first divergent record positions: 117, 117, 117.",
+        "reason": "Historical canonical verification diverged at recorded positions. The later clean observations do not erase that retained failure, so this backend remains excluded pending separate qualification."
       },
       "last_tested": {
         "hermit_sha": "90e46cba9ad83550205f3c9cd232ae222c6b6173",
@@ -399553,7 +398937,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "crash-error",
+        "evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4",
+        "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: verify exited with status 125 before producing a terminal comparison"
       },
       "observations": [],
       "measurement": "never-measured"
@@ -400914,7 +400300,7 @@
       "mode": "verify",
       "backend": "kvm",
       "enabled": true,
-      "status": "red",
+      "status": "green",
       "observations": [
         {
           "event_ids": [
