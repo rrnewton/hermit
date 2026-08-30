@@ -7473,6 +7473,138 @@ fn self_test(root: &Path) -> Result<(), String> {
                 .into(),
         );
     }
+
+    // Drive one fail-then-pass retained history through production summarize,
+    // not only through its helper functions. This is the load-bearing bracket
+    // for both attempt accumulation and the per-repetition retry counter.
+    let summarize_retry = unfiltered
+        .selected
+        .iter()
+        .find(|tracked| tracked.id.mode == "naked" && tracked.id.backend == "native")
+        .ok_or("self-test needs one selected naked/native red cell")?;
+    let summarize_retry_selection = CellSelection {
+        test: Some(summarize_retry.id.test.clone()),
+        mode: Some(summarize_retry.id.mode.clone()),
+        backend: Some(summarize_retry.id.backend.clone()),
+        repetitions: Some(1),
+        run_id_prefix: Some("summarize-retry".into()),
+        run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+        ..CellSelection::default()
+    };
+    let summarize_retry_results = scratch.join("summarize-retry");
+    let (mut summarize_retry_metadata, _) = write_plan_after_scorecard_check(
+        &checked_scorecard,
+        &summarize_retry_results,
+        &summarize_retry_results.join("dag.json"),
+        &summarize_retry_selection,
+    )?;
+    summarize_retry_metadata.source_tree_dirty = false;
+    fs::write(
+        summarize_retry_results.join("run.json"),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&summarize_retry_metadata)
+                .map_err(|e| format!("cannot encode summarize retry metadata: {e}"))?
+        ),
+    )
+    .map_err(|e| format!("cannot write summarize retry metadata: {e}"))?;
+    let summarize_retry_slug = cell_run_slug(&summarize_retry.id, Some(1));
+    let summarize_retry_run_id = cell_evidence_run_id(
+        &summarize_retry.id,
+        Some(1),
+        summarize_retry_metadata.run_id_prefix.as_deref(),
+    );
+    let summarize_retry_cell_dir = summarize_retry_results
+        .join("cells")
+        .join(&summarize_retry_slug);
+    fs::create_dir_all(&summarize_retry_cell_dir)
+        .map_err(|e| format!("cannot create summarize retry fixture: {e}"))?;
+    fs::write(summarize_retry_cell_dir.join("harness-status"), "0\n")
+        .map_err(|e| format!("cannot write summarize retry harness status: {e}"))?;
+
+    let mut summarize_first = result_row.clone();
+    summarize_first.run_id = summarize_retry_run_id.clone();
+    summarize_first.run_index = Some(1);
+    summarize_first.hermit_sha = summarize_retry_metadata.hermit_sha.clone();
+    summarize_first.source_tree_dirty = summarize_retry_metadata.source_tree_dirty;
+    summarize_first.test = summarize_retry.id.test.clone();
+    summarize_first.category = summarize_retry.id.category.clone();
+    summarize_first.lane = summarize_retry.id.lane.clone();
+    summarize_first.mode = summarize_retry.id.mode.clone();
+    summarize_first.backend = Some(summarize_retry.id.backend.clone());
+    summarize_first.classification = if summarize_retry.enabled {
+        "required".into()
+    } else {
+        "disabled".into()
+    };
+    summarize_first.outcome = "FAIL".into();
+    summarize_first.result = Some(ObservedResult::CrashError);
+    summarize_first.failure_class = Some(FailureClass::ProductFailure);
+    summarize_first.reason = Some("planted first-attempt failure".into());
+    summarize_first.attempt = 1;
+    summarize_first.attempts = vec![fixture_attempt("FAIL", 1)];
+    summarize_first.artifact_dir = summarize_retry_results
+        .join("runs")
+        .join(&summarize_retry_run_id)
+        .join("attempt-1")
+        .to_string_lossy()
+        .into_owned();
+    let mut summarize_second = summarize_first.clone();
+    summarize_second.outcome = "PASS".into();
+    summarize_second.result = Some(ObservedResult::Pass);
+    summarize_second.failure_class = None;
+    summarize_second.reason = None;
+    summarize_second.attempt = 2;
+    summarize_second.attempts = vec![fixture_attempt("PASS", 0)];
+    summarize_second.artifact_dir = summarize_retry_results
+        .join("runs")
+        .join(&summarize_retry_run_id)
+        .join("attempt-2")
+        .to_string_lossy()
+        .into_owned();
+    fs::write(
+        summarize_retry_cell_dir.join("results.jsonl"),
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&summarize_first)
+                .map_err(|e| format!("cannot encode summarize first attempt: {e}"))?,
+            serde_json::to_string(&summarize_second)
+                .map_err(|e| format!("cannot encode summarize retry attempt: {e}"))?,
+        ),
+    )
+    .map_err(|e| format!("cannot write summarize retry results: {e}"))?;
+    let summarize_runner = BTreeMap::from([(
+        format!("cell.{summarize_retry_slug}"),
+        runner_ok,
+    )]);
+    summarize(
+        root,
+        &summarize_retry_results,
+        false,
+        Some(&summarize_runner),
+    )?;
+    let summarize_json: JsonValue = serde_json::from_str(
+        &fs::read_to_string(summarize_retry_results.join("summary.json"))
+            .map_err(|e| format!("cannot read production retry summary: {e}"))?,
+    )
+    .map_err(|e| format!("cannot parse production retry summary: {e}"))?;
+    let summarized_cell = summarize_json
+        .get("repeated_cells")
+        .and_then(JsonValue::as_array)
+        .and_then(|cells| cells.first())
+        .ok_or("production retry summary lost its repeated cell")?;
+    if summarize_json["attempted"] != 2
+        || summarize_json["retried_repetitions"] != 1
+        || summarized_cell["passes"] != 1
+        || summarized_cell["clean_passes"] != 0
+        || summarized_cell["retried_repetitions"] != 1
+        || summarized_cell["total"] != 1
+        || summarized_cell["result"] != "flaky"
+    {
+        return Err(format!(
+            "production summarize lost fail-then-pass retry accounting: {summarize_json}"
+        ));
+    }
     let mut one_pass = second_row.clone();
     one_pass.attempt = 1;
     if !repetition_passed_cleanly("pass", &[one_pass]) {
