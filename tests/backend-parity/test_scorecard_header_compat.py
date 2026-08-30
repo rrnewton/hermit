@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import csv
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -81,6 +82,32 @@ PLANTED = [
 ]
 
 FAILURES: list[str] = []
+
+
+def typed_host_capabilities(
+    *, cpuid_faulting: bool = True
+) -> dict[str, dict[str, object]]:
+    """Build the complete producer-owned capability record used by run_case."""
+    return run_matrix.parse_host_capabilities(
+        json.dumps(
+            {
+                "schema": 1,
+                "host_capabilities": {
+                    "cpuid-faulting": {
+                        "present": cpuid_faulting,
+                        "evidence": "typed test fixture",
+                    },
+                    "kvm": {
+                        "present": True,
+                        "evidence": "typed test fixture",
+                    },
+                },
+            }
+        ).encode()
+    )
+
+
+HOST_CAPABILITIES_PRESENT = typed_host_capabilities()
 
 
 def check(label: str, ok: bool, detail: str = "") -> None:
@@ -203,6 +230,7 @@ def run_producer(candidate_stdout: bytes):
             "hello_stdout",
             run_matrix.CatalogFixtures(),
             strict=True,
+            host_capabilities=HOST_CAPABILITIES_PRESENT,
             evidence=evidence,
         )
     finally:
@@ -254,6 +282,7 @@ def run_dynamic_producer(reference_stdout: bytes, candidate_stdout: bytes):
             "virtual_pid",
             run_matrix.CatalogFixtures(),
             strict=True,
+            host_capabilities=HOST_CAPABILITIES_PRESENT,
             evidence=evidence,
         )
     finally:
@@ -302,6 +331,7 @@ def run_backend_local_dynamic(name: str, candidate_stdout: bytes):
             name,
             fixtures,
             strict=True,
+            host_capabilities=HOST_CAPABILITIES_PRESENT,
             evidence=evidence,
         )
     finally:
@@ -407,6 +437,7 @@ try:
         "memory_advice",
         run_matrix.CatalogFixtures(),
         strict=True,
+        host_capabilities=HOST_CAPABILITIES_PRESENT,
         evidence=kvm_evidence,
     )
 finally:
@@ -438,7 +469,12 @@ check(
 print("case CPUID-BLOCKED — reference capture preserves capability semantics")
 
 
-def run_cpuid_reference(reference_returncode: int, reference_stderr: bytes):
+def run_cpuid_reference(
+    reference_returncode: int,
+    reference_stderr: bytes,
+    *,
+    cpuid_faulting: bool,
+):
     commands: list[list[str]] = []
 
     def planted_cpuid(command):
@@ -471,6 +507,9 @@ def run_cpuid_reference(reference_returncode: int, reference_stderr: bytes):
             "cpuid_policy",
             run_matrix.CatalogFixtures(),
             strict=True,
+            host_capabilities=typed_host_capabilities(
+                cpuid_faulting=cpuid_faulting
+            ),
             evidence=evidence,
         )
     finally:
@@ -478,22 +517,42 @@ def run_cpuid_reference(reference_returncode: int, reference_stderr: bytes):
     return result, evidence, commands
 
 
-for marker in (
+blocked, blocked_evidence, cpuid_commands = run_cpuid_reference(
+    14,
+    b"unrelated ptrace reference failure\n",
+    cpuid_faulting=False,
+)
+check(
+    "typed CPUID absence is BLOCKED independently of stderr",
+    blocked[0] == "BLOCKED"
+    and blocked[1] == "host kernel/CPU lacks CPUID faulting"
+    and len(cpuid_commands) == 1
+    and "stdout_parity" not in blocked_evidence,
+    repr((blocked, blocked_evidence, cpuid_commands)),
+)
+
+for legacy_marker in (
     b"continuing without CPUID interception\n",
     b"CPUID faulting is unavailable\n",
 ):
-    blocked, blocked_evidence, cpuid_commands = run_cpuid_reference(14, marker)
+    marker_failure, _, cpuid_commands = run_cpuid_reference(
+        14,
+        legacy_marker,
+        cpuid_faulting=True,
+    )
     check(
-        f"CPUID capability marker remains BLOCKED: {marker.decode().strip()}",
-        blocked[0] == "BLOCKED"
-        and blocked[1] == "host kernel/CPU lacks CPUID faulting"
-        and len(cpuid_commands) == 1
-        and "stdout_parity" not in blocked_evidence,
-        repr((blocked, blocked_evidence, cpuid_commands)),
+        f"legacy stderr marker cannot override typed CPUID presence: "
+        f"{legacy_marker.decode().strip()}",
+        marker_failure[0] == "FAIL"
+        and "ptrace reference exited 14" in marker_failure[1]
+        and len(cpuid_commands) == 1,
+        repr((marker_failure, cpuid_commands)),
     )
 
 generic_failure, _, generic_commands = run_cpuid_reference(
-    14, b"unrelated ptrace reference failure\n"
+    14,
+    b"unrelated ptrace reference failure\n",
+    cpuid_faulting=True,
 )
 check(
     "unrelated ptrace reference failure remains FAIL",
@@ -504,7 +563,9 @@ check(
 )
 
 cpuid_match, cpuid_evidence, cpuid_commands = run_cpuid_reference(
-    0, b""
+    0,
+    b"",
+    cpuid_faulting=True,
 )
 check(
     "available CPUID path still executes 1 reference plus 3 candidates",
@@ -526,6 +587,7 @@ try:
         "hello_stdout",
         run_matrix.CatalogFixtures(),
         strict=True,
+        host_capabilities=HOST_CAPABILITIES_PRESENT,
         evidence={},
     )
     preserved = run_matrix.run_case(
@@ -534,6 +596,7 @@ try:
         "random_sources",
         run_matrix.CatalogFixtures(),
         strict=True,
+        host_capabilities=HOST_CAPABILITIES_PRESENT,
     )
 finally:
     run_matrix.run_with_timeout = original
