@@ -85,10 +85,10 @@ The count table includes all **5744** tracked cells; no row is omitted. The curr
 
 | Status | `never-measured` | `measured-and-passed` | `measured-no-verdict` | `diverged-unlocated` | `diverged` | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `green` | 0 | 301 | 0 | 3 | 0 | 304 |
+| `green` | 0 | 294 | 0 | 6 | 4 | 304 |
 | `red` | 362 | 2 | 0 | 0 | 8 | 372 |
 | `not-applicable` | 5067 | 0 | 0 | 0 | 1 | 5068 |
-| **Total** | **5429** | **303** | **0** | **3** | **9** | **5744** |
+| **Total** | **5429** | **296** | **0** | **6** | **13** | **5744** |
 
 Cells whose stored `measurement` is not `never-measured` are shown individually so status and measurement remain visible together.
 
@@ -199,7 +199,7 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `c-programs/dbt-exec-failure` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/dbt-mmap-exec` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/dbt-mmap-exec` | `verify` | `sabre` | `green` | `measured-and-passed` |
-| `c-programs/fp-reduction-nondeterminism` | `chaos` | `ptrace` | `green` | `measured-and-passed` |
+| `c-programs/fp-reduction-nondeterminism` | `chaos` | `ptrace` | `green` | `diverged-unlocated` |
 | `c-programs/fp-reduction-nondeterminism` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/futex-waitv-enosys` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/futex-waitv-enosys` | `verify` | `sabre` | `green` | `measured-and-passed` |
@@ -230,7 +230,7 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `c-programs/keyctl-enosys` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/keyctl-enosys` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/keyctl-passthrough` | `verify` | `ptrace` | `green` | `measured-and-passed` |
-| `c-programs/keyctl-passthrough` | `verify` | `sabre` | `green` | `measured-and-passed` |
+| `c-programs/keyctl-passthrough` | `verify` | `sabre` | `green` | `diverged` |
 | `c-programs/listmount-enosys` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/listmount-enosys` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/liteinst-advanced` | `verify` | `ptrace` | `green` | `measured-and-passed` |
@@ -260,7 +260,7 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `c-programs/periodic-setitimer-delivery` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/pidfd-open-self` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/pidfd-open-self` | `verify` | `sabre` | `green` | `measured-and-passed` |
-| `c-programs/pidfd-poll-self` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `c-programs/pidfd-poll-self` | `verify` | `ptrace` | `green` | `diverged-unlocated` |
 | `c-programs/pidfd-poll-self` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/pipe2-errno-precedence` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/pipe2-errno-precedence` | `verify` | `sabre` | `green` | `measured-and-passed` |
@@ -275,7 +275,7 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `c-programs/proc-fdinfo` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/proc-locks` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/proc-locks` | `verify` | `sabre` | `green` | `measured-and-passed` |
-| `c-programs/procfs-positioned-probe` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `c-programs/procfs-positioned-probe` | `verify` | `ptrace` | `green` | `diverged-unlocated` |
 | `c-programs/procfs-positioned-probe` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/pselect6-simulation` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/pty-nr-count` | `verify` | `ptrace` | `green` | `measured-and-passed` |
@@ -291,9 +291,9 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `c-programs/recvmsg-scm-rights-mmap` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/recvmsg-scm-rights-mmap` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/sched-setattr-batch` | `verify` | `ptrace` | `green` | `measured-and-passed` |
-| `c-programs/sched-setattr-batch` | `verify` | `sabre` | `green` | `measured-and-passed` |
+| `c-programs/sched-setattr-batch` | `verify` | `sabre` | `green` | `diverged` |
 | `c-programs/sched-setattr-idle` | `verify` | `ptrace` | `green` | `measured-and-passed` |
-| `c-programs/sched-setattr-idle` | `verify` | `sabre` | `green` | `measured-and-passed` |
+| `c-programs/sched-setattr-idle` | `verify` | `sabre` | `green` | `diverged` |
 | `c-programs/sched-setattr-other` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/sched-setattr-other` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/scheduler-policy-queries` | `verify` | `ptrace` | `green` | `measured-and-passed` |
@@ -407,5 +407,5 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `system-utils/startup-tls-guards` | `verify` | `sabre` | `red` | `diverged` |
 | `system-utils/sysfs-sanitized-prefixes` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `system-utils/uuidgen-random` | `verify` | `ptrace` | `green` | `measured-and-passed` |
-| `applications/kvm-python-examples` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `applications/kvm-python-examples` | `verify` | `kvm` | `green` | `diverged` |
 | `backend-parity-c/cpuid-probe` | `verify` | `ptrace` | `green` | `measured-and-passed` |
