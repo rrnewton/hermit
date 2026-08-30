@@ -99208,7 +99208,13 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 passed ptrace, but SaBRe timed out twice in Run1 at the 15-second cell cap with no comparison and less than 75 ms CPU; preserve whole-test-group qualification by holding this sibling."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -99266,7 +99272,13 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "timeout",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 timed out both SaBRe attempts in Run1 at the 15-second cell cap with no comparison and less than 75 ms CPU, showing no progress in the pinned-root child-lifecycle path."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -104066,7 +104078,13 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 passed ptrace, but SaBRe timed out twice in Run1 at the 15-second cell cap with no comparison and less than 75 ms CPU; preserve whole-test-group qualification by holding this sibling."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -104124,7 +104142,13 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "timeout",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 timed out both SaBRe attempts in Run1 at the 15-second cell cap with no comparison and less than 75 ms CPU, showing no progress in the pinned-root child-lifecycle path."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -104326,7 +104350,13 @@
       "mode": "verify",
       "backend": "kvm",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 failed both KVM attempts before comparison because the pinned-root PIE/glibc guest raised exception vector 13 at 0x1014dac, so no canonical comparison ran."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -104384,7 +104414,13 @@
       "mode": "verify",
       "backend": "liteinst",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 passed LiteInst, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -104442,7 +104478,13 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 passed ptrace, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -104500,7 +104542,13 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 passed SaBRe, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -112562,7 +112610,13 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 passed ptrace, but SaBRe timed out twice in Run1 at the 15-second cell cap with no comparison and less than 75 ms CPU; preserve whole-test-group qualification by holding this sibling."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -112620,7 +112674,13 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "timeout",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 timed out both SaBRe attempts in Run1 at the 15-second cell cap with no comparison and less than 75 ms CPU, showing no progress in the pinned-root child-lifecycle path."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -140647,7 +140707,13 @@
       "mode": "verify",
       "backend": "kvm",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 failed both KVM attempts before comparison because the pinned-root PIE/glibc guest raised exception vector 13 at 0x1014dac, so no canonical comparison ran."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -140717,7 +140783,13 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 passed ptrace, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -140775,7 +140847,13 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 passed SaBRe, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -148287,7 +148365,13 @@
       "mode": "verify",
       "backend": "kvm",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 failed both KVM attempts before comparison because the pinned-root PIE/glibc guest raised exception vector 13 at 0x1014dac, so no canonical comparison ran."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -148345,7 +148429,13 @@
       "mode": "verify",
       "backend": "liteinst",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 passed LiteInst, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -148403,7 +148493,13 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 passed ptrace, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -148461,7 +148557,13 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 passed SaBRe, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -155132,7 +155234,13 @@
       "mode": "verify",
       "backend": "kvm",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 failed both KVM attempts before comparison because the pinned-root PIE/glibc guest raised exception vector 13 at 0x1014dac, so no canonical comparison ran."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -155190,7 +155298,13 @@
       "mode": "verify",
       "backend": "liteinst",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 passed LiteInst, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -155248,7 +155362,13 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 passed ptrace, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -155306,7 +155426,13 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 passed SaBRe, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -155508,7 +155634,13 @@
       "mode": "verify",
       "backend": "kvm",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 failed both KVM attempts before comparison because the pinned-root PIE/glibc guest raised exception vector 13 at 0x1014dac, so no canonical comparison ran."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -155566,7 +155698,13 @@
       "mode": "verify",
       "backend": "liteinst",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 passed LiteInst, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -155624,7 +155762,13 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 passed ptrace, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -155682,7 +155826,13 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 passed SaBRe, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -155884,7 +156034,13 @@
       "mode": "verify",
       "backend": "kvm",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 failed both KVM attempts before comparison because the pinned-root PIE/glibc guest raised exception vector 13 at 0x1014dac, so no canonical comparison ran."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -155942,7 +156098,13 @@
       "mode": "verify",
       "backend": "liteinst",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 passed LiteInst, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -156000,7 +156162,13 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 passed ptrace, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -156058,7 +156226,13 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 passed SaBRe, but KVM failed twice before comparison with a pinned-root PIE/glibc guest exception; preserve whole-test-group qualification by holding this sibling."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -168564,7 +168738,13 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 passed ptrace, but SaBRe timed out twice in Run1 at the 15-second cell cap with no comparison and less than 75 ms CPU; preserve whole-test-group qualification by holding this sibling."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -168622,7 +168802,13 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "timeout",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 timed out both SaBRe attempts in Run1 at the 15-second cell cap with no comparison and less than 75 ms CPU, showing no progress in the pinned-root child-lifecycle path."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -184626,7 +184812,13 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 passed ptrace, but SaBRe timed out twice in Run1 at the 15-second cell cap with no comparison and less than 75 ms CPU; preserve whole-test-group qualification by holding this sibling."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -184684,7 +184876,13 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "timeout",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 timed out both SaBRe attempts in Run1 at the 15-second cell cap with no comparison and less than 75 ms CPU, showing no progress in the pinned-root child-lifecycle path."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -185249,7 +185447,13 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "unavailable",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 passed ptrace, but SaBRe timed out twice in Run1 at the 15-second cell cap with no comparison and less than 75 ms CPU; preserve whole-test-group qualification by holding this sibling."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [
@@ -185307,7 +185511,13 @@
       "mode": "verify",
       "backend": "sabre",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "timeout",
+        "evidence": "RUN1573 at 6976687a0b2d; manifest_c_programs/results.jsonl",
+        "reason": "RUN1573 timed out both SaBRe attempts in Run1 at the 15-second cell cap with no comparison and less than 75 ms CPU, showing no progress in the pinned-root child-lifecycle path."
+      },
+      "green_removal_reason": "RUN1573 at 6976687a0b2d failed 12 promoted coordinates; preserve whole-test-group qualification by demoting their 35-cell groups.",
       "observations": [
         {
           "event_ids": [

@@ -2178,20 +2178,6 @@
       "category": "c-programs",
       "lane": "portable",
       "mode": "verify",
-      "test": "c-programs/dbt-copied-tiocgpgrp"
-    },
-    {
-      "backend": "sabre",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/dbt-copied-tiocgpgrp"
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
       "test": "c-programs/dbt-prlimit-self"
     },
     {
@@ -2202,111 +2188,6 @@
       "test": "c-programs/dbt-prlimit-self"
     },
     {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/dbt-wait-lifecycle"
-    },
-    {
-      "backend": "sabre",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/dbt-wait-lifecycle"
-    },
-    {
-      "backend": "kvm",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/epoll-determinism"
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/epoll-determinism"
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/epoll-determinism"
-    },
-    {
-      "backend": "sabre",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/epoll-determinism"
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/get-robust-list-child"
-    },
-    {
-      "backend": "sabre",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/get-robust-list-child"
-    },
-    {
-      "backend": "kvm",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/madvise-determinism"
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/madvise-determinism"
-    },
-    {
-      "backend": "sabre",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/madvise-determinism"
-    },
-    {
-      "backend": "kvm",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/mmap-determinism"
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/mmap-determinism"
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/mmap-determinism"
-    },
-    {
-      "backend": "sabre",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/mmap-determinism"
-    },
-    {
       "backend": "liteinst",
       "category": "c-programs",
       "lane": "portable",
@@ -2368,104 +2249,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/name-to-handle-empty-path-eopnotsupp"
-    },
-    {
-      "backend": "kvm",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/netlink-autobind-generic"
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/netlink-autobind-generic"
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/netlink-autobind-generic"
-    },
-    {
-      "backend": "sabre",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/netlink-autobind-generic"
-    },
-    {
-      "backend": "kvm",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/netlink-autobind-route"
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/netlink-autobind-route"
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/netlink-autobind-route"
-    },
-    {
-      "backend": "sabre",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/netlink-autobind-route"
-    },
-    {
-      "backend": "kvm",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/netlink-autobind-usersock"
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/netlink-autobind-usersock"
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/netlink-autobind-usersock"
-    },
-    {
-      "backend": "sabre",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/netlink-autobind-usersock"
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/pidfd-waitid-child"
-    },
-    {
-      "backend": "sabre",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/pidfd-waitid-child"
     },
     {
       "backend": "liteinst",
@@ -2501,34 +2284,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/procfs-identity-agreement"
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/ptrace-attach-eperm"
-    },
-    {
-      "backend": "sabre",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/ptrace-attach-eperm"
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/ptrace-seize-eperm"
-    },
-    {
-      "backend": "sabre",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/ptrace-seize-eperm"
     },
     {
       "backend": "liteinst",
