@@ -81,14 +81,14 @@ These rows are part of the selected regression denominator even though they are 
 
 The table above reports status. This table reports the separate `measurement` field derived from observations stored in `ci/compat-envelope/cells.json`; it does not change status or which cells ordinary validation selects. Retained history that has not been imported is not counted here. A stored measurement does not establish that it describes current code; `show` reports whether the recorded last test still matches `HEAD:detcore`.
 
-The count table includes all **5744** tracked cells; no row is omitted. The current green/`never-measured` count is **0**, and the current red/`measured-and-passed` count is **246**. These values use the same counts printed in the table below.
+The count table includes all **5744** tracked cells; no row is omitted. The current green/`never-measured` count is **0**, and the current red/`measured-and-passed` count is **241**. These values use the same counts printed in the table below.
 
 | Status | `never-measured` | `measured-and-passed` | `measured-no-verdict` | `diverged-unlocated` | `diverged` | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `green` | 0 | 340 | 0 | 6 | 4 | 350 |
-| `red` | 65 | 246 | 0 | 0 | 15 | 326 |
+| `red` | 60 | 241 | 0 | 0 | 25 | 326 |
 | `not-applicable` | 5067 | 0 | 0 | 0 | 1 | 5068 |
-| **Total** | **5132** | **586** | **0** | **6** | **20** | **5744** |
+| **Total** | **5127** | **581** | **0** | **6** | **30** | **5744** |
 
 Cells whose stored `measurement` is not `never-measured` are shown individually so status and measurement remain visible together.
 
@@ -281,6 +281,7 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `c-programs/dbt-execveat-unsupported` | `verify` | `ptrace` | `red` | `measured-and-passed` |
 | `c-programs/dbt-mmap-exec` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/dbt-mmap-exec` | `verify` | `sabre` | `green` | `measured-and-passed` |
+| `c-programs/dbt-pid-virtualization` | `verify` | `ptrace` | `red` | `measured-and-passed` |
 | `c-programs/dbt-prlimit-self` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/dbt-prlimit-self` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/dbt-self-sigqueue` | `verify` | `ptrace` | `red` | `measured-and-passed` |
@@ -443,6 +444,7 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `c-programs/pread64-nostdlib` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/print-memaddrs` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/printf-with-threads` | `verify` | `ptrace` | `red` | `measured-and-passed` |
+| `c-programs/printf-with-threads` | `verify` | `sabre` | `red` | `diverged` |
 | `c-programs/proc-fd-link-aliases` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `c-programs/proc-fd-link-aliases` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/proc-fd-link-aliases` | `verify` | `sabre` | `green` | `measured-and-passed` |
@@ -463,6 +465,7 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `c-programs/procfs-positioned-probe` | `verify` | `ptrace` | `green` | `diverged-unlocated` |
 | `c-programs/procfs-positioned-probe` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/prodcons-determinism` | `verify` | `ptrace` | `red` | `measured-and-passed` |
+| `c-programs/prodcons-determinism` | `verify` | `sabre` | `red` | `diverged` |
 | `c-programs/pselect6-simulation` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/ptrace-attach-eperm` | `verify` | `ptrace` | `red` | `measured-and-passed` |
 | `c-programs/ptrace-attach-eperm` | `verify` | `sabre` | `red` | `measured-and-passed` |
@@ -481,7 +484,7 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `c-programs/rcx-canonicalization` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/rcx-canonicalization` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/record-replay-fd-close` | `verify` | `ptrace` | `red` | `measured-and-passed` |
-| `c-programs/record-replay-file-state` | `verify` | `ptrace` | `red` | `measured-and-passed` |
+| `c-programs/record-replay-file-state` | `verify` | `ptrace` | `red` | `diverged` |
 | `c-programs/record-replay-lseek-seek-cur` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/record-replay-lseek-seek-cur` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/record-replay-setsockopt` | `verify` | `ptrace` | `green` | `measured-and-passed` |
@@ -494,7 +497,7 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `c-programs/remap-file-pages-memfd-enosys` | `verify` | `dbt` | `red` | `measured-and-passed` |
 | `c-programs/remap-file-pages-memfd-enosys` | `verify` | `ptrace` | `red` | `measured-and-passed` |
 | `c-programs/remap-file-pages-memfd-enosys` | `verify` | `sabre` | `red` | `measured-and-passed` |
-| `c-programs/remap-file-pages-tmpfile-enosys` | `verify` | `dbt` | `red` | `measured-and-passed` |
+| `c-programs/remap-file-pages-tmpfile-enosys` | `verify` | `dbt` | `red` | `diverged` |
 | `c-programs/remap-file-pages-tmpfile-enosys` | `verify` | `ptrace` | `red` | `measured-and-passed` |
 | `c-programs/remap-file-pages-tmpfile-enosys` | `verify` | `sabre` | `red` | `measured-and-passed` |
 | `c-programs/request-key-enosys` | `verify` | `dbt` | `red` | `measured-and-passed` |
@@ -507,6 +510,7 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `c-programs/sched-setattr-other` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/sched-setattr-other` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/sched-yield-progress` | `verify` | `ptrace` | `red` | `measured-and-passed` |
+| `c-programs/sched-yield-progress` | `verify` | `sabre` | `red` | `diverged` |
 | `c-programs/scheduler-policy-queries` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/scheduler-policy-queries` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/session-identity` | `verify` | `ptrace` | `green` | `measured-and-passed` |
@@ -578,6 +582,7 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `c-programs/tee-enosys` | `verify` | `ptrace` | `red` | `measured-and-passed` |
 | `c-programs/tee-enosys` | `verify` | `sabre` | `red` | `measured-and-passed` |
 | `c-programs/thread-self-procfs-handoff` | `verify` | `ptrace` | `red` | `measured-and-passed` |
+| `c-programs/thread-self-procfs-handoff` | `verify` | `sabre` | `red` | `diverged` |
 | `c-programs/thread-sync-determinism` | `chaos` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/thread-sync-determinism` | `verify` | `kvm` | `red` | `diverged` |
 | `c-programs/thread-sync-determinism` | `verify` | `ptrace` | `red` | `measured-and-passed` |
@@ -618,7 +623,7 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `debugger-c/debuggee` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `debugger-c/debuggee` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `debugger-c/debuggee` | `verify` | `sabre` | `green` | `measured-and-passed` |
-| `determinism-stress/example-race` | `verify` | `kvm` | `red` | `measured-and-passed` |
+| `determinism-stress/example-race` | `verify` | `kvm` | `red` | `diverged` |
 | `determinism-stress/example-race` | `verify` | `ptrace` | `red` | `measured-and-passed` |
 | `determinism-stress/order-violation` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `determinism-stress/process-chains` | `verify` | `ptrace` | `green` | `measured-and-passed` |
@@ -629,11 +634,11 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `determinism-stress-c/fork-tree` | `verify` | `sabre` | `red` | `diverged` |
 | `determinism-stress-c/lock-free` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `determinism-stress-c/mmap-fork-shared` | `verify` | `ptrace` | `red` | `measured-and-passed` |
-| `determinism-stress-c/mmap-fork-shared` | `verify` | `sabre` | `red` | `measured-and-passed` |
+| `determinism-stress-c/mmap-fork-shared` | `verify` | `sabre` | `red` | `diverged` |
 | `determinism-stress-c/pid-tid` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `determinism-stress-c/pid-tid-identity` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `determinism-stress-c/pipe-chain` | `verify` | `ptrace` | `red` | `measured-and-passed` |
-| `determinism-stress-c/pipe-chain` | `verify` | `sabre` | `red` | `measured-and-passed` |
+| `determinism-stress-c/pipe-chain` | `verify` | `sabre` | `red` | `diverged` |
 | `determinism-stress-c/pipe-prefill` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `determinism-stress-c/producer-consumer` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `determinism-stress-c/signal-order` | `verify` | `ptrace` | `green` | `measured-and-passed` |
@@ -643,7 +648,7 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `language-runtimes/bash-loop-pipe-time` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `language-runtimes/bash-random` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `language-runtimes/cpp-stl-determinism` | `verify` | `ptrace` | `green` | `measured-and-passed` |
-| `language-runtimes/example-python-random` | `verify` | `dbt` | `red` | `measured-and-passed` |
+| `language-runtimes/example-python-random` | `verify` | `dbt` | `red` | `diverged` |
 | `language-runtimes/example-python-random` | `verify` | `kvm` | `red` | `measured-and-passed` |
 | `language-runtimes/example-python-random` | `verify` | `liteinst` | `red` | `measured-and-passed` |
 | `language-runtimes/example-python-random` | `verify` | `ptrace` | `red` | `measured-and-passed` |
