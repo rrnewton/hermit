@@ -14015,6 +14015,10 @@ fn tool_root_split_bracket() -> Result<(), String> {
         .and_then(|_| std::fs::create_dir_all(state_root.join("ci-hub/ledger")))
         .and_then(|_| std::fs::create_dir_all(&checkout))
         .and_then(|_| std::fs::create_dir_all(fake_root.join("ci-hub")))
+        // A real validate points TMPDIR inside its worktree. Without this
+        // invalid marker, Git walks upward from fake_root, finds that outer
+        // checkout, and this no longer exercises the non-repository refusal.
+        .and_then(|_| std::fs::write(fake_root.join(".git"), "not a git worktree\n"))
         .map_err(|error| format!("tool-root split: cannot create fixture: {error}"))?;
     std::fs::write(
         state_root.join(".gitmodules"),
