@@ -36,7 +36,10 @@ use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::ObservedResult;
 use hermit_manifest_plan::stress_series::HostCapability;
 use hermit_manifest_plan::stress_series::HostCapabilityVerdict;
+use hermit_manifest_plan::stress_series::SeriesAttemptDisposition;
 use hermit_manifest_plan::stress_series::SeriesCoordinates;
+use hermit_manifest_plan::stress_series::SeriesNoVerdictEvidence;
+use hermit_manifest_plan::stress_series::SeriesNoVerdictKind;
 use hermit_manifest_plan::stress_series::SeriesOutcome;
 use hermit_manifest_plan::stress_series::SeriesPayload;
 use hermit_manifest_plan::stress_series::SeriesProducer;
@@ -82,12 +85,12 @@ Commands:
       FRESH, DRIFTED, WRONG, or UNCHECKABLE. This reads existing results; it does
       not execute a guest and it never changes scorecard colour.
   project-observations --series-root DIR --refreshed-at STAMP
-      Re-derive observations and last_tested from comparison rows in the series
-      store. Rows that produced no comparison are named and skipped. REFUSES to
-      drop measured evidence when the source supplied no rows: reading nothing
-      is what an unpopulated series looks like, not a finding that a cell has no
-      evidence. An unreachable root is refused outright rather than read as
-      empty.
+      Re-derive observations and last_tested from exact comparison and typed
+      no-verdict rows in the series store. Historical rows lacking either are
+      named and skipped. REFUSES to drop measured evidence when the source
+      supplied no rows: reading nothing is what an unpopulated series looks
+      like, not a finding that a cell has no evidence. An unreachable root is
+      refused outright rather than read as empty.
   verify-results --results DIR [--lanes portable,privileged]
       Check the tracked files, then require a fresh PASS row at HEAD for every
       selected regression cell in the named lanes. The default is both lanes.
@@ -4796,10 +4799,12 @@ fn project_observations(root: &Path, series_root: &Path, refreshed_at: &str) -> 
     write_observation_files(root, &derived, &tracked)?;
 
     println!(
-        "compatibility scorecard: projected {} cell(s) from {} comparison row(s) \
-         representing {} run(s); read {rows_read} canonical series row(s) under {} at {} tree {}",
+        "compatibility scorecard: projected {} cell(s) from {} evidence row(s), including {} \
+         measured no-verdict row(s), representing {} run(s); read {rows_read} canonical series \
+         row(s) under {} at {} tree {}",
         projection.cells,
         projection.rows,
+        projection.no_verdict_rows,
         projection.runs,
         snapshot.source,
         snapshot.source_commit,
@@ -4914,6 +4919,7 @@ fn replace_generated_files_with(
 struct ProjectObservationsOutcome {
     cells: usize,
     rows: usize,
+    no_verdict_rows: usize,
     runs: u64,
     represented_rows: usize,
     replaced_observations: usize,
@@ -4930,12 +4936,19 @@ struct PreparedSeriesRow {
     hermit_sha: String,
     run_id: String,
     attempt: u64,
-    result: ObservedResult,
+    result: Option<ObservedResult>,
+    no_verdict: bool,
     num_runs: u64,
     main_ancestry: Option<bool>,
     depth: BTreeMap<String, SourceDepth>,
     coordinates: Option<SeriesCoordinates>,
     order: (String, String, u64, String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SeriesEvidence {
+    result: Option<ObservedResult>,
+    no_verdict: bool,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -5096,7 +5109,17 @@ fn series_provenance(producer: SeriesProducer) -> ObservationProvenance {
     }
 }
 
-fn series_result(row: &SeriesRow, mode: &str) -> Option<ObservedResult> {
+fn series_evidence(row: &SeriesRow, mode: &str) -> Option<SeriesEvidence> {
+    if let Some(evidence) = &row.series.no_verdict_evidence {
+        return Some(SeriesEvidence {
+            result: evidence
+                .attempts
+                .iter()
+                .any(|attempt| attempt.timed_out)
+                .then_some(ObservedResult::Timeout),
+            no_verdict: true,
+        });
+    }
     if row.schema == SeriesSchema::V3 {
         return match row.series.result {
             Some(
@@ -5104,12 +5127,15 @@ fn series_result(row: &SeriesRow, mode: &str) -> Option<ObservedResult> {
                 | ObservedResult::DeterminismFailure
                 | ObservedResult::ParityFailure
                 | ObservedResult::ReplayFailure),
-            ) => Some(result),
+            ) => Some(SeriesEvidence {
+                result: Some(result),
+                no_verdict: false,
+            }),
             Some(ObservedResult::CrashError | ObservedResult::Timeout | ObservedResult::Oom)
             | None => None,
         };
     }
-    match (row.series.outcome, mode) {
+    let result = match (row.series.outcome, mode) {
         (SeriesOutcome::Passed, _) => Some(ObservedResult::Pass),
         (SeriesOutcome::Diverged, "replay") => Some(ObservedResult::ReplayFailure),
         (SeriesOutcome::Diverged, _) => Some(ObservedResult::DeterminismFailure),
@@ -5120,7 +5146,11 @@ fn series_result(row: &SeriesRow, mode: &str) -> Option<ObservedResult> {
             | SeriesOutcome::Skipped,
             _,
         ) => None,
-    }
+    }?;
+    Some(SeriesEvidence {
+        result: Some(result),
+        no_verdict: false,
+    })
 }
 
 fn series_observation_identity(row: &SeriesRow) -> Result<SeriesObservationIdentity, String> {
@@ -5229,6 +5259,23 @@ fn remove_replaceable_projected_observations(
 }
 
 fn apply_series_rows(
+    ambient_git_root: &Path,
+    tracked: &mut TrackedCells,
+    rows: &[SeriesRow],
+    projection_source: Option<&str>,
+) -> Result<ProjectObservationsOutcome, String> {
+    let mut updated = tracked.clone();
+    let outcome = apply_series_rows_inner(
+        ambient_git_root,
+        &mut updated,
+        rows,
+        projection_source,
+    )?;
+    *tracked = updated;
+    Ok(outcome)
+}
+
+fn apply_series_rows_inner(
     _ambient_git_root: &Path,
     tracked: &mut TrackedCells,
     rows: &[SeriesRow],
@@ -5250,6 +5297,9 @@ fn apply_series_rows(
     for row in rows {
         let label = row.label();
         if let Err(why) = row.validate_for_projection() {
+            if row.series.no_verdict_evidence.is_some() {
+                return Err(format!("{label}: {why}"));
+            }
             skipped.push(format!("{label}: {why}"));
             continue;
         }
@@ -5268,11 +5318,11 @@ fn apply_series_rows(
         }
         let cell_index = indices[0];
         let provenance = series_provenance(row.producer);
-        let result = match series_result(row, &tracked.cells[cell_index].id.mode) {
-            Some(result) => result,
+        let evidence = match series_evidence(row, &tracked.cells[cell_index].id.mode) {
+            Some(evidence) => evidence,
             None => {
                 skipped.push(format!(
-                    "{label}: outcome {:?} produced no comparison and is not evidence",
+                    "{label}: outcome {:?} produced no comparison and carries no exact no-verdict evidence",
                     row.series.outcome.as_str()
                 ));
                 continue;
@@ -5293,7 +5343,8 @@ fn apply_series_rows(
             hermit_sha: row.series.tree.clone(),
             run_id: row.run_id.clone(),
             attempt: row.series.attempt.unwrap_or(1),
-            result,
+            result: evidence.result,
+            no_verdict: evidence.no_verdict,
             num_runs: row.series.num_runs,
             main_ancestry: row.series.main_ancestry,
             depth: row.series.depth.clone(),
@@ -5320,6 +5371,7 @@ fn apply_series_rows(
     }
 
     let admitted_rows = prepared.len();
+    let no_verdict_rows = prepared.iter().filter(|row| row.no_verdict).count();
     let admitted_runs = prepared.iter().map(|row| row.num_runs).sum();
     let admitted_cells = prepared
         .iter()
@@ -5368,6 +5420,13 @@ fn apply_series_rows(
     let mut represented_rows = 0usize;
     let mut to_project = Vec::new();
     for row in prepared.iter().cloned() {
+        // Projector-owned no-verdict rows carry immutable event IDs instead of
+        // the direct writer's literal invocation. Do not conflate the two
+        // storage forms or suppress the series event by a run-level match.
+        if row.no_verdict {
+            to_project.push(row);
+            continue;
+        }
         let key = (
             row.cell_index,
             row.provenance,
@@ -5397,10 +5456,13 @@ fn apply_series_rows(
                 row.num_runs
             ));
         }
-        if results != &BTreeSet::from([row.result]) {
+        let result = row
+            .result
+            .expect("comparison series evidence always carries a result");
+        if results != &BTreeSet::from([result]) {
             return Err(format!(
                 "series event {} maps to existing run {} at Hermit {}, but results {results:?} disagree with {:?}",
-                row.event_id, row.run_id, row.hermit_sha, row.result
+                row.event_id, row.run_id, row.hermit_sha, result
             ));
         }
         represented_rows += 1;
@@ -5435,7 +5497,9 @@ fn apply_series_rows(
         observation.event_ids.insert(row.event_id.clone());
         observation.depth = row.depth.clone();
         observation.hermit_shas.insert(row.hermit_sha.clone());
-        observation.results.insert(row.result);
+        if let Some(result) = row.result {
+            observation.results.insert(result);
+        }
         for _ in 0..row.num_runs {
             observation.first_divergent_scheduler_turn.record(
                 row.coordinates
@@ -5496,6 +5560,7 @@ fn apply_series_rows(
     Ok(ProjectObservationsOutcome {
         cells: admitted_cells.len(),
         rows: admitted_rows,
+        no_verdict_rows,
         runs: admitted_runs,
         represented_rows,
         replaced_observations,
@@ -6841,8 +6906,32 @@ fn literal_shell_command(cwd: &str, env: &BTreeMap<String, String>, argv: &[Stri
 const RECORDED_ROOT: &str = "/repo";
 
 fn rewrite_recorded_root(value: &mut String, root: &str) {
-    if value.contains(root) {
-        *value = value.replace(root, RECORDED_ROOT);
+    fn delimiter(character: char) -> bool {
+        character.is_whitespace()
+            || matches!(
+                character,
+                '=' | ':' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | '<' | '>' | '"' | '\''
+            )
+    }
+
+    let mut rewritten = String::with_capacity(value.len());
+    let mut cursor = 0;
+    for (offset, _) in value.match_indices(root) {
+        let end = offset + root.len();
+        let starts_token = value[..offset].chars().next_back().is_none_or(delimiter);
+        let ends_token = value[end..]
+            .chars()
+            .next()
+            .is_none_or(|character| character == '/' || delimiter(character));
+        if starts_token && ends_token {
+            rewritten.push_str(&value[cursor..offset]);
+            rewritten.push_str(RECORDED_ROOT);
+            cursor = end;
+        }
+    }
+    if cursor != 0 {
+        rewritten.push_str(&value[cursor..]);
+        *value = rewritten;
     }
 }
 
@@ -10909,6 +10998,7 @@ red/`measured-and-passed` count is **0**.",
                 outcome,
                 result,
                 failure_class,
+                no_verdict_evidence: None,
                 run_index: 1,
                 attempt: None,
                 num_runs,
@@ -11183,6 +11273,196 @@ red/`measured-and-passed` count is **0**.",
     {
         return Err(format!(
             "no_result was not refused and named without creating evidence: {no_comparison_error}"
+        ));
+    }
+
+    // Current series rows retain one exact outer attempt and the producer's
+    // typed no-verdict disposition. They must project to the same measurement
+    // as direct observation: timeout only when the producer recorded a timeout,
+    // otherwise no invented result. Both rows remain independently identifiable
+    // even though they group into one observation by Detcore tree.
+    let no_verdict_evidence = |timed_out: bool| SeriesNoVerdictEvidence {
+        evidence_sha256: if timed_out {
+            "b".repeat(64)
+        } else {
+            "c".repeat(64)
+        },
+        attempts: vec![SeriesAttemptDisposition {
+            index: "1".into(),
+            kind: SeriesNoVerdictKind::NotRun,
+            attempt_outcome: "ERROR".into(),
+            disposition: if timed_out {
+                SeriesOutcome::Timeout
+            } else {
+                SeriesOutcome::NoResult
+            },
+            error_kind: Some("incomplete-verification-evidence".into()),
+            status: (!timed_out).then_some(125),
+            signal: timed_out.then_some(15),
+            timed_out,
+            verification_report_sha256: Some("d".repeat(64)),
+        }],
+    };
+    let mut series_timeout = series_row(
+        "fixture/boundary/verify/ptrace",
+        SeriesOutcome::NoResult,
+        SeriesProducer::Validate,
+        1,
+        Some(fixture_detcore_tree.clone()),
+        None,
+    );
+    series_timeout.event_id = "fixture-series-timeout-attempt-1".into();
+    series_timeout.series.attempt = Some(1);
+    series_timeout.series.no_verdict_evidence = Some(no_verdict_evidence(true));
+    let mut series_unavailable = series_row(
+        "fixture/boundary/verify/ptrace",
+        SeriesOutcome::NoResult,
+        SeriesProducer::Validate,
+        1,
+        Some(fixture_detcore_tree.clone()),
+        None,
+    );
+    series_unavailable.event_id = "fixture-series-unavailable-attempt-2".into();
+    series_unavailable.series.run_index = 2;
+    series_unavailable.series.attempt = Some(2);
+    series_unavailable.series.no_verdict_evidence = Some(no_verdict_evidence(false));
+    let project_series_fixture = |rows: &[SeriesRow]| -> Result<
+        (TrackedCells, ProjectObservationsOutcome),
+        String,
+    > {
+        let mut tracked = TrackedCells {
+            schema: SCHEMA,
+            projection: None,
+            cells: vec![boundary_cell(Vec::new(), CellStatus::Green)],
+        };
+        let outcome = apply_series_rows(&root, &mut tracked, rows, None)?;
+        refresh_measurement(&mut tracked);
+        Ok((tracked, outcome))
+    };
+    let (projected_timeout, _) = project_series_fixture(&[series_timeout.clone()])?;
+    let (direct_timeout, _) = fold_fixture_row(not_run_row.clone())?;
+    if projected_timeout.cells[0].measurement != direct_timeout.cells[0].measurement
+        || projected_timeout.cells[0].observations[0].results
+            != direct_timeout.cells[0].observations[0].results
+    {
+        return Err("RUN1573-style SaBRe timeout changed between direct and series paths".into());
+    }
+    let (projected_unavailable, _) = project_series_fixture(&[series_unavailable.clone()])?;
+    let mut direct_kvm_unavailable = not_run_row.clone();
+    direct_kvm_unavailable.run_id = "fixture-series-kvm-exit-125".into();
+    direct_kvm_unavailable.attempts[0]["timed_out"] = JsonValue::Bool(false);
+    direct_kvm_unavailable.attempts[0]["status"] = serde_json::json!(125);
+    direct_kvm_unavailable.attempts[0]["signal"] = JsonValue::Null;
+    let (direct_unavailable, _) = fold_fixture_row(direct_kvm_unavailable)?;
+    if projected_unavailable.cells[0].measurement != direct_unavailable.cells[0].measurement
+        || projected_unavailable.cells[0].observations[0].results
+            != direct_unavailable.cells[0].observations[0].results
+    {
+        return Err("RUN1573-style KVM unavailable changed between direct and series paths".into());
+    }
+
+    let mut series_noncanonical = series_unavailable.clone();
+    series_noncanonical.event_id = "fixture-series-noncanonical-attempt-3".into();
+    series_noncanonical.series.run_index = 3;
+    series_noncanonical.series.attempt = Some(3);
+    let disposition = &mut series_noncanonical
+        .series
+        .no_verdict_evidence
+        .as_mut()
+        .unwrap()
+        .attempts[0];
+    disposition.kind = SeriesNoVerdictKind::NoncanonicalMatch;
+    disposition.attempt_outcome = "PASS".into();
+    disposition.error_kind = None;
+    disposition.status = Some(0);
+    let (projected_noncanonical, _) = project_series_fixture(&[series_noncanonical])?;
+    let mut direct_noncanonical_rows = coordinate_less_row(&unlocated_id, "PASS");
+    let direct_noncanonical = &mut direct_noncanonical_rows
+        .get_mut(&unlocated_id)
+        .unwrap()[0]
+        .row;
+    let mut report: JsonValue = serde_json::from_str(
+        direct_noncanonical.attempts[0]["verification_report"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    report["comparison"]["display_name"] = serde_json::json!("Stripped");
+    replace_embedded_report(direct_noncanonical, report);
+    let mut direct_noncanonical_tracked = TrackedCells {
+        schema: SCHEMA,
+        projection: None,
+        cells: vec![bare_cell(&unlocated_id)],
+    };
+    apply_validate_results(
+        &mut direct_noncanonical_tracked,
+        &direct_noncanonical_rows,
+        "sha-1",
+        "tree-1",
+        &depth_fixture,
+        true,
+        true,
+    )?;
+    refresh_measurement(&mut direct_noncanonical_tracked);
+    if projected_noncanonical.cells[0].measurement
+        != direct_noncanonical_tracked.cells[0].measurement
+        || projected_noncanonical.cells[0].observations[0].results
+            != direct_noncanonical_tracked.cells[0].observations[0].results
+    {
+        return Err(
+            "noncanonical comparison changed between direct and series paths".into(),
+        );
+    }
+
+    let (projected_no_verdict, projected_no_verdict_outcome) =
+        project_series_fixture(&[series_timeout.clone(), series_unavailable.clone()])?;
+    let no_verdict_observation = &projected_no_verdict.cells[0].observations[0];
+    if projected_no_verdict_outcome.rows != 2
+        || projected_no_verdict_outcome.no_verdict_rows != 2
+        || projected_no_verdict.cells[0].measurement != MeasurementState::MeasuredNoVerdict
+        || projected_no_verdict.cells[0].last_tested.is_none()
+        || no_verdict_observation.results != BTreeSet::from([ObservedResult::Timeout])
+        || no_verdict_observation.event_ids
+            != BTreeSet::from([
+                series_timeout.event_id.clone(),
+                series_unavailable.event_id.clone(),
+            ])
+    {
+        return Err(format!(
+            "typed series no-verdict evidence did not preserve timeout/unavailable semantics: {projected_no_verdict_outcome:?}"
+        ));
+    }
+
+    let mut contradictory_timeout = series_timeout;
+    contradictory_timeout
+        .series
+        .no_verdict_evidence
+        .as_mut()
+        .unwrap()
+        .attempts[0]
+        .timed_out = false;
+    let mut atomic_series = TrackedCells {
+        schema: SCHEMA,
+        projection: None,
+        cells: vec![boundary_cell(Vec::new(), CellStatus::Green)],
+    };
+    let before_contradiction = serde_json::to_vec(&atomic_series)
+        .map_err(|error| format!("cannot encode no-verdict atomicity fixture: {error}"))?;
+    let contradiction = apply_series_rows(
+        &root,
+        &mut atomic_series,
+        &[series_unavailable, contradictory_timeout],
+        None,
+    )
+    .expect_err("a contradictory series no-verdict row was accepted");
+    let after_contradiction = serde_json::to_vec(&atomic_series)
+        .map_err(|error| format!("cannot re-encode no-verdict atomicity fixture: {error}"))?;
+    if !contradiction.contains("not_run evidence must carry")
+        || after_contradiction != before_contradiction
+    {
+        return Err(format!(
+            "series no-verdict contradiction was not an atomic refusal: error={contradiction:?}, unchanged={}",
+            after_contradiction == before_contradiction
         ));
     }
 
@@ -12017,10 +12297,21 @@ red/`measured-and-passed` count is **0**.",
     //
     // NEGATIVE LEG FIRST, so this cannot become a guard that never fires: the
     // fixture below is built WITH a foreign absolute root, and the assertions
-    // fail if that root reaches the encoded bytes.
+    // fail if that exact root or one of its descendants survives. A sibling
+    // path and an interior substring are negative controls: rewriting either
+    // would alias evidence from a different location.
     let foreign_root = "/home/example/checkouts/hermit-42";
+    let sibling_root = format!("{foreign_root}-backup");
+    let embedded_root = format!("--hermit={foreign_root}/target/debug/hermit");
+    let path_root = format!("/usr/bin:{foreign_root}/bin");
+    let interior_root = format!("prefix{foreign_root}/target/debug/hermit");
     let foreign_env: BTreeMap<String, String> =
-        [("HOME".to_string(), format!("{foreign_root}/home"))]
+        [
+            ("HOME".to_string(), format!("{foreign_root}/home")),
+            ("PATH".to_string(), path_root),
+            ("SIBLING".to_string(), sibling_root.clone()),
+            ("INTERIOR".to_string(), interior_root.clone()),
+        ]
             .into_iter()
             .collect();
     let mut fixture = ObservedInvocation {
@@ -12029,7 +12320,14 @@ red/`measured-and-passed` count is **0**.",
         attempt: None,
         evidence_sha256: None,
         result: Some(ObservedResult::Pass),
-        argv: vec![format!("{foreign_root}/target/debug/hermit"), "run".into()],
+        argv: vec![
+            format!("{foreign_root}/target/debug/hermit"),
+            foreign_root.into(),
+            embedded_root,
+            sibling_root.clone(),
+            interior_root.clone(),
+            "run".into(),
+        ],
         guest_argv: vec!["/bin/true".into()],
         env: foreign_env.clone(),
         cwd: foreign_root.into(),
@@ -12050,7 +12348,25 @@ red/`measured-and-passed` count is **0**.",
     normalise_invocation_root(&mut fixture);
     let encoded = serde_json::to_string(&fixture)
         .map_err(|e| format!("path-independence fixture will not serialize: {e}"))?;
-    if encoded.contains(foreign_root) {
+    if fixture.cwd != RECORDED_ROOT
+        || fixture.argv[0] != format!("{RECORDED_ROOT}/target/debug/hermit")
+        || fixture.argv[1] != RECORDED_ROOT
+        || fixture.argv[2] != format!("--hermit={RECORDED_ROOT}/target/debug/hermit")
+        || fixture.env.get("HOME") != Some(&format!("{RECORDED_ROOT}/home"))
+        || fixture.env.get("PATH") != Some(&format!("/usr/bin:{RECORDED_ROOT}/bin"))
+    {
+        return Err("path normalisation did not rewrite the exact root and descendants".into());
+    }
+    if fixture.argv[3] != sibling_root
+        || fixture.argv[4] != interior_root
+        || fixture.env.get("SIBLING") != Some(&sibling_root)
+        || fixture.env.get("INTERIOR") != Some(&interior_root)
+    {
+        return Err("path normalisation rewrote a sibling path or interior substring".into());
+    }
+    let mut encoded_residue = encoded.clone();
+    rewrite_recorded_root(&mut encoded_residue, foreign_root);
+    if encoded_residue != encoded {
         return Err(format!(
             "encoded cells still name the producing worktree {foreign_root}"
         ));
