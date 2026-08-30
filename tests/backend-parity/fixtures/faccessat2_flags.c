@@ -40,7 +40,14 @@ int main(void) {
         printf("faccessat2 ok=0 [mkstemp fail]\n");
         return 1;
     }
-    write(fd, "hi\n", 3);
+    ssize_t written = write(fd, "hi\n", 3);
+    if (written != 3) {
+        if (written < 0) perror("write");
+        else fprintf(stderr, "short write: %zd of 3 bytes\n", written);
+        close(fd);
+        unlink(tmpl);
+        return 1;
+    }
 
     // (1) F_OK existence check on the freshly created file.
     if (faccessat2_call(AT_FDCWD, tmpl, F_OK, 0) == 0) ok++;

@@ -125,7 +125,10 @@ int main(void) {
             if (read(acc[i], &c, 1) == 1) { checksum = checksum * 31 + (unsigned char)c; ev("served idx=%d ch=%c", i, c); }
         }
         const char *reply = "A";
-        write(acc[winner], reply, 1);
+        if (write(acc[winner], reply, 1) != 1) {
+            perror("write reply");
+            return 1;
+        }
     } else {
         /* Branch B: a DIFFERENT service order and a different reply, so the taken
          * branch propagates into the syscall sequence rather than only a label. */
@@ -135,7 +138,10 @@ int main(void) {
             if (read(acc[i], &c, 1) == 1) { checksum = checksum * 31 + (unsigned char)c; ev("served idx=%d ch=%c", i, c); }
         }
         const char *reply = "B";
-        write(acc[winner], reply, 1);
+        if (write(acc[winner], reply, 1) != 1) {
+            perror("write reply");
+            return 1;
+        }
     }
     ev("checksum=%lu", checksum);
 
