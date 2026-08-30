@@ -4,7 +4,7 @@ set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly script_dir
-readonly TEST_RESULTS_WRITER="$script_dir/test-results.rs"
+readonly TEST_RESULTS_WRITER="$script_dir/structured-test-results.rs"
 
 function usage {
     echo "usage: $0 <executed-tests> <filtered-tests> [<id> <pass|fail> <attempts>]..." >&2

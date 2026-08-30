@@ -5,7 +5,7 @@
 
 test_results_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 readonly test_results_root
-readonly TEST_RESULTS_READER="$test_results_root/ci/test-results.rs"
+readonly TEST_RESULTS_READER="$test_results_root/ci/structured-test-results.rs"
 
 # These globals are the sourced library's interface.
 # shellcheck disable=SC2034
