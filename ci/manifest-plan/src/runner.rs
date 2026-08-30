@@ -1905,6 +1905,39 @@ fn execute_spec_until(
                 .unwrap_or("unknown backend unavailability")
         ));
     }
+    // A producer class that cannot satisfy the requested backend or execution
+    // shape is unavailable evidence, not a product crash. In particular, the
+    // human error line must never override a mismatched class into FAIL.
+    let invalid_backend_evidence = !output.timed_out
+        && !output.status.success()
+        && !backend_unavailable
+        && failure_class_line
+            .starts_with("HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=");
+    if invalid_backend_evidence {
+        outcome = "ERROR".into();
+        error_kind = Some("invalid-backend-evidence".into());
+        reason = Some(format!(
+            "backend availability evidence does not match this attempt: {failure_class_line}"
+        ));
+    }
+    // The producer did write a class, but it did not establish a more specific
+    // result. Keep that absence as no-result instead of letting the following
+    // English line manufacture a product failure.
+    let unclassified_internal_failure = !output.timed_out
+        && !output.status.success()
+        && !launch_refusal
+        && !backend_unavailable
+        && !invalid_backend_evidence
+        && failure_class_line == "HERMIT_INTERNAL_FAILURE class=cli-error";
+    if unclassified_internal_failure {
+        outcome = "ERROR".into();
+        error_kind = Some("incomplete-verification-evidence".into());
+        reason = Some("Hermit reported cli-error without a more specific result".into());
+    }
+    let producer_failure_classified = launch_refusal
+        || backend_unavailable
+        || invalid_backend_evidence
+        || unclassified_internal_failure;
     let mut report_json = None;
     let mut report_sha = None;
     let mut runtime = None;
@@ -1954,11 +1987,10 @@ fn execute_spec_until(
                             first_divergent_right_message =
                                 report.first_divergent_right_message.clone();
                         }
-                        if launch_refusal || backend_unavailable {
-                            // The process never created a guest.  A report at
-                            // this point is the invocation's pre-stamped
-                            // no-result record or otherwise unrelated, and
-                            // cannot supersede the refusal classification.
+                        if producer_failure_classified {
+                            // The producer's classified failure, or a
+                            // contradiction in that evidence, cannot be
+                            // superseded by a pre-stamped or unrelated report.
                         } else if report.verdict == Verdict::InfrastructureError {
                             let comparison_error = report
                                 .comparison
@@ -2025,7 +2057,7 @@ fn execute_spec_until(
                             ));
                         }
                     }
-                    Err(error) if !backend_unavailable => {
+                    Err(error) if !producer_failure_classified => {
                         outcome = "ERROR".into();
                         error_kind = Some("incomplete-verification-evidence".into());
                         reason = Some(format!("verification report is unreadable: {error}"));
@@ -2033,7 +2065,7 @@ fn execute_spec_until(
                     Err(_) => {}
                 }
             }
-            Err(_error) if launch_refusal || backend_unavailable => {}
+            Err(_error) if producer_failure_classified => {}
             Err(error) => {
                 outcome = "ERROR".into();
                 error_kind = Some("incomplete-verification-evidence".into());
@@ -5403,16 +5435,58 @@ backends_disabled:
         );
 
         for result in [wrong_backend, guest_output] {
-            assert_eq!(result.outcome, "FAIL", "unexpected result: {result:?}");
-            assert_eq!(result.error_kind, None, "unexpected result: {result:?}");
+            assert_eq!(result.outcome, "ERROR", "unexpected result: {result:?}");
+            assert_eq!(
+                observed_result(
+                    "verify",
+                    &result.outcome,
+                    std::slice::from_ref(&result),
+                    result.error_kind.as_deref(),
+                ),
+                None,
+                "mismatched producer evidence must not manufacture a product result: {result:?}"
+            );
+            assert_eq!(
+                failure_class(&result.outcome, None, result.error_kind.as_deref()),
+                Some(FailureClass::NoResult),
+                "mismatched producer evidence must remain no-result: {result:?}"
+            );
+            assert_eq!(
+                result.error_kind.as_deref(),
+                Some("invalid-backend-evidence"),
+                "unexpected result: {result:?}"
+            );
             assert!(
                 result
                     .reason
                     .as_deref()
-                    .is_some_and(|reason| reason.contains("exited with status")),
-                "ordinary product failure must keep its process outcome: {result:?}"
+                    .is_some_and(|reason| reason.contains("does not match this attempt")),
+                "mismatched producer evidence must name the mismatch: {result:?}"
             );
         }
+
+        let ordinary_failure = attempt_from_script(
+            "sabre",
+            "printf %s \"$1\" > \"$2\"; printf 'guest-started\\n'; exit 8",
+            Some(no_result),
+        );
+        assert_eq!(ordinary_failure.outcome, "FAIL");
+        let observed = observed_result(
+            "verify",
+            &ordinary_failure.outcome,
+            std::slice::from_ref(&ordinary_failure),
+            ordinary_failure.error_kind.as_deref(),
+        );
+        assert_eq!(observed, Some(ObservedResult::CrashError));
+        assert_eq!(
+            failure_class(
+                &ordinary_failure.outcome,
+                observed,
+                ordinary_failure.error_kind.as_deref(),
+            ),
+            Some(FailureClass::ProductFailure),
+            "an ordinary process failure without contradictory producer evidence remains product-attributed"
+        );
     }
 
     #[test]
@@ -5459,8 +5533,25 @@ backends_disabled:
 
         assert_eq!(typed.error_kind.as_deref(), Some("guest-launch-refused"));
         assert_eq!(typed.outcome, "ERROR");
-        assert_eq!(prose_only.error_kind, None);
-        assert_eq!(prose_only.outcome, "FAIL");
+        assert_eq!(
+            prose_only.error_kind.as_deref(),
+            Some("incomplete-verification-evidence")
+        );
+        assert_eq!(prose_only.outcome, "ERROR");
+        assert_eq!(
+            failure_class(
+                &prose_only.outcome,
+                observed_result(
+                    "verify",
+                    &prose_only.outcome,
+                    std::slice::from_ref(&prose_only),
+                    prose_only.error_kind.as_deref(),
+                ),
+                prose_only.error_kind.as_deref(),
+            ),
+            Some(FailureClass::NoResult),
+            "English launch prose without the producer class must remain no-result"
+        );
     }
 
     #[test]
