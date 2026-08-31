@@ -6013,16 +6013,16 @@ fn local_off_the_record_refusal(args: &Args, dirty: bool) -> Option<String> {
 }
 
 /// Construct the refusal for an unadmitted product run. Production supplies
-/// `canonically_admitted` only from [`validate_lock_admission`].
+/// `lock_admitted` only from [`validate_lock_admission`].
 fn product_front_door_refusal(
     tool_root: &Path,
     root: &Path,
     commit: &str,
     requested_args: &str,
     ci_hub_launcher_available: bool,
-    canonically_admitted: bool,
+    lock_admitted: bool,
 ) -> Option<String> {
-    if canonically_admitted {
+    if lock_admitted {
         return None;
     }
     let ci_hub_path = tool_root.join("ci-hub/ci-hub");
