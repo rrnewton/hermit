@@ -460,25 +460,26 @@ def _wait_for_qemu(process: subprocess.Popen, qmp_socket: Path, timeout: float) 
     raise TimeoutError("QEMU process for {} was not found".format(qmp_socket))
 
 
-def _stop_safehermit_unit(report: Path) -> None:
+def _stop_safehermit_unit(report: Path) -> bool:
     """Stop the cgroup safehermit created for this exact run, if it created one."""
     try:
         lines = report.read_text(errors="replace").splitlines()
     except OSError:
-        return
+        return False
     prefix = "safehermit: unit="
     units = [line[len(prefix):] for line in lines if line.startswith(prefix)]
     if len(units) != 1 or units[0] == "none":
-        return
+        return False
     unit = units[0]
     if re.fullmatch(r"[A-Za-z0-9_.@:-]+", unit) is None:
-        return
-    subprocess.run(
+        return False
+    stopped = subprocess.run(
         ["systemctl", "--user", "kill", "--signal=SIGKILL", unit + ".service"],
         check=False,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    return stopped.returncode == 0
 
 
 def _open_serial_pipe(
@@ -887,19 +888,34 @@ class HermitGuestProgram:
                 except OSError:
                     pass
                 setattr(self, attribute, None)
+        stopped_unit = False
+        process_finished = False
         if self._safehermit_report is not None:
-            _stop_safehermit_unit(self._safehermit_report)
-        if self._process_group is not None:
+            stopped_unit = _stop_safehermit_unit(self._safehermit_report)
+        if self._process is not None and stopped_unit:
+            try:
+                # Let safehermit drain its pipe, write the final report fields,
+                # and remove the transient unit before falling back to killpg.
+                self._process.wait(timeout=10)
+                process_finished = True
+            except subprocess.TimeoutExpired:
+                pass
+        if (
+            self._process_group is not None
+            and self._process is not None
+            and self._process.poll() is None
+        ):
             try:
                 os.killpg(self._process_group, signal.SIGKILL)
             except ProcessLookupError:
                 pass
         if self._process is not None:
-            try:
-                self._process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
-                self._process.wait(timeout=10)
+            if not process_finished:
+                try:
+                    self._process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self._process.kill()
+                    self._process.wait(timeout=10)
             if self._safehermit_report is not None:
                 report_safehermit(self._safehermit_report, self._process.returncode)
                 self._safehermit_report = None
