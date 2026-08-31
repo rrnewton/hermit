@@ -39,12 +39,10 @@ impl Record {
         dir: &Path,
         mountinfo_root_rewrites: Vec<MountInfoRootRewrite>,
         mountinfo_mount_ids: Vec<u64>,
-        mountinfo_mount_id_prefix_len: usize,
     ) -> Result<Self, Error> {
         let mut metadata = Metadata::new(&command)?;
         metadata.mountinfo_root_rewrites = mountinfo_root_rewrites;
         metadata.mountinfo_mount_ids = mountinfo_mount_ids;
-        metadata.mountinfo_mount_id_prefix_len = mountinfo_mount_id_prefix_len;
 
         let exe = dir.join(EXE_NAME);
 
@@ -60,7 +58,6 @@ impl Record {
         let mut config = record_or_replay_config(dir);
         config.mountinfo_root_rewrites = metadata.mountinfo_root_rewrites.clone();
         config.mountinfo_mount_ids = metadata.mountinfo_mount_ids.clone();
-        config.mountinfo_mount_id_prefix_len = metadata.mountinfo_mount_id_prefix_len;
 
         let tracer = reverie_ptrace::TracerBuilder::<RecordTool>::new(command)
             .config(config)

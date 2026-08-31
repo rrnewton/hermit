@@ -669,6 +669,68 @@ fn proc_self_mountinfo_preserves_user_mount_over_private_tmp() {
 }
 
 #[test]
+fn proc_self_mountinfo_preserves_user_bind_over_private_tmp() {
+    let _guard = hermit_run_lock();
+    let user_tmp = tempfile::Builder::new()
+        .prefix(".tmp")
+        .rand_bytes(6)
+        .tempdir_in("/tmp")
+        .expect("create user-controlled bind source");
+    let read = || {
+        read_procfs_with("/proc/self/mountinfo", None, |command| {
+            command.arg(format!("--bind={}:/tmp", user_tmp.path().display()));
+        })
+    };
+    let first = read();
+    assert_eq!(first, read(), "an exact /tmp bind changed across runs");
+    let text = std::str::from_utf8(&first).expect("mountinfo should be UTF-8");
+    let effective_tmp = text
+        .lines()
+        .rfind(|line| line.split(' ').nth(4) == Some("/tmp"))
+        .expect("mountinfo must expose /tmp");
+    assert!(
+        effective_tmp.contains(user_tmp.path().file_name().unwrap().to_str().unwrap()),
+        "the exact /tmp bind root was not preserved: {effective_tmp}"
+    );
+    assert_eq!(
+        effective_tmp.split(' ').nth(4),
+        Some("/tmp"),
+        "the exact /tmp bind exposed Hermit's random staging mountpoint"
+    );
+}
+
+#[test]
+fn ordered_nested_user_mounts_preserve_linux_stacking() {
+    let _guard = hermit_run_lock();
+    let parent_source = tempfile::tempdir().expect("create parent mount source");
+    let child_source = tempfile::tempdir().expect("create child mount source");
+    fs::create_dir(parent_source.path().join("child")).expect("create covered child path");
+    let read = || {
+        read_procfs_with("/proc/self/mountinfo", None, |command| {
+            command
+                .arg(format!(
+                    "--mount=type=bind,source={},target=/tmp/stack/child",
+                    child_source.path().display()
+                ))
+                .arg(format!(
+                    "--mount=type=bind,source={},target=/tmp/stack",
+                    parent_source.path().display()
+                ));
+        })
+    };
+    let first = read();
+    assert_eq!(first, read(), "ordered nested mounts changed across runs");
+    let text = std::str::from_utf8(&first).expect("mountinfo should be UTF-8");
+    for target in ["/tmp/stack/child", "/tmp/stack"] {
+        assert!(
+            text.lines()
+                .any(|line| line.split(' ').nth(4) == Some(target)),
+            "mount stacking dropped {target}:\n{text}"
+        );
+    }
+}
+
+#[test]
 fn user_root_mount_keeps_the_later_private_tmp_provenance() {
     let _guard = hermit_run_lock();
     let read = || {
@@ -688,6 +750,35 @@ fn user_root_mount_keeps_the_later_private_tmp_provenance() {
             line.split(' ').nth(4) == Some("/tmp") && line.contains("/tmpvol/.hermit/tmp")
         }),
         "the active private /tmp row was not canonicalized after a root bind:\n{text}"
+    );
+}
+
+#[test]
+fn user_var_mount_shadows_literal_var_run_identity_mounts() {
+    let _guard = hermit_run_lock();
+    let user_var = tempfile::tempdir().expect("create user /var source");
+    let read = || {
+        read_procfs_with("/proc/self/mountinfo", None, |command| {
+            command.arg(format!(
+                "--mount=type=bind,source={},target=/var",
+                user_var.path().display()
+            ));
+        })
+    };
+    let first = read();
+    assert_eq!(first, read(), "a user /var mount changed across runs");
+    let text = std::str::from_utf8(&first).expect("mountinfo should be UTF-8");
+    assert!(
+        text.lines()
+            .any(|line| line.split(' ').nth(4) == Some("/var")),
+        "the user /var mount is absent:\n{text}"
+    );
+    assert!(
+        !text.lines().any(|line| {
+            matches!(line.split(' ').nth(4), Some("/var/run/nscd" | "/run/nscd"))
+                && line.contains("/tmpvol/.hermit/run/nscd")
+        }),
+        "the hidden identity-hardening nscd mount survived a later /var mount:\n{text}"
     );
 }
 

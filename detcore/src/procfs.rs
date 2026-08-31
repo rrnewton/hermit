@@ -16,6 +16,8 @@ use std::path::PathBuf;
 use chrono::DateTime;
 use chrono::Utc;
 use detcore_model::config::MountInfoRootRewrite;
+use detcore_model::procfs::MountInfoRow;
+pub(crate) use detcore_model::procfs::parse_mountinfo;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -392,14 +394,6 @@ pub(crate) struct TimerSlackReadPreview {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct MountInfoRow {
-    pub(crate) raw_mount_id: u64,
-    pub(crate) raw_parent_id: u64,
-    pub(crate) raw_device: u64,
-    pub(crate) raw_peer_groups: Vec<u64>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MountInfoSnapshot {
     pub(crate) rows: Vec<MountInfoRow>,
     pub(crate) mount_ids: BTreeMap<u64, u64>,
@@ -527,7 +521,7 @@ impl MountInfoSnapshot {
                 .copied()
                 .collect::<std::collections::BTreeSet<_>>();
             if supplied.len() != mount_id_order.len()
-                || !mount_id_order.starts_with(&derived_order)
+                || mount_id_order != derived_order
                 || !expected_mount_ids.iter().all(|raw| supplied.contains(raw))
             {
                 return None;
@@ -2810,6 +2804,9 @@ fn sanitize_fdinfo(contents: &[u8], identity: Option<(u64, i32, u64, u64)>) -> V
                         | "it_value"
                         | "it_interval"
                         | "seals"
+                        // Linux reports the number of descriptors currently
+                        // queued on this socket. It is socket state, not a
+                        // host-assigned identity, so preserve it verbatim.
                         | "scm_fds"
                 )
             });
@@ -3404,45 +3401,6 @@ fn mount_peer_group(field: &[u8]) -> Result<Option<(&'static [u8], u64)>, ()> {
         }
     }
     Ok(None)
-}
-
-fn parse_mountinfo_row(line: &[u8]) -> Option<MountInfoRow> {
-    let fields = line.split(|byte| *byte == b' ').collect::<Vec<_>>();
-    if fields.iter().any(|field| field.is_empty()) {
-        return None;
-    }
-    let separator = fields.iter().position(|field| *field == b"-")?;
-    if separator < 6 || separator + 4 != fields.len() {
-        return None;
-    }
-    let mut device = fields[2].split(|byte| *byte == b':');
-    let major = u32::try_from(decimal_bytes(device.next()?)?).ok()?;
-    let minor = u32::try_from(decimal_bytes(device.next()?)?).ok()?;
-    if device.next().is_some() {
-        return None;
-    }
-    let mut raw_peer_groups = Vec::new();
-    for field in &fields[6..separator] {
-        if let Some((_, raw)) = mount_peer_group(field).ok()? {
-            raw_peer_groups.push(raw);
-        }
-    }
-    Some(MountInfoRow {
-        raw_mount_id: decimal_bytes(fields[0])?,
-        raw_parent_id: decimal_bytes(fields[1])?,
-        raw_device: libc::makedev(major, minor),
-        raw_peer_groups,
-    })
-}
-
-pub(crate) fn parse_mountinfo(contents: &[u8]) -> Option<Vec<MountInfoRow>> {
-    let body = contents.strip_suffix(b"\n").unwrap_or(contents);
-    if body.is_empty() {
-        return None;
-    }
-    body.split(|byte| *byte == b'\n')
-        .map(parse_mountinfo_row)
-        .collect()
 }
 
 fn sanitize_mountinfo(contents: &[u8], snapshot: &MountInfoSnapshot) -> Vec<u8> {
@@ -4761,12 +4719,28 @@ Rss:                   4 kB\n" as &[u8];
     }
 
     #[test]
+    fn empty_mountinfo_snapshot_renders_empty_for_process_and_task_aliases() {
+        let rows = parse_mountinfo(b"").expect("empty mountinfo is a valid empty snapshot");
+        let snapshot = MountInfoSnapshot::new(rows, &[], false, BTreeMap::new(), BTreeMap::new())
+            .expect("empty mountinfo identity snapshot");
+        for path in ["/proc/37/mountinfo", "/proc/37/task/38/mountinfo"] {
+            let mut file = ProcfsFile::from_path(Path::new(path))
+                .unwrap_or_else(|| panic!("{path} must classify as mountinfo"));
+            file.initialize(
+                Vec::new(),
+                ProcfsSnapshotContext {
+                    mountinfo: Some(snapshot.clone()),
+                    ..ProcfsSnapshotContext::default()
+                },
+            );
+            assert_eq!(file.take(usize::MAX), Some(Vec::new()), "{path}");
+        }
+    }
+
+    #[test]
     fn duplicate_mount_id_or_unknown_proven_id_rejects_the_snapshot() {
         let duplicate = b"20 10 8:1 / /a rw - ext4 /dev/a rw\n20 10 8:1 / /b rw - ext4 /dev/a rw\n";
-        let rows = parse_mountinfo(duplicate).unwrap();
-        assert!(
-            MountInfoSnapshot::new(rows, &[], false, BTreeMap::new(), BTreeMap::new()).is_none()
-        );
+        assert!(parse_mountinfo(duplicate).is_none());
 
         let ordinary = b"20 10 8:1 / /a rw - ext4 /dev/a rw\n";
         let rows = parse_mountinfo(ordinary).unwrap();
@@ -4863,18 +4837,17 @@ Rss:                   4 kB\n" as &[u8];
         );
 
         let rows = parse_mountinfo(input).unwrap();
-        let snapshot = MountInfoSnapshot::new(
-            rows,
-            &[20, 30, 10, 999],
-            false,
-            BTreeMap::new(),
-            BTreeMap::new(),
-        )
-        .expect("a trailing inherited-fd mount ID should not alter the snapshot prefix");
-        assert_eq!(snapshot.canonical_mount_id(20), Some(1));
-        assert_eq!(snapshot.canonical_mount_id(30), Some(2));
-        assert_eq!(snapshot.canonical_mount_id(10), Some(3));
-        assert_eq!(snapshot.canonical_mount_id(999), Some(4));
+        assert!(
+            MountInfoSnapshot::new(
+                rows,
+                &[20, 30, 10, 999],
+                false,
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .is_none(),
+            "recorded mount identity order must describe exactly this mountinfo snapshot"
+        );
     }
 
     #[test]

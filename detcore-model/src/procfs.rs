@@ -8,6 +8,85 @@
 
 //! Types and parsers shared by procfs producers and consumers.
 
+use std::collections::BTreeSet;
+
+/// Identity-bearing fields from one Linux `/proc/*/mountinfo` row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MountInfoRow {
+    pub raw_mount_id: u64,
+    pub raw_parent_id: u64,
+    pub raw_device: u64,
+    pub root: Vec<u8>,
+    pub raw_peer_groups: Vec<u64>,
+}
+
+const MOUNT_PEER_PREFIXES: [&[u8]; 3] = [b"shared:", b"master:", b"propagate_from:"];
+
+fn decimal(field: &[u8]) -> Option<u64> {
+    if field.is_empty() || field.iter().any(|byte| !byte.is_ascii_digit()) {
+        return None;
+    }
+    std::str::from_utf8(field).ok()?.parse().ok()
+}
+
+fn mount_peer_group(field: &[u8]) -> Option<Option<u64>> {
+    for prefix in MOUNT_PEER_PREFIXES {
+        if let Some(raw) = field.strip_prefix(prefix) {
+            return Some(Some(decimal(raw)?));
+        }
+    }
+    Some(None)
+}
+
+fn parse_mountinfo_row(line: &[u8]) -> Option<MountInfoRow> {
+    let fields = line.split(|byte| *byte == b' ').collect::<Vec<_>>();
+    if fields.iter().any(|field| field.is_empty()) {
+        return None;
+    }
+    let separator = fields.iter().position(|field| *field == b"-")?;
+    if separator < 6 || separator + 4 != fields.len() {
+        return None;
+    }
+    let mut device = fields[2].split(|byte| *byte == b':');
+    let major = u32::try_from(decimal(device.next()?)?).ok()?;
+    let minor = u32::try_from(decimal(device.next()?)?).ok()?;
+    if device.next().is_some() {
+        return None;
+    }
+    let mut raw_peer_groups = Vec::new();
+    for field in &fields[6..separator] {
+        if let Some(raw) = mount_peer_group(field)? {
+            raw_peer_groups.push(raw);
+        }
+    }
+    Some(MountInfoRow {
+        raw_mount_id: decimal(fields[0])?,
+        raw_parent_id: decimal(fields[1])?,
+        raw_device: libc::makedev(major, minor),
+        root: fields[3].to_vec(),
+        raw_peer_groups,
+    })
+}
+
+/// Strictly parse a Linux `/proc/*/mountinfo` snapshot.
+///
+/// Empty files are valid empty snapshots. Malformed rows and duplicate mount
+/// IDs are rejected so every producer and consumer accepts the same grammar.
+pub fn parse_mountinfo(contents: &[u8]) -> Option<Vec<MountInfoRow>> {
+    let body = contents.strip_suffix(b"\n").unwrap_or(contents);
+    if body.is_empty() {
+        return Some(Vec::new());
+    }
+    let rows = body
+        .split(|byte| *byte == b'\n')
+        .map(parse_mountinfo_row)
+        .collect::<Option<Vec<_>>>()?;
+    let mut seen = BTreeSet::new();
+    rows.iter()
+        .all(|row| seen.insert(row.raw_mount_id))
+        .then_some(rows)
+}
+
 /// Parse the one decimal `mnt_id` field required by Linux fdinfo.
 ///
 /// Missing, duplicate, malformed, signed, or out-of-range values are rejected.
@@ -36,6 +115,7 @@ pub fn parse_fdinfo_mount_id(contents: &[u8]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::parse_fdinfo_mount_id;
+    use super::parse_mountinfo;
 
     #[test]
     fn fdinfo_mount_id_is_strict_and_unique() {
@@ -51,5 +131,20 @@ mod tests {
         ] {
             assert_eq!(parse_fdinfo_mount_id(malformed), None, "{malformed:?}");
         }
+    }
+
+    #[test]
+    fn mountinfo_parser_accepts_empty_and_refuses_malformed_or_duplicate_rows() {
+        assert_eq!(parse_mountinfo(b""), Some(Vec::new()));
+        let row = b"37 1 8:1 / / rw shared:9 - ext4 /dev/root rw\n";
+        let parsed = parse_mountinfo(row).expect("valid mountinfo row");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].raw_mount_id, 37);
+        assert_eq!(parsed[0].raw_parent_id, 1);
+        assert_eq!(parsed[0].root, b"/");
+        assert_eq!(parsed[0].raw_peer_groups, [9]);
+        assert!(parse_mountinfo(b"37 1 bad / / rw - ext4 /dev/root rw\n").is_none());
+        let duplicate = [row.as_slice(), row.as_slice()].concat();
+        assert!(parse_mountinfo(&duplicate).is_none());
     }
 }

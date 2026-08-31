@@ -355,6 +355,15 @@ Record/replay is less broadly compatible than deterministic `run` mode. Keep
 the recording directory, executable, inputs, environment, and Hermit revision
 unchanged between phases.
 
+Hermit presents deterministic mount identities in `/proc/*/mountinfo` and the
+matching `mnt_id` fields in `/proc/*/fdinfo/*`. Mount topology, stacking order,
+and non-identity Linux fields remain visible; Hermit-owned temporary roots are
+rewritten only when their source object has been proved. The `scm_fds` fdinfo
+field passes through because it is the socket's queued-descriptor count, not a
+host-assigned identity. With `run --no-namespace`, Hermit snapshots the live
+mount table on first use and refuses if that table changes during the run,
+rather than applying an identity map to a different host mount topology.
+
 ## Compatibility
 
 The following matrix summarizes unmodified host-binary testing on x86-64 Linux

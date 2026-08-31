@@ -106,14 +106,13 @@ impl RecordVersion {
 // raw mount-ID order. That makes fdinfo's mnt_id use the same canonical identity
 // as mountinfo during replay instead of consulting the unrelated replay
 // namespace or collapsing all descriptors to one mount.
-// 0x111 -> 0x112: mountinfo identity metadata now records the boundary between
-// namespace rows and inherited regular-descriptor mounts. Replay needs that
-// boundary to keep pipefs, sockfs, and anonymous-inode IDs independent of the
-// recorder's stdio shape.
-// 0x112 -> 0x113: fdinfo mount identities are now keyed by the observed raw
-// mount ID rather than broad descriptor classes. Replay must rebuild that
-// run-global mapping from the recorded namespace order and recording-time
-// fdinfo bytes, or pidfs/nsfs/anon_inodefs can be collapsed or rejected.
+// 0x111 -> 0x113: fdinfo mount identities are now keyed by each observed raw
+// mount ID rather than broad descriptor classes. Metadata carries only the
+// completed namespace's mountinfo row/parent order; pseudo-filesystem IDs that
+// are absent from mountinfo are allocated afterward in deterministic guest
+// observation order. Replay must rebuild that mapping from recording-time raw
+// bytes, or pidfs/nsfs/anon_inodefs can be collapsed or rejected. The draft
+// 0x112 format was never shipped.
 pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x113);
 
 /// The highest RECORD_VERSION this project has ever shipped.
@@ -179,10 +178,6 @@ pub struct Metadata {
     /// Recording-namespace raw mount IDs in canonical row order.
     #[serde(default)]
     pub mountinfo_mount_ids: Vec<u64>,
-    /// Length of the mountinfo-derived prefix in `mountinfo_mount_ids`; the
-    /// remaining configured IDs are inherited regular descriptors.
-    #[serde(default)]
-    pub mountinfo_mount_id_prefix_len: usize,
 }
 
 impl Metadata {
@@ -233,7 +228,6 @@ impl Metadata {
             version: RECORD_VERSION,
             mountinfo_root_rewrites: Vec::new(),
             mountinfo_mount_ids: Vec::new(),
-            mountinfo_mount_id_prefix_len: 0,
         })
     }
 
@@ -263,9 +257,9 @@ impl Metadata {
 pub fn record_or_replay_config(data: &Path) -> detcore::Config {
     // NOTE: Record and replay should use the exact same Detcore configuration.
     // Callers add `Metadata::mountinfo_root_rewrites` and
-    // `Metadata::mountinfo_mount_ids` and its prefix length after this common base is built, so replay
-    // uses the recording namespace's raw IDs rather than the unrelated IDs of
-    // its fresh container.
+    // `Metadata::mountinfo_mount_ids` after this common base is built, so
+    // replay uses the recording namespace's raw IDs rather than the unrelated
+    // IDs of its fresh container.
     //
     // WHY THIS IS NOT `hermit run --strict`, WRITTEN HERE ON PURPOSE.
     //
@@ -322,7 +316,6 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         mountinfo_root_rewrites: Vec::new(),
         mountinfo_device_rewrites: Vec::new(),
         mountinfo_mount_ids: Vec::new(),
-        mountinfo_mount_id_prefix_len: 0,
         virtualize_cpuid: true,
         cpuid_virtualized_by_backend: false,
         backend_supports_madvise: true,

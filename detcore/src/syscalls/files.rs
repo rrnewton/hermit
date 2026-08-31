@@ -1311,7 +1311,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .await
                     .ok_or_else(|| {
                         Error::Tool(anyhow::anyhow!(
-                            "fdinfo mnt_id {raw_mount_id} for {fd_type:?} was absent from {mountinfo_path}"
+                            "mount namespace changed after the identity snapshot while resolving fdinfo mnt_id {raw_mount_id} for {fd_type:?} from {mountinfo_path}"
                         ))
                     })?
             } else {
@@ -1319,7 +1319,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .await
                     .ok_or_else(|| {
                         Error::Tool(anyhow::anyhow!(
-                            "fdinfo mnt_id {raw_mount_id} for {fd_type:?} was absent from recorded mountinfo provenance"
+                            "recorded mount identity provenance was invalid while resolving fdinfo mnt_id {raw_mount_id} for {fd_type:?}"
                         ))
                     })?
             };

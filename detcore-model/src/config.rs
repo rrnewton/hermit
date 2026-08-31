@@ -253,18 +253,6 @@ pub struct Config {
     #[clap(skip)]
     pub mountinfo_mount_ids: Vec<u64>,
 
-    /// Number of entries in `mountinfo_mount_ids` derived from mountinfo itself.
-    ///
-    /// Any remaining entries are inherited regular-file descriptor mounts that
-    /// are absent from the completed namespace's mountinfo table. Keeping this
-    /// boundary explicit lets fdinfo preserve the compatibility-reserved range
-    /// before assigning those inherited mounts. Other unlisted raw mount IDs
-    /// are then assigned distinct run-local identities in deterministic guest
-    /// observation order.
-    #[serde(default)]
-    #[clap(skip)]
-    pub mountinfo_mount_id_prefix_len: usize,
-
     /// Sequentialize thread execution deterministically.
     #[clap(long)]
     pub sequentialize_threads: bool,
@@ -1389,15 +1377,10 @@ mod tests {
             .unwrap()
             .remove("mountinfo_device_rewrites");
         value.as_object_mut().unwrap().remove("mountinfo_mount_ids");
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("mountinfo_mount_id_prefix_len");
         let restored: Config = serde_json::from_value(value).unwrap();
         assert!(restored.mountinfo_root_rewrites.is_empty());
         assert!(restored.mountinfo_device_rewrites.is_empty());
         assert!(restored.mountinfo_mount_ids.is_empty());
-        assert_eq!(restored.mountinfo_mount_id_prefix_len, 0);
     }
 
     #[test]

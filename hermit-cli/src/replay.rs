@@ -99,7 +99,6 @@ impl Replay {
         // the unrelated IDs of this fresh replay namespace.
         config.mountinfo_root_rewrites = metadata.mountinfo_root_rewrites.clone();
         config.mountinfo_mount_ids = metadata.mountinfo_mount_ids.clone();
-        config.mountinfo_mount_id_prefix_len = metadata.mountinfo_mount_id_prefix_len;
         let sequentialize_threads = config.sequentialize_threads;
 
         let (chroot, bootstrap_program, materialization_scope, replay_mounts) =

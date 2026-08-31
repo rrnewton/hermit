@@ -25,6 +25,7 @@ use std::time::Instant;
 
 use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
 use reverie::process::Command as ReverieCommand;
+use reverie::process::Mount;
 
 static HERMIT_RECORD_LOCK: Mutex<()> = Mutex::new(());
 static WORKLOADS: OnceLock<Vec<Workload>> = OnceLock::new();
@@ -47,6 +48,38 @@ fn public_record_entry_points_do_not_start_a_nested_runtime() {
         !format!("{output_error:#}").contains("Cannot start a runtime from within a runtime"),
         "record_with_output created a nested Tokio runtime: {output_error:#}"
     );
+}
+
+#[test]
+fn public_record_uses_the_completed_command_namespace_and_stdio() {
+    let _guard = hermit_record_lock();
+    let data = tempfile::tempdir().expect("create recording directory");
+    let files = tempfile::tempdir().expect("create command mount directory");
+    let source = files.path().join("source");
+    let target = files.path().join("target");
+    let input = files.path().join("input");
+    let output = files.path().join("output");
+    fs::write(&source, b"mounted-content\n").expect("write mount source");
+    fs::write(&target, b"unmounted-content\n").expect("write mount target");
+    fs::write(&input, b"stdin-content\n").expect("write command stdin");
+
+    let mut command = ReverieCommand::new("/bin/cat");
+    command
+        .args(["/proc/self/mountinfo", "/proc/self/fdinfo/1"])
+        .arg(&target)
+        .arg("/dev/stdin")
+        .map_root()
+        .mount(Mount::bind(&source, &target))
+        .stdin(fs::File::open(&input).expect("open command stdin"))
+        .stdout(fs::File::create(&output).expect("create command stdout"));
+
+    let status = hermit::record_to(command, data.path()).expect("public recording should run");
+    assert_eq!(status, reverie::process::ExitStatus::Exited(0));
+    let captured = fs::read_to_string(&output).expect("read command stdout");
+    assert!(captured.lines().any(|line| line.starts_with("mnt_id:")));
+    assert!(captured.contains("mounted-content\n"));
+    assert!(captured.contains("stdin-content\n"));
+    assert!(!captured.contains("unmounted-content"));
 }
 
 const BASELINE_RECORD_WORKLOADS: [&str; 10] = [
@@ -709,6 +742,45 @@ fn independent_mountinfo_recordings_are_canonical() {
     let text = std::str::from_utf8(&first).expect("mountinfo should be UTF-8");
     assert!(text.contains("/tmpvol/.hermit/etc/group"));
     assert!(!text.contains("/.tmp"));
+}
+
+#[test]
+fn record_start_preserves_ordered_nested_user_mounts() {
+    let _guard = hermit_record_lock();
+    let data_dir = tempfile::tempdir().expect("recording data directory");
+    let parent_source = tempfile::tempdir().expect("create parent mount source");
+    let child_source = tempfile::tempdir().expect("create child mount source");
+    let targets = tempfile::tempdir().expect("create mount targets");
+    let parent_target = targets.path().join("stack");
+    let child_target = parent_target.join("child");
+    fs::create_dir(parent_source.path().join("child")).expect("create covered child path");
+    fs::create_dir_all(&child_target).expect("create nested mount targets");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .args(["--log=off", "record", "start", "--strict"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg(format!(
+            "--mount=type=bind,source={},target={}",
+            child_source.path().display(),
+            child_target.display()
+        ))
+        .arg(format!(
+            "--mount=type=bind,source={},target={}",
+            parent_source.path().display(),
+            parent_target.display()
+        ))
+        .args(["--", "/bin/cat", "/proc/self/mountinfo"]);
+    let output = command_output(command, "recording ordered nested mounts");
+    let text = std::str::from_utf8(&output.stdout).expect("mountinfo should be UTF-8");
+    for target in [&child_target, &parent_target] {
+        assert!(
+            text.lines()
+                .any(|line| line.split(' ').nth(4) == target.to_str()),
+            "record planning dropped {}:\n{text}",
+            target.display()
+        );
+    }
 }
 
 #[test]
