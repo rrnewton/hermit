@@ -46,7 +46,11 @@ fn epoll_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("epoll-determinism");
+        // This integration target is selected by more than one DAG step. Each
+        // nextest invocation is a separate process, so the lock and OnceLock
+        // above cannot protect a shared output path across those invocations.
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("epoll-determinism-{}", std::process::id()));
         fs::create_dir_all(&build_root).expect("failed to create epoll guest build directory");
         let output = build_root.join("epoll_determinism");
 

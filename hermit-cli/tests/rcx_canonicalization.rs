@@ -46,7 +46,11 @@ fn rcx_guest() -> &'static Path {
             let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .expect("hermit-cli should be inside the repository");
-            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("rcx-canonicalization");
+            // This integration target is selected by more than one DAG step.
+            // Keep concurrent nextest processes from replacing each other's
+            // guest binary while Hermit is about to execute it.
+            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+                .join(format!("rcx-canonicalization-{}", std::process::id()));
             fs::create_dir_all(&build_root)
                 .expect("failed to create rcx canonicalization build directory");
             let binary = build_root.join("rcx_canonicalization");
