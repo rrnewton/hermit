@@ -8,6 +8,17 @@ fail() {
     exit 1
 }
 
+valid_submodule_path() {
+    local path=$1 component
+    local -a components
+    [[ -n $path && $path != /* && $path != */ && $path != *//* \
+        && $path != *$'\n'* && $path != *$'\r'* ]] || return 1
+    IFS='/' read -r -a components <<<"$path"
+    for component in "${components[@]}"; do
+        [[ -n $component && $component != . && $component != .. ]] || return 1
+    done
+}
+
 check_submodules() {
     local git_command=${SUBMODULE_GIT:-git}
     local -a git_argv
@@ -16,149 +27,238 @@ check_submodules() {
 
     [[ -r .gitmodules ]] || fail '.gitmodules is missing or unreadable'
 
-    local expected_file status_file
+    local expected_file tree_file index_file status_file
     expected_file=$(mktemp)
+    tree_file=$(mktemp)
+    index_file=$(mktemp)
     status_file=$(mktemp)
-    trap 'rm -f -- "$expected_file" "$status_file"' RETURN
+    trap 'rm -f -- "$expected_file" "$tree_file" "$index_file" "$status_file"' RETURN
 
-    if ! "${git_argv[@]}" config -f .gitmodules --get-regexp '^submodule\..*\.path$' \
-        >"$expected_file"; then
+    if ! GIT_OPTIONAL_LOCKS=0 "${git_argv[@]}" -c core.fsmonitor=false \
+        config -z -f .gitmodules --get-regexp '^submodule\..*\.path$' >"$expected_file"; then
         fail 'could not read the configured submodule paths from .gitmodules'
     fi
-
-    local -a expected_paths=()
-    local key path
-    while read -r key path; do
-        [[ -n $key && -n $path ]] || fail 'malformed submodule path entry in .gitmodules'
-        expected_paths+=("$path")
-    done <"$expected_file"
-    ((${#expected_paths[@]} > 0)) || fail '.gitmodules declares no submodules'
-
-    if ! "${git_argv[@]}" submodule status --recursive >"$status_file"; then
-        fail 'git submodule status --recursive failed; no inventory was verified'
+    if ! GIT_OPTIONAL_LOCKS=0 "${git_argv[@]}" -c core.fsmonitor=false \
+        ls-tree -rz --full-tree HEAD >"$tree_file"; then
+        fail 'could not read committed gitlinks from HEAD'
     fi
-    [[ -s $status_file ]] || fail 'git submodule status --recursive returned an empty inventory'
 
-    local line prefix suffix marker observed=0 bad=0
-    while IFS= read -r line; do
-        [[ ${#line} -ge 43 ]] || fail "malformed submodule status line: $line"
-        prefix=${line:0:41}
-        [[ $prefix =~ ^[\ +U-][0-9a-f]{40}$ && ${line:41:1} == ' ' ]] || \
-            fail "malformed submodule status line: $line"
-        suffix=${line:42}
-        [[ -n $suffix ]] || fail "malformed submodule status line: $line"
-        marker=${line:0:1}
-        ((observed += 1))
-        if [[ $marker != ' ' ]]; then
-            ((bad += 1))
-        fi
-    done <"$status_file"
+    local -a configured_records=() tree_records=()
+    mapfile -d '' -t configured_records <"$expected_file"
+    mapfile -d '' -t tree_records <"$tree_file"
+    ((${#configured_records[@]} > 0)) || fail '.gitmodules declares no submodules'
 
-    local missing=0
-    for path in "${expected_paths[@]}"; do
-        if ! awk -v wanted="$path" '
-            substr($0, 43, length(wanted)) == wanted &&
-            (length($0) == 42 + length(wanted) || substr($0, 43 + length(wanted), 1) == " ") {
-                found = 1
-            }
-            END { exit found ? 0 : 1 }
-        ' "$status_file"; then
-            printf 'error: configured submodule is absent from status output: %s\n' "$path" >&2
-            ((missing += 1))
-        fi
+    local -A configured=() gitlinks=()
+    local -a configured_paths=()
+    local record key path metadata mode type sha extra
+    for record in "${configured_records[@]}"; do
+        [[ $record == *$'\n'* ]] || fail 'malformed submodule path entry in .gitmodules'
+        key=${record%%$'\n'*}
+        path=${record#*$'\n'}
+        [[ $key == submodule.*.path ]] || fail "malformed submodule path key: $key"
+        valid_submodule_path "$path" || fail "unsafe or malformed submodule path: $path"
+        [[ -z ${configured[$path]+present} ]] || fail "duplicate configured submodule path: $path"
+        configured[$path]=1
+        configured_paths+=("$path")
     done
 
-    cat "$status_file"
-    if ((bad > 0 || missing > 0)); then
-        printf 'error: submodule verification refused: %d drifted/uninitialized/conflicted, %d configured path(s) absent\n' \
-            "$bad" "$missing" >&2
-        printf '%s\n' "  leading '-' = not initialized, '+' = a different revision, 'U' = merge conflict" >&2
-        printf '%s\n' "  NOT repaired: run 'make checkout-all' explicitly to reset to the recorded pins." >&2
-        return 1
-    fi
+    for record in "${tree_records[@]}"; do
+        [[ $record == *$'\t'* ]] || fail 'malformed git tree entry'
+        metadata=${record%%$'\t'*}
+        path=${record#*$'\t'}
+        read -r mode type sha extra <<<"$metadata"
+        [[ -z ${extra:-} ]] || fail "malformed git tree metadata for $path"
+        [[ $mode == 160000 ]] || continue
+        [[ $type == commit && $sha =~ ^[0-9a-f]{40}$ ]] || \
+            fail "malformed committed gitlink for $path"
+        valid_submodule_path "$path" || fail "unsafe or malformed committed gitlink path: $path"
+        [[ -z ${gitlinks[$path]+present} ]] || fail "duplicate committed gitlink path: $path"
+        gitlinks[$path]=$sha
+    done
 
-    printf 'submodules OK -- %d configured path(s), %d status row(s), verified without repair\n' \
-        "${#expected_paths[@]}" "$observed"
+    ((${#configured[@]} == ${#gitlinks[@]})) || \
+        fail ".gitmodules declares ${#configured[@]} path(s), but HEAD contains ${#gitlinks[@]} gitlink(s)"
+    for path in "${!gitlinks[@]}"; do
+        [[ -n ${configured[$path]+present} ]] || \
+            fail "committed gitlink is not declared in .gitmodules: $path"
+    done
+
+    local observed=0 nested_root expected_root nested_head dirty
+    local -a index_records=()
+    for path in "${configured_paths[@]}"; do
+        [[ -n ${gitlinks[$path]+present} ]] || \
+            fail "configured path is not a committed gitlink in HEAD: $path"
+        sha=${gitlinks[$path]}
+
+        : >"$index_file"
+        if ! GIT_OPTIONAL_LOCKS=0 "${git_argv[@]}" -c core.fsmonitor=false --literal-pathspecs \
+            ls-files --stage -z -- "$path" >"$index_file"; then
+            fail "could not inspect the index entry for submodule: $path"
+        fi
+        index_records=()
+        mapfile -d '' -t index_records <"$index_file"
+        ((${#index_records[@]} == 1)) || \
+            fail "submodule index entry is missing or conflicted for $path (${#index_records[@]} stage rows)"
+        record=${index_records[0]}
+        [[ $record == *$'\t'* ]] || fail "malformed submodule index entry for $path"
+        metadata=${record%%$'\t'*}
+        [[ ${record#*$'\t'} == "$path" ]] || fail "submodule index path mismatch for $path"
+        read -r mode nested_head type extra <<<"$metadata"
+        [[ -z ${extra:-} && $mode == 160000 && $type == 0 && $nested_head == "$sha" ]] || \
+            fail "submodule index entry does not match HEAD gitlink for $path"
+
+        [[ -d $path && ! -L $path ]] || fail "submodule directory is missing or not a directory: $path"
+        if ! nested_root=$(GIT_OPTIONAL_LOCKS=0 "${git_argv[@]}" -c core.fsmonitor=false \
+            -C "$path" rev-parse --show-toplevel); then
+            fail "submodule path is not a populated git repository: $path"
+        fi
+        expected_root=$(cd -- "$path" && pwd -P)
+        nested_root=$(cd -- "$nested_root" && pwd -P)
+        [[ $nested_root == "$expected_root" ]] || \
+            fail "submodule path resolves through a different git repository: $path"
+        if ! nested_head=$(GIT_OPTIONAL_LOCKS=0 "${git_argv[@]}" -c core.fsmonitor=false \
+            -C "$path" rev-parse --verify 'HEAD^{commit}'); then
+            fail "submodule has no readable HEAD commit: $path"
+        fi
+        [[ $nested_head == "$sha" ]] || \
+            fail "submodule HEAD differs from recorded gitlink for $path: expected $sha, found $nested_head"
+
+        : >"$status_file"
+        if ! GIT_OPTIONAL_LOCKS=0 "${git_argv[@]}" -c core.fsmonitor=false \
+            -C "$path" status --porcelain=v1 --untracked-files=all --ignore-submodules=none \
+            >"$status_file"; then
+            fail "could not inspect submodule worktree state: $path"
+        fi
+        dirty=$(<"$status_file")
+        [[ -z $dirty ]] || fail "submodule worktree is dirty: $path"
+
+        printf ' %s %s\n' "$sha" "$path"
+        ((observed += 1))
+    done
+
+    printf 'submodules OK -- %d configured path(s), verified against HEAD and populated worktrees without repair\n' \
+        "$observed"
 }
 
 self_test() {
-    local root self fake expected status output
+    local root self git_bin agent_seed rr_seed super agent_sha rr_sha output
     root=$(mktemp -d)
     self=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
-    fake=$root/fake-git
-    expected=$root/expected
-    status=$root/status
+    git_bin=$(command -v git)
+    agent_seed=$root/agent-utils-seed
+    rr_seed=$root/rr-seed
+    super=$root/super
     output=$root/output
     trap 'rm -rf -- "$root"' RETURN
 
-    touch "$root/.gitmodules"
-    tee "$fake" >/dev/null <<'FAKE'
-#!/usr/bin/env bash
-set -euo pipefail
-case "${1-} ${2-}" in
-    'config -f')
-        if [[ ${FAKE_CONFIG_RC:-0} != 0 ]]; then exit "$FAKE_CONFIG_RC"; fi
-        cat "$FAKE_EXPECTED"
-        ;;
-    'submodule status')
-        if [[ ${FAKE_STATUS_RC:-0} != 0 ]]; then exit "$FAKE_STATUS_RC"; fi
-        cat "$FAKE_STATUS"
-        ;;
-    *)
-        echo "unexpected fake-git argv: $*" >&2
-        exit 97
-        ;;
-esac
-FAKE
-    chmod +x "$fake"
+    make_seed() {
+        local repo=$1 payload=$2
+        "$git_bin" init -q "$repo"
+        printf '%s\n' "$payload" >"$repo/payload"
+        "$git_bin" -C "$repo" add payload
+        "$git_bin" -C "$repo" -c user.name=fixture -c user.email=fixture@example.invalid \
+            commit -qm initial
+    }
+    make_seed "$agent_seed" agent-utils
+    make_seed "$rr_seed" rr
+    agent_sha=$("$git_bin" -C "$agent_seed" rev-parse HEAD)
+    rr_sha=$("$git_bin" -C "$rr_seed" rev-parse HEAD)
 
-    printf '%s\n' \
-        'submodule.agent-utils.path agent-utils' \
-        'submodule.rr.path third-party/rr' >"$expected"
-    printf ' %040d agent-utils (heads/main)\n %040d third-party/rr (v5.8)\n' 1 2 >"$status"
+    "$git_bin" init -q "$super"
+    mkdir -p "$super/third-party"
+    cat >"$super/.gitmodules" <<EOF
+[submodule "agent-utils"]
+    path = agent-utils
+    url = $agent_seed
+[submodule "rr"]
+    path = third-party/rr
+    url = $rr_seed
+EOF
+    "$git_bin" -C "$super" add .gitmodules
+    "$git_bin" -C "$super" update-index --add --cacheinfo "160000,$agent_sha,agent-utils"
+    "$git_bin" -C "$super" update-index --add --cacheinfo "160000,$rr_sha,third-party/rr"
+    "$git_bin" -C "$super" -c user.name=fixture -c user.email=fixture@example.invalid \
+        commit -qm super
 
+    make_checkout() {
+        local checkout=$root/$1
+        "$git_bin" clone -q --no-recurse-submodules "$super" "$checkout"
+        "$git_bin" clone -q "$agent_seed" "$checkout/agent-utils"
+        mkdir -p "$checkout/third-party"
+        "$git_bin" clone -q "$rr_seed" "$checkout/third-party/rr"
+        printf '%s\n' "$checkout"
+    }
     run_check() {
-        (cd "$root" && SUBMODULE_GIT="$fake" FAKE_EXPECTED="$expected" \
-            FAKE_STATUS="$status" FAKE_CONFIG_RC="${FAKE_CONFIG_RC:-0}" \
-            FAKE_STATUS_RC="${FAKE_STATUS_RC:-0}" "$self" --check) >"$output" 2>&1
+        local checkout=$1
+        (cd "$checkout" && SUBMODULE_GIT="$git_bin" "$self" --check) >"$output" 2>&1
     }
     expect_refusal() {
-        local label=$1
-        if run_check; then
+        local label=$1 checkout=$2
+        if run_check "$checkout"; then
             cat "$output" >&2
             fail "self-test $label unexpectedly passed"
         fi
     }
 
-    run_check || { cat "$output" >&2; fail 'self-test clean inventory failed'; }
-    grep -q 'verified without repair' "$output" || fail 'self-test clean success marker absent'
+    local checkout config_before config_after
+    checkout=$(make_checkout clean)
+    if "$git_bin" -C "$checkout" config --local --get-regexp '^submodule\..*\.' >/dev/null; then
+        fail 'self-test clean fixture unexpectedly registered submodules'
+    fi
+    config_before=$(cksum <"$checkout/.git/config")
+    run_check "$checkout" || { cat "$output" >&2; fail 'self-test clean unregistered checkout failed'; }
+    config_after=$(cksum <"$checkout/.git/config")
+    [[ $config_before == "$config_after" ]] || fail 'self-test verifier mutated local git config'
+    if "$git_bin" -C "$checkout" config --local --get-regexp '^submodule\..*\.' >/dev/null; then
+        fail 'self-test verifier registered submodules while checking them'
+    fi
+    grep -q 'verified against HEAD and populated worktrees without repair' "$output" || \
+        fail 'self-test clean success marker absent'
 
-    FAKE_CONFIG_RC=17 expect_refusal 'config producer failure'
-    FAKE_CONFIG_RC=0
-    : >"$expected"
-    expect_refusal 'empty configured population'
-    printf '%s\n' \
-        'submodule.agent-utils.path agent-utils' \
-        'submodule.rr.path third-party/rr' >"$expected"
+    checkout=$(make_checkout missing)
+    rm -rf -- "$checkout/third-party/rr"
+    expect_refusal 'missing directory' "$checkout"
 
-    FAKE_STATUS_RC=19 expect_refusal 'status producer failure'
-    FAKE_STATUS_RC=0
-    : >"$status"
-    expect_refusal 'empty observed population'
-    printf '%s\n' 'not-a-status-line' >"$status"
-    expect_refusal 'malformed status'
+    checkout=$(make_checkout nonrepo)
+    rm -rf -- "$checkout/agent-utils"
+    mkdir "$checkout/agent-utils"
+    expect_refusal 'non-repository directory' "$checkout"
 
-    local marker before after
-    for marker in '-' '+' 'U'; do
-        printf '%s%040d agent-utils (heads/main)\n %040d third-party/rr (v5.8)\n' \
-            "$marker" 1 2 >"$status"
-        before=$(cksum <"$status")
-        expect_refusal "status marker $marker"
-        after=$(cksum <"$status")
-        [[ $before == "$after" ]] || fail "self-test marker $marker mutated its observed input"
-    done
+    checkout=$(make_checkout wrong-head)
+    printf '%s\n' changed >>"$checkout/agent-utils/payload"
+    "$git_bin" -C "$checkout/agent-utils" add payload
+    "$git_bin" -C "$checkout/agent-utils" -c user.name=fixture -c user.email=fixture@example.invalid \
+        commit -qm changed
+    expect_refusal 'wrong clean HEAD' "$checkout"
 
-    printf 'PASS: verify-submodules refuses failed, empty, malformed, -, +, and U inventories without mutation\n'
+    checkout=$(make_checkout dirty)
+    printf '%s\n' dirty >>"$checkout/agent-utils/payload"
+    expect_refusal 'dirty worktree' "$checkout"
+
+    checkout=$(make_checkout conflict)
+    "$git_bin" -C "$checkout" update-index --force-remove agent-utils
+    printf '160000 %s 1\tagent-utils\0' "$agent_sha" | \
+        "$git_bin" -C "$checkout" update-index -z --index-info
+    printf '160000 %s 2\tagent-utils\0' "$rr_sha" | \
+        "$git_bin" -C "$checkout" update-index -z --index-info
+    printf '160000 %s 3\tagent-utils\0' "$agent_sha" | \
+        "$git_bin" -C "$checkout" update-index -z --index-info
+    expect_refusal 'conflicted gitlink' "$checkout"
+
+    checkout=$(make_checkout malformed)
+    cat >"$checkout/.gitmodules" <<EOF
+[submodule "escape"]
+    path = ../escape
+    url = $agent_seed
+EOF
+    expect_refusal 'unsafe configured path' "$checkout"
+
+    checkout=$(make_checkout producer-failure)
+    if (cd "$checkout" && SUBMODULE_GIT=false "$self" --check) >"$output" 2>&1; then
+        fail 'self-test git producer failure unexpectedly passed'
+    fi
+
+    printf 'PASS: verify-submodules checks unregistered populated repositories and refuses missing, non-repo, wrong-HEAD, dirty, conflicted, malformed, and unreadable states without repair\n'
 }
 
 case "${1:---check}" in

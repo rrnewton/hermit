@@ -1082,6 +1082,205 @@ fn strict_flag_missing_from(argv: &[String]) -> bool {
         .any(|arg| arg == STRICT_EXECUTION_FLAG)
 }
 
+/// Exercise the real bootstrap boundary around the first DAG node.
+///
+/// With agent-utils populated, the Rust driver can start and a missing rr
+/// checkout must become a schema-3 FAILED result from `pre.submodules`, even
+/// though cgroup setup replaces the process first. With agent-utils absent,
+/// rust-script cannot build the driver; that remains a pre-driver bootstrap
+/// failure and must not manufacture a typed result.
+fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, String> {
+    fn run_fixture(checkout: &Path, result: &Path) -> Result<std::process::Output, String> {
+        let mut command = Command::new("timeout");
+        command
+            .args([
+                "--signal=TERM",
+                "300",
+                "./scripts/validate.rs",
+                ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION,
+                "--only",
+                "portable",
+                "pre.submodules",
+            ])
+            .current_dir(checkout)
+            .env(VALIDATE_SERVICE_RESULT_PATH_ENV, result)
+            .env("DAGRUN_FORCE_SCOPE_ATTEMPT", "1")
+            .env_remove("CI")
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("DAGRUN_IN_SCOPE")
+            .env_remove("DAGRUN_SCOPE_UNIT")
+            .env_remove("DAGRUN_EXPECTED_OUTER_MEMORY_MAX_BYTES")
+            .env_remove("DAGRUN_EXPECTED_OUTER_CPU_COUNT")
+            .env_remove("DAGRUN_EXPECTED_RUNTIME_MAX_SEC")
+            .env_remove(OWN_SCOPE_DEADLINE_ENV)
+            .env_remove(PARENT_ENV)
+            .env_remove(TOOL_ROOT_ENV)
+            .env_remove(TOOL_AUTHORITY_ENV)
+            .env_remove(TOOL_CONTENT_SHA256_ENV)
+            .env_remove(TOOL_PARENT_SHA_ENV)
+            .env_remove(TOOL_HERMIT_SHA_ENV)
+            .env_remove(TOOL_AGENT_UTILS_SHA_ENV)
+            .env_remove(TOOL_BOOTSTRAP_SHA256_ENV)
+            .env_remove(validate_runtime::ACTIVE_ENV)
+            .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_PID")
+            .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_FILE");
+        command
+            .output()
+            .map_err(|error| format!("submodule service result: cannot launch fixture: {error}"))
+    }
+
+    fn checked_command(command: &mut Command, what: &str) -> Result<(), String> {
+        let output = command
+            .output()
+            .map_err(|error| format!("submodule service result: cannot {what}: {error}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "submodule service result: {what} failed with {:?}: {}{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    }
+
+    let fixture = tempfile::tempdir()
+        .map_err(|error| format!("submodule service result: cannot create fixture: {error}"))?;
+    let checkout = fixture.path().join("hermit");
+    checked_command(
+        Command::new("git")
+            .args(["clone", "--quiet", "--no-local", "--no-recurse-submodules"])
+            .arg(root)
+            .arg(&checkout),
+        "clone the independent Hermit fixture",
+    )?;
+
+    // A self-test can run from an uncommitted edit while it is being developed.
+    // Overlay exactly this test's production files, then commit only when that
+    // changed the clone. The real child therefore still runs from a clean SHA.
+    for relative in ["Makefile", "ci/verify-submodules.sh", "scripts/validate.rs"] {
+        std::fs::copy(root.join(relative), checkout.join(relative)).map_err(|error| {
+            format!("submodule service result: cannot copy {relative} into fixture: {error}")
+        })?;
+    }
+    checked_command(
+        Command::new("git")
+            .args([
+                "add",
+                "--",
+                "Makefile",
+                "ci/verify-submodules.sh",
+                "scripts/validate.rs",
+            ])
+            .current_dir(&checkout),
+        "stage the fixture sources",
+    )?;
+    let staged = Command::new("git")
+        .args(["diff", "--cached", "--quiet"])
+        .current_dir(&checkout)
+        .status()
+        .map_err(|error| {
+            format!("submodule service result: cannot inspect fixture diff: {error}")
+        })?;
+    if !staged.success() {
+        checked_command(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=validate fixture",
+                    "-c",
+                    "user.email=validate-fixture@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "validate service-result fixture",
+                ])
+                .current_dir(&checkout),
+            "commit the fixture sources",
+        )?;
+    }
+
+    let bootstrap_result = fixture.path().join("bootstrap-result.json");
+    let bootstrap = run_fixture(&checkout, &bootstrap_result)?;
+    let bootstrap_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&bootstrap.stdout),
+        String::from_utf8_lossy(&bootstrap.stderr)
+    );
+    if bootstrap.status.success()
+        || bootstrap_result.exists()
+        || String::from_utf8_lossy(&bootstrap.stdout).contains(FINAL_VALIDATE_STATUS_PREFIX)
+        || !bootstrap_output.contains("agent-utils")
+    {
+        return Err(format!(
+            "submodule service result: missing agent-utils did not remain a diagnosed bootstrap failure: \
+             status={:?} result_exists={} output={bootstrap_output}",
+            bootstrap.status.code(),
+            bootstrap_result.exists()
+        ));
+    }
+
+    checked_command(
+        Command::new("git")
+            .args(["clone", "--quiet", "--no-local"])
+            .arg(root.join("agent-utils"))
+            .arg(checkout.join("agent-utils")),
+        "populate only agent-utils",
+    )?;
+    let expected_agent_utils = Command::new("git")
+        .args(["ls-tree", "HEAD", "agent-utils"])
+        .current_dir(&checkout)
+        .output()
+        .map_err(|error| {
+            format!("submodule service result: cannot read agent-utils pin: {error}")
+        })?;
+    let expected_agent_utils = String::from_utf8_lossy(&expected_agent_utils.stdout)
+        .split_whitespace()
+        .nth(2)
+        .ok_or("submodule service result: agent-utils gitlink is absent")?
+        .to_string();
+    checked_command(
+        Command::new("git")
+            .args(["checkout", "--quiet", &expected_agent_utils])
+            .current_dir(checkout.join("agent-utils")),
+        "checkout the recorded agent-utils pin",
+    )?;
+
+    let result_path = fixture.path().join("service-result.json");
+    let output = run_fixture(&checkout, &result_path)?;
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result = ValidationServiceResult::from_json_slice(&std::fs::read(&result_path).map_err(
+        |error| {
+            format!(
+                "submodule service result: pre.submodules failure wrote no typed result: {error}; \
+                 status={:?} output={rendered}",
+                output.status.code()
+            )
+        },
+    )?)?;
+    if output.status.code() != Some(1)
+        || result.final_validate_status != FinalValidateStatus::Failed
+        || result.exit_code != 1
+        || result.executed_nodes != 1
+        || !rendered.contains("pre.submodules")
+        || !rendered.contains("third-party/rr")
+        || !rendered.contains("FINAL_VALIDATE_STATUS: FAILED")
+    {
+        return Err(format!(
+            "submodule service result: missing rr was not attributed to the real first DAG node: \
+             status={:?} result={result:?} output={rendered}",
+            output.status.code()
+        ));
+    }
+
+    Ok("missing agent-utils stays a bootstrap failure; with agent-utils present, missing rr is a typed pre.submodules failure across scope re-exec".into())
+}
+
 /// Inert brackets for the policy predicate and the shell quoter.
 ///
 /// These cannot launch a run or authorize a receipt — they only prove the
@@ -1092,6 +1291,10 @@ fn strict_flag_missing_from(argv: &[String]) -> bool {
 fn self_test() -> Result<(), String> {
     inner_freshness_skip_cli_bracket()?;
     run_owned_cache_bracket()?;
+    println!(
+        "  {}",
+        submodule_failure_service_result_bracket(&repo_root())?
+    );
 
     // ---- known-fail-closed disposition, as a pure decision table ----
     //
@@ -3901,6 +4104,7 @@ fn resolve_cgroups(
     allow_failure: bool,
     run_timeout_s: Option<i64>,
     deadline_ns: Option<u64>,
+    service_result_path: Option<&Path>,
 ) -> Result<BoxedCgroups, u8> {
     let owns_request = owns_scope_request(deadline_ns);
     if is_in_scope() && run_timeout_s.is_some() && !owns_request {
@@ -3919,12 +4123,22 @@ fn resolve_cgroups(
             std::env::remove_var(OWN_SCOPE_DEADLINE_ENV);
         }
     }
-    safe_ci_scope::propagate_result(safe_ci_scope::resolve_cgroups(
+    // `main` removes this producer-owned path immediately after capturing it so
+    // nested commands cannot inherit authority to publish a competing result.
+    // The one legitimate descendant is our own systemd scope replacement.
+    // Expose the stored path only across that exec boundary; if setup returns,
+    // remove it again before any DAG payload can be launched.
+    if let Some(path) = service_result_path {
+        std::env::set_var(VALIDATE_SERVICE_RESULT_PATH_ENV, path);
+    }
+    let result = safe_ci_scope::resolve_cgroups(
         "validate",
         allow_failure,
         scope_runtime_s,
         owns_request,
-    ))
+    );
+    std::env::remove_var(VALIDATE_SERVICE_RESULT_PATH_ENV);
+    safe_ci_scope::propagate_result(result)
 }
 
 // --------------------------------------------------------------------------- durable log
@@ -15801,7 +16015,7 @@ fn main() -> ExitCode {
 
     // The durable log outlives `run` so the summary lands INSIDE it.
     let mut durable: Option<DurableLog> = None;
-    let summary = run(&mut durable);
+    let summary = run(&mut durable, service_result_path.as_deref());
     if let Err(error) = publish_validation_service_result(service_result_path.as_deref(), &summary) {
         eprintln!("validate: ERROR: {error}");
     }
@@ -15813,7 +16027,7 @@ fn main() -> ExitCode {
 }
 
 /// The whole invocation, returning what it concluded rather than an exit code.
-fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
+fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>) -> RunSummary {
     let args = match parse_args() {
         Ok(a) => a,
         // `parse_args` returns 0 only for `--help`, whose usage text is the
@@ -16669,7 +16883,12 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     }
 
     let cgroups: BoxedCgroups =
-        match resolve_cgroups(args.allow_cgroup_failure, run_timeout, deadline_ns) {
+        match resolve_cgroups(
+            args.allow_cgroup_failure,
+            run_timeout,
+            deadline_ns,
+            service_result_path,
+        ) {
             Ok(c) => {
                 // Claim the re-entrancy marker HERE, not before resolve_cgroups.
                 // On the default path resolve_cgroups re-execs into a transient
