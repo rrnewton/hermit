@@ -353,6 +353,7 @@ struct Args {
     force_full: bool,
     baseline: Option<String>,
     allow_local_off_the_record_run: bool,
+    out_of_place_concurrency_experiment: bool,
     skip_inner_dirty_working_tree_and_rebase_freshness_checks: bool,
     ignore_cache: bool,
     label_pr: bool,
@@ -377,6 +378,12 @@ const SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION: &str =
 const SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_ENV: &str =
     "VALIDATE_SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS";
 const ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION: &str = "--allow-local-off-the-record-run";
+const OUT_OF_PLACE_CONCURRENCY_EXPERIMENT_OPTION: &str =
+    "--out-of-place-concurrency-experiment";
+const OUT_OF_PLACE_CONCURRENCY_RESOURCES: [&str; 2] = [
+    validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE,
+    "manifest_guest",
+];
 
 fn usage() -> &'static str {
     "Usage: ./scripts/validate.rs [LEVEL] [OPTIONS]\n\
@@ -419,6 +426,11 @@ fn usage() -> &'static str {
      \x20                  Permit a clean, commit-anchored quick or focused local run for\n\
      \x20                  iterative testing. It writes no ledger row, publishes no receipt,\n\
      \x20                  and cannot be cited as validation evidence.\n\
+     \x20 --out-of-place-concurrency-experiment\n\
+     \x20                  INTERNAL EXPERIMENT: force the complete full plan, ignore cached\n\
+     \x20                  validation, publish no label, and remove hermit_guest/manifest_guest\n\
+     \x20                  caps and demands after plan construction. Requires an explicit\n\
+     \x20                  HERMIT_VALIDATE_LEDGER for a non-plan run.\n\
      \x20 --verbose        Verbosity level 2: stream tagged per-step output.\n\
      \x20 --verbosity N    Output level 1..5 (default 1; levels 3/4 currently equal 2;\n\
      \x20                  level 5 prefixes every streamed line with test identity).\n\
@@ -537,6 +549,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         force_full: env_flag("VALIDATE_FORCE_FULL", "1"),
         baseline: None,
         allow_local_off_the_record_run: false,
+        out_of_place_concurrency_experiment: false,
         skip_inner_dirty_working_tree_and_rebase_freshness_checks: env_flag(
             SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_ENV,
             "1",
@@ -658,6 +671,9 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
                 args.allow_local_off_the_record_run = true;
                 args.label_pr = false;
             }
+            OUT_OF_PLACE_CONCURRENCY_EXPERIMENT_OPTION => {
+                args.out_of_place_concurrency_experiment = true;
+            }
             SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION => {
                 args.skip_inner_dirty_working_tree_and_rebase_freshness_checks = true
             }
@@ -761,6 +777,18 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
     }
     if args.allow_local_off_the_record_run {
         args.label_pr = false;
+    }
+    if args.out_of_place_concurrency_experiment {
+        if args.level != Level::Full || args.focused.is_some() {
+            eprintln!(
+                "validate: {OUT_OF_PLACE_CONCURRENCY_EXPERIMENT_OPTION} requires the complete full profile"
+            );
+            return Err(2);
+        }
+        args.force_full = true;
+        args.ignore_cache = true;
+        args.label_pr = false;
+        args.no_label_pr_explicit = true;
     }
     if args.ignore_selected_deps && args.selected.is_none() {
         eprintln!("validate: --ignore-selected-deps requires --selected");
@@ -1350,6 +1378,10 @@ fn self_test() -> Result<(), String> {
     inner_freshness_skip_cli_bracket()?;
     run_owned_cache_bracket()?;
     println!("  {}", portable_strict_compat_outer_dag_bracket(&repo_root())?);
+    println!(
+        "  {}",
+        out_of_place_concurrency_experiment_bracket(&repo_root())?
+    );
     println!("  {}", raw_run_dag_strict_compat_bracket(&repo_root())?);
     shard_coverage_resource_policy_bracket(&repo_root())?;
     println!(
@@ -6184,6 +6216,169 @@ impl Default for Plan {
             cell_evidence_expected: None,
         }
     }
+}
+
+/// Remove only the two guest-concurrency resources whose box-wide exclusion is
+/// under test. This runs after every plan constructor/expander so newly-created
+/// strict-compat and manifest nodes cannot retain a hidden demand. All other
+/// resource accounting remains intact.
+fn neutralize_out_of_place_concurrency_resources(plan: &mut Plan) {
+    let neutralize = |cfg: &mut DagConfig| {
+        for resource in OUT_OF_PLACE_CONCURRENCY_RESOURCES {
+            cfg.resource_caps.remove(resource);
+        }
+        for step in &mut cfg.steps {
+            for resource in OUT_OF_PLACE_CONCURRENCY_RESOURCES {
+                step.hint.resources.remove(resource);
+            }
+        }
+    };
+    neutralize(&mut plan.cfg);
+    if let Some(second) = &mut plan.second {
+        neutralize(second);
+    }
+}
+
+fn out_of_place_concurrency_experiment_bracket(root: &Path) -> Result<String, String> {
+    let parsed = parse_argv(&[OUT_OF_PLACE_CONCURRENCY_EXPERIMENT_OPTION.into()])
+        .map_err(|code| format!("concurrency experiment: valid argv refused with exit {code}"))?;
+    if parsed.level != Level::Full
+        || parsed.focused.is_some()
+        || !parsed.force_full
+        || !parsed.ignore_cache
+        || parsed.label_pr
+        || !parsed.no_label_pr_explicit
+        || parsed.allow_local_off_the_record_run
+    {
+        return Err(
+            "concurrency experiment: parser did not force full, uncached, no-label evidence while retaining alternate-ledger writeback"
+                .into(),
+        );
+    }
+    for argv in [
+        vec!["quick".into(), OUT_OF_PLACE_CONCURRENCY_EXPERIMENT_OPTION.into()],
+        vec![
+            "--strict-compat-only".into(),
+            OUT_OF_PLACE_CONCURRENCY_EXPERIMENT_OPTION.into(),
+        ],
+    ] {
+        if parse_argv(&argv).is_ok() {
+            return Err(format!(
+                "concurrency experiment: partial profile was accepted: {argv:?}"
+            ));
+        }
+    }
+
+    let fixture = tempfile::Builder::new()
+        .prefix("validate-concurrency-experiment-")
+        .tempdir()
+        .map_err(|error| format!("concurrency experiment: cannot create fixture: {error}"))?;
+    let mut plan = build_plan(root, &parsed, fixture.path())?;
+    if plan.second.is_some() {
+        return Err("concurrency experiment: default full plan unexpectedly has two DAGs".into());
+    }
+    for resource in OUT_OF_PLACE_CONCURRENCY_RESOURCES {
+        if !plan.cfg.resource_caps.contains_key(resource)
+            || !plan
+                .cfg
+                .steps
+                .iter()
+                .any(|step| step.hint.resources.contains_key(resource))
+        {
+            return Err(format!(
+                "concurrency experiment: constructed full plan did not contain {resource} before the final rewrite"
+            ));
+        }
+    }
+    let preserved_caps = plan
+        .cfg
+        .resource_caps
+        .iter()
+        .filter(|(resource, _)| !OUT_OF_PLACE_CONCURRENCY_RESOURCES.contains(&resource.as_str()))
+        .map(|(resource, capacity)| (resource.clone(), *capacity))
+        .collect::<BTreeMap<_, _>>();
+    let preserved_demands = plan
+        .cfg
+        .steps
+        .iter()
+        .map(|step| {
+            (
+                step.tag(),
+                step.hint
+                    .resources
+                    .iter()
+                    .filter(|(resource, _)| {
+                        !OUT_OF_PLACE_CONCURRENCY_RESOURCES.contains(&resource.as_str())
+                    })
+                    .map(|(resource, demand)| (resource.clone(), *demand))
+                    .collect::<BTreeMap<_, _>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if !preserved_caps.contains_key("kvm")
+        || !preserved_caps
+            .keys()
+            .any(|resource| resource.starts_with(FUSED_INTEGRATION_TEST_RESOURCE_PREFIX))
+    {
+        return Err(format!(
+            "concurrency experiment: full plan lacks non-experimental resource controls: {:?}",
+            preserved_caps.keys().collect::<Vec<_>>()
+        ));
+    }
+
+    neutralize_out_of_place_concurrency_resources(&mut plan);
+    let assert_neutral = |label: &str, cfg: &DagConfig| -> Result<(), String> {
+        let surviving_caps = OUT_OF_PLACE_CONCURRENCY_RESOURCES
+            .iter()
+            .filter(|resource| cfg.resource_caps.contains_key(**resource))
+            .copied()
+            .collect::<Vec<_>>();
+        let surviving_demands = cfg
+            .steps
+            .iter()
+            .flat_map(|step| {
+                OUT_OF_PLACE_CONCURRENCY_RESOURCES
+                    .iter()
+                    .filter(move |resource| step.hint.resources.contains_key(**resource))
+                    .map(move |resource| format!("{}:{resource}", step.tag()))
+            })
+            .collect::<Vec<_>>();
+        if !surviving_caps.is_empty() || !surviving_demands.is_empty() {
+            return Err(format!(
+                "concurrency experiment: {label} retained caps {surviving_caps:?} or demands {surviving_demands:?}"
+            ));
+        }
+        Ok(())
+    };
+    assert_neutral("rewritten plan", &plan.cfg)?;
+    if plan.cfg.resource_caps != preserved_caps {
+        return Err("concurrency experiment: final rewrite changed an unrelated resource cap".into());
+    }
+    let rewritten_demands = plan
+        .cfg
+        .steps
+        .iter()
+        .map(|step| (step.tag(), step.hint.resources.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if rewritten_demands != preserved_demands {
+        return Err("concurrency experiment: final rewrite changed an unrelated resource demand".into());
+    }
+    if !validate_plan::ungrantable_resources(&plan.cfg).is_empty() {
+        return Err("concurrency experiment: rewritten full plan has an ungrantable resource".into());
+    }
+
+    let serialized = dag_to_json(&plan.cfg);
+    let decoded = dag_from_json(&serialized)
+        .map_err(|error| format!("concurrency experiment: serialized DAG did not round-trip: {error}"))?;
+    assert_neutral("serialized round-trip", &decoded)?;
+    if decoded.resource_caps != preserved_caps {
+        return Err("concurrency experiment: serialized DAG lost an unrelated resource cap".into());
+    }
+    Ok(format!(
+        "out-of-place concurrency experiment: removed hermit_guest/manifest_guest from {} steps and serialized round-trip preserved {} other cap(s)",
+        decoded.steps.len(),
+        decoded.resource_caps.len()
+    ))
 }
 
 /// Keep a subgraph of the plan that validate has already constructed.
@@ -17883,6 +18078,23 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
              evidence."
         );
     }
+    if args.out_of_place_concurrency_experiment
+        && !args.show_plan
+        && std::env::var_os(LEDGER_ENV).is_none_or(|value| value.is_empty())
+    {
+        return RunSummary::refused(
+            2,
+            &profile_name,
+            "the out-of-place concurrency experiment boundary",
+            vec![
+                format!(
+                    "{OUT_OF_PLACE_CONCURRENCY_EXPERIMENT_OPTION} requires an explicit {LEDGER_ENV} path"
+                ),
+                "launch through ci-hub validate-run --frozen-validate so the result is written outside the canonical ledger and marked non-qualifying"
+                    .into(),
+            ],
+        );
+    }
 
     // ---- dev-hermit product front door -------------------------------------
     //
@@ -17898,6 +18110,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     let ci_hub_dir_present =
         tool_root.as_ref().is_some_and(|candidate| candidate.join("ci-hub").is_dir());
     if !args.allow_local_off_the_record_run
+        && !args.out_of_place_concurrency_experiment
         && product_front_door_applies(
         parent.is_some(),
         ci_hub_dir_present,
@@ -18237,6 +18450,10 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
                 ],
             );
         }
+    }
+
+    if args.out_of_place_concurrency_experiment {
+        neutralize_out_of_place_concurrency_resources(&mut plan);
     }
 
     assign_fail_fast_families(&mut plan);
