@@ -1239,7 +1239,7 @@ mod tests {
             ObservedResult::SandboxDenied,
             ObservedResult::InfrastructureError,
         ] {
-            let mut fixture = row(SeriesSchema::V3);
+            let mut fixture = no_verdict_row();
             fixture.series.outcome = SeriesOutcome::Errored;
             fixture.series.result = Some(result);
             fixture.series.failure_class = Some(FailureClass::UnderstoodInfrastructureFailure);
