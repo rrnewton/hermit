@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use chrono::DateTime;
 use chrono::Utc;
 use detcore_model::config::MountInfoRootRewrite;
+use detcore_model::procfs::MOUNT_PEER_PREFIXES;
 use detcore_model::procfs::MountInfoRow;
 pub(crate) use detcore_model::procfs::parse_mountinfo;
 use serde::Deserialize;
@@ -3386,10 +3387,6 @@ fn sanitize_schedstat(contents: &[u8]) -> Vec<u8> {
     normalized
 }
 
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-873): Review private mount-root normalization.
-const MOUNT_PEER_PREFIXES: [&[u8]; 3] = [b"shared:", b"master:", b"propagate_from:"];
-
 fn decimal_bytes(field: &[u8]) -> Option<u64> {
     parse_decimal(std::str::from_utf8(field).ok()?)
 }
@@ -4674,7 +4671,7 @@ Rss:                   4 kB\n" as &[u8];
 
     #[test]
     fn mountinfo_topology_preserves_self_and_unknown_parents() {
-        let input = b"10 10 8:1 / / rw shared:44 master:55 propagate_from:66 custom:77 - ext4 /dev/a rw\n20 999 8:2 / /child rw - ext4 /dev/b rw\n";
+        let input = b"10 10 8:1 / / rw shared:44 master:55 propagate_from:66 unbindable - ext4 /dev/a rw\n20 999 8:2 / /child rw - ext4 /dev/b rw\n";
         let snapshot = mountinfo_snapshot(
             input,
             BTreeMap::from([
@@ -4684,7 +4681,7 @@ Rss:                   4 kB\n" as &[u8];
         );
         assert_eq!(
             sanitize_mountinfo(input, &snapshot),
-            b"1 1 0:1 / / rw shared:1 master:2 propagate_from:3 custom:77 - ext4 /dev/a rw\n2 3 0:2 / /child rw - ext4 /dev/b rw\n"
+            b"1 1 0:1 / / rw shared:1 master:2 propagate_from:3 unbindable - ext4 /dev/a rw\n2 3 0:2 / /child rw - ext4 /dev/b rw\n"
         );
     }
 
@@ -4709,6 +4706,7 @@ Rss:                   4 kB\n" as &[u8];
             b"mount 10 259:5 / /child rw - ext4 /dev/a rw\n".as_slice(),
             b"20 10 4294967296:5 / /child rw - ext4 /dev/a rw\n".as_slice(),
             b"20 10 259:5 / /child rw shared:not-a-number - ext4 /dev/a rw\n".as_slice(),
+            b"20 10 259:5 / /child rw future_peer:77 - ext4 /dev/a rw\n".as_slice(),
         ] {
             assert!(
                 parse_mountinfo(input).is_none(),

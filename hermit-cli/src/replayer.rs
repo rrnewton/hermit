@@ -256,14 +256,17 @@ fn remember_materialized_path(
 
 use crate::desync::DesyncError;
 use crate::event::OpenMaterialization;
+use crate::event_stream::ChildEventStreamIds;
 use crate::event_stream::DebugEvent;
 use crate::event_stream::EventReader;
-use crate::event_stream::EventStreamIds;
+use crate::event_stream::EventStreamId;
 use crate::event_stream::normalize_unused_args;
 
 #[derive(Serialize, Deserialize)]
 pub struct ReplayerThreadState {
     events: EventReader,
+    stream_id: EventStreamId,
+    child_stream_ids: ChildEventStreamIds,
     bootstrapped: bool,
 }
 
@@ -308,9 +311,6 @@ pub struct Replayer {
     stdout_error: Option<String>,
     #[serde(skip)]
     stderr_error: Option<String>,
-    /// Stable event-stream names independent of host PID allocation.
-    #[serde(skip)]
-    stream_ids: EventStreamIds,
 }
 
 impl Default for Replayer {
@@ -323,7 +323,6 @@ impl Default for Replayer {
             stderr_output_lock: tokio::sync::Mutex::new(()),
             stdout_error: None,
             stderr_error: None,
-            stream_ids: EventStreamIds::default(),
         }
     }
 }
@@ -344,7 +343,6 @@ impl Tool for Replayer {
             stderr_output_lock: tokio::sync::Mutex::new(()),
             stdout_error,
             stderr_error,
-            stream_ids: EventStreamIds::default(),
         }
     }
 
@@ -353,15 +351,20 @@ impl Tool for Replayer {
         child: Tid,
         parent: Option<(Tid, &Self::ThreadState)>,
     ) -> Self::ThreadState {
-        let stream_id = self.stream_ids.next(parent.is_none());
+        let stream_id = match parent {
+            None => EventStreamId::root(),
+            Some((_, state)) => state.child_stream_ids.next(&state.stream_id),
+        };
         // We have to unwrap because there is no way to handle errors here.
         ReplayerThreadState {
-            events: EventReader::open(&self.data, stream_id).unwrap_or_else(|err| {
+            events: EventReader::open(&self.data, &stream_id).unwrap_or_else(|err| {
                 panic!(
                     "Failed to open {:?} for replay thread {} (physical {}): {}",
                     self.data, stream_id, child, err
                 )
             }),
+            stream_id,
+            child_stream_ids: ChildEventStreamIds::default(),
             bootstrapped: parent.is_some_and(|(_, state)| state.bootstrapped),
         }
     }
@@ -1891,6 +1894,7 @@ impl Replayer {
 
         let error = DesyncError {
             thread,
+            stream_id: guest.thread_state().stream_id.clone(),
             count: guest.thread_state().count,
             actual: actual_event,
             expected: debug_event,

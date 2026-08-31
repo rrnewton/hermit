@@ -64,8 +64,9 @@ use crate::event::OpenEvent;
 use crate::event::OpenMaterialization;
 use crate::event::ReplayFdKind;
 use crate::event::SyscallEvent;
+use crate::event_stream::ChildEventStreamIds;
 use crate::event_stream::DebugEvent;
-use crate::event_stream::EventStreamIds;
+use crate::event_stream::EventStreamId;
 use crate::event_stream::EventWriter;
 
 const MAX_EXEC_DEPENDENCY_DEPTH: usize = 5;
@@ -73,6 +74,8 @@ const MAX_EXEC_DEPENDENCY_DEPTH: usize = 5;
 #[derive(Default, Serialize, Deserialize)]
 pub struct RecorderThreadState {
     events: EventWriter,
+    stream_id: EventStreamId,
+    child_stream_ids: ChildEventStreamIds,
     pending_exec: Option<PreparedExec>,
     bootstrapped: bool,
 }
@@ -323,9 +326,6 @@ pub struct Recorder {
     stdout_ofd: Mutex<Option<std::os::fd::OwnedFd>>,
     #[serde(skip)]
     stderr_ofd: Mutex<Option<std::os::fd::OwnedFd>>,
-    /// Stable event-stream names independent of host PID allocation.
-    #[serde(skip)]
-    stream_ids: EventStreamIds,
 }
 
 impl Default for Recorder {
@@ -336,7 +336,6 @@ impl Default for Recorder {
             stderr: None,
             stdout_ofd: Mutex::new(None),
             stderr_ofd: Mutex::new(None),
-            stream_ids: EventStreamIds::default(),
         }
     }
 }
@@ -353,7 +352,6 @@ impl Tool for Recorder {
             stderr: OutputIdentity::for_fd(pid, libc::STDERR_FILENO),
             stdout_ofd: Mutex::new(duplicate_regular_output(pid, libc::STDOUT_FILENO)),
             stderr_ofd: Mutex::new(duplicate_regular_output(pid, libc::STDERR_FILENO)),
-            stream_ids: EventStreamIds::default(),
         }
     }
 
@@ -362,15 +360,20 @@ impl Tool for Recorder {
         child: Tid,
         parent: Option<(Tid, &Self::ThreadState)>,
     ) -> Self::ThreadState {
-        let stream_id = self.stream_ids.next(parent.is_none());
+        let stream_id = match parent {
+            None => EventStreamId::root(),
+            Some((_, state)) => state.child_stream_ids.next(&state.stream_id),
+        };
         // We have to unwrap because there is no way to handle errors here.
         RecorderThreadState {
-            events: EventWriter::create(&self.data, stream_id).unwrap_or_else(|err| {
+            events: EventWriter::create(&self.data, &stream_id).unwrap_or_else(|err| {
                 panic!(
                     "Failed to create {:?} for recording thread {} (physical {}): {}",
                     self.data, stream_id, child, err
                 )
             }),
+            stream_id,
+            child_stream_ids: ChildEventStreamIds::default(),
             pending_exec: None,
             bootstrapped: parent.is_some_and(|(_, state)| state.bootstrapped),
         }

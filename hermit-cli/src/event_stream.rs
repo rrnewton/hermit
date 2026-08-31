@@ -11,11 +11,10 @@ use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::atomic::AtomicI32;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use reverie::Errno;
-use reverie::Tid;
 use reverie::syscalls::Displayable;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::ReadAddr;
@@ -28,30 +27,83 @@ use serde::Serialize;
 
 use crate::event::Event;
 
-/// Stable event-stream IDs independent of host PID allocation.
+/// Stable event-stream identity derived from the guest process tree.
 ///
-/// Record and replay observe child creation in the same serialized order, so
-/// both sides derive the same stream names without persisting host IDs.
-pub(crate) struct EventStreamIds(AtomicI32);
+/// Each component after the root is the parent's deterministic child ordinal.
+/// Unlike a process-local counter, this remains collision-free when Reverie
+/// forks the tool itself and each process receives its own tool instance.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct EventStreamId(Vec<u64>);
 
-impl Default for EventStreamIds {
-    fn default() -> Self {
-        Self(AtomicI32::new(detcore::ROOT_DETPID.as_raw() + 1))
+impl EventStreamId {
+    pub(crate) fn root() -> Self {
+        Self(Vec::new())
+    }
+
+    pub(crate) fn child(&self, ordinal: u64) -> Self {
+        let mut path = self.0.clone();
+        path.push(ordinal);
+        Self(path)
     }
 }
 
-impl EventStreamIds {
-    pub(crate) fn next(&self, is_root: bool) -> Tid {
-        if is_root {
-            return Tid::from_raw(detcore::ROOT_DETPID.as_raw());
+impl Default for EventStreamId {
+    fn default() -> Self {
+        Self::root()
+    }
+}
+
+impl fmt::Display for EventStreamId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", detcore::ROOT_DETPID.as_raw())?;
+        for ordinal in &self.0 {
+            write!(f, ".{ordinal}")?;
         }
-        let id = self
+        Ok(())
+    }
+}
+
+/// Allocates child ordinals within one deterministic parent stream.
+///
+/// The counter belongs to the parent thread state rather than the Recorder or
+/// Replayer process instance. When Reverie forks a tool process, the child
+/// receives its already-assigned stream identity and a fresh descendant
+/// counter, while the continuing parent retains the incremented counter.
+pub(crate) struct ChildEventStreamIds(AtomicU64);
+
+impl Default for ChildEventStreamIds {
+    fn default() -> Self {
+        Self(AtomicU64::new(0))
+    }
+}
+
+impl ChildEventStreamIds {
+    pub(crate) fn next(&self, parent: &EventStreamId) -> EventStreamId {
+        let ordinal = self
             .0
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
-            .unwrap_or_else(|_| panic!("record/replay event-stream thread ID overflow"));
-        Tid::from_raw(id)
+            .unwrap_or_else(|_| panic!("record/replay child stream ordinal overflow"));
+        parent.child(ordinal)
+    }
+}
+
+impl Serialize for ChildEventStreamIds {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u64(self.0.load(Ordering::Relaxed))
+    }
+}
+
+impl<'de> Deserialize<'de> for ChildEventStreamIds {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(Self(AtomicU64::new(u64::deserialize(deserializer)?)))
     }
 }
 
@@ -119,6 +171,15 @@ impl DebugEvent {
 
     pub(crate) fn exec_request_matches(&self, other: &Self) -> bool {
         self.exec_request == other.exec_request
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(sysno: Sysno, pretty: &str) -> Self {
+        Self {
+            syscall: (sysno, SyscallArgs::new(0, 0, 0, 0, 0, 0)),
+            pretty: pretty.to_owned(),
+            exec_request: None,
+        }
     }
 }
 
@@ -214,13 +275,13 @@ fn default_reader() -> io::BufReader<fs::File> {
 
 impl EventReader {
     /// Opens an existing event stream.
-    pub fn open(path: &Path, thread_id: Tid) -> io::Result<Self> {
+    pub fn open(path: &Path, stream_id: &EventStreamId) -> io::Result<Self> {
         Ok(Self {
             reader: io::BufReader::new(fs::File::open(
-                path.join("thread").join(thread_id.to_string()),
+                path.join("thread").join(stream_id.to_string()),
             )?),
             debug_events: io::BufReader::new(fs::File::open(
-                path.join("thread").join(format!("{}.debug", thread_id)),
+                path.join("thread").join(format!("{stream_id}.debug")),
             )?),
             count: 0,
         })
@@ -271,16 +332,21 @@ fn default_writer() -> io::BufWriter<fs::File> {
 
 impl EventWriter {
     /// Creates a new event stream.
-    pub fn create(path: &Path, thread_id: Tid) -> io::Result<Self> {
+    pub fn create(path: &Path, stream_id: &EventStreamId) -> io::Result<Self> {
         let path = path.join("thread");
 
         fs::create_dir_all(&path)?;
 
+        let create = |path| {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+        };
+
         Ok(Self {
-            writer: io::BufWriter::new(fs::File::create(path.join(thread_id.to_string()))?),
-            debug_events: io::BufWriter::new(fs::File::create(
-                path.join(format!("{}.debug", thread_id)),
-            )?),
+            writer: io::BufWriter::new(create(path.join(stream_id.to_string()))?),
+            debug_events: io::BufWriter::new(create(path.join(format!("{stream_id}.debug")))?),
         })
     }
 
@@ -316,7 +382,8 @@ mod tests {
     use reverie::syscalls::SyscallArgs;
     use reverie::syscalls::Sysno;
 
-    use super::EventStreamIds;
+    use super::ChildEventStreamIds;
+    use super::EventStreamId;
     use super::kernel_arg_count;
     use super::normalize_unused_args;
 
@@ -396,16 +463,36 @@ mod tests {
     }
 
     #[test]
-    fn recording_local_stream_ids_do_not_depend_on_host_pids() {
-        let recording = EventStreamIds::default();
-        let replay = EventStreamIds::default();
-        assert_eq!(
-            recording.next(true),
-            replay.next(true),
-            "root stream IDs must match"
-        );
-        for _physical_pid_pair in [(300_001, 900_001), (300_117, 900_900)] {
-            assert_eq!(recording.next(false), replay.next(false));
-        }
+    fn pedigree_stream_ids_are_stable_and_collision_free() {
+        let root = EventStreamId::root();
+        let recording = ChildEventStreamIds::default();
+        let replay = ChildEventStreamIds::default();
+        let first = recording.next(&root);
+        let second = recording.next(&root);
+        assert_eq!(first.to_string(), "3.0");
+        assert_eq!(second.to_string(), "3.1");
+        assert_ne!(first, second);
+        assert_eq!(first, replay.next(&root));
+        assert_eq!(second, replay.next(&root));
+
+        let serialized = serde_json::to_vec(&recording).expect("serialize child ordinal");
+        let restored: ChildEventStreamIds =
+            serde_json::from_slice(&serialized).expect("restore child ordinal");
+        assert_eq!(restored.next(&root).to_string(), "3.2");
+
+        let grandchildren = ChildEventStreamIds::default();
+        assert_eq!(grandchildren.next(&first).to_string(), "3.0.0");
+    }
+
+    #[test]
+    fn duplicate_stream_identity_refuses_instead_of_overwriting() {
+        let data = tempfile::tempdir().expect("create recording directory");
+        let stream_id = EventStreamId::root().child(0);
+        let first = super::EventWriter::create(data.path(), &stream_id).expect("create stream");
+        let error = super::EventWriter::create(data.path(), &stream_id)
+            .err()
+            .expect("duplicate stream must refuse");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        drop(first);
     }
 }

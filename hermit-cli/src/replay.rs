@@ -21,7 +21,6 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use reverie::ExitStatus;
-use reverie::Tid;
 use reverie::process::Mount;
 use reverie::process::MountFlags;
 use reverie::process::Output;
@@ -37,6 +36,7 @@ use crate::event::ExecImage;
 use crate::event::ExecTarget;
 use crate::event::SyscallEvent;
 use crate::event_stream::EventReader;
+use crate::event_stream::EventStreamId;
 use crate::metadata::Metadata;
 use crate::metadata::RECORD_VERSION;
 use crate::metadata::record_or_replay_config;
@@ -412,8 +412,7 @@ fn ensure_replay_standard_directories(replay_root: &OwnedFd) -> io::Result<()> {
 /// runtime stream. The first successful exec is validated immediately so a later
 /// exec cannot mask a corrupt bootstrap record.
 fn read_bootstrap_exec_event(dir: &Path, metadata: &Metadata) -> io::Result<ExecEvent> {
-    let root_tid = Tid::from_raw(detcore::ROOT_DETPID.as_raw());
-    let mut events = EventReader::open(dir, root_tid)?;
+    let mut events = EventReader::open(dir, &EventStreamId::root())?;
     let mut count = 0_u64;
     let exec = loop {
         let event = events.next_event().map_err(|error| {

@@ -20,7 +20,7 @@ pub struct MountInfoRow {
     pub raw_peer_groups: Vec<u64>,
 }
 
-const MOUNT_PEER_PREFIXES: [&[u8]; 3] = [b"shared:", b"master:", b"propagate_from:"];
+pub const MOUNT_PEER_PREFIXES: [&[u8]; 3] = [b"shared:", b"master:", b"propagate_from:"];
 
 fn decimal(field: &[u8]) -> Option<u64> {
     if field.is_empty() || field.iter().any(|byte| !byte.is_ascii_digit()) {
@@ -57,6 +57,16 @@ fn parse_mountinfo_row(line: &[u8]) -> Option<MountInfoRow> {
     for field in &fields[6..separator] {
         if let Some(raw) = mount_peer_group(field)? {
             raw_peer_groups.push(raw);
+        } else if field
+            .iter()
+            .position(|byte| *byte == b':')
+            .is_some_and(|separator| decimal(&field[separator + 1..]).is_some())
+        {
+            // Unknown numeric optional fields can carry mount-namespace
+            // identity just like the peer-group fields above. Passing one
+            // through would expose an unsanitized host identifier, so refuse
+            // until its Linux semantics and deterministic mapping are known.
+            return None;
         }
     }
     Some(MountInfoRow {
@@ -148,6 +158,19 @@ mod tests {
         assert_eq!(parsed[0].root, b"/");
         assert_eq!(parsed[0].raw_peer_groups, [9]);
         assert!(parse_mountinfo(b"37 1 bad / / rw - ext4 /dev/root rw\n").is_none());
+        assert!(
+            parse_mountinfo(b"37 1 8:1 / / rw unbindable nosymfollow - ext4 /dev/root rw\n")
+                .is_some(),
+            "known bare optional flags must remain accepted"
+        );
+        assert!(
+            parse_mountinfo(b"37 1 8:1 / / rw future_peer:19 - ext4 /dev/root rw\n").is_none(),
+            "unknown numeric optional fields must fail closed"
+        );
+        assert!(
+            parse_mountinfo(b"37 1 8:1 / / rw future_flag:value - ext4 /dev/root rw\n").is_some(),
+            "unknown nonnumeric flags carry no raw numeric identity"
+        );
         let duplicate = [row.as_slice(), row.as_slice()].concat();
         assert!(parse_mountinfo(&duplicate).is_none());
     }

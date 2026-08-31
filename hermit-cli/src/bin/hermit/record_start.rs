@@ -43,7 +43,6 @@ use super::container::IdentityGuard;
 use super::container::RunGuarded;
 use super::container::default_container;
 use super::container::identity_hardening_mounts;
-use super::container::mount_target_is_shadowed;
 use super::gdb_client::CLIENT_EXITED_BEFORE_CONNECTING;
 use super::gdb_client::GdbClientWatch;
 use super::global_opts::GlobalOpts;
@@ -402,9 +401,7 @@ impl StartOpts {
         let (mut identity_mounts, mut identity_guard) = identity_hardening_mounts()?;
         for mount in &self.mount {
             let user_target = mount.get_target();
-            identity_mounts
-                .retain(|existing| !mount_target_is_shadowed(existing.get_target(), user_target));
-            identity_guard.discard_roots_shadowed_by(user_target);
+            identity_guard.discard_mounts_shadowed_by(&mut identity_mounts, user_target);
         }
         container.mounts(identity_mounts);
         container.mounts(self.mount.clone());

@@ -58,7 +58,6 @@ use super::container::apply_affinity;
 use super::container::default_container;
 use super::container::identity_hardening_mounts;
 use super::container::image_container;
-use super::container::mount_target_is_shadowed;
 use super::container::with_container;
 use super::global_opts::GlobalOpts;
 use super::record_envelope::RecordEnvelope;
@@ -4147,9 +4146,7 @@ impl RunOpts {
 
         for mount in &self.mount {
             let user_target = mount.get_target();
-            identity_mounts
-                .retain(|existing| !mount_target_is_shadowed(existing.get_target(), user_target));
-            identity_sources.discard_roots_shadowed_by(user_target);
+            identity_sources.discard_mounts_shadowed_by(&mut identity_mounts, user_target);
             if let Ok(path) = mount.get_target().strip_prefix(TMP_DIR) {
                 explicit_tmp_mount |= path.as_os_str().is_empty();
                 // If the target is in /tmp, change it so it goes to our
@@ -4170,7 +4167,8 @@ impl RunOpts {
                 // ignored outside-/tmp bind must not suppress the real
                 // identity-hardening mount at that target.
                 explicit_tmp_mount |= relative_path.as_os_str().is_empty();
-                identity_sources.discard_roots_shadowed_by(mount.get_target());
+                identity_sources
+                    .discard_mounts_shadowed_by(&mut identity_mounts, mount.get_target());
                 let target = tmpfs.join(relative_path);
                 user_mounts.push(mount.target(target).touch_target());
             } else {
