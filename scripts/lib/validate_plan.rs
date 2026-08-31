@@ -110,6 +110,13 @@ const COMPAT_CPU_TIMEOUT_S: i64 = 120;
 /// Memory ceiling for a compatibility probe.
 const COMPAT_MEM_BYTES: i64 = 4 * 1024 * 1024 * 1024;
 
+/// Maximum portable strict probes that the former inner scheduler admitted at
+/// once.  Flattening the probes into validate's outer graph makes this demand
+/// visible to the one scheduler instead of hiding sixteen guests behind one
+/// `test.strict_compat` node.
+pub const PORTABLE_STRICT_COMPAT_CONCURRENCY: i64 = 16;
+pub const PORTABLE_STRICT_COMPAT_RESOURCE: &str = "hermit_guest";
+
 /// Which compatibility corpus a focused mode runs, and how it is labelled.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CompatMode {
@@ -160,8 +167,11 @@ impl CompatMode {
                 s("run"),
                 s("--strict"),
                 s("--verify"),
+                s("--base-env=minimal"),
                 s("--no-virtualize-cpuid"),
                 s("--max-timeslice=disabled"),
+                s("--mount=type=tmpfs,target=/test"),
+                s("--workdir=/test"),
                 s("--env"),
                 s("TMPDIR=/tmp"),
                 s("--"),

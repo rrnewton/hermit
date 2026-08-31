@@ -45,9 +45,19 @@ jq -e '.profile == "portable-only" and .selection_mode == "full"' \
     exit 2
 }
 mapfile -t expected < <(jq -r '.dags[].steps[].tag' <<<"$plan_json" | sort -u)
+mapfile -t strict_compat_expansion < <(
+    jq -r '
+        .dags[].steps[].tag
+        | select(. == "compatprep.fixtures" or startswith("compat."))
+    ' <<<"$plan_json" | sort -u
+)
+if ((${#strict_compat_expansion[@]} == 0)); then
+    echo "check-shard-coverage.sh: constructed plan has no direct strict compatibility nodes" >&2
+    exit 2
+fi
 
-# Every node assigned by the shard map, across all job buckets.
-mapfile -t assigned < <(
+# Every selection alias assigned by the shard map, across all job buckets.
+mapfile -t assigned_aliases < <(
     jq -r '
         (.preflight_nodes // [])
       + (.check_nodes // [])
@@ -61,6 +71,18 @@ mapfile -t assigned < <(
       + ([ (.release_shards // [])[] | .nodes[] ])
         | .[]
     ' "$shards" | sort
+)
+strict_alias_count=$(printf '%s\n' "${assigned_aliases[@]}" |
+    grep -Fxc 'test.strict_compat' || true)
+if [[ $strict_alias_count -ne 1 ]]; then
+    echo "check-shard-coverage.sh: FAIL — shard map assigns test.strict_compat $strict_alias_count times; expected exactly one stable alias" >&2
+    exit 1
+fi
+mapfile -t assigned < <(
+    {
+        printf '%s\n' "${assigned_aliases[@]}" | grep -Fvx 'test.strict_compat'
+        printf '%s\n' "${strict_compat_expansion[@]}"
+    } | sort
 )
 
 # Duplicate assignment (a node in two buckets) is a defect.
@@ -176,7 +198,8 @@ check_json=$(jq -c '.check_nodes // []' "$shards")
 build_debug_json=$(jq -c '.build_debug_nodes // []' "$shards")
 build_dbt_json=$(jq -c '.build_dbt_nodes // []' "$shards")
 build_aux_json=$(jq -c '.build_aux_nodes // []' "$shards")
-strict_compat_json=$(jq -c '.strict_compat_nodes // []' "$shards")
+strict_compat_json=$(printf '%s\n' "${strict_compat_expansion[@]}" |
+    jq -Rsc 'split("\n") | map(select(length > 0))')
 through_preflight=$(jq -cn --argjson preflight "$preflight_json" '$preflight')
 through_checks=$(jq -cn --argjson preflight "$preflight_json" --argjson checks "$check_json" '$preflight + $checks')
 through_debug=$(jq -cn --argjson preflight "$preflight_json" --argjson debug "$build_debug_json" '$preflight + $debug')

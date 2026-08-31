@@ -811,8 +811,9 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  # test.strict_compat depends on results from several debug shards. Keep it in
-  # a later job so the hosted grouping preserves those constructed edges.
+  # The test.strict_compat selection alias expands into the direct compat.*
+  # nodes and depends on results from several debug shards. Keep it in a later
+  # job so the hosted grouping preserves those constructed edges.
   strict-compat:
     name: Portable strict compatibility
     needs: [select, build-debug, build-complete, test-debug]

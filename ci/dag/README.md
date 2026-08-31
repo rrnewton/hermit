@@ -166,13 +166,13 @@ Node `cmd`s are the **verbatim** commands `scripts/validate.rs` runs, with three
 deliberate exceptions, chosen to avoid duplicating script logic that has many
 moving parts:
 
-- **Composite envelope gates reuse `scripts/validate.rs`'s own standalone entrypoints**
-  so there is one source of truth: `test.strict_compat` runs
-  `./scripts/validate.rs --portable-strict-compat-only`, and (privileged) `rr.compat_baseline`
-  runs `./scripts/validate.rs --rr-compat-only`. The privileged selector builds release;
-  portable strict compatibility reuses `STRICT_COMPAT_HERMIT_BIN` from the
-  preceding workspace build. Without that override, the strict flag builds
-  release as before.
+- **Portable strict compatibility is a generated expansion.** The committed
+  `test.strict_compat` row is a fail-closed marker; `scripts/validate.rs`
+  replaces it with one run-unique fixture-preparation node and the corpus-derived
+  `compat.*` nodes before invoking dagrun. This keeps the corpus JSON as the one
+  source of argv while exposing every probe and its resource demand to the one
+  outer scheduler. The privileged `rr.compat_baseline` composite still reuses
+  `./scripts/validate.rs --rr-compat-only`.
 - **The DBT stderr-isolation CLI case is a separate 120-second node** so a
   backend hang fails quickly without consuming the aggregate CLI budget. The
   aggregate node skips that case, so the test set remains unchanged.

@@ -46,8 +46,9 @@
 #
 # THE PARTITION IS THE SHARD MAP, NOT THE `group` FIELD. A naive implementation
 # gets this wrong in both directions:
-#   * the strict compatibility node has group "test" but runs after its other
-#     test-node predecessors in a separate hosted job;
+#   * the strict compatibility marker has group "test" but expands into direct
+#     `compat.*` nodes after its other test-node predecessors in a separate
+#     hosted job;
 #   * preflight, check, setup, and E2E audit nodes are not group "build", but
 #     they execute before the remaining test side.
 # Read the map rather than reconstructing either partition from tag prefixes.
@@ -198,13 +199,38 @@ build_node_count=$(tr ',' '\n' <<<"$build_nodes" | wc -l)
 test_node_count=$(tr ',' '\n' <<<"$test_nodes" | wc -l)
 total_node_count=$((build_node_count + test_node_count))
 if [[ -z "$shards" ]]; then
-    selected_list=$(tr ',' '\n' <<<"$build_nodes,$test_nodes" | LC_ALL=C sort)
-    duplicate_nodes=$(uniq -d <<<"$selected_list" || true)
     plan_out=$(mktemp)
     ./scripts/validate.rs portable-only --show-plan-json \
         --skip-inner-dirty-working-tree-and-rebase-freshness-checks >"$plan_out"
     plan_json=$(sed -n '1p' "$plan_out")
     rm -f "$plan_out"
+    strict_alias_count=$(tr ',' '\n' <<<"$build_nodes,$test_nodes" |
+        grep -Fxc 'test.strict_compat' || true)
+    [[ $strict_alias_count -eq 1 ]] || {
+        echo "run-split-validate: shard map has $strict_alias_count test.strict_compat aliases; expected exactly one." >&2
+        exit 1
+    }
+    compat_expansion=$(jq -r '
+        .dags[].steps[].tag
+        | select(. == "compatprep.fixtures" or startswith("compat."))
+    ' <<<"$plan_json")
+    [[ -n "$compat_expansion" ]] || {
+        echo "run-split-validate: constructed plan has no direct strict compatibility nodes." >&2
+        exit 1
+    }
+    # The shard map deliberately retains the stable `test.strict_compat`
+    # selection alias. Validate expands that alias at execution time; expand it
+    # here too before comparing the partition with the constructed graph.
+    selected_list=$(
+        {
+            tr ',' '\n' <<<"$build_nodes,$test_nodes" | grep -Fvx 'test.strict_compat'
+            printf '%s\n' "$compat_expansion"
+        } | LC_ALL=C sort
+    )
+    duplicate_nodes=$(uniq -d <<<"$selected_list" || true)
+    strict_compat_node_count=$(wc -l <<<"$compat_expansion")
+    test_node_count=$((test_node_count - 1 + strict_compat_node_count))
+    total_node_count=$((build_node_count + test_node_count))
     expected_list=$(jq -r '.dags[].steps[].tag' <<<"$plan_json" | LC_ALL=C sort)
     duplicate_dag_nodes=$(uniq -d <<<"$expected_list" || true)
     selected_unique=$(uniq <<<"$selected_list")
