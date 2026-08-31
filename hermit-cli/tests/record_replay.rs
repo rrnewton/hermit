@@ -381,9 +381,15 @@ fn assert_recordings_equal_while_host_mountinfo_stable(
             && after_first == before_second
             && before_second == after_second
         {
+            let first_without_devices = mountinfo_without_device_column(&first)
+                .unwrap_or_else(|error| panic!("{label}: first recording: {error}"));
+            let second_without_devices = mountinfo_without_device_column(&second)
+                .unwrap_or_else(|error| panic!("{label}: second recording: {error}"));
             assert_eq!(
-                first, second,
-                "{label}: recording output differed while the host mount table was stable"
+                first_without_devices,
+                second_without_devices,
+                "{label}: recording output differed outside mountinfo's device column while the host mount table was stable; {}",
+                first_mountinfo_row_difference(&first_without_devices, &second_without_devices)
             );
             return first;
         }
@@ -413,6 +419,27 @@ fn assert_recordings_equal_while_host_mountinfo_stable(
         }
     }
     unreachable!()
+}
+
+fn mountinfo_without_device_column(contents: &[u8]) -> Result<Vec<u8>, &'static str> {
+    detcore_model::procfs::parse_mountinfo(contents).ok_or("malformed mountinfo")?;
+    let mut normalized = Vec::with_capacity(contents.len());
+    for row in contents.split_inclusive(|byte| *byte == b'\n') {
+        if row.is_empty() {
+            continue;
+        }
+        let mut spaces = row
+            .iter()
+            .enumerate()
+            .filter_map(|(index, byte)| (*byte == b' ').then_some(index));
+        let _after_mount_id = spaces.next().ok_or("mountinfo row has no parent ID")?;
+        let device_start = spaces.next().ok_or("mountinfo row has no device field")? + 1;
+        let device_end = spaces.next().ok_or("mountinfo row has no root field")?;
+        normalized.extend_from_slice(&row[..device_start]);
+        normalized.extend_from_slice(b"<major:minor>");
+        normalized.extend_from_slice(&row[device_end..]);
+    }
+    Ok(normalized)
 }
 
 fn first_mountinfo_row_difference(left: &[u8], right: &[u8]) -> String {
@@ -1035,6 +1062,43 @@ fn independent_mountinfo_recordings_are_canonical() {
     let text = std::str::from_utf8(&first).expect("mountinfo should be UTF-8");
     assert!(text.contains("/tmpvol/.hermit/etc/group"));
     assert!(!text.contains("/.tmp"));
+}
+
+#[test]
+fn independent_mountinfo_comparison_ignores_only_the_device_column() {
+    let baseline = b"10 1 0:42 / /proc rw,nosuid shared:7 - proc proc rw,nodev\n";
+    let other_device = b"10 1 0:99 / /proc rw,nosuid shared:7 - proc proc rw,nodev\n";
+    let normalized = mountinfo_without_device_column(baseline).expect("valid baseline row");
+    assert_eq!(
+        normalized,
+        mountinfo_without_device_column(other_device).expect("valid alternate device row")
+    );
+
+    for changed in [
+        b"11 1 0:42 / /proc rw,nosuid shared:7 - proc proc rw,nodev\n" as &[u8],
+        b"10 2 0:42 / /proc rw,nosuid shared:7 - proc proc rw,nodev\n",
+        b"10 1 0:42 /sub /proc rw,nosuid shared:7 - proc proc rw,nodev\n",
+        b"10 1 0:42 / /other rw,nosuid shared:7 - proc proc rw,nodev\n",
+        b"10 1 0:42 / /proc ro,nosuid shared:7 - proc proc rw,nodev\n",
+        b"10 1 0:42 / /proc rw,nosuid master:7 - proc proc rw,nodev\n",
+        b"10 1 0:42 / /proc rw,nosuid shared:7 - sysfs proc rw,nodev\n",
+        b"10 1 0:42 / /proc rw,nosuid shared:7 - proc none rw,nodev\n",
+        b"10 1 0:42 / /proc rw,nosuid shared:7 - proc proc ro,nodev\n",
+    ] {
+        assert_ne!(
+            normalized,
+            mountinfo_without_device_column(changed).expect("valid changed row"),
+            "a non-device mountinfo field was incorrectly ignored: {}",
+            String::from_utf8_lossy(changed)
+        );
+    }
+    assert!(
+        mountinfo_without_device_column(
+            b"10 1 0:42 / /proc rw,nosuid shared:7 + proc proc rw,nodev\n"
+        )
+        .is_err(),
+        "a changed mountinfo separator must fail strict parsing"
+    );
 }
 
 #[test]

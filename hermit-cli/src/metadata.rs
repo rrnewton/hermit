@@ -307,8 +307,15 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
     // different clock values. Demonstrated: `hermit run -- date` twice returns the
     // identical virtual epoch, while `hermit record start -- date` twice returns real
     // wall-clock times seconds apart. Replay fidelity says nothing about that, and
-    // nothing in either test suite currently compares two independent recordings.
-    // So do not read a green `--verify` as cross-recording determinism.
+    // the focused `independent_mountinfo_recordings_are_canonical` test compares
+    // two independent mountinfo recordings after replacing exactly field 3, the
+    // major:minor device column. With `virtualize_metadata: false`, Linux may
+    // legitimately allocate a different anonymous-block-device minor for the
+    // private procfs mount in each container. That test still compares mount ID,
+    // parent ID, root, mountpoint, options, optional fields, separator,
+    // filesystem type, source, and superblock options byte-for-byte. It does not
+    // establish general cross-recording determinism, and a green `--verify`
+    // remains only a replay-fidelity result.
     //
     // This configuration differs from `hermit run --strict` on four of the five
     // properties that define it (see run.rs: only `sequentialize_threads` matches).
