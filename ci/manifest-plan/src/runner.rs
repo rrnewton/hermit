@@ -1701,6 +1701,10 @@ fn remaining_cell_seconds_at(deadline: Instant, now: Instant) -> u64 {
         .saturating_add(u64::from(remaining.subsec_nanos() != 0))
 }
 
+fn execution_deadline_after_preparation(prepared_at: Instant, timeout_seconds: u64) -> Instant {
+    prepared_at + Duration::from_secs(timeout_seconds)
+}
+
 fn require_executable_program(path: &Path, captures: &Path) -> Result<(), String> {
     let executable = path
         .metadata()
@@ -2463,10 +2467,19 @@ fn cell_timeout_attempt(
     duration: Duration,
 ) -> AttemptResult {
     let index = spec.attempt.as_str();
+    // Preparation consumed the cell's whole budget, so no process exists from
+    // which to recover an exit status or signal.  Record that fact with the
+    // same typed NotRun report Hermit uses before its first guest run.  A
+    // synthetic exit code would make a scheduler decision look like a process
+    // result, while a bare FAIL makes the retained attempt unreadable to every
+    // typed consumer.
+    let report = serde_json::to_string(&VerificationReport::no_result())
+        .expect("the typed NotRun report must serialize");
+    let report_sha256 = hex_digest(report.as_bytes());
     AttemptResult {
         index: index.into(),
-        outcome: "FAIL".into(),
-        error_kind: None,
+        outcome: "ERROR".into(),
+        error_kind: Some("incomplete-verification-evidence".into()),
         status: None,
         signal: None,
         timed_out: true,
@@ -2480,8 +2493,8 @@ fn cell_timeout_attempt(
         shell_command: shell_command(&spec.cwd.to_string_lossy(), &spec.env, &spec.argv),
         stdout: String::new(),
         stderr: String::new(),
-        verification_report: None,
-        verification_report_sha256: None,
+        verification_report: Some(report),
+        verification_report_sha256: Some(report_sha256),
         runtime: None,
         first_divergent_scheduler_turn: None,
         first_divergent_virtual_nanoseconds: None,
@@ -2621,11 +2634,20 @@ fn apply_failed_chaos_assertion(
 pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult, String> {
     let dir = cell_artifact_dir(context, cell);
     let started = Instant::now();
-    let deadline = started + Duration::from_secs(cell.timeout_seconds);
+    let preparation_deadline = started + Duration::from_secs(cell.timeout_seconds);
     let binary_before = fs::read(&context.hermit_bin)
         .ok()
         .map(|bytes| hex_digest(&bytes));
-    let (guest, preparation_cpu_usage_usec) = prepare_test_until(context, cell, &dir, deadline)?;
+    let (guest, preparation_cpu_usage_usec) =
+        prepare_test_until(context, cell, &dir, preparation_deadline)?;
+    // The manifest timeout bounds guest execution. In the canonical prebuilt
+    // path, fixture copying is already bounded by the enclosing 600-second
+    // manifest DAG node; a second 15-second copy bound would duplicate that
+    // policy and is exactly what made cold/contended copies consume the guest's
+    // entire allowance. Local non-prebuilt compilation keeps its existing
+    // preparation bound above. In both paths the guest receives a fresh full
+    // allowance once preparation is complete.
+    let deadline = execution_deadline_after_preparation(Instant::now(), cell.timeout_seconds);
     let mode = cell.test.modes.get(&cell.id.mode).unwrap();
     let mut attempts = Vec::new();
     match cell.id.mode.as_str() {
@@ -4157,6 +4179,89 @@ mod tests {
             remaining_cell_time_at(deadline, started + Duration::from_secs(15)),
             Duration::ZERO
         );
+    }
+
+    #[test]
+    fn slow_preparation_does_not_reduce_the_guest_timeout() {
+        let preparation_started = Instant::now();
+        let prepared_at = preparation_started + Duration::from_millis(47_770);
+        let execution_deadline = execution_deadline_after_preparation(prepared_at, 15);
+        assert_eq!(
+            remaining_cell_seconds_at(execution_deadline, prepared_at),
+            15,
+            "the measured 47.77-second preparation must not consume the 15-second guest bound"
+        );
+    }
+
+    #[test]
+    fn an_expired_preparation_budget_emits_typed_not_run_without_a_process() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-prelaunch-timeout-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let spec = CellRunSpec {
+            id: CellId {
+                test: "fixture/prelaunch-timeout".into(),
+                mode: "verify".into(),
+                backend: Some("ptrace".into()),
+            },
+            lane: "portable".into(),
+            category: "fixture".into(),
+            cwd: root.clone(),
+            env: BTreeMap::new(),
+            argv: vec!["/bin/false".into()],
+            guest_argv: vec!["fixture".into()],
+            timeout_seconds: 15,
+            verdict_path: Some(root.join("verdict.json")),
+            verification_log_dir: None,
+            sabre_path_evidence: None,
+            cell_dir: root.clone(),
+            attempt: "1".into(),
+            fixed_workdir_source: root.join("workdir/1"),
+        };
+
+        // This is the exact boundary reached after fixture preparation uses
+        // the whole cell budget: execution is asked to begin with no time
+        // remaining, so no child process can exist or have an exit status.
+        let attempt = execute_spec_until(&spec, Instant::now(), 15).unwrap();
+        assert_eq!(attempt.outcome, "ERROR");
+        assert_eq!(
+            attempt.error_kind.as_deref(),
+            Some("incomplete-verification-evidence")
+        );
+        assert!(attempt.timed_out);
+        assert_eq!((attempt.status, attempt.signal), (None, None));
+        let report = attempt
+            .verification_report
+            .as_deref()
+            .expect("pre-launch timeout must carry typed NotRun evidence");
+        let report_sha256 = hex_digest(report.as_bytes());
+        assert_eq!(
+            attempt.verification_report_sha256.as_deref(),
+            Some(report_sha256.as_str())
+        );
+        let report = VerificationReport::from_json_slice(report.as_bytes()).unwrap();
+        assert_eq!(report.verdict, Verdict::NoResult);
+        assert_eq!(
+            report.no_result_reason,
+            Some(crate::canonical_verdict::NoResultReason::NotRun)
+        );
+        assert_eq!(
+            failure_class(
+                &attempt.outcome,
+                observed_result(
+                    "verify",
+                    &attempt.outcome,
+                    std::slice::from_ref(&attempt),
+                    attempt.error_kind.as_deref(),
+                ),
+                attempt.error_kind.as_deref(),
+            ),
+            Some(FailureClass::NoResult)
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -6412,6 +6517,61 @@ backends_disabled:
             cell.timeout_seconds,
         )
         .expect("healthy fixture preparation must finish silently under the same bound");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preparation_does_not_consume_the_guest_execution_budget() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-separate-preparation-budget-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let program = root.join("fixture.sh");
+        fs::write(
+            &program,
+            "#!/bin/sh\ncase \"$1\" in\n  --prepare) sleep 1.1 ;;\n  --run) sleep 1.1; printf 'complete\\n' ;;\n  *) exit 64 ;;\nesac\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&program).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&program, permissions).unwrap();
+
+        let mut test = recipe(true);
+        test.id = "fixture/separate-preparation-budget".into();
+        test.program = Some("fixture.sh".into());
+        test.direct = None;
+        let mut mode = test.modes.remove("verify").unwrap();
+        mode.runs = Some(1);
+        mode.assert = Some(Assertions {
+            min_distinct: Some(1),
+            ..Assertions::default()
+        });
+        test.modes.insert("naked".into(), mode);
+        let cell = SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: test.id.clone(),
+                mode: "naked".into(),
+                backend: None,
+            },
+            test,
+            enabled: true,
+            timeout_seconds: 2,
+        };
+        let context = run_context(&root);
+
+        let result = run_cell(&context, &cell).unwrap();
+        assert_eq!(result.outcome, "PASS", "unexpected result: {result:?}");
+        assert_eq!(result.result, Some(ObservedResult::Pass));
+        assert_eq!(result.attempts.len(), 1);
+        assert!(!result.attempts[0].timed_out);
+        assert_eq!(result.attempts[0].stdout, "complete\n");
+        assert!(
+            result.duration_ms.is_some_and(|duration| duration >= 2_000),
+            "the fixture did not exercise separate preparation and execution time: {result:?}"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
