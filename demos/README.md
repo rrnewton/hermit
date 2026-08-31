@@ -1,14 +1,13 @@
 # Hermit Demo Walkthrough
 
-This walkthrough demonstrates reproducible Linux execution with Hermit from the
-`dev-hermit` workspace. Hermit runs unmodified x86-64 Linux programs under the
+This walkthrough demonstrates reproducible Linux execution from the Hermit
+repository. Hermit runs unmodified x86-64 Linux programs under the
 [Reverie](https://github.com/facebookexperimental/reverie) ptrace backend and
 controls common sources of nondeterminism, including thread scheduling, time,
 random data, CPUID results, address layout, and selected file metadata.
 
-The demo materials live entirely in this parent repository. The pinned
-`hermit/` submodule is unmodified: the outer workspace only adds to it. The
-walkthrough covers seven working workflows:
+The demo materials and Hermit source live in this repository. The walkthrough
+covers seven confirmed workflows:
 
 1. repeat an execution with stable guest-visible inputs;
 2. record an execution and replay it, with or without GDB;
@@ -26,7 +25,7 @@ walkthrough covers seven working workflows:
 
 ## Requirements
 
-Use an x86-64 Linux host with Rust nightly (selected by the submodule's
+Use an x86-64 Linux host with Rust nightly (selected by the repository's
 `rust-toolchain.toml`), libunwind and LZMA development libraries, Linux
 user/PID namespaces, and parent-child ptrace and seccomp support. GDB is needed
 for the record/replay section, and the Python demo uses `/usr/bin/python3`. The
@@ -46,8 +45,8 @@ make install-deps
 `libunwind-devel`, `xz-devel`, and `pkgconf` on Red Hat-family
 hosts. In particular, Hermit's `unwind-sys` build requires the
 `libunwind-ptrace.pc` file; the Makefile reports that missing dependency before
-Cargo starts and points back to `make install-deps`. Running `make` initializes
-the `hermit/` submodule when needed and builds the release Hermit binary.
+Cargo starts and points back to `make install-deps`. Running `make` verifies the
+pinned submodules and builds the debug Hermit binary with every backend.
 
 The demos use private temporary and ignored build-artifact directories. Demos
 5-7 additionally need Python 3, `qemu-system-x86_64`, `qemu-img`, a statically
@@ -83,10 +82,12 @@ and per-run paths visible.
 ## Layout
 
 ```text
-Makefile                    # dependency install/check and release build
+Makefile                    # dependency install/check and Hermit build
 demos/
   README.md                 # this walkthrough
-  common.sh                 # checks dependencies, builds hermit/, defines helpers
+  QEMU_BUSYBOX.md           # standalone BusyBox/QEMU example
+  qemu-busybox.sh           # standalone BusyBox/QEMU runner
+  common.sh                 # checks dependencies, builds Hermit, defines helpers
   01-deterministic-run.sh   # stable inputs, --verify
   02-record-replay.sh       # record, list, replay, replay under GDB
   03-chaos-concurrency.sh   # seeded schedules, save/replay a failing schedule
@@ -94,7 +95,7 @@ demos/
   05-qemu-boot.py           # boot, snapshot, metadata, repeat verification
   06-qemu-resume.py         # resume, command snapshot, repeat verification
   07-drgn-kernel.sh         # reproducible kernel task-list evolution
-  WALKTHROUGH.md            # commands and expected output for demos 1-8
+  WALKTHROUGH.md            # commands and expected output for the demo suite
   lib/
     demo_common.py          # hashes, metadata, QMP, serial, strict log diff
     qemu_controller.py      # deterministic in-Hermit QEMU serial/QMP controller
@@ -102,8 +103,8 @@ demos/
     qemu-snapshot.sh        # QMP, snapshot, and stable-log helpers
 ```
 
-Demos 1-4 source `demos/common.sh`, which locates the `hermit/` submodule,
-builds the release and debug binaries, and defines the shared `run_hermit`,
+Demos 1-4 source `demos/common.sh`, which locates this repository, builds the
+release and debug binaries, and defines the shared `run_hermit`,
 `verify_hermit`, and `chaos_run` wrappers. The Python QEMU demos use
 `demos/lib/demo_common.py` for QMP, serial streaming, hashes, metadata, and
 repeat comparison. `run_hermit` and `chaos_run`
@@ -126,28 +127,24 @@ Clone current `main` with its pinned submodules, install dependencies once per
 host, and build Hermit:
 
 ```bash
-git clone --recurse-submodules https://github.com/rrnewton/dev-hermit.git
-cd dev-hermit
-make install-deps-core
+git clone --recurse-submodules https://github.com/rrnewton/hermit.git
+cd hermit
+make install-deps
 make
 ```
 
-Run the scheduled superset locally with one command. It executes Hermit's
-existing `super` stress profile, prepares the pinned Demo 8 btrfs/ASAN assets,
+Run the demo suite locally with one command. It prepares the required assets,
 then runs demos 1-8 with a PASS/FAIL row and log for each demo:
 
 ```bash
-scripts/super-validate.sh
+scripts/prepare-demo08-assets.sh
+make demos
 ```
 
-Use `scripts/super-validate.sh --demos-only` when the product super profile has
-already passed and only the full demo sweep needs to be repeated. Demo logs and
-the machine-readable summary are written under `target/demo-sweep/`. The full
-super profile is scheduled nightly. Pull requests and main commits run the
-demos-only profile when they change the Hermit or Reverie gitlink, demos, QEMU
-assets, or the sweep tooling; unrelated parent changes do not pay this cost.
-Every triggered red is a P0 demo regression: the workflow names the exact
-commit, annotates the run, preserves per-demo logs, and stays failed.
+Demo logs and the machine-readable summary are written under
+`target/demo-sweep/`. The manually dispatched and scheduled P0 Demo Gate runs
+the suite at an exact Hermit commit, preserves per-demo logs, and stays failed
+on every demo red.
 
 Demo 8 seed calibration writes `ignored/demo08-run/calibration.tsv` plus one
 retained output per attempted seed. Each row records the seed, whether the
@@ -277,7 +274,7 @@ On first use, `demos/lib/qemu-assets.sh` downloads this content-addressed
 kernel and verifies it before atomically populating the cache:
 
 ```text
-https://github.com/rrnewton/dev-hermit/releases/download/qemu-kernel-e4b1c0248a31c7e1f7cb31d82a1a03d4e7cab408ee1b8e622dd897c17eae46a2/bzImage
+https://github.com/rrnewton/hermit/releases/download/qemu-kernel-e4b1c0248a31c7e1f7cb31d82a1a03d4e7cab408ee1b8e622dd897c17eae46a2/bzImage
 sha256: e4b1c0248a31c7e1f7cb31d82a1a03d4e7cab408ee1b8e622dd897c17eae46a2
 ```
 
@@ -333,6 +330,7 @@ divergence after stripping only the wallclock prefix.
   the guest. Demo 6 performs the paired comparison for repeated guest commands
   without paying for a second Linux boot.
 
-For full option and troubleshooting coverage, see the Hermit product
-documentation under `hermit/docs/`. Hermit is BSD-licensed; see
-`hermit/LICENSE`.
+The pre-existing standalone BusyBox/QEMU example remains available as
+`demos/qemu-busybox.sh`; see `demos/QEMU_BUSYBOX.md` for its separate commands
+and evidence. For full option and troubleshooting coverage, see `docs/`.
+Hermit is BSD-licensed; see `LICENSE`.

@@ -84,11 +84,16 @@ for f in "$BUGGY" "$FIXED" "$IMAGE"; do
 done
 
 HERMIT_RELEASE="${HERMIT_RELEASE:-$ROOT/target/release/hermit}"
+SAFEHERMIT="${SAFEHERMIT:-$ROOT/bin/safehermit}"
 if [ ! -x "$HERMIT_RELEASE" ]; then
   make -C "$ROOT" --no-print-directory -s release-core
 fi
 if [ ! -x "$HERMIT_RELEASE" ]; then
   echo "error: missing Hermit release binary: $HERMIT_RELEASE" >&2
+  exit 1
+fi
+if [ ! -x "$SAFEHERMIT" ]; then
+  echo "error: missing safehermit wrapper: $SAFEHERMIT" >&2
   exit 1
 fi
 
@@ -139,7 +144,7 @@ asan_core() {
 # the interleaving.
 chaos_convert() {
   local conv="$1" seed="$2" img="$3" out="$4"
-  timeout "$TIMEOUT" "$HERMIT_RELEASE" --log=error run \
+  timeout "$TIMEOUT" "$SAFEHERMIT" "$HERMIT_RELEASE" --log=error run \
     --chaos --sched-seed "$seed" --no-virtualize-cpuid \
     -- "$conv" "$img" >"$out" 2>&1
 }

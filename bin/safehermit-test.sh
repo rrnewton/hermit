@@ -22,7 +22,8 @@
 # the test asserts the fixture genuinely hangs bare before trusting the result.
 set -uo pipefail
 SH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/safehermit"
-HB="${SAFEHERMIT_TEST_BIN:-$(dirname "$SH")/hermit}"
+ROOT="$(cd "$(dirname "$SH")/.." && pwd)"
+HB="${SAFEHERMIT_TEST_BIN:-$ROOT/target/release/hermit}"
 pass=0; fail=0
 ok(){ printf '  PASS  %s\n' "$1"; pass=$((pass+1)); }
 no(){ printf '  FAIL  %s -- %s\n' "$1" "$2"; fail=$((fail+1)); }

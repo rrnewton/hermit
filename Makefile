@@ -2,6 +2,8 @@ SUBMODULE_PROXY ?= $(shell command -v with-proxy 2>/dev/null)
 SUBMODULE_GIT = $(SUBMODULE_PROXY) git
 CARGO_PROXY ?= $(SUBMODULE_PROXY)
 CARGO = $(CARGO_PROXY) cargo
+PKG_CONFIG ?= pkg-config
+PKG_CONFIG_MODULES := libunwind-ptrace liblzma
 # Keep Cargo and nested native builds wide enough for high-core CI hosts without
 # immediately saturating every hardware thread. Override on smaller shared hosts.
 THIRD_PARTY_BUILD_JOBS ?= 64
@@ -17,7 +19,8 @@ RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 .PHONY: build install-deps install-hooks release-core prune-stale-release help checkout-all check-build-tools \
 	install-build-tools check-submodules verify-submodules check-skill-discovery validate validate-plan \
 	validate-self-test validate-timeout-layers-test lint \
-	validate-kvm validate-dbt validate-sabre validate-liteinst validate-e9patch
+	validate-kvm validate-dbt validate-sabre validate-liteinst validate-e9patch \
+	check-demo-deps demo1 demo2 demo3 demo4 demo5 demo6 demo7 demo8 demos
 
 build: prune-stale-release install-deps ## Build the development Hermit binary with every backend
 	@echo 'make: building the hermit binary (dev profile, third-party-backends) -- expect ~45s warm, longer cold'
@@ -56,6 +59,36 @@ install-hooks: ## Install this checkout's git pre-commit hooks (Reverie pin poli
 
 release-core: check-submodules ## Build the lean core-only release binary (ptrace/kvm/liteinst)
 	$(CARGO) build --release --locked -p hermit
+
+check-demo-deps: check-build-tools verify-submodules ## Verify native dependencies used by the demos
+	@set -eu; \
+	pkg_config="$(PKG_CONFIG)"; \
+	if ! command -v "$$pkg_config" >/dev/null 2>&1 \
+	&& [ "$$pkg_config" = "pkg-config" ] \
+	&& command -v pkgconf >/dev/null 2>&1; then \
+		pkg_config="pkgconf"; \
+	fi; \
+	if ! command -v "$$pkg_config" >/dev/null 2>&1; then \
+		echo "ERROR: pkg-config (pkgconf on CentOS/RHEL) is required." >&2; \
+		echo "Run: make install-deps" >&2; \
+		exit 1; \
+	fi; \
+	missing=""; \
+	for module in $(PKG_CONFIG_MODULES); do \
+		if ! "$$pkg_config" --exists "$$module"; then missing="$$missing $$module"; fi; \
+	done; \
+	if [ -n "$$missing" ]; then \
+		echo "ERROR: missing required demo build dependencies:$$missing" >&2; \
+		echo "Run: make install-deps" >&2; \
+		exit 1; \
+	fi; \
+	echo "Dependency check passed: $(PKG_CONFIG_MODULES)"
+
+demo1 demo2 demo3 demo4 demo5 demo6 demo7 demo8: ## Run one numbered demo
+	@$(MAKE) -C demos --no-print-directory $@
+
+demos: ## Run every numbered demo with per-demo result reporting
+	@$(MAKE) -C demos --no-print-directory all
 
 # `make build` produces target/debug/hermit but never rebuilds an existing
 # target/release/hermit. A release binary left over from an earlier
@@ -137,6 +170,7 @@ lint: lint-checks lint-cargo ## Run the full lint suite matching CI (rustfmt, sh
 # ⚠️ Comments INSIDE the recipe below must be TAB-indented. A comment at column 0 ends
 # the recipe, silently dropping every line after it.
 lint-checks: ## The lint checkers CI schedules as one node (everything in `lint` except the two cargo passes)
+	$(MAKE) -C demos --no-print-directory test
 	./scripts/check-skill-discovery.rs
 	./scripts/test-required-check-outcomes.sh
 	./scripts/test-check-status-outcome.sh

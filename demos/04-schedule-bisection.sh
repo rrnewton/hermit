@@ -72,7 +72,7 @@ done
 demo_analyze_keep='^:: Event-Level Search Pass |^:: Completed analysis successfully|^:: Critical events found|^:: Critical branch boundary|^Critical event index '
 
 run_analyze() {
-  NO_COLOR=1 timeout 600 "$HERMIT" --log=error analyze \
+  NO_COLOR=1 timeout 600 "$SAFEHERMIT" "$HERMIT" --log=error analyze \
     "${HERMIT_ANALYZE_TMP_FLAGS[@]}" \
     "${analyze_run_flags[@]}" \
     --report-file="$ANALYSIS_REPORT" \
