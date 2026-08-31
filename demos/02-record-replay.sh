@@ -31,7 +31,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 # integration test and this complete workflow. Keep the demo honest about the
 # binary it exercises rather than reporting a product failure as a demo pass.
 if [ "${DEMO_SKIP_BUILD:-0}" != "1" ]; then
-  (cd "$HERMIT_REPO" && cargo build -p hermit --bin hermit)
+  (cd "$HERMIT_REPO" && cargo build --locked -p hermit --bin hermit)
 fi
 HERMIT="$HERMIT_REPO/target/debug/hermit"
 if [ ! -x "$HERMIT" ]; then

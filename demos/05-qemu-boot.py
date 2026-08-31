@@ -41,7 +41,7 @@ from qemu_controller import build_qemu_command  # noqa: E402
 
 
 DEMO_LABEL = "Demo 5: QEMU Linux Snapshot"
-HERMIT_REPO = Path(os.environ.get("HERMIT_REPO", ROOT / "hermit"))
+HERMIT_REPO = Path(os.environ.get("HERMIT_REPO", ROOT))
 HERMIT = Path(os.environ.get("HERMIT_RELEASE", HERMIT_REPO / "target/release/hermit"))
 # Whether the caller pinned the binary. Must be read BEFORE main() writes
 # HERMIT_RELEASE back into the environment, which would make this always true.
@@ -132,7 +132,7 @@ def main() -> int:
         ),
         dependency + "\n" + qemu_dependency,
     )
-    # A pinned binary is NOT rebuilt. `make build-hermit` depends on `init-hermit`
+    # A pinned binary is NOT rebuilt. `make release-core` checks submodules
     # -> `checkout-all`, which runs `git submodule update --init --recursive`; the
     # Makefile warns that this DETACHES attached primaries. When the parent gitlink
     # and the primary's HEAD differ, that MOVES the primary checkout and then builds
@@ -149,7 +149,7 @@ def main() -> int:
             )
         )
     else:
-        run_checked(["make", "--no-print-directory", "-s", "build-hermit"], cwd=ROOT)
+        run_checked(["make", "--no-print-directory", "-s", "release-core"], cwd=ROOT)
     banner("Verify QEMU kernel and initramfs")
     run_checked([str(DEMO_DIR / "lib/qemu-assets.sh")], cwd=ROOT)
     if not HERMIT.is_file() or not os.access(str(HERMIT), os.X_OK):

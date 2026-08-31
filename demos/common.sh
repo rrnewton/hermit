@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# Shared setup for the dev-hermit demo scripts.
+# Shared setup for the Hermit demo scripts.
 #
 # Source this from a demo script; do not execute it directly. It locates the
 # pinned hermit/ submodule inside this parent workspace, builds the binaries the
@@ -16,10 +16,10 @@
 
 set -euo pipefail
 
-# Resolve the workspace root (parent of demos/) and the hermit submodule.
+# Resolve the Hermit repository root (parent of demos/).
 DEMO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$DEMO_DIR/.." && pwd)"
-export HERMIT_REPO="${HERMIT_REPO:-$ROOT/hermit}"
+export HERMIT_REPO="${HERMIT_REPO:-$ROOT}"
 
 # PREFLIGHT: collect every missing prerequisite and report them together.
 # These checks used to exit on the FIRST miss, so a fresh machine discovered
@@ -29,7 +29,7 @@ export HERMIT_REPO="${HERMIT_REPO:-$ROOT/hermit}"
 . "$DEMO_DIR/lib/preflight.sh"
 
 preflight_require_file "$HERMIT_REPO/Cargo.toml" \
-  "hermit submodule is not populated at $HERMIT_REPO -- run: git submodule update --init hermit"
+  "Hermit repository is unavailable at $HERMIT_REPO"
 # Native dependencies are checked via the Makefile so fresh machines and every
 # demo get the same package names and remediation path.
 preflight_require_command make \
@@ -44,18 +44,20 @@ preflight_report "${DEMO_LABEL:-demo prerequisites}"
 # can OOM under load) plus the debug guest binaries whose source info the
 # analyzer resolves (demo 4). Set DEMO_SKIP_BUILD=1 to reuse an existing build.
 if [ "${DEMO_SKIP_BUILD:-0}" = "1" ]; then
-  make --no-print-directory -s -C "$ROOT" check-deps
+  make --no-print-directory -s -C "$ROOT" check-demo-deps
 else
   case "${DEMO_BUILD_MODE:-all}" in
     release)
-      make --no-print-directory -s -C "$ROOT" build
+      make --no-print-directory -s -C "$ROOT" check-demo-deps
+      (cd "$HERMIT_REPO" && \
+        cargo build --locked --release -p hermit --bin hermit --no-default-features)
       ;;
     all)
-      make --no-print-directory -s -C "$ROOT" check-deps
+      make --no-print-directory -s -C "$ROOT" check-demo-deps
       ( cd "$HERMIT_REPO" && \
-        cargo build --release -p hermit --bin hermit --no-default-features && \
-        cargo build -p hermetic_infra_hermit_flaky-tests --bin hello_race && \
-        cargo build -p hermetic_infra_hermit_tests --bin rustbin_heap_ptrs )
+        cargo build --locked --release -p hermit --bin hermit --no-default-features && \
+        cargo build --locked -p hermetic_infra_hermit_flaky-tests --bin hello_race && \
+        cargo build --locked -p hermetic_infra_hermit_tests --bin rustbin_heap_ptrs )
       ;;
     *)
       echo "ERROR: unsupported DEMO_BUILD_MODE: $DEMO_BUILD_MODE" >&2
