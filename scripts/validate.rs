@@ -202,6 +202,8 @@ fn validation_step_identity(step: &Step) -> ValidationStepIdentity {
 }
 
 const LEDGER_ENV: &str = "HERMIT_VALIDATE_LEDGER";
+const CONCURRENCY_EXPERIMENT_CONTRACT_ENV: &str =
+    "HERMIT_VALIDATE_CONCURRENCY_EXPERIMENT_CONTRACT";
 const PARENT_ENV: &str = "DEV_HERMIT_PARENT";
 const TOOL_ROOT_ENV: &str = "DEV_HERMIT_TOOL_ROOT";
 const TOOL_AUTHORITY_ENV: &str = "DEV_HERMIT_TOOL_AUTHORITY";
@@ -6237,6 +6239,85 @@ fn neutralize_out_of_place_concurrency_resources(plan: &mut Plan) {
     if let Some(second) = &mut plan.second {
         neutralize(second);
     }
+}
+
+fn validate_out_of_place_concurrency_contract_record(
+    record: &serde_json::Value,
+    root: &Path,
+    commit: &str,
+    ledger: &Path,
+) -> Result<(), String> {
+    let object = record
+        .as_object()
+        .ok_or("concurrency experiment contract is not one JSON object")?;
+    let exact = |field: &str, expected: &str| -> Result<(), String> {
+        match object.get(field).and_then(serde_json::Value::as_str) {
+            Some(observed) if observed == expected => Ok(()),
+            observed => Err(format!(
+                "concurrency experiment contract {field} is {observed:?}, expected {expected:?}"
+            )),
+        }
+    };
+    if object
+        .get("concurrency_experiment")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err("concurrency experiment contract is not marked concurrency_experiment=true".into());
+    }
+    if object
+        .get("temporary_checkout")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err("concurrency experiment contract does not name a temporary checkout".into());
+    }
+    if object
+        .get("qualifying_receipt")
+        .and_then(serde_json::Value::as_bool)
+        != Some(false)
+    {
+        return Err("concurrency experiment contract is not explicitly non-qualifying".into());
+    }
+    exact("kind", "frozen-validate")?;
+    exact("admission", "frozen-validate")?;
+    exact("target", commit)?;
+    exact("checkout", &root.to_string_lossy())?;
+    exact("result_record", &ledger.to_string_lossy())?;
+    Ok(())
+}
+
+fn validate_out_of_place_concurrency_contract(root: &Path, commit: &str) -> Result<(), String> {
+    let contract = std::env::var_os(CONCURRENCY_EXPERIMENT_CONTRACT_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            format!(
+                "{OUT_OF_PLACE_CONCURRENCY_EXPERIMENT_OPTION} requires the parent-issued {CONCURRENCY_EXPERIMENT_CONTRACT_ENV}; an arbitrary ledger path is not admission"
+            )
+        })?;
+    if !contract.is_absolute() {
+        return Err(format!(
+            "{CONCURRENCY_EXPERIMENT_CONTRACT_ENV} must be an absolute path"
+        ));
+    }
+    let ledger = std::env::var_os(LEDGER_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("concurrency experiment requires an explicit {LEDGER_ENV} path"))?;
+    let text = std::fs::read_to_string(&contract).map_err(|error| {
+        format!(
+            "cannot read parent-issued concurrency experiment contract {}: {error}",
+            contract.display()
+        )
+    })?;
+    let record: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+        format!(
+            "parent-issued concurrency experiment contract {} is not valid JSON: {error}",
+            contract.display()
+        )
+    })?;
+    validate_out_of_place_concurrency_contract_record(&record, root, commit, &ledger)
 }
 
 fn out_of_place_concurrency_experiment_bracket(root: &Path) -> Result<String, String> {
@@ -18160,22 +18241,21 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
              evidence."
         );
     }
-    if args.out_of_place_concurrency_experiment
-        && !args.show_plan
-        && std::env::var_os(LEDGER_ENV).is_none_or(|value| value.is_empty())
-    {
-        return RunSummary::refused(
-            2,
-            &profile_name,
-            "the out-of-place concurrency experiment boundary",
-            vec![
-                format!(
-                    "{OUT_OF_PLACE_CONCURRENCY_EXPERIMENT_OPTION} requires an explicit {LEDGER_ENV} path"
-                ),
-                "launch through ci-hub validate-run --frozen-validate so the result is written outside the canonical ledger and marked non-qualifying"
-                    .into(),
-            ],
-        );
+    if args.out_of_place_concurrency_experiment && !args.show_plan {
+        if let Err(error) =
+            validate_out_of_place_concurrency_contract(&root, &git_sha())
+        {
+            return RunSummary::refused(
+                2,
+                &profile_name,
+                "the out-of-place concurrency experiment boundary",
+                vec![
+                    error,
+                    "launch through ci-hub validate-run --frozen-validate so the parent creates the exact non-qualifying run contract before service start"
+                        .into(),
+                ],
+            );
+        }
     }
 
     // ---- dev-hermit product front door -------------------------------------
@@ -20147,6 +20227,47 @@ mod e2e_attempt_tests {
         );
         assert_eq!(validation_step_identity(&ordinary), ValidationStepIdentity::Other);
         assert!(!ordinary.env.contains_key("E2E_ATTEMPT"));
+    }
+
+    #[test]
+    fn concurrency_experiment_contract_binds_checkout_commit_and_ledger() {
+        let root = Path::new("/tmp/validate-concurrency-contract/checkout");
+        let ledger = Path::new("/tmp/validate-concurrency-contract/result.jsonl");
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let valid = serde_json::json!({
+            "kind": "frozen-validate",
+            "admission": "frozen-validate",
+            "concurrency_experiment": true,
+            "temporary_checkout": true,
+            "qualifying_receipt": false,
+            "target": commit,
+            "checkout": root,
+            "result_record": ledger,
+        });
+        validate_out_of_place_concurrency_contract_record(&valid, root, commit, ledger)
+            .expect("exact parent-issued contract must be accepted");
+
+        let mutations = [
+            ("kind", serde_json::json!("validate")),
+            ("admission", serde_json::json!("ci-hub validate-lock")),
+            ("concurrency_experiment", serde_json::json!(false)),
+            ("temporary_checkout", serde_json::json!(false)),
+            ("qualifying_receipt", serde_json::json!(true)),
+            ("target", serde_json::json!("f".repeat(40))),
+            ("checkout", serde_json::json!("/tmp/wrong-checkout")),
+            ("result_record", serde_json::json!("/tmp/wrong-ledger.jsonl")),
+        ];
+        for (field, value) in mutations {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            assert!(
+                validate_out_of_place_concurrency_contract_record(
+                    &invalid, root, commit, ledger
+                )
+                .is_err(),
+                "mutating {field} must invalidate the parent-issued contract"
+            );
+        }
     }
 
 }
