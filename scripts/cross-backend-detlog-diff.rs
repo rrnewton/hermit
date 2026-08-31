@@ -25,9 +25,12 @@
 //!
 //! 1. **Evidence must come from an authoritative sink.** `ptrace` honours the
 //!    host-opened `--log-file`. DBT's ordinary single-run adapter deliberately
-//!    refuses that option and shares stderr with the guest, so this tool refuses
-//!    DBT rather than accepting guest-forgeable records. It never chooses a
-//!    stderr stream merely because it contains more record-looking lines.
+//!    refuses that option and shares stderr with the guest. SaBRe forwards its
+//!    real Detcore records to raw stderr while the host `--log-file` contains
+//!    only an incomplete controller stream. This tool therefore refuses both
+//!    paths rather than accepting guest-forgeable or incomplete records. It
+//!    never chooses a stderr stream merely because it contains more
+//!    record-looking lines.
 //! 2. **Normalization is where fake parity gets manufactured.** Every
 //!    normalization here is opt-in except the wall-clock prefix, and every one
 //!    actually applied is listed in the output. If a lossy normalization could
@@ -37,7 +40,7 @@
 //!
 //! ```text
 //! ./scripts/cross-backend-detlog-diff.rs --backends ptrace,ptrace -- /bin/true
-//! ./scripts/cross-backend-detlog-diff.rs --backends ptrace,sabre --detlog-heap -- ./guest arg
+//! ./scripts/cross-backend-detlog-diff.rs --backends ptrace,liteinst --detlog-heap -- ./guest arg
 //! ./scripts/cross-backend-detlog-diff.rs --normalize host-addresses,virtual-time -- ./guest
 //! ./scripts/cross-backend-detlog-diff.rs --self-test
 //! ./scripts/cross-backend-detlog-diff.rs --list-normalizations
@@ -133,11 +136,12 @@ fn backend_description(backend: &str) -> Result<&'static str, String> {
     }
 }
 
-fn supports_single_run_log_file(backend: &str) -> bool {
+fn has_authoritative_complete_single_run_log_file(backend: &str) -> bool {
     // Live hermit-cli policy: DBT's ordinary single-run adapter refuses
-    // --log-file. Its stderr is shared with the guest and is not accepted as
-    // authoritative evidence by this diagnostic.
-    backend != "dbt"
+    // --log-file. SaBRe accepts the controller's --log-file, but the injected
+    // Detcore plugin forwards its actual records to raw stderr instead. Neither
+    // path exposes a complete isolated/authenticated sink to this diagnostic.
+    !matches!(backend, "dbt" | "sabre")
 }
 
 fn usage() -> String {
@@ -157,8 +161,10 @@ fn usage() -> String {
          \x20 --list-normalizations   describe every normalization and exit\n\n\
          Backends: ptrace, dbt, liteinst, sabre, kvm. `e9patch` means\n\
          preprocessing followed by the ptrace runtime; it is not a backend.\n\
-         DBT currently refuses here because its one-run stderr is guest-\n\
-         controllable and no isolated authenticated sink is exposed.\n\n\
+         DBT currently refuses because its one-run stderr is guest-controllable.\n\
+         SaBRe also refuses: its Detcore records use raw guest-controllable\n\
+         stderr, while the host --log-file is incomplete. Neither path exposes\n\
+         an isolated authenticated complete sink.\n\n\
          Exit: 0 agree, 1 diverge, 2 could not compare.\n",
     );
     s.push_str("\nNormalizations:\n");
@@ -302,6 +308,11 @@ fn select_authoritative_stream<'a>(
             "{side} DynamoRIO DBT ordinary single-run evidence is available only on stderr, which is shared with the guest and can be forged; no isolated typed/authenticated one-run sink is exposed, so this diagnostic refuses DBT (use strict canonical verify instead)"
         ));
     }
+    if backend == "sabre" {
+        return Err(format!(
+            "{side} SaBRe Detcore records are forwarded to raw stderr, which is shared with the guest and can be forged, while the host --log-file contains an incomplete controller stream; no isolated typed/authenticated complete sink is exposed, so this diagnostic refuses SaBRe (use strict canonical verify instead)"
+        ));
+    }
     if from_file.is_empty() {
         let stderr_records = stderr.lines().filter(|line| is_record(line)).count();
         return Err(format!(
@@ -341,7 +352,7 @@ fn capture(cfg: &Config, backend: &str, side: &str, tmpdir: &Path) -> Result<Cap
     let log_file = tmpdir.join(format!("{side}-{backend}.log-file"));
     let mut cmd = Command::new(&cfg.hermit);
     cmd.arg("--log").arg("info");
-    if supports_single_run_log_file(backend) {
+    if has_authoritative_complete_single_run_log_file(backend) {
         cmd.arg("--log-file").arg(&log_file);
     }
     cmd.arg("run")
@@ -889,8 +900,10 @@ fn run_self_test() {
         "obsolete dbi spelling was accepted",
     );
     check(
-        !supports_single_run_log_file("dbt") && supports_single_run_log_file("ptrace"),
-        "DBT single-run log sink policy was not represented",
+        !has_authoritative_complete_single_run_log_file("dbt")
+            && !has_authoritative_complete_single_run_log_file("sabre")
+            && has_authoritative_complete_single_run_log_file("ptrace"),
+        "DBT/SaBRe single-run log sink policy was not represented",
     );
     check(
         backend_description("unknown").is_err(),
@@ -973,6 +986,16 @@ fn run_self_test() {
     check(
         select_authoritative_stream("left", "dbt", "", forged_longer).is_err(),
         "DBT guest-controllable stderr was accepted as evidence",
+    );
+    check(
+        select_authoritative_stream("left", "sabre", authoritative, forged_longer).is_err_and(
+            |error| {
+                error.contains("SaBRe Detcore records are forwarded to raw stderr")
+                    && error.contains("host --log-file contains an incomplete controller stream")
+                    && error.contains("no isolated typed/authenticated complete sink")
+            },
+        ),
+        "SaBRe guest-controllable stderr or incomplete host log file was accepted as evidence",
     );
     check(
         select_authoritative_stream("left", "ptrace", "", "").is_err(),
