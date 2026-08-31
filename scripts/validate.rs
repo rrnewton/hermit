@@ -5069,7 +5069,7 @@ fn checkout_admission(
     commit: &str,
     host: &str,
 ) -> CheckoutAdmission {
-    let lock_admitted = canonical_validate_lock_admission(tool_root, commit, host).is_ok();
+    let lock_admitted = validate_lock_admission(tool_root, commit, host).is_ok();
     CheckoutAdmission {
         lock_admitted,
         disposable: lock_admitted && is_disposable_validate_checkout(root, parent),
@@ -6013,16 +6013,16 @@ fn local_off_the_record_refusal(args: &Args, dirty: bool) -> Option<String> {
 }
 
 /// Construct the refusal for an unadmitted product run. Production supplies
-/// `canonically_admitted` only from [`canonical_validate_lock_admission`].
+/// `lock_admitted` only from [`validate_lock_admission`].
 fn product_front_door_refusal(
     tool_root: &Path,
     root: &Path,
     commit: &str,
     requested_args: &str,
     ci_hub_launcher_available: bool,
-    canonically_admitted: bool,
+    lock_admitted: bool,
 ) -> Option<String> {
-    if canonically_admitted {
+    if lock_admitted {
         return None;
     }
     let ci_hub_path = tool_root.join("ci-hub/ci-hub");
@@ -12912,10 +12912,12 @@ fn receipt_evidence(
     }
 }
 
-/// Ask the canonical parent lock authority whether this exact run is admitted.
+/// Ask the parent lock authority whether this exact run is admitted. Ordinary
+/// validation requires canonical current-main authority; frozen validation
+/// requires a fully checked lock holder that remains explicitly noncanonical.
 /// Production never trusts caller-supplied owner PIDs or sidecar paths. The
 /// stop-test JSON seam is confined to an intrinsically non-qualifying fixture.
-fn canonical_validate_lock_admission(
+fn validate_lock_admission(
     tool_root: Option<&Path>,
     commit: &str,
     host: &str,
@@ -12956,7 +12958,7 @@ fn canonical_validate_lock_admission(
     let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .ok()
         .map(|id| id.trim().to_string());
-    canonical_validate_lock_status_reason(
+    validate_lock_status_reason(
         &status,
         commit,
         host,
@@ -12965,18 +12967,18 @@ fn canonical_validate_lock_admission(
     )
 }
 
-/// Parse and bind one canonical authority response. The injected identity
+/// Parse and bind one validation-lock authority response. The injected identity
 /// predicate is the real `/proc` ancestry check in production and a planted,
 /// inert identity in `--self-test`; no caller-supplied environment marker can
 /// bypass these exact commit, host, boot, PID, and start-time checks.
-fn canonical_validate_lock_status_admits(
+fn validate_lock_status_admits(
     status: &[u8],
     commit: &str,
     host: &str,
     boot_id: Option<&str>,
     identity_in_ancestry: &mut dyn FnMut(i32, u64) -> bool,
 ) -> bool {
-    canonical_validate_lock_status_reason(status, commit, host, boot_id, identity_in_ancestry)
+    validate_lock_status_reason(status, commit, host, boot_id, identity_in_ancestry)
         .is_ok()
 }
 
@@ -13003,7 +13005,7 @@ fn canonical_validate_lock_status_admits(
 /// instantiates one more reference layer -- `F`, `&mut F`, `&mut &mut F`, ...
 /// -- and monomorphization never terminates. Measured 2026-08-26: as
 /// `impl FnMut` this failed to compile with "reached the recursion limit while
-/// instantiating `canonical_validate_lock_status_reason::<&mut &mut &mut &mut
+/// instantiating `validate_lock_status_reason::<&mut &mut &mut &mut
 /// &mut ...>`", which took the whole validate gate off the air on `main` --
 /// validate could not build, so nothing could be validated at all.
 ///
@@ -13011,7 +13013,7 @@ fn canonical_validate_lock_status_admits(
 /// different crate configuration and passed 16/16 while the release build the
 /// gate actually runs could not compile. A green self-test is therefore NOT
 /// evidence that this file builds; only a release build is.
-fn canonical_validate_lock_status_reason(
+fn validate_lock_status_reason(
     status: &[u8],
     commit: &str,
     host: &str,
@@ -13041,7 +13043,7 @@ fn canonical_validate_lock_status_reason(
         for authority in authorities {
             let encoded = serde_json::to_vec(authority)
                 .map_err(|error| format!("cannot encode validation slot: {error}"))?;
-            match canonical_validate_lock_status_reason(
+            match validate_lock_status_reason(
                 &encoded,
                 commit,
                 host,
@@ -13072,22 +13074,56 @@ fn canonical_validate_lock_status_reason(
     {
         return Err("the authority response is not schema_version 1".into());
     }
-    if value.get("admissible").and_then(serde_json::Value::as_bool) != Some(true) {
-        return Err("the authority itself reports admissible=false".into());
+    let holder_kind = object_string(holder, "kind");
+    match holder_kind {
+        Some("validate") => {
+            if value.get("admissible").and_then(serde_json::Value::as_bool) != Some(true) {
+                return Err("the authority itself reports admissible=false".into());
+            }
+            if !value
+                .get("reason_code")
+                .is_some_and(serde_json::Value::is_null)
+            {
+                return Err(format!(
+                    "the authority attached reason_code {}",
+                    shown(value.get("reason_code").and_then(serde_json::Value::as_str))
+                ));
+            }
+        }
+        Some("frozen-validate") => {
+            if value
+                .get("lock_admissible")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                return Err("the frozen authority itself reports lock_admissible=false".into());
+            }
+            if value.get("admissible").and_then(serde_json::Value::as_bool) != Some(false) {
+                return Err(
+                    "the frozen authority must remain noncanonical (admissible=false)".into(),
+                );
+            }
+            if value.get("reason_code").and_then(serde_json::Value::as_str)
+                != Some("canonical-holder-kind-not-validate")
+            {
+                return Err(format!(
+                    "the frozen authority attached reason_code {}, not \
+                     \"canonical-holder-kind-not-validate\"",
+                    shown(value.get("reason_code").and_then(serde_json::Value::as_str))
+                ));
+            }
+        }
+        _ => {
+            return Err(format!(
+                "the held lock is kind {}, not \"validate\" or \"frozen-validate\"",
+                shown(holder_kind)
+            ));
+        }
     }
     if value.get("state").and_then(serde_json::Value::as_str) != Some("held") {
         return Err(format!(
             "the lock state is {}, not \"held\"",
             shown(value.get("state").and_then(serde_json::Value::as_str))
-        ));
-    }
-    if !value
-        .get("reason_code")
-        .is_some_and(serde_json::Value::is_null)
-    {
-        return Err(format!(
-            "the authority attached reason_code {}",
-            shown(value.get("reason_code").and_then(serde_json::Value::as_str))
         ));
     }
     if value
@@ -13110,12 +13146,6 @@ fn canonical_validate_lock_status_reason(
                     .get("cleanup_state")
                     .and_then(serde_json::Value::as_str)
             )
-        ));
-    }
-    if object_string(holder, "kind") != Some("validate") {
-        return Err(format!(
-            "the held lock is kind {}, not \"validate\"",
-            shown(object_string(holder, "kind"))
         ));
     }
     if object_string(holder, "target") != Some(commit) {
@@ -13177,8 +13207,8 @@ fn canonical_validate_lock_status_reason(
     Ok(())
 }
 
-/// Inert two-sided bracket for the front door and the canonical authority
-/// parser. It proves the new guard neither accepts missing/mismatched authority
+/// Inert two-sided bracket for the front door and the validation-lock authority
+/// parser. It proves the guard neither accepts missing/mismatched authority
 /// nor mistakes a generic superproject for dev-hermit. Nested payloads remain
 /// subject to the same authority, so their caller-supplied marker cannot become
 /// an admission bypass.
@@ -13208,6 +13238,7 @@ fn product_front_door_bracket() -> Result<(), String> {
     let boot_id = "11111111-2222-3333-4444-555555555555";
     let authority = serde_json::json!({
         "schema_version": 1,
+        "lock_admissible": true,
         "admissible": true,
         "state": "held",
         "reason_code": null,
@@ -13223,7 +13254,7 @@ fn product_front_door_bracket() -> Result<(), String> {
         }
     });
     let encode = |value: &serde_json::Value| serde_json::to_vec(value).unwrap();
-    if !canonical_validate_lock_status_admits(
+    if !validate_lock_status_admits(
         &encode(&authority),
         commit,
         host,
@@ -13231,6 +13262,46 @@ fn product_front_door_bracket() -> Result<(), String> {
         &mut (|pid, ticks| pid == 4242 && ticks == 987654),
     ) {
         return Err("product front door refused exact canonical authority".into());
+    }
+
+    let mut frozen_authority = authority.clone();
+    frozen_authority["lock_admissible"] = serde_json::json!(true);
+    frozen_authority["admissible"] = serde_json::json!(false);
+    frozen_authority["reason_code"] =
+        serde_json::json!("canonical-holder-kind-not-validate");
+    frozen_authority["holder"]["kind"] = serde_json::json!("frozen-validate");
+    if !validate_lock_status_admits(
+        &encode(&frozen_authority),
+        commit,
+        host,
+        Some(boot_id),
+        &mut (|pid, ticks| pid == 4242 && ticks == 987654),
+    ) {
+        return Err("product front door refused exact frozen authority".into());
+    }
+
+    let mut frozen_weakened = Vec::new();
+    let mut value = frozen_authority.clone();
+    value["lock_admissible"] = serde_json::json!(false);
+    frozen_weakened.push(("not lock-admissible", value));
+    let mut value = frozen_authority.clone();
+    value["holder"]["target"] = serde_json::json!("different-commit");
+    frozen_weakened.push(("wrong target", value));
+    let mut value = frozen_authority.clone();
+    value["owner"]["liveness"] = serde_json::json!("dead");
+    frozen_weakened.push(("owner not alive", value));
+    for (label, value) in frozen_weakened {
+        if validate_lock_status_admits(
+            &encode(&value),
+            commit,
+            host,
+            Some(boot_id),
+            &mut (|pid, ticks| pid == 4242 && ticks == 987654),
+        ) {
+            return Err(format!(
+                "product front door accepted invalid frozen authority: {label}"
+            ));
+        }
     }
 
     // Goalpost safety: every case below weakens or changes an identity claim.
@@ -13280,7 +13351,7 @@ fn product_front_door_bracket() -> Result<(), String> {
     value["owner"]["boot_id"] = serde_json::json!("other-boot");
     weakened.push(("wrong boot", value));
     for (label, value) in weakened {
-        if canonical_validate_lock_status_admits(
+        if validate_lock_status_admits(
             &encode(&value),
             commit,
             host,
@@ -13290,7 +13361,7 @@ fn product_front_door_bracket() -> Result<(), String> {
             return Err(format!("product front door accepted weakened authority: {label}"));
         }
     }
-    if canonical_validate_lock_status_admits(
+    if validate_lock_status_admits(
         &encode(&authority),
         commit,
         host,
@@ -13314,7 +13385,7 @@ fn product_front_door_bracket() -> Result<(), String> {
     for (name, value) in legacy_env {
         unsafe { std::env::set_var(name, value) };
     }
-    let forged_env_admitted = canonical_validate_lock_status_admits(
+    let forged_env_admitted = validate_lock_status_admits(
         br#"{"schema_version":1,"admissible":false}"#,
         commit,
         host,
@@ -14989,7 +15060,7 @@ fn tool_root_split_bracket() -> Result<(), String> {
     }
     let tool_authority_marker = state_root.join("authority-called");
     let authority =
-        canonical_validate_lock_admission(Some(effective_tool_root), "fixture", "fixture-host");
+        validate_lock_admission(Some(effective_tool_root), "fixture", "fixture-host");
     if authority.is_ok() || !tool_authority_marker.is_file() {
         return Err(
             "tool-root split: authority did not execute exclusively from the tool root".into(),
@@ -17168,7 +17239,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         let commit = git_sha();
         let host = short_hostname();
         let ci_hub_launcher_available = tool_root.join("ci-hub/ci-hub").is_file();
-        let admission = canonical_validate_lock_admission(Some(tool_root), &commit, &host);
+        let admission = validate_lock_admission(Some(tool_root), &commit, &host);
         // NAME THE CONJUNCT THAT FAILED. The decision is unchanged -- it is still
         // exactly `admission.is_ok()` -- but a refusal that lists three
         // possibilities and identifies none is undiagnosable from outside, and
@@ -18914,7 +18985,7 @@ fn stop_test_seam(
     let wall = started.elapsed().as_secs_f64();
     let ledger = ledger_path(root);
     let host = short_hostname();
-    let lock_admitted = canonical_validate_lock_admission(tool_root, &commit, &host).is_ok();
+    let lock_admitted = validate_lock_admission(tool_root, &commit, &host).is_ok();
     let ctx = LedgerCtx {
         started_at,
         host,
