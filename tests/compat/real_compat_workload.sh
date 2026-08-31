@@ -363,13 +363,29 @@ pub fn weighted_sum(values: &[u64]) -> u64 {
         .sum()
 }
 EOF
-        cargo metadata --offline --format-version 1 --no-deps \
+        CARGO="$FIXTURE_ROOT/toolchain/cargo"
+        RUSTC="$FIXTURE_ROOT/toolchain/rustc"
+        test -x "$CARGO"
+        test -x "$RUSTC"
+        RUSTC="$RUSTC" "$CARGO" metadata --offline --format-version 1 --no-deps \
             --manifest-path "$WORK_DIR/Cargo.toml" >"$WORK_DIR/metadata.json"
-        cargo package --offline --allow-dirty --list \
+        RUSTC="$RUSTC" "$CARGO" package --offline --allow-dirty --list \
             --manifest-path "$WORK_DIR/Cargo.toml" >"$WORK_DIR/package-files.txt"
         grep -q '"name":"hermit-real-compat"' "$WORK_DIR/metadata.json"
         grep -qx 'src/lib.rs' "$WORK_DIR/package-files.txt"
         printf 'cargo:metadata-and-package-list\n'
+        ;;
+    df)
+        # Coreutils df reads /proc/self/mountinfo before statfs(2). Feed that
+        # read from the immutable fixture through an inherited descriptor so
+        # Hermit's per-attempt private mount roots cannot contaminate the
+        # strict comparison. The redirect marker proves the fixture was used.
+        output=$(HERMIT_LSOF_MOUNTS_FD=0 \
+            HERMIT_LSOF_REDIRECT_MARKER="$WORK_DIR/df.redirected" \
+            LD_PRELOAD="$FIXTURE_ROOT/lsof/libmount_redirect.so" \
+            /usr/bin/df -P / <"$FIXTURE_ROOT/df/mountinfo")
+        [[ $(cat "$WORK_DIR/df.redirected") == fixed-mount-fd ]]
+        printf '%s\n' "$output"
         ;;
     rustc)
         cat >"$WORK_DIR/main.rs" <<'EOF'

@@ -17,7 +17,18 @@ fi
 readonly FIXTURE_ROOT=$1
 rm -rf "$FIXTURE_ROOT"
 mkdir -p "$FIXTURE_ROOT/binutils" "$FIXTURE_ROOT/gprof" "$FIXTURE_ROOT/gcov" \
-    "$FIXTURE_ROOT/lsof"
+    "$FIXTURE_ROOT/lsof" "$FIXTURE_ROOT/df" "$FIXTURE_ROOT/toolchain"
+
+# Compatibility probes run from an otherwise-empty /test. Snapshot the one
+# repository input used by the coreutils rows instead of accidentally relying
+# on the validate driver's current directory.
+cp "$PWD/README.md" "$FIXTURE_ROOT/README.md"
+
+# `--base-env=minimal` deliberately excludes the user's rustup directory. The
+# cargo workload still needs the active toolchain, so expose exactly cargo and
+# rustc through this run-owned fixture rather than passing through the host PATH.
+ln -s "$(rustup which cargo)" "$FIXTURE_ROOT/toolchain/cargo"
+ln -s "$(rustup which rustc)" "$FIXTURE_ROOT/toolchain/rustc"
 
 gcc -O2 -Wall -Wextra -Werror -Wl,--build-id=none \
     "$PWD/tests/compat/localhost_http_server.c" \
@@ -80,6 +91,15 @@ gcc -shared -fPIC -Wall -Wextra -Werror \
     -o "$FIXTURE_ROOT/lsof/libmount_redirect.so"
 cat >"$FIXTURE_ROOT/lsof/mounts" <<'EOF'
 fixture /tmp fixture rw 0 0
+EOF
+
+# `df` consults mountinfo before statfs(2). Hermit's private mount roots differ
+# between the two executions inside --verify, so give this command-compatibility
+# probe a fixed, valid view of the root mount. The product-level mountinfo
+# determinization remains covered separately; this fixture does not weaken or
+# filter the verifier.
+cat >"$FIXTURE_ROOT/df/mountinfo" <<'EOF'
+1 0 0:1 / / rw,relatime - rootfs rootfs rw
 EOF
 
 # Prevent host build time from becoming guest-visible input.
