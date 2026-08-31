@@ -84,7 +84,8 @@ check_submodules() {
     done
 
     local observed=0 nested_root expected_root nested_head dirty
-    local -a index_records=()
+    local nested_record nested_metadata nested_mode nested_type nested_sha nested_extra nested_path
+    local -a index_records=() nested_tree_records=()
     for path in "${configured_paths[@]}"; do
         [[ -n ${gitlinks[$path]+present} ]] || \
             fail "configured path is not a committed gitlink in HEAD: $path"
@@ -132,6 +133,33 @@ check_submodules() {
         dirty=$(<"$status_file")
         [[ -z $dirty ]] || fail "submodule worktree is dirty: $path"
 
+        # The old `git submodule status --recursive` gate refused an absent or
+        # drifted descendant. Registration-free recursion needs to interpret
+        # each nested repository's own .gitmodules and index; until that exists,
+        # refuse any committed nested gitlink rather than silently dropping the
+        # recursive part of the contract.
+        : >"$tree_file"
+        if ! GIT_OPTIONAL_LOCKS=0 "${git_argv[@]}" -c core.fsmonitor=false \
+            -C "$path" ls-tree -rz --full-tree HEAD >"$tree_file"; then
+            fail "could not inspect committed nested gitlinks under submodule: $path"
+        fi
+        nested_tree_records=()
+        mapfile -d '' -t nested_tree_records <"$tree_file"
+        for nested_record in "${nested_tree_records[@]}"; do
+            [[ $nested_record == *$'\t'* ]] || \
+                fail "malformed nested git tree entry under submodule: $path"
+            nested_metadata=${nested_record%%$'\t'*}
+            nested_path=${nested_record#*$'\t'}
+            read -r nested_mode nested_type nested_sha nested_extra <<<"$nested_metadata"
+            [[ $nested_mode == 160000 ]] || continue
+            [[ -z ${nested_extra:-} && $nested_type == commit \
+                && $nested_sha =~ ^[0-9a-f]{40}$ ]] || \
+                fail "malformed committed nested gitlink: $path/$nested_path"
+            valid_submodule_path "$nested_path" || \
+                fail "unsafe or malformed committed nested gitlink path: $path/$nested_path"
+            fail "committed nested submodule is not yet supported by the registration-free verifier: $path/$nested_path"
+        done
+
         printf ' %s %s\n' "$sha" "$path"
         ((observed += 1))
     done
@@ -141,7 +169,7 @@ check_submodules() {
 }
 
 self_test() {
-    local root self git_bin agent_seed rr_seed super agent_sha rr_sha output
+    local root self git_bin agent_seed rr_seed nested_seed super agent_sha rr_sha output
     root=$(mktemp -d)
     self=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
     git_bin=$(command -v git)
@@ -183,7 +211,7 @@ EOF
     make_checkout() {
         local checkout=$root/$1
         "$git_bin" clone -q --no-recurse-submodules "$super" "$checkout"
-        "$git_bin" clone -q "$agent_seed" "$checkout/agent-utils"
+        "$git_bin" clone -q --no-recurse-submodules "$agent_seed" "$checkout/agent-utils"
         mkdir -p "$checkout/third-party"
         "$git_bin" clone -q "$rr_seed" "$checkout/third-party/rr"
         printf '%s\n' "$checkout"
@@ -258,7 +286,34 @@ EOF
         fail 'self-test git producer failure unexpectedly passed'
     fi
 
-    printf 'PASS: verify-submodules checks unregistered populated repositories and refuses missing, non-repo, wrong-HEAD, dirty, conflicted, malformed, and unreadable states without repair\n'
+    # Preserve the recursive refusal from the prior `git submodule status
+    # --recursive` implementation. A populated top-level repository does not
+    # report its absent nested checkout as dirty, so the committed gitlink must
+    # be inspected directly rather than inferred from `git status`.
+    nested_seed=$root/nested-seed
+    make_seed "$nested_seed" nested
+    "$git_bin" -c protocol.file.allow=always -C "$agent_seed" submodule add -q \
+        "$nested_seed" nested
+    "$git_bin" -C "$agent_seed" -c user.name=fixture -c user.email=fixture@example.invalid \
+        commit -qam nested
+    agent_sha=$("$git_bin" -C "$agent_seed" rev-parse HEAD)
+    "$git_bin" -C "$super" update-index --cacheinfo "160000,$agent_sha,agent-utils"
+    "$git_bin" -C "$super" -c user.name=fixture -c user.email=fixture@example.invalid \
+        commit -qm nested
+    checkout=$(make_checkout nested)
+    if "$git_bin" -C "$checkout/agent-utils" config --local \
+        --get-regexp '^submodule\..*\.' >/dev/null; then
+        fail 'self-test nested fixture unexpectedly registered its descendant'
+    fi
+    config_before=$(cksum <"$checkout/agent-utils/.git/config")
+    expect_refusal 'committed nested submodule' "$checkout"
+    config_after=$(cksum <"$checkout/agent-utils/.git/config")
+    [[ $config_before == "$config_after" ]] || \
+        fail 'self-test nested refusal mutated local git config'
+    grep -q 'agent-utils/nested' "$output" || \
+        fail 'self-test nested refusal did not name the committed nested path'
+
+    printf 'PASS: verify-submodules checks unregistered populated repositories and refuses missing, non-repo, wrong-HEAD, dirty, conflicted, nested, malformed, and unreadable states without repair\n'
 }
 
 case "${1:---check}" in
