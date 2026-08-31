@@ -29,7 +29,9 @@ static bool is_proc_mount_table(const char *path) {
     }
     if (strcmp(path, "/proc/mounts") == 0 ||
         strcmp(path, "/proc/self/mounts") == 0 ||
-        strcmp(path, "/proc/thread-self/mounts") == 0) {
+        strcmp(path, "/proc/thread-self/mounts") == 0 ||
+        strcmp(path, "/proc/self/mountinfo") == 0 ||
+        strcmp(path, "/proc/thread-self/mountinfo") == 0) {
         return true;
     }
 
@@ -44,7 +46,8 @@ static bool is_proc_mount_table(const char *path) {
     while (*cursor >= '0' && *cursor <= '9') {
         ++cursor;
     }
-    return strcmp(cursor, "/mounts") == 0;
+    return strcmp(cursor, "/mounts") == 0 ||
+           strcmp(cursor, "/mountinfo") == 0;
 }
 
 static int fixed_mount_fd(void) {
@@ -128,6 +131,28 @@ FILE *fopen64(const char *path, const char *mode) {
     return stream;
 }
 
+FILE *fopen(const char *path, const char *mode) {
+    static FILE *(*next_fopen)(const char *, const char *);
+    if (next_fopen == NULL) {
+        next_fopen = dlsym(RTLD_NEXT, "fopen");
+    }
+    if (!is_proc_mount_table(path)) {
+        return next_fopen(path, mode);
+    }
+
+    int fd = duplicate_mount_fd();
+    if (fd < 0) {
+        return NULL;
+    }
+    FILE *stream = fdopen(fd, mode);
+    if (stream == NULL) {
+        (void)close(fd);
+    } else {
+        mark_redirect();
+    }
+    return stream;
+}
+
 int open64(const char *path, int flags, ...) {
     static int (*next_open64)(const char *, int, ...);
     mode_t mode = 0;
@@ -149,4 +174,27 @@ int open64(const char *path, int flags, ...) {
         return next_open64(path, flags, mode);
     }
     return next_open64(path, flags);
+}
+
+int openat(int dirfd, const char *path, int flags, ...) {
+    static int (*next_openat)(int, const char *, int, ...);
+    mode_t mode = 0;
+    if (next_openat == NULL) {
+        next_openat = dlsym(RTLD_NEXT, "openat");
+    }
+    if (is_proc_mount_table(path)) {
+        int fd = duplicate_mount_fd();
+        if (fd >= 0) {
+            mark_redirect();
+        }
+        return fd;
+    }
+    if ((flags & O_CREAT) != 0 || (flags & O_TMPFILE) == O_TMPFILE) {
+        va_list args;
+        va_start(args, flags);
+        mode = va_arg(args, mode_t);
+        va_end(args);
+        return next_openat(dirfd, path, flags, mode);
+    }
+    return next_openat(dirfd, path, flags);
 }
