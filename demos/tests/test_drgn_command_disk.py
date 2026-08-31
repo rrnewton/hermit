@@ -72,6 +72,35 @@ class CommandDiskProtocolTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "preloaded command disk"):
             program.advance("different", b"done")
 
+    def test_safehermit_cleanup_targets_the_unit_recorded_for_the_run(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            report = Path(directory) / "safehermit-report.txt"
+            report.write_text("safehermit: unit=safehermit-test-123\n")
+            with mock.patch.object(dh.subprocess, "run") as run:
+                dh._stop_safehermit_unit(report)
+
+        run.assert_called_once_with(
+            [
+                "systemctl",
+                "--user",
+                "kill",
+                "--signal=SIGKILL",
+                "safehermit-test-123.service",
+            ],
+            check=False,
+            stdout=dh.subprocess.DEVNULL,
+            stderr=dh.subprocess.DEVNULL,
+        )
+
+    def test_safehermit_cleanup_refuses_an_untrusted_unit_name(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            report = Path(directory) / "safehermit-report.txt"
+            report.write_text("safehermit: unit=bad;unit\n")
+            with mock.patch.object(dh.subprocess, "run") as run:
+                dh._stop_safehermit_unit(report)
+
+        run.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
