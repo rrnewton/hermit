@@ -48,6 +48,31 @@ def _make_default(extra_env=None) -> Path:
 
 
 class DefaultQemuAssetsTest(unittest.TestCase):
+    def test_dependency_check_accepts_make_prerequisite_output(self):
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=(
+                "make: build tools OK\n"
+                "submodules OK -- 2 configured paths\n"
+                "Dependency check passed: libunwind-ptrace liblzma\n"
+            ),
+            stderr="",
+        )
+        with mock.patch.object(dc.subprocess, "run", return_value=completed):
+            self.assertEqual(
+                dc.check_dependencies(DEMO_DIR.parent),
+                "Dependency check passed: libunwind-ptrace liblzma",
+            )
+
+    def test_dependency_check_refuses_success_without_its_result_line(self):
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="submodules OK\n", stderr=""
+        )
+        with mock.patch.object(dc.subprocess, "run", return_value=completed):
+            with self.assertRaisesRegex(RuntimeError, "unexpected dependency-check"):
+                dc.check_dependencies(DEMO_DIR.parent)
+
     def test_tmp_checkouts_are_host_visible_and_checkout_scoped(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as first, tempfile.TemporaryDirectory(
             dir="/tmp"
@@ -84,14 +109,14 @@ class DefaultQemuAssetsTest(unittest.TestCase):
             )
 
     def test_tmp_checkout_adds_the_identity_tmp_mount(self):
-        self.assertEqual(dc.hermit_tmp_args(Path("/tmp/work/dev-hermit")), ["--tmp=/tmp"])
-        self.assertEqual(dc.hermit_tmp_args(Path("/srv/dev-hermit")), [])
+        self.assertEqual(dc.hermit_tmp_args(Path("/tmp/work/hermit")), ["--tmp=/tmp"])
+        self.assertEqual(dc.hermit_tmp_args(Path("/srv/hermit")), [])
 
     def test_external_paths_render_without_relative_to_failure(self):
         external = Path("/var/tmp/assets/run-metadata.json")
-        self.assertEqual(dc.display_path(external, Path("/tmp/dev-hermit")), str(external))
+        self.assertEqual(dc.display_path(external, Path("/tmp/hermit")), str(external))
         self.assertEqual(
-            dc.display_path(Path("/tmp/dev-hermit/demos/out"), Path("/tmp/dev-hermit")),
+            dc.display_path(Path("/tmp/hermit/demos/out"), Path("/tmp/hermit")),
             "demos/out",
         )
 

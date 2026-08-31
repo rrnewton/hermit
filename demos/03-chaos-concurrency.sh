@@ -50,7 +50,7 @@ demo_banner "Save and replay the failing schedule"
 export CHAOS_SCHEDULE="$DEMO_ARTIFACTS/hello-race-schedule.json"
 
 # Both commands are expected to return the guest's failure status.
-if "$HERMIT" --log=error run \
+if safehermit --log=error run \
   "${HERMIT_TMP_FLAGS[@]}" \
   --chaos --seed=0 \
   --base-env=minimal \
@@ -64,7 +64,7 @@ if "$HERMIT" --log=error run \
 fi
 test -s "$CHAOS_SCHEDULE"
 
-if "$HERMIT" --log=error run \
+if safehermit --log=error run \
   "${HERMIT_TMP_FLAGS[@]}" \
   --chaos \
   --base-env=minimal \
