@@ -9,6 +9,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
@@ -17,6 +18,23 @@ use std::sync::MutexGuard;
 
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 const RUNS: usize = 5;
+
+fn compile_c(source: &Path, output: &Path) {
+    let rendered = format!("cc -O0 -g {} -o {}", source.display(), output.display());
+    let result = Command::new("cc")
+        .args(["-O0", "-g"])
+        .arg(source)
+        .arg("-o")
+        .arg(output)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    assert!(
+        result.status.success(),
+        "guest compilation failed: {rendered}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
 
 fn hermit_run_lock() -> MutexGuard<'static, ()> {
     HERMIT_RUN_LOCK
@@ -848,6 +866,81 @@ fn user_var_mount_does_not_shadow_the_run_nscd_alias() {
             "a user /var mount incorrectly discarded the active /run/nscd hardening mount:\n{text}"
         );
     }
+}
+
+#[test]
+fn ordered_var_then_nscd_mount_keeps_the_run_nscd_hardening_mount() {
+    let _guard = hermit_run_lock();
+    if !PathBuf::from("/var/run/nscd").is_dir()
+        || fs::canonicalize("/var/run").ok() != fs::canonicalize("/run").ok()
+    {
+        return;
+    }
+
+    let user_var = tempfile::tempdir().expect("create user /var source");
+    fs::create_dir_all(user_var.path().join("run/nscd")).expect("create user /var nscd path");
+    fs::write(user_var.path().join("run/nscd/from-var"), b"from-var\n").expect("write /var marker");
+    let later_nscd = tempfile::tempdir().expect("create later nscd source");
+    fs::write(later_nscd.path().join("from-later"), b"from-later\n").expect("write later marker");
+    let build = tempfile::tempdir().expect("create guest build directory");
+    let guest = build.path().join("mount-nscd-order");
+    compile_c(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli must be inside the repository")
+            .join("tests/c/mount_nscd_order.c"),
+        &guest,
+    );
+
+    let run = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        command
+            .args([
+                "--log=error",
+                "run",
+                "--base-env=minimal",
+                "--no-virtualize-cpuid",
+                "--max-timeslice=disabled",
+                "--tmp=/tmp",
+            ])
+            .arg(format!(
+                "--mount=type=bind,source={},target=/var",
+                user_var.path().display()
+            ))
+            .arg(format!(
+                "--mount=type=bind,source={},target=/var/run/nscd",
+                later_nscd.path().display()
+            ))
+            .arg("--")
+            .arg(&guest);
+        let rendered = format!("{command:?}");
+        let output = command
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+        assert!(
+            output.status.success(),
+            "ordered mount run failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    let first = assert_runs_equal_while_host_mountinfo_stable(
+        run,
+        "ordered /var then /var/run/nscd mounts changed across runs",
+    );
+    let text = std::str::from_utf8(&first).expect("guest output should be UTF-8");
+    assert!(
+        text.starts_with("from-later\n"),
+        "later user mount was absent: {text}"
+    );
+    assert!(
+        text.lines().any(|line| {
+            line.split(' ').nth(4) == Some("/run/nscd") && line.contains("/tmpvol/.hermit/run/nscd")
+        }),
+        "ordered user mounts incorrectly removed the /run/nscd hardening mount:\n{text}"
+    );
 }
 
 #[test]

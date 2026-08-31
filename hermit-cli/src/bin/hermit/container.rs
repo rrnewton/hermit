@@ -233,6 +233,7 @@ pub(super) struct IdentityGuard {
     _group_file: Option<tempfile::NamedTempFile>,
     _nscd_dir: Option<tempfile::TempDir>,
     mountinfo_roots: Vec<MountInfoRootSource>,
+    user_mount_targets: Vec<PathBuf>,
 }
 
 impl IdentityGuard {
@@ -244,6 +245,7 @@ impl IdentityGuard {
             _group_file: None,
             _nscd_dir: None,
             mountinfo_roots: Vec::new(),
+            user_mount_targets: Vec::new(),
         }
     }
 
@@ -267,9 +269,34 @@ impl IdentityGuard {
     /// The hidden mount must also be omitted from the mount plan: otherwise its
     /// private root would remain visible as a lower stacked mountinfo row even
     /// though no pathname could reopen that exact layer afterward.
-    pub(super) fn discard_roots_shadowed_by(&mut self, overriding_target: &Path) {
-        self.mountinfo_roots
-            .retain(|source| !mount_target_is_shadowed(&source.target, overriding_target));
+    pub(super) fn discard_mounts_shadowed_by(
+        &mut self,
+        mounts: &mut Vec<Mount>,
+        overriding_target: &Path,
+    ) {
+        // Host canonicalization describes the namespace only until the first
+        // user mount that can replace an ancestor of this target. After that,
+        // pathname resolution must follow the ordered mount plan rather than
+        // the launcher's host tree. For example, mounting a new `/var` changes
+        // what a later `/var/run/nscd` names and must not remove the earlier
+        // hardening mount installed at the host-resolved `/run/nscd`.
+        let resolution_changed = self
+            .user_mount_targets
+            .iter()
+            .any(|earlier| overriding_target.starts_with(earlier));
+        let resolved_override = if resolution_changed {
+            overriding_target.to_path_buf()
+        } else {
+            canonical_mount_target(overriding_target)
+        };
+        mounts.retain(|mount| {
+            !canonical_mount_target(mount.get_target()).starts_with(&resolved_override)
+        });
+        self.mountinfo_roots.retain(|source| {
+            !canonical_mount_target(&source.target).starts_with(&resolved_override)
+        });
+        self.user_mount_targets
+            .push(overriding_target.to_path_buf());
     }
 
     /// Resolve proven source objects to exact mount IDs in the completed guest
@@ -304,6 +331,7 @@ fn canonical_mount_target(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+#[cfg(test)]
 pub(super) fn mount_target_is_shadowed(target: &Path, overriding_target: &Path) -> bool {
     canonical_mount_target(target).starts_with(canonical_mount_target(overriding_target))
 }
@@ -382,6 +410,7 @@ pub(super) fn identity_hardening_mounts() -> Result<(Vec<Mount>, IdentityGuard),
             _group_file: Some(group_file),
             _nscd_dir: nscd_dir,
             mountinfo_roots,
+            user_mount_targets: Vec::new(),
         },
     ))
 }
@@ -1354,6 +1383,7 @@ mod tests {
             _group_file: Some(actual),
             _nscd_dir: None,
             mountinfo_roots: vec![matching],
+            user_mount_targets: Vec::new(),
         };
 
         let rewrites = guard.mountinfo_root_rewrites().unwrap();
@@ -1424,6 +1454,7 @@ mod tests {
             _group_file: Some(actual),
             _nscd_dir: None,
             mountinfo_roots: vec![same_target_wrong_source],
+            user_mount_targets: Vec::new(),
         };
 
         let error = guard.mountinfo_root_rewrites().unwrap_err().to_string();
@@ -1437,8 +1468,50 @@ mod tests {
         guard.add_private_tmp(private_tmp.path()).unwrap();
         assert_eq!(guard.mountinfo_roots.len(), 1);
 
-        guard.discard_roots_shadowed_by(Path::new("/tmp"));
+        let mut mounts = Vec::new();
+        guard.discard_mounts_shadowed_by(&mut mounts, Path::new("/tmp"));
         assert!(guard.mountinfo_roots.is_empty());
+    }
+
+    #[test]
+    fn ordered_user_mounts_do_not_reuse_stale_host_resolution() {
+        let var_run_is_run = fs::canonicalize("/var/run").ok() == fs::canonicalize("/run").ok();
+        if !var_run_is_run {
+            return;
+        }
+
+        let mut guard = IdentityGuard::empty();
+        guard.mountinfo_roots.push(MountInfoRootSource {
+            source: None,
+            target: PathBuf::from("/run/nscd"),
+            deterministic_root: Some(DETERMINISTIC_NSCD_ROOT.to_vec()),
+            rewrite_descendant_roots: false,
+            raw_mountpoint_prefix: None,
+            deterministic_mountpoint_prefix: None,
+        });
+        let mut mounts = vec![Mount::bind("/tmp", "/run/nscd")];
+
+        guard.discard_mounts_shadowed_by(&mut mounts, Path::new("/var"));
+        guard.discard_mounts_shadowed_by(&mut mounts, Path::new("/var/run/nscd"));
+
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(guard.mountinfo_roots.len(), 1);
+
+        for direct_target in ["/run", "/var/run/nscd"] {
+            let mut guard = IdentityGuard::empty();
+            guard.mountinfo_roots.push(MountInfoRootSource {
+                source: None,
+                target: PathBuf::from("/run/nscd"),
+                deterministic_root: Some(DETERMINISTIC_NSCD_ROOT.to_vec()),
+                rewrite_descendant_roots: false,
+                raw_mountpoint_prefix: None,
+                deterministic_mountpoint_prefix: None,
+            });
+            let mut mounts = vec![Mount::bind("/tmp", "/run/nscd")];
+            guard.discard_mounts_shadowed_by(&mut mounts, Path::new(direct_target));
+            assert!(mounts.is_empty(), "{direct_target} must shadow /run/nscd");
+            assert!(guard.mountinfo_roots.is_empty());
+        }
     }
 
     #[test]

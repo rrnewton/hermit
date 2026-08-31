@@ -146,6 +146,71 @@ fn public_record_uses_the_completed_command_namespace_and_stdio() {
     assert!(!captured.contains("unmounted-content"));
 }
 
+#[test]
+fn public_record_replay_preserves_distinct_forked_child_streams() {
+    const INNER: &str = "HERMIT_FORKED_STREAM_RECORD_REPLAY_INNER";
+    if std::env::var_os(INNER).is_none() {
+        let mut command = ReverieCommand::new(std::env::current_exe().expect("find test binary"));
+        command
+            .args([
+                "--exact",
+                "public_record_replay_preserves_distinct_forked_child_streams",
+                "--nocapture",
+            ])
+            .env(INNER, "1")
+            .map_root()
+            .unshare(Namespace::MOUNT | Namespace::PID)
+            .mount(Mount::proc());
+        let output = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build namespace test runtime")
+            .block_on(command.output())
+            .expect("launch forked-stream record/replay namespace");
+        assert_eq!(
+            output.status,
+            reverie::process::ExitStatus::Exited(0),
+            "forked-stream record/replay failed in its user namespace:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let _guard = hermit_record_lock();
+    let data = tempfile::tempdir().expect("create recording directory");
+    let build = tempfile::tempdir().expect("create guest build directory");
+    let guest = build.path().join("record-replay-forked-streams");
+    compile_c(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli must be inside the repository")
+            .join("tests/c/record_replay_forked_streams.c"),
+        &guest,
+    );
+
+    let mut command = ReverieCommand::new(&guest);
+    command.map_root();
+    let recording =
+        hermit::record_with_output(command, data.path()).expect("forked guest should record");
+    assert_eq!(recording.status, reverie::process::ExitStatus::Exited(0));
+    assert_eq!(recording.stdout, b"first-child\nsecond-child\nparent\n");
+
+    let thread_dir = data.path().join("thread");
+    for stream in ["3", "3.0", "3.1"] {
+        for suffix in ["", ".debug"] {
+            let path = thread_dir.join(format!("{stream}{suffix}"));
+            let metadata = fs::metadata(&path)
+                .unwrap_or_else(|error| panic!("missing stream {}: {error}", path.display()));
+            assert!(metadata.len() > 0, "empty stream file: {}", path.display());
+        }
+    }
+
+    let replay = hermit::replay_with_output(data.path()).expect("forked guest should replay");
+    assert_eq!(replay.status, reverie::process::ExitStatus::Exited(0));
+    assert_eq!(replay.stdout, recording.stdout);
+}
+
 fn section_contents<'a>(output: &'a str, name: &str) -> &'a str {
     let start_marker = format!("__{name}__\n");
     let end_marker = format!("__END_{name}__\n");
@@ -922,6 +987,68 @@ fn record_start_preserves_ordered_nested_user_mounts() {
             target.display()
         );
     }
+}
+
+#[test]
+fn record_start_ordered_var_then_nscd_keeps_run_nscd_hardening() {
+    let _guard = hermit_record_lock();
+    if !PathBuf::from("/var/run/nscd").is_dir()
+        || fs::canonicalize("/var/run").ok() != fs::canonicalize("/run").ok()
+    {
+        return;
+    }
+
+    let data_dir = tempfile::tempdir().expect("recording data directory");
+    let user_var = tempfile::tempdir().expect("create user /var source");
+    fs::create_dir_all(user_var.path().join("run/nscd")).expect("create user /var nscd path");
+    fs::write(user_var.path().join("run/nscd/from-var"), b"from-var\n").expect("write /var marker");
+    let later_nscd = tempfile::tempdir().expect("create later nscd source");
+    fs::write(later_nscd.path().join("from-later"), b"from-later\n").expect("write later marker");
+    let guest = Path::new(env!("CARGO_BIN_EXE_hermit"))
+        .parent()
+        .expect("Hermit binary should have a parent directory")
+        .join("mount-nscd-order-round8");
+    compile_c(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli must be inside the repository")
+            .join("tests/c/mount_nscd_order.c"),
+        &guest,
+    );
+
+    let mut record = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    record
+        .args(["--log=off", "record", "start", "--strict"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg(format!(
+            "--mount=type=bind,source={},target=/var",
+            user_var.path().display()
+        ))
+        .arg(format!(
+            "--mount=type=bind,source={},target=/var/run/nscd",
+            later_nscd.path().display()
+        ))
+        .arg("--")
+        .arg(&guest);
+    let recorded = command_output(record, "record ordered /var and nscd mounts");
+    let text = std::str::from_utf8(&recorded.stdout).expect("guest output should be UTF-8");
+    assert!(
+        text.starts_with("from-later\n"),
+        "later user mount was absent: {text}"
+    );
+    assert!(
+        text.lines().any(|line| {
+            line.split(' ').nth(4) == Some("/run/nscd") && line.contains("/tmpvol/.hermit/run/nscd")
+        }),
+        "record planning removed the /run/nscd hardening mount:\n{text}"
+    );
+
+    let mut replay = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    replay
+        .args(["--log=off", "replay", "--autopilot", "--data-dir"])
+        .arg(data_dir.path());
+    let replayed = command_output(replay, "replay ordered /var and nscd mounts");
+    assert_eq!(replayed.stdout, recorded.stdout);
 }
 
 #[test]
