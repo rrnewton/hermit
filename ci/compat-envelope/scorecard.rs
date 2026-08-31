@@ -1791,15 +1791,20 @@ impl ResultRow {
                             })?;
                         let disposition = matches!((status, signal), (Some(status), None) if status != 0)
                             || matches!((status, signal), (None, Some(_)));
+                        let no_process_timeout = timed_out
+                            && status.is_none()
+                            && signal.is_none()
+                            && attempt.get("error_kind").and_then(JsonValue::as_str)
+                                == Some("incomplete-verification-evidence");
                         if attempt.get("outcome").and_then(JsonValue::as_str) != Some("ERROR")
                             || attempt
                                 .get("error_kind")
                                 .and_then(JsonValue::as_str)
                                 .is_none_or(str::is_empty)
-                            || !disposition
+                            || !(disposition || no_process_timeout)
                         {
                             return Err(format!(
-                                "attempt {} NotRun report has no complete timeout disposition",
+                                "attempt {} NotRun report has no complete process or pre-launch timeout disposition",
                                 index + 1
                             ));
                         }
@@ -9561,6 +9566,50 @@ red/`measured-and-passed` count is **0**.",
         }
     }
 
+    // Fixture preparation can consume the whole pre-execution budget before
+    // the first Hermit process starts. That attempt has no process disposition,
+    // but the producer's typed NotRun report must coexist with a later
+    // canonical PASS instead of making the entire write-back unreadable.
+    let mut prelaunch_not_run = not_run_row.clone();
+    prelaunch_not_run.run_id = "fixture-recovered-prelaunch-not-run".into();
+    prelaunch_not_run.attempts[0]["status"] = JsonValue::Null;
+    prelaunch_not_run.attempts[0]["signal"] = JsonValue::Null;
+    prelaunch_not_run.attempts[0]["timed_out"] = JsonValue::Bool(true);
+    let mut prelaunch_pass = recovered_pass_row.clone();
+    prelaunch_pass.run_id = prelaunch_not_run.run_id.clone();
+    let (tracked, fold) = fold_fixture_rows(vec![prelaunch_not_run.clone(), prelaunch_pass])
+        .map_err(|error| format!("recovered pre-launch NotRun was refused: {error}"))?;
+    if fold.passed != 1
+        || fold.errored.len() != 1
+        || !fold.errored[0].contains("did not complete its first run")
+        || fold.reads_all_green()
+        || tracked.cells[0].measurement != MeasurementState::MeasuredAndPassed
+        || tracked.cells[0].observations.len() != 1
+        || tracked.cells[0].observations[0].results
+            != BTreeSet::from([ObservedResult::Pass, ObservedResult::Timeout])
+        || tracked.cells[0].observations[0].invocations.len() != 2
+    {
+        return Err(format!(
+            "a recovered pre-launch NotRun did not retain its timeout and later canonical PASS: {fold:?}"
+        ));
+    }
+    for (label, field, value) in [
+        ("not-timed-out", "timed_out", JsonValue::Bool(false)),
+        (
+            "wrong-error-kind",
+            "error_kind",
+            JsonValue::String("infrastructure".into()),
+        ),
+    ] {
+        let mut malformed = prelaunch_not_run.clone();
+        malformed.attempts[0][field] = value;
+        if fold_fixture_rows(vec![malformed]).is_ok() {
+            return Err(format!(
+                "{label} pre-launch NotRun evidence was accepted without a process disposition"
+            ));
+        }
+    }
+
     for (label, rows, expected_measurement, expected_results, expected_runs) in [
         ("terminal", vec![not_run_row.clone()]),
         (
@@ -10084,7 +10133,10 @@ red/`measured-and-passed` count is **0**.",
         &mut not_run,
         serde_json::to_value(canonical_verdict::VerificationReport::no_result()).unwrap(),
     );
-    assert_recovered_refuses(not_run, "NotRun report has no complete timeout disposition");
+    assert_recovered_refuses(
+        not_run,
+        "NotRun report has no complete process or pre-launch timeout disposition",
+    );
 
     let mut attempt_outcome_mismatch = no_result_row.clone();
     attempt_outcome_mismatch.attempts[0]["outcome"] = JsonValue::String("PASS".into());
