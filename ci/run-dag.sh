@@ -10,7 +10,9 @@
 # This entrypoint is the shared local/GitHub execution path for the centralized
 # portable and privileged CI plans. Each gate is an independently boxed node
 # with explicit dependencies and resource limits (see ci/dag/README.md).
-# scripts/validate.rs and GitHub Actions both consume these exact DAG files.
+# Portable execution asks scripts/validate.rs for the constructed DAG so its
+# corpus-derived strict-compatibility expansion is shared by local, hosted, and
+# validate callers; privileged currently needs no generated expansion.
 #
 # Usage:
 #   ci/run-dag.sh <lane> [runner-args...]
@@ -60,6 +62,24 @@ else
     if [[ ! -f $dag ]]; then
         echo "run-dag.sh: unknown lane '$lane' (no such file: $dag)" >&2
         echo "            known lanes: portable, privileged" >&2
+        exit 2
+    fi
+fi
+
+# Portable strict compatibility is generated from the canonical corpus during
+# validate plan construction. Raw portable execution must consume that same
+# constructed graph: executing portable.json directly would reach the
+# fail-closed test.strict_compat marker instead of the 189 compat.* steps.
+# This exports data only; the single dagrun invocation below remains the only
+# scheduler.
+generated_dir=
+if [[ -z ${RUN_DAG_FILE_OVERRIDE:-} && $lane == portable ]]; then
+    mkdir -p "$ROOT_DIR/target/validation" || exit 2
+    generated_dir=$(mktemp -d "$ROOT_DIR/target/validation/run-dag.XXXXXX") || exit 2
+    trap 'rm -rf -- "$generated_dir"' EXIT
+    dag="$generated_dir/portable.json"
+    if ! ./scripts/validate.rs portable-only --write-constructed-dag "$dag" >/dev/null; then
+        echo "run-dag.sh: validate could not construct the portable DAG" >&2
         exit 2
     fi
 fi
@@ -118,4 +138,8 @@ if (($# > 0)) && [[ $1 == list || $1 == ascii || $1 == dot || $1 == json ]]; the
 fi
 
 echo "run-dag.sh: lane=$lane runner=$runner verb=$verb cargo-jobs=$CARGO_BUILD_JOBS reverie-dbt-budget=portable-build-child-only" >&2
+if [[ -n $generated_dir ]]; then
+    "$runner" "$verb" --dag "$dag" "$@"
+    exit $?
+fi
 exec "$runner" "$verb" --dag "$dag" "$@"

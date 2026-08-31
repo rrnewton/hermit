@@ -166,13 +166,13 @@ Node `cmd`s are the **verbatim** commands `scripts/validate.rs` runs, with three
 deliberate exceptions, chosen to avoid duplicating script logic that has many
 moving parts:
 
-- **Composite envelope gates reuse `scripts/validate.rs`'s own standalone entrypoints**
-  so there is one source of truth: `test.strict_compat` runs
-  `./scripts/validate.rs --portable-strict-compat-only`, and (privileged) `rr.compat_baseline`
-  runs `./scripts/validate.rs --rr-compat-only`. The privileged selector builds release;
-  portable strict compatibility reuses `STRICT_COMPAT_HERMIT_BIN` from the
-  preceding workspace build. Without that override, the strict flag builds
-  release as before.
+- **Portable strict compatibility is a generated expansion.** The committed
+  `test.strict_compat` row is a fail-closed marker; `scripts/validate.rs`
+  replaces it with one run-unique fixture-preparation node and the corpus-derived
+  `compat.*` nodes before invoking dagrun. This keeps the corpus JSON as the one
+  source of argv while exposing every probe and its resource demand to the one
+  outer scheduler. The privileged `rr.compat_baseline` composite still reuses
+  `./scripts/validate.rs --rr-compat-only`.
 - **The DBT stderr-isolation CLI case is a separate 120-second node** so a
   backend hang fails quickly without consuming the aggregate CLI budget. The
   aggregate node skips that case, so the test set remains unchanged.
@@ -294,7 +294,11 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
   `{"hermit_guest": 1, "manifest_guest": 8}`. Legacy guest gates request the
   single `hermit_guest` slot, so they run **one at a time** (they share the
   working filesystem, are mutually nondeterministic, and on a PMU host contend
-  for the counter). Ordinary manifest buckets use disjoint cell trees and
+  for the counter). When validate expands strict compatibility, it represents
+  the same exclusion at a scale of sixteen: ordinary consumers take all sixteen
+  `hermit_guest` units and each direct `compat.*` probe takes one. Compatibility
+  probes may therefore overlap each other, but never an ordinary Hermit gate.
+  Ordinary manifest buckets use disjoint cell trees and
   request one `manifest_guest` slot after the shared build barrier. The two
   high-width buckets, `backend-parity-c` and `c-programs`, request all eight
   `manifest_guest` slots plus the portable `hermit_guest` slot, so neither can
@@ -341,11 +345,14 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
 
 ## Conservatism and how to relax it
 
-The `hermit_guest: 1` serialization faithfully reproduces `scripts/validate.rs`, which
-ran these gates strictly one-after-another. It is intentionally conservative: as
-individual guest gates are shown to be safe to co-run (e.g. distinct scratch
-directories, no shared fixture), drop their `resources` hint (or raise the cap)
-to unlock more parallelism. The DAG shape and dependencies stay the same.
+The ordinary `hermit_guest` serialization faithfully reproduces
+`scripts/validate.rs`, which ran these gates strictly one-after-another. The
+strict compatibility expansion preserves that exclusion while allowing its own
+run-isolated probes to use the reviewed sixteen-wide limit. It is intentionally
+conservative: as individual guest gates are shown to be safe to co-run (e.g.
+distinct scratch directories, no shared fixture), their demand can be changed
+with corresponding execution evidence. The DAG shape and dependencies stay the
+same.
 
 The former `pmu: 1` cap (and the matching `flock /tmp/hermit-privileged-pmu.lock`
 in the workflows, plus the `pmu-serial` runner label) were retired: they guarded
