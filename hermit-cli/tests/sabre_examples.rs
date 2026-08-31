@@ -15,7 +15,11 @@ use std::process::Stdio;
 use std::time::Duration;
 use std::time::Instant;
 
-const NON_RACY_EXAMPLES: [&str; 4] = ["date.sh", "devrand.sh", "rand.py", "timed-progress-bar.py"];
+// Keep timed-progress-bar.py out of this SaBRe ratchet while
+// tests/e2e/manifests/applications.yaml disables its SaBRe verify cell: SaBRe
+// does not yet determinize its busy-wait polling on virtual wall-clock
+// advancement. The selected ptrace manifest cell remains covered separately.
+const NON_RACY_EXAMPLES: [&str; 3] = ["date.sh", "devrand.sh", "rand.py"];
 const SABRE_BACKEND_FACT_PREFIX: &str = ":: Backend: sabre static rewriting + ptrace runtime;";
 
 fn hermit_binary() -> PathBuf {
