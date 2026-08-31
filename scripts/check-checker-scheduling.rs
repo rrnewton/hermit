@@ -593,6 +593,17 @@ fn is_invoked(text: &str, path: &str) -> bool {
     if text.lines().any(|line| invokes_on_line(line, &dotted)) {
         return true;
     }
+    // Repository shell helpers commonly resolve their own root and invoke a
+    // sibling as `"$ROOT_DIR/ci/check-x.sh"`. Match that rooted spelling while
+    // retaining the same command-position guard, so an assignment such as
+    // `CHECKER="$ROOT_DIR/ci/check-x.sh"` remains declaration rather than reachability.
+    // Include the quotes in the needle: single quotes would suppress ROOT_DIR expansion.
+    for prefix in ["$ROOT_DIR/", "${ROOT_DIR}/"] {
+        let quoted = format!("\"{prefix}{path}\"");
+        if invokes_outside_quotes(text, &quoted) {
+            return true;
+        }
+    }
     // `rustc` is a runner here too: ci/run-reverie-pin-check.sh COMPILES
     // scripts/check-reverie-pin.rs and runs the resulting binary, so the checker is
     // genuinely scheduled without ever being executed as a script.
@@ -650,22 +661,304 @@ fn invokes_on_line(line: &str, needle: &str) -> bool {
     let mut from = 0;
     while let Some(hit) = line[from..].find(needle) {
         let at = from + hit;
-        // ⚠️ THE MATCH MUST END AT A WORD BOUNDARY TOO. Without this,
-        // `./scripts/check-z.sh.disabled` schedules `scripts/check-z.sh`: a longer
-        // path CONTAINING the checker as a prefix satisfies the guard. Renaming a
-        // checker to `.disabled` is a normal way to retire one, so this fires by
-        // ACCIDENT rather than by contrivance -- reported by agent(hermit-020)
-        // relaying codex, and reproduced here.
-        let after = line[at + needle.len()..].chars().next();
-        let ends_cleanly = after
-            .map(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')' | '"' | '\'' | ','))
-            .unwrap_or(true);
-        if ends_cleanly && in_command_position(&line[..at]) {
+        if invocation_at(line, at, needle) {
             return true;
         }
         from = at + 1;
     }
     false
+}
+
+fn invocation_at(line: &str, at: usize, needle: &str) -> bool {
+    // ⚠️ THE MATCH MUST END AT A WORD BOUNDARY TOO. Without this,
+    // `./scripts/check-z.sh.disabled` schedules `scripts/check-z.sh`: a longer
+    // path CONTAINING the checker as a prefix satisfies the guard. Renaming a
+    // checker to `.disabled` is a normal way to retire one, so this fires by
+    // ACCIDENT rather than by contrivance -- reported by agent(hermit-020)
+    // relaying codex, and reproduced here.
+    let after = line[at + needle.len()..].chars().next();
+    let ends_cleanly = after
+        .map(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')' | '"' | '\'' | ','))
+        .unwrap_or(true);
+    ends_cleanly && in_command_position(&line[..at])
+}
+
+/// Find an invocation while carrying quote state across line boundaries.
+///
+/// Command position remains a line-local question, but shell and fixture strings may
+/// span lines. Resetting quote state at each newline lets an inert second line look
+/// executable.
+fn invokes_outside_quotes(text: &str, needle: &str) -> bool {
+    let mut from = 0;
+    while let Some(hit) = text[from..].find(needle) {
+        let at = from + hit;
+        if is_active_shell_position(text, at) {
+            let line_start = text[..at].rfind('\n').map_or(0, |index| index + 1);
+            let line_end = text[at..].find('\n').map_or(text.len(), |index| at + index);
+            if invocation_at(&text[line_start..line_end], at - line_start, needle) {
+                return true;
+            }
+        }
+        from = at + 1;
+    }
+    false
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuoteState {
+    Unquoted,
+    Single,
+    AnsiC,
+    Double,
+}
+
+struct QuoteLexer {
+    state: QuoteState,
+    escaped: bool,
+    effective_dollar: bool,
+}
+
+impl QuoteLexer {
+    fn new() -> Self {
+        Self {
+            state: QuoteState::Unquoted,
+            escaped: false,
+            effective_dollar: false,
+        }
+    }
+
+    /// Consume shell text while retaining only the lexical state needed to decide
+    /// whether a later byte is executable. This is deliberately not a shell parser.
+    fn scan(&mut self, text: &str) {
+        let bytes = text.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if self.escaped {
+                self.escaped = false;
+                if byte != b'\n' {
+                    self.effective_dollar = false;
+                }
+                index += 1;
+                continue;
+            }
+            match self.state {
+                QuoteState::Unquoted => match byte {
+                    b'\\' => self.escaped = true,
+                    b'$' => self.effective_dollar = true,
+                    b'\'' => {
+                        self.state = if self.effective_dollar {
+                            QuoteState::AnsiC
+                        } else {
+                            QuoteState::Single
+                        };
+                        self.effective_dollar = false;
+                    }
+                    b'"' => {
+                        self.state = QuoteState::Double;
+                        self.effective_dollar = false;
+                    }
+                    _ => self.effective_dollar = false,
+                },
+                QuoteState::Single => {
+                    if byte == b'\'' {
+                        self.state = QuoteState::Unquoted;
+                    }
+                    self.effective_dollar = false;
+                }
+                QuoteState::AnsiC => match byte {
+                    b'\\' => self.escaped = true,
+                    b'\'' => self.state = QuoteState::Unquoted,
+                    _ => {}
+                },
+                QuoteState::Double => match byte {
+                    b'\\'
+                        if matches!(
+                            bytes.get(index + 1),
+                            Some(b'$' | b'`' | b'"' | b'\\' | b'\n')
+                        ) =>
+                    {
+                        self.escaped = true;
+                    }
+                    b'"' => self.state = QuoteState::Unquoted,
+                    _ => {}
+                },
+            }
+            if self.state != QuoteState::Unquoted {
+                self.effective_dollar = false;
+            }
+            index += 1;
+        }
+    }
+
+    fn is_unquoted(&self) -> bool {
+        self.state == QuoteState::Unquoted && !self.escaped
+    }
+}
+
+/// Does `text` end inside shell-like single, ANSI-C, or double quotes?
+fn has_open_quote(text: &str) -> bool {
+    let mut lexer = QuoteLexer::new();
+    lexer.scan(text);
+    !lexer.is_unquoted()
+}
+
+#[derive(Clone, Debug)]
+struct HereDoc {
+    delimiter: String,
+    strip_tabs: bool,
+}
+
+fn is_shell_boundary(byte: u8) -> bool {
+    byte.is_ascii_whitespace() || b";&|()<>".contains(&byte)
+}
+
+/// Parse the deliberately small heredoc grammar this reachability check accepts.
+/// Only wholly single- or double-quoted static delimiters make the body inert: an
+/// unquoted heredoc expands command substitutions. Bare, escaped, concatenated,
+/// dynamic, and multiple heredocs are refused, preserving the safe false-orphan
+/// direction instead of claiming their bodies are data.
+fn parse_heredoc(after_operator: &str) -> Result<HereDoc, ()> {
+    let mut tail = after_operator;
+    let strip_tabs = tail.starts_with('-');
+    if strip_tabs {
+        tail = &tail[1..];
+    }
+    tail = tail.trim_start_matches([' ', '\t']);
+    let bytes = tail.as_bytes();
+    let Some(&first) = bytes.first() else {
+        return Err(());
+    };
+
+    if !matches!(first, b'\'' | b'"') {
+        return Err(());
+    }
+    let quote = first;
+    let Some(end) = bytes[1..].iter().position(|byte| *byte == quote) else {
+        return Err(());
+    };
+    let delimiter = &tail[1..end + 1];
+    if delimiter.is_empty()
+        || delimiter
+            .bytes()
+            .any(|byte| matches!(byte, b'$' | b'`' | b'\\'))
+    {
+        return Err(());
+    }
+    let consumed = end + 2;
+    if bytes
+        .get(consumed)
+        .is_some_and(|byte| !is_shell_boundary(*byte))
+    {
+        return Err(());
+    }
+    Ok(HereDoc {
+        delimiter: delimiter.to_string(),
+        strip_tabs,
+    })
+}
+
+struct ShellLexer {
+    quote: QuoteLexer,
+    pending_heredoc: Option<HereDoc>,
+    heredoc: Option<HereDoc>,
+    unsupported: bool,
+}
+
+impl ShellLexer {
+    fn new() -> Self {
+        Self {
+            quote: QuoteLexer::new(),
+            pending_heredoc: None,
+            heredoc: None,
+            unsupported: false,
+        }
+    }
+
+    fn scan_code_line(&mut self, line: &str) {
+        let mut start = 0;
+        while let Some(hit) = line[start..].find("<<") {
+            let index = start + hit;
+            self.quote.scan(&line[start..index]);
+            let operator_len = if line.as_bytes().get(index + 2) == Some(&b'<') {
+                3
+            } else {
+                2
+            };
+            if self.quote.is_unquoted() && operator_len == 2 {
+                if self.pending_heredoc.is_some() {
+                    self.unsupported = true;
+                    return;
+                }
+                match parse_heredoc(&line[index + 2..]) {
+                    Ok(spec) => self.pending_heredoc = Some(spec),
+                    Err(()) => {
+                        self.unsupported = true;
+                        return;
+                    }
+                }
+            }
+            self.quote.scan(&line[index..index + operator_len]);
+            start = index + operator_len;
+        }
+        self.quote.scan(&line[start..]);
+    }
+
+    fn scan_line(&mut self, line: &str, complete: bool) {
+        if self.unsupported {
+            return;
+        }
+        if let Some(spec) = &self.heredoc {
+            let candidate = if spec.strip_tabs {
+                line.trim_start_matches('\t')
+            } else {
+                line
+            };
+            if complete && candidate.trim_end_matches('\r') == spec.delimiter {
+                self.heredoc = None;
+            }
+            return;
+        }
+
+        self.scan_code_line(line);
+        if !complete || self.unsupported {
+            return;
+        }
+        let continued = self.quote.escaped;
+        self.quote.scan("\n");
+        if let Some(spec) = self.pending_heredoc.take() {
+            if continued || !self.quote.is_unquoted() {
+                self.unsupported = true;
+            } else {
+                self.heredoc = Some(spec);
+            }
+        }
+    }
+
+    fn scan(&mut self, text: &str) {
+        let mut remainder = text;
+        while let Some(newline) = remainder.find('\n') {
+            self.scan_line(&remainder[..newline], true);
+            remainder = &remainder[newline + 1..];
+        }
+        if !remainder.is_empty() {
+            self.scan_line(remainder, false);
+        }
+    }
+
+    fn is_executable(&self) -> bool {
+        !self.unsupported
+            && self.heredoc.is_none()
+            && self.quote.is_unquoted()
+            && !self.quote.effective_dollar
+    }
+}
+
+/// Is `at` executable shell text rather than quoted or heredoc fixture data?
+fn is_active_shell_position(text: &str, at: usize) -> bool {
+    let mut lexer = ShellLexer::new();
+    lexer.scan(&text[..at]);
+    lexer.is_executable()
 }
 
 /// Is a match starting right after `before` THE FIRST WORD OF A COMMAND?
@@ -694,6 +987,9 @@ fn in_command_position(before: &str) -> bool {
             return false;
         }
         before = rest;
+    }
+    if has_open_quote(before) {
+        return false;
     }
     // The match must START A WORD. `OUT=./scripts/check-x.sh` is an assignment's VALUE.
     if let Some(last) = before.chars().last() {
@@ -941,6 +1237,11 @@ fn self_test() {
             "a runner prefix carried as FIXTURE DATA -- hermit#2656, the P0 that turned \
              this checker red on main, reverted once by stripping any trailing quote",
         ),
+        (
+            r#"fixture='bundle=$("$ROOT_DIR/ci/verify-hermit-e2e-artifact.sh" "$pointer")'"#,
+            "ci/verify-hermit-e2e-artifact.sh",
+            "a rooted invocation inside a single-quoted shell fixture is dead text",
+        ),
     ] {
         assert!(!is_invoked(text, path), "false SCHEDULED (silent direction): {why}");
     }
@@ -994,6 +1295,11 @@ fn self_test() {
             "scripts/check-y.sh",
             "a checker CHAINED after another command -- the bare-path clause used to \
              require the START OF A LINE",
+        ),
+        (
+            r#"bundle=$("$ROOT_DIR/ci/verify-hermit-e2e-artifact.sh" "$pointer")"#,
+            "ci/verify-hermit-e2e-artifact.sh",
+            "the live artifact consumer invokes the verifier through its checkout root",
         ),
     ] {
         assert!(is_invoked(text, path), "false ORPHAN (loud direction): {why}");
@@ -1333,6 +1639,135 @@ mod tests {
             "\t$(SUBMODULE_PROXY) ./ci/run-x.sh",
             "ci/run-x.sh"
         ));
+        assert!(is_invoked(
+            "bundle=$(\"$ROOT_DIR/ci/verify-x.sh\" \"$pointer\")",
+            "ci/verify-x.sh"
+        ));
+        assert!(is_invoked(
+            "bundle=$(\"${ROOT_DIR}/ci/verify-x.sh\" \"$pointer\")",
+            "ci/verify-x.sh"
+        ));
+        assert!(is_invoked(
+            "printf '%s' 'fixture'; bundle=$(\"$ROOT_DIR/ci/verify-x.sh\" \"$pointer\")",
+            "ci/verify-x.sh"
+        ));
+        assert!(is_invoked(
+            "printf \\'; bundle=$(\"$ROOT_DIR/ci/verify-x.sh\" \"$pointer\")",
+            "ci/verify-x.sh"
+        ));
+        assert!(
+            !is_invoked(
+                "VERIFY=\"$ROOT_DIR/ci/verify-x.sh\"",
+                "ci/verify-x.sh"
+            ),
+            "assigning a rooted checker path is not execution"
+        );
+        assert!(
+            !is_invoked(
+                r##"let fixture = r#"bundle=$("$ROOT_DIR/ci/verify-x.sh" "$pointer")"#;"##,
+                "ci/verify-x.sh"
+            ),
+            "a rooted invocation inside Rust fixture data is not execution"
+        );
+        let commented = strip_comments(
+            "# bundle=$(\"$ROOT_DIR/ci/verify-x.sh\" \"$pointer\")",
+            "fixture.sh",
+        );
+        assert!(
+            !is_invoked(&commented, "ci/verify-x.sh"),
+            "a commented-out rooted command is not execution"
+        );
+        let mutated_wrapper = r#"
+fixture='
+bundle=$("$ROOT_DIR/ci/verify-x.sh" "$pointer")'
+bundle=/nonexistent
+"#;
+        assert!(
+            !is_invoked(mutated_wrapper, "ci/verify-x.sh"),
+            "dead single-quoted fixture text cannot replace the real consumer call"
+        );
+        let ansi_c_fixture = r#"
+fixture=$'escaped apostrophe: \'
+bundle=$("$ROOT_DIR/ci/verify-x.sh" "$pointer")'
+bundle=/nonexistent
+"#;
+        assert!(
+            !is_invoked(ansi_c_fixture, "ci/verify-x.sh"),
+            "an escaped quote inside multiline ANSI-C fixture data must not end the quote"
+        );
+        let split_ansi_c_fixture = r#"
+fixture=$\
+'escaped apostrophe: \'
+bundle=$("$ROOT_DIR/ci/verify-x.sh" "$pointer")'
+bundle=/nonexistent
+"#;
+        assert!(
+            !is_invoked(split_ansi_c_fixture, "ci/verify-x.sh"),
+            "a backslash-newline may split the `$'` ANSI-C quote opener"
+        );
+        let split_locale_fixture = r#"
+fixture=$\
+"$ROOT_DIR/ci/verify-x.sh"
+bundle=/nonexistent
+"#;
+        assert!(
+            !is_invoked(split_locale_fixture, "ci/verify-x.sh"),
+            "a backslash-newline may split the `$\"` locale-string quote opener"
+        );
+        let double_quoted_fixture = r#"
+fixture="escaped quote: \"
+bundle=\$(\"$ROOT_DIR/ci/verify-x.sh\" \"$pointer\")"
+bundle=/nonexistent
+"#;
+        assert!(
+            !is_invoked(double_quoted_fixture, "ci/verify-x.sh"),
+            "an escaped quote inside multiline double-quoted fixture data must not end the quote"
+        );
+        let single_quoted_heredoc = r#"
+cat <<'FIXTURE'
+bundle=$("$ROOT_DIR/ci/verify-x.sh" "$pointer")
+FIXTURE
+bundle=$("$ROOT_DIR/ci/verify-y.sh" "$pointer")
+"#;
+        assert!(
+            !is_invoked(single_quoted_heredoc, "ci/verify-x.sh"),
+            "a rooted command-shaped line in a single-quoted heredoc is inert data"
+        );
+        assert!(
+            is_invoked(single_quoted_heredoc, "ci/verify-y.sh"),
+            "a single-quoted heredoc terminator must restore executable shell context"
+        );
+        let double_quoted_heredoc = r#"
+cat <<"FIXTURE"
+bundle=$("$ROOT_DIR/ci/verify-x.sh" "$pointer")
+FIXTURE
+bundle=$("$ROOT_DIR/ci/verify-y.sh" "$pointer")
+"#;
+        assert!(
+            !is_invoked(double_quoted_heredoc, "ci/verify-x.sh"),
+            "a rooted command-shaped line in a double-quoted heredoc is inert data"
+        );
+        assert!(
+            is_invoked(double_quoted_heredoc, "ci/verify-y.sh"),
+            "a double-quoted heredoc terminator must restore executable shell context"
+        );
+        let unsupported_bare_heredoc = r#"
+cat <<FIXTURE
+ignored
+FIXTURE
+bundle=$("$ROOT_DIR/ci/verify-x.sh" "$pointer")
+"#;
+        assert!(
+            !is_invoked(unsupported_bare_heredoc, "ci/verify-x.sh"),
+            "an unsupported bare heredoc must fail closed rather than guess"
+        );
+        assert!(
+            !is_invoked(
+                "bundle=$('$ROOT_DIR/ci/verify-x.sh' \"$pointer\")",
+                "ci/verify-x.sh"
+            ),
+            "single quotes prevent ROOT_DIR expansion"
+        );
         // Compiled rather than interpreted, and split across a continuation line --
         // how run-reverie-pin-check.sh reaches both pin checkers.
         assert!(is_invoked(
@@ -1356,6 +1791,19 @@ mod tests {
         // eaten as the value; `python3 -c ./x.sh` is a SyntaxError, never run.
         assert!(!is_invoked("\tbash -o scripts/check-x.sh", "scripts/check-x.sh"));
         assert!(!is_invoked("\tpython3 -c scripts/check-x.py", "scripts/check-x.py"));
+    }
+
+    #[test]
+    fn ansi_c_quote_openers_follow_shell_line_continuation_rules() {
+        let mut split = QuoteLexer::new();
+        split.scan("$\\");
+        split.scan("\n");
+        split.scan("'escaped apostrophe: \\'");
+        assert_eq!(split.state, QuoteState::AnsiC);
+
+        let mut intervening_escape = QuoteLexer::new();
+        intervening_escape.scan("$\\x'escaped apostrophe: \\'");
+        assert_eq!(intervening_escape.state, QuoteState::Unquoted);
     }
 
     // A DAG `description` is prose and routinely names checkers it does not run.
