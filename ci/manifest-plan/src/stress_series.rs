@@ -552,17 +552,22 @@ impl SeriesRow {
                     } else {
                         SeriesOutcome::NoResult
                     };
+                    let no_process_timeout = disposition.timed_out
+                        && disposition.status.is_none()
+                        && disposition.signal.is_none()
+                        && disposition.error_kind.as_deref()
+                            == Some("incomplete-verification-evidence");
                     if disposition.attempt_outcome != "ERROR"
                         || disposition.disposition != expected
                         || disposition
                             .error_kind
                             .as_ref()
                             .is_none_or(|value| value.trim().is_empty())
-                        || !has_nonzero_process_disposition
+                        || !(has_nonzero_process_disposition || no_process_timeout)
                         || disposition.verification_report_sha256.is_none()
                     {
                         return Err(
-                            "not_run evidence must carry attempt outcome ERROR, an error_kind, a verification report, exactly one nonzero status or signal, and a matching typed disposition"
+                            "not_run evidence must carry attempt outcome ERROR, an error_kind, a verification report, either one nonzero process disposition or an explicit pre-launch timeout, and a matching typed disposition"
                                 .into(),
                         );
                     }
@@ -1166,13 +1171,38 @@ mod tests {
                 .attempts[0];
             disposition.status = status;
             disposition.signal = None;
-            assert!(
-                incomplete
-                    .validate_for_read()
-                    .unwrap_err()
-                    .contains("exactly one nonzero status or signal")
-            );
+            assert!(incomplete.validate_for_read().unwrap_err().contains(
+                "either one nonzero process disposition or an explicit pre-launch timeout"
+            ));
         }
+
+        let mut prelaunch_timeout = no_verdict_row();
+        let disposition = &mut prelaunch_timeout
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0];
+        disposition.disposition = SeriesOutcome::Timeout;
+        disposition.status = None;
+        disposition.signal = None;
+        disposition.timed_out = true;
+        prelaunch_timeout.validate_for_write().unwrap();
+
+        let mut wrong_prelaunch_kind = prelaunch_timeout;
+        wrong_prelaunch_kind
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0]
+            .error_kind = Some("infrastructure".into());
+        assert!(
+            wrong_prelaunch_kind
+                .validate_for_write()
+                .unwrap_err()
+                .contains("explicit pre-launch timeout")
+        );
 
         let mut historical_errored = row(SeriesSchema::V3);
         historical_errored.series.outcome = SeriesOutcome::Errored;
