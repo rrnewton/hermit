@@ -138,6 +138,16 @@ if (($# > 0)) && [[ $1 == list || $1 == ascii || $1 == dot || $1 == json ]]; the
 fi
 
 echo "run-dag.sh: lane=$lane runner=$runner verb=$verb cargo-jobs=$CARGO_BUILD_JOBS reverie-dbt-budget=portable-build-child-only" >&2
+if [[ $verb == run ]]; then
+    export HERMIT_REAL_RUST_SCRIPT
+    HERMIT_REAL_RUST_SCRIPT=$(command -v rust-script) || {
+        echo "run-dag.sh: rust-script is required" >&2
+        exit 2
+    }
+    export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$ROOT_DIR/target/ci/rust-scripts"
+    export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1
+    export PATH="$ROOT_DIR/ci/rust-script-bin:$PATH"
+fi
 if [[ -n $generated_dir ]]; then
     "$runner" "$verb" --dag "$dag" "$@"
     exit $?

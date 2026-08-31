@@ -6,6 +6,19 @@
   "default_step_timeout": 120,
   "steps": [
     {
+      "group": "build", "job": "rust_scripts",
+      "desc": "Build every tracked rust-script before graph consumers run",
+      "description": "DISCOVERED PRODUCER 2026-08-31: every tracked rust-script entrypoint is generated as a Cargo package, checked with the existing clippy policy, built as a release executable, and, when it carries tests, built as a test harness. The outputs are copied into target/ci/rust-scripts after checkout and pin verification, and all compiling consumers wait for this node. Repository graph commands resolve rust-script through ci/rust-script-bin, which executes only the published binaries and never invokes Cargo; sources owned by external operational tooling remain that tooling's responsibility. Two concurrent rust-script --force probes sharing one cache measured a real Cargo build-directory lock wait; separate caches removed the wait but duplicated compilation. Keeping one writer and read-only consumers makes compilation placement deterministic without creating per-node target directories.",
+      "cmd": "./ci/prepare-rust-scripts.sh",
+      "deps": ["check.reverie_pin"],
+      "timeout": 300,
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS",
+      "hint": {"est_duration_s": 190, "rss_baseline_bytes": 1073741824,
+               "hard_mem_max_bytes": 2147483648, "classification": "cpu-bound",
+               "preferred_inner_jobs": 8}
+    },
+    {
       "group": "check", "job": "reverie_pin",
       "desc": "Require Hermit's recorded Reverie revision to be an ANCESTOR of rrnewton/reverie:main and to never regress below the base pin",
       "cmd": "./ci/run-reverie-pin-check.sh",
@@ -62,6 +75,7 @@
       "desc": "Build the manifest-plan binaries the metadata validation runs",
       "description": "COST DRIVER CORRECTED 2026-08-08; budget raised 19s -> 180s. THE PREVIOUS RATIONALE HERE WAS WRONG AND MISLEADING: it derived 19s from a COMPILE measurement, but the cold path this node actually dies on is a NETWORK FETCH. Both privileged reds on main that day (run 31283614686 @ e692a151d, run 31284978438 @ 501b787f3) failed here with one detail line -- 'Updating git submodule https://github.com/rrnewton/dynamorio.git' -- and zero 'Compiling' lines. WHY A TRIVIAL PACKAGE PAYS A HUGE COST: hermit-manifest-plan depends only on serde, serde_json, sha2 and toml, so its own compile really is the measured ~5.4s; but `cargo build -p <member>` must first MATERIALIZE every git dependency in the workspace lock, including git+https://github.com/rrnewton/reverie.git, and the reverie repo carries third-party/dynamorio as a git SUBMODULE. The first cargo invocation of the run therefore checks reverie out into $CARGO_HOME/git/checkouts and recursively fetches DynamoRIO (235 MB; measured on this box 6.3s full clone) plus sabre and e9patch. The runner blew 19s on the DynamoRIO fetch alone. BIMODAL, NOT A REGRESSION: 2f8f8e537, the commit that introduced this node, is an ANCESTOR of edae964e2, which was GREEN at this same 19s budget. The discriminator is cache state, not code. THE DECIDING CACHE IS $CARGO_HOME/git, NOT target/. Each distinct reverie pin gets its own checkout directory, so a pin bump, a cache eviction, or a different self-hosted box makes this node cold however warm target/ is. The old claim that this lane is 'structurally warmer than portable' because the self-hosted checkout persists target/ is true and IRRELEVANT -- target/ is not the cache being missed. WHY 180s, MATCHING PORTABLE: the cost is network+disk materialization of a fixed set of git dependencies, which is lane-INDEPENDENT, so the ~9x compile-speed gap between ubuntu-latest and the self-hosted boxes does not apply and both lanes should budget this node alike. Deliberately generous; the durable fix is to prefetch $CARGO_HOME/git OUTSIDE the DAG's budgeted critical path (filed separately). ARITHMETIC after innermost timeout nesting: this node is on the critical path (setup.manifest_plan -> e2e.metadata -> build.manifest_guests -> e2e.manifest_applications), now 180+180+120+180 = 660s, so the inner launcher is 720s and the job timeout 22 minutes. Do not hand-tune any of these: target/debug/test-harness recomputes the path and both bounds from source, so rerun `target/debug/test-harness validate`.",
       "cmd": "cargo build -p hermit-manifest-plan --bins",
+      "deps": ["build.rust_scripts"],
       "timeout": 180,
       "hint": {"est_duration_s": 6,
                "rss_baseline_bytes": 536870912, "hard_mem_max_bytes": 2147483648,

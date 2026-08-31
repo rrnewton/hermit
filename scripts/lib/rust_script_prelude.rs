@@ -1,10 +1,11 @@
 //! Process-wide conventions shared by Hermit's standalone Rust scripts.
 //!
 //! Every tracked entrypoint uses `rust-script --force`. That makes Cargo inspect
-//! this included module and local path dependencies on every invocation instead
-//! of trusting rust-script's main-file-only executable cache. The warm Cargo
-//! check is normally tens of milliseconds; `check-script-sigpipe.sh` refuses a
-//! tracked rust-script that omits the flag.
+//! this included module and local path dependencies on every ordinary invocation
+//! instead of trusting rust-script's main-file-only executable cache. Validation
+//! compiles the same discovered population in `build.rust_scripts` and then runs
+//! those prepared binaries; `check-script-sigpipe.sh` refuses a tracked
+//! rust-script that omits the flag.
 
 /// Make a standalone script tolerate a downstream reader closing the pipe early
 /// (`prog | head`, `prog | grep -q`, …) by terminating cleanly on `SIGPIPE`.

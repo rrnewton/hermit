@@ -1124,7 +1124,13 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
             .env_remove(TOOL_BOOTSTRAP_SHA256_ENV)
             .env_remove(validate_runtime::ACTIVE_ENV)
             .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_PID")
-            .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_FILE");
+            .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_FILE")
+            // This fixture deliberately exercises the pre-driver bootstrap in
+            // an independent checkout. It must compile that copied driver with
+            // the real rust-script so a missing path dependency remains visible
+            // instead of consuming this checkout's prepared executable.
+            .env_remove("HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED")
+            .env_remove("HERMIT_RUST_SCRIPT_ARTIFACT_ROOT");
         command
             .output()
             .map_err(|error| format!("submodule service result: cannot launch fixture: {error}"))
@@ -2258,6 +2264,7 @@ fn self_test() -> Result<(), String> {
         validate_history::self_test()?,
         validate_receipt::self_test()?,
         validate_runtime::self_test()?,
+        prebuilt_rust_script_plan_bracket()?,
         pinned_root_plan_bracket()?,
     ] {
         println!("  {line}");
@@ -6184,6 +6191,222 @@ impl Default for Plan {
             cell_evidence_expected: None,
         }
     }
+}
+
+const RUST_SCRIPT_PRODUCER_TAG: &str = "build.rust_scripts";
+const RUST_SCRIPT_COMMAND_PREFIX: &str = "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; \
+    export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; \
+    export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ";
+
+fn rust_script_producer_step() -> Step {
+    let mut step = step_with_caps(
+        "build",
+        "rust_scripts",
+        "Build every tracked rust-script before graph consumers run",
+        "./ci/prepare-rust-scripts.sh".into(),
+        Vec::new(),
+        300,
+        900,
+        2 * 1024 * 1024 * 1024,
+    );
+    step.description = "Discovers every tracked rust-script entrypoint, runs the existing clippy contract, and publishes release executables plus test harnesses. It runs after checkout and pin verification; every compiling consumer resolves rust-script through the read-only manifest, so compilation cost cannot migrate according to scheduler order.".into();
+    step.hint.classification = dagrun::model::StepClass::CpuBound;
+    step.hint.preferred_inner_jobs = Some(8);
+    step.jobs_flag = Some(String::new());
+    step.jobs_env = Some("CARGO_BUILD_JOBS".into());
+    step
+}
+
+/// Put rust-script compilation at one explicit point in each scheduled DAG.
+///
+/// The checked-in lane files carry this node for direct `ci/run-dag.sh` users.
+/// Synthetic validation profiles do not, so the driver adds the same node when
+/// absent. The producer follows checkout verification and precedes the manifest
+/// build; plans with no preflight put it before every prior root. A source
+/// invocation later in the graph still reaches its ordinary shebang, but PATH
+/// resolves rust-script to the repository shim, which executes the immutable
+/// published binary rather than entering Cargo again. Hosted shards explicitly
+/// omit predecessors supplied by earlier jobs, so those plans require and check
+/// the transported producer output instead of synthesizing another writer.
+fn configure_prebuilt_rust_scripts(
+    plan: &mut Plan,
+    require_external_output: bool,
+) -> Result<(), String> {
+    for cfg in std::iter::once(&mut plan.cfg).chain(plan.second.iter_mut()) {
+        if cfg.steps.is_empty() {
+            continue;
+        }
+        let producer_tags: Vec<String> = cfg
+            .steps
+            .iter()
+            .filter(|step| {
+                step.job == "rust_scripts" && step.cmd == "./ci/prepare-rust-scripts.sh"
+            })
+            .map(Step::tag)
+            .collect();
+        let producer_tag = match producer_tags.as_slice() {
+            [] => {
+                if require_external_output {
+                    String::new()
+                } else {
+                    cfg.steps.push(rust_script_producer_step());
+                    RUST_SCRIPT_PRODUCER_TAG.to_string()
+                }
+            }
+            [tag] => tag.clone(),
+            tags => {
+                return Err(format!(
+                    "execution plan contains {} rust-script producer nodes ({}); exactly one may publish the script binaries",
+                    tags.len(),
+                    tags.join(", ")
+                ))
+            }
+        };
+        let has_pin = cfg.steps.iter().any(|step| step.tag() == PIN_GATE_TAG);
+        let producer_prerequisite = has_pin.then(|| PIN_GATE_TAG.to_string());
+        let prior_roots: BTreeSet<String> = cfg
+            .steps
+            .iter()
+            .filter(|step| step.tag() != producer_tag && step.deps.is_empty())
+            .map(Step::tag)
+            .collect();
+        for step in &mut cfg.steps {
+            let tag = step.tag();
+            if !producer_tag.is_empty() && tag == producer_tag {
+                step.deps = producer_prerequisite.iter().cloned().collect();
+            } else if tag != "pre.submodules" {
+                if !producer_tag.is_empty() && has_pin {
+                    for dependency in &mut step.deps {
+                        if dependency == PIN_GATE_TAG {
+                            *dependency = producer_tag.clone();
+                        }
+                    }
+                } else if !producer_tag.is_empty() && prior_roots.contains(&tag) {
+                    step.deps.push(producer_tag.clone());
+                }
+                step.deps.sort();
+                step.deps.dedup();
+            }
+            if !step.cmd.starts_with(RUST_SCRIPT_COMMAND_PREFIX) {
+                step.cmd = format!("{RUST_SCRIPT_COMMAND_PREFIX}{}", step.cmd);
+            }
+            if producer_tag.is_empty() {
+                step.cmd = format!("./ci/prepare-rust-scripts.sh --check; {}", step.cmd);
+            }
+        }
+        if let Some(stuck) = first_dependency_cycle(&cfg.steps) {
+            return Err(format!(
+                "rust-script producer ordering created a dependency cycle among: {}",
+                stuck.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn prebuilt_rust_script_plan_bracket() -> Result<String, String> {
+    let step = |job: &str, deps: Vec<String>| {
+        step_with_caps("fixture", job, "fixture", "true".into(), deps, 30, 30, 1024 * 1024)
+    };
+    let mut plan = Plan {
+        cfg: validate_plan::config_from(
+            vec![
+                step("root", vec![]),
+                step("child", vec!["fixture.root".into()]),
+            ],
+            "rust-script producer bracket",
+        ),
+        ..Default::default()
+    };
+    configure_prebuilt_rust_scripts(&mut plan, false)?;
+    let producer = plan
+        .cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == RUST_SCRIPT_PRODUCER_TAG)
+        .ok_or("rust-script producer bracket did not add the producer")?;
+    let root = plan
+        .cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == "fixture.root")
+        .ok_or("rust-script producer bracket lost the root fixture")?;
+    let child = plan
+        .cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == "fixture.child")
+        .ok_or("rust-script producer bracket lost the child fixture")?;
+    if producer.cmd != format!("{RUST_SCRIPT_COMMAND_PREFIX}./ci/prepare-rust-scripts.sh")
+        || root.deps != [RUST_SCRIPT_PRODUCER_TAG.to_string()]
+        || child.deps != ["fixture.root".to_string()]
+        || !root.cmd.starts_with(RUST_SCRIPT_COMMAND_PREFIX)
+        || !child.cmd.starts_with(RUST_SCRIPT_COMMAND_PREFIX)
+    {
+        return Err(format!(
+            "rust-script producer bracket lost its single-producer ordering or command wrapper: producer={producer:?} root={root:?} child={child:?}"
+        ));
+    }
+    let mut duplicated = Plan {
+        cfg: validate_plan::config_from(
+            vec![rust_script_producer_step(), rust_script_producer_step()],
+            "duplicate rust-script producer bracket",
+        ),
+        ..Default::default()
+    };
+    if configure_prebuilt_rust_scripts(&mut duplicated, false).is_ok() {
+        return Err("rust-script producer bracket accepted duplicate writers".into());
+    }
+    let mut transported = Plan {
+        cfg: validate_plan::config_from(
+            vec![step("transported", vec![])],
+            "transported rust-script bracket",
+        ),
+        ..Default::default()
+    };
+    configure_prebuilt_rust_scripts(&mut transported, true)?;
+    if transported
+        .cfg
+        .steps
+        .iter()
+        .any(|step| step.job == "rust_scripts")
+        || !transported.cfg.steps[0]
+            .cmd
+            .starts_with("./ci/prepare-rust-scripts.sh --check; ")
+    {
+        return Err(format!(
+            "rust-script transported-output bracket synthesized a writer or omitted its check: {:?}",
+            transported.cfg.steps
+        ));
+    }
+    let mut preflight = Plan {
+        cfg: validate_plan::config_from(
+            validate_plan::preflight_nodes(Path::new("/repo"), false),
+            "rust-script preflight bracket",
+        ),
+        ..Default::default()
+    };
+    configure_prebuilt_rust_scripts(&mut preflight, false)?;
+    let producer = preflight
+        .cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == RUST_SCRIPT_PRODUCER_TAG)
+        .ok_or("rust-script preflight bracket lost the producer")?;
+    let manifest_plan = preflight
+        .cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
+        .ok_or("rust-script preflight bracket lost the manifest producer")?;
+    if producer.deps != [PIN_GATE_TAG.to_string()]
+        || manifest_plan.deps != [RUST_SCRIPT_PRODUCER_TAG.to_string()]
+    {
+        return Err(format!(
+            "rust-script preflight bracket did not place compilation between pin verification and manifest compilation: producer={producer:?} manifest={manifest_plan:?}"
+        ));
+    }
+    Ok("rust-script build: one producer follows checkout verification and precedes graph consumers; prepared binaries are read-only and duplicate producers refuse".into())
 }
 
 /// Keep a subgraph of the plan that validate has already constructed.
@@ -10487,6 +10710,8 @@ fn propagate_verbosity(plan: &mut Plan, verbosity: i64) {
 /// `ci/publish-hermit-e2e-artifact.sh` copies that whole tree into the artifact the
 /// cells unpack and run. A list assembled from memory would have stopped at five.
 const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
+    // builds the rust-script executables that source-based cell helpers invoke
+    "build.rust_scripts",
     // builds target/debug/test-harness, which the cell command invokes directly
     "setup.manifest_plan",
     // builds target/debug/hermit, which the cells run as the guest tracer
@@ -10645,6 +10870,12 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
                 .filter(|dep| producer_tags.contains(*dep))
                 .map(|dep| pinned_root_producer_twin_tag(dep))
                 .collect();
+            if producer.tag() != RUST_SCRIPT_PRODUCER_TAG
+                && producer_tags.contains(RUST_SCRIPT_PRODUCER_TAG)
+            {
+                twin.deps
+                    .push(pinned_root_producer_twin_tag(RUST_SCRIPT_PRODUCER_TAG));
+            }
             // Fusion replaces e2e.metadata with the host gate.manifest node.
             // That host node is deliberately not copied into the pinned root,
             // so preserve the actual build prerequisite explicitly: this
@@ -10702,6 +10933,15 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
                 step.deps
                     .push("build.e2e_artifact_in_pinned_root".into());
             }
+            if producer_tags.contains(RUST_SCRIPT_PRODUCER_TAG)
+                && !step
+                    .deps
+                    .iter()
+                    .any(|dep| dep == "build.rust_scripts_in_pinned_root")
+            {
+                step.deps
+                    .push("build.rust_scripts_in_pinned_root".into());
+            }
             step.cmd = pinned_root_command(root, &out, step);
             if index == 0 && !step.deps.iter().any(|dep| dep == PINNED_ROOT_FETCH_TAG) {
                 step.deps.push(PINNED_ROOT_FETCH_TAG.into());
@@ -10727,6 +10967,7 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
             vec![
                 step("pre", "submodules", "host-submodules", vec![]),
                 step("pre", "reverie_pin", "./ci/run-reverie-pin-check.sh", vec!["pre.submodules".into()]),
+                step("build", "rust_scripts", "./ci/prepare-rust-scripts.sh", vec![PIN_GATE_TAG.into()]),
                 cell,
                 // The four below are the shape of the forty-four that must STAY on
                 // the host. gate.manifest is named explicitly because it is the one
@@ -10811,10 +11052,14 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
         .ok_or("pinned-root bracket: the in-image copy of build.workspace was not added; the cells would get host-built binaries the image cannot load")?;
     if !twin.cmd.contains("run-in-pinned-root.sh")
         || twin.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
+        || !twin
+            .deps
+            .iter()
+            .any(|dep| dep == "build.rust_scripts_in_pinned_root")
     {
         return Err(format!(
-            "pinned-root bracket: the in-image copy of build.workspace is not actually in the image: cmd={:?} env={:?}",
-            twin.cmd, twin.env
+            "pinned-root bracket: the in-image copy of build.workspace is not actually in the image or can contend with the rust-script producer: cmd={:?} env={:?} deps={:?}",
+            twin.cmd, twin.env, twin.deps
         ));
     }
 
@@ -10863,6 +11108,19 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
         return Err(format!(
             "pinned-root bracket: the scheduled cell must depend on build.workspace_in_pinned_root, not the host build.workspace, or it runs against binaries the image cannot load: deps={:?}",
             wrapped.deps
+        ));
+    }
+    let rust_script_twin = by_tag
+        .get("build.rust_scripts_in_pinned_root")
+        .ok_or("pinned-root bracket: the in-image rust-script producer was not added")?;
+    if !rust_script_twin.cmd.contains("run-in-pinned-root.sh")
+        || !wrapped
+            .deps
+            .iter()
+            .any(|dep| dep == "build.rust_scripts_in_pinned_root")
+    {
+        return Err(format!(
+            "pinned-root bracket: the scheduled cell does not consume the in-image rust-script producer: producer={rust_script_twin:?} cell={wrapped:?}"
         ));
     }
 
@@ -18279,6 +18537,15 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
                 vec![error],
             );
         }
+    }
+
+    if let Err(error) = configure_prebuilt_rust_scripts(&mut plan, args.ignore_selected_deps) {
+        return RunSummary::refused(
+            2,
+            &plan.profile,
+            "rust-script build-plan construction",
+            vec![error],
+        );
     }
 
     // The public environment variable is the per-cell gate, not proof that the
