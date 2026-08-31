@@ -18,6 +18,7 @@ use chrono::Utc;
 use detcore_model::config::MountInfoRootRewrite;
 use detcore_model::procfs::MOUNT_PEER_PREFIXES;
 use detcore_model::procfs::MountInfoRow;
+use detcore_model::procfs::mount_ids_are_ordered_subset;
 pub(crate) use detcore_model::procfs::parse_mountinfo;
 use serde::Deserialize;
 use serde::Serialize;
@@ -421,14 +422,26 @@ impl MountInfoSnapshot {
         mut devices: BTreeMap<u64, u64>,
         rewrites: BTreeMap<u64, MountInfoRootRewrite>,
     ) -> Option<Self> {
-        let visible_mounts = rows
+        let visible_mount_order = rows.iter().map(|row| row.raw_mount_id).collect::<Vec<_>>();
+        let visible_mounts = visible_mount_order
             .iter()
-            .map(|row| row.raw_mount_id)
+            .copied()
             .collect::<std::collections::BTreeSet<_>>();
-        if visible_mounts.len() != rows.len()
-            || !rewrites
+        let supplied_mounts = mount_id_order
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let rewrites_are_known = if mount_id_order.is_empty() {
+            rewrites
                 .keys()
                 .all(|mount_id| visible_mounts.contains(mount_id))
+        } else {
+            rewrites
+                .keys()
+                .all(|mount_id| supplied_mounts.contains(mount_id))
+        };
+        if visible_mounts.len() != rows.len()
+            || !rewrites_are_known
             || rewrites.values().any(|rewrite| {
                 rewrite.deterministic_root.first() != Some(&b'/')
                     || rewrite
@@ -514,26 +527,29 @@ impl MountInfoSnapshot {
                 derived_order.push(row.raw_parent_id);
             }
         }
-        let canonical_order = if mount_id_order.is_empty() {
+        let mount_ids = if mount_id_order.is_empty() {
             derived_order
+                .into_iter()
+                .enumerate()
+                .map(|(index, raw)| (raw, index as u64 + 1))
+                .collect()
         } else {
-            let supplied = mount_id_order
-                .iter()
-                .copied()
-                .collect::<std::collections::BTreeSet<_>>();
-            if supplied.len() != mount_id_order.len()
-                || mount_id_order != derived_order
-                || !expected_mount_ids.iter().all(|raw| supplied.contains(raw))
+            if supplied_mounts.len() != mount_id_order.len()
+                || !mount_ids_are_ordered_subset(&visible_mount_order, mount_id_order)
+                || !expected_mount_ids
+                    .iter()
+                    .all(|raw| supplied_mounts.contains(raw))
             {
                 return None;
             }
-            mount_id_order.to_vec()
+            mount_id_order
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, raw)| expected_mount_ids.contains(raw))
+                .map(|(index, raw)| (raw, index as u64 + 1))
+                .collect()
         };
-        let mount_ids = canonical_order
-            .into_iter()
-            .enumerate()
-            .map(|(index, raw)| (raw, index as u64 + 1))
-            .collect();
 
         let mut peer_groups = BTreeMap::new();
         for row in &rows {
@@ -545,6 +561,7 @@ impl MountInfoSnapshot {
 
         let root_rewrites = rewrites
             .iter()
+            .filter(|(raw_mount_id, _)| visible_mounts.contains(raw_mount_id))
             .map(|(raw_mount_id, rewrite)| (*raw_mount_id, rewrite.deterministic_root.clone()))
             .collect();
         let mut root_prefix_rewrites = rewrites
@@ -4787,7 +4804,7 @@ Rss:                   4 kB\n" as &[u8];
     }
 
     #[test]
-    fn mountinfo_snapshot_refuses_incomplete_or_wrong_policy_device_maps() {
+    fn mountinfo_snapshot_accepts_only_known_ordered_subsets_and_matching_device_policy() {
         let input = b"20 10 8:1 / /a rw - ext4 /dev/a rw\n30 20 8:2 / /b rw - ext4 /dev/b rw\n";
         let rows = parse_mountinfo(input).unwrap();
         let first = libc::makedev(8, 1);
@@ -4837,15 +4854,39 @@ Rss:                   4 kB\n" as &[u8];
         let rows = parse_mountinfo(input).unwrap();
         assert!(
             MountInfoSnapshot::new(
-                rows,
-                &[20, 30, 10, 999],
+                rows.clone(),
+                &[30, 20, 10],
                 false,
                 BTreeMap::new(),
                 BTreeMap::new(),
             )
             .is_none(),
-            "recorded mount identity order must describe exactly this mountinfo snapshot"
+            "visible mount rows must retain their producer-captured order"
         );
+
+        let snapshot = MountInfoSnapshot::new(
+            rows,
+            &[5, 20, 25, 30, 10, 999],
+            false,
+            BTreeMap::new(),
+            BTreeMap::from([(
+                5,
+                MountInfoRootRewrite {
+                    raw_mount_id: 5,
+                    deterministic_root: b"/invisible-but-captured".to_vec(),
+                    raw_root_prefix: None,
+                    deterministic_root_prefix: None,
+                    raw_mountpoint_prefix: None,
+                    deterministic_mountpoint_prefix: None,
+                },
+            )]),
+        )
+        .expect("a chroot-visible subset should retain captured canonical positions");
+        assert_eq!(snapshot.canonical_mount_id(20), Some(2));
+        assert_eq!(snapshot.canonical_mount_id(30), Some(4));
+        assert_eq!(snapshot.canonical_mount_id(10), Some(5));
+        assert_eq!(snapshot.raw_mount_id_order(), [20, 30, 10]);
+        assert!(!snapshot.root_rewrites.contains_key(&5));
     }
 
     #[test]

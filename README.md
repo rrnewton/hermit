@@ -362,7 +362,11 @@ rewritten only when their source object has been proved. The `scm_fds` fdinfo
 field passes through because it is the socket's queued-descriptor count, not a
 host-assigned identity. With `run --no-namespace`, Hermit snapshots the live
 mount-ID order on first use and refuses if that order changes during the run,
-rather than applying an identity map to a different host mount-ID layout.
+rather than applying an identity map to a different host mount-ID layout. A
+chroot may expose an order-preserving subset of a captured mount table; those
+rows retain their positions in the captured identity order, including gaps.
+If a new mount namespace exposes a mount ID absent from the captured order, a
+mountinfo read refuses instead of assigning a plausible but unproved identity.
 
 ## Compatibility
 

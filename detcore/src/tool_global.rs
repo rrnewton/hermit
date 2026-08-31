@@ -33,6 +33,7 @@ use std::time::SystemTime;
 use anyhow::bail;
 use chrono::DateTime;
 use chrono::Utc;
+use detcore_model::procfs::mount_ids_are_ordered_subset;
 use detcore_model::summary::RunSummary;
 use detcore_model::summary::TimesliceStats;
 use nix::sys::signal;
@@ -253,6 +254,7 @@ enum MountIdPool {
     Ready {
         mount_ids: BTreeMap<u64, u64>,
         mountinfo_order: Vec<u64>,
+        allow_visible_subsets: bool,
         unlisted_order: Vec<u64>,
         next_mount_id: u64,
     },
@@ -273,10 +275,14 @@ impl MountIdPool {
             }
             return Self::Uninitialized;
         }
-        Self::from_orders(mount_ids, unlisted_ids).unwrap_or(Self::Invalid)
+        Self::from_orders(mount_ids, unlisted_ids, true).unwrap_or(Self::Invalid)
     }
 
-    fn from_orders(mount_ids: &[u64], unlisted_ids: &[u64]) -> Option<Self> {
+    fn from_orders(
+        mount_ids: &[u64],
+        unlisted_ids: &[u64],
+        allow_visible_subsets: bool,
+    ) -> Option<Self> {
         let mut seen = BTreeSet::new();
         if !mount_ids.iter().all(|raw| seen.insert(*raw))
             || !unlisted_ids
@@ -294,6 +300,7 @@ impl MountIdPool {
         Some(Self::Ready {
             mount_ids: mappings,
             mountinfo_order: mount_ids.to_vec(),
+            allow_visible_subsets,
             unlisted_order: unlisted_ids.to_vec(),
             next_mount_id,
         })
@@ -301,16 +308,21 @@ impl MountIdPool {
 
     fn validate_mountinfo_order(&mut self, mountinfo_order: &[u64]) -> bool {
         if matches!(self, Self::Uninitialized) {
-            *self = Self::from_orders(mountinfo_order, &[]).unwrap_or(Self::Invalid);
+            *self = Self::from_orders(mountinfo_order, &[], false).unwrap_or(Self::Invalid);
         }
         let Self::Ready {
             mountinfo_order: expected,
+            allow_visible_subsets,
             ..
         } = self
         else {
             return false;
         };
-        mountinfo_order == expected
+        if *allow_visible_subsets {
+            mount_ids_are_ordered_subset(mountinfo_order, expected)
+        } else {
+            mountinfo_order == expected
+        }
     }
 
     fn determinize(&mut self, raw_mount_id: u64, mountinfo_order: Option<&[u64]>) -> Option<u64> {
@@ -3460,6 +3472,26 @@ mod tests {
         let mut empty = MountIdPool::from_config(&[], false, &[]);
         assert!(empty.validate_mountinfo_order(&[]));
         assert!(!empty.validate_mountinfo_order(&[10]));
+    }
+
+    #[test]
+    fn configured_mountinfo_order_accepts_only_ordered_known_subsets() {
+        let mut pool = MountIdPool::from_config(&[10, 20, 30, 40], true, &[]);
+        assert!(pool.validate_mountinfo_order(&[10, 30, 40]));
+        assert_eq!(pool.determinize(30, None), Some(3));
+        assert!(pool.validate_mountinfo_order(&[20, 40]));
+        assert!(!pool.validate_mountinfo_order(&[30, 20]));
+        assert!(!pool.validate_mountinfo_order(&[10, 10]));
+    }
+
+    #[test]
+    fn configured_mountinfo_order_refuses_new_namespace_ids() {
+        let mut pool = MountIdPool::from_config(&[10, 20, 30, 40], true, &[]);
+        assert!(pool.validate_mountinfo_order(&[10, 30, 40]));
+        assert!(
+            !pool.validate_mountinfo_order(&[10, 99, 40]),
+            "a namespace-local mount ID absent from captured provenance must fail closed"
+        );
     }
 
     #[test]

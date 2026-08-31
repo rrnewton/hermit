@@ -45,8 +45,8 @@ impl fmt::Display for DesyncError {
 
         writeln!(
             f,
-            "On thread {}, got unexpected syscall (count = {}):",
-            self.thread, self.count
+            "On physical thread {} (recording stream {}), got unexpected syscall (count = {}):",
+            self.thread, self.stream_id, self.count
         )?;
         writeln!(
             f,
@@ -224,6 +224,8 @@ mod tests {
             expected: DebugEvent::for_test(Sysno::getppid, "getppid()"),
         };
         let summary = error.summary(data.path(), 1, 1).to_string();
+        assert!(summary.contains(&format!("physical thread {physical_tid}")));
+        assert!(summary.contains(&format!("recording stream {}", error.stream_id)));
         assert!(
             summary.contains("getpid()"),
             "missing preceding context: {summary}"

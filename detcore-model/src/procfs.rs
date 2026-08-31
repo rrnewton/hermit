@@ -20,7 +20,22 @@ pub struct MountInfoRow {
     pub raw_peer_groups: Vec<u64>,
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-873): Review private mount-root normalization.
 pub const MOUNT_PEER_PREFIXES: [&[u8]; 3] = [b"shared:", b"master:", b"propagate_from:"];
+
+/// Whether every visible mount ID occurs once and in the same relative order
+/// as the producer-captured namespace.
+pub fn mount_ids_are_ordered_subset(visible: &[u64], captured: &[u64]) -> bool {
+    let mut seen = BTreeSet::new();
+    if !visible.iter().all(|raw| seen.insert(*raw)) {
+        return false;
+    }
+    let mut captured = captured.iter();
+    visible
+        .iter()
+        .all(|raw| captured.by_ref().any(|candidate| candidate == raw))
+}
 
 fn decimal(field: &[u8]) -> Option<u64> {
     if field.is_empty() || field.iter().any(|byte| !byte.is_ascii_digit()) {
@@ -127,6 +142,7 @@ pub fn parse_fdinfo_mount_id(contents: &[u8]) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use super::mount_ids_are_ordered_subset;
     use super::parse_fdinfo_mount_id;
     use super::parse_mountinfo;
 
@@ -173,5 +189,14 @@ mod tests {
         );
         let duplicate = [row.as_slice(), row.as_slice()].concat();
         assert!(parse_mountinfo(&duplicate).is_none());
+    }
+
+    #[test]
+    fn mount_id_subset_requires_unique_members_in_captured_order() {
+        assert!(mount_ids_are_ordered_subset(&[], &[10, 20, 30]));
+        assert!(mount_ids_are_ordered_subset(&[10, 30], &[10, 20, 30]));
+        assert!(!mount_ids_are_ordered_subset(&[30, 10], &[10, 20, 30]));
+        assert!(!mount_ids_are_ordered_subset(&[10, 99], &[10, 20, 30]));
+        assert!(!mount_ids_are_ordered_subset(&[10, 10], &[10, 20, 30]));
     }
 }
