@@ -5,7 +5,7 @@ set -euo pipefail
 
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$LIB_DIR/../.." && pwd)"
-HERMIT_REPO="${HERMIT_REPO:-$ROOT/hermit}"
+HERMIT_REPO="${HERMIT_REPO:-$ROOT}"
 # shellcheck source=qemu-paths.sh
 source "$LIB_DIR/qemu-paths.sh"
 ARTIFACT_DIR="${QEMU_ASSETS:-$(qemu_default_assets "$ROOT")}"
