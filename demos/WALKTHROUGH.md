@@ -97,6 +97,11 @@ inspect:
 
 Demo 4 is intentionally the slowest process-level example.
 
+Demo 2 uses the debug Hermit binary built from the same recorded source
+revision. At Hermit `e85aaf9654983116ac26ae02beb8f95f7c46f02f`, the release
+binary returns `EFAULT` while replaying the bootstrap exec; the debug binary and
+Hermit's corresponding record/replay integration test complete successfully.
+
 ## Demo 5: boot once and store the Linux snapshot
 
 Run Demo 5 explicitly when you want to prepare the shared snapshot ahead of
@@ -163,11 +168,11 @@ every task.
 Expected output includes this stable core:
 
 ```text
-evolution 1: before_tasks=84 after_tasks=86 removed=0 added=2 read_states=t/T,t/T serial_delta=0/0
-evolution 2: before_tasks=84 after_tasks=86 removed=0 added=2 read_states=t/T,t/T serial_delta=0/0
+evolution 1: before_tasks=84 after_tasks=85 removed=2 added=3 read_states=t/T,t/T serial_delta=0/0
+evolution 2: before_tasks=84 after_tasks=85 removed=2 added=3 read_states=t/T,t/T serial_delta=0/0
 before tasks (84 total; first 16 shown, pid comm):
       0 swapper/0
-      1 sh
+      1 init
       2 kthreadd
       3 pool_workqueue_
       4 kworker/R-rcu_g
@@ -182,7 +187,7 @@ before tasks (84 total; first 16 shown, pid comm):
      13 kworker/R-mm_pe
      14 kworker/u4:1
      15 ksoftirqd/0
-after tasks (86 total; first 16 shown, pid comm):
+after tasks (85 total; first 16 shown, pid comm):
       0 swapper/0
       1 sh
       2 kthreadd
@@ -200,14 +205,17 @@ after tasks (86 total; first 16 shown, pid comm):
      14 kworker/u4:1
      15 ksoftirqd/0
 task-list diff (- before, + after):
-  +    91 sleep
-  +    92 sleep
+  -     1 init
+  -    95 sleep
+  +     1 sh
+  +   101 sleep
+  +   102 sleep
 RESULT: restored phase-5 snapshot; fixed_virtual_advance_us=1000; task_lists_differ=yes; evolution_reproducible=yes; read_virtual_time_advanced=no
 ```
 
-The exact kernel-worker prefix belongs to the fixed demo kernel and stored
-snapshot. The important assertions are that the complete lists reproduce, the
-same two task rows are added, and both read intervals remain quiescent.
+The exact kernel-worker prefix and process IDs belong to the fixed demo kernel
+and stored snapshot. The important assertions are that the complete lists and
+their exact diff reproduce, and both read intervals remain quiescent.
 
 ## Why the drgn reads have zero guest-time cost
 
