@@ -10650,6 +10650,8 @@ fn propagate_verbosity(plan: &mut Plan, verbosity: i64) {
 /// `ci/publish-hermit-e2e-artifact.sh` copies that whole tree into the artifact the
 /// cells unpack and run. A list assembled from memory would have stopped at five.
 const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
+    // builds the rust-script executables that source-based cell helpers invoke
+    "build.rust_scripts",
     // builds target/debug/test-harness, which the cell command invokes directly
     "setup.manifest_plan",
     // builds target/debug/hermit, which the cells run as the guest tracer
@@ -10865,6 +10867,15 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
                 step.deps
                     .push("build.e2e_artifact_in_pinned_root".into());
             }
+            if producer_tags.contains(RUST_SCRIPT_PRODUCER_TAG)
+                && !step
+                    .deps
+                    .iter()
+                    .any(|dep| dep == "build.rust_scripts_in_pinned_root")
+            {
+                step.deps
+                    .push("build.rust_scripts_in_pinned_root".into());
+            }
             step.cmd = pinned_root_command(root, &out, step);
             if index == 0 && !step.deps.iter().any(|dep| dep == PINNED_ROOT_FETCH_TAG) {
                 step.deps.push(PINNED_ROOT_FETCH_TAG.into());
@@ -10890,6 +10901,7 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
             vec![
                 step("pre", "submodules", "host-submodules", vec![]),
                 step("pre", "reverie_pin", "./ci/run-reverie-pin-check.sh", vec!["pre.submodules".into()]),
+                step("build", "rust_scripts", "./ci/prepare-rust-scripts.sh", vec![PIN_GATE_TAG.into()]),
                 cell,
                 // The four below are the shape of the forty-four that must STAY on
                 // the host. gate.manifest is named explicitly because it is the one
@@ -11026,6 +11038,19 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
         return Err(format!(
             "pinned-root bracket: the scheduled cell must depend on build.workspace_in_pinned_root, not the host build.workspace, or it runs against binaries the image cannot load: deps={:?}",
             wrapped.deps
+        ));
+    }
+    let rust_script_twin = by_tag
+        .get("build.rust_scripts_in_pinned_root")
+        .ok_or("pinned-root bracket: the in-image rust-script producer was not added")?;
+    if !rust_script_twin.cmd.contains("run-in-pinned-root.sh")
+        || !wrapped
+            .deps
+            .iter()
+            .any(|dep| dep == "build.rust_scripts_in_pinned_root")
+    {
+        return Err(format!(
+            "pinned-root bracket: the scheduled cell does not consume the in-image rust-script producer: producer={rust_script_twin:?} cell={wrapped:?}"
         ));
     }
 
