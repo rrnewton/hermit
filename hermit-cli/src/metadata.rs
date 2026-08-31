@@ -12,6 +12,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use detcore::BlockingMode;
+use detcore_model::config::MountInfoRootRewrite;
 use reverie::process::Command;
 use serde::Deserialize;
 use serde::Serialize;
@@ -93,7 +94,21 @@ impl RecordVersion {
 // The replayer now consumes one exact pidfd_getfd event and reissues the
 // syscall to reproduce the kernel side effect; accepting a 0x10e stream would
 // therefore consume the next event at every pidfd_getfd call.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x10f);
+//
+// TODO-HUMAN-REVIEW(PR-2799): Review recording-time mountinfo provenance.
+// 0x10f -> 0x110: metadata now carries the recording namespace's proven
+// Hermit-owned mount IDs. Detcore applies that map after both the recorder's
+// raw read and the replayer's ReadV2 copyout. An older recording has no map and
+// would replay different guest-visible mountinfo bytes under this sanitizer,
+// so accepting it would violate replay fidelity even though the event enum did
+// not change.
+//
+// TODO-HUMAN-REVIEW(PR-2799): Review recording-time fdinfo/mountinfo identity.
+// 0x110 -> 0x111: metadata now also carries the recording namespace's full
+// raw mount-ID order. That makes fdinfo's mnt_id use the same canonical identity
+// as mountinfo during replay instead of consulting the unrelated replay
+// namespace or collapsing all descriptors to one mount.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x111);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -118,7 +133,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x10f);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x10f;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x111;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -148,6 +163,16 @@ pub struct Metadata {
     pub envs: BTreeMap<String, String>,
     /// Hermit record/replay version.
     pub version: RecordVersion,
+    /// Recording-namespace mount roots proven to be Hermit-owned.
+    ///
+    /// Replay consumes the recorder's raw syscall buffers, so it must apply the
+    /// recording-time raw mount IDs rather than IDs from the fresh replay
+    /// namespace.  Older recordings default to no private-root rewrites.
+    #[serde(default)]
+    pub mountinfo_root_rewrites: Vec<MountInfoRootRewrite>,
+    /// Recording-namespace raw mount IDs in canonical row order.
+    #[serde(default)]
+    pub mountinfo_mount_ids: Vec<u64>,
 }
 
 impl Metadata {
@@ -196,6 +221,8 @@ impl Metadata {
             domainname,
             envs,
             version: RECORD_VERSION,
+            mountinfo_root_rewrites: Vec::new(),
+            mountinfo_mount_ids: Vec::new(),
         })
     }
 
@@ -222,11 +249,12 @@ impl Metadata {
     }
 }
 
-// TODO: Record this in the metadata instead of hardcoding this.
 pub fn record_or_replay_config(data: &Path) -> detcore::Config {
-    // NOTE: Record and replay should use the exact same detcore
-    // configuration. Otherwise, the behavior of the program could diverge
-    // during replay.
+    // NOTE: Record and replay should use the exact same Detcore configuration.
+    // Callers add `Metadata::mountinfo_root_rewrites` and
+    // `Metadata::mountinfo_mount_ids` after this common base is built, so replay
+    // uses the recording namespace's raw IDs rather than the unrelated IDs of
+    // its fresh container.
     //
     // WHY THIS IS NOT `hermit run --strict`, WRITTEN HERE ON PURPOSE.
     //
@@ -280,6 +308,8 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         deterministic_io: false,
         virtualize_time: crate::RECORD_REPLAY_VIRTUALIZES_TIME,
         virtualize_metadata: false,
+        mountinfo_root_rewrites: Vec::new(),
+        mountinfo_mount_ids: Vec::new(),
         virtualize_cpuid: true,
         cpuid_virtualized_by_backend: false,
         backend_supports_madvise: true,
