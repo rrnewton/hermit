@@ -10969,7 +10969,7 @@ mod nextest_timeout_tests {
         let manifest = include_str!("../tests/e2e/manifests/defaults.yaml");
         let manifest_timeout_stanzas = [
             "- filter: test(/(^|::)every_record_container_site_classifies_a_child_fault_by_name$/)\n    timeout_seconds: 45",
-            "- filter: test(/(^|::)run_timeout_fallback_fires_when_the_unwind_does_not_finish$/)\n    timeout_seconds: 30",
+            "- filter: test(/(^|::)run_timeout_fallback_fires_when_the_unwind_does_not_finish$/)\n    timeout_seconds: 45",
             "- filter: binary(=container_init_deadline)\n    timeout_seconds: 30",
         ];
         let manifest_timeouts_match = |source: &str| {
@@ -10989,6 +10989,15 @@ mod nextest_timeout_tests {
                 "source-audit timeout mutation 45->{wrong_timeout} escaped the ratchet"
             );
         }
+        let fallback_timeout_mutation = manifest.replacen(
+            "- filter: test(/(^|::)run_timeout_fallback_fires_when_the_unwind_does_not_finish$/)\n    timeout_seconds: 45",
+            "- filter: test(/(^|::)run_timeout_fallback_fires_when_the_unwind_does_not_finish$/)\n    timeout_seconds: 30",
+            1,
+        );
+        assert!(
+            !manifest_timeouts_match(&fallback_timeout_mutation),
+            "fallback timeout mutation 45->30 escaped the ratchet"
+        );
         let timeouts: Vec<&str> = config
             .lines()
             .map(str::trim)
@@ -10999,10 +11008,10 @@ mod nextest_timeout_tests {
             vec![
                 "slow-timeout = { period = \"15s\", terminate-after = 1, grace-period = \"2s\" }",
                 "slow-timeout = { period = \"45s\", terminate-after = 1, grace-period = \"2s\" }",
-                "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
+                "slow-timeout = { period = \"45s\", terminate-after = 1, grace-period = \"2s\" }",
                 "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
             ],
-            "the per-test timeout must stay at 15s with one justified 45s override and two justified 30s overrides"
+            "the per-test timeout must stay at 15s with two justified 45s overrides and one justified 30s override"
         );
         for required in [
             "test(/(^|::)every_record_container_site_classifies_a_child_fault_by_name$/)",
@@ -11027,7 +11036,10 @@ mod nextest_timeout_tests {
         assert!(config.contains("20s teardown budget"));
         assert!(config.contains("15.002s"));
         assert!(config.contains("RUN_TIMEOUT_UNWIND_GRACE"));
-        assert!(config.contains("11.2s"));
+        for required in ["29.636s", "30.002s", "1.52x"] {
+            assert!(config.contains(required), "nextest config lost {required}");
+            assert!(manifest.contains(required), "manifest lost {required}");
+        }
         assert!(manifest.contains("15-second timeout"));
         assert!(manifest.contains("20-second teardown budget"));
         assert!(manifest.contains("15.002 seconds"));
