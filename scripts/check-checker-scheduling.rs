@@ -593,6 +593,22 @@ fn is_invoked(text: &str, path: &str) -> bool {
     if text.lines().any(|line| invokes_on_line(line, &dotted)) {
         return true;
     }
+    // Repository scripts commonly resolve their own checkout and invoke a sibling
+    // through `$ROOT_DIR/<path>`. That is still a direct command: the prefix changes
+    // where the path is rooted, not whether it executes. This exact shape carries the
+    // E2E artifact verifier from a DAG-scheduled wrapper. Keep the opening quote in the
+    // needle so `invokes_on_line` can distinguish command substitution from an
+    // assignment value or a path quoted in prose.
+    for rooted in [
+        format!(r#""$ROOT_DIR/{path}"#),
+        format!(r#""${{ROOT_DIR}}/{path}"#),
+        format!("$ROOT_DIR/{path}"),
+        format!("${{ROOT_DIR}}/{path}"),
+    ] {
+        if text.lines().any(|line| invokes_on_line(line, &rooted)) {
+            return true;
+        }
+    }
     // `rustc` is a runner here too: ci/run-reverie-pin-check.sh COMPILES
     // scripts/check-reverie-pin.rs and runs the resulting binary, so the checker is
     // genuinely scheduled without ever being executed as a script.
@@ -1269,6 +1285,34 @@ mod tests {
             };
             assert!(is_invoked(real, path), "must still fire: {real}");
         }
+    }
+
+    #[test]
+    fn repository_root_qualified_command_is_an_invocation() {
+        let command = r#"bundle=$("$ROOT_DIR/ci/verify-hermit-e2e-artifact.sh" "$pointer")"#;
+        assert!(is_invoked(
+            command,
+            "ci/verify-hermit-e2e-artifact.sh"
+        ));
+    }
+
+    #[test]
+    fn repository_root_qualified_noncommands_stay_unscheduled() {
+        for noncommand in [
+            r#"VERIFY="$ROOT_DIR/ci/check-z.sh""#,
+            r#"echo "run $ROOT_DIR/ci/check-z.sh after publication""#,
+            r#"printf '%s\n' "$ROOT_DIR/ci/check-z.sh""#,
+        ] {
+            assert!(
+                !is_invoked(noncommand, "ci/check-z.sh"),
+                "a non-command reference was treated as scheduling: {noncommand}"
+            );
+        }
+        assert_eq!(
+            exit_code_for(1, 0),
+            1,
+            "a genuinely unscheduled checker must remain a refusal"
+        );
     }
 
     #[test]
