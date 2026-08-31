@@ -38,7 +38,7 @@ under hermit, so the demo binaries carry a small, clearly commented harness.
 It is applied **identically to the buggy and fixed variants**, so the only
 behavioral difference between them remains the real bug (detach/no-join vs.
 join). The full source is vendored under
-`experiments/btrfs-convert-progress-uaf-chaos_20260729/src/`.
+`demos/fixtures/demo08/`.
 
 1. **The progress timer never fires under hermit.** The historical code paces
    the subthread with a wall-clock `CLOCK_MONOTONIC` `timerfd`. Hermit
@@ -64,7 +64,7 @@ thread frees it — is the genuine, unmodified 73e211a7 bug.
 
 ## Results
 
-From `experiments/btrfs-convert-progress-uaf-chaos_20260729/` (btrfs-progs
+From `demos/fixtures/demo08/` (btrfs-progs
 v7.1, hermit primary checkout `103657d…`, `pop-tiny.img` ≈100 files):
 
 | Execution | Runs | UAF crashes | Notes |
@@ -115,7 +115,7 @@ Overrides: `DEMO08_DIR`, `DEMO08_ARTIFACTS`, `DEMO08_CRASH_SEED` (default 15),
 ## Build recipe
 
 Build btrfs-progs **v7.1** twice, applying the vendored sources from
-`experiments/btrfs-convert-progress-uaf-chaos_20260729/src/`:
+`demos/fixtures/demo08/`:
 
 - `src/buggy/common/task-utils.c` and `src/fixed/common/task-utils.c` — the two
   teardown variants (both carry the pipe harness; they differ only in

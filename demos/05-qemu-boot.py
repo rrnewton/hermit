@@ -82,7 +82,7 @@ def _hermit_version(binary: Path) -> str:
     """Return the binary's self-reported version, or a marker if it will not run."""
     try:
         result = subprocess.run(
-            [str(binary), "--version"],
+            [str(SAFEHERMIT), str(binary), "--version"],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -144,7 +144,7 @@ def main() -> int:
     # source state as well as the SHA).
     if HERMIT_PINNED and HERMIT.is_file() and os.access(str(HERMIT), os.X_OK):
         print(
-            "Pinned Hermit (skipping build-hermit): {} [{}]".format(
+            "Pinned Hermit (skipping release-core): {} [{}]".format(
                 HERMIT, _hermit_version(HERMIT)
             )
         )

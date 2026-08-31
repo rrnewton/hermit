@@ -30,14 +30,15 @@ BUILD_ROOT="${DEMO08_BUILD_ROOT:-$ROOT/ignored/demo08-build}"
 SOURCE="$BUILD_ROOT/btrfs-progs-v7.1"
 STAGING="$BUILD_ROOT/staging"
 PATCH="$ROOT/demos/fixtures/demo08-convert-main-v7.1.patch"
-VARIANT_SOURCE="$ROOT/experiments/btrfs-convert-progress-uaf-chaos_20260729/src"
+VARIANT_SOURCE="$ROOT/demos/fixtures/demo08"
 BTRFS_REPO="${DEMO08_BTRFS_REPO:-https://github.com/kdave/btrfs-progs.git}"
 BTRFS_TAG=v7.1
 BTRFS_COMMIT=4ab0e80be9e3bb1db2e6038e6d4316d35fb7ba8b
 PREP_VERSION=1
 STAMP="$ASSETS/.nightly-prep-version"
 JOBS="${DEMO08_BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)}"
-HERMIT_RELEASE="${HERMIT_RELEASE:-$ROOT/hermit/target/release/hermit}"
+HERMIT_RELEASE="${HERMIT_RELEASE:-$ROOT/target/release/hermit}"
+SAFEHERMIT="${SAFEHERMIT:-$ROOT/bin/safehermit}"
 CALIBRATION_SEEDS="${DEMO08_CALIBRATION_SEEDS:-64}"
 # Measured on a 176-core AMD EPYC 9D64 development host over seeds 0-15 of the freshly built v7.1
 # fixture: min 6s, median 11s, max 103s per seed. The former 30s default truncated the tail
@@ -103,9 +104,10 @@ calibrate_crash_seed() {
 
   if [ ! -x "$HERMIT_RELEASE" ]; then
     echo "Building release Hermit for Demo 8 seed calibration..."
-    make -C "$ROOT" --no-print-directory build-hermit
+    make -C "$ROOT" --no-print-directory release-core
   fi
   [ -x "$HERMIT_RELEASE" ] || fail "release Hermit is unavailable: $HERMIT_RELEASE"
+  [ -x "$SAFEHERMIT" ] || fail "safehermit wrapper is unavailable: $SAFEHERMIT"
 
   mkdir -p "$artifacts"
 
@@ -142,7 +144,7 @@ calibrate_crash_seed() {
     # so the ASAN grep below still sees the guest output; the wall `timeout` still governs
     # per-seed duration and the box CPU-budget (4x) only reaps a true runaway.
     "${box[@]}" -- \
-      timeout "$CALIBRATION_TIMEOUT" "$HERMIT_RELEASE" --log=error run \
+      timeout "$CALIBRATION_TIMEOUT" "$SAFEHERMIT" "$HERMIT_RELEASE" --log=error run \
       --chaos --sched-seed "$seed" --no-virtualize-cpuid \
       -- "$ASSETS/buggy/btrfs-convert" "$image" >"$output" 2>&1
     rc=$?

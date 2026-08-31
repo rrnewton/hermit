@@ -6,18 +6,16 @@ name: Linux boot (QEMU) — dedicated lane
 # it needs QEMU, a pinned kernel, a BusyBox initramfs, and — because it runs
 # under `--strict` — PMU retired-branch preemption, so it can only run on the
 # self-hosted `pmu` lane. The broader `demo-hot-path.yml` diagnostic also runs
-# this boot as part of `scripts/super-validate.sh --demos-only`.
+# this boot as part of `demos/run-all.sh --all`.
 #
 # This lane does one thing: boot Linux under Hermit and assert it reached
 # userspace deterministically. It is manually dispatched and never runs on a
-# pull request, `main`, or a schedule. It also uses Hermit's OWN self-contained demo
-# (`demos/05-qemu-busybox.sh`) rather than the parent's demo harness, so the
+# pull request, `main`, or a schedule. It also uses Hermit's self-contained demo
+# (`demos/qemu-busybox.sh`) rather than the numbered demo harness, so the
 # check lives in the repository whose commits can break it.
 #
-# NOTE FOR ANYONE RUNNING THE PARENT HARNESS INSTEAD: `dev-hermit`'s
-# `demos/05-qemu-boot.py` shells out to `make check-deps`, which runs
-# `git submodule update` on the PARENT and will detach the primary checkouts.
-# That is why this lane calls the in-repo demo directly.
+# The numbered suite and this focused smoke both build from this checkout and
+# share no parent-repository path assumptions.
 
 on:
   workflow_dispatch:
@@ -97,7 +95,7 @@ jobs:
           # boot wedge, which hangs rather than erroring, so this bound is what
           # converts a wedge into a red instead of a six-hour occupancy.
           DEMO_TIMEOUT_SECONDS: "600"
-        run: ./demos/05-qemu-busybox.sh
+        run: ./demos/qemu-busybox.sh
 
       - name: Upload boot logs
         if: always()
