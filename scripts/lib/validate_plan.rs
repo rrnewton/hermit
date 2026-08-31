@@ -599,7 +599,7 @@ pub fn lane_nodes(
             .collect();
         // Every lane node waits on the manifest gate, reproducing
         // run_ci_manifest_lane's ordering (validate.sh:4344).
-        if step.deps.is_empty() {
+        if step.deps.is_empty() && !(s.group == "build" && s.job == "rust_scripts") {
             step.deps.push(gate_dep.to_string());
         }
         // Supply a memory cap for any lane node that shipped without one, so the

@@ -6,10 +6,24 @@
   "default_step_timeout": 600,
   "steps": [
     {
+      "group": "build", "job": "rust_scripts",
+      "desc": "Build every tracked rust-script before graph consumers run",
+      "description": "DISCOVERED PRODUCER 2026-08-31: every tracked rust-script entrypoint is generated as a Cargo package, checked with the existing clippy policy, built as a release executable, and, when it carries tests, built as a test harness. The outputs are copied into target/ci/rust-scripts after checkout and pin verification, and all compiling consumers wait for this node. Graph processes resolve rust-script through ci/rust-script-bin, which executes only the published binaries and never invokes Cargo. Two concurrent rust-script --force probes sharing one cache measured a real Cargo build-directory lock wait; separate caches removed the wait but duplicated compilation. Keeping one writer and read-only consumers makes compilation placement deterministic without creating per-node target directories.",
+      "cmd": "./ci/prepare-rust-scripts.sh",
+      "deps": ["check.reverie_pin"],
+      "timeout": 900,
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS",
+      "hint": {"est_duration_s": 190, "rss_baseline_bytes": 1073741824,
+               "hard_mem_max_bytes": 2147483648, "classification": "cpu-bound",
+               "preferred_inner_jobs": 8}
+    },
+    {
       "group": "setup", "job": "manifest_plan",
       "desc": "Build the manifest-plan binaries the metadata validation runs",
       "description": "MOVED OUT OF e2e.metadata 2026-08-08. e2e.metadata is a DAG ROOT whose first action is `cargo run -p hermit-manifest-plan` -- twice: load_tests uses the default bin, audit_test_footprints uses generate-test-footprints. It therefore COMPILES, upstream of every build node. That made the old metadata budget BIMODAL: 16.5s warm, 57s cold, 2 slow in 9 sampled CI runs. The compile remains HERE under a build-shaped budget so metadata inherits a warm artifact. The later 180s metadata budget is independent: by 2026-08-09 the non-build audit workload itself consumed 71.44-73.84s wall and 58.36-60.38s CPU across three warm samples, exceeding the former 60s ceiling even after this compile split.",
       "cmd": "cargo build -p hermit-manifest-plan --bins",
+      "deps": ["build.rust_scripts"],
       "timeout": 180,
       "hint": {"est_duration_s": 60, "rss_baseline_bytes": 536870912,
                "hard_mem_max_bytes": 2147483648, "classification": "cpu-bound"}
@@ -26,6 +40,7 @@
       "group": "check", "job": "skill_discovery",
       "desc": "Verify Claude and stock Codex discover the same safe product skills",
       "cmd": "mkdir -p target/ci && RUSTUP_TOOLCHAIN=stable rustc --edition=2021 scripts/check-skill-discovery.rs -o target/ci/check-skill-discovery && target/ci/check-skill-discovery",
+      "deps": ["build.rust_scripts"],
       "timeout": 60,
       "hint": {"est_duration_s": 3, "rss_baseline_bytes": 67108864,
                "hard_mem_max_bytes": 536870912, "classification": "light"}
@@ -35,6 +50,7 @@
       "desc": "Refuse a bare exit-status integer in a test, for the four values that changed meaning",
       "description": "hermit#2558 gave hermit its own failure exit code 125, so tests asserting 1 for a failure hermit CHOSE are now wrong -- and which ones cannot be found by running the suite, because 85 of 133 hermit-cli test targets are run by no node. This node is STATIC for exactly that reason: it reads source, so it sees the unrun targets that no execution ever will. It does not judge correctness, which is undecidable here -- stress_suite.rs:342 and flock_exclusion.rs:245 are the same expression and mean opposite things. It refuses a BARE integer, i.e. a site that never says which channel produced the number, for the four contested values 1/125/126/127. Ratchet at 17; it may only go down.",
       "cmd": "./scripts/check-exit-status-class.rs --gate",
+      "deps": ["build.rust_scripts"],
       "timeout": 60,
       "hint": {"est_duration_s": 3, "rss_baseline_bytes": 67108864,
                "hard_mem_max_bytes": 536870912, "classification": "light"}
@@ -53,6 +69,7 @@
       "group": "check", "job": "backend_abstraction",
       "desc": "Detcore backend-abstraction check",
       "cmd": "./scripts/check-detcore-backend-abstraction.sh",
+      "deps": ["build.rust_scripts"],
       "timeout": 120,
       "hint": {"est_duration_s": 20, "rss_baseline_bytes": 268435456,
                "hard_mem_max_bytes": 1073741824, "classification": "light"}
@@ -62,6 +79,7 @@
       "desc": "Backend-parity identity fixtures are non-vacuous (native mutation harness)",
       "description": "Proves every backend-parity identity fixture would FAIL if a backend got its value wrong: for each declared field, planting a mutation must diverge the fixture's (exit,stdout); a field that changes nothing is flagged VACUOUS. Native mode (cc only, no hermit build) so it guards the whole growing family cheaply on every PR. Real cross-backend parity (golden ptrace vs dbt/kvm) is covered by the dbt_parity node against the same fixtures.",
       "cmd": "python3 tests/backend-parity/parity_mutation.py",
+      "deps": ["build.rust_scripts"],
       "timeout": 120,
       "hint": {"est_duration_s": 5, "rss_baseline_bytes": 134217728,
                "hard_mem_max_bytes": 536870912, "classification": "light"}
@@ -80,6 +98,7 @@
       "group": "check", "job": "portability_paths",
       "desc": "Reject developer-specific paths in build/run files",
       "cmd": "./scripts/check-portable-paths.sh",
+      "deps": ["build.rust_scripts"],
       "timeout": 60,
       "hint": {"est_duration_s": 2, "rss_baseline_bytes": 67108864,
                "hard_mem_max_bytes": 536870912, "classification": "light"}
@@ -89,6 +108,7 @@
       "desc": "Every portable DAG node is assigned to exactly one fan-out job",
       "description": "ci/check-shard-coverage.sh compares ci/dag/portable.json to ci/portable-shards.json and refuses when a node is assigned to no job, to more than one, or when the map names a node the DAG does not have. The script is not new and was not broken: it was added 2026-08-02 with the fan-out workflow and fails closed correctly. What was missing is a reader. Its only caller was .github/workflows/ci-portable.yml, which builds the hosted matrix from the shard map, and hosted CI has not run since 2026-08-11 -- so the guard reported to nobody while TWO nodes drifted out of the map behind it: check.dbt_runtime_abi, corrected per-node on 2026-08-21 by 3b6cd503cc, and check.exit_status_class, corrected in this change. A guard whose only scheduler is dormant is indistinguishable from no guard, which is why this node runs it in the lane that actually executes: scripts/validate.rs builds its plan from portable.json directly, so a node listed here runs on every local validate. THE UNASSIGNED NODE IS NOT MERELY UNRUN EVERYWHERE. Local validate reads the DAG, so check.exit_status_class HAS been running and failing there (measured: 6 of 6 recent local validates ran it, 0 passed) while never running on the hosted lane. This node is itself listed in preflight_nodes, because a guard against unassigned nodes that is itself unassigned is the same defect wearing the fix's clothes.",
       "cmd": "./ci/check-shard-coverage.sh",
+      "deps": ["build.rust_scripts"],
       "timeout": 600,
       "hint": {"est_duration_s": 2, "rss_baseline_bytes": 67108864,
                "hard_mem_max_bytes": 1073741824, "classification": "light"}
@@ -98,6 +118,7 @@
       "desc": "Keep hermit's DAG-runner naming in agreement with the pinned agent-utils",
       "description": "agent-utils renamed its DAG runner to dagrun: the crate, the package, the executables under common/bin, py/bin and rs/bin, the per-checkout profile store directory, and every runner-read environment variable (which took a DAGRUN_ prefix). scripts/check-dagrun-naming.sh is the authoritative record of the retired spellings and is the one file exempt from this scan, so the exact old names live there rather than here. The rename arrives through a SUBMODULE PIN BUMP, so no hermit build target fails when a hermit-side reference goes stale -- which is exactly how main broke at 4b9a56bfc2: cargo build, test and clippy all stayed green while ci/run-dag.sh and ci/run-node.sh could not locate the runner at all and NO DAG NODE COULD EXECUTE. This node holds the retired spellings at zero in forward-looking files, and separately asserts that the Python and Rust JOBS_ENV_ENV constants match each other and Hermit's export. That second check is not decoration: it is how a node's declared build width reaches Cargo, and if any of the three names diverge, one or both engines silently fall back to the ambient 8 -- the width fix would revert itself in silence. Demonstrated failing on planted occurrences of both classes, and exiting 2 (not 1) when the submodule is unpopulated so a checkout problem is never misread as a naming problem.",
       "cmd": "./scripts/check-dagrun-naming.sh",
+      "deps": ["build.rust_scripts"],
       "timeout": 60,
       "hint": {"est_duration_s": 2, "rss_baseline_bytes": 67108864,
                "hard_mem_max_bytes": 536870912, "classification": "light"}
@@ -108,6 +129,7 @@
       "desc": "Guard ci/run-node.sh's argument contract (refusals + single-node edit)",
       "description": "Until 2026-08-25 ci/run-node.sh read two positional arguments and IGNORED the rest, so `ci/run-node.sh portable test.detcore_unit -E 'test(=cpuid_leaf_count)'` ran the whole 534-test node and printed PASS with the filter silently dropped -- a full-node green read as a one-test green. This node runs ci/run-node-args-test.sh, which asserts the five refusals and that `-- <args>` edits exactly one node's command and nothing else in the DAG. Mutation-checked 2026-08-25: restoring the silent-swallow branch makes it exit 1 on 'expected exit 2, got 0'. It executes no DAG node and needs no build artifacts (RUN_NODE_PRINT_ONLY stops after writing the scratch DAG), which is why it sits in preflight.",
       "cmd": "./ci/run-node-args-test.sh",
+      "deps": ["build.rust_scripts"],
       "timeout": 120,
       "hint": {
         "est_duration_s": 1,
@@ -121,6 +143,7 @@
       "desc": "Run the check-outcome consumer regression and the merge-gate policy lint",
       "description": "These two scripts guard the merge-gate status classifier, and until 2026-08-23 NO DAG NODE RAN EITHER OF THEM. PR #2363's test plan cited check.script_sigpipe as their coverage; that node is a SIGPIPE and rust-script compile guard and both of these are plain bash, so it never executed them and the coverage claim was false. A guard nothing runs is indistinguishable from a guard that passes, which is the defect class the classifier change itself was fixing. Measured 2026-08-23: with the classifier mutated to report a failing check as PASSED, this node exits 1 on `mismatch: completed/failure expected=FAILED python=PASSED shell=PASSED`, while the DAG without this node stays green because nothing runs either script.",
       "cmd": "./scripts/test-check-status-outcome.sh && ./scripts/check-merge-gate-policy.sh",
+      "deps": ["build.rust_scripts"],
       "timeout": 120,
       "hint": {"est_duration_s": 5, "rss_baseline_bytes": 67108864,
                "hard_mem_max_bytes": 536870912, "classification": "light"}
@@ -130,15 +153,17 @@
       "desc": "Run `make lint-checks`: every checker in the lint target except the two cargo passes",
       "description": "THIS NODE IS DELIBERATELY A TARGET, NOT A LIST OF SCRIPTS, and that is the entire point. check_outcome_consumers above records the same gap being closed by hand for two scripts on 2026-08-23; wiring those two individually is precisely what let the rest persist. Measured 2026-08-25 at main a5fef7ff7623: `make lint` invoked ten checkers and SIX had no DAG node at all (ci/verify-submodules.sh both arms, scripts/check-nested-lockfiles.rs, test-configure-merge-gate-ruleset.sh, test_pr_status.py, test-required-check-outcomes.sh, test_validate_stop_paths.py), while four more checkers were reachable from nothing whatsoever, not even the lint target. Nothing anywhere runs `make lint`, and all ten GitHub workflows are workflow_dispatch-only except linux-boot.yml, so appearing in ci-portable.yml is NOT evidence a checker runs. Pointing one node at the target makes a checker added to lint-checks gated by construction instead of by someone remembering to hand-write a node here. TRIAGED BEFORE WIRING: all ten checkers plus shellcheck (188 tracked scripts at --severity=error), `git diff --check`, and the 84 previously-unrun rust-script unit tests were run at that commit and every one passed, so this node starts green and adds no standing red. The two cargo passes stay OUT of the target's CI node: lint.clippy is a measured 300s and this would be a second, duplicate run of it outside ci/run-with-reverie-dbt-budget.sh, which that node wraps it in. TIMEOUT: the target is dominated by test_validate_stop_paths.py, which compiles scripts/validate.rs as a rust-script and then spawns it once per signal case. Measured on 2026-08-25 with a full validate holding the box: that script alone ran 8m54s at load 42.8 and 31s at load 35.7, and a third run at load 42.8 FAILED on its own internal 120s readiness deadline with the validate log at 0 bytes -- which is why that deadline is raised to 600s in the same change. A 31s-to-8m54s spread on one commit is contention, not a defect. 2400s is roughly 4x the slowest observed loaded run, so a real hang stays loud while ordinary contention on a shared box cannot trip it.",
       "cmd": "./ci/lint-checks-node.sh",
+      "deps": ["build.rust_scripts"],
       "timeout": 2400,
       "hint": {"est_duration_s": 600, "rss_baseline_bytes": 536870912,
                "hard_mem_max_bytes": 2147483648, "classification": "light"}
     },
     {
       "group": "check", "job": "script_sigpipe",
-      "desc": "Standalone scripts exit cleanly on downstream SIGPIPE, and every rust-script compiles",
-      "description": "MEASURED 2026-08-20 when this node gained the compile sweep. rust-scripts are not Cargo workspace members, so no cargo gate compiles them and this node is the only one that does. Sweeping all 14 tracked entrypoints via `rust-script --package` + `cargo check` measured 25.6s warm and 29.8s with fresh package and target directories, against 0.67s when every generated package is already built. Peak RSS of a cold `cargo check` of the heaviest script (ci/compat-envelope/scorecard.rs) was 278MB, so the former 512MB hard cap left only 1.8x margin and is raised to 1GiB. The former 60s timeout is raised to 300s: 10x the cold measurement, so a real hang still terminates well inside the job while normal variance cannot trip it.",
+      "desc": "Standalone scripts exit cleanly on downstream SIGPIPE, and every rust-script has a prepared binary",
+      "description": "Compilation moved to build.rust_scripts on 2026-08-31. This node retains the independent SIGPIPE behavior check and audits that every tracked rust-script entrypoint keeps the freshness-preserving shebang, initializes the shared prelude, and has one matching executable in the producer manifest. Under the graph it uses --check and cannot compile; a standalone invocation builds first so the checker remains independently runnable.",
       "cmd": "./scripts/check-script-sigpipe.sh",
+      "deps": ["build.rust_scripts"],
       "timeout": 300,
       "hint": {"est_duration_s": 35, "rss_baseline_bytes": 314572800,
                "hard_mem_max_bytes": 1073741824, "classification": "light"}
@@ -147,6 +172,7 @@
       "group": "lint", "job": "rustfmt",
       "desc": "Rustfmt (cargo fmt --all -- --check)",
       "cmd": "cargo fmt --all -- --check",
+      "deps": ["build.rust_scripts"],
       "timeout": 120,
       "hint": {"est_duration_s": 20, "rss_baseline_bytes": 268435456,
                "hard_mem_max_bytes": 1073741824, "classification": "light"}
@@ -155,6 +181,7 @@
       "group": "setup", "job": "nextest",
       "desc": "cargo-nextest available",
       "cmd": "cargo nextest show-config version >/dev/null 2>&1 || if command -v with-proxy >/dev/null 2>&1; then with-proxy cargo install cargo-nextest --locked --version 0.9.100; else cargo install cargo-nextest --locked --version 0.9.100; fi",
+      "deps": ["build.rust_scripts"],
       "timeout": 600,
       "hint": {"est_duration_s": 30, "rss_baseline_bytes": 536870912,
                "hard_mem_max_bytes": 2147483648, "classification": "light"}
