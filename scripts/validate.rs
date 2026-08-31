@@ -6239,7 +6239,7 @@ fn rust_script_producer_step() -> Step {
         "Build every tracked rust-script before graph consumers run",
         "./ci/prepare-rust-scripts.sh".into(),
         Vec::new(),
-        900,
+        180,
         900,
         2 * 1024 * 1024 * 1024,
     );
