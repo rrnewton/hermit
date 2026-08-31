@@ -251,27 +251,27 @@ jobs:
       # recorded set before asking the gate to inspect it.
       - name: Initialize submodules
         run: git submodule update --init --recursive
-      # check.script_sigpipe COMPILES all fifteen tracked rust-scripts, and the
+      # build.rust_scripts compiles all tracked rust-scripts, and the
       # workflow-wide RUSTFLAGS link them with `-llzma` (Hermit's own build needs
       # it). Preflight is otherwise a lint job with no apt step, so the library
-      # was absent and nine of fifteen scripts failed to link -- measured on run
+      # was absent and nine scripts failed to link -- measured on run
       # 32514647702, AFTER the interpreter itself was installed. The interpreter
       # and the library it links with are two separate prerequisites and this job
       # was missing both.
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y liblzma-dev
-      # check.script_sigpipe compiles every tracked rust-script with `cargo
+          sudo apt-get install -y binutils liblzma-dev
+      # build.rust_scripts compiles every tracked rust-script with `cargo
       # clippy`, so clippy is a prerequisite of THIS job and not only of the jobs
       # that lint Hermit itself. Installing rustfmt alone made cargo answer
-      # "'cargo-clippy' is not installed" for all fifteen scripts, which the gate
-      # then reported as fifteen compile failures -- run 32814930018. Every other
+      # "'cargo-clippy' is not installed" for every script, which the gate then
+      # reported as compile failures -- run 32814930018. Every other
       # job in this workflow already installs both.
       - name: Rust components
         run: rustup component add clippy rustfmt
-      # check.script_sigpipe compiles every tracked rust-script entrypoint, and
-      # scripts/check-script-sigpipe.sh refuses without the interpreter. No
+      # build.rust_scripts compiles every tracked rust-script entrypoint, and
+      # ci/prepare-rust-scripts.sh refuses without the interpreter. No
       # runner image ships it (see the strict-compat shard's note below), so the
       # node died at `command -v rust-script` having measured nothing. Pinned to
       # the same RUST_SCRIPT_VERSION as that shard so every job in this workflow
@@ -290,7 +290,7 @@ jobs:
       - name: Verify rust-script resolves (preflight)
         run: |
           if ! command -v rust-script >/dev/null; then
-            echo "::error::rust-script is not on PATH; check.script_sigpipe would exit 2 having compiled nothing."
+            echo "::error::rust-script is not on PATH; build.rust_scripts would exit 2 having compiled nothing."
             exit 1
           fi
           echo "rust-script resolved: $(command -v rust-script) $(rust-script --version)"
@@ -298,15 +298,17 @@ jobs:
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
         run: ./ci/run-node.sh portable "$(jq -r '.preflight_nodes|join(",")' ci/portable-shards.json)"
-      - name: Pack manifest plan tools
+      - name: Pack manifest plan tools and rust-script binaries
         run: |
           set -euo pipefail
           test -x target/debug/test-harness
           test -x target/debug/hermit-manifest-plan
+          test -s target/ci/rust-scripts/manifest.tsv
           tar -czf "$MANIFEST_PLAN_TARBALL" \
             target/debug/test-harness \
-            target/debug/hermit-manifest-plan
-      - name: Upload manifest plan tools
+            target/debug/hermit-manifest-plan \
+            target/ci/rust-scripts
+      - name: Upload manifest plan tools and rust-script binaries
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.MANIFEST_PLAN_ARTIFACT }}
@@ -351,6 +353,17 @@ jobs:
         env:
           RUSTFLAGS: ""
         run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
+      - name: Download rust-script binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.MANIFEST_PLAN_ARTIFACT }}
+          path: .
+      - name: Unpack rust-script binaries
+        run: |
+          set -euo pipefail
+          tar -xzf "$MANIFEST_PLAN_TARBALL"
+          rm -f "$MANIFEST_PLAN_TARBALL"
+          ./ci/prepare-rust-scripts.sh --check
       - name: Run preflight check nodes
         env:
           # Let gh authenticate with this repository's read-only token. The two
@@ -401,7 +414,7 @@ jobs:
       - name: Rust components
         run: rustup component add clippy rustfmt
       # gate.manifest runs `test-harness validate`, which shells out to
-      # tests/manifest-cli.rs -- one of fifteen tracked entrypoints carrying
+      # tests/manifest-cli.rs -- one of the tracked entrypoints carrying
       # `#!/usr/bin/env -S rust-script --force`. Without the interpreter that
       # exec fails 127 and run_audit reported it as "self-test failed", i.e. an
       # absent interpreter wearing a product-failure label. Because build-debug
@@ -421,18 +434,19 @@ jobs:
             exit 1
           fi
           echo "rust-script resolved: $(command -v rust-script) $(rust-script --version)"
-      - name: Download manifest plan tools
+      - name: Download manifest plan tools and rust-script binaries
         uses: actions/download-artifact@v4
         with:
           name: ${{ env.MANIFEST_PLAN_ARTIFACT }}
           path: .
-      - name: Unpack manifest plan tools
+      - name: Unpack manifest plan tools and rust-script binaries
         run: |
           set -euo pipefail
           tar -xzf "$MANIFEST_PLAN_TARBALL"
           rm -f "$MANIFEST_PLAN_TARBALL"
           test -x target/debug/test-harness
           test -x target/debug/hermit-manifest-plan
+          ./ci/prepare-rust-scripts.sh --check
       # Group the debug-build step tags; validate supplies their commands,
       # dependencies, and resource policy from the constructed plan.
       - name: Run debug build nodes
@@ -518,6 +532,7 @@ jobs:
             target/debug/deps/libdetcore_dbt.so \
             target/install_pkg/rsrcs/libdetcore_dbt.so \
             target/ci/bin/cargo-nextest \
+            target/ci/rust-scripts \
             ignored/e2e/build
           ls -lh "$DEBUG_TARBALL"
       - name: Upload debug prebuilt tree
@@ -558,6 +573,17 @@ jobs:
         env:
           RUSTFLAGS: ""
         run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
+      - name: Download rust-script binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.MANIFEST_PLAN_ARTIFACT }}
+          path: .
+      - name: Unpack rust-script binaries
+        run: |
+          set -euo pipefail
+          tar -xzf "$MANIFEST_PLAN_TARBALL"
+          rm -f "$MANIFEST_PLAN_TARBALL"
+          ./ci/prepare-rust-scripts.sh --check
       - name: Run release build node
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf

@@ -3,9 +3,9 @@
 # Run the unit tests carried by rust-script entrypoints.
 #
 # rust-scripts are not Cargo workspace members, so `cargo test` never sees them.
-# `scripts/check-script-sigpipe.sh` already COMPILES all tracked entrypoints via
-# `rust-script --package` + `cargo check`, which is why a broken script is caught
-# -- but compiling a `#[cfg(test)] mod tests` block does not run it. Measured
+# `build.rust_scripts` compiles all tracked entrypoints and their test harnesses
+# before this graph consumer runs. This script executes those harnesses; outside
+# the graph, rust-script retains its ordinary compile-and-run behavior. Measured
 # 2026-08-25 at hermit main a5fef7ff7623: seven entrypoints carried 84 unit tests
 # between them and no target anywhere passed `--test`, so all 84 were documentation.
 # They all passed once run, so this gate starts green.

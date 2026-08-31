@@ -218,8 +218,9 @@ partial, and nothing in the output said so.
 2. **Does it cover everything its name implies?** Features (`--all-features`),
    targets (`--all-targets`), workspace members, lanes. Note that
    `cargo --workspace` does **not** reach nested workspaces or crates outside
-   `[workspace] members`, and no cargo gate reaches `scripts/*.rs` rust-scripts —
-   `scripts/check-script-sigpipe.sh` exists solely because of that last gap.
+   `[workspace] members`, and no workspace cargo gate reaches `scripts/*.rs`
+   rust-scripts — `build.rust_scripts` discovers and compiles that population,
+   while `scripts/check-script-sigpipe.sh` audits its entrypoint contract.
 3. **Can it fail?** A gate that only ever emits warnings, or whose exit status
    comes from the last element of a pipeline, cannot refuse anything. Prefer
    `-D warnings`; if you pipe, capture the status before the pipe.
