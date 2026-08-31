@@ -8847,24 +8847,6 @@ red/`measured-and-passed` count is **0**.",
                 })
         })
     };
-    let has_current_no_verdict = |cells: &TrackedCells| {
-        cells.cells.iter().any(|cell| {
-            cell.id == verify_id
-                && cell
-                    .last_tested
-                    .as_ref()
-                    .is_some_and(|last| last.hermit_sha == fixture_head)
-                && cell.observations.iter().any(|observation| {
-                    observation.hermit_shas.contains(&fixture_head)
-                        && observation.results.is_empty()
-                        && observation.invocations.iter().any(|invocation| {
-                            invocation.run_id == "result-command-verify"
-                                && invocation.attempt == Some(1)
-                                && invocation.result.is_none()
-                        })
-                })
-        })
-    };
     let restore_generated = || -> Result<(), String> {
         fs::write(
             result_command_root.join(SCORECARD),
@@ -8914,7 +8896,7 @@ red/`measured-and-passed` count is **0**.",
         serde_json::to_vec(&PressureSummary {
             schema: PRESSURE_SUMMARY_SCHEMA,
             hermit_sha: fixture_head.clone(),
-            detcore_tree: fixture_detcore_tree,
+            detcore_tree: fixture_detcore_tree.clone(),
             source_tree_dirty: false,
             rows: vec![current_row],
         })
@@ -8946,19 +8928,120 @@ red/`measured-and-passed` count is **0**.",
         return Err("retained import silently skipped a malformed report identity".into());
     }
 
-    let mut verify_row = replay_row;
+    // Seed a canonical PASS for this exact cell and Detcore tree. A later
+    // no-verdict invocation must be retained without erasing that prior result
+    // or manufacturing a result/comparison for the new invocation. This makes
+    // the bracket independent of whatever valid observations cells.json has
+    // accumulated since the fixture was written.
+    let mut prior_verify_row = replay_row.clone();
+    prior_verify_row.run_id = "result-command-verify-prior-pass".into();
+    prior_verify_row.mode = verify_id.mode.clone();
+    let mut prior_verify_report: JsonValue = serde_json::from_str(
+        prior_verify_row.attempts[0]["verification_report"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    prior_verify_report["comparison"]["virtualize_time"] = serde_json::json!(true);
+    let prior_verify_report = serde_json::to_string(&prior_verify_report).unwrap();
+    prior_verify_row.attempts[0]["verification_report_sha256"] = JsonValue::String(format!(
+        "{:x}",
+        Sha256::digest(prior_verify_report.as_bytes())
+    ));
+    prior_verify_row.attempts[0]["verification_report"] =
+        JsonValue::String(prior_verify_report);
+    write_result_row(&prior_verify_row)?;
+    let seeded = run_result_command("observe-results", None)?;
+    if !seeded.status.success() {
+        return Err(format!(
+            "observe-results did not seed canonical verify evidence: {:?}",
+            String::from_utf8_lossy(&seeded.stderr)
+        ));
+    }
+    let seeded_cells: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+    let seeded_cell = seeded_cells
+        .cells
+        .iter()
+        .find(|cell| cell.id == verify_id)
+        .ok_or("observe-results lost the verify fixture cell")?;
+    let seeded_observation = seeded_cell
+        .observations
+        .iter()
+        .find(|observation| {
+            observation.detcore_tree.as_deref() == Some(&fixture_detcore_tree)
+                && observation.provenance == ObservationProvenance::Validate
+                && observation.event_ids.is_empty()
+        })
+        .ok_or("observe-results did not retain the seeded same-tree verify PASS")?;
+    if !seeded_observation.results.contains(&ObservedResult::Pass)
+        || !seeded_observation
+            .canonical_comparisons
+            .iter()
+            .any(|comparison| {
+                comparison.run_id == prior_verify_row.run_id
+                    && comparison.result == ObservedResult::Pass
+            })
+    {
+        return Err("observe-results did not retain the seeded same-tree verify PASS".into());
+    }
+    let prior_results = seeded_observation.results.clone();
+    let prior_comparisons = seeded_observation.canonical_comparisons.clone();
+
+    let mut verify_row = prior_verify_row;
     verify_row.run_id = "result-command-verify".into();
-    verify_row.mode = verify_id.mode.clone();
+    let mut verify_report: JsonValue = serde_json::from_str(
+        verify_row.attempts[0]["verification_report"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    verify_report["comparison"]["virtualize_time"] = serde_json::json!(false);
+    let verify_report = serde_json::to_string(&verify_report).unwrap();
+    verify_row.attempts[0]["verification_report_sha256"] =
+        JsonValue::String(format!("{:x}", Sha256::digest(verify_report.as_bytes())));
+    verify_row.attempts[0]["verification_report"] = JsonValue::String(verify_report);
+    let verify_evidence_identity = verify_row.evidence_identity()?;
     write_result_row(&verify_row)?;
     let unavailable = run_result_command("observe-results", None)?;
     let unavailable_stdout = String::from_utf8_lossy(&unavailable.stdout);
+    let observed_cells: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+    let observed_cell = observed_cells
+        .cells
+        .iter()
+        .find(|cell| cell.id == verify_id);
+    let final_observation = observed_cell.and_then(|cell| {
+        cell.observations.iter().find(|observation| {
+            observation.detcore_tree.as_deref() == Some(&fixture_detcore_tree)
+                && observation.provenance == ObservationProvenance::Validate
+                && observation.event_ids.is_empty()
+        })
+    });
+    let retained_no_verdict = observed_cell.is_some_and(|cell| {
+        cell.last_tested
+            .as_ref()
+            .is_some_and(|last| last.hermit_sha == fixture_head)
+    }) && final_observation.is_some_and(|observation| {
+        observation.results == prior_results
+            && observation.canonical_comparisons == prior_comparisons
+            && !observation
+                .canonical_comparisons
+                .iter()
+                .any(|comparison| comparison.run_id == verify_row.run_id)
+            && observation.invocations.iter().any(|invocation| {
+                invocation.run_id == verify_row.run_id
+                    && invocation.attempt == Some(1)
+                    && invocation.evidence_sha256.as_deref()
+                        == Some(verify_evidence_identity.as_str())
+                    && invocation.result.is_none()
+            })
+    });
     if !unavailable.status.success()
         || !unavailable_stdout.contains("DETERMINED NOTHING")
         || unavailable_stdout.contains("expected result for an all-green run")
-        || !has_current_no_verdict(&read_json(&result_command_root.join(CELLS))?)
+        || !retained_no_verdict
     {
         return Err(
-            "observe-results did not name and retain verify evidence as measured-no-verdict".into(),
+            "observe-results did not retain exact verify no-verdict evidence without changing the prior same-tree result".into(),
         );
     }
     restore_generated()?;
