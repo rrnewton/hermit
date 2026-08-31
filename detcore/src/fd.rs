@@ -408,6 +408,13 @@ impl DetFd {
             .is_some_and(ProcfsFile::needs_mapping_identities)
     }
 
+    pub(crate) fn procfs_needs_mountinfo_identities(&self) -> bool {
+        self.description()
+            .procfs
+            .as_ref()
+            .is_some_and(ProcfsFile::needs_mountinfo_identities)
+    }
+
     pub(crate) fn procfs_needs_random_uuid(&self) -> bool {
         self.description()
             .procfs

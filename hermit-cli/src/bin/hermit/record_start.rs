@@ -41,7 +41,9 @@ use reverie::process::MountFlags;
 use super::container::Classified;
 use super::container::IdentityGuard;
 use super::container::RunGuarded;
-use super::container::deterministic_container;
+use super::container::default_container;
+use super::container::identity_hardening_mounts;
+use super::container::mount_target_is_shadowed;
 use super::gdb_client::CLIENT_EXITED_BEFORE_CONNECTING;
 use super::gdb_client::GdbClientWatch;
 use super::global_opts::GlobalOpts;
@@ -396,7 +398,15 @@ impl StartOpts {
     }
 
     fn configured_container(&self) -> Result<(Container, IdentityGuard), Error> {
-        let (mut container, identity_guard) = deterministic_container()?;
+        let mut container = default_container(true);
+        let (mut identity_mounts, mut identity_guard) = identity_hardening_mounts()?;
+        for mount in &self.mount {
+            let user_target = mount.get_target();
+            identity_mounts
+                .retain(|existing| !mount_target_is_shadowed(existing.get_target(), user_target));
+            identity_guard.discard_roots_shadowed_by(user_target);
+        }
+        container.mounts(identity_mounts);
         container.mounts(self.mount.clone());
         if let Some(workdir) = &self.workdir {
             container.current_dir(workdir);
@@ -437,7 +447,7 @@ impl StartOpts {
             let hermit = HermitData::from(self.data_dir.as_ref());
             let record_timeout = self.record_timeout();
 
-            let (mut container, _identity_guard) = self.recording_container(global)?;
+            let (mut container, identity_guard) = self.recording_container(global)?;
 
             let recording = match record_timeout {
                 Some(timeout) => {
@@ -449,8 +459,11 @@ impl StartOpts {
                             crate::container::arm_container_init_guards()?;
                             let _guard = global.init_tracing();
                             let command = self.guest_command().map_err(SerializableError::from)?;
+                            let mountinfo = identity_guard
+                                .mountinfo_root_rewrites()
+                                .map_err(SerializableError::from)?;
                             with_recording_deadline(timeout, || {
-                                hermit::record_to(command, &data_path)
+                                hermit::record_to_with_mountinfo(command, &data_path, mountinfo)
                             })
                             .map_err(SerializableError::from)
                         })
@@ -463,7 +476,12 @@ impl StartOpts {
                         crate::container::arm_container_init_guards()?;
                         let _guard = global.init_tracing();
                         let command = self.guest_command().map_err(SerializableError::from)?;
-                        hermit.record(command).map_err(SerializableError::from)
+                        let mountinfo = identity_guard
+                            .mountinfo_root_rewrites()
+                            .map_err(SerializableError::from)?;
+                        hermit
+                            .record_with_mountinfo(command, mountinfo)
+                            .map_err(SerializableError::from)
                     })
                     .classified()?,
             };
@@ -496,7 +514,7 @@ impl StartOpts {
         let ((global1, log1), (global2, log2)) =
             setup_double_run(global, "record", "replay", strictness);
 
-        let (mut recording_container, _record_identity_guard) = self.recording_container(global)?;
+        let (mut recording_container, record_identity_guard) = self.recording_container(global)?;
 
         eprintln!(":: {}", "Recording...".yellow().bold());
 
@@ -511,12 +529,15 @@ impl StartOpts {
                 let _guard = global1.init_tracing();
 
                 let command = self.guest_command().map_err(SerializableError::from)?;
+                let mountinfo = record_identity_guard
+                    .mountinfo_root_rewrites()
+                    .map_err(SerializableError::from)?;
 
                 match record_timeout {
                     Some(timeout) => with_recording_deadline(timeout, || {
-                        hermit::record_with_output(command, data_dir)
+                        hermit::record_with_output_with_mountinfo(command, data_dir, mountinfo)
                     }),
-                    None => hermit::record_with_output(command, data_dir),
+                    None => hermit::record_with_output_with_mountinfo(command, data_dir, mountinfo),
                 }
                 .map_err(SerializableError::from)
             })
@@ -585,7 +606,7 @@ impl StartOpts {
     }
     /// This is called when `--verify-with-gdbex` is passed to the command line.
     fn record_verify_debug(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
-        let (mut container, _identity_guard) = self.recording_container(global)?;
+        let (mut container, identity_guard) = self.recording_container(global)?;
 
         eprintln!(":: {}", "Recording...".yellow().bold());
 
@@ -600,12 +621,15 @@ impl StartOpts {
                 let _guard = global.init_tracing();
 
                 let command = self.guest_command().map_err(SerializableError::from)?;
+                let mountinfo = identity_guard
+                    .mountinfo_root_rewrites()
+                    .map_err(SerializableError::from)?;
 
                 match record_timeout {
-                    Some(timeout) => {
-                        with_recording_deadline(timeout, || hermit::record_to(command, data_dir))
-                    }
-                    None => hermit::record_to(command, data_dir),
+                    Some(timeout) => with_recording_deadline(timeout, || {
+                        hermit::record_to_with_mountinfo(command, data_dir, mountinfo)
+                    }),
+                    None => hermit::record_to_with_mountinfo(command, data_dir, mountinfo),
                 }
                 .map_err(SerializableError::from)
             })
