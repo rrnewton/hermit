@@ -4140,35 +4140,23 @@ impl RunOpts {
 
     /// Returns the mounts to be used with the container.
     fn mounts(&self, tmpfs: &Path) -> Result<PreparedMounts, Error> {
-        let (mut mounts, identity_sources) = identity_hardening_mounts()?;
+        let (mut identity_mounts, identity_sources) = identity_hardening_mounts()?;
         let mut identity_sources = identity_sources;
         let mut explicit_tmp_mount = false;
+        let mut user_mounts = Vec::with_capacity(self.mount.len() + self.bind.len());
 
         for mount in &self.mount {
             let user_target = mount.get_target();
-            mounts.retain(|existing| !mount_target_is_shadowed(existing.get_target(), user_target));
+            identity_mounts
+                .retain(|existing| !mount_target_is_shadowed(existing.get_target(), user_target));
             identity_sources.discard_roots_shadowed_by(user_target);
             if let Ok(path) = mount.get_target().strip_prefix(TMP_DIR) {
                 explicit_tmp_mount |= path.as_os_str().is_empty();
                 // If the target is in /tmp, change it so it goes to our
                 // temporary /tmp instead.
-                mounts.push(mount.clone().target(tmpfs.join(path)).touch_target());
+                user_mounts.push(mount.clone().target(tmpfs.join(path)).touch_target());
             } else {
-                mounts.push(mount.clone());
-            }
-        }
-
-        if self.tmp.is_none() {
-            if explicit_tmp_mount {
-                // The user mount is installed on the generated staging path,
-                // then exposed at `/tmp` by the final bind below. Preserve the
-                // user's root and translate only that internal mountpoint.
-                identity_sources.add_translated_tmp_mountpoint(tmpfs);
-            } else {
-                // Add this after explicit mounts. A user mount at `/` shadows
-                // group/nscd, but the final `/tmp` bind below is later and
-                // remains active, so its provenance must survive.
-                identity_sources.add_private_tmp(tmpfs)?;
+                user_mounts.push(mount.clone());
             }
         }
 
@@ -4181,9 +4169,10 @@ impl RunOpts {
                 // Discard provenance only for a bind we actually retain. An
                 // ignored outside-/tmp bind must not suppress the real
                 // identity-hardening mount at that target.
+                explicit_tmp_mount |= relative_path.as_os_str().is_empty();
                 identity_sources.discard_roots_shadowed_by(mount.get_target());
                 let target = tmpfs.join(relative_path);
-                mounts.push(mount.target(target).touch_target());
+                user_mounts.push(mount.target(target).touch_target());
             } else {
                 eprintln!(
                     "WARNING: --bind target {} is outside guest /tmp, so this option has no \
@@ -4192,6 +4181,23 @@ impl RunOpts {
                 );
             }
         }
+
+        if self.tmp.is_none() {
+            if explicit_tmp_mount {
+                // The user mount or bind is installed on the generated staging
+                // path, then exposed at `/tmp` by the final bind below. Preserve
+                // the user's root and translate only that internal mountpoint.
+                identity_sources.add_translated_tmp_mountpoint(tmpfs);
+            } else {
+                // Add this after explicit mounts. A user mount at `/` shadows
+                // group/nscd, but the final `/tmp` bind below is later and
+                // remains active, so its provenance must survive.
+                identity_sources.add_private_tmp(tmpfs)?;
+            }
+        }
+
+        let mut mounts = identity_mounts;
+        mounts.extend(user_mounts);
 
         if let Some(overlay) = &self.e9patch_overlay {
             let target = if let Ok(relative_path) = overlay.target.strip_prefix(TMP_DIR) {
@@ -4472,8 +4478,7 @@ impl RunOpts {
             .map(IdentityGuard::mountinfo_identity_order)
             .transpose()?
             .unwrap_or_default();
-        config.mountinfo_mount_ids = mountinfo_order.ids;
-        config.mountinfo_mount_id_prefix_len = mountinfo_order.mountinfo_prefix_len;
+        config.mountinfo_mount_ids = mountinfo_order;
         self.save_config_to_disk()?;
 
         let timeout = self.run_timeout();
@@ -4538,8 +4543,7 @@ impl RunOpts {
             .map(IdentityGuard::mountinfo_identity_order)
             .transpose()?
             .unwrap_or_default();
-        config.mountinfo_mount_ids = mountinfo_order.ids;
-        config.mountinfo_mount_id_prefix_len = mountinfo_order.mountinfo_prefix_len;
+        config.mountinfo_mount_ids = mountinfo_order;
         self.save_config_to_disk()?;
 
         hermit::run_with_output_backend_timeout_and_skid_overshoots(

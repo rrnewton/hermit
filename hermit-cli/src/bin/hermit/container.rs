@@ -29,7 +29,6 @@ use hermit::Context;
 use hermit::Error;
 use hermit::FailureKind;
 use hermit::HERMIT_DEADLINE_EXIT;
-use hermit::MountInfoIdOrder;
 use hermit::SerializableError;
 use hermit::SkidOvershootError;
 use hermit::capture_mountinfo_identity_order;
@@ -92,40 +91,18 @@ fn mount_id_for_fd(fd: i32) -> io::Result<u64> {
 
 fn mountinfo_root_for_id(raw_mount_id: u64) -> io::Result<Vec<u8>> {
     let contents = fs::read("/proc/self/mountinfo")?;
-    let mut root = None;
-    for line in contents.split(|byte| *byte == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let fields = line.split(|byte| *byte == b' ').collect::<Vec<_>>();
-        if fields.len() < 6 || fields.iter().any(|field| field.is_empty()) {
-            return Err(io::Error::new(
+    let rows = detcore_model::procfs::parse_mountinfo(&contents).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "mountinfo has a malformed row")
+    })?;
+    rows.into_iter()
+        .find(|row| row.raw_mount_id == raw_mount_id)
+        .map(|row| row.root)
+        .ok_or_else(|| {
+            io::Error::new(
                 io::ErrorKind::InvalidData,
-                "mountinfo has a malformed row",
-            ));
-        }
-        let mount_id = std::str::from_utf8(fields[0])
-            .ok()
-            .and_then(|field| field.parse::<u64>().ok())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "mountinfo has an invalid mount ID",
-                )
-            })?;
-        if mount_id == raw_mount_id && root.replace(fields[3].to_vec()).is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "mountinfo has a duplicate mount ID",
-            ));
-        }
-    }
-    root.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "mountinfo omitted the proven mount ID",
-        )
-    })
+                "mountinfo omitted the proven mount ID",
+            )
+        })
 }
 
 fn mountinfo_escape_path(path: &Path) -> Vec<u8> {
@@ -309,7 +286,7 @@ impl IdentityGuard {
 
     /// Capture the exact raw mount-ID order used by Detcore's snapshot-local
     /// canonicalizer. This runs in the completed, quiescent guest namespace.
-    pub(super) fn mountinfo_identity_order(&self) -> Result<MountInfoIdOrder, Error> {
+    pub(super) fn mountinfo_identity_order(&self) -> Result<Vec<u64>, Error> {
         capture_mountinfo_identity_order()
             .context("Failed to capture guest mountinfo identity order")
     }
@@ -323,7 +300,8 @@ fn normalized_mount_target(path: &Path) -> PathBuf {
 }
 
 pub(super) fn mount_target_is_shadowed(target: &Path, overriding_target: &Path) -> bool {
-    normalized_mount_target(target).starts_with(normalized_mount_target(overriding_target))
+    target.starts_with(overriding_target)
+        || normalized_mount_target(target).starts_with(normalized_mount_target(overriding_target))
 }
 
 /// Snapshot the host group database into a private temp file, appending a
@@ -1452,6 +1430,22 @@ mod tests {
 
         guard.discard_roots_shadowed_by(Path::new("/tmp"));
         assert!(guard.mountinfo_roots.is_empty());
+    }
+
+    #[test]
+    fn shadow_detection_preserves_var_run_alias_and_literal_var_ancestry() {
+        assert!(mount_target_is_shadowed(
+            Path::new("/var/run/nscd"),
+            Path::new("/var")
+        ));
+        assert!(mount_target_is_shadowed(
+            Path::new("/var/run/nscd"),
+            Path::new("/run")
+        ));
+        assert!(!mount_target_is_shadowed(
+            Path::new("/var/run/nscd"),
+            Path::new("/var/lib")
+        ));
     }
 
     #[test]
