@@ -5114,7 +5114,14 @@ fn series_provenance(producer: SeriesProducer) -> ObservationProvenance {
     }
 }
 
-fn series_evidence(row: &SeriesRow, mode: &str) -> Option<SeriesEvidence> {
+fn is_naked_native(id: &CellId) -> bool {
+    id.mode == "naked" && id.backend == "native"
+}
+
+fn series_evidence(row: &SeriesRow, id: &CellId) -> Option<SeriesEvidence> {
+    if is_naked_native(id) {
+        return None;
+    }
     if let Some(evidence) = &row.series.no_verdict_evidence {
         return Some(SeriesEvidence {
             result: evidence
@@ -5140,7 +5147,7 @@ fn series_evidence(row: &SeriesRow, mode: &str) -> Option<SeriesEvidence> {
             | None => None,
         };
     }
-    let result = match (row.series.outcome, mode) {
+    let result = match (row.series.outcome, id.mode.as_str()) {
         (SeriesOutcome::Passed, _) => Some(ObservedResult::Pass),
         (SeriesOutcome::Diverged, "replay") => Some(ObservedResult::ReplayFailure),
         (SeriesOutcome::Diverged, _) => Some(ObservedResult::DeterminismFailure),
@@ -5322,14 +5329,21 @@ fn apply_series_rows_inner(
             continue;
         }
         let cell_index = indices[0];
+        let cell = &tracked.cells[cell_index];
         let provenance = series_provenance(row.producer);
-        let evidence = match series_evidence(row, &tracked.cells[cell_index].id.mode) {
+        let evidence = match series_evidence(row, &cell.id) {
             Some(evidence) => evidence,
             None => {
-                skipped.push(format!(
-                    "{label}: outcome {:?} produced no comparison and carries no exact no-verdict evidence",
-                    row.series.outcome.as_str()
-                ));
+                if is_naked_native(&cell.id) {
+                    skipped.push(format!(
+                        "{label}: stress-series/v1-v3 naked/native row does not retain ordered inner attempts and declared min_distinct, so it is not qualifying observation evidence"
+                    ));
+                } else {
+                    skipped.push(format!(
+                        "{label}: outcome {:?} produced no comparison and carries no exact no-verdict evidence",
+                        row.series.outcome.as_str()
+                    ));
+                }
                 continue;
             }
         };
@@ -11197,6 +11211,139 @@ red/`measured-and-passed` count is **0**.",
             },
         }
     };
+
+    // A stress-series/v1-v3 naked/native row does not retain the ordered inner
+    // attempts or declared min_distinct that justify its outer result. Exclude
+    // every outcome uniformly. In particular, admitting only PASS while
+    // dropping a failed diversity check, timeout, or no-result row would make
+    // the projected scorecard less honest than the canonical series.
+    let mut native_cell = boundary_cell(Vec::new(), CellStatus::Red);
+    native_cell.id.mode = "naked".into();
+    native_cell.id.backend = "native".into();
+    let mut native_projection = TrackedCells {
+        schema: SCHEMA,
+        projection: None,
+        cells: vec![
+            boundary_cell(Vec::new(), CellStatus::Green),
+            native_cell,
+        ],
+    };
+    let native_pass = series_row(
+        "fixture/boundary/naked/native",
+        SeriesOutcome::Passed,
+        SeriesProducer::Validate,
+        1,
+        None,
+        None,
+    );
+    // Until the next schema carries the inner hashes, the producer's failed
+    // outer result is the only retained statement that successful attempts did
+    // not meet the declared diversity requirement.
+    let native_failed_diversity = series_row(
+        "fixture/boundary/naked/native",
+        SeriesOutcome::Errored,
+        SeriesProducer::Validate,
+        1,
+        None,
+        None,
+    );
+    let native_timeout = series_row(
+        "fixture/boundary/naked/native",
+        SeriesOutcome::Timeout,
+        SeriesProducer::Validate,
+        1,
+        None,
+        None,
+    );
+    let native_no_result = series_row(
+        "fixture/boundary/naked/native",
+        SeriesOutcome::NoResult,
+        SeriesProducer::Validate,
+        1,
+        None,
+        None,
+    );
+    let ptrace_pass = series_row(
+        "fixture/boundary/verify/ptrace",
+        SeriesOutcome::Passed,
+        SeriesProducer::Validate,
+        1,
+        Some(fixture_detcore_tree.clone()),
+        None,
+    );
+    let native_outcome = apply_series_rows(
+        &root,
+        &mut native_projection,
+        &[
+            native_pass,
+            native_failed_diversity,
+            native_timeout,
+            native_no_result,
+            ptrace_pass,
+        ],
+        None,
+    )?;
+    refresh_measurement(&mut native_projection);
+    if native_outcome.rows != 1
+        || native_outcome.cells != 1
+        || native_outcome.runs != 1
+        || native_projection.cells.len() != 2
+        || native_outcome.skipped.len() != 4
+        || !native_outcome.skipped.iter().all(|line| {
+            line.contains(
+                "stress-series/v1-v3 naked/native row does not retain ordered inner attempts and declared min_distinct, so it is not qualifying observation evidence",
+            )
+        })
+        || !native_projection.cells[1].observations.is_empty()
+        || native_projection.cells[1].last_tested.is_some()
+        || native_projection.cells[1].measurement != MeasurementState::NeverMeasured
+        || native_projection.cells[1].status != CellStatus::Red
+        || native_projection.cells[0].observations.len() != 1
+        || native_projection.cells[0].observations[0].results
+            != BTreeSet::from([ObservedResult::Pass])
+        || native_projection.cells[0].measurement != MeasurementState::MeasuredAndPassed
+        || native_projection.cells[0].status != CellStatus::Green
+    {
+        return Err(format!(
+            "native rows were not uniformly excluded while ptrace still projected: {native_outcome:?}"
+        ));
+    }
+
+    let mut native_only = TrackedCells {
+        schema: SCHEMA,
+        projection: None,
+        cells: vec![native_projection.cells[1].clone()],
+    };
+    let native_only_before = serde_json::to_vec(&native_only)
+        .map_err(|error| format!("cannot encode native-only atomicity fixture: {error}"))?;
+    let native_only_error = apply_series_rows(
+        &root,
+        &mut native_only,
+        &[series_row(
+            "fixture/boundary/naked/native",
+            SeriesOutcome::Passed,
+            SeriesProducer::Validate,
+            1,
+            None,
+            None,
+        )],
+        None,
+    )
+    .expect_err("a native-only projection with no legacy evidence was accepted");
+    let native_only_after = serde_json::to_vec(&native_only)
+        .map_err(|error| format!("cannot re-encode native-only atomicity fixture: {error}"))?;
+    if !native_only_error.contains("every one of the 1 readable series row(s) determined nothing")
+        || !native_only_error.contains(
+            "stress-series/v1-v3 naked/native row does not retain ordered inner attempts and declared min_distinct, so it is not qualifying observation evidence",
+        )
+        || native_only_after != native_only_before
+    {
+        return Err(format!(
+            "native-only all-skipped projection was not an atomic refusal: error={native_only_error:?}, unchanged={}",
+            native_only_after == native_only_before
+        ));
+    }
+
     let mut projected_from_series = TrackedCells {
         schema: SCHEMA,
         projection: None,
