@@ -51,6 +51,7 @@ use crate::timeouts::DEFAULTS_FILE;
 #[cfg(test)]
 use crate::timeouts::EXPLICIT_TIMEOUT_CALIBRATIONS;
 #[cfg(test)]
+use crate::timeouts::IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT;
 use crate::timeouts::KVM_2026_09_08_SELECTED_CI_CELL_COUNT;
 #[cfg(test)]
 use crate::timeouts::KVM_NEXT40_QUALIFIED_CI_CELL_COUNT;
@@ -4851,10 +4852,11 @@ mod tests {
                 + KVM_NEXT40_QUALIFIED_CI_CELL_COUNT
                 + 2
                 + KVM_2026_09_08_SELECTED_CI_CELL_COUNT
+                + IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT
         );
         assert_eq!(
             enabled.len() - required.len(),
-            NON_CI_CELL_COUNT,
+            NON_CI_CELL_COUNT - IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT,
             "the current manifest census records every enabled ci:false cell"
         );
 
