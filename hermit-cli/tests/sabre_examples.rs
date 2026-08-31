@@ -15,12 +15,18 @@ use std::process::Stdio;
 use std::time::Duration;
 use std::time::Instant;
 
-// Keep timed-progress-bar.py out of this SaBRe ratchet while
-// tests/e2e/manifests/applications.yaml disables its SaBRe verify cell: SaBRe
-// does not yet determinize its busy-wait polling on virtual wall-clock
-// advancement. The selected ptrace manifest cell remains covered separately.
-const NON_RACY_EXAMPLES: [&str; 3] = ["date.sh", "devrand.sh", "rand.py"];
+// Keep examples with manifest-disabled SaBRe verify cells out of this ratchet.
+// TODO(#1519): SaBRe does not yet determinize timed-progress-bar.py's busy-wait
+// polling on virtual wall-clock advancement.
+// TODO(#2895): SaBRe strict verification of rand.py retains different syscall
+// streams across its two runs. Other enabled backends still cover both guests.
+const NON_RACY_EXAMPLES: [&str; 2] = ["date.sh", "devrand.sh"];
 const SABRE_BACKEND_FACT_PREFIX: &str = ":: Backend: sabre static rewriting + ptrace runtime;";
+
+#[test]
+fn sabre_non_racy_example_baseline_is_exact() {
+    assert_eq!(NON_RACY_EXAMPLES, ["date.sh", "devrand.sh"]);
+}
 
 fn hermit_binary() -> PathBuf {
     std::env::var_os("HERMIT_SABRE_TEST_BINARY")
