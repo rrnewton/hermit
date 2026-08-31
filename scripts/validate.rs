@@ -14379,9 +14379,14 @@ fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
         || !cell.cmd.contains("--backend 'ptrace'")
         || !cell.cmd.contains("${E2E_RESULT_ROOT:?")
         || !cell.cmd.contains("${E2E_RUN_ID:?")
+        || cell
+            .env
+            .get("HERMIT_E2E_EMPTY_WORKDIR")
+            .map(String::as_str)
+            != Some("/test")
     {
         return Err(format!(
-            "requalification plan: selected pressure cell lost its pressure-owned identity or runtime handoff: {cell:?}"
+            "requalification plan: selected pressure cell lost its pressure-owned identity, runtime handoff, or canonical /test workdir: {cell:?}"
         ));
     }
 
@@ -14393,6 +14398,7 @@ fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
     let result_root = execution_root.join("results");
     let calls = execution_root.join("harness-calls");
     let run_ids = execution_root.join("run-ids");
+    let workdirs = execution_root.join("workdirs");
     let harness = execution_root.join("test-harness");
     std::fs::create_dir_all(result_root.join("prepare/applications-timed-progress-bar"))
         .map_err(|error| format!("requalification plan: cannot prepare execution fixture: {error}"))?;
@@ -14407,6 +14413,7 @@ fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
 set -euo pipefail
 printf '%s\n' "$*" >> "$PRESSURE_PROBE_CALLS"
 printf '%s\n' "${E2E_RUN_ID:?}" >> "$PRESSURE_PROBE_RUN_IDS"
+printf '%s\n' "${HERMIT_E2E_EMPTY_WORKDIR:?}" >> "$PRESSURE_PROBE_WORKDIRS"
 result= junit=
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -14457,12 +14464,14 @@ fi
     let prior_run_id = std::env::var_os("E2E_RUN_ID");
     let prior_calls = std::env::var_os("PRESSURE_PROBE_CALLS");
     let prior_run_ids = std::env::var_os("PRESSURE_PROBE_RUN_IDS");
+    let prior_workdirs = std::env::var_os("PRESSURE_PROBE_WORKDIRS");
     let restore_environment = || {
         for (name, prior) in [
             ("E2E_RESULT_ROOT", prior_result_root.as_ref()),
             ("E2E_RUN_ID", prior_run_id.as_ref()),
             ("PRESSURE_PROBE_CALLS", prior_calls.as_ref()),
             ("PRESSURE_PROBE_RUN_IDS", prior_run_ids.as_ref()),
+            ("PRESSURE_PROBE_WORKDIRS", prior_workdirs.as_ref()),
         ] {
             match prior {
                 Some(value) => unsafe { std::env::set_var(name, value) },
@@ -14478,6 +14487,7 @@ fi
         std::env::set_var("E2E_RUN_ID", "validate-self-test@machine:1");
         std::env::set_var("PRESSURE_PROBE_CALLS", &calls);
         std::env::set_var("PRESSURE_PROBE_RUN_IDS", &run_ids);
+        std::env::set_var("PRESSURE_PROBE_WORKDIRS", &workdirs);
     }
     let positive = run_lane_once(
         &execution,
@@ -14495,6 +14505,7 @@ fi
         .join(cell_tag.trim_start_matches("cell."))
         .join("results.jsonl");
     let observed_run_id = std::fs::read_to_string(&run_ids).unwrap_or_default();
+    let observed_workdir = std::fs::read_to_string(&workdirs).unwrap_or_default();
     if !positive.ok
         || !positive.complete
         || !positive.skipped.is_empty()
@@ -14504,9 +14515,10 @@ fi
             .trim()
             .starts_with("validate-self-test@machine:1-pid")
         || !observed_run_id.trim().ends_with(cell_tag.trim_start_matches("cell."))
+        || observed_workdir.trim() != "/test"
     {
         return Err(format!(
-            "requalification plan: outer scheduler did not execute the selected pressure cell and terminal step exactly once: ok={} complete={} outcomes={:?} skipped={:?} retained={} run_id={observed_run_id:?}",
+            "requalification plan: outer scheduler did not execute the selected pressure cell exactly once under the canonical /test workdir: ok={} complete={} outcomes={:?} skipped={:?} retained={} run_id={observed_run_id:?} workdir={observed_workdir:?}",
             positive.ok,
             positive.complete,
             positive
@@ -14538,6 +14550,7 @@ fi
         std::env::remove_var("E2E_RUN_ID");
         std::env::set_var("PRESSURE_PROBE_CALLS", &broken_calls);
         std::env::set_var("PRESSURE_PROBE_RUN_IDS", &broken_run_ids);
+        std::env::set_var("PRESSURE_PROBE_WORKDIRS", execution_root.join("broken-workdirs"));
     }
     let negative = run_lane_once(
         &execution,
@@ -14578,7 +14591,7 @@ fi
     }
 
     println!(
-        "  requalification plan: pressure selected one exact green cell; validate's outer scheduler executed that cell and its terminal step, no nested runner remained, and a missing run ID refused before the harness; schema-7 eligible, never full authority"
+        "  requalification plan: pressure selected one exact green cell; validate's outer scheduler executed it under the same /test workdir as full validation, no nested runner remained, and a missing run ID refused before the harness; schema-7 eligible, never full authority"
     );
     Ok(())
 }

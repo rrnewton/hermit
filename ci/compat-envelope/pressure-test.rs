@@ -100,6 +100,8 @@ const PRESSURE_CELL_TIMEOUT_SECONDS: i64 = 600;
 /// threshold: breach makes the run incomplete and publishes no promotion.
 const PRESSURE_RUN_TIMEOUT_SECONDS: i64 = 2 * 60 * 60;
 const PRESSURE_SCOPE_TIMEOUT_ENV: &str = "HERMIT_PRESSURE_SCOPE_TIMEOUT_SECONDS";
+const HERMETIC_TEST_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
+const HERMETIC_TEST_WORKDIR: &str = "/test";
 
 /// Match validate's measured host-adaptive outer scheduling policy.
 ///
@@ -2872,7 +2874,14 @@ fn write_plan_after_scorecard_check(
                 manifest: None,
                 integration_test_binaries: None,
                 deps,
-                env: BTreeMap::new(),
+                // Requalification evidence must exercise the same hermetic
+                // guest workdir contract as canonical validation. Otherwise a
+                // pressure pass can promote a backend that the full run must
+                // refuse before guest execution.
+                env: BTreeMap::from([(
+                    HERMETIC_TEST_WORKDIR_ENV.into(),
+                    HERMETIC_TEST_WORKDIR.into(),
+                )]),
                 // `None` preserves the existing GLOBAL eager-exit behaviour, which is what
                 // this graph had before the runner learned about fail-fast families.
                 // Scoping the pressure graph into families is a separate decision.
