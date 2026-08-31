@@ -220,13 +220,17 @@ impl InodePool {
 /// a guest-visible `stat`/`statx` field.
 ///
 /// We replace each distinct raw device number with a strictly-increasing
-/// synthetic id assigned in first-observation order. Because the guest's
-/// sequence of `stat` calls is fixed by Detcore's deterministic schedule, the
-/// order in which distinct devices are first seen is deterministic, so the
-/// synthetic ids are stable across runs. The remapping preserves device
-/// distinctness (distinct raw devices map to distinct ids) and consistency
-/// (the same raw device always maps to the same id), so `find -xdev`, `du -x`,
-/// and hardlink `(st_dev, st_ino)` identity checks still behave correctly.
+/// synthetic id assigned in first-observation order. Both `stat`/`statx` and a
+/// virtualized mountinfo snapshot use this pool. A mountinfo read intentionally
+/// pre-populates it in that snapshot's row order, and later metadata syscalls
+/// reuse those assignments.
+///
+/// This guarantees identity consistency within one Detcore run. It is not an
+/// unconditional cross-machine guarantee: hosts with different filesystem
+/// layouts can expose different device equivalence classes or first-observation
+/// order. The remapping still preserves distinctness and equality within the
+/// run, so `find -xdev`, `du -x`, and `(st_dev, st_ino)` checks behave
+/// consistently with the mountinfo device column.
 #[derive(Debug)]
 struct DevicePool {
     devices: HashMap<u64, u64>,
@@ -3807,6 +3811,23 @@ mod tests {
         // Re-observing a raw device is stable within a run.
         assert_eq!(pool1.determinize(raw_root), root1);
         assert_eq!(pool1.determinize(raw_proc_run1), proc1);
+    }
+
+    #[test]
+    fn mountinfo_prepopulation_is_reused_by_later_stat_observations() {
+        use super::DevicePool;
+
+        let mountinfo_devices = [libc::makedev(8, 1), libc::makedev(0, 44)];
+        let mut pool = DevicePool::new();
+        let rendered = mountinfo_devices
+            .into_iter()
+            .map(|raw| pool.determinize(raw))
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered, [1, 2]);
+        assert_eq!(pool.determinize(libc::makedev(0, 44)), rendered[1]);
+        assert_eq!(pool.determinize(libc::makedev(8, 1)), rendered[0]);
+        assert_eq!(pool.determinize(libc::makedev(259, 7)), 3);
     }
 
     #[tokio::test]

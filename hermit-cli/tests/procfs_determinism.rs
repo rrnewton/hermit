@@ -7,8 +7,10 @@
  */
 
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 
@@ -26,6 +28,14 @@ fn read_procfs(path: &str) -> Vec<u8> {
 }
 
 fn read_procfs_at_epoch(path: &str, epoch: Option<&str>) -> Vec<u8> {
+    read_procfs_with(path, epoch, |_| {})
+}
+
+fn read_procfs_with(
+    path: &str,
+    epoch: Option<&str>,
+    configure: impl FnOnce(&mut Command),
+) -> Vec<u8> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command.args([
         "--log=error",
@@ -37,6 +47,7 @@ fn read_procfs_at_epoch(path: &str, epoch: Option<&str>) -> Vec<u8> {
     if let Some(epoch) = epoch {
         command.arg(format!("--epoch={epoch}"));
     }
+    configure(&mut command);
     command.args(["--", "/bin/cat", path]);
     let rendered = format!("{command:?}");
     let output = command
@@ -480,27 +491,327 @@ fn proc_rtc_tracks_custom_epoch_and_virtual_time() {
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-873): Review mountinfo and UUID snapshots.
 #[test]
-fn proc_self_mountinfo_hides_private_temp_roots() {
-    fn private_mount_records() -> Vec<String> {
-        let contents = read_procfs("/proc/self/mountinfo");
-        let text = std::str::from_utf8(&contents).expect("mountinfo should be UTF-8");
-        assert!(!text.contains("/tmpvol/.tmp"));
-        text.lines()
-            .filter(|line| line.contains("/tmpvol/.hermit/"))
-            .filter_map(|line| line.split_once(" /tmpvol/.hermit/"))
-            .map(|(_, stable)| format!("/tmpvol/.hermit/{stable}"))
-            .collect()
-    }
-
+fn proc_self_mountinfo_is_deterministic() {
     let _guard = hermit_run_lock();
-    let first = private_mount_records();
+    let host_tmpdir = tempfile::tempdir().expect("host TMPDIR");
+    let read = || {
+        read_procfs_with("/proc/self/mountinfo", None, |command| {
+            command.env("TMPDIR", host_tmpdir.path());
+        })
+    };
+    let first = read();
     for run in 2..=RUNS {
-        assert_eq!(
-            first,
-            private_mount_records(),
-            "private mount records differed between run 1 and run {run}"
-        );
+        assert_eq!(first, read(), "mountinfo differed on run {run}");
     }
+    {
+        let contents = &first;
+        let text = std::str::from_utf8(contents).expect("mountinfo should be UTF-8");
+        assert!(!text.contains("/tmpvol/.tmp"));
+        assert!(text.lines().all(|line| line.contains(" - ")));
+        assert!(text.contains(" /tmpvol/.hermit/"));
+    }
+}
+
+#[test]
+fn proc_self_mountinfo_preserves_user_mount_with_tempfile_shape() {
+    let _guard = hermit_run_lock();
+    let mut user_group = tempfile::Builder::new()
+        .prefix(".tmp")
+        .rand_bytes(6)
+        .tempfile_in("/tmp")
+        .expect("create user-controlled tempfile-shaped group file");
+    writeln!(user_group, "root:x:0:").expect("populate user group file");
+    let contents = read_procfs_with("/proc/self/mountinfo", None, |command| {
+        command.arg(format!(
+            "--mount=type=bind,source={},target=/etc/group",
+            user_group.path().display()
+        ));
+    });
+    let text = std::str::from_utf8(&contents).expect("mountinfo should be UTF-8");
+    let group_rows = text
+        .lines()
+        .filter(|line| line.split(' ').nth(4) == Some("/etc/group"))
+        .collect::<Vec<_>>();
+    assert!(!group_rows.is_empty(), "mountinfo must contain /etc/group");
+    assert!(
+        group_rows
+            .iter()
+            .all(|row| !row.contains("/tmpvol/.hermit/etc/group")),
+        "a user-supplied mount must not be represented as Hermit-owned: {group_rows:?}"
+    );
+    assert!(
+        group_rows
+            .iter()
+            .any(|row| row.contains(user_group.path().file_name().unwrap().to_str().unwrap())),
+        "the user-supplied tempfile-shaped root must be preserved: {group_rows:?}"
+    );
+}
+
+fn mountinfo_and_stat_proc_device(no_virtualize_metadata: bool, stat_first: bool) -> (u64, u64) {
+    let script = if stat_first {
+        "/usr/bin/stat -c '__STAT__ %d' /proc; cat /proc/self/mountinfo"
+    } else {
+        "cat /proc/self/mountinfo; /usr/bin/stat -c '__STAT__ %d' /proc"
+    };
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command.args([
+        "--log=error",
+        "run",
+        "--base-env=minimal",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+    ]);
+    if no_virtualize_metadata {
+        command.arg("--no-virtualize-metadata");
+    }
+    command.args(["--", "/bin/sh", "-c", script]);
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    assert!(
+        output.status.success(),
+        "mountinfo/stat probe failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let text = std::str::from_utf8(&output.stdout).expect("probe output should be UTF-8");
+    let stat_device = text
+        .lines()
+        .find_map(|line| line.strip_prefix("__STAT__ "))
+        .expect("probe omitted stat device")
+        .parse::<u64>()
+        .expect("stat device should be decimal");
+    let mount_devices = text
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split(' ').collect::<Vec<_>>();
+            (fields.get(4) == Some(&"/proc")).then_some(fields)
+        })
+        .map(|fields| {
+            let (major, minor) = fields[2]
+                .split_once(':')
+                .expect("mountinfo device should be major:minor");
+            libc::makedev(
+                major.parse().expect("mountinfo major should be decimal"),
+                minor.parse().expect("mountinfo minor should be decimal"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mounted_device = *mount_devices
+        .last()
+        .expect("probe omitted the effective /proc mount row");
+    // A mount namespace may retain covered lower rows. Linux reports them all
+    // in stacking order; pathname lookup and stat observe the final/top row.
+    (mounted_device, stat_device)
+}
+
+#[test]
+fn mountinfo_device_agrees_with_stat_with_and_without_metadata_virtualization() {
+    let _guard = hermit_run_lock();
+    for no_virtualize_metadata in [false, true] {
+        for stat_first in [false, true] {
+            let (mountinfo_device, stat_device) =
+                mountinfo_and_stat_proc_device(no_virtualize_metadata, stat_first);
+            assert_eq!(
+                mountinfo_device, stat_device,
+                "mountinfo and stat disagreed when no_virtualize_metadata={no_virtualize_metadata}, \
+                 stat_first={stat_first}"
+            );
+        }
+    }
+}
+
+#[test]
+fn proc_self_mountinfo_preserves_user_mount_over_private_tmp() {
+    let _guard = hermit_run_lock();
+    let user_tmp = tempfile::Builder::new()
+        .prefix(".tmp")
+        .rand_bytes(6)
+        .tempdir_in("/tmp")
+        .expect("create user-controlled tempfile-shaped tmp directory");
+    let contents = read_procfs_with("/proc/self/mountinfo", None, |command| {
+        command.arg(format!(
+            "--mount=type=bind,source={},target=/tmp",
+            user_tmp.path().display()
+        ));
+    });
+    let text = std::str::from_utf8(&contents).expect("mountinfo should be UTF-8");
+    let tmp_rows = text
+        .lines()
+        .filter(|line| line.split(' ').nth(4) == Some("/tmp"))
+        .collect::<Vec<_>>();
+    assert!(!tmp_rows.is_empty(), "mountinfo must expose /tmp");
+    assert!(
+        tmp_rows
+            .iter()
+            .all(|row| !row.contains("/tmpvol/.hermit/tmp")),
+        "a user mount over /tmp must discard private-tmp provenance: {tmp_rows:?}"
+    );
+    let effective_tmp = tmp_rows
+        .last()
+        .expect("nonempty /tmp mount rows should have a top mount");
+    assert!(
+        effective_tmp.contains(user_tmp.path().file_name().unwrap().to_str().unwrap()),
+        "the user-provided /tmp root must remain visible: {tmp_rows:?}"
+    );
+}
+
+#[test]
+fn ignored_bind_outside_tmp_does_not_discard_private_mount_provenance() {
+    let _guard = hermit_run_lock();
+    let ignored_source = tempfile::NamedTempFile::new().expect("ignored bind source");
+    let read = || {
+        read_procfs_with("/proc/self/mountinfo", None, |command| {
+            command.arg(format!(
+                "--bind={}:{}",
+                ignored_source.path().display(),
+                "/etc/group"
+            ));
+        })
+    };
+    let first = read();
+    let second = read();
+    assert_eq!(
+        first, second,
+        "an ignored outside-/tmp bind must not destabilize private provenance"
+    );
+    let text = std::str::from_utf8(&first).expect("mountinfo should be UTF-8");
+    assert!(
+        text.lines().any(|line| {
+            line.split(' ').nth(4) == Some("/etc/group")
+                && line.contains("/tmpvol/.hermit/etc/group")
+        }),
+        "ignored bind incorrectly removed the active private /etc/group provenance"
+    );
+}
+
+fn fdinfo_and_mountinfo_ids() -> (u64, u64, u64, u64) {
+    let script = "exec 3</; exec 4</proc; \
+                  printf '__ROOT_FD__ '; sed -n 's/^mnt_id:[[:space:]]*//p' /proc/self/fdinfo/3; \
+                  printf '__PROC_FD__ '; sed -n 's/^mnt_id:[[:space:]]*//p' /proc/self/fdinfo/4; \
+                  cat /proc/self/mountinfo";
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command.args([
+        "--log=error",
+        "run",
+        "--base-env=minimal",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+        "--",
+        "/bin/sh",
+        "-c",
+        script,
+    ]);
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    assert!(
+        output.status.success(),
+        "fdinfo/mountinfo probe failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let text = std::str::from_utf8(&output.stdout).expect("probe output should be UTF-8");
+    let tagged = |prefix: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("missing {prefix} in:\n{text}"))
+            .parse::<u64>()
+            .unwrap_or_else(|error| panic!("invalid {prefix}: {error}"))
+    };
+    let top_mount = |target: &str| {
+        text.lines()
+            .filter_map(|line| {
+                let fields = line.split(' ').collect::<Vec<_>>();
+                (fields.get(4) == Some(&target)).then(|| {
+                    fields[0]
+                        .parse::<u64>()
+                        .expect("mountinfo ID should be decimal")
+                })
+            })
+            .next_back()
+            .unwrap_or_else(|| panic!("missing mountinfo target {target} in:\n{text}"))
+    };
+    (
+        tagged("__ROOT_FD__ "),
+        tagged("__PROC_FD__ "),
+        top_mount("/"),
+        top_mount("/proc"),
+    )
+}
+
+#[test]
+fn fdinfo_mount_ids_match_mountinfo_without_aliasing() {
+    let _guard = hermit_run_lock();
+    let first = fdinfo_and_mountinfo_ids();
+    let second = fdinfo_and_mountinfo_ids();
+    assert_eq!(
+        first, second,
+        "fdinfo/mountinfo identities changed across runs"
+    );
+    assert_eq!(first.0, first.2, "root fdinfo disagreed with mountinfo");
+    assert_eq!(first.1, first.3, "proc fdinfo disagreed with mountinfo");
+    assert_ne!(first.0, first.1, "distinct mounts collapsed to one mnt_id");
+}
+
+fn redirected_regular_stdio_fdinfo() -> Vec<u8> {
+    let mut input = tempfile::NamedTempFile::new().expect("redirected stdin file");
+    writeln!(input, "unused input").expect("populate redirected stdin");
+    let output = tempfile::NamedTempFile::new().expect("redirected stdout file");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .args([
+            "--log=error",
+            "run",
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--",
+            "/bin/cat",
+            "/proc/self/fdinfo/0",
+            "/proc/self/fdinfo/1",
+        ])
+        .stdin(Stdio::from(
+            input.reopen().expect("reopen redirected stdin"),
+        ))
+        .stdout(Stdio::from(
+            output.reopen().expect("reopen redirected stdout"),
+        ));
+    let rendered = format!("{command:?}");
+    let result = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    assert!(
+        result.status.success(),
+        "redirected stdio fdinfo failed: {rendered}\nstatus: {}\nstderr:\n{}",
+        result.status,
+        String::from_utf8_lossy(&result.stderr),
+    );
+    let contents = fs::read(output.path()).expect("read redirected fdinfo output");
+    assert_eq!(
+        contents
+            .split(|byte| *byte == b'\n')
+            .filter(|line| line.starts_with(b"mnt_id:"))
+            .count(),
+        2,
+        "both redirected stdin and stdout must retain fdinfo mount identities"
+    );
+    contents
+}
+
+#[test]
+fn redirected_regular_stdin_and_stdout_fdinfo_are_stable() {
+    let _guard = hermit_run_lock();
+    assert_eq!(
+        redirected_regular_stdio_fdinfo(),
+        redirected_regular_stdio_fdinfo()
+    );
 }
 
 #[test]

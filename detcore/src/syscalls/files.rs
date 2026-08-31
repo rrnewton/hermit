@@ -48,6 +48,7 @@ use super::deterministic_stdio_inode;
 use crate::config::SchedHeuristic;
 use crate::dirents::*;
 use crate::fd::*;
+use crate::procfs::MountInfoSnapshot;
 use crate::procfs::ProcfsFile;
 use crate::procfs::ProcfsSnapshotContext;
 use crate::record_or_replay::RecordOrReplay;
@@ -1245,21 +1246,105 @@ impl<T: RecordOrReplay> Detcore<T> {
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_target_fd())?;
         let fdinfo_identity = if let Some(target_fd) = target_fd {
-            let (cached_inode, logical_flags, open_file_id) =
+            let (cached_stat, logical_flags, open_file_id, fd_type) =
                 guest.thread_state().with_detfd(target_fd, |detfd| {
                     (
-                        detfd.stat().map(|stat| stat.inode),
+                        detfd.stat(),
                         detfd.status_flags(),
                         detfd.open_file_id(),
+                        detfd.ty(),
                     )
                 })?;
-            let raw_inode = match cached_inode {
-                Some(inode) => inode,
-                None => self.inject_fstat(guest, target_fd).await?.st_ino,
+            let (raw_inode, raw_mode) = match cached_stat {
+                Some(stat) => (stat.inode, stat.mode),
+                None => {
+                    let stat = self.inject_fstat(guest, target_fd).await?;
+                    (stat.st_ino, stat.st_mode)
+                }
             };
             let virtual_inode = match deterministic_stdio_inode(target_fd) {
                 Some(inode) => inode,
                 None => determinize_inode(guest, raw_inode).await.0,
+            };
+            let raw_mount_id =
+                crate::procfs::parse_fdinfo_mount_id(&contents).ok_or_else(|| {
+                    Error::Tool(anyhow::anyhow!(
+                        "kernel returned malformed /proc/*/fdinfo without one numeric mnt_id"
+                    ))
+                })?;
+            // CLI container and recording paths provide the exact namespace's
+            // row order. Replay intentionally retains the recording-time raw
+            // IDs because ReadV2 supplies recording-time fdinfo bytes.
+            let configured_mount_ids = &guest.config().mountinfo_mount_ids;
+            let unlisted_mount = |listed_mount_count: u64| match raw_mode & libc::S_IFMT {
+                libc::S_IFIFO => Some(listed_mount_count + 1),
+                libc::S_IFSOCK => Some(listed_mount_count + 2),
+                _ => match fd_type {
+                    FdType::Signalfd
+                    | FdType::Eventfd
+                    | FdType::Timerfd
+                    | FdType::Inotify
+                    | FdType::Epoll
+                    | FdType::Pidfd
+                    | FdType::Userfaultfd => Some(listed_mount_count + 3),
+                    FdType::Regular
+                    | FdType::Memfd
+                    | FdType::Rng
+                    | FdType::Pipe
+                    | FdType::Socket => None,
+                },
+            };
+            let virtual_mount_id = if raw_mount_id == 0 && fd_type == FdType::Memfd {
+                // Linux uses zero for anonymous objects (for example memfd)
+                // which do not correspond to any mountinfo row.
+                0
+            } else if configured_mount_ids.is_empty() {
+                // Public non-container callers have no pre-captured provenance.
+                // Mount/unshare/setns are refused once Detcore starts, so a
+                // tracer-side snapshot of this task's namespace is immutable.
+                let mountinfo_path = format!("/proc/{}/mountinfo", guest.pid().as_raw());
+                let mountinfo_contents = std::fs::read(&mountinfo_path).map_err(|error| {
+                    Error::Tool(anyhow::anyhow!(
+                        "failed to read {mountinfo_path} while validating fdinfo mnt_id: {error}"
+                    ))
+                })?;
+                let mountinfo_rows =
+                    crate::procfs::parse_mountinfo(&mountinfo_contents).ok_or_else(|| {
+                        Error::Tool(anyhow::anyhow!(
+                            "kernel returned malformed {mountinfo_path} while validating fdinfo mnt_id"
+                        ))
+                    })?;
+                let snapshot = MountInfoSnapshot::new(
+                    mountinfo_rows,
+                    &[],
+                    false,
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                )
+                .ok_or_else(|| {
+                    Error::Tool(anyhow::anyhow!(
+                        "{mountinfo_path} failed strict identity validation for fdinfo"
+                    ))
+                })?;
+                snapshot
+                    .canonical_mount_id(raw_mount_id)
+                    .or_else(|| unlisted_mount(snapshot.mount_ids.len() as u64))
+                    .ok_or_else(|| {
+                        Error::Tool(anyhow::anyhow!(
+                            "fdinfo mnt_id {raw_mount_id} for {fd_type:?} was absent from {mountinfo_path}"
+                        ))
+                    })?
+            } else {
+                configured_mount_ids
+                    .iter()
+                    .position(|mount_id| *mount_id == raw_mount_id)
+                    .map(|index| index as u64 + 1)
+                    .or_else(|| unlisted_mount(configured_mount_ids.len() as u64))
+                    .ok_or_else(|| {
+                        Error::Tool(anyhow::anyhow!(
+                            "fdinfo mnt_id {raw_mount_id} for {fd_type:?} was absent from recorded mountinfo provenance"
+                        ))
+                    })?
             };
             Some((
                 // Determinized immediately above (stdio-special or
@@ -1268,6 +1353,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 virtual_inode.as_raw(),
                 logical_flags,
                 open_file_id.deterministic_socket_cookie(),
+                virtual_mount_id,
             ))
         } else {
             None
@@ -1327,11 +1413,69 @@ impl<T: RecordOrReplay> Detcore<T> {
                 mapping_identities.insert((raw_dev, raw_inode), (det_dev, det_inode.as_raw()));
             }
         }
+        let mountinfo = if guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_mountinfo_identities())?
+        {
+            let rows = crate::procfs::parse_mountinfo(&contents).ok_or_else(|| {
+                Error::Tool(anyhow::anyhow!(
+                    "kernel returned malformed /proc/*/mountinfo"
+                ))
+            })?;
+            let mut raw_devices = Vec::new();
+            let mut seen_devices = BTreeSet::new();
+            for row in &rows {
+                if seen_devices.insert(row.raw_device) {
+                    raw_devices.push(row.raw_device);
+                }
+            }
+            let mut devices = BTreeMap::new();
+            let virtualize_metadata = guest.config().virtualize_metadata;
+            if virtualize_metadata {
+                // Intentionally use snapshot row order to pre-populate the
+                // same run-global DevicePool used by stat/statx. This makes
+                // every later observation of a device agree within the run.
+                // It does not promise that unlike host filesystem layouts
+                // expose the same device equivalence classes or order.
+                for raw in raw_devices {
+                    devices.insert(raw, determinize_device(guest, raw).await);
+                }
+            }
+            let mut root_rewrites = BTreeMap::new();
+            for rewrite in &guest.config().mountinfo_root_rewrites {
+                if root_rewrites
+                    .insert(rewrite.raw_mount_id, rewrite.deterministic_root.clone())
+                    .is_some()
+                {
+                    return Err(Error::Tool(anyhow::anyhow!(
+                        "duplicate proven mountinfo root rewrite for mount ID {}",
+                        rewrite.raw_mount_id
+                    )));
+                }
+            }
+            Some(
+                MountInfoSnapshot::new(
+                    rows,
+                    &guest.config().mountinfo_mount_ids,
+                    virtualize_metadata,
+                    devices,
+                    root_rewrites,
+                )
+                .ok_or_else(|| {
+                    Error::Tool(anyhow::anyhow!(
+                        "mountinfo snapshot failed strict identity validation"
+                    ))
+                })?,
+            )
+        } else {
+            None
+        };
         guest.thread_state().with_detfd(call.fd(), |detfd| {
             detfd.initialize_procfs(
                 contents.clone(),
                 ProcfsSnapshotContext {
                     mapping_identities: mapping_identities.clone(),
+                    mountinfo: mountinfo.clone(),
                     virtual_uptime_seconds,
                     virtual_realtime_seconds,
                     virtual_memory_kb,

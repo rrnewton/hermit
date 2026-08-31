@@ -628,6 +628,57 @@ fn record_strict_direct_cli_records_and_replays_echo() {
 }
 
 #[test]
+fn record_proc_mountinfo_replays_the_captured_read_buffer() {
+    let _guard = hermit_record_lock();
+    // The inner Recorder stores the raw kernel bytes in ReadV2. The inner
+    // Replayer writes those exact bytes back, and the outer Detcore layer then
+    // reapplies the recording-time provenance stored in metadata. This checks
+    // the whole record-to-replay transport; the next test separately checks
+    // independent recordings against different private source paths.
+    record_then_replay_command(
+        "proc mountinfo captured read buffer",
+        Path::new("/bin/cat"),
+        &[OsStr::new("/proc/self/mountinfo")],
+    );
+}
+
+#[test]
+fn record_proc_fdinfo_reuses_the_recording_mountinfo_identity_map() {
+    let _guard = hermit_record_lock();
+    record_then_replay_command(
+        "proc fdinfo mount identity",
+        Path::new("/bin/cat"),
+        &[OsStr::new("/proc/self/fdinfo/1")],
+    );
+}
+
+#[test]
+fn independent_mountinfo_recordings_are_canonical() {
+    let _guard = hermit_record_lock();
+
+    let record_once = |label: &str| {
+        let data_dir = tempfile::tempdir().expect("recording data directory");
+        let host_tmpdir = tempfile::tempdir().expect("recording host TMPDIR");
+        let mut command = Command::new("timeout");
+        command
+            .env("TMPDIR", host_tmpdir.path())
+            .args(["--kill-after=5s", "45s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args(["--log=off", "record", "start", "--strict"])
+            .arg(format!("--data-dir={}", data_dir.path().display()))
+            .args(["--", "/bin/cat", "/proc/self/mountinfo"]);
+        command_output(command, label).stdout
+    };
+
+    let first = record_once("first independent mountinfo recording");
+    let second = record_once("second independent mountinfo recording");
+    assert_eq!(first, second);
+    let text = std::str::from_utf8(&first).expect("mountinfo should be UTF-8");
+    assert!(text.contains("/tmpvol/.hermit/etc/group"));
+    assert!(!text.contains("/.tmp"));
+}
+
+#[test]
 fn replay_output_sink_failure_aborts_once_without_guest_retry() {
     let _guard = hermit_record_lock();
     let data_dir = tempfile::tempdir().expect("failed to create recording directory");

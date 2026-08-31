@@ -117,3 +117,55 @@ fn kvm_matches_ptrace_for_prefilled_pipe_across_fork() {
         "fork-pipe bytes=21 child-exit=37 payload=KVM PIPE INHERITANCE\n",
     );
 }
+
+#[test]
+fn kvm_mountinfo_uses_its_synthetic_namespace_identity() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+    let _guard = KVM_RUN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let run = || {
+        let mut command = Command::new("timeout");
+        command
+            .args(["--kill-after", "10s", "90s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args([
+                "run",
+                "--backend",
+                "kvm",
+                "--strict",
+                "--workdir=/",
+                "--",
+                "/bin/cat",
+                "/proc/self/mountinfo",
+            ]);
+        let output = command.output().expect("run KVM mountinfo guest");
+        assert!(
+            output.status.success(),
+            "KVM mountinfo failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        output.stdout
+    };
+    let first = run();
+    let second = run();
+    assert_eq!(first, second, "KVM mountinfo changed between strict runs");
+    let fields = std::str::from_utf8(&first)
+        .expect("KVM mountinfo should be UTF-8")
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    assert_eq!(&fields[..2], ["1", "2"]);
+    // This exact KVM guest flow observes four distinct device classes before
+    // reading the synthetic rootfs row, so the shared DevicePool assigns 0:5.
+    // Pin the field instead of silently ignoring it. This is output/status
+    // evidence only; KVM does not expose comparable INFO logs for a full L2
+    // claim, and the first-observation policy is not a cross-machine promise.
+    assert_eq!(fields[2], "0:5");
+    assert_eq!(
+        &fields[3..],
+        ["/", "/", "rw", "-", "rootfs", "rootfs", "rw"]
+    );
+}

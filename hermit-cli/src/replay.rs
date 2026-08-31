@@ -93,7 +93,12 @@ impl Replay {
             command.stderr(Stdio::piped());
         }
 
-        let config = record_or_replay_config(dir);
+        let mut config = record_or_replay_config(dir);
+        // Recorder events contain the raw bytes from the recording namespace.
+        // Reapply Detcore's sanitizer with the recording-time mount IDs, not
+        // the unrelated IDs of this fresh replay namespace.
+        config.mountinfo_root_rewrites = metadata.mountinfo_root_rewrites.clone();
+        config.mountinfo_mount_ids = metadata.mountinfo_mount_ids.clone();
         let sequentialize_threads = config.sequentialize_threads;
 
         let (chroot, bootstrap_program, materialization_scope, replay_mounts) =

@@ -58,6 +58,7 @@ use super::container::apply_affinity;
 use super::container::default_container;
 use super::container::identity_hardening_mounts;
 use super::container::image_container;
+use super::container::mount_target_is_shadowed;
 use super::container::with_container;
 use super::global_opts::GlobalOpts;
 use super::record_envelope::RecordEnvelope;
@@ -3675,16 +3676,16 @@ impl RunOpts {
             let mut process = Container::new();
             apply_affinity(&mut process, self.pin_threads);
             return with_container(&mut process, || {
-                self.run_in_container(global, capture_output)
+                self.run_in_container(global, capture_output, None)
             });
         }
 
         let tmpfs = self.tmpfs()?;
 
-        let (mut container, _identity_sources) = self.container(tmpfs.path())?;
+        let (mut container, identity_sources) = self.container(tmpfs.path())?;
 
         with_container(&mut container, || {
-            self.run_in_container(global, capture_output)
+            self.run_in_container(global, capture_output, Some(&identity_sources))
         })
     }
 
@@ -4140,8 +4141,19 @@ impl RunOpts {
     /// Returns the mounts to be used with the container.
     fn mounts(&self, tmpfs: &Path) -> Result<PreparedMounts, Error> {
         let (mut mounts, identity_sources) = identity_hardening_mounts()?;
+        let mut identity_sources = identity_sources;
+        if self.tmp.is_none() {
+            // Claim the private /tmp before applying explicit mounts. A user
+            // mount targeting /tmp (or an ancestor) must discard this claim;
+            // adding it afterward would retain stale provenance and turn the
+            // expected object-identity mismatch into a launch-time refusal.
+            identity_sources.add_private_tmp(tmpfs)?;
+        }
 
         for mount in &self.mount {
+            let user_target = mount.get_target();
+            mounts.retain(|existing| !mount_target_is_shadowed(existing.get_target(), user_target));
+            identity_sources.discard_roots_shadowed_by(user_target);
             if let Ok(path) = mount.get_target().strip_prefix(TMP_DIR) {
                 // If the target is in /tmp, change it so it goes to our
                 // temporary /tmp instead.
@@ -4157,6 +4169,10 @@ impl RunOpts {
             // Bind mounts currently only make sense for things in `/tmp` since
             // that is the only directory we overlay.
             if let Ok(relative_path) = mount.get_target().strip_prefix(TMP_DIR) {
+                // Discard provenance only for a bind we actually retain. An
+                // ignored outside-/tmp bind must not suppress the real
+                // identity-hardening mount at that target.
+                identity_sources.discard_roots_shadowed_by(mount.get_target());
                 let target = tmpfs.join(relative_path);
                 mounts.push(mount.target(target).touch_target());
             } else {
@@ -4252,17 +4268,17 @@ impl RunOpts {
             apply_affinity(&mut process, self.pin_threads);
             let mut log_file = Some(log_file);
             return with_container(&mut process, || {
-                self.run_verify_in_container(&mut log_file, global)
+                self.run_verify_in_container(&mut log_file, global, None)
             });
         }
 
         let tmpfs = self.tmpfs()?;
 
-        let (mut container, _identity_sources) = self.container(tmpfs.path())?;
+        let (mut container, identity_sources) = self.container(tmpfs.path())?;
 
         let mut log_file = Some(log_file);
         with_container(&mut container, || {
-            self.run_verify_in_container(&mut log_file, global)
+            self.run_verify_in_container(&mut log_file, global, Some(&identity_sources))
         })
     }
 
@@ -4432,12 +4448,21 @@ impl RunOpts {
         &self,
         global: &GlobalOpts,
         capture_output: bool,
+        identity_sources: Option<&IdentityGuard>,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
         let _guard = global.init_tracing();
 
         let command = self.guest_command()?;
 
-        let config = self.effective_det_config();
+        let mut config = self.effective_det_config();
+        config.mountinfo_root_rewrites = identity_sources
+            .map(IdentityGuard::mountinfo_root_rewrites)
+            .transpose()?
+            .unwrap_or_default();
+        config.mountinfo_mount_ids = identity_sources
+            .map(IdentityGuard::mountinfo_mount_ids)
+            .transpose()?
+            .unwrap_or_default();
         self.save_config_to_disk()?;
 
         let timeout = self.run_timeout();
@@ -4468,6 +4493,7 @@ impl RunOpts {
         &self,
         log_file: &mut Option<fs::File>,
         global: &GlobalOpts,
+        identity_sources: Option<&IdentityGuard>,
     ) -> Result<(Output, u64), Error> {
         // HACK: Use interior mutability to workaround not being able to pass
         // `log_file` by value. Guaranteed by caller to never panic.
@@ -4492,7 +4518,15 @@ impl RunOpts {
 
         let command = self.guest_command()?;
 
-        let config = self.effective_det_config();
+        let mut config = self.effective_det_config();
+        config.mountinfo_root_rewrites = identity_sources
+            .map(IdentityGuard::mountinfo_root_rewrites)
+            .transpose()?
+            .unwrap_or_default();
+        config.mountinfo_mount_ids = identity_sources
+            .map(IdentityGuard::mountinfo_mount_ids)
+            .transpose()?
+            .unwrap_or_default();
         self.save_config_to_disk()?;
 
         hermit::run_with_output_backend_timeout_and_skid_overshoots(

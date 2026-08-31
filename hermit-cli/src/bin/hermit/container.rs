@@ -7,21 +7,31 @@
  */
 
 use std::any::Any;
+use std::ffi::CString;
 use std::fs;
+use std::fs::File;
+use std::io;
 use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::panic;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use anyhow::anyhow;
+use detcore_model::config::MountInfoRootRewrite;
 use hermit::Context;
 use hermit::Error;
 use hermit::FailureKind;
 use hermit::HERMIT_DEADLINE_EXIT;
 use hermit::SerializableError;
 use hermit::SkidOvershootError;
+use hermit::capture_mountinfo_id_order;
 use nix::sched::CpuSet;
 use nix::sched::sched_getaffinity;
 use nix::sys::signal::SaFlags;
@@ -41,6 +51,103 @@ use reverie::process::RunError;
 const GROUP_FILE: &str = "/etc/group";
 const NSCD_DIR: &str = "/var/run/nscd";
 const OVERFLOW_GID: &str = "65534";
+const DETERMINISTIC_GROUP_ROOT: &[u8] = b"/tmpvol/.hermit/etc/group";
+const DETERMINISTIC_NSCD_ROOT: &[u8] = b"/tmpvol/.hermit/run/nscd";
+const DETERMINISTIC_TMP_ROOT: &[u8] = b"/tmpvol/.hermit/tmp";
+
+#[derive(Debug)]
+struct MountInfoRootSource {
+    source: File,
+    target: PathBuf,
+    deterministic_root: Vec<u8>,
+}
+
+fn open_path(path: &Path) -> io::Result<File> {
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // O_PATH pins the object without requiring read permission.  The descriptor
+    // remains valid if a path is renamed after this point, which is exactly why
+    // provenance is carried by descriptors rather than by a second stat(path).
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `open` returned a new owned descriptor above.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn mount_id_for_fd(fd: i32) -> io::Result<u64> {
+    let fdinfo = fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))?;
+    let mut ids = fdinfo.lines().filter_map(|line| {
+        line.strip_prefix("mnt_id:")
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    });
+    let id = ids
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "fdinfo has no mnt_id"))?;
+    if ids.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fdinfo has multiple mnt_id fields",
+        ));
+    }
+    Ok(id)
+}
+
+impl MountInfoRootSource {
+    fn new(source: &Path, target: &Path, deterministic_root: &[u8]) -> Result<Self, Error> {
+        Ok(Self {
+            source: open_path(source).with_context(|| {
+                format!(
+                    "Failed to pin mountinfo provenance source {}",
+                    source.display()
+                )
+            })?,
+            target: target.to_path_buf(),
+            deterministic_root: deterministic_root.to_vec(),
+        })
+    }
+
+    fn resolve(&self) -> Result<MountInfoRootRewrite, Error> {
+        let target = open_path(&self.target).with_context(|| {
+            format!(
+                "Failed to pin mountinfo provenance target {}",
+                self.target.display()
+            )
+        })?;
+        let source_metadata = self.source.metadata().with_context(|| {
+            format!(
+                "Failed to inspect pinned mountinfo provenance source for {}",
+                self.target.display()
+            )
+        })?;
+        let target_metadata = target.metadata().with_context(|| {
+            format!(
+                "Failed to inspect pinned mountinfo provenance target {}",
+                self.target.display()
+            )
+        })?;
+        if (source_metadata.dev(), source_metadata.ino())
+            != (target_metadata.dev(), target_metadata.ino())
+        {
+            return Err(Error::msg(format!(
+                "Refusing mountinfo provenance for {}: the completed mount target does not match \
+                 the pinned Hermit-owned source",
+                self.target.display()
+            )));
+        }
+        let raw_mount_id = mount_id_for_fd(target.as_raw_fd()).with_context(|| {
+            format!(
+                "Failed to identify the mount containing proven target {}",
+                self.target.display()
+            )
+        })?;
+        Ok(MountInfoRootRewrite {
+            raw_mount_id,
+            deterministic_root: self.deterministic_root.clone(),
+        })
+    }
+}
 
 // Bind mount sources must outlive Reverie's pre-exec container setup, which
 // applies the mounts in the forked child before exec. Hold this guard in the
@@ -49,6 +156,7 @@ const OVERFLOW_GID: &str = "65534";
 pub(super) struct IdentityGuard {
     _group_file: Option<tempfile::NamedTempFile>,
     _nscd_dir: Option<tempfile::TempDir>,
+    mountinfo_roots: Vec<MountInfoRootSource>,
 }
 
 impl IdentityGuard {
@@ -59,8 +167,58 @@ impl IdentityGuard {
         Self {
             _group_file: None,
             _nscd_dir: None,
+            mountinfo_roots: Vec::new(),
         }
     }
+
+    /// Include an automatically-created private `/tmp` in mountinfo provenance.
+    /// User-supplied `--tmp` paths deliberately do not call this method.
+    pub(super) fn add_private_tmp(&mut self, source: &Path) -> Result<(), Error> {
+        self.mountinfo_roots.push(MountInfoRootSource::new(
+            source,
+            Path::new("/tmp"),
+            DETERMINISTIC_TMP_ROOT,
+        )?);
+        Ok(())
+    }
+
+    /// Drop provenance for a Hermit mount hidden by an explicit user mount.
+    /// The hidden mount must also be omitted from the mount plan: otherwise its
+    /// private root would remain visible as a lower stacked mountinfo row even
+    /// though no pathname could reopen that exact layer afterward.
+    pub(super) fn discard_roots_shadowed_by(&mut self, overriding_target: &Path) {
+        self.mountinfo_roots
+            .retain(|source| !mount_target_is_shadowed(&source.target, overriding_target));
+    }
+
+    /// Resolve proven source objects to exact mount IDs in the completed guest
+    /// namespace.  This runs after all mounts are installed and before the guest
+    /// starts, while the namespace is quiescent.  Held source and target
+    /// descriptors plus the target fd's `mnt_id` avoid both pathname TOCTOU and
+    /// ambiguity from stacked mounts sharing one textual mountpoint.
+    pub(super) fn mountinfo_root_rewrites(&self) -> Result<Vec<MountInfoRootRewrite>, Error> {
+        self.mountinfo_roots
+            .iter()
+            .map(MountInfoRootSource::resolve)
+            .collect()
+    }
+
+    /// Capture the exact raw mount-ID order used by Detcore's snapshot-local
+    /// canonicalizer. This runs in the completed, quiescent guest namespace.
+    pub(super) fn mountinfo_mount_ids(&self) -> Result<Vec<u64>, Error> {
+        capture_mountinfo_id_order().context("Failed to capture guest mountinfo identity order")
+    }
+}
+
+fn normalized_mount_target(path: &Path) -> PathBuf {
+    path.strip_prefix("/var/run").map_or_else(
+        |_| path.to_path_buf(),
+        |suffix| Path::new("/run").join(suffix),
+    )
+}
+
+pub(super) fn mount_target_is_shadowed(target: &Path, overriding_target: &Path) -> bool {
+    normalized_mount_target(target).starts_with(normalized_mount_target(overriding_target))
 }
 
 /// Snapshot the host group database into a private temp file, appending a
@@ -104,12 +262,22 @@ fn frozen_group_file() -> Result<tempfile::NamedTempFile, Error> {
 /// Returns the mounts plus a guard that must outlive container setup.
 pub(super) fn identity_hardening_mounts() -> Result<(Vec<Mount>, IdentityGuard), Error> {
     let group_file = frozen_group_file()?;
+    let mut mountinfo_roots = vec![MountInfoRootSource::new(
+        group_file.path(),
+        Path::new(GROUP_FILE),
+        DETERMINISTIC_GROUP_ROOT,
+    )?];
     let mut mounts = vec![Mount::bind(group_file.path(), GROUP_FILE).readonly()];
 
     // Host nscd cache readiness is external state and can differ between runs.
     let nscd_dir = if Path::new(NSCD_DIR).is_dir() {
         let directory =
             tempfile::TempDir::new().context("Failed to create the empty guest nscd directory")?;
+        mountinfo_roots.push(MountInfoRootSource::new(
+            directory.path(),
+            Path::new(NSCD_DIR),
+            DETERMINISTIC_NSCD_ROOT,
+        )?);
         mounts.push(Mount::bind(directory.path(), NSCD_DIR).readonly());
         Some(directory)
     } else {
@@ -121,6 +289,7 @@ pub(super) fn identity_hardening_mounts() -> Result<(Vec<Mount>, IdentityGuard),
         IdentityGuard {
             _group_file: Some(group_file),
             _nscd_dir: nscd_dir,
+            mountinfo_roots,
         },
     ))
 }
@@ -1074,6 +1243,53 @@ mod tests {
                 .any(|line| line.split(':').nth(2) == Some(OVERFLOW_GID)),
             "frozen group database must resolve overflow gid {OVERFLOW_GID}:\n{contents}"
         );
+    }
+
+    #[test]
+    fn mountinfo_provenance_uses_object_identity_not_temp_name_or_target() {
+        let actual = tempfile::NamedTempFile::new().expect("create actual temporary source");
+        let target = actual.path().to_path_buf();
+        let matching =
+            MountInfoRootSource::new(actual.path(), &target, b"/tmpvol/.hermit/matching").unwrap();
+        let guard = IdentityGuard {
+            _group_file: Some(actual),
+            _nscd_dir: None,
+            mountinfo_roots: vec![matching],
+        };
+
+        let rewrites = guard.mountinfo_root_rewrites().unwrap();
+        assert_eq!(rewrites.len(), 1);
+        assert_eq!(rewrites[0].deterministic_root, b"/tmpvol/.hermit/matching");
+        assert_ne!(rewrites[0].raw_mount_id, 0);
+    }
+
+    #[test]
+    fn mountinfo_provenance_refuses_a_same_target_lookalike() {
+        let actual = tempfile::NamedTempFile::new().expect("create actual temporary source");
+        let lookalike = tempfile::NamedTempFile::new().expect("create lookalike temporary source");
+        let target = actual.path().to_path_buf();
+        let same_target_wrong_source =
+            MountInfoRootSource::new(lookalike.path(), &target, b"/tmpvol/.hermit/lookalike")
+                .unwrap();
+        let guard = IdentityGuard {
+            _group_file: Some(actual),
+            _nscd_dir: None,
+            mountinfo_roots: vec![same_target_wrong_source],
+        };
+
+        let error = guard.mountinfo_root_rewrites().unwrap_err().to_string();
+        assert!(error.contains("does not match the pinned Hermit-owned source"));
+    }
+
+    #[test]
+    fn explicit_tmp_mount_discards_private_tmp_provenance_before_resolution() {
+        let private_tmp = tempfile::TempDir::new().expect("create private tmp");
+        let mut guard = IdentityGuard::empty();
+        guard.add_private_tmp(private_tmp.path()).unwrap();
+        assert_eq!(guard.mountinfo_roots.len(), 1);
+
+        guard.discard_roots_shadowed_by(Path::new("/tmp"));
+        assert!(guard.mountinfo_roots.is_empty());
     }
 
     #[test]
