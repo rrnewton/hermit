@@ -162,6 +162,15 @@ const REQUALIFICATION_RUN_ID_PLACEHOLDER: &str = "validate-requalification-run-i
 const QUICK_E2E_VERIFY_TIMEOUT_S: i64 = 1800;
 const PINNED_ROOT_FETCH_TAG: &str = "setup.pinned_root_fetch";
 const PINNED_ROOT_FETCH_COMMAND: &str = "seed=(); if [ -n \"${CARGO_HOME:-}\" ]; then seed=(--seed-cargo \"$CARGO_HOME\"); fi; ./ci/hermetic/run-split-validate.sh --fetch-only \"${seed[@]}\"";
+const DETCORE_MISC_TEST_PREBUILD_COMMAND: &str = r#"mkdir -p target/ci; tests_misc_json="target/ci/tests-misc.cargo.jsonl.tmp.$$"; tests_misc_pointer_tmp="target/ci/tests-misc.path.tmp.$$"; if ! CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run --message-format=json > "$tests_misc_json"; then exit 1; fi; mapfile -t tests_misc_bins < <(jq -er 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "tests_misc" and .executable != null) | .executable' "$tests_misc_json" | sort -u); if ((${#tests_misc_bins[@]} != 1)); then printf 'privileged build: expected one Cargo-reported tests_misc executable, found %d\n' "${#tests_misc_bins[@]}" >&2; exit 1; fi; tests_misc="${tests_misc_bins[0]}"; if [ ! -f "$tests_misc" ] || [ -L "$tests_misc" ] || [ ! -x "$tests_misc" ]; then printf 'privileged build: Cargo-reported tests_misc executable is missing, symlinked, or non-executable: %s\n' "$tests_misc" >&2; exit 1; fi; printf '%s\n' "$tests_misc" > "$tests_misc_pointer_tmp"; mv -f "$tests_misc_pointer_tmp" target/ci/tests-misc.path; mv -f "$tests_misc_json" target/ci/tests-misc.cargo.jsonl"#;
+const HERMIT_PRIVILEGED_TEST_PREBUILD_COMMAND: &str = "CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run";
+const TESTS_MISC_EXECUTABLE_READ_COMMAND: &str = r#"if [ ! -s target/ci/tests-misc.path ]; then printf 'privileged build: Cargo-reported tests_misc path is missing\n' >&2; exit 1; fi; mapfile -t tests_misc_paths < target/ci/tests-misc.path; if ((${#tests_misc_paths[@]} != 1)); then printf 'privileged build: Cargo-reported tests_misc path must contain exactly one line, found %d\n' "${#tests_misc_paths[@]}" >&2; exit 1; fi; tests_misc="${tests_misc_paths[0]}"; case "$tests_misc" in "$PWD"/target/*) ;; *) printf 'privileged build: Cargo-reported tests_misc path is outside this target directory: %s\n' "$tests_misc" >&2; exit 1 ;; esac; case "${tests_misc##*/}" in tests_misc-*) ;; *) printf 'privileged build: Cargo-reported path does not name tests_misc: %s\n' "$tests_misc" >&2; exit 1 ;; esac; if [ ! -f "$tests_misc" ] || [ -L "$tests_misc" ] || [ ! -x "$tests_misc" ]; then printf 'privileged build: Cargo-reported tests_misc executable is missing, symlinked, or non-executable: %s\n' "$tests_misc" >&2; exit 1; fi"#;
+
+fn fused_privileged_test_build_command() -> String {
+    format!(
+        "./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null || exit 1; {DETCORE_MISC_TEST_PREBUILD_COMMAND}; {HERMIT_PRIVILEGED_TEST_PREBUILD_COMMAND} || exit 1; {TESTS_MISC_EXECUTABLE_READ_COMMAND}"
+    )
+}
 
 const PINNED_ROOT_FORWARDED_ENV: &[&str] = &[
     "CARGO_BUILD_JOBS",
@@ -2697,16 +2706,40 @@ cleared-caps refusal names {} starved step(s)",
                 ));
             }
         }
-        let expected_test_prebuild = "CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run";
         if !privileged_build
             .cmd
             .contains("verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path")
-            || !privileged_build.cmd.contains(expected_test_prebuild)
-            || !privileged_build.cmd.contains("tests_misc-*")
+            || !privileged_build
+                .cmd
+                .contains(DETCORE_MISC_TEST_PREBUILD_COMMAND)
+            || !privileged_build
+                .cmd
+                .contains(HERMIT_PRIVILEGED_TEST_PREBUILD_COMMAND)
+            || !privileged_build
+                .cmd
+                .contains(TESTS_MISC_EXECUTABLE_READ_COMMAND)
         {
             return Err(
                 "full-plan bracket: privileged build did not assert the artifact and prebuild the exact downstream test binaries".into(),
             );
+        }
+        let detcore_prebuild_at = privileged_build
+            .cmd
+            .find(DETCORE_MISC_TEST_PREBUILD_COMMAND)
+            .expect("presence checked above");
+        let hermit_prebuild_at = privileged_build
+            .cmd
+            .find(HERMIT_PRIVILEGED_TEST_PREBUILD_COMMAND)
+            .expect("presence checked above");
+        let artifact_scan_at = privileged_build
+            .cmd
+            .find(TESTS_MISC_EXECUTABLE_READ_COMMAND)
+            .expect("presence checked above");
+        if !(detcore_prebuild_at < hermit_prebuild_at && hermit_prebuild_at < artifact_scan_at) {
+            return Err(format!(
+                "full-plan bracket: privileged build does not create tests_misc before later prebuilds and the artifact check: {}",
+                privileged_build.cmd
+            ));
         }
         if ["test.cli", "test.hermit_modes"]
             .iter()
@@ -2767,6 +2800,15 @@ cleared-caps refusal names {} starved step(s)",
             return Err(
                 "full-plan bracket: CPUID test does not directly execute the prebuilt binary"
                     .into(),
+            );
+        }
+        if !cpuid
+            .deps
+            .iter()
+            .any(|dependency| dependency == "privileged-build.privileged_tests")
+        {
+            return Err(
+                "full-plan bracket: CPUID consumer can run before tests_misc is built".into(),
             );
         }
         // Exercise the actual full plan after lane fusion, then apply the
@@ -8067,31 +8109,14 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             }
         }
         privileged_build.deps.sort();
-        // SELECT THE NEWEST, DO NOT REQUIRE EXACTLY ONE.
-        //
-        // This assertion used to end `test "$count" -eq 1`, and that made the
-        // owner's `make validate` fail EVERY TIME while passing in every agent
-        // worktree. Cargo writes one hash-suffixed `tests_misc-<hash>` per build
-        // and never prunes the old ones, so the count is 1 only in a FRESH or
-        // just-`cargo clean`ed tree. Measured 2026-08-10: 9 executables in
-        // ~/work/dev-hermit/hermit versus 1 in a cleaned slot. `test 9 -eq 1`
-        // exits 1 instantly and the shell builtin prints nothing -- which is
-        // exactly the "0s, exit 1" with an empty detail block seen in both
-        // failing runs at 2b38d8e6. It is not flaky and it is not a timeout:
-        // once a working tree accumulates a second binary it can never pass
-        // again. We validated only in clean clones, i.e. the one condition
-        // where the defect cannot appear.
-        //
-        // Fixing the CHECK rather than the user's working directory is
-        // deliberate: this must work in any checkout, including a dirty one,
-        // and validate must not delete a developer's build artifacts.
-        //
-        // Newest-by-mtime is what cargo itself would run. Deliberately NOT
-        // relaxed to `-ge 1`: the CPUID consumer below executes the binary it
-        // selects, so "any one of nine" would let it silently test a STALE
-        // artifact -- a check that passes while measuring the wrong thing,
-        // which is worse than failing loudly. Zero binaries still fails.
-        privileged_build.cmd = "./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null || exit 1; CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run || exit 1; newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"".to_string();
+        // Cargo owns the executable layout. Capture the exact compiler-artifact
+        // path from this build instead of reconstructing it from target/debug:
+        // current nightly Cargo places this generated test under
+        // build/hermit-detcore/<hash>/out, while older layouts used deps/.
+        // The pointer is overwritten by this producer and every consumer below
+        // validates that it names one regular executable in this checkout's
+        // target directory, so a stale or ambiguous artifact fails closed.
+        privileged_build.cmd = fused_privileged_test_build_command();
         let cpuid = steps
             .iter_mut()
             .find(|s| s.tag() == "privileged-cpuid.faulting")
@@ -8103,13 +8128,9 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
                 cpuid.cmd
             ));
         }
-        // Same defect, same fix: `((${#bins[@]} == 1))` failed for exactly the
-        // reason above, so this node could never run in a long-lived checkout
-        // either. It EXECUTES the binary it picks, which is precisely why the
-        // selection must be the NEWEST rather than an arbitrary survivor of a
-        // `-ge 1` relaxation -- running a stale `tests_misc` would report a
-        // CPUID verdict about an artifact that is not the one under test.
-        cpuid.cmd = "newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"; timeout 30 \"$newest\" rdrand_rdseed_is_masked --exact".to_string();
+        cpuid.cmd = format!(
+            "{TESTS_MISC_EXECUTABLE_READ_COMMAND}; timeout 30 \"$tests_misc\" rdrand_rdseed_is_masked --exact"
+        );
     }
     attach_compatibility_scorecard(&mut steps, &lanes, "")?;
     // Fusing lanes means one config for both. Their default wall timeouts differ,
@@ -20221,6 +20242,165 @@ fn stop_test_seam(
         s.ledger = Some(ledger);
     }
     s
+}
+
+#[cfg(test)]
+mod fused_privileged_build_tests {
+    use super::*;
+
+    fn write_executable(path: &Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn cold_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let cargo_log = root.path().join("cargo-calls");
+        write_executable(
+            &root.path().join("ci/verify-hermit-e2e-artifact.sh"),
+            "#!/bin/sh\nexit 0\n",
+        );
+        write_executable(
+            &root.path().join("bin/cargo"),
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$CARGO_CALL_LOG"
+case "$*" in
+  "test -p hermit-detcore --test tests_misc --no-run --message-format=json")
+    case "${CARGO_ARTIFACT_MODE:-current}" in
+      current)
+        artifact="$PWD/target/debug/build/hermit-detcore/cold/out/tests_misc-cold-fixture"
+        mkdir -p "$(dirname "$artifact")"
+        : > "$artifact"
+        chmod 700 "$artifact"
+        ;;
+      missing)
+        artifact="$PWD/target/debug/build/hermit-detcore/cold/out/tests_misc-missing"
+        ;;
+      wrong)
+        artifact="$PWD/target/debug/hermit"
+        mkdir -p "$(dirname "$artifact")"
+        : > "$artifact"
+        chmod 700 "$artifact"
+        ;;
+      ambiguous)
+        artifact="$PWD/target/debug/build/hermit-detcore/one/out/tests_misc-one"
+        second="$PWD/target/debug/build/hermit-detcore/two/out/tests_misc-two"
+        mkdir -p "$(dirname "$artifact")" "$(dirname "$second")"
+        : > "$artifact"
+        : > "$second"
+        chmod 700 "$artifact" "$second"
+        printf '{"reason":"compiler-artifact","profile":{"test":true},"target":{"name":"tests_misc"},"executable":"%s"}\n' "$second"
+        ;;
+      *)
+        exit 65
+        ;;
+    esac
+    printf '{"reason":"compiler-artifact","profile":{"test":true},"target":{"name":"tests_misc"},"executable":"%s"}\n' "$artifact"
+    ;;
+  "test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run")
+    :
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+"#,
+        );
+        let bin = root.path().join("bin");
+        (root, bin, cargo_log)
+    }
+
+    fn run_build(
+        command: &str,
+        root: &Path,
+        bin: &Path,
+        cargo_log: &Path,
+        artifact_mode: &str,
+    ) -> std::process::ExitStatus {
+        let mut path = vec![bin.to_path_buf()];
+        if let Some(existing) = std::env::var_os("PATH") {
+            path.extend(std::env::split_paths(&existing));
+        }
+        Command::new("bash")
+            .arg("-c")
+            .arg(command)
+            .current_dir(root)
+            .env("PATH", std::env::join_paths(path).unwrap())
+            .env("CARGO_CALL_LOG", cargo_log)
+            .env("CARGO_ARTIFACT_MODE", artifact_mode)
+            .status()
+            .unwrap()
+    }
+
+    #[test]
+    fn fused_privileged_build_creates_tests_misc_in_a_cold_target_before_consumers() {
+        let command = fused_privileged_test_build_command();
+        let missing_producer =
+            command.replacen(&format!("{DETCORE_MISC_TEST_PREBUILD_COMMAND}; "), "", 1);
+        assert_ne!(missing_producer, command);
+
+        let (old_root, old_bin, old_log) = cold_fixture();
+        assert!(
+            !run_build(
+                &missing_producer,
+                old_root.path(),
+                &old_bin,
+                &old_log,
+                "current",
+            )
+            .success(),
+            "the pre-fix command must fail from an empty target rather than consume a missing tests_misc binary"
+        );
+        assert!(!old_root
+            .path()
+            .join("target/ci/tests-misc.path")
+            .exists());
+
+        let (fixed_root, fixed_bin, fixed_log) = cold_fixture();
+        assert!(
+            run_build(
+                &command,
+                fixed_root.path(),
+                &fixed_bin,
+                &fixed_log,
+                "current",
+            )
+            .success()
+        );
+        assert!(fixed_root
+            .path()
+            .join("target/debug/build/hermit-detcore/cold/out/tests_misc-cold-fixture")
+            .is_file());
+        assert_eq!(
+            std::fs::read_to_string(fixed_root.path().join("target/ci/tests-misc.path"))
+                .unwrap(),
+            format!(
+                "{}/target/debug/build/hermit-detcore/cold/out/tests_misc-cold-fixture\n",
+                fixed_root.path().display()
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixed_log).unwrap(),
+            format!(
+                "test -p hermit-detcore --test tests_misc --no-run --message-format=json\n{}\n",
+                HERMIT_PRIVILEGED_TEST_PREBUILD_COMMAND
+                    .strip_prefix("CARGO_BUILD_JOBS=8 cargo ")
+                    .unwrap()
+            )
+        );
+
+        for mode in ["missing", "wrong", "ambiguous"] {
+            let (root, bin, log) = cold_fixture();
+            assert!(
+                !run_build(&command, root.path(), &bin, &log, mode).success(),
+                "the fused build must refuse Cargo artifact mode {mode}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

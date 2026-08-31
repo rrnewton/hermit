@@ -770,7 +770,12 @@ fn dynamorio_sdk_available() -> bool {
 
 #[cfg(feature = "dbt")]
 fn dbt_runtime_unavailable_reason() -> Option<String> {
-    detcore_dbt::runtime_library_path().err().map(|error| {
+    dbt_runtime_unavailable_reason_from(detcore_dbt::runtime_library_path())
+}
+
+#[cfg(feature = "dbt")]
+fn dbt_runtime_unavailable_reason_from(runtime: io::Result<PathBuf>) -> Option<String> {
+    runtime.err().map(|error| {
         format!(
             "the Detcore DBT runtime is unavailable: {error}; build the hermit binary and \
              cdylib in the same target directory"
@@ -3485,27 +3490,21 @@ mod tests {
     /// message must say which flag and admit what it did not check.
     #[test]
     fn an_unbuilt_backend_names_the_flag_and_claims_nothing_about_the_machine() {
-        for (backend, flag) in [
+        let feature_disabled_backends: &[(Backend, &str)] = &[
+            #[cfg(not(feature = "dbt"))]
             (Backend::Dbt, "dbt"),
+            #[cfg(not(feature = "sabre"))]
             (Backend::Sabre, "sabre"),
+            #[cfg(not(feature = "e9patch"))]
             (Backend::E9patch, "e9patch"),
-        ] {
-            let Some(reason) = backend.unavailable_reason() else {
-                // Built in on this configuration; nothing to assert.
-                continue;
-            };
-            // ⚠️ KEY THE FILTER ON THE CONDITION, NOT ON THE NEW WORDING. My first
-            // version skipped unless the message already said "not enabled in this
-            // build" -- so reverting to the old "support was not included in this
-            // build" fell through the filter and the test passed. A guard that only
-            // recognises the fixed form cannot catch the regression it exists for.
-            // "build" appears in both wordings and in neither of the runtime ones.
-            if !reason.contains("build") {
-                // Unavailable for a REAL, tested reason (missing runtime, etc.).
-                continue;
-            }
+        ];
+
+        for &(backend, feature) in feature_disabled_backends {
+            let reason = backend
+                .unavailable_reason()
+                .expect("a feature-disabled backend must report why it is unavailable");
             assert!(
-                reason.contains(flag),
+                reason.contains(feature),
                 "{backend:?}: a build-flag message must name the flag to rebuild with, got: {reason}"
             );
             assert!(
@@ -3513,6 +3512,21 @@ mod tests {
                 "{backend:?}: a build-flag message must not imply the machine was tested, got: {reason}"
             );
         }
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn a_cold_dbt_runtime_diagnostic_is_not_feature_absence() {
+        let reason = dbt_runtime_unavailable_reason_from(Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Hermit DBT runtime was not built beside /cold-target/hermit or in its deps directory",
+        )))
+        .expect("a missing cold-target runtime must remain unavailable");
+
+        assert!(reason.contains("was not built beside"));
+        assert!(reason.contains("build the hermit binary and cdylib"));
+        assert!(!reason.contains("not enabled in this build"));
+        assert!(!reason.contains("has not been checked"));
     }
     use std::ffi::OsStr;
     use std::fs;
@@ -3529,6 +3543,8 @@ mod tests {
     use super::collect_recording_ids;
     #[cfg(feature = "dbt")]
     use super::dbt_runtime_unavailable_reason;
+    #[cfg(feature = "dbt")]
+    use super::dbt_runtime_unavailable_reason_from;
     #[cfg(feature = "dbt")]
     use super::dynamorio_sdk_available;
     use super::ensure_backend_dispatch;
