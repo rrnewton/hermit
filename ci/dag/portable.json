@@ -628,15 +628,17 @@
     },
     {
       "group": "test", "job": "strict_compat",
-      "desc": "Portable strict compatibility envelope (one scheduler epoch: 420s prep < 480s gate < 600s run < 660s owned local scope when available < 720s node < 900s job; timeout preserves named probe evidence)",
-      "cmd": "acf=(); if [ -n \"${GITHUB_ACTIONS:-}\" ] || [ -n \"${CI:-}\" ]; then acf=(--allow-cgroup-failure); fi; VALIDATE_GATE_TIMEOUT_SECONDS=480 HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS=600 DAGRUN_LOG_DIR=\"${RUN_NODE_PERF_DIR:-$PWD/ignored/ci/perf/strict-compat}/logs\" STRICT_COMPAT_HERMIT_BIN=$PWD/target/ci/hermit-strict ./scripts/validate.rs --portable-strict-compat-only --reuse-parent-manifest-gate --no-label-pr --verbose \"${acf[@]}\"",
+      "desc": "Portable strict compatibility expansion marker",
+      "description": "scripts/validate.rs replaces this marker with one run-unique fixture-preparation node and the corpus-derived compat.* nodes before invoking the outer scheduler. Executing the unexpanded lane fails loudly instead of reporting a false compatibility pass.",
+      "cmd": "echo 'test.strict_compat is expanded by scripts/validate.rs into direct compat.* nodes; run this lane through validate or ci/run-node.sh' >&2; exit 125",
       "deps": ["build.runtime_release", "lint.clippy", "doc.doctests", "doc.rustdoc",
                "test.regular_crates",
                "test.hermit_unit", "test.detcore_unit", "test.rr_suite_contract"],
-      "timeout": 720,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 600,
-               "rss_baseline_bytes": 12884901888, "hard_mem_max_bytes": 25769803776,
-               "classification": "latency-bound"}
+      "timeout": 30,
+      "cpu_timeout": 30,
+      "hint": {"est_duration_s": 1,
+               "rss_baseline_bytes": 67108864, "hard_mem_max_bytes": 268435456,
+               "classification": "light"}
     }
   ]
 }

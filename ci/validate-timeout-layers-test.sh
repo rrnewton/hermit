@@ -5,17 +5,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# Live, on-demand bracket for validate's nested wall-time limits. This is not a
+# Live, on-demand bracket for validate's wall-time limits. This is not a
 # default portable test: it deliberately requires a working systemd --user
 # manager and cgroup-v2 delegation so a configuration-only pass is impossible.
 #
-# This checks the FOUR validate rungs. The full ladder has more rungs than these
-# -- hermit's own `run --timeout`, the nextest per-test cap, the manifest cell
-# `timeout_seconds`, the dagrun step timeout, and safehermit's cgroup deadline --
-# and they do NOT bound the same quantity. Before changing any timeout anywhere,
-# read docs/TIMEOUT_LADDER.md: it says what each rung bounds, why the exit code
-# cannot tell you which one fired, and the strict-inequality invariant that makes
-# an inner bound dead configuration when it is set too high.
+# Portable strict compatibility is now part of validate's one outer DAG; its
+# generated per-probe bounds and absence of a nested scheduler are bracketed by
+# `scripts/validate.rs --self-test`. This script independently proves that a
+# named DAG step timeout and the enclosing systemd scope timeout both still fire.
 
 set -euo pipefail
 
@@ -30,19 +27,6 @@ fi
 
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/validate-timeout-layers.XXXXXX")
 trap 'rm -rf -- "$scratch"' EXIT
-
-cmd=$(jq -r '.steps[] | select(.group == "test" and .job == "strict_compat") | .cmd' \
-    ci/dag/portable.json)
-gate_s=$(sed -n 's/.*VALIDATE_GATE_TIMEOUT_SECONDS=\([0-9][0-9]*\).*/\1/p' <<<"$cmd")
-run_s=$(sed -n 's/.*HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS=\([0-9][0-9]*\).*/\1/p' <<<"$cmd")
-node_s=$(jq -r '.steps[] | select(.group == "test" and .job == "strict_compat") | .timeout' \
-    ci/dag/portable.json)
-scope_s=$((run_s + (run_s / 10 > 60 ? run_s / 10 : 60)))
-if ((gate_s != 480 || run_s != 600 || scope_s != 660 || node_s != 720)); then
-    printf 'validate-timeout-layers: wrong deployed ladder: %s < %s < %s < %s\n' \
-        "$gate_s" "$run_s" "$scope_s" "$node_s" >&2
-    exit 1
-fi
 
 cat >"$scratch/inner.json" <<'EOF'
 {
@@ -144,5 +128,4 @@ outer_message='Finished with result: timeout'
 printf 'VALIDATE-TIMEOUT-LAYERS negative-inner=1 message=%q\n' "$inner_message"
 printf 'VALIDATE-TIMEOUT-LAYERS negative-outer=1 message=%q\n' "$outer_message"
 printf 'VALIDATE-TIMEOUT-LAYERS positive=1 healthy-control=PASS\n'
-printf 'VALIDATE-TIMEOUT-LAYERS deployed=%ss<%ss<%ss<%ss (gate<run<scope<node)\n' \
-    "$gate_s" "$run_s" "$scope_s" "$node_s"
+printf 'VALIDATE-TIMEOUT-LAYERS named-step=PASS outer-scope=PASS\n'

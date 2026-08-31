@@ -14,9 +14,9 @@ rung can never fire: it is dead configuration that reads as protection, and it
 presents as an intermittently killed test rather than as the configuration error
 it is.
 
-`ci/validate-timeout-layers-test.sh` already calls the nested wall-time limits a
-**ladder** and fails closed on a wrong one; this is the same idea widened to
-every rung, including the ones that script does not cover.
+`ci/validate-timeout-layers-test.sh` exercises both a named DAG-step timeout and
+the outer validate scope. This is the same idea widened to every rung,
+including the ones that script does not cover.
 
 All values measured 2026-08-26 against `rrnewton/hermit` `main`
 `f77d7c44067a12ba11e75b5a85864ce0bc23e8f4`. Re-measure before quoting them; the
@@ -36,7 +36,8 @@ agreeing with each other.
 | nextest `slow-timeout` | **one cargo test process**, which may invoke hermit zero or many times | `.config/nextest.toml`: 15s default, two named 30s overrides | `SIGTERM` to the test binary, 2s grace, then `SIGKILL` | wrapper exit 100, test named by nextest |
 | manifest cell `timeout_seconds` | **one manifest cell** | `tests/e2e/manifests/*.yaml`, per cell | `timeout --kill-after=10s Ns` around the cell command | exit 124 |
 | dagrun step `timeout` | **one DAG node**, i.e. a whole batch of cells or tests | `ci/dag/{portable,privileged}.json` | dagrun stops the step | node failure |
-| validate's nested limits | the validate run and its scope | `VALIDATE_GATE_TIMEOUT_SECONDS`, `HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS`, the scope, the node | see `ci/validate-timeout-layers-test.sh` | ladder `480 < 600 < 660 < 720` |
+| validate run budget | the whole outer validate graph | `HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS` or `--run-timeout` | dagrun stops admitting work and records unfinished nodes | incomplete validation, with named unfinished nodes |
+| validate systemd scope | the same outer run plus teardown grace | validate's safe-ci scope | systemd stops the whole process tree | outer-scope timeout |
 | `safehermit --sh-deadline` | **the whole wrapped process tree** | `bin/safehermit`, default 3600s | `systemd-run --user RuntimeMaxSec`, a **cgroup kill** | exit 124, `safehermit: bound.wall=` |
 
 Distribution of the values actually deployed today:
@@ -156,9 +157,11 @@ run is stopped by the outer rung instead, hard and unnamed. The symptom is a
 test that looks intermittently killed for no stated reason, which is why this
 belongs in a configuration check and not in a debugging session.
 
-`ci/validate-timeout-layers-test.sh` enforces this for the four validate rungs
-by pinning the exact ladder and failing closed. Nothing enforces it across the
-manifest, nextest and native rungs yet.
+`ci/validate-timeout-layers-test.sh` exercises the named DAG-step and outer-scope
+stops. `scripts/validate.rs --self-test` brackets the generated strict-compat
+per-probe budgets and proves those probes do not start a nested scheduler.
+Nothing enforces the invariant across the manifest, nextest and native rungs
+yet.
 
 ## Reading a "global default" for the manifest
 

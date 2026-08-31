@@ -137,8 +137,9 @@ explicit partial/debug mode and skips the manifest population.
 Two things worth knowing before touching this:
 
 - **The partition is the shard map, not the `group` field.**
-  `test.strict_compat` has group `test` but runs after its other test-node
-  predecessors in a separate hosted job; `setup.manifest_plan`,
+  The stable `test.strict_compat` selection alias has group `test`, expands to
+  direct `compat.*` nodes, and runs after its other test-node predecessors in a
+  separate hosted job; `setup.manifest_plan`,
   `setup.nextest`, `e2e.metadata` and `e2e.audit_compile_backend_parity_c` are
   not group `build` but execute before the remaining test side. Partitioning on
   `group` therefore does not reproduce the hosted grouping.
@@ -247,9 +248,9 @@ renamed — which it was, mid-flight, while this branch was open. Grep for the
 
 That refusal is correct: resource boxing is the runner's primary purpose and it
 declines to pretend. The canonical path avoids this topology rather than
-weakening the host-owned cgroup. Its nested strict-compatibility payload uses
-the existing explicit inner-cgroup opt-out while the outer DAG step remains
-boxed and supplies the scheduler deadline.
+weakening the host-owned cgroup. Strict compatibility is expanded into direct
+outer-DAG probes, so it neither starts an inner scheduler nor needs an inner
+cgroup opt-out.
 
 Existing evidence proves the boundary and toolchain components end to end:
 `assert-no-network.sh` passes inside the container, `cargo metadata` and a real
