@@ -2374,30 +2374,49 @@ fn self_test() -> Result<(), String> {
                     "carry bracket: lane {lane} dropped jobs env but named {jobs_env_error}"
                 ));
             }
-            if base.resource_caps.is_empty() {
-                return Err(format!("carry bracket: lane {lane} declares no resource_caps; \
-                                    the bracket would be vacuous"));
-            }
             let bad = validate_plan::ungrantable_resources(&carried);
             if !bad.is_empty() {
                 return Err(format!(
                     "grantable bracket: lane {lane} carried its caps yet still reports {} \
                      ungrantable demand(s): {:?}", bad.len(), &bad[..bad.len().min(3)]));
             }
-            // NEGATIVE: drop the caps exactly as the bug did -> must be REFUSED,
-            // and must NAME the resource rather than sleeping on it.
-            let mut stripped = carried.clone();
-            stripped.resource_caps.clear();
-            let starved = validate_plan::ungrantable_resources(&stripped);
-            if starved.is_empty() {
-                return Err(format!(
-                    "grantable bracket: lane {lane} with resource_caps CLEARED reported nothing \
-                     ungrantable -- the check is inert and would not have caught the stall"));
+            for unsupported in ["hermit_guest", "kvm"] {
+                if base.resource_caps.contains_key(unsupported)
+                    || base
+                        .steps
+                        .iter()
+                        .any(|step| step.hint.resources.contains_key(unsupported))
+                {
+                    return Err(format!(
+                        "resource-cap bracket: lane {lane} restored unsupported exclusive resource {unsupported}"
+                    ));
+                }
             }
-            let named = base.resource_caps.keys().any(|r| starved.iter().any(|b| b.contains(r)));
-            if !named {
-                return Err(format!("grantable bracket: refusal for {lane} names no resource: {:?}",
-                                   &starved[..starved.len().min(2)]));
+            let mut cleared_cap_starvation = 0;
+            if !base.resource_caps.is_empty() {
+                // NEGATIVE: drop declared caps exactly as the historical bug did
+                // -> every remaining demand must be REFUSED and named rather
+                // than sleeping forever. A lane with neither caps nor demands
+                // is valid and has no negative cap-removal case to construct.
+                let mut stripped = carried.clone();
+                stripped.resource_caps.clear();
+                let starved = validate_plan::ungrantable_resources(&stripped);
+                if starved.is_empty() {
+                    return Err(format!(
+                        "grantable bracket: lane {lane} with resource_caps CLEARED reported nothing \
+                         ungrantable -- the check is inert and would not have caught the stall"));
+                }
+                let named = base
+                    .resource_caps
+                    .keys()
+                    .any(|resource| starved.iter().any(|row| row.contains(resource)));
+                if !named {
+                    return Err(format!(
+                        "grantable bracket: refusal for {lane} names no resource: {:?}",
+                        &starved[..starved.len().min(2)]
+                    ));
+                }
+                cleared_cap_starvation = starved.len();
             }
             // NEGATIVE 2: a dropped config must be DETECTED, not tolerated.
             let defaulted = validate_plan::config_from(carried.steps.clone(), "bracket");
@@ -2408,7 +2427,7 @@ fn self_test() -> Result<(), String> {
             }
             println!("  dag-config: {lane} carries {} cap(s), default_step_timeout={}s; \
 cleared-caps refusal names {} starved step(s)",
-                     base.resource_caps.len(), base.default_step_timeout, starved.len());
+                     base.resource_caps.len(), base.default_step_timeout, cleared_cap_starvation);
         }
     }
     // The full hot path is one fused DAG and pays the exact-tree manifest audit
@@ -7537,20 +7556,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             Some("compatprep.fixtures"),
         )?);
         let profile = args.focused.as_ref().unwrap().profile();
-        let mut cfg = validate_plan::config_from(steps, &format!("compatibility matrix: {mode:?}"));
-        if mode == CompatMode::PortableStrict {
-            cfg.resource_caps.insert(
-                validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE.into(),
-                validate_plan::PORTABLE_STRICT_COMPAT_CONCURRENCY,
-            );
-            for step in &mut cfg.steps {
-                if step.group == "compat" {
-                    step.hint
-                        .resources
-                        .insert(validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE.into(), 1);
-                }
-            }
-        }
+        let cfg = validate_plan::config_from(steps, &format!("compatibility matrix: {mode:?}"));
         return Ok(Plan {
             planned_test_nodes: test_nodes_of(&cfg),
             cfg,
@@ -8739,50 +8745,6 @@ fn expand_portable_strict_compat(
         );
     }
 
-    match cfg
-        .resource_caps
-        .get(validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE)
-    {
-        Some(1) => {}
-        Some(capacity) => {
-            return Err(format!(
-                "portable lane {} capacity is {capacity}, expected the reviewed exclusive capacity 1 before expansion",
-                validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE
-            ));
-        }
-        None => {
-            return Err(format!(
-                "portable lane has no {} capacity before strict compatibility expansion",
-                validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE
-            ));
-        }
-    }
-
-    // Ordinary Hermit nodes historically consumed the lane's sole
-    // `hermit_guest` unit. Keep that exclusion after exposing sixteen
-    // compatibility probes: an ordinary node consumes the full capacity while
-    // each compat probe consumes one. Thus compat may overlap only compat;
-    // ordinary Hermit work remains one-at-a-time and cannot overlap the matrix.
-    for step in &mut cfg.steps {
-        let tag = step.tag();
-        let Some(demand) = step
-            .hint
-            .resources
-            .get_mut(validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE)
-        else {
-            continue;
-        };
-        if *demand != 1 {
-            return Err(format!(
-                "{} demands {}={}, expected 1 before strict compatibility expansion",
-                tag,
-                validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE,
-                *demand
-            ));
-        }
-        *demand = validate_plan::PORTABLE_STRICT_COMPAT_CONCURRENCY;
-    }
-
     let placeholder = cfg.steps.remove(index);
     if placeholder.cmd != STRICT_COMPAT_PLACEHOLDER_COMMAND {
         return Err(format!(
@@ -8810,7 +8772,7 @@ fn expand_portable_strict_compat(
         run_root.display()
     );
 
-    let mut probes = validate_plan::compat_nodes(
+    let probes = validate_plan::compat_nodes(
         root,
         CompatMode::PortableStrict,
         &hermit_bin.to_string_lossy(),
@@ -8818,12 +8780,6 @@ fn expand_portable_strict_compat(
         &paths,
         Some("compatprep.fixtures"),
     )?;
-    for probe in &mut probes {
-        probe
-            .hint
-            .resources
-            .insert(validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE.into(), 1);
-    }
     let expected = validate_corpus::STRICT_COMPAT_TOTAL
         - validate_corpus::portable_super_only().len();
     if probes.len() != expected {
@@ -8844,10 +8800,6 @@ fn expand_portable_strict_compat(
         );
     }
 
-    cfg.resource_caps.insert(
-        validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE.into(),
-        validate_plan::PORTABLE_STRICT_COMPAT_CONCURRENCY,
-    );
     cfg.steps.splice(index..index, std::iter::once(prep).chain(probes));
     Ok(true)
 }
@@ -8855,11 +8807,11 @@ fn expand_portable_strict_compat(
 /// Exercise the flattened strict-compatibility handoff through the real outer
 /// scheduler without running the 189-program corpus.
 ///
-/// The production plan is inspected first.  The execution half then keeps its
-/// real resource declarations and replaces only two guest commands with a
-/// barrier: both must be admitted concurrently and must observe dagrun's one
-/// outer-step identity.  A hidden serial/nested scheduler cannot satisfy that
-/// barrier, and an absent resource cap is rejected separately.
+/// The production plan is inspected first. The execution half replaces two
+/// guest commands and one ordinary Hermit command with a barrier: all three
+/// must be admitted concurrently and must observe dagrun's one outer-step
+/// identity. A hidden serial/nested scheduler or restored guest-exclusion
+/// resource cannot satisfy that barrier.
 fn portable_strict_compat_outer_dag_bracket(root: &Path) -> Result<String, String> {
     let fixture = tempfile::Builder::new()
         .prefix("validate-strict-compat-flat-")
@@ -8869,37 +8821,17 @@ fn portable_strict_compat_outer_dag_bracket(root: &Path) -> Result<String, Strin
     let run_b = fixture.path().join("run-b");
 
     let mut coexistence = validate_plan::lane_config(root, "portable")?;
-    let ordinary_tags = coexistence
-        .steps
-        .iter()
-        .filter(|step| {
-            step.hint
-                .resources
-                .get(validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE)
-                == Some(&1)
-        })
-        .map(Step::tag)
-        .collect::<BTreeSet<_>>();
-    if ordinary_tags.is_empty() {
-        return Err("strict-compat flatten: portable lane has no ordinary hermit_guest consumer".into());
-    }
     expand_portable_strict_compat(root, &run_a, &mut coexistence)?;
-    for tag in &ordinary_tags {
-        let demand = coexistence
+    if coexistence.resource_caps.contains_key("hermit_guest")
+        || coexistence
             .steps
             .iter()
-            .find(|step| step.tag() == *tag)
-            .and_then(|step| {
-                step.hint
-                    .resources
-                    .get(validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE)
-            });
-        if demand != Some(&validate_plan::PORTABLE_STRICT_COMPAT_CONCURRENCY) {
-            return Err(format!(
-                "strict-compat flatten: ordinary node {tag} demand became {demand:?}, expected the full capacity {}",
-                validate_plan::PORTABLE_STRICT_COMPAT_CONCURRENCY
-            ));
-        }
+            .any(|step| step.hint.resources.contains_key("hermit_guest"))
+    {
+        return Err(
+            "strict-compat flatten: constructed portable plan restored hermit_guest exclusion"
+                .into(),
+        );
     }
     let ordinary = coexistence
         .steps
@@ -8950,23 +8882,15 @@ fn portable_strict_compat_outer_dag_bracket(root: &Path) -> Result<String, Strin
             probes.len(), prep.deps
         ));
     }
-    if first
-        .resource_caps
-        .get(validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE)
-        != Some(&validate_plan::PORTABLE_STRICT_COMPAT_CONCURRENCY)
-        || probes.iter().any(|probe| {
-            probe
-                .hint
-                .resources
-                .get(validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE)
-                != Some(&1)
-        })
+    if first.resource_caps.contains_key("hermit_guest")
+        || first
+            .steps
+            .iter()
+            .any(|step| step.hint.resources.contains_key("hermit_guest"))
     {
-        return Err(format!(
-            "strict-compat flatten: outer resource accounting is not {} probes x 1 against capacity {}",
-            probes.len(),
-            validate_plan::PORTABLE_STRICT_COMPAT_CONCURRENCY
-        ));
+        return Err(
+            "strict-compat flatten: expansion injected a hermit_guest cap or demand".into(),
+        );
     }
     let required_prefix = " run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test --env TMPDIR=/tmp -- ";
     if probes.iter().any(|probe| !probe.cmd.contains(required_prefix)) {
@@ -9080,20 +9004,6 @@ fn portable_strict_compat_outer_dag_bracket(root: &Path) -> Result<String, Strin
         }
     }
 
-    let mut uncapped = first.clone();
-    uncapped
-        .resource_caps
-        .remove(validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE);
-    let ungrantable = validate_plan::ungrantable_resources(&uncapped);
-    if !ungrantable.iter().any(|finding| {
-        finding.contains("compat.")
-            && finding.contains(validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE)
-    }) {
-        return Err(format!(
-            "strict-compat flatten: removing the outer resource capacity did not fail closed: {ungrantable:?}"
-        ));
-    }
-
     let barrier = fixture.path().join("barrier");
     std::fs::create_dir_all(&barrier)
         .map_err(|error| format!("strict-compat flatten: cannot create barrier: {error}"))?;
@@ -9101,10 +9011,6 @@ fn portable_strict_compat_outer_dag_bracket(root: &Path) -> Result<String, Strin
         description: "strict compatibility one-scheduler execution bracket".into(),
         ..Default::default()
     };
-    execution.resource_caps.insert(
-        validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE.into(),
-        validate_plan::PORTABLE_STRICT_COMPAT_CONCURRENCY,
-    );
     let mut execution_prep = prep.clone();
     execution_prep.deps.clear();
     execution_prep.cmd = "true".into();
@@ -9123,7 +9029,7 @@ fn portable_strict_compat_outer_dag_bracket(root: &Path) -> Result<String, Strin
         let ordinary_active = barrier.join("ordinary.active");
         let observed = barrier.join(format!("{index}.observed"));
         probe.cmd = format!(
-            "set -eu; test \"${{DAGRUN_OUTER_RUN:-}}\" = {tag}; test -n \"${{DAGRUN_STEP:-}}\"; touch {active} {own}; i=0; while test ! -e {peer}; do i=$((i+1)); test \"$i\" -lt 200; sleep 0.01; done; sleep 0.1; test ! -e {ordinary_active}; rm -f -- {active}; printf '%s\\n' \"$DAGRUN_OUTER_RUN\" > {observed}",
+            "set -eu; test \"${{DAGRUN_OUTER_RUN:-}}\" = {tag}; test -n \"${{DAGRUN_STEP:-}}\"; touch {active} {own}; i=0; while test ! -e {peer} || test ! -e {ordinary_active}; do i=$((i+1)); test \"$i\" -lt 200; sleep 0.01; done; sleep 0.1; rm -f -- {active}; printf '%s\\n' \"$DAGRUN_OUTER_RUN\" > {observed}",
             tag = validate_plan::shell_quote(&tags[index]),
             active = validate_plan::shell_quote(&active.to_string_lossy()),
             own = validate_plan::shell_quote(&own.to_string_lossy()),
@@ -9139,7 +9045,7 @@ fn portable_strict_compat_outer_dag_bracket(root: &Path) -> Result<String, Strin
     let ordinary_observed = barrier.join("ordinary.observed");
     ordinary.deps = vec!["compatprep.fixtures".into()];
     ordinary.cmd = format!(
-        "set -eu; test \"${{DAGRUN_OUTER_RUN:-}}\" = {tag}; test -n \"${{DAGRUN_STEP:-}}\"; touch {active}; sleep 0.1; test ! -e {first}; test ! -e {second}; rm -f -- {active}; printf '%s\\n' \"$DAGRUN_OUTER_RUN\" > {observed}",
+        "set -eu; test \"${{DAGRUN_OUTER_RUN:-}}\" = {tag}; test -n \"${{DAGRUN_STEP:-}}\"; touch {active}; i=0; while test ! -e {first} || test ! -e {second}; do i=$((i+1)); test \"$i\" -lt 200; sleep 0.01; done; sleep 0.1; rm -f -- {active}; printf '%s\\n' \"$DAGRUN_OUTER_RUN\" > {observed}",
         tag = validate_plan::shell_quote(&ordinary.tag()),
         active = validate_plan::shell_quote(&barrier.join("ordinary.active").to_string_lossy()),
         first = validate_plan::shell_quote(&barrier.join("0.active").to_string_lossy()),
@@ -9184,7 +9090,7 @@ fn portable_strict_compat_outer_dag_bracket(root: &Path) -> Result<String, Strin
             != expected_observed
     {
         return Err(format!(
-            "strict-compat flatten: one outer scheduler did not execute both resource-accounted probes concurrently: ok={} complete={} outcomes={:?} skipped={:?} observed={observed:?}",
+            "strict-compat flatten: one outer scheduler did not execute two probes and one ordinary Hermit node concurrently: ok={} complete={} outcomes={:?} skipped={:?} observed={observed:?}",
             result.ok,
             result.complete,
             result.outcomes.iter().map(|outcome| outcome.tag.as_str()).collect::<Vec<_>>(),
@@ -9193,8 +9099,7 @@ fn portable_strict_compat_outer_dag_bracket(root: &Path) -> Result<String, Strin
     }
 
     Ok(format!(
-        "portable strict compatibility: {expected} direct outer nodes, {}-wide compat-only resource capacity with ordinary Hermit exclusion, run-unique fixture/shell/top paths, one scheduler execution",
-        validate_plan::PORTABLE_STRICT_COMPAT_CONCURRENCY
+        "portable strict compatibility: {expected} direct outer nodes without hermit_guest exclusion, run-unique fixture/shell/top paths, one scheduler execution"
     ))
 }
 
@@ -9247,17 +9152,15 @@ fn raw_run_dag_strict_compat_bracket(root: &Path) -> Result<String, String> {
             .iter()
             .filter(|step| step.group == "compat")
             .collect::<Vec<_>>();
-        let ordinary = cfg
+        let ordinary_present = cfg
             .steps
             .iter()
-            .filter(|step| {
-                step.group != "compat"
-                    && step
-                        .hint
-                        .resources
-                        .contains_key(validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE)
-            })
-            .collect::<Vec<_>>();
+            .any(|step| step.tag() == "test.hermit_modes");
+        let has_guest_exclusion = cfg.resource_caps.contains_key("hermit_guest")
+            || cfg
+                .steps
+                .iter()
+                .any(|step| step.hint.resources.contains_key("hermit_guest"));
         let expected = validate_corpus::STRICT_COMPAT_TOTAL
             - validate_corpus::portable_super_only().len();
         if compat.len() != expected
@@ -9275,26 +9178,11 @@ fn raw_run_dag_strict_compat_bracket(root: &Path) -> Result<String, String> {
                 .steps
                 .iter()
                 .any(|step| step.cmd == STRICT_COMPAT_PLACEHOLDER_COMMAND)
-            || cfg
-                .resource_caps
-                .get(validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE)
-                != Some(&validate_plan::PORTABLE_STRICT_COMPAT_CONCURRENCY)
-            || compat.iter().any(|step| {
-                step.hint
-                    .resources
-                    .get(validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE)
-                    != Some(&1)
-            })
-            || ordinary.is_empty()
-            || ordinary.iter().any(|step| {
-                step.hint
-                    .resources
-                    .get(validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE)
-                    != Some(&validate_plan::PORTABLE_STRICT_COMPAT_CONCURRENCY)
-            })
+            || has_guest_exclusion
+            || !ordinary_present
         {
             return Err(format!(
-                "raw run-dag: {label} did not receive the reviewed expansion: compat={} prep={} marker={} ordinary={} cap={:?}",
+                "raw run-dag: {label} did not receive the reviewed cap-free expansion: compat={} prep={} marker={} ordinary_present={} hermit_guest_present={has_guest_exclusion}",
                 compat.len(),
                 cfg.steps
                     .iter()
@@ -9304,9 +9192,7 @@ fn raw_run_dag_strict_compat_bracket(root: &Path) -> Result<String, String> {
                     .iter()
                     .filter(|step| step.tag() == STRICT_COMPAT_PLACEHOLDER_TAG)
                     .count(),
-                ordinary.len(),
-                cfg.resource_caps
-                    .get(validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE),
+                ordinary_present,
             ));
         }
         Ok(())

@@ -1,5 +1,5 @@
 {
-  "resource_caps": {"kvm": 1},
+  "resource_caps": {},
   "mem_cap_factor": 1.25,
   "mem_cap_floor_bytes": 8589934592,
   "outer_mem_safety_factor": 1.0,
@@ -110,7 +110,7 @@
       "cmd": "./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category applications --ci-only --allow-empty --prebuilt",
       "deps": ["build.privileged_tests", "build.manifest_guests", "e2e.metadata"],
       "timeout": 180,
-      "hint": {"resources": {"kvm": 1}, "est_duration_s": 90,
+      "hint": {"est_duration_s": 90,
                "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "latency-bound"}
     },
@@ -121,20 +121,20 @@
       "cmd": "./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --allow-empty --prebuilt",
       "deps": ["build.privileged_tests", "build.manifest_guests", "e2e.metadata"],
       "timeout": 120,
-      "hint": {"resources": {"kvm": 1}, "est_duration_s": 5,
+      "hint": {"est_duration_s": 5,
                "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "latency-bound"}
     },
     {
       "group": "test", "job": "cli_kvm",
       "desc": "All 24 run_kvm_ CLI tests",
-      "description": "Runs all KVM-specific hermit CLI tests on the privileged lane after requiring /dev/kvm and verifying that the selected inventory remains exactly 24 tests. The portable lane continues to skip run_kvm_ because these tests self-guard without /dev/kvm and would otherwise report silent passes. The kvm resource cap serializes this node with other KVM consumers.",
+      "description": "Runs all KVM-specific hermit CLI tests on the privileged lane after requiring /dev/kvm and verifying that the selected inventory remains exactly 24 tests. The portable lane continues to skip run_kvm_ because these tests self-guard without /dev/kvm and would otherwise report silent passes. KVM consumers may overlap: /dev/kvm supports multiple concurrent guests, and no repository or host constraint establishes it as an exclusive resource.",
       "requires_host_capability": "kvm",
       "cmd": "set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f \"$log\"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] | length == 24' \"$log\" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\\n' >&2; exit 1; fi; NEXTEST_EXPECTED_EXECUTED=24 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?",
       "integration_test_binaries": ["cli"],
       "deps": ["build.privileged_tests"],
       "timeout": 180,
-      "hint": {"resources": {"kvm": 1}, "est_duration_s": 60,
+      "hint": {"est_duration_s": 60,
                "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "cpu-bound"}
     }

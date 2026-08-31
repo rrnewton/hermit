@@ -73,10 +73,9 @@ A successful PR run on 2026-07-26 provided the baseline:
 
 The diagnostics now run in the scheduled `super` tier. The portable plan uses a 14 GiB memory budget, which the current model
 maps to `-j 2` on the 16 GiB portable runner. Compile, lint, documentation, unit,
-and contract nodes may overlap when dependencies allow, while Hermit guest
-executions retain the
-`hermit_guest: 1` exclusion. Per-node performance reports are uploaded from
-every run so estimates can be replaced with measurements.
+contract, and Hermit guest nodes may overlap when dependencies and memory allow.
+Per-node performance reports are uploaded from every run so estimates can be
+replaced with measurements.
 
 ### Relationship to local validation
 
@@ -291,23 +290,16 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
 
 **Outer** — how many gates may co-run:
 
-- `resource_caps` gates *scarce* resources. `portable.json` keeps
-  `{"hermit_guest": 1, "manifest_guest": 8}`. Legacy guest gates request the
-  single `hermit_guest` slot, so they run **one at a time** (they share the
-  working filesystem, are mutually nondeterministic, and on a PMU host contend
-  for the counter). When validate expands strict compatibility, it represents
-  the same exclusion at a scale of sixteen: ordinary consumers take all sixteen
-  `hermit_guest` units and each direct `compat.*` probe takes one. Compatibility
-  probes may therefore overlap each other, but never an ordinary Hermit gate.
-  Ordinary manifest buckets use disjoint cell trees and
-  request one `manifest_guest` slot after the shared build barrier. The two
-  high-width buckets, `backend-parity-c` and `c-programs`, request all eight
-  `manifest_guest` slots plus the portable `hermit_guest` slot, so neither can
-  overlap another manifest bucket or legacy Hermit guest gate. Reducing their
-  blocking width from 20 to 8 deliberately removes 20-way manifest pressure
-  coverage from ordinary validation; it does not change the selected cells or
-  their strict comparator. Non-guest gates carry no scarce resource and
-  parallelize freely. `privileged.json` caps only `{"kvm": 1}`. The PMU is
+- `resource_caps` gates *scarce* resources. `portable.json` keeps only
+  `{"manifest_guest": 8}`. Ordinary manifest buckets use disjoint cell trees
+  and request one slot after the shared build barrier. The two high-width
+  buckets, `backend-parity-c` and `c-programs`, request all eight slots and pass
+  `--jobs 8`, so they do not overlap another manifest bucket while retaining
+  the measured worker width. Legacy Hermit guest gates and direct strict
+  compatibility probes have no shared scarce-resource demand; they may overlap
+  when dependencies, the outer scheduler width, and memory allow.
+  `privileged.json` declares no resource cap: `/dev/kvm` supports concurrent
+  guests, so its three consumers may overlap. The PMU is
   **not** a scarce resource and carries no cap: reverie
   measures retired conditional branches with per-task (`cpu = -1`) counters that
   the kernel context-switches, so only the running task's counters need be
@@ -346,14 +338,12 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
 
 ## Conservatism and how to relax it
 
-The ordinary `hermit_guest` serialization faithfully reproduces
-`scripts/validate.rs`, which ran these gates strictly one-after-another. The
-strict compatibility expansion preserves that exclusion while allowing its own
-run-isolated probes to use the reviewed sixteen-wide limit. It is intentionally
-conservative: as individual guest gates are shown to be safe to co-run (e.g.
-distinct scratch directories, no shared fixture), their demand can be changed
-with corresponding execution evidence. The DAG shape and dependencies stay the
-same.
+The remaining `manifest_guest` cap limits one real worker population. Ordinary
+manifest buckets consume one slot; the two explicit eight-worker buckets consume
+all eight so their own worker count, rather than overlapping sibling buckets, is
+the pressure under test. Legacy guest gates, direct strict compatibility probes,
+and KVM consumers are bounded by their existing dependencies, CPU and memory
+declarations rather than a synthetic exclusive resource.
 
 The former `pmu: 1` cap (and the matching `flock /tmp/hermit-privileged-pmu.lock`
 in the workflows, plus the `pmu-serial` runner label) were retired: they guarded
