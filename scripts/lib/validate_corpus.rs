@@ -147,6 +147,11 @@ pub fn portable_diagnostic() -> BTreeMap<&'static str, &'static str> {
             "df",
             "tracked in #2801: mountinfo exposes Hermit's host-TMPDIR backing paths",
         ),
+        // TODO(#2897): remove once the temporary-directory getdents64 payload is deterministic.
+        (
+            "ranlib",
+            "tracked in #2897: ranlib's temporary-directory getdents64 payload diverges",
+        ),
         ("top", "live process-table reads differ on the GitHub-managed portable runner"),
         ("zstd", "timed out on the GitHub-managed portable no-PMU runner"),
         ("zstd-roundtrip", "timed out on the GitHub-managed portable no-PMU runner"),
