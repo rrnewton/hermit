@@ -120,7 +120,21 @@ fn controller_diagnostics(path: Option<&Path>) -> String {
 }
 
 fn run_bounded(mut command: Command, label: &str, diagnostic_log: Option<&Path>) -> Output {
+    // Verification observes the guest's current directory. The source checkout is shared by
+    // concurrent validation nodes, so Cargo or another test can change its metadata or entries
+    // between Run1 and Run2. Keep this invocation in one empty directory until both runs and
+    // their comparison have completed.
+    let working_directory = tempfile::Builder::new()
+        .prefix("sabre-working-directory-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap_or_else(|error| panic!("failed to create {label} working directory: {error}"));
     command
+        .current_dir(working_directory.path())
+        // Bash validates inherited PWD and OLDPWD by statting their path components. Leave them
+        // unset so it obtains the same directory through getcwd without observing mutable
+        // ancestors of this validation checkout.
+        .env_remove("PWD")
+        .env_remove("OLDPWD")
         .process_group(0)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

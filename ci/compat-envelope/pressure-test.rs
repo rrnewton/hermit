@@ -182,7 +182,7 @@ Commands:
       checks against the same clean committed source. Use --green with
       --repetitions to select enabled green cells instead; an exact cell, --mode,
       and --sample may narrow either population. Existing resource
-      caps allow at most four manifest guests at once and at most one KVM guest.
+      caps allow at most four manifest guests at once, including KVM guests.
       This reports per-cell flakiness; it never edits or demotes the scorecard.
       Only unfiltered --green covers the complete current green set; an exact
       cell, --mode, or --sample is partial evidence.
@@ -211,7 +211,7 @@ Exact-cell options (run and plan):
                            jobs, or selected green cells with --green. COUNT must
                            be positive. Plan and run
                            require a clean commit. At most four manifest guests
-                           run at once, and KVM remains limited to one.
+                           run at once, including KVM guests.
   --run-id-prefix ID       Bind each retained result to this physical invocation.
                            Accepted only with one exact repeated cell; letters,
                            digits, '.', '_', and '-' only.
@@ -233,8 +233,7 @@ Selection and bounded-batch options (run and plan):
   --run-timeout SECONDS    Whole-run WALL-CLOCK bound (default 7200). This is
                            not a CPU budget and never weakens per-cell limits.
   --jobs COUNT             Fixed safe-ci scheduler pool (default 4). Named
-                           resource caps still limit manifest guests to four
-                           and KVM guests to one.
+                           resource caps still limit manifest guests to four.
 
 Examples:
   # Probe one currently red ptrace/verify cell with a 60-second boxed wall cap.
@@ -278,7 +277,7 @@ How it runs:
   recursively running the full validation metadata audit. Fixture preparation
   is serialized. Every selected-cell repetition then runs in its own safe-ci
   cgroup. Existing resource caps admit
-  four manifest guests at once and one KVM guest. A failure, timeout, OOM, or missing result does not
+  four manifest guests at once, including KVM guests. A failure, timeout, OOM, or missing result does not
   intentionally stop later selected checks.
   The combined crash/error bucket contains remaining nonzero harness exits,
   including signal-caused crashes when the shell reports a nonzero status; the
@@ -2332,7 +2331,6 @@ fn require_cell_occupancy_fits(
             .to_string()
     })?;
     let mut all_seconds = 0_i64;
-    let mut kvm_seconds = 0_i64;
     for tracked in cells {
         let budget = budgets
             .get(&(
@@ -2355,24 +2353,17 @@ fn require_cell_occupancy_fits(
             "the selected cells make the declared pressure-test occupancy exceed the supported integer range"
                 .to_string()
         })?;
-        if tracked.id.backend == "kvm" {
-            kvm_seconds = kvm_seconds.checked_add(seconds).ok_or_else(|| {
-                "the selected KVM cells make the declared pressure-test occupancy exceed the supported integer range"
-                    .to_string()
-            })?;
-        }
     }
-    // The generated graph permits at most four manifest guests, and at most one
-    // KVM guest, at a time. If every selected cell consumes its declared cap,
-    // these resource limits impose this minimum wall time even before build and
-    // preparation work. Refuse an impossible public bound instead of printing a
-    // command which cannot satisfy its own contract.
+    // The generated graph permits at most four manifest guests at a time. If
+    // every selected cell consumes its declared cap, this resource limit imposes
+    // this minimum wall time even before build and preparation work. Refuse an
+    // impossible public bound instead of printing a command which cannot satisfy
+    // its own contract.
     let guest_width = jobs.clamp(1, 4);
-    let guest_floor = all_seconds / guest_width + i64::from(all_seconds % guest_width != 0);
-    let occupancy_floor = guest_floor.max(kvm_seconds);
+    let occupancy_floor = all_seconds / guest_width + i64::from(all_seconds % guest_width != 0);
     if occupancy_floor >= run_timeout_seconds {
         return Err(format!(
-            "selected {} cell run(s) have at least {occupancy_floor}s of declared worst-case cell occupancy at -j {jobs}, manifest_guest=4, and kvm=1, which cannot fit the {run_timeout_seconds}s whole-run WALL bound; use --sample (and optionally --cell-timeout), reduce --repetitions, or deliberately raise --run-timeout",
+            "selected {} cell run(s) have at least {occupancy_floor}s of declared worst-case cell occupancy at -j {jobs} and manifest_guest=4, which cannot fit the {run_timeout_seconds}s whole-run WALL bound; use --sample (and optionally --cell-timeout), reduce --repetitions, or deliberately raise --run-timeout",
             i64::try_from(cells.len())
                 .unwrap_or(i64::MAX)
                 .saturating_mul(repetitions)
@@ -2839,10 +2830,7 @@ fn write_plan_after_scorecard_check(
             } else {
                 3_i64 * 1024 * 1024 * 1024
             };
-            let mut resources = BTreeMap::from([("manifest_guest".into(), 1)]);
-            if cell.backend == "kvm" {
-                resources.insert("kvm".into(), 1);
-            }
+            let resources = BTreeMap::from([("manifest_guest".into(), 1)]);
             let deps = selected_cell_dependencies(
                 selection.is_exact(),
                 selection.uses_shared_preparation(),
@@ -2955,11 +2943,8 @@ fn write_plan_after_scorecard_check(
 
     let max_timeout = steps.iter().map(|step| step.timeout).max().unwrap_or(120);
     let mut dag = canonical;
-    dag.resource_caps = BTreeMap::from([
-        ("cargo_writer".into(), 1),
-        ("manifest_guest".into(), 4),
-        ("kvm".into(), 1),
-    ]);
+    dag.resource_caps =
+        BTreeMap::from([("cargo_writer".into(), 1), ("manifest_guest".into(), 4)]);
     dag.default_step_timeout = max_timeout;
     dag.default_step_cpu_timeout = max_timeout * 2;
     dag.steps = steps;
@@ -6314,7 +6299,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             .cmd
             .contains("cargo build --release --locked -p hermit --bin hermit")
         || repeated_dag.resource_caps.get("manifest_guest") != Some(&4)
-        || repeated_dag.resource_caps.get("kvm") != Some(&1)
+        || repeated_dag.resource_caps.contains_key("kvm")
     {
         return Err(
             "repeated exact plan lost its shared direct build, preparation, cells, or resource caps, or reintroduced the recursive metadata audit"
