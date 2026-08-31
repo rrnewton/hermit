@@ -48,6 +48,7 @@ use super::deterministic_stdio_inode;
 use crate::config::SchedHeuristic;
 use crate::dirents::*;
 use crate::fd::*;
+use crate::procfs::MountInfoSnapshot;
 use crate::procfs::ProcfsFile;
 use crate::procfs::ProcfsSnapshotContext;
 use crate::record_or_replay::RecordOrReplay;
@@ -1327,11 +1328,54 @@ impl<T: RecordOrReplay> Detcore<T> {
                 mapping_identities.insert((raw_dev, raw_inode), (det_dev, det_inode.as_raw()));
             }
         }
+        let mountinfo = if guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_mountinfo_identities())?
+        {
+            let rows = crate::procfs::parse_mountinfo(&contents).ok_or_else(|| {
+                Error::Tool(anyhow::anyhow!(
+                    "kernel returned malformed /proc/*/mountinfo"
+                ))
+            })?;
+            let mut raw_devices = Vec::new();
+            let mut seen_devices = BTreeSet::new();
+            for row in &rows {
+                if seen_devices.insert(row.raw_device) {
+                    raw_devices.push(row.raw_device);
+                }
+            }
+            let mut devices = BTreeMap::new();
+            for raw in raw_devices {
+                devices.insert(raw, determinize_device(guest, raw).await);
+            }
+            let mut root_rewrites = BTreeMap::new();
+            for rewrite in &guest.config().mountinfo_root_rewrites {
+                if root_rewrites
+                    .insert(rewrite.raw_mount_id, rewrite.deterministic_root.clone())
+                    .is_some()
+                {
+                    return Err(Error::Tool(anyhow::anyhow!(
+                        "duplicate proven mountinfo root rewrite for mount ID {}",
+                        rewrite.raw_mount_id
+                    )));
+                }
+            }
+            Some(
+                MountInfoSnapshot::new(rows, devices, root_rewrites).ok_or_else(|| {
+                    Error::Tool(anyhow::anyhow!(
+                        "mountinfo snapshot did not contain each proven mount exactly once"
+                    ))
+                })?,
+            )
+        } else {
+            None
+        };
         guest.thread_state().with_detfd(call.fd(), |detfd| {
             detfd.initialize_procfs(
                 contents.clone(),
                 ProcfsSnapshotContext {
                     mapping_identities: mapping_identities.clone(),
+                    mountinfo: mountinfo.clone(),
                     virtual_uptime_seconds,
                     virtual_realtime_seconds,
                     virtual_memory_kb,

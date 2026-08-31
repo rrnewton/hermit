@@ -31,6 +31,21 @@ const fn default_true() -> bool {
     true
 }
 
+/// One mount row whose kernel-private root must be replaced before it becomes
+/// guest-visible.
+///
+/// The CLI populates this only after proving, with held file descriptors in the
+/// completed mount namespace, that the mount is one Hermit created.  The raw
+/// mount ID is namespace-local, so these entries are valid only for the one
+/// container run whose configuration carries them.
+#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
+pub struct MountInfoRootRewrite {
+    /// Mount ID read from the held target descriptor's `/proc/self/fdinfo`.
+    pub raw_mount_id: u64,
+    /// Stable guest-visible replacement for the row's root field.
+    pub deterministic_root: Vec<u8>,
+}
+
 /// Configuration options for detcore.
 #[derive(Debug, Serialize, Deserialize, Clone, Parser)]
 pub struct Config {
@@ -188,6 +203,15 @@ pub struct Config {
     /// of the real metadata returned by `fstat`, implies `virtualize_time`.
     #[clap(long = "no-virtualize-metadata", action = clap::ArgAction::SetFalse)]
     pub virtualize_metadata: bool,
+
+    /// Proven Hermit-owned mount roots to hide from `/proc/*/mountinfo`.
+    ///
+    /// This is runtime provenance, not a user option.  `serde(default)` keeps
+    /// older serialized configurations compatible and makes backends which do
+    /// not use the common container setup explicitly receive no rewrite claim.
+    #[serde(default)]
+    #[clap(skip)]
+    pub mountinfo_root_rewrites: Vec<MountInfoRootRewrite>,
 
     /// Sequentialize thread execution deterministically.
     #[clap(long)]
@@ -1299,6 +1323,17 @@ mod tests {
         assert!(!config.backend_requires_thread_directed_process_signals);
         assert!(!config.backend_virtualizes_capability_prctls);
         assert!(!config.backend_defers_vfork_child_registration);
+    }
+
+    #[test]
+    fn missing_mountinfo_provenance_deserializes_as_empty() {
+        let mut value = serde_json::to_value(Config::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("mountinfo_root_rewrites");
+        let restored: Config = serde_json::from_value(value).unwrap();
+        assert!(restored.mountinfo_root_rewrites.is_empty());
     }
 
     #[test]

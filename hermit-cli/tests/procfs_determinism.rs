@@ -7,6 +7,7 @@
  */
 
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
@@ -26,6 +27,14 @@ fn read_procfs(path: &str) -> Vec<u8> {
 }
 
 fn read_procfs_at_epoch(path: &str, epoch: Option<&str>) -> Vec<u8> {
+    read_procfs_with(path, epoch, |_| {})
+}
+
+fn read_procfs_with(
+    path: &str,
+    epoch: Option<&str>,
+    configure: impl FnOnce(&mut Command),
+) -> Vec<u8> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command.args([
         "--log=error",
@@ -37,6 +46,7 @@ fn read_procfs_at_epoch(path: &str, epoch: Option<&str>) -> Vec<u8> {
     if let Some(epoch) = epoch {
         command.arg(format!("--epoch={epoch}"));
     }
+    configure(&mut command);
     command.args(["--", "/bin/cat", path]);
     let rendered = format!("{command:?}");
     let output = command
@@ -480,27 +490,60 @@ fn proc_rtc_tracks_custom_epoch_and_virtual_time() {
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-873): Review mountinfo and UUID snapshots.
 #[test]
-fn proc_self_mountinfo_hides_private_temp_roots() {
-    fn private_mount_records() -> Vec<String> {
-        let contents = read_procfs("/proc/self/mountinfo");
-        let text = std::str::from_utf8(&contents).expect("mountinfo should be UTF-8");
-        assert!(!text.contains("/tmpvol/.tmp"));
-        text.lines()
-            .filter(|line| line.contains("/tmpvol/.hermit/"))
-            .filter_map(|line| line.split_once(" /tmpvol/.hermit/"))
-            .map(|(_, stable)| format!("/tmpvol/.hermit/{stable}"))
-            .collect()
-    }
-
+fn proc_self_mountinfo_is_deterministic() {
     let _guard = hermit_run_lock();
-    let first = private_mount_records();
+    let host_tmpdir = tempfile::tempdir().expect("host TMPDIR");
+    let read = || {
+        read_procfs_with("/proc/self/mountinfo", None, |command| {
+            command.env("TMPDIR", host_tmpdir.path());
+        })
+    };
+    let first = read();
     for run in 2..=RUNS {
-        assert_eq!(
-            first,
-            private_mount_records(),
-            "private mount records differed between run 1 and run {run}"
-        );
+        assert_eq!(first, read(), "mountinfo differed on run {run}");
     }
+    {
+        let contents = &first;
+        let text = std::str::from_utf8(contents).expect("mountinfo should be UTF-8");
+        assert!(!text.contains("/tmpvol/.tmp"));
+        assert!(text.lines().all(|line| line.contains(" - ")));
+        assert!(text.contains(" /tmpvol/.hermit/"));
+    }
+}
+
+#[test]
+fn proc_self_mountinfo_preserves_user_mount_with_tempfile_shape() {
+    let _guard = hermit_run_lock();
+    let mut user_group = tempfile::Builder::new()
+        .prefix(".tmp")
+        .rand_bytes(6)
+        .tempfile_in("/tmp")
+        .expect("create user-controlled tempfile-shaped group file");
+    writeln!(user_group, "root:x:0:").expect("populate user group file");
+    let contents = read_procfs_with("/proc/self/mountinfo", None, |command| {
+        command.arg(format!(
+            "--mount=type=bind,source={},target=/etc/group",
+            user_group.path().display()
+        ));
+    });
+    let text = std::str::from_utf8(&contents).expect("mountinfo should be UTF-8");
+    let group_rows = text
+        .lines()
+        .filter(|line| line.split(' ').nth(4) == Some("/etc/group"))
+        .collect::<Vec<_>>();
+    assert!(!group_rows.is_empty(), "mountinfo must contain /etc/group");
+    assert!(
+        group_rows
+            .iter()
+            .all(|row| !row.contains("/tmpvol/.hermit/etc/group")),
+        "a user-supplied mount must not be represented as Hermit-owned: {group_rows:?}"
+    );
+    assert!(
+        group_rows
+            .iter()
+            .any(|row| row.contains(user_group.path().file_name().unwrap().to_str().unwrap())),
+        "the user-supplied tempfile-shaped root must be preserved: {group_rows:?}"
+    );
 }
 
 #[test]

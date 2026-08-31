@@ -390,6 +390,77 @@ pub(crate) struct TimerSlackReadPreview {
     offset: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MountInfoRow {
+    pub(crate) raw_mount_id: u64,
+    pub(crate) raw_parent_id: u64,
+    pub(crate) raw_device: u64,
+    pub(crate) raw_peer_groups: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MountInfoSnapshot {
+    pub(crate) rows: Vec<MountInfoRow>,
+    pub(crate) mount_ids: BTreeMap<u64, u64>,
+    pub(crate) devices: BTreeMap<u64, u64>,
+    pub(crate) peer_groups: BTreeMap<u64, u64>,
+    pub(crate) root_rewrites: BTreeMap<u64, Vec<u8>>,
+}
+
+impl MountInfoSnapshot {
+    /// Build namespace-local identities from one kernel snapshot.
+    ///
+    /// Visible mount IDs are assigned in row order before parent-only IDs.
+    /// Thus a forward parent reference maps to the same identity as its later
+    /// row, a self-parent stays self-parent, and a parent outside the visible
+    /// snapshot still receives a stable distinct ID.  Mount and propagation
+    /// IDs are intentionally scoped to this snapshot because Linux scopes both
+    /// to a mount namespace; a run-global raw-ID pool can alias two namespaces.
+    pub(crate) fn new(
+        rows: Vec<MountInfoRow>,
+        devices: BTreeMap<u64, u64>,
+        root_rewrites: BTreeMap<u64, Vec<u8>>,
+    ) -> Option<Self> {
+        let visible_mounts = rows
+            .iter()
+            .map(|row| row.raw_mount_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        if visible_mounts.len() != rows.len()
+            || !root_rewrites
+                .keys()
+                .all(|mount_id| visible_mounts.contains(mount_id))
+        {
+            return None;
+        }
+
+        let mut mount_ids = BTreeMap::new();
+        for row in &rows {
+            let next = mount_ids.len() as u64 + 1;
+            mount_ids.entry(row.raw_mount_id).or_insert(next);
+        }
+        for row in &rows {
+            let next = mount_ids.len() as u64 + 1;
+            mount_ids.entry(row.raw_parent_id).or_insert(next);
+        }
+
+        let mut peer_groups = BTreeMap::new();
+        for row in &rows {
+            for &raw in &row.raw_peer_groups {
+                let next = peer_groups.len() as u64 + 1;
+                peer_groups.entry(raw).or_insert(next);
+            }
+        }
+
+        Some(Self {
+            rows,
+            mount_ids,
+            devices,
+            peer_groups,
+            root_rewrites,
+        })
+    }
+}
+
 /// Guest-visible values used to normalize one procfs snapshot.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ProcfsSnapshotContext {
@@ -412,6 +483,7 @@ pub(crate) struct ProcfsSnapshotContext {
     /// exactly as `fdinfo_identity` above is built, and this table is only a
     /// lookup for rendering.
     pub(crate) mapping_identities: BTreeMap<(u64, u64), (u64, u64)>,
+    pub(crate) mountinfo: Option<MountInfoSnapshot>,
     pub(crate) random_uuid: Option<[u8; 16]>,
 }
 
@@ -454,7 +526,7 @@ impl ProcfsFile {
             "/proc/sys/fs/dentry-state" => ProcfsKind::DentryState,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-873): Review deterministic kernel pseudo-file snapshots.
-            "/proc/self/mountinfo" => ProcfsKind::Mountinfo,
+            other if is_process_file_path(other, "mountinfo") => ProcfsKind::Mountinfo,
             "/proc/sys/kernel/random/uuid" => ProcfsKind::RandomUuid,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-933): Review host-global AIO count normalization.
@@ -613,6 +685,10 @@ impl ProcfsFile {
         matches!(self.kind, ProcfsKind::Maps | ProcfsKind::Smaps)
     }
 
+    pub(crate) fn needs_mountinfo_identities(&self) -> bool {
+        self.kind == ProcfsKind::Mountinfo
+    }
+
     pub(crate) fn needs_snapshot(&self) -> bool {
         !matches!(self.kind, ProcfsKind::TimerSlack(_)) && self.contents.is_none()
     }
@@ -662,6 +738,7 @@ impl ProcfsFile {
             fdinfo_identity,
             random_uuid,
             mapping_identities,
+            mountinfo,
         } = context;
         let mapping_identities = &mapping_identities;
         self.contents = Some(match &self.kind {
@@ -755,7 +832,12 @@ impl ProcfsFile {
             ProcfsKind::ModuleRefcnt(module) => {
                 sanitize_module_refcnt(&contents, module.as_str(), &read_host_modules())
             }
-            ProcfsKind::Mountinfo => sanitize_mountinfo(&contents),
+            ProcfsKind::Mountinfo => sanitize_mountinfo(
+                &contents,
+                mountinfo
+                    .as_ref()
+                    .expect("mountinfo identities were not prepared"),
+            ),
             ProcfsKind::RandomUuid => sanitize_random_uuid(
                 &contents,
                 random_uuid.expect("random UUID snapshot omitted deterministic bytes"),
@@ -3169,65 +3251,122 @@ fn sanitize_schedstat(contents: &[u8]) -> Vec<u8> {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-873): Review private mount-root normalization.
-fn sanitize_mountinfo(contents: &[u8]) -> Vec<u8> {
-    fn is_private_temp_root(root: &[u8]) -> bool {
-        fn is_tempfile_name(name: &[u8]) -> bool {
-            let Some(suffix) = name.strip_prefix(b".tmp") else {
-                return false;
-            };
-            suffix.len() == 6 && suffix.iter().all(u8::is_ascii_alphanumeric)
-        }
+const MOUNT_PEER_PREFIXES: [&[u8]; 3] = [b"shared:", b"master:", b"propagate_from:"];
 
-        let Some(separator) = root.iter().rposition(|byte| *byte == b'/') else {
-            return false;
-        };
-        let (parent, name) = root.split_at(separator);
-        if !is_tempfile_name(&name[1..]) {
-            return false;
-        }
+fn decimal_bytes(field: &[u8]) -> Option<u64> {
+    parse_decimal(std::str::from_utf8(field).ok()?)
+}
 
-        if parent == b"/tmp" || parent == b"/tmpvol" {
-            return true;
+fn mount_peer_group(field: &[u8]) -> Result<Option<(&'static [u8], u64)>, ()> {
+    for prefix in MOUNT_PEER_PREFIXES {
+        if let Some(raw) = field.strip_prefix(prefix) {
+            return decimal_bytes(raw).map(|id| Some((prefix, id))).ok_or(());
         }
-
-        // Validation gives each run a Python `tempfile.mkdtemp(prefix="v")`
-        // directory under host /tmp. Hermit's own `.tmpXXXXXX` directory is
-        // therefore one level below the `/tmpvol` mount root seen by guests.
-        let Some(validate_root) = parent.strip_prefix(b"/tmpvol/") else {
-            return false;
-        };
-        validate_root.len() == 9
-            && validate_root[0] == b'v'
-            && validate_root[1..]
-                .iter()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
     }
+    Ok(None)
+}
 
+fn parse_mountinfo_row(line: &[u8]) -> Option<MountInfoRow> {
+    let fields = line.split(|byte| *byte == b' ').collect::<Vec<_>>();
+    if fields.iter().any(|field| field.is_empty()) {
+        return None;
+    }
+    let separator = fields.iter().position(|field| *field == b"-")?;
+    if separator < 6 || separator + 4 != fields.len() {
+        return None;
+    }
+    let mut device = fields[2].split(|byte| *byte == b':');
+    let major = u32::try_from(decimal_bytes(device.next()?)?).ok()?;
+    let minor = u32::try_from(decimal_bytes(device.next()?)?).ok()?;
+    if device.next().is_some() {
+        return None;
+    }
+    let mut raw_peer_groups = Vec::new();
+    for field in &fields[6..separator] {
+        if let Some((_, raw)) = mount_peer_group(field).ok()? {
+            raw_peer_groups.push(raw);
+        }
+    }
+    Some(MountInfoRow {
+        raw_mount_id: decimal_bytes(fields[0])?,
+        raw_parent_id: decimal_bytes(fields[1])?,
+        raw_device: libc::makedev(major, minor),
+        raw_peer_groups,
+    })
+}
+
+pub(crate) fn parse_mountinfo(contents: &[u8]) -> Option<Vec<MountInfoRow>> {
+    let body = contents.strip_suffix(b"\n").unwrap_or(contents);
+    if body.is_empty() {
+        return None;
+    }
+    body.split(|byte| *byte == b'\n')
+        .map(parse_mountinfo_row)
+        .collect()
+}
+
+fn sanitize_mountinfo(contents: &[u8], snapshot: &MountInfoSnapshot) -> Vec<u8> {
     let mut normalized = Vec::with_capacity(contents.len());
+    let mut rows = snapshot.rows.iter();
+    let mut rewritten_roots = 0;
     for line in contents.split_inclusive(|byte| *byte == b'\n') {
         let has_newline = line.last() == Some(&b'\n');
         let body = line.strip_suffix(b"\n").unwrap_or(line);
+        let row = rows.next().expect("validated mountinfo row disappeared");
         let fields = body.split(|byte| *byte == b' ').collect::<Vec<_>>();
-
-        if fields.len() >= 5 && is_private_temp_root(fields[3]) {
-            for (index, field) in fields.iter().enumerate() {
-                if index > 0 {
-                    normalized.push(b' ');
-                }
-                if index == 3 {
-                    normalized.extend_from_slice(b"/tmpvol/.hermit");
-                    normalized.extend_from_slice(fields[4]);
-                } else {
-                    normalized.extend_from_slice(field);
-                }
+        let separator = fields
+            .iter()
+            .position(|field| *field == b"-")
+            .expect("validated mountinfo separator disappeared");
+        for (index, field) in fields.iter().enumerate() {
+            if index > 0 {
+                normalized.push(b' ');
             }
-        } else {
-            normalized.extend_from_slice(body);
+            match index {
+                0 | 1 => {
+                    let raw = if index == 0 {
+                        row.raw_mount_id
+                    } else {
+                        row.raw_parent_id
+                    };
+                    normalized.extend_from_slice(snapshot.mount_ids[&raw].to_string().as_bytes());
+                }
+                2 => {
+                    let device = snapshot.devices[&row.raw_device];
+                    normalized.extend_from_slice(
+                        format!("{}:{}", libc::major(device), libc::minor(device)).as_bytes(),
+                    );
+                }
+                3 if snapshot.root_rewrites.contains_key(&row.raw_mount_id) => {
+                    normalized.extend_from_slice(&snapshot.root_rewrites[&row.raw_mount_id]);
+                    rewritten_roots += 1;
+                }
+                6.. if index < separator => match mount_peer_group(field)
+                    .expect("validated mountinfo peer group became malformed")
+                {
+                    Some((prefix, raw)) => {
+                        normalized.extend_from_slice(prefix);
+                        normalized
+                            .extend_from_slice(snapshot.peer_groups[&raw].to_string().as_bytes());
+                    }
+                    None => normalized.extend_from_slice(field),
+                },
+                _ => normalized.extend_from_slice(field),
+            }
         }
         if has_newline {
             normalized.push(b'\n');
         }
     }
+    assert!(
+        rows.next().is_none(),
+        "validated mountinfo row count changed"
+    );
+    assert_eq!(
+        rewritten_roots,
+        snapshot.root_rewrites.len(),
+        "a proven mountinfo root rewrite did not identify exactly one row"
+    );
     normalized
 }
 
@@ -4241,34 +4380,149 @@ Rss:                   4 kB\n" as &[u8];
     fn recognizes_mount_and_random_uuid_paths() {
         for (path, kind) in [
             ("/proc/self/mountinfo", ProcfsKind::Mountinfo),
+            ("/proc/thread-self/mountinfo", ProcfsKind::Mountinfo),
+            ("/proc/37/mountinfo", ProcfsKind::Mountinfo),
+            ("/proc/self/task/38/mountinfo", ProcfsKind::Mountinfo),
+            ("/proc/37/task/38/mountinfo", ProcfsKind::Mountinfo),
             ("/proc/sys/kernel/random/uuid", ProcfsKind::RandomUuid),
         ] {
             assert_eq!(ProcfsFile::from_path(Path::new(path)).unwrap().kind, kind);
         }
+        for path in [
+            "/proc/task/mountinfo",
+            "/proc/37/task/self/mountinfo",
+            "/proc/37/task/38/mountinfo/extra",
+        ] {
+            assert!(ProcfsFile::from_path(Path::new(path)).is_none());
+        }
+    }
+
+    fn mountinfo_snapshot(contents: &[u8], devices: BTreeMap<u64, u64>) -> MountInfoSnapshot {
+        mountinfo_snapshot_with_rewrites(contents, devices, BTreeMap::new())
+    }
+
+    fn mountinfo_snapshot_with_rewrites(
+        contents: &[u8],
+        devices: BTreeMap<u64, u64>,
+        root_rewrites: BTreeMap<u64, Vec<u8>>,
+    ) -> MountInfoSnapshot {
+        let rows = parse_mountinfo(contents).unwrap();
+        MountInfoSnapshot::new(rows, devices, root_rewrites).unwrap()
     }
 
     #[test]
-    fn private_mount_roots_are_guest_stable() {
-        let input = b"37 29 0:31 /tmpvol/.tmpAb12Z9 /tmp rw - btrfs /dev/md0 rw\n38 29 0:31 /host/data /data ro - btrfs /dev/md0 ro\n39 29 0:31 /tmp/.tmp654321 /etc/group ro - btrfs /dev/md0 ro\n40 29 0:31 /tmpvol/v_45e4xci/.tmpxZruR5 /run/nscd ro - btrfs /dev/md0 rw\n41 29 0:31 /tmpvol/vabcdefgh/.tmp123abc /etc/group ro - btrfs /dev/md0 rw\n";
+    fn only_proven_private_mount_roots_are_guest_stable() {
+        let input = b"37 29 0:31 /tmpvol/.tmpAb12Z9 /tmp rw - btrfs /dev/md0 rw\n38 29 0:31 /host/data /data ro - btrfs /dev/md0 ro\n39 29 0:31 /tmp/.tmp654321 /etc/group ro - btrfs /dev/md0 ro\n40 29 0:31 /arbitrary/host/tmpdir/.tmpxZruR5 /run/nscd ro - btrfs /dev/md0 rw\n41 29 0:31 /another/place/.tmp123abc /etc/group ro - btrfs /dev/md0 rw\n42 29 0:31 /stacked/.tmpABC123 /tmp rw - btrfs /dev/md0 rw\n";
+        let device = libc::makedev(0, 31);
+        let snapshot = mountinfo_snapshot_with_rewrites(
+            input,
+            BTreeMap::from([(device, device)]),
+            BTreeMap::from([
+                (37, b"/tmpvol/.hermit/tmp".to_vec()),
+                (39, b"/tmpvol/.hermit/etc/group".to_vec()),
+                (40, b"/tmpvol/.hermit/run/nscd".to_vec()),
+            ]),
+        );
         assert_eq!(
-            sanitize_mountinfo(input),
-            b"37 29 0:31 /tmpvol/.hermit/tmp /tmp rw - btrfs /dev/md0 rw\n38 29 0:31 /host/data /data ro - btrfs /dev/md0 ro\n39 29 0:31 /tmpvol/.hermit/etc/group /etc/group ro - btrfs /dev/md0 ro\n40 29 0:31 /tmpvol/.hermit/run/nscd /run/nscd ro - btrfs /dev/md0 rw\n41 29 0:31 /tmpvol/.hermit/etc/group /etc/group ro - btrfs /dev/md0 rw\n"
+            sanitize_mountinfo(input, &snapshot),
+            b"1 7 0:31 /tmpvol/.hermit/tmp /tmp rw - btrfs /dev/md0 rw\n2 7 0:31 /host/data /data ro - btrfs /dev/md0 ro\n3 7 0:31 /tmpvol/.hermit/etc/group /etc/group ro - btrfs /dev/md0 ro\n4 7 0:31 /tmpvol/.hermit/run/nscd /run/nscd ro - btrfs /dev/md0 rw\n5 7 0:31 /another/place/.tmp123abc /etc/group ro - btrfs /dev/md0 rw\n6 7 0:31 /stacked/.tmpABC123 /tmp rw - btrfs /dev/md0 rw\n"
         );
     }
 
     #[test]
     fn unrelated_mount_roots_are_preserved() {
-        for root in [
-            "/tmpvol/build/.tmpAb12Z9",
-            "/tmpvol/v_short/.tmpAb12Z9",
-            "/tmpvol/v-45e4xci/.tmpAb12Z9",
-            "/tmpvol/v_45e4xci/work/.tmpAb12Z9",
-            "/tmpvol/v_45e4xci/.tmpAb12Z9/child",
-            "/tmpvol/v_45e4xci/.tmpAb12Z!",
+        let device = libc::makedev(0, 31);
+        for (root, mountpoint) in [
+            ("/tmpvol/build/not-a-tempfile", "/tmp"),
+            ("/tmpvol/build/.tmpAb12Z!", "/tmp"),
+            ("/tmpvol/build/.tmpAb12Z9/child", "/tmp"),
+            ("/tmpvol/build/.tmpAb12Z9", "/data"),
         ] {
-            let input = format!("37 29 0:31 {root} /tmp rw - btrfs /dev/md0 rw\n");
-            assert_eq!(sanitize_mountinfo(input.as_bytes()), input.as_bytes());
+            let input = format!("37 29 0:31 {root} {mountpoint} rw - btrfs /dev/md0 rw\n");
+            let snapshot = mountinfo_snapshot(input.as_bytes(), BTreeMap::from([(device, device)]));
+            assert_eq!(
+                sanitize_mountinfo(input.as_bytes(), &snapshot),
+                format!("1 2 0:31 {root} {mountpoint} rw - btrfs /dev/md0 rw\n").as_bytes()
+            );
         }
+    }
+
+    #[test]
+    fn mountinfo_identities_are_stable_with_a_forward_parent_reference() {
+        let first = b"20 10 259:5 / /child rw shared:1 - ext4 /dev/a rw\n10 1 8:1 / / rw - ext4 /dev/b rw\n";
+        let second = b"90 80 0:44 / /child rw shared:99 - ext4 /dev/a rw\n80 7 0:33 / / rw - ext4 /dev/b rw\n";
+        let first_snapshot = mountinfo_snapshot(
+            first,
+            BTreeMap::from([
+                (libc::makedev(259, 5), libc::makedev(0, 1)),
+                (libc::makedev(8, 1), libc::makedev(0, 2)),
+            ]),
+        );
+        let second_snapshot = mountinfo_snapshot(
+            second,
+            BTreeMap::from([
+                (libc::makedev(0, 44), libc::makedev(0, 1)),
+                (libc::makedev(0, 33), libc::makedev(0, 2)),
+            ]),
+        );
+        let expected =
+            b"1 2 0:1 / /child rw shared:1 - ext4 /dev/a rw\n2 3 0:2 / / rw - ext4 /dev/b rw\n";
+
+        assert_eq!(sanitize_mountinfo(first, &first_snapshot), expected);
+        assert_eq!(sanitize_mountinfo(second, &second_snapshot), expected);
+    }
+
+    #[test]
+    fn mountinfo_topology_preserves_self_and_unknown_parents() {
+        let input = b"10 10 8:1 / / rw shared:44 master:55 propagate_from:66 custom:77 - ext4 /dev/a rw\n20 999 8:2 / /child rw - ext4 /dev/b rw\n";
+        let snapshot = mountinfo_snapshot(
+            input,
+            BTreeMap::from([
+                (libc::makedev(8, 1), libc::makedev(0, 1)),
+                (libc::makedev(8, 2), libc::makedev(0, 2)),
+            ]),
+        );
+        assert_eq!(
+            sanitize_mountinfo(input, &snapshot),
+            b"1 1 0:1 / / rw shared:1 master:2 propagate_from:3 custom:77 - ext4 /dev/a rw\n2 3 0:2 / /child rw - ext4 /dev/b rw\n"
+        );
+    }
+
+    #[test]
+    fn mountinfo_parser_accepts_non_utf8_and_literal_control_bytes() {
+        let input = b"20 10 259:5 /\xff\x0broot /child rw shared:44 - ext4 /dev/\xfe rw\n";
+        let snapshot = mountinfo_snapshot(
+            input,
+            BTreeMap::from([(libc::makedev(259, 5), libc::makedev(0, 1))]),
+        );
+        assert_eq!(
+            sanitize_mountinfo(input, &snapshot),
+            b"1 2 0:1 /\xff\x0broot /child rw shared:1 - ext4 /dev/\xfe rw\n"
+        );
+    }
+
+    #[test]
+    fn one_malformed_mountinfo_row_rejects_the_snapshot() {
+        let input = b"20 10 259:5 / /child rw - ext4 /dev/a rw\n37 29 0:31 / / rw\n";
+        assert!(parse_mountinfo(input).is_none());
+    }
+
+    #[test]
+    fn duplicate_mount_id_or_unknown_proven_id_rejects_the_snapshot() {
+        let duplicate = b"20 10 8:1 / /a rw - ext4 /dev/a rw\n20 10 8:1 / /b rw - ext4 /dev/a rw\n";
+        let rows = parse_mountinfo(duplicate).unwrap();
+        assert!(MountInfoSnapshot::new(rows, BTreeMap::new(), BTreeMap::new()).is_none());
+
+        let ordinary = b"20 10 8:1 / /a rw - ext4 /dev/a rw\n";
+        let rows = parse_mountinfo(ordinary).unwrap();
+        assert!(
+            MountInfoSnapshot::new(
+                rows,
+                BTreeMap::new(),
+                BTreeMap::from([(99, b"/deterministic".to_vec())]),
+            )
+            .is_none()
+        );
     }
 
     #[test]

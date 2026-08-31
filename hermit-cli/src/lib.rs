@@ -1942,6 +1942,15 @@ async fn run_kvm(
     capture_output: bool,
 ) -> Result<Output, Error> {
     let dispatch_started = Instant::now();
+    // KVM does not expose the outer container's procfs. Its executor serves a
+    // synthetic `/proc/self/mountinfo` containing one deterministic rootfs row
+    // (`reverie-kvm/src/executor.rs::synthetic_proc_content`). Consequently
+    // none of the outer namespace's Hermit-owned bind mounts, or their raw
+    // mount IDs, can appear in the bytes Detcore receives. The exact provenance
+    // set for KVM's guest-visible mount table is therefore empty. Keeping outer
+    // IDs here is not conservative: it makes the shared sanitizer reject a
+    // valid synthetic row because those IDs name a different namespace.
+    config.mountinfo_root_rewrites.clear();
     let stdin = if capture_output {
         let (snapshot_reserved, snapshot) = output_backend_stdin_reservation()?;
         if snapshot_reserved {
@@ -2970,8 +2979,17 @@ impl HermitData {
     /// itself failed, then we still return a successful recording, but its exit
     /// status will be non-zero.
     pub fn record(&self, command: Command) -> Result<Recording, Error> {
+        self.record_with_mountinfo(command, Vec::new())
+    }
+
+    /// Records with mountinfo provenance captured from the active container.
+    pub fn record_with_mountinfo(
+        &self,
+        command: Command,
+        mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
+    ) -> Result<Recording, Error> {
         let data = self.create_recording_dir()?;
-        let exit_status = record_to(command, data.path())?;
+        let exit_status = record_to_with_mountinfo(command, data.path(), mountinfo_root_rewrites)?;
         self.commit_recording(data, exit_status)
     }
 
@@ -3117,25 +3135,55 @@ impl<'a> From<Option<&'a PathBuf>> for HermitData {
 /// Records to the specified directory, which must already exist.
 #[tokio::main(flavor = "current_thread")]
 pub async fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
+    record_to_with_mountinfo(command, dir, Vec::new())
+}
+
+/// Records to the specified directory with exact mountinfo provenance.
+#[tokio::main(flavor = "current_thread")]
+pub async fn record_to_with_mountinfo(
+    command: Command,
+    dir: &Path,
+    mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
+) -> Result<ExitStatus, Error> {
     let skid_overshoot_report = SkidOvershootReport::begin(true);
-    let result = async { Ok(Record::spawn(command, dir).await?.wait().await?) }.await;
+    let result = async {
+        Ok(
+            Record::spawn_with_mountinfo(command, dir, mountinfo_root_rewrites)
+                .await?
+                .wait()
+                .await?,
+        )
+    }
+    .await;
     skid_overshoot_report.finish(result)
 }
 
 /// Records to the specified directory, which must already exist. The
 /// stderr/stdout of the recording is captured in `Output`.
 #[tokio::main(flavor = "current_thread")]
-pub async fn record_with_output(mut command: Command, dir: &Path) -> Result<Output, Error> {
+pub async fn record_with_output(command: Command, dir: &Path) -> Result<Output, Error> {
+    record_with_output_with_mountinfo(command, dir, Vec::new())
+}
+
+/// Records with captured output and exact mountinfo provenance.
+#[tokio::main(flavor = "current_thread")]
+pub async fn record_with_output_with_mountinfo(
+    mut command: Command,
+    dir: &Path,
+    mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
+) -> Result<Output, Error> {
     let skid_overshoot_report = SkidOvershootReport::begin(true);
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
 
     let result = async {
-        Ok(Record::spawn(command, dir)
-            .await?
-            .wait_with_output()
-            .await?)
+        Ok(
+            Record::spawn_with_mountinfo(command, dir, mountinfo_root_rewrites)
+                .await?
+                .wait_with_output()
+                .await?,
+        )
     }
     .await;
     skid_overshoot_report.finish(result)

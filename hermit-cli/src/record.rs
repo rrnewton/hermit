@@ -9,6 +9,7 @@
 use std::fs;
 use std::path::Path;
 
+use detcore_model::config::MountInfoRootRewrite;
 use reverie::ExitStatus;
 use reverie::process::Command;
 use reverie::process::Output;
@@ -31,9 +32,15 @@ pub struct Record {
 }
 
 impl Record {
-    /// Spawns a new recording.
-    pub async fn spawn(command: Command, dir: &Path) -> Result<Self, Error> {
-        let metadata = Metadata::new(&command)?;
+    /// Spawns a recording with exact mountinfo provenance captured from the
+    /// completed recording container namespace.
+    pub async fn spawn_with_mountinfo(
+        command: Command,
+        dir: &Path,
+        mountinfo_root_rewrites: Vec<MountInfoRootRewrite>,
+    ) -> Result<Self, Error> {
+        let mut metadata = Metadata::new(&command)?;
+        metadata.mountinfo_root_rewrites = mountinfo_root_rewrites;
 
         let exe = dir.join(EXE_NAME);
 
@@ -46,7 +53,8 @@ impl Record {
         serde_json::to_writer_pretty(fs::File::create(dir.join(METADATA_NAME))?, &metadata)
             .context("Failed to serialize metadata")?;
 
-        let config = record_or_replay_config(dir);
+        let mut config = record_or_replay_config(dir);
+        config.mountinfo_root_rewrites = metadata.mountinfo_root_rewrites.clone();
 
         let tracer = reverie_ptrace::TracerBuilder::<RecordTool>::new(command)
             .config(config)
