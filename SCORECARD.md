@@ -10,24 +10,24 @@ Every selected `verify` cell, and every seed in a selected `chaos` cell, runs th
 
 | Backend | Green | Red | Not applicable | Total |
 | --- | ---: | ---: | ---: | ---: |
-| `ptrace` | 346 | 18 | 713 | 1077 |
+| `ptrace` | 347 | 17 | 713 | 1077 |
 | `dbt` | 0 | 61 | 1016 | 1077 |
 | `kvm` | 4 | 18 | 1055 | 1077 |
 | `sabre` | 111 | 32 | 934 | 1077 |
 | `liteinst` | 28 | 25 | 1024 | 1077 |
 | `native` | 0 | 33 | 326 | 359 |
-| **Total** | **489** | **187** | **5068** | **5744** |
+| **Total** | **490** | **186** | **5068** | **5744** |
 
 ## Denominator, and why the percentage is not comparable across changes to it
 
-Green is **489 of 5744**, which is **8.51%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
+Green is **490 of 5744**, which is **8.53%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
 
 - backends: `ptrace`, `dbt`, `kvm`, `sabre`, `liteinst`, `native`
 - modes: `chaos`, `naked`, `replay`, `verify`
 
-⚠️ **5068 of those 5744 cells are NOT APPLICABLE** — their backend is not enabled for their mode, so they were never asked to run and cannot pass or fail. Over the 676 cells that CAN run, green is **72.34%**.
+⚠️ **5068 of those 5744 cells are NOT APPLICABLE** — their backend is not enabled for their mode, so they were never asked to run and cannot pass or fail. Over the 676 cells that CAN run, green is **72.49%**.
 
-⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same 489 green cells measured against a smaller denominator. Nothing was fixed to produce it; it is what the first figure always meant once the cells that cannot run are excluded. Quote both or neither, and never compare one against the other as though something moved.
+⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same 490 green cells measured against a smaller denominator. Nothing was fixed to produce it; it is what the first figure always meant once the cells that cannot run are excluded. Quote both or neither, and never compare one against the other as though something moved.
 
 ⚠️ **Adding or removing a backend or mode changes this denominator and therefore the percentage, without anything about the product changing.** Removing a backend whose cells are mostly red RAISES the reported figure; adding honest red cells LOWERS it. Neither is progress. Before comparing this percentage against an earlier one, diff the two lists above: if they differ, the numbers are not comparable and the difference is not a result.
 
@@ -37,9 +37,9 @@ The mode view makes the current order of work explicit: expand `verify` first, t
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `verify` | 340 / 359 | 0 / 359 | 4 / 359 | 111 / 359 | 28 / 359 | — | 483 | 152 | 1160 | 1795 |
 | `replay` | 1 / 359 | 0 / 359 | 0 / 359 | 0 / 359 | 0 / 359 | — | 1 | 0 | 1794 | 1795 |
-| `chaos` | 5 / 359 | 0 / 359 | 0 / 359 | 0 / 359 | 0 / 359 | — | 5 | 2 | 1788 | 1795 |
+| `chaos` | 6 / 359 | 0 / 359 | 0 / 359 | 0 / 359 | 0 / 359 | — | 6 | 1 | 1788 | 1795 |
 | `naked` | — | — | — | — | — | 0 / 359 | 0 | 33 | 326 | 359 |
-| **Total** | | | | | | | **489** | **187** | **5068** | **5744** |
+| **Total** | | | | | | | **490** | **186** | **5068** | **5744** |
 
 ## Cross-backend parity
 
@@ -54,7 +54,7 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | `applications` | 3 / 6 | 0 / 6 | 0 / 6 | 3 | 18 |
 | `backend-parity-c` | 103 / 104 | 0 / 104 | 0 / 104 | 103 | 312 |
 | `bin-c` | 1 / 2 | 0 / 2 | 0 / 2 | 1 | 6 |
-| `c-programs` | 158 / 164 | 0 / 164 | 2 / 164 | 160 | 492 |
+| `c-programs` | 158 / 164 | 0 / 164 | 3 / 164 | 161 | 492 |
 | `chaos-c` | 1 / 1 | 0 / 1 | 1 / 1 | 2 | 3 |
 | `data-handling` | 6 / 6 | 0 / 6 | 0 / 6 | 6 | 18 |
 | `debugger-c` | 1 / 1 | 0 / 1 | 0 / 1 | 1 | 3 |
@@ -65,7 +65,7 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | `system-utils` | 33 / 34 | 1 / 34 | 0 / 34 | 34 | 102 |
 | `util-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |
 
-Ordinary full validation executes 492 selected regression cells: the 489 green compatibility cells above (including 5 chaos-mode race-exposure checks), and 3 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
+Ordinary full validation executes 493 selected regression cells: the 490 green compatibility cells above (including 6 chaos-mode race-exposure checks), and 3 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
 
 ### Selected custom commands outside the comparable denominator
 
@@ -85,10 +85,10 @@ The count table includes all **5744** tracked cells; no row is omitted. The curr
 
 | Status | `never-measured` | `measured-and-passed` | `measured-no-verdict` | `diverged-unlocated` | `diverged` | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `green` | 0 | 479 | 0 | 6 | 4 | 489 |
-| `red` | 60 | 102 | 0 | 0 | 25 | 187 |
+| `green` | 0 | 480 | 0 | 6 | 4 | 490 |
+| `red` | 59 | 102 | 0 | 0 | 25 | 186 |
 | `not-applicable` | 5067 | 0 | 0 | 0 | 1 | 5068 |
-| **Total** | **5127** | **581** | **0** | **6** | **30** | **5744** |
+| **Total** | **5126** | **582** | **0** | **6** | **30** | **5744** |
 
 Cells whose stored `measurement` is not `never-measured` are shown individually so status and measurement remain visible together.
 
@@ -330,6 +330,7 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `c-programs/ioctl-fioclex` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/ioctl-siocethtool` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/ioctl-siocethtool` | `verify` | `sabre` | `green` | `measured-and-passed` |
+| `c-programs/ipc-determinism` | `chaos` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/ipc-determinism` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/just-spin` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/kcmp-eperm` | `verify` | `dbt` | `red` | `measured-and-passed` |

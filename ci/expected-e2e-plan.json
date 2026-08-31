@@ -3446,6 +3446,13 @@
       "lane": "privileged",
       "mode": "verify",
       "test": "applications/kvm-shell-environment"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "chaos",
+      "test": "c-programs/ipc-determinism"
     }
   ],
   "schema": 1
