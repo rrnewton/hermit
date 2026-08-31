@@ -475668,10 +475668,7 @@
       "mode": "chaos",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "Measured 2026-08-25 by agent(hermit-007). 32 seeds under --chaos --strict gave 32 of 32 passes and 0 failures, but only 6 distinct observation classes against this cell's own assert.min_distinct of 16. The other two cells in this ratchet met their oracles - thread-sync-determinism 14 distinct, thread-contention 32. Reconcile the 16 before enabling - either diversity regressed from the 32 classes the description records, or the threshold does not describe what the harness hashes, which is status plus stdout."
-      },
+      "status": "green",
       "last_tested": {
         "hermit_sha": "8f78fc6620c75bafde1aed758020aed6783a84c2",
         "detcore_tree": "c6423f8e4c6f8190c6cfaa3687cf9916d22e5a0a",

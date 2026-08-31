@@ -47,6 +47,18 @@ pub const KVM_2026_09_08_EVIDENCE_COMPLETED_UTC: &str = "2026-09-08T14:03:16Z";
 pub const KVM_2026_09_08_SELECTED_CI_CELL_COUNT: usize = 21;
 pub const KVM_2026_09_08_MAX_REQUIRED_CPU_SECONDS: u64 = 7;
 pub const KVM_2026_09_08_MAX_REQUIRED_WALL_SECONDS: u64 = 20;
+/// One ptrace chaos cell promoted after re-measuring its observation diversity
+/// against its own UNCHANGED floor of `assert.min_distinct: 16`.
+///
+/// `c-programs/ipc-determinism` chaos/ptrace was held because a 2026-08-25 run
+/// saw only 6 distinct observation classes. Re-measurement contradicts that: the
+/// cell's 32 seeds produce 32 distinct status-plus-stdout classes, twice the
+/// floor, with 32 of 32 same-seed strict comparisons matching. The floor was not
+/// lowered; a control run with the floor raised to 33 fails, so the assertion is
+/// live rather than decorative.
+pub const IPC_DETERMINISM_CHAOS_EVIDENCE_SHA: &str = "0b26fb782192e017ef9103e27d017f8c73ceeeb4";
+pub const IPC_DETERMINISM_CHAOS_EVIDENCE_COMPLETED_UTC: &str = "2026-09-15T22:07:28Z";
+pub const IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT: usize = 1;
 /// Among the 182 KVM ratchet cells covered by the ordinary defaults, retained
 /// passing evidence has one to three samples per cell. These are the largest
 /// bounds produced by the owner-approved formula.
