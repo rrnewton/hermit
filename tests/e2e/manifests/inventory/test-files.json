@@ -3455,6 +3455,204 @@
       "path": "tests/chaos/thread_interleaving.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/*.yaml",
       "why": "tests/chaos/thread_interleaving.c is owned by target/debug/test-harness via tests/e2e/manifests/*.yaml: Direct schema-v2 program; all modes and backend policy are centralized in the YAML bucket manifests"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/barrier-rounds.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/barrier-rounds.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the barrier-rounds workload from steady_state_common.c and is compiled as the performance/barrier-rounds cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/barrier-yield-rounds.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/barrier-yield-rounds.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the barrier-yield-rounds workload from steady_state_third.c and is compiled as the performance/barrier-yield-rounds cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/clock-query-churn.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/clock-query-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the clock-query-churn workload from steady_state_third.c and is compiled as the performance/clock-query-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/condvar-baton.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/condvar-baton.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the condvar-baton workload from steady_state_common.c and is compiled as the performance/condvar-baton cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/condvar-signal-baton.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/condvar-signal-baton.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the condvar-signal-baton workload from steady_state_third.c and is compiled as the performance/condvar-signal-baton cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/dup-close-churn.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/dup-close-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the dup-close-churn workload from steady_state_third.c and is compiled as the performance/dup-close-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/epoll-eventfd-ring.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/epoll-eventfd-ring.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the epoll-eventfd-ring workload from steady_state_extra.c and is compiled as the performance/epoll-eventfd-ring cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/eventfd-roundtrip.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/eventfd-roundtrip.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the eventfd-roundtrip workload from steady_state_extra.c and is compiled as the performance/eventfd-roundtrip cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/fork-wait-churn.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/fork-wait-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the fork-wait-churn workload from steady_state_extra.c and is compiled as the performance/fork-wait-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/futex-baton.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/futex-baton.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the futex-baton workload from steady_state_extra.c and is compiled as the performance/futex-baton cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/getrandom-churn.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/getrandom-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the getrandom-churn workload from steady_state_third.c and is compiled as the performance/getrandom-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/mmap-churn.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/mmap-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the mmap-churn workload from steady_state_common.c and is compiled as the performance/mmap-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/mutex-contention.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/mutex-contention.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the mutex-contention workload from steady_state_common.c and is compiled as the performance/mutex-contention cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/nanosleep-yield.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/nanosleep-yield.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the nanosleep-yield workload from steady_state_extra.c and is compiled as the performance/nanosleep-yield cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/open-read-close-churn.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/open-read-close-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the open-read-close-churn workload from steady_state_third.c and is compiled as the performance/open-read-close-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/pipe-fd-churn.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/pipe-fd-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the pipe-fd-churn workload from steady_state_extra.c and is compiled as the performance/pipe-fd-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/pipe-nonblock-churn.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/pipe-nonblock-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the pipe-nonblock-churn workload from steady_state_third.c and is compiled as the performance/pipe-nonblock-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/pipe-roundtrip.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/pipe-roundtrip.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the pipe-roundtrip workload from steady_state_common.c and is compiled as the performance/pipe-roundtrip cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/poll-pipe-ring.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/poll-pipe-ring.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the poll-pipe-ring workload from steady_state_extra.c and is compiled as the performance/poll-pipe-ring cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/rwlock-contention.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/rwlock-contention.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the rwlock-contention workload from steady_state_common.c and is compiled as the performance/rwlock-contention cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/rwlock-mixed-contention.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/rwlock-mixed-contention.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the rwlock-mixed-contention workload from steady_state_third.c and is compiled as the performance/rwlock-mixed-contention cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/semaphore-baton.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/semaphore-baton.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the semaphore-baton workload from steady_state_extra.c and is compiled as the performance/semaphore-baton cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/sigmask-toggle.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/sigmask-toggle.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the sigmask-toggle workload from steady_state_common.c and is compiled as the performance/sigmask-toggle cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/socketpair-dgram-churn.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/socketpair-dgram-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the socketpair-dgram-churn workload from steady_state_third.c and is compiled as the performance/socketpair-dgram-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/socketpair-roundtrip.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/socketpair-roundtrip.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the socketpair-roundtrip workload from steady_state_common.c and is compiled as the performance/socketpair-roundtrip cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/spin-trylock-contention.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/spin-trylock-contention.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the spin-trylock-contention workload from steady_state_third.c and is compiled as the performance/spin-trylock-contention cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/steady_state_common.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/steady_state_common.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: it supplies shared bounded performance workloads selected by the wrapper sources in this directory and is not an independently executable test."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/steady_state_extra.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/steady_state_extra.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: it supplies shared bounded performance workloads selected by the wrapper sources in this directory and is not an independently executable test."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/steady_state_third.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/steady_state_third.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: it supplies shared bounded performance workloads selected by the wrapper sources in this directory and is not an independently executable test."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/syscall-mix.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/syscall-mix.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the syscall-mix workload from steady_state_common.c and is compiled as the performance/syscall-mix cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/thread-churn.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/thread-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the thread-churn workload from steady_state_extra.c and is compiled as the performance/thread-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/trylock-contention.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/trylock-contention.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the trylock-contention workload from steady_state_extra.c and is compiled as the performance/trylock-contention cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/yield-storm.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/yield-storm.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the yield-storm workload from steady_state_common.c and is compiled as the performance/yield-storm cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
     }
   ],
   "schema": 2
