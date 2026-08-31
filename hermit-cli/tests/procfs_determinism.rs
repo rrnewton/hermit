@@ -64,6 +64,72 @@ fn read_procfs_with(
     output.stdout
 }
 
+fn assert_runs_equal_while_host_mountinfo_stable<T: Eq + std::fmt::Debug>(
+    mut run: impl FnMut() -> T,
+    label: &str,
+) -> T {
+    for attempt in 1..=3 {
+        let before_first = fs::read("/proc/self/mountinfo").expect("read host mountinfo");
+        let first = run();
+        let after_first = fs::read("/proc/self/mountinfo").expect("read host mountinfo");
+        let before_second = fs::read("/proc/self/mountinfo").expect("read host mountinfo");
+        let second = run();
+        let after_second = fs::read("/proc/self/mountinfo").expect("read host mountinfo");
+        if before_first == after_first
+            && after_first == before_second
+            && before_second == after_second
+        {
+            assert_eq!(
+                first, second,
+                "{label}: product output differed while the host mount table was stable"
+            );
+            return first;
+        }
+        let host_change = [
+            ("before first", &before_first, "after first", &after_first),
+            ("after first", &after_first, "before second", &before_second),
+            (
+                "before second",
+                &before_second,
+                "after second",
+                &after_second,
+            ),
+        ]
+        .into_iter()
+        .find(|(_, left, _, right)| left != right)
+        .map(|(left_label, left, right_label, right)| {
+            format!(
+                "{left_label} versus {right_label}: {}",
+                first_mountinfo_row_difference(left, right)
+            )
+        });
+        if attempt == 3 {
+            panic!(
+                "{label}: host /proc/self/mountinfo changed around all three independent-run pairs; last observed change: {}",
+                host_change.as_deref().unwrap_or("unavailable")
+            );
+        }
+    }
+    unreachable!()
+}
+
+fn first_mountinfo_row_difference(left: &[u8], right: &[u8]) -> String {
+    let mut left_rows = left.split(|byte| *byte == b'\n');
+    let mut right_rows = right.split(|byte| *byte == b'\n');
+    for row_index in 0.. {
+        let left = left_rows.next();
+        let right = right_rows.next();
+        if left != right {
+            return format!(
+                "row {row_index}: {:?} -> {:?}",
+                left.map(String::from_utf8_lossy),
+                right.map(String::from_utf8_lossy)
+            );
+        }
+    }
+    unreachable!("different mountinfo byte strings must have a differing row")
+}
+
 fn assert_deterministic(path: &str, validate: impl Fn(&[u8])) {
     let _guard = hermit_run_lock();
     let first = read_procfs(path);
@@ -641,11 +707,9 @@ fn proc_self_mountinfo_preserves_user_mount_over_private_tmp() {
             ));
         })
     };
-    let contents = read();
-    assert_eq!(
-        contents,
-        read(),
-        "a user mount at /tmp exposed Hermit's random staging mountpoint"
+    let contents = assert_runs_equal_while_host_mountinfo_stable(
+        read,
+        "user mount at /tmp exposed Hermit's random staging mountpoint",
     );
     let text = std::str::from_utf8(&contents).expect("mountinfo should be UTF-8");
     let tmp_rows = text
@@ -681,8 +745,8 @@ fn proc_self_mountinfo_preserves_user_bind_over_private_tmp() {
             command.arg(format!("--bind={}:/tmp", user_tmp.path().display()));
         })
     };
-    let first = read();
-    assert_eq!(first, read(), "an exact /tmp bind changed across runs");
+    let first =
+        assert_runs_equal_while_host_mountinfo_stable(read, "exact /tmp bind changed across runs");
     let text = std::str::from_utf8(&first).expect("mountinfo should be UTF-8");
     let effective_tmp = text
         .lines()
@@ -718,8 +782,10 @@ fn ordered_nested_user_mounts_preserve_linux_stacking() {
                 ));
         })
     };
-    let first = read();
-    assert_eq!(first, read(), "ordered nested mounts changed across runs");
+    let first = assert_runs_equal_while_host_mountinfo_stable(
+        read,
+        "ordered nested mounts changed across runs",
+    );
     let text = std::str::from_utf8(&first).expect("mountinfo should be UTF-8");
     for target in ["/tmp/stack/child", "/tmp/stack"] {
         assert!(
@@ -738,11 +804,9 @@ fn user_root_mount_keeps_the_later_private_tmp_provenance() {
             command.arg("--mount=type=bind,source=/,target=/");
         })
     };
-    let first = read();
-    assert_eq!(
-        first,
-        read(),
-        "a user root mount discarded the later private /tmp provenance"
+    let first = assert_runs_equal_while_host_mountinfo_stable(
+        read,
+        "user root mount discarded the later private /tmp provenance",
     );
     let text = std::str::from_utf8(&first).expect("mountinfo should be UTF-8");
     assert!(
@@ -754,7 +818,7 @@ fn user_root_mount_keeps_the_later_private_tmp_provenance() {
 }
 
 #[test]
-fn user_var_mount_shadows_literal_var_run_identity_mounts() {
+fn user_var_mount_does_not_shadow_the_run_nscd_alias() {
     let _guard = hermit_run_lock();
     let user_var = tempfile::tempdir().expect("create user /var source");
     let read = || {
@@ -765,20 +829,52 @@ fn user_var_mount_shadows_literal_var_run_identity_mounts() {
             ));
         })
     };
-    let first = read();
-    assert_eq!(first, read(), "a user /var mount changed across runs");
+    let first =
+        assert_runs_equal_while_host_mountinfo_stable(read, "user /var mount changed across runs");
     let text = std::str::from_utf8(&first).expect("mountinfo should be UTF-8");
     assert!(
         text.lines()
             .any(|line| line.split(' ').nth(4) == Some("/var")),
         "the user /var mount is absent:\n{text}"
     );
+    if PathBuf::from("/var/run/nscd").is_dir()
+        && fs::canonicalize("/var/run").ok() == fs::canonicalize("/run").ok()
+    {
+        assert!(
+            text.lines().any(|line| {
+                line.split(' ').nth(4) == Some("/run/nscd")
+                    && line.contains("/tmpvol/.hermit/run/nscd")
+            }),
+            "a user /var mount incorrectly discarded the active /run/nscd hardening mount:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn user_run_mount_shadows_the_run_nscd_identity_mount() {
+    let _guard = hermit_run_lock();
+    let user_run = tempfile::tempdir().expect("create user /run source");
+    let read = || {
+        read_procfs_with("/proc/self/mountinfo", None, |command| {
+            command.arg(format!(
+                "--mount=type=bind,source={},target=/run",
+                user_run.path().display()
+            ));
+        })
+    };
+    let first =
+        assert_runs_equal_while_host_mountinfo_stable(read, "user /run mount changed across runs");
+    let text = std::str::from_utf8(&first).expect("mountinfo should be UTF-8");
+    assert!(
+        text.lines()
+            .any(|line| line.split(' ').nth(4) == Some("/run")),
+        "the user /run mount is absent:\n{text}"
+    );
     assert!(
         !text.lines().any(|line| {
-            matches!(line.split(' ').nth(4), Some("/var/run/nscd" | "/run/nscd"))
-                && line.contains("/tmpvol/.hermit/run/nscd")
+            line.split(' ').nth(4) == Some("/run/nscd") && line.contains("/tmpvol/.hermit/run/nscd")
         }),
-        "the hidden identity-hardening nscd mount survived a later /var mount:\n{text}"
+        "the identity-hardening nscd mount survived a later /run mount:\n{text}"
     );
 }
 
@@ -787,11 +883,9 @@ fn assert_mountinfo_target_under_private_tmp_is_stable(
     target: &str,
 ) {
     let read = || read_procfs_with("/proc/self/mountinfo", None, option);
-    let first = read();
-    let second = read();
-    assert_eq!(
-        first, second,
-        "mountinfo changed across runs for user target {target}"
+    let first = assert_runs_equal_while_host_mountinfo_stable(
+        read,
+        &format!("mountinfo changed across runs for user target {target}"),
     );
     let text = std::str::from_utf8(&first).expect("mountinfo should be UTF-8");
     let rows = text
@@ -824,9 +918,10 @@ fn user_bind_under_private_tmp_has_a_stable_guest_mountpoint() {
     let option = |command: &mut Command| {
         command.arg("--bind=/etc/hostname:/tmp/user-bind");
     };
-    let first = read_procfs_with("/proc/self/mountinfo", None, option);
-    let second = read_procfs_with("/proc/self/mountinfo", None, option);
-    assert_eq!(first, second, "bind mountinfo changed across runs");
+    let first = assert_runs_equal_while_host_mountinfo_stable(
+        || read_procfs_with("/proc/self/mountinfo", None, option),
+        "bind mountinfo changed across runs",
+    );
     let text = std::str::from_utf8(&first).expect("mountinfo should be UTF-8");
     let rows = text
         .lines()
@@ -853,11 +948,9 @@ fn ignored_bind_outside_tmp_does_not_discard_private_mount_provenance() {
             ));
         })
     };
-    let first = read();
-    let second = read();
-    assert_eq!(
-        first, second,
-        "an ignored outside-/tmp bind must not destabilize private provenance"
+    let first = assert_runs_equal_while_host_mountinfo_stable(
+        read,
+        "ignored outside-/tmp bind destabilized private provenance",
     );
     let text = std::str::from_utf8(&first).expect("mountinfo should be UTF-8");
     assert!(
@@ -929,11 +1022,9 @@ fn fdinfo_and_mountinfo_ids() -> (u64, u64, u64, u64) {
 #[test]
 fn fdinfo_mount_ids_match_mountinfo_without_aliasing() {
     let _guard = hermit_run_lock();
-    let first = fdinfo_and_mountinfo_ids();
-    let second = fdinfo_and_mountinfo_ids();
-    assert_eq!(
-        first, second,
-        "fdinfo/mountinfo identities changed across runs"
+    let first = assert_runs_equal_while_host_mountinfo_stable(
+        fdinfo_and_mountinfo_ids,
+        "fdinfo/mountinfo identities changed across runs",
     );
     assert_eq!(first.0, first.2, "root fdinfo disagreed with mountinfo");
     assert_eq!(first.1, first.3, "proc fdinfo disagreed with mountinfo");
@@ -1040,8 +1131,16 @@ fn fdinfo_mount_classes_with_stdio(guest: &PathBuf, regular_stdin_and_stderr: bo
 fn guest_pipe_socket_and_anon_fdinfo_ignore_hermit_stdio_shape() {
     let _guard = hermit_run_lock();
     let guest = compile_fdinfo_mount_classes_guest();
-    let piped = fdinfo_mount_classes_with_stdio(&guest, false);
-    let regular = fdinfo_mount_classes_with_stdio(&guest, true);
+    let pair = assert_runs_equal_while_host_mountinfo_stable(
+        || {
+            (
+                fdinfo_mount_classes_with_stdio(&guest, false),
+                fdinfo_mount_classes_with_stdio(&guest, true),
+            )
+        },
+        "fdinfo class outputs changed across repeated stdio-shape pairs",
+    );
+    let (piped, regular) = pair;
     assert_eq!(
         piped, regular,
         "guest fdinfo changed with Hermit stdio shape"
@@ -1132,20 +1231,70 @@ fn mount_namespace_fdinfo(no_namespace: bool) -> Vec<u8> {
 fn mount_namespace_fdinfo_is_stable_with_and_without_namespace_setup() {
     let _guard = hermit_run_lock();
     for no_namespace in [false, true] {
-        assert_eq!(
-            mount_namespace_fdinfo(no_namespace),
-            mount_namespace_fdinfo(no_namespace),
-            "nsfs fdinfo changed across runs when no_namespace={no_namespace}"
+        assert_runs_equal_while_host_mountinfo_stable(
+            || mount_namespace_fdinfo(no_namespace),
+            &format!("nsfs fdinfo changed across runs when no_namespace={no_namespace}"),
         );
     }
 }
 
 #[test]
+fn no_namespace_mountinfo_and_fdinfo_share_one_mount_identity_map() {
+    let _guard = hermit_run_lock();
+    let run = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        command.args([
+            "--log=error",
+            "run",
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--no-namespace",
+            "--",
+            "/bin/sh",
+            "-c",
+            "exec 3</bin/sh; cat /proc/self/mountinfo; printf '__FDINFO__\\n'; cat /proc/self/fdinfo/3",
+        ]);
+        let rendered = format!("{command:?}");
+        let output = command
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+        assert!(
+            output.status.success(),
+            "no-namespace mountinfo/fdinfo read failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        output.stdout
+    };
+    let output = assert_runs_equal_while_host_mountinfo_stable(
+        run,
+        "no-namespace mountinfo/fdinfo identities changed across runs",
+    );
+    let text = std::str::from_utf8(&output).expect("procfs output should be UTF-8");
+    let (mountinfo, fdinfo) = text
+        .split_once("__FDINFO__\n")
+        .expect("guest output must separate mountinfo and fdinfo");
+    let fdinfo_mount_id = fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:\t"))
+        .expect("namespace fdinfo must contain mnt_id");
+    assert!(
+        mountinfo.lines().any(|line| {
+            line.split_once(' ')
+                .is_some_and(|(mount_id, _)| mount_id == fdinfo_mount_id)
+        }),
+        "no-namespace fdinfo mnt_id {fdinfo_mount_id} is absent from mountinfo:\n{text}"
+    );
+}
+
+#[test]
 fn redirected_regular_stdin_and_stdout_fdinfo_are_stable() {
     let _guard = hermit_run_lock();
-    assert_eq!(
-        redirected_regular_stdio_fdinfo(),
-        redirected_regular_stdio_fdinfo()
+    assert_runs_equal_while_host_mountinfo_stable(
+        redirected_regular_stdio_fdinfo,
+        "redirected regular stdio fdinfo changed across runs",
     );
 }
 

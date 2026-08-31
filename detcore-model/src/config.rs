@@ -253,6 +253,23 @@ pub struct Config {
     #[clap(skip)]
     pub mountinfo_mount_ids: Vec<u64>,
 
+    /// Whether `mountinfo_mount_ids` is an exact producer-owned snapshot.
+    ///
+    /// The distinction matters for an empty mountinfo file: an absent snapshot
+    /// asks Detcore to observe the completed guest namespace, while a captured
+    /// empty snapshot must remain empty during replay.
+    #[serde(default)]
+    #[clap(skip)]
+    pub mountinfo_mount_ids_captured: bool,
+
+    /// Raw fdinfo mount IDs absent from mountinfo, in first-observation order.
+    ///
+    /// Recording persists this producer-observed order so replay does not
+    /// derive identities from its fresh namespace or launch descriptor shape.
+    #[serde(default)]
+    #[clap(skip)]
+    pub fdinfo_unlisted_mount_ids: Vec<u64>,
+
     /// Sequentialize thread execution deterministically.
     #[clap(long)]
     pub sequentialize_threads: bool,
@@ -1377,10 +1394,20 @@ mod tests {
             .unwrap()
             .remove("mountinfo_device_rewrites");
         value.as_object_mut().unwrap().remove("mountinfo_mount_ids");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("mountinfo_mount_ids_captured");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("fdinfo_unlisted_mount_ids");
         let restored: Config = serde_json::from_value(value).unwrap();
         assert!(restored.mountinfo_root_rewrites.is_empty());
         assert!(restored.mountinfo_device_rewrites.is_empty());
         assert!(restored.mountinfo_mount_ids.is_empty());
+        assert!(!restored.mountinfo_mount_ids_captured);
+        assert!(restored.fdinfo_unlisted_mount_ids.is_empty());
     }
 
     #[test]

@@ -4479,6 +4479,8 @@ impl RunOpts {
             .transpose()?
             .unwrap_or_default();
         config.mountinfo_mount_ids = mountinfo_order;
+        config.mountinfo_mount_ids_captured = identity_sources.is_some();
+        config.fdinfo_unlisted_mount_ids.clear();
         self.save_config_to_disk()?;
 
         let timeout = self.run_timeout();
@@ -4544,6 +4546,8 @@ impl RunOpts {
             .transpose()?
             .unwrap_or_default();
         config.mountinfo_mount_ids = mountinfo_order;
+        config.mountinfo_mount_ids_captured = identity_sources.is_some();
+        config.fdinfo_unlisted_mount_ids.clear();
         self.save_config_to_disk()?;
 
         hermit::run_with_output_backend_timeout_and_skid_overshoots(

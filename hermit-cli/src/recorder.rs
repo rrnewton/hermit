@@ -65,6 +65,7 @@ use crate::event::OpenMaterialization;
 use crate::event::ReplayFdKind;
 use crate::event::SyscallEvent;
 use crate::event_stream::DebugEvent;
+use crate::event_stream::EventStreamIds;
 use crate::event_stream::EventWriter;
 
 const MAX_EXEC_DEPENDENCY_DEPTH: usize = 5;
@@ -303,7 +304,7 @@ fn guest_has_open_file_description(pid: Pid, target: &std::os::fd::OwnedFd) -> b
 
 /// A Reverie tool that records syscalls. Note that only syscalls that cannot be
 /// made deterministic are forwarded to this tool.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Recorder {
     // TODO: We'll need to keep track of file descriptors here in order to
     // determine if a file descriptor should be fully recorded or simply cached
@@ -322,6 +323,22 @@ pub struct Recorder {
     stdout_ofd: Mutex<Option<std::os::fd::OwnedFd>>,
     #[serde(skip)]
     stderr_ofd: Mutex<Option<std::os::fd::OwnedFd>>,
+    /// Stable event-stream names independent of host PID allocation.
+    #[serde(skip)]
+    stream_ids: EventStreamIds,
+}
+
+impl Default for Recorder {
+    fn default() -> Self {
+        Self {
+            data: PathBuf::new(),
+            stdout: None,
+            stderr: None,
+            stdout_ofd: Mutex::new(None),
+            stderr_ofd: Mutex::new(None),
+            stream_ids: EventStreamIds::default(),
+        }
+    }
 }
 
 #[reverie::tool]
@@ -336,6 +353,7 @@ impl Tool for Recorder {
             stderr: OutputIdentity::for_fd(pid, libc::STDERR_FILENO),
             stdout_ofd: Mutex::new(duplicate_regular_output(pid, libc::STDOUT_FILENO)),
             stderr_ofd: Mutex::new(duplicate_regular_output(pid, libc::STDERR_FILENO)),
+            stream_ids: EventStreamIds::default(),
         }
     }
 
@@ -344,12 +362,13 @@ impl Tool for Recorder {
         child: Tid,
         parent: Option<(Tid, &Self::ThreadState)>,
     ) -> Self::ThreadState {
+        let stream_id = self.stream_ids.next(parent.is_none());
         // We have to unwrap because there is no way to handle errors here.
         RecorderThreadState {
-            events: EventWriter::create(&self.data, child).unwrap_or_else(|err| {
+            events: EventWriter::create(&self.data, stream_id).unwrap_or_else(|err| {
                 panic!(
-                    "Failed to create {:?} for thread {}: {}",
-                    self.data, child, err
+                    "Failed to create {:?} for recording thread {} (physical {}): {}",
+                    self.data, stream_id, child, err
                 )
             }),
             pending_exec: None,

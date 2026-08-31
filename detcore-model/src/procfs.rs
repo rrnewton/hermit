@@ -73,9 +73,12 @@ fn parse_mountinfo_row(line: &[u8]) -> Option<MountInfoRow> {
 /// Empty files are valid empty snapshots. Malformed rows and duplicate mount
 /// IDs are rejected so every producer and consumer accepts the same grammar.
 pub fn parse_mountinfo(contents: &[u8]) -> Option<Vec<MountInfoRow>> {
+    if contents.is_empty() {
+        return Some(Vec::new());
+    }
     let body = contents.strip_suffix(b"\n").unwrap_or(contents);
     if body.is_empty() {
-        return Some(Vec::new());
+        return None;
     }
     let rows = body
         .split(|byte| *byte == b'\n')
@@ -136,6 +139,7 @@ mod tests {
     #[test]
     fn mountinfo_parser_accepts_empty_and_refuses_malformed_or_duplicate_rows() {
         assert_eq!(parse_mountinfo(b""), Some(Vec::new()));
+        assert_eq!(parse_mountinfo(b"\n"), None);
         let row = b"37 1 8:1 / / rw shared:9 - ext4 /dev/root rw\n";
         let parsed = parse_mountinfo(row).expect("valid mountinfo row");
         assert_eq!(parsed.len(), 1);

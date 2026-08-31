@@ -113,7 +113,12 @@ impl RecordVersion {
 // observation order. Replay must rebuild that mapping from recording-time raw
 // bytes, or pidfs/nsfs/anon_inodefs can be collapsed or rejected. The draft
 // 0x112 format was never shipped.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x113);
+//
+// 0x113 -> 0x114: recordings persist the completed guest's mountinfo order and
+// unlisted fdinfo mount-ID order, and event streams use stable recording-local
+// thread IDs rather than host PID allocation. An older reader cannot rebuild
+// either mapping reliably for a plain public record API recording.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x114);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -138,7 +143,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x113);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x113;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x114;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -178,6 +183,14 @@ pub struct Metadata {
     /// Recording-namespace raw mount IDs in canonical row order.
     #[serde(default)]
     pub mountinfo_mount_ids: Vec<u64>,
+    /// Whether `mountinfo_mount_ids` is a producer-owned snapshot, including a
+    /// valid empty snapshot.
+    #[serde(default)]
+    pub mountinfo_mount_ids_captured: bool,
+    /// Recording-time raw fdinfo mount IDs absent from mountinfo, in the order
+    /// Detcore first observed them.
+    #[serde(default)]
+    pub fdinfo_unlisted_mount_ids: Vec<u64>,
 }
 
 impl Metadata {
@@ -228,6 +241,8 @@ impl Metadata {
             version: RECORD_VERSION,
             mountinfo_root_rewrites: Vec::new(),
             mountinfo_mount_ids: Vec::new(),
+            mountinfo_mount_ids_captured: false,
+            fdinfo_unlisted_mount_ids: Vec::new(),
         })
     }
 
@@ -256,10 +271,9 @@ impl Metadata {
 
 pub fn record_or_replay_config(data: &Path) -> detcore::Config {
     // NOTE: Record and replay should use the exact same Detcore configuration.
-    // Callers add `Metadata::mountinfo_root_rewrites` and
-    // `Metadata::mountinfo_mount_ids` after this common base is built, so
-    // replay uses the recording namespace's raw IDs rather than the unrelated
-    // IDs of its fresh container.
+    // Callers add the completed producer namespace's mountinfo order and
+    // unlisted fdinfo mount-ID order after this common base is built, so replay
+    // uses recording-time raw IDs rather than IDs from its fresh container.
     //
     // WHY THIS IS NOT `hermit run --strict`, WRITTEN HERE ON PURPOSE.
     //
@@ -316,6 +330,8 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         mountinfo_root_rewrites: Vec::new(),
         mountinfo_device_rewrites: Vec::new(),
         mountinfo_mount_ids: Vec::new(),
+        mountinfo_mount_ids_captured: false,
+        fdinfo_unlisted_mount_ids: Vec::new(),
         virtualize_cpuid: true,
         cpuid_virtualized_by_backend: false,
         backend_supports_madvise: true,

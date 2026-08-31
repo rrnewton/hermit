@@ -361,8 +361,8 @@ and non-identity Linux fields remain visible; Hermit-owned temporary roots are
 rewritten only when their source object has been proved. The `scm_fds` fdinfo
 field passes through because it is the socket's queued-descriptor count, not a
 host-assigned identity. With `run --no-namespace`, Hermit snapshots the live
-mount table on first use and refuses if that table changes during the run,
-rather than applying an identity map to a different host mount topology.
+mount-ID order on first use and refuses if that order changes during the run,
+rather than applying an identity map to a different host mount-ID layout.
 
 ## Compatibility
 

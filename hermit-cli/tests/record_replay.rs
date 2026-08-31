@@ -26,6 +26,7 @@ use std::time::Instant;
 use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
 use reverie::process::Command as ReverieCommand;
 use reverie::process::Mount;
+use reverie::process::Namespace;
 
 static HERMIT_RECORD_LOCK: Mutex<()> = Mutex::new(());
 static WORKLOADS: OnceLock<Vec<Workload>> = OnceLock::new();
@@ -52,34 +53,107 @@ fn public_record_entry_points_do_not_start_a_nested_runtime() {
 
 #[test]
 fn public_record_uses_the_completed_command_namespace_and_stdio() {
+    const INNER: &str = "HERMIT_PUBLIC_RECORD_REPLAY_INNER";
+    if std::env::var_os(INNER).is_none() {
+        let mut command = ReverieCommand::new(std::env::current_exe().expect("find test binary"));
+        command
+            .args([
+                "--exact",
+                "public_record_uses_the_completed_command_namespace_and_stdio",
+                "--nocapture",
+            ])
+            .env(INNER, "1")
+            .map_root()
+            .unshare(Namespace::MOUNT | Namespace::PID)
+            .mount(Mount::proc());
+        let output = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build namespace test runtime")
+            .block_on(command.output())
+            .expect("launch public record/replay namespace");
+        assert_eq!(
+            output.status,
+            reverie::process::ExitStatus::Exited(0),
+            "public API record/replay failed in its user namespace:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
     let _guard = hermit_record_lock();
     let data = tempfile::tempdir().expect("create recording directory");
     let files = tempfile::tempdir().expect("create command mount directory");
     let source = files.path().join("source");
     let target = files.path().join("target");
-    let input = files.path().join("input");
-    let output = files.path().join("output");
     fs::write(&source, b"mounted-content\n").expect("write mount source");
     fs::write(&target, b"unmounted-content\n").expect("write mount target");
-    fs::write(&input, b"stdin-content\n").expect("write command stdin");
 
-    let mut command = ReverieCommand::new("/bin/cat");
+    let guest = files.path().join("public-record-mount-stdio");
+    compile_c(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli must be inside the repository")
+            .join("tests/c/public_record_mount_stdio.c"),
+        &guest,
+    );
+
+    let mut command = ReverieCommand::new(&guest);
     command
-        .args(["/proc/self/mountinfo", "/proc/self/fdinfo/1"])
         .arg(&target)
-        .arg("/dev/stdin")
         .map_root()
         .mount(Mount::bind(&source, &target))
-        .stdin(fs::File::open(&input).expect("open command stdin"))
-        .stdout(fs::File::create(&output).expect("create command stdout"));
+        .stdin(reverie::process::Stdio::null());
 
-    let status = hermit::record_to(command, data.path()).expect("public recording should run");
-    assert_eq!(status, reverie::process::ExitStatus::Exited(0));
-    let captured = fs::read_to_string(&output).expect("read command stdout");
-    assert!(captured.lines().any(|line| line.starts_with("mnt_id:")));
+    let recording =
+        hermit::record_with_output(command, data.path()).expect("public recording should run");
+    assert_eq!(recording.status, reverie::process::ExitStatus::Exited(0));
+    let captured = String::from_utf8(recording.stdout).expect("recording stdout must be UTF-8");
+    let metadata: serde_json::Value = serde_json::from_slice(
+        &fs::read(data.path().join("metadata.json")).expect("read recording metadata"),
+    )
+    .expect("parse recording metadata");
+    assert_eq!(metadata["mountinfo_mount_ids_captured"], true);
+    assert!(
+        metadata["mountinfo_mount_ids"]
+            .as_array()
+            .is_some_and(|ids| !ids.is_empty()),
+        "completed recording mountinfo order was not persisted"
+    );
+    assert!(
+        metadata["fdinfo_unlisted_mount_ids"]
+            .as_array()
+            .is_some_and(|ids| !ids.is_empty()),
+        "recording-time pipe mount identity was not persisted"
+    );
+    let replay = hermit::replay_with_output(data.path()).expect("public recording should replay");
+    assert_eq!(replay.status, reverie::process::ExitStatus::Exited(0));
+    assert_eq!(replay.stdout, captured.as_bytes());
+
+    let mountinfo = section_contents(&captured, "MOUNTINFO");
+    let fdinfo = section_contents(&captured, "FDINFO");
+    let fdinfo_mount_id = fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:\t"))
+        .expect("fdinfo must contain mnt_id");
+    assert!(mountinfo.lines().any(|line| {
+        line.split_once(' ')
+            .is_some_and(|(mount_id, _)| mount_id == fdinfo_mount_id)
+    }));
     assert!(captured.contains("mounted-content\n"));
-    assert!(captured.contains("stdin-content\n"));
+    assert_eq!(section_contents(&captured, "STDIN"), "");
     assert!(!captured.contains("unmounted-content"));
+}
+
+fn section_contents<'a>(output: &'a str, name: &str) -> &'a str {
+    let start_marker = format!("__{name}__\n");
+    let end_marker = format!("__END_{name}__\n");
+    output
+        .split_once(&start_marker)
+        .and_then(|(_, rest)| rest.split_once(&end_marker))
+        .map(|(contents, _)| contents)
+        .unwrap_or_else(|| panic!("missing {name} section in public recording output"))
 }
 
 const BASELINE_RECORD_WORKLOADS: [&str; 10] = [
@@ -138,6 +212,72 @@ fn hermit_record_lock() -> MutexGuard<'static, ()> {
     HERMIT_RECORD_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn assert_recordings_equal_while_host_mountinfo_stable(
+    mut record: impl FnMut(&str) -> Vec<u8>,
+    label: &str,
+) -> Vec<u8> {
+    for attempt in 1..=3 {
+        let before_first = fs::read("/proc/self/mountinfo").expect("read host mountinfo");
+        let first = record("first independent mountinfo recording");
+        let after_first = fs::read("/proc/self/mountinfo").expect("read host mountinfo");
+        let before_second = fs::read("/proc/self/mountinfo").expect("read host mountinfo");
+        let second = record("second independent mountinfo recording");
+        let after_second = fs::read("/proc/self/mountinfo").expect("read host mountinfo");
+        if before_first == after_first
+            && after_first == before_second
+            && before_second == after_second
+        {
+            assert_eq!(
+                first, second,
+                "{label}: recording output differed while the host mount table was stable"
+            );
+            return first;
+        }
+        let host_change = [
+            ("before first", &before_first, "after first", &after_first),
+            ("after first", &after_first, "before second", &before_second),
+            (
+                "before second",
+                &before_second,
+                "after second",
+                &after_second,
+            ),
+        ]
+        .into_iter()
+        .find(|(_, left, _, right)| left != right)
+        .map(|(left_label, left, right_label, right)| {
+            format!(
+                "{left_label} versus {right_label}: {}",
+                first_mountinfo_row_difference(left, right)
+            )
+        });
+        if attempt == 3 {
+            panic!(
+                "{label}: host /proc/self/mountinfo changed around all three recording pairs; last observed change: {}",
+                host_change.as_deref().unwrap_or("unavailable")
+            );
+        }
+    }
+    unreachable!()
+}
+
+fn first_mountinfo_row_difference(left: &[u8], right: &[u8]) -> String {
+    let mut left_rows = left.split(|byte| *byte == b'\n');
+    let mut right_rows = right.split(|byte| *byte == b'\n');
+    for row_index in 0.. {
+        let left = left_rows.next();
+        let right = right_rows.next();
+        if left != right {
+            return format!(
+                "row {row_index}: {:?} -> {:?}",
+                left.map(String::from_utf8_lossy),
+                right.map(String::from_utf8_lossy)
+            );
+        }
+    }
+    unreachable!("different mountinfo byte strings must have a differing row")
 }
 
 fn compile_c(source: &Path, output: &Path) {
@@ -736,9 +876,10 @@ fn independent_mountinfo_recordings_are_canonical() {
         command_output(command, label).stdout
     };
 
-    let first = record_once("first independent mountinfo recording");
-    let second = record_once("second independent mountinfo recording");
-    assert_eq!(first, second);
+    let first = assert_recordings_equal_while_host_mountinfo_stable(
+        record_once,
+        "independent mountinfo recordings",
+    );
     let text = std::str::from_utf8(&first).expect("mountinfo should be UTF-8");
     assert!(text.contains("/tmpvol/.hermit/etc/group"));
     assert!(!text.contains("/.tmp"));

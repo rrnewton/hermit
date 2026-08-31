@@ -292,16 +292,20 @@ impl IdentityGuard {
     }
 }
 
-fn normalized_mount_target(path: &Path) -> PathBuf {
-    path.strip_prefix("/var/run").map_or_else(
-        |_| path.to_path_buf(),
-        |suffix| Path::new("/run").join(suffix),
-    )
+fn canonical_mount_target(path: &Path) -> PathBuf {
+    for ancestor in path.ancestors() {
+        if let Ok(mut canonical) = fs::canonicalize(ancestor)
+            && let Ok(suffix) = path.strip_prefix(ancestor)
+        {
+            canonical.push(suffix);
+            return canonical;
+        }
+    }
+    path.to_path_buf()
 }
 
 pub(super) fn mount_target_is_shadowed(target: &Path, overriding_target: &Path) -> bool {
-    target.starts_with(overriding_target)
-        || normalized_mount_target(target).starts_with(normalized_mount_target(overriding_target))
+    canonical_mount_target(target).starts_with(canonical_mount_target(overriding_target))
 }
 
 /// Snapshot the host group database into a private temp file, appending a
@@ -356,12 +360,17 @@ pub(super) fn identity_hardening_mounts() -> Result<(Vec<Mount>, IdentityGuard),
     let nscd_dir = if Path::new(NSCD_DIR).is_dir() {
         let directory =
             tempfile::TempDir::new().context("Failed to create the empty guest nscd directory")?;
+        // Preserve Linux pathname resolution: on distributions where
+        // /var/run is a symlink to /run, mounting the hardening directory at
+        // the resolved target keeps it reachable even if a user later mounts
+        // an unrelated /var tree.
+        let target = canonical_mount_target(Path::new(NSCD_DIR));
         mountinfo_roots.push(MountInfoRootSource::new(
             directory.path(),
-            Path::new(NSCD_DIR),
+            &target,
             DETERMINISTIC_NSCD_ROOT,
         )?);
-        mounts.push(Mount::bind(directory.path(), NSCD_DIR).readonly());
+        mounts.push(Mount::bind(directory.path(), target).readonly());
         Some(directory)
     } else {
         None
@@ -1433,15 +1442,16 @@ mod tests {
     }
 
     #[test]
-    fn shadow_detection_preserves_var_run_alias_and_literal_var_ancestry() {
-        assert!(mount_target_is_shadowed(
-            Path::new("/var/run/nscd"),
-            Path::new("/var")
-        ));
-        assert!(mount_target_is_shadowed(
-            Path::new("/var/run/nscd"),
-            Path::new("/run")
-        ));
+    fn shadow_detection_follows_the_host_var_run_target() {
+        let var_run_is_run = fs::canonicalize("/var/run").ok() == fs::canonicalize("/run").ok();
+        assert_eq!(
+            mount_target_is_shadowed(Path::new("/var/run/nscd"), Path::new("/var")),
+            !var_run_is_run
+        );
+        assert_eq!(
+            mount_target_is_shadowed(Path::new("/var/run/nscd"), Path::new("/run")),
+            var_run_is_run
+        );
         assert!(!mount_target_is_shadowed(
             Path::new("/var/run/nscd"),
             Path::new("/var/lib")

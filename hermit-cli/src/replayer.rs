@@ -258,6 +258,7 @@ use crate::desync::DesyncError;
 use crate::event::OpenMaterialization;
 use crate::event_stream::DebugEvent;
 use crate::event_stream::EventReader;
+use crate::event_stream::EventStreamIds;
 use crate::event_stream::normalize_unused_args;
 
 #[derive(Serialize, Deserialize)]
@@ -288,7 +289,7 @@ impl Default for ReplayerThreadState {
 
 /// A Reverie tool that replays syscalls. Note that only syscalls that cannot be
 /// made deterministic are forwarded to this tool.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Replayer {
     // Keep track of the data directory. Each thread uses this path to open its
     // event stream.
@@ -307,6 +308,24 @@ pub struct Replayer {
     stdout_error: Option<String>,
     #[serde(skip)]
     stderr_error: Option<String>,
+    /// Stable event-stream names independent of host PID allocation.
+    #[serde(skip)]
+    stream_ids: EventStreamIds,
+}
+
+impl Default for Replayer {
+    fn default() -> Self {
+        Self {
+            data: PathBuf::new(),
+            stdout: None,
+            stderr: None,
+            stdout_output_lock: tokio::sync::Mutex::new(()),
+            stderr_output_lock: tokio::sync::Mutex::new(()),
+            stdout_error: None,
+            stderr_error: None,
+            stream_ids: EventStreamIds::default(),
+        }
+    }
 }
 
 #[reverie::tool]
@@ -325,6 +344,7 @@ impl Tool for Replayer {
             stderr_output_lock: tokio::sync::Mutex::new(()),
             stdout_error,
             stderr_error,
+            stream_ids: EventStreamIds::default(),
         }
     }
 
@@ -333,12 +353,13 @@ impl Tool for Replayer {
         child: Tid,
         parent: Option<(Tid, &Self::ThreadState)>,
     ) -> Self::ThreadState {
-        // We have to unwrap because there is now way to handle errors here.
+        let stream_id = self.stream_ids.next(parent.is_none());
+        // We have to unwrap because there is no way to handle errors here.
         ReplayerThreadState {
-            events: EventReader::open(&self.data, child).unwrap_or_else(|err| {
+            events: EventReader::open(&self.data, stream_id).unwrap_or_else(|err| {
                 panic!(
-                    "Failed to open {:?} for thread {}: {}",
-                    self.data, child, err
+                    "Failed to open {:?} for replay thread {} (physical {}): {}",
+                    self.data, stream_id, child, err
                 )
             }),
             bootstrapped: parent.is_some_and(|(_, state)| state.bootstrapped),
