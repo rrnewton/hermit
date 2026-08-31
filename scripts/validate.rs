@@ -2721,7 +2721,9 @@ cleared-caps refusal names {} starved step(s)",
             .cmd
             .contains("verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path")
             || !privileged_build.cmd.contains(expected_test_prebuild)
-            || !privileged_build.cmd.contains("tests_misc-*")
+            || !privileged_build.cmd.contains("find target/debug")
+            || !privileged_build.cmd.contains("-name 'tests_misc-*'")
+            || !privileged_build.cmd.contains("-perm -111")
         {
             return Err(
                 "full-plan bracket: privileged build did not assert the artifact and prebuild the exact downstream test binaries".into(),
@@ -8092,12 +8094,15 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // deliberate: this must work in any checkout, including a dirty one,
         // and validate must not delete a developer's build artifacts.
         //
+        // Cargo may place final test executables in target/debug/deps or under
+        // its internal build directory. Search by executable type and name
+        // instead of pinning validation to either implementation detail.
         // Newest-by-mtime is what cargo itself would run. Deliberately NOT
         // relaxed to `-ge 1`: the CPUID consumer below executes the binary it
         // selects, so "any one of nine" would let it silently test a STALE
         // artifact -- a check that passes while measuring the wrong thing,
         // which is worse than failing loudly. Zero binaries still fails.
-        privileged_build.cmd = "./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null || exit 1; CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run || exit 1; newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"".to_string();
+        privileged_build.cmd = "./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null || exit 1; CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run || exit 1; newest=\"\"; while IFS= read -r -d '' f; do if [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; then newest=\"$f\"; fi; done < <(find target/debug -type f -name 'tests_misc-*' -perm -111 -print0); test -n \"$newest\"".to_string();
         let cpuid = steps
             .iter_mut()
             .find(|s| s.tag() == "privileged-cpuid.faulting")
@@ -8115,7 +8120,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // selection must be the NEWEST rather than an arbitrary survivor of a
         // `-ge 1` relaxation -- running a stale `tests_misc` would report a
         // CPUID verdict about an artifact that is not the one under test.
-        cpuid.cmd = "newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"; timeout 30 \"$newest\" rdrand_rdseed_is_masked --exact".to_string();
+        cpuid.cmd = "newest=\"\"; while IFS= read -r -d '' f; do if [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; then newest=\"$f\"; fi; done < <(find target/debug -type f -name 'tests_misc-*' -perm -111 -print0); test -n \"$newest\"; timeout 30 \"$newest\" rdrand_rdseed_is_masked --exact".to_string();
     }
     attach_compatibility_scorecard(&mut steps, &lanes, "")?;
     // Fusing lanes means one config for both. Their default wall timeouts differ,
