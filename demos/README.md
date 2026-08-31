@@ -107,11 +107,11 @@ Demos 1-4 source `demos/common.sh`, which locates this repository, builds the
 release and debug binaries, and defines the shared `run_hermit`,
 `verify_hermit`, and `chaos_run` wrappers. The Python QEMU demos use
 `demos/lib/demo_common.py` for QMP, serial streaming, hashes, metadata, and
-repeat comparison. `run_hermit` and `chaos_run`
-deliberately disable CPUID virtualization and PMU timer preemption so the short
-examples also run on hosts without those features; CPUID is therefore a host
-input in those commands, and CPU-bound guests receive fewer preemption
-opportunities. `verify_hermit` is different: it keeps PMU-based preemption on
+repeat comparison. `run_hermit` disables CPUID virtualization, so CPUID is a
+host input in those commands. It leaves PMU timer preemption enabled by default;
+`HERMIT_DEMO_MAX_TIMESLICE=disabled` selects syscall-boundary-only scheduling
+for hosts without accessible performance counters. `chaos_run` uses
+syscall-boundary-only scheduling. `verify_hermit` keeps PMU-based preemption on
 (the racy verify guest is only reliably determinized with real preemption) and
 raises the log level to `info` (at `--log=error` the execution log that
 `--verify` compares is empty). The demo-1 `--verify` step requires the PMU;
@@ -170,7 +170,7 @@ Run each demo individually so its output and result remain easy to inspect:
 Demo 4 is intentionally slow. Demo 5 must complete before Demos 6 and 7 because
 it creates their baseline QEMU snapshot.
 
-Set `DEMO_SKIP_BUILD=1` to reuse an existing `hermit/target` build, or export
+Set `DEMO_SKIP_BUILD=1` to reuse an existing `target` build, or export
 `HERMIT`, `HELLO_RACE`, and `HEAP_PTRS` to point at prebuilt binaries.
 
 ## What Each Demo Shows
