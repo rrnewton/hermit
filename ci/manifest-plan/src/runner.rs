@@ -4132,6 +4132,23 @@ mod tests {
     }
 
     #[test]
+    fn shipped_readdir_order_identity_uses_its_measured_timeout() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let cells = ManifestSet::load(&root)
+            .unwrap()
+            .select(&Selection {
+                population: Some(Population::Required),
+                test: Some("backend-parity-c/readdir-order-identity".into()),
+                mode: Some("verify".into()),
+                backend: Some("ptrace".into()),
+                ..Selection::default()
+            })
+            .unwrap();
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].timeout_seconds, 30);
+    }
+
+    #[test]
     fn bucket_timeout_requires_a_reason_and_must_change_the_global_default() {
         let mut document = ManifestDocument {
             schema: MANIFEST_SCHEMA,
