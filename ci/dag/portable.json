@@ -1,5 +1,5 @@
 {
-  "resource_caps": {"hermit_guest": 1, "manifest_guest": 8},
+  "resource_caps": {"manifest_guest": 8},
   "mem_cap_factor": 1.25,
   "mem_cap_floor_bytes": 8589934592,
   "outer_mem_safety_factor": 1.0,
@@ -263,13 +263,13 @@
     {
       "group": "e2e", "job": "manifest_backend_parity_c",
       "desc": "Portable manifest bucket: backend-parity-c",
-      "description": "WORKER WIDTH measured 2026-08-23: recent 20-way validation runs rotated an identical empty early-Run1 no_result across unrelated ptrace cells, while each affected cell passed in another run. A focused run at eight workers completed all 79 selected strict rows in 175.9s with 79 canonical matches and no no_result, leaving a measured 424.1s margin to the unchanged 600s hang bound. This node reserves all 8 manifest_guest slots plus the exclusive hermit_guest slot and passes the same width to the harness. Tradeoff: blocking validation no longer exercises the former 20-way manifest pressure; every cell and the strict comparator remain enabled and unchanged. MEMORY measured 2026-08-25 at Hermit 16f70d9994 with the complete current-main artifact and width 8 under ambient load 49-64: three uncapped cgroup peaks were 2856333312, 3168403456, and 2857349120 bytes; three stricter 4-GiB-cap repetitions completed all 85 cells with peaks up to 3465289728 bytes and no cgroup kill. The 4-GiB baseline rounds above the observed high-water mark; the 6-GiB hard cap preserves another 2.5 GiB of runaway headroom without reserving the former unmeasured 32 GiB.",
+      "description": "WORKER WIDTH measured 2026-08-23: recent 20-way validation runs rotated an identical empty early-Run1 no_result across unrelated ptrace cells, while each affected cell passed in another run. A focused run at eight workers completed all 79 selected strict rows in 175.9s with 79 canonical matches and no no_result, leaving a measured 424.1s margin to the unchanged 600s hang bound. This node reserves all 8 manifest_guest slots and passes the same width to the harness; ordinary Hermit gates may overlap now that their unsupported exclusive resource is removed. Tradeoff: blocking validation still does not exercise the former 20-way manifest pressure; every cell and the strict comparator remain enabled and unchanged. MEMORY measured 2026-08-25 at Hermit 16f70d9994 with the complete current-main artifact and width 8 under ambient load 49-64: three uncapped cgroup peaks were 2856333312, 3168403456, and 2857349120 bytes; three stricter 4-GiB-cap repetitions completed all 85 cells with peaks up to 3465289728 bytes and no cgroup kill. The 4-GiB baseline rounds above the observed high-water mark; the 6-GiB hard cap preserves another 2.5 GiB of runaway headroom without reserving the former unmeasured 32 GiB.",
       "manifest": {"lane": "portable", "category": "backend-parity-c"},
       "cmd": "./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --jobs 8",
       "jobs_flag": "",
       "deps": ["build.e2e_artifact", "build.manifest_guests", "e2e.metadata"],
       "timeout": 600,
-      "hint": {"resources": {"hermit_guest": 1, "manifest_guest": 8}, "est_duration_s": 180,
+      "hint": {"resources": {"manifest_guest": 8}, "est_duration_s": 180,
                "rss_baseline_bytes": 4294967296, "hard_mem_max_bytes": 6442450944,
                "classification": "latency-bound", "preferred_inner_jobs": 8}
     },
@@ -297,13 +297,13 @@
     {
       "group": "e2e", "job": "manifest_c_programs",
       "desc": "Portable manifest bucket: c-programs",
-      "description": "WORKER WIDTH measured 2026-08-23: recent 20-way validation runs rotated an identical empty early-Run1 no_result across unrelated ptrace cells, while each affected cell passed in another run. A focused run at eight workers completed all 127 selected strict rows in 264.3s with 127 canonical matches and no no_result, leaving a measured 335.7s margin to the unchanged 600s hang bound. This node reserves all 8 manifest_guest slots plus the exclusive hermit_guest slot and passes the same width to the harness. Tradeoff: blocking validation no longer exercises the former 20-way manifest pressure; every cell and the strict comparator remain enabled and unchanged. MEMORY measured 2026-08-25 at Hermit 16f70d9994 with the complete current-main artifact and width 8 under ambient load 40-107: five uncapped cgroup peaks were 2855145472-2894295040 bytes; three stricter 4-GiB-cap repetitions completed all 128 cells with peaks up to 3025047552 bytes and no cgroup kill. The 4-GiB baseline rounds above the observed high-water mark; the 6-GiB hard cap preserves nearly 3 GiB of runaway headroom without reserving the former unmeasured 32 GiB.",
+      "description": "WORKER WIDTH measured 2026-08-23: recent 20-way validation runs rotated an identical empty early-Run1 no_result across unrelated ptrace cells, while each affected cell passed in another run. A focused run at eight workers completed all 127 selected strict rows in 264.3s with 127 canonical matches and no no_result, leaving a measured 335.7s margin to the unchanged 600s hang bound. This node reserves all 8 manifest_guest slots and passes the same width to the harness; ordinary Hermit gates may overlap now that their unsupported exclusive resource is removed. Tradeoff: blocking validation still does not exercise the former 20-way manifest pressure; every cell and the strict comparator remain enabled and unchanged. MEMORY measured 2026-08-25 at Hermit 16f70d9994 with the complete current-main artifact and width 8 under ambient load 40-107: five uncapped cgroup peaks were 2855145472-2894295040 bytes; three stricter 4-GiB-cap repetitions completed all 128 cells with peaks up to 3025047552 bytes and no cgroup kill. The 4-GiB baseline rounds above the observed high-water mark; the 6-GiB hard cap preserves nearly 3 GiB of runaway headroom without reserving the former unmeasured 32 GiB.",
       "manifest": {"lane": "portable", "category": "c-programs"},
       "cmd": "./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category c-programs --ci-only --allow-empty --prebuilt --jobs 8",
       "jobs_flag": "",
       "deps": ["build.e2e_artifact", "build.manifest_guests", "e2e.metadata"],
       "timeout": 600,
-      "hint": {"resources": {"hermit_guest": 1, "manifest_guest": 8}, "est_duration_s": 300,
+      "hint": {"resources": {"manifest_guest": 8}, "est_duration_s": 300,
                "rss_baseline_bytes": 4294967296, "hard_mem_max_bytes": 6442450944,
                "classification": "latency-bound", "preferred_inner_jobs": 8}
     },
@@ -414,7 +414,7 @@
       "cmd": "./ci/run-with-hermit-e2e-artifact.sh --require-install ./tests/e2e/lib/applications/run_all.sh",
       "deps": ["build.e2e_artifact"],
       "timeout": 300,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 30,
+      "hint": {"est_duration_s": 30,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
                "classification": "latency-bound"}
     },
@@ -474,7 +474,7 @@
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
       "jobs_flag": "",
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+      "hint": {"est_duration_s": 120,
                "rss_baseline_bytes": 5368709120, "hard_mem_max_bytes": 7516192768,
                "classification": "cpu-bound", "preferred_inner_jobs": 8}
     },
@@ -497,7 +497,7 @@
       "cmd": "./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore --test tests_misc -j 1 -- --skip has_rdrand_without_detcore --skip rdrand_rdseed_is_masked --skip ordinary_clone_child_starts_before_parent_resumes --skip ordinary_clone_parent_mode_can_resume_before_child --skip network_syscalls_are_deterministic_across_five_runs",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 720,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
+      "hint": {"est_duration_s": 90,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "cpu-bound"}
     },
@@ -508,7 +508,7 @@
       "cmd": "./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore --test tests_parallelism -j 4 -- --skip detcore",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 720,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+      "hint": {"est_duration_s": 120,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "cpu-bound"}
     },
@@ -520,7 +520,7 @@
       "integration_test_binaries": ["aio_nr_determinism", "arch_status_determinism", "chaos_sched_yield_progress", "chaos_stress_pmu_detection", "chown_virtual_root_identity", "clock_determinism", "clock_discipline_determinism", "container_init_deadline", "cpufreq_avg_determinism", "epoll_determinism", "epoll_pwait_zero_timeout_progress", "file_nr_determinism", "fp_reduction_determinism", "futex2_refusal", "hashseed_determinism", "inode_nr_determinism", "kernel_keyring", "key_users_determinism", "mmap_determinism", "node_vmstat_determinism", "numa_maps_determinism", "perf_event_refusal", "pidfd_creation", "process_isolation_refusals", "proc_fdinfo_determinism", "proc_locks_determinism", "procfs_determinism", "procfs_positioned_determinism", "pty_nr_determinism", "python_stdlib", "self_sched_determinism", "self_schedstat_determinism", "signal_determinism", "smaps_determinism", "smaps_rollup_determinism", "sockstat_determinism", "softnet_stat_determinism", "swaps_determinism", "thp_stats_determinism", "verification_report_consumers", "zero_copy_pipe_fallback"],
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 1200,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 300,
+      "hint": {"est_duration_s": 300,
                "rss_baseline_bytes": 6442450944, "hard_mem_max_bytes": 8589934592,
                "classification": "latency-bound"}
     },
@@ -532,7 +532,7 @@
       "integration_test_binaries": ["arbitrary_binaries"],
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+      "hint": {"est_duration_s": 120,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
     },
@@ -544,7 +544,7 @@
       "integration_test_binaries": ["cli"],
       "deps": ["build.e2e_artifact", "build.liteinst_runtime_release", "setup.nextest"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 150,
+      "hint": {"est_duration_s": 150,
                "rss_baseline_bytes": 4294967296, "hard_mem_max_bytes": 6442450944,
                "classification": "latency-bound"}
     },
@@ -555,7 +555,7 @@
       "integration_test_binaries": ["liteinst_advanced"],
       "deps": ["build.e2e_artifact", "build.liteinst_runtime_release", "setup.nextest"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+      "hint": {"est_duration_s": 120,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
                "classification": "latency-bound"}
     },
@@ -566,7 +566,7 @@
       "integration_test_binaries": ["sabre_examples"],
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
+      "hint": {"est_duration_s": 90,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
                "classification": "latency-bound"}
     },
@@ -578,7 +578,7 @@
       "integration_test_binaries": ["hermit_modes"],
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 150,
+      "hint": {"est_duration_s": 150,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
     },
@@ -590,7 +590,7 @@
       "integration_test_binaries": ["app_strict_verify"],
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
+      "hint": {"est_duration_s": 180,
                "rss_baseline_bytes": 3221225472, "hard_mem_max_bytes": 6442450944,
                "classification": "latency-bound"}
     },
@@ -602,7 +602,7 @@
       "integration_test_binaries": ["command_strict_verify"],
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
+      "hint": {"est_duration_s": 180,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
     },
@@ -614,7 +614,7 @@
       "integration_test_binaries": ["epoll_determinism", "rcx_canonicalization"],
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 720,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
+      "hint": {"est_duration_s": 90,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
     },
@@ -638,7 +638,7 @@
       "cmd": "python3 tests/backend-parity/run_matrix.py --hermit target/release/hermit --backend dbt --strict --require-backend --no-parent-scorecard",
       "deps": ["build.runtime_release", "check.dbt_runtime_abi"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
+      "hint": {"est_duration_s": 180,
                "rss_baseline_bytes": 536870912, "hard_mem_max_bytes": 2147483648,
                "classification": "latency-bound"}
     },
@@ -649,7 +649,7 @@
       "cmd": "set -e; HERMIT=target/debug/hermit; ARGS='run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled'; REPS=${L4_REPS:-20}; EXECUTED=0; CURRENT_TEST=''; RESULTS=(); publish_counts() { local status=$? count_status; trap - EXIT; set +e; if ((status != 0)) && [[ -n $CURRENT_TEST ]]; then RESULTS+=(\"envelope/$CURRENT_TEST\" fail 1); fi; ./ci/write-structured-test-counts.sh \"$EXECUTED\" 0 \"${RESULTS[@]}\"; count_status=$?; if ((status == 0 && count_status != 0)); then status=$count_status; fi; exit \"$status\"; }; trap publish_counts EXIT; run_probe() { local id=\"$1\"; local c=\"$2\"; CURRENT_TEST=\"$id\"; EXECUTED=$((EXECUTED + 1)); printf '##TEST-START %s\\n' \"$id\" >&2; timeout 30s $HERMIT $ARGS --strict -- $c </dev/null >&2; timeout 30s $HERMIT $ARGS --strict --verify -- $c </dev/null >&2; timeout 30s $HERMIT $ARGS --strict --verify --detlog-heap --detlog-stack -- $c </dev/null >&2; local i; for ((i=0;i<REPS;i++)); do timeout 30s $HERMIT $ARGS --strict --verify -- $c </dev/null >&2; done; printf '##TEST-END %s PASS\\n' \"$id\" >&2; RESULTS+=(\"envelope/$id\" pass 1); CURRENT_TEST=''; }; run_probe true '/bin/true'; run_probe echo '/bin/echo hermit-envelope'; run_probe date '/bin/date -u +%Y'",
       "deps": ["build.workspace"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+      "hint": {"est_duration_s": 120,
                "rss_baseline_bytes": 134217728, "hard_mem_max_bytes": 1073741824,
                "classification": "latency-bound"}
     },
