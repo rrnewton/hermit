@@ -27,8 +27,6 @@
 set -uo pipefail
 
 POLICY="demos/ADVERSARIAL-REVIEW-POLICY.md"
-TRAILER_RE='^[[:space:]]*Demo-Green-Review:.*reviewer=[^[:space:]]+.*result=GREEN.*evidence=[^[:space:]]+'
-
 # Clean help for the safe probe: stdout, exit 0, no leaked raw comment header.
 help() {
     cat <<'EOF'
@@ -70,7 +68,21 @@ any_demo_touched() {  # stdin: NUL- or newline-separated paths
 }
 
 has_attestation() {  # $1 = text blob to search for a valid trailer
-    printf '%s' "$1" | grep -qE "$TRAILER_RE"
+    local line
+    while IFS= read -r line; do
+        printf '%s\n' "$line" | grep -qE '^[[:space:]]*Demo-Green-Review:' || continue
+        printf '%s\n' "$line" | grep -qE '(^|[[:space:]])reviewer=[^[:space:]]+([[:space:]]|$)' || continue
+        printf '%s\n' "$line" | grep -qE '(^|[[:space:]])demo=(all|demos/[^[:space:]]+)([[:space:]]|$)' || continue
+        printf '%s\n' "$line" | grep -qE '(^|[[:space:]])result=GREEN([[:space:]]|$)' || continue
+        printf '%s\n' "$line" | grep -qE '(^|[[:space:]])evidence=[^[:space:]]+([[:space:]]|$)' || continue
+        return 0
+    done <<<"$1"
+    return 1
+}
+
+git_refused() {
+    echo "demo-review gate: REFUSED: git could not inspect $1" >&2
+    exit 2
 }
 
 mode="" ; range="" ; msgfile="" ; commit=""
@@ -87,16 +99,36 @@ done
 
 case "$mode" in
     range)
-        changed=$(git diff --name-only "$range" 2>/dev/null)
-        messages=$(git log --format='%B' "$range" 2>/dev/null)
+        changed=$(git diff --name-only "$range" 2>/dev/null) || git_refused "range $range"
+        commits=$(git rev-list "$range" 2>/dev/null) || git_refused "range $range"
+        messages=""
+        latest_demo_commit=""
+        for revision in $commits; do
+            paths=$(git diff-tree --no-commit-id --name-only -r "$revision" 2>/dev/null) \
+                || git_refused "commit $revision"
+            if printf '%s\n' "$paths" | any_demo_touched >/dev/null; then
+                latest_demo_commit="$revision"
+                break
+            fi
+        done
+        if [ -n "$latest_demo_commit" ]; then
+            for revision in $commits; do
+                message=$(git log -1 --format='%B' "$revision" 2>/dev/null) \
+                    || git_refused "commit $revision"
+                messages="${messages}${message}"$'\n'
+                [ "$revision" = "$latest_demo_commit" ] && break
+            done
+        fi
         where="range $range" ;;
     staged)
-        changed=$(git diff --cached --name-only 2>/dev/null)
+        changed=$(git diff --cached --name-only 2>/dev/null) || git_refused "staged change"
         messages=$([ -n "$msgfile" ] && cat "$msgfile" 2>/dev/null || true)
         where="staged change" ;;
     commit)
-        changed=$(git show --name-only --format= "$commit" 2>/dev/null)
-        messages=$(git log -1 --format='%B' "$commit" 2>/dev/null)
+        changed=$(git show --name-only --format= "$commit" 2>/dev/null) \
+            || git_refused "commit $commit"
+        messages=$(git log -1 --format='%B' "$commit" 2>/dev/null) \
+            || git_refused "commit $commit"
         where="commit $commit" ;;
     *) usage ;;
 esac
