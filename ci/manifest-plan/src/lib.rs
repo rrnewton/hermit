@@ -1,6 +1,7 @@
 #[path = "../../../hermit-cli/src/canonical_verdict.rs"]
 pub mod canonical_verdict;
 pub mod ci_selection;
+pub mod environmental_block;
 pub mod host_capability;
 pub mod ledger;
 pub mod manifest_value;

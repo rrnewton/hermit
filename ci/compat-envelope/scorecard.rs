@@ -57,7 +57,7 @@ const SCORECARD: &str = "SCORECARD.md";
 const CELLS: &str = "ci/compat-envelope/cells.json";
 const EXPECTED_PLAN: &str = "ci/expected-e2e-plan.json";
 const SCHEMA: u64 = 7;
-const PRESSURE_SUMMARY_SCHEMA: u64 = 4;
+const PRESSURE_SUMMARY_SCHEMA: u64 = 5;
 const CELL_RESULT_SCHEMA: u64 = 4;
 
 const USAGE: &str = r#"Usage: ci/compat-envelope/scorecard.rs COMMAND [OPTIONS]
@@ -428,7 +428,11 @@ fn derive_measurement(cell: &TrackedCell) -> MeasurementState {
                 ObservedResult::DeterminismFailure
                 | ObservedResult::ParityFailure
                 | ObservedResult::ReplayFailure => diverged = true,
-                ObservedResult::CrashError | ObservedResult::Timeout | ObservedResult::Oom => {}
+                ObservedResult::CrashError
+                | ObservedResult::Timeout
+                | ObservedResult::Oom
+                | ObservedResult::SandboxDenied
+                | ObservedResult::InfrastructureError => {}
             }
         }
         located |= !observation.first_divergent_record.is_empty()
@@ -497,6 +501,7 @@ struct Observation {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     depth: BTreeMap<String, SourceDepth>,
     hermit_shas: BTreeSet<String>,
+    #[serde(deserialize_with = "deserialize_product_observation_results")]
     results: BTreeSet<ObservedResult>,
     /// The compact receipt for canonical validate evidence. Raw result files
     /// remain in retained history; this keeps the comparison identity and INFO
@@ -3663,7 +3668,7 @@ fn apply_pressure_summary(
     detcore_tree: &str,
     depth: &BTreeMap<String, SourceDepth>,
 ) -> Result<FoldOutcome, String> {
-    if summary.schema != PRESSURE_SUMMARY_SCHEMA {
+    if !matches!(summary.schema, 4 | PRESSURE_SUMMARY_SCHEMA) {
         return Err(format!(
             "unsupported pressure summary schema {}",
             summary.schema
@@ -5010,6 +5015,32 @@ where
     Ok(unique)
 }
 
+fn require_product_observation_results(results: &BTreeSet<ObservedResult>) -> Result<(), String> {
+    if let Some(result) = results.iter().find(|result| {
+        matches!(
+            result,
+            ObservedResult::SandboxDenied | ObservedResult::InfrastructureError
+        )
+    }) {
+        return Err(format!(
+            "tracked scorecard observation cannot contain non-product result `{}`",
+            result.as_str()
+        ));
+    }
+    Ok(())
+}
+
+fn deserialize_product_observation_results<'de, D>(
+    deserializer: D,
+) -> Result<BTreeSet<ObservedResult>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let results = BTreeSet::<ObservedResult>::deserialize(deserializer)?;
+    require_product_observation_results(&results).map_err(serde::de::Error::custom)?;
+    Ok(results)
+}
+
 fn validate_observation_identity_namespace(cells: &TrackedCells) -> Result<(), String> {
     let permits_projected_identity = cells.schema >= 7
         && cells.projection.as_ref().is_some_and(|projection| {
@@ -5019,6 +5050,7 @@ fn validate_observation_identity_namespace(cells: &TrackedCells) -> Result<(), S
     for cell in &cells.cells {
         let id = display_id(&cell.id);
         for observation in &cell.observations {
+            require_product_observation_results(&observation.results)?;
             let projected = !observation.event_ids.is_empty();
             if (projected || observation.detcore_tree.is_none()) && !permits_projected_identity {
                 return Err(format!(
@@ -5131,7 +5163,13 @@ fn series_evidence(row: &SeriesRow, mode: &str) -> Option<SeriesEvidence> {
                 result: Some(result),
                 no_verdict: false,
             }),
-            Some(ObservedResult::CrashError | ObservedResult::Timeout | ObservedResult::Oom)
+            Some(
+                ObservedResult::CrashError
+                | ObservedResult::Timeout
+                | ObservedResult::Oom
+                | ObservedResult::SandboxDenied
+                | ObservedResult::InfrastructureError,
+            )
             | None => None,
         };
     }
@@ -8855,8 +8893,10 @@ red/`measured-and-passed` count is **0**.",
                     .as_ref()
                     .is_some_and(|last| last.hermit_sha == fixture_head)
                 && cell.observations.iter().any(|observation| {
-                    observation.hermit_shas.contains(&fixture_head)
-                        && observation.results.is_empty()
+                    observation.detcore_tree.as_deref() == Some(fixture_detcore_tree.as_str())
+                        && observation.provenance == ObservationProvenance::Validate
+                        && observation.hermit_shas.contains(&fixture_head)
+                        && observation.results.contains(&ObservedResult::Pass)
                         && observation.invocations.iter().any(|invocation| {
                             invocation.run_id == "result-command-verify"
                                 && invocation.attempt == Some(1)
@@ -8914,7 +8954,7 @@ red/`measured-and-passed` count is **0**.",
         serde_json::to_vec(&PressureSummary {
             schema: PRESSURE_SUMMARY_SCHEMA,
             hermit_sha: fixture_head.clone(),
-            detcore_tree: fixture_detcore_tree,
+            detcore_tree: fixture_detcore_tree.clone(),
             source_tree_dirty: false,
             rows: vec![current_row],
         })
@@ -10469,6 +10509,22 @@ red/`measured-and-passed` count is **0**.",
     {
         return Err("infrastructure failure was stored as product behavior".into());
     }
+    let sandbox_denied = pressure_summary(
+        "sha-1",
+        "tree-1",
+        vec![pressure_row("sandbox-denied", None, None)],
+    );
+    if apply_pressure_summary(
+        &mut refusal_target,
+        &sandbox_denied,
+        "sha-1",
+        "tree-1",
+        &depth_fixture,
+    )
+    .is_ok()
+    {
+        return Err("sandbox-denied pressure output was stored as product behavior".into());
+    }
     // ⚠️ THE HEADLINE PROPERTY, OWNER RULING: A BATCH OF N CELLS HAS EXACTLY THE
     // SAME EFFECT AS N SEPARATE SINGLE-CELL RUNS. Cells have nothing to do with
     // each other, so one bad row must affect its own cell and nothing else.
@@ -11787,6 +11843,33 @@ red/`measured-and-passed` count is **0**.",
     event_ids.push(duplicate_event_id);
     if serde_json::from_value::<TrackedCells>(duplicate_event_ids).is_ok() {
         return Err("duplicate projected observation event_id was accepted".into());
+    }
+    for (rendered, typed) in [
+        ("sandbox-denied", ObservedResult::SandboxDenied),
+        ("infrastructure-error", ObservedResult::InfrastructureError),
+    ] {
+        let mut direct_json: JsonValue = serde_json::from_str(&object_store_outputs[0])
+            .map_err(|e| format!("cannot decode projected fixture for result refusal: {e}"))?;
+        direct_json["cells"][0]["observations"][0]["results"] =
+            serde_json::json!([rendered]);
+        let direct_error = serde_json::from_value::<TrackedCells>(direct_json)
+            .expect_err("direct tracked serde accepted a non-product observation result")
+            .to_string();
+        if !direct_error.contains(rendered) {
+            return Err(format!(
+                "direct tracked serde refusal did not name {rendered}: {direct_error}"
+            ));
+        }
+
+        let mut typed_cells = projected_fixture.clone();
+        typed_cells.cells[0].observations[0].results = BTreeSet::from([typed]);
+        let encode_error = encoded_cells(&typed_cells)
+            .expect_err("scorecard writer accepted a non-product observation result");
+        if !encode_error.contains(rendered) {
+            return Err(format!(
+                "scorecard writer refusal did not name {rendered}: {encode_error}"
+            ));
+        }
     }
 
     // The real erasure mode: the observation SURVIVES and its coordinates are

@@ -763,7 +763,8 @@ impl SeriesRow {
                 )
                 | (
                     SeriesOutcome::Errored,
-                    None,
+                    Some(ObservedResult::SandboxDenied | ObservedResult::InfrastructureError)
+                        | None,
                     Some(FailureClass::UnderstoodInfrastructureFailure)
                 )
                 | (
@@ -1230,5 +1231,31 @@ mod tests {
                 .unwrap_err()
                 .contains("noncanonical_match evidence")
         );
+    }
+
+    #[test]
+    fn v3_accepts_only_matching_typed_infrastructure_classifications() {
+        for result in [
+            ObservedResult::SandboxDenied,
+            ObservedResult::InfrastructureError,
+        ] {
+            let mut fixture = no_verdict_row();
+            fixture.series.outcome = SeriesOutcome::Errored;
+            fixture.series.result = Some(result);
+            fixture.series.failure_class = Some(FailureClass::UnderstoodInfrastructureFailure);
+            fixture.validate_for_read().unwrap();
+            fixture.validate_for_write().unwrap();
+            fixture.validate_for_projection().unwrap();
+
+            let encoded = serde_json::to_string(&fixture).unwrap();
+            let decoded: SeriesRow = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded.series.result, Some(result));
+            decoded.validate_for_read().unwrap();
+
+            fixture.series.failure_class = Some(FailureClass::ProductFailure);
+            let error = fixture.validate_for_write().unwrap_err();
+            assert!(error.contains(&format!("{result:?}")), "{error}");
+            assert!(error.contains("ProductFailure"), "{error}");
+        }
     }
 }
