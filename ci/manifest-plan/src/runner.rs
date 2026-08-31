@@ -4145,7 +4145,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(cells.len(), 1);
-        assert_eq!(cells[0].timeout_seconds, 30);
+        assert_eq!(cells[0].timeout_seconds, 45);
     }
 
     #[test]
