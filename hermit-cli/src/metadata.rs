@@ -122,7 +122,11 @@ impl RecordVersion {
 // 0x114 -> 0x115: event stream filenames now encode deterministic process-tree
 // pedigrees instead of process-local allocation order. Older readers look for
 // integer filenames and cannot replay a recording containing child streams.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x115);
+//
+// 0x115 -> 0x116: event stream filenames are fixed-size SHA-256 names and each
+// data/debug stream begins with its complete process-tree identity. Older
+// readers cannot skip or validate these headers.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x116);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -147,7 +151,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x115);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x115;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x116;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

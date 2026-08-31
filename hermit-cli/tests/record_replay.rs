@@ -197,16 +197,103 @@ fn public_record_replay_preserves_distinct_forked_child_streams() {
     assert_eq!(recording.stdout, b"first-child\nsecond-child\nparent\n");
 
     let thread_dir = data.path().join("thread");
-    for stream in ["3", "3.0", "3.1"] {
-        for suffix in ["", ".debug"] {
-            let path = thread_dir.join(format!("{stream}{suffix}"));
-            let metadata = fs::metadata(&path)
-                .unwrap_or_else(|error| panic!("missing stream {}: {error}", path.display()));
-            assert!(metadata.len() > 0, "empty stream file: {}", path.display());
-        }
+    let streams = fs::read_dir(&thread_dir)
+        .expect("read thread streams")
+        .map(|entry| entry.expect("read stream entry"))
+        .filter(|entry| !entry.file_name().to_string_lossy().ends_with(".debug"))
+        .collect::<Vec<_>>();
+    assert_eq!(streams.len(), 3, "root and both child streams must survive");
+    for stream in streams {
+        let name = stream.file_name();
+        let name = name.to_string_lossy();
+        assert!(
+            name.starts_with("stream-"),
+            "unexpected stream name: {name}"
+        );
+        assert_eq!(name.len(), "stream-".len() + 64);
+        assert!(stream.metadata().expect("read stream metadata").len() > 0);
+        assert!(
+            fs::metadata(thread_dir.join(format!("{name}.debug")))
+                .expect("read debug stream metadata")
+                .len()
+                > 0
+        );
     }
 
     let replay = hermit::replay_with_output(data.path()).expect("forked guest should replay");
+    assert_eq!(replay.status, reverie::process::ExitStatus::Exited(0));
+    assert_eq!(replay.stdout, recording.stdout);
+}
+
+#[test]
+fn public_record_replay_handles_a_deep_serial_fork_chain() {
+    const INNER: &str = "HERMIT_DEEP_FORK_STREAM_RECORD_REPLAY_INNER";
+    if std::env::var_os(INNER).is_none() {
+        let mut command = ReverieCommand::new(std::env::current_exe().expect("find test binary"));
+        command
+            .args([
+                "--exact",
+                "public_record_replay_handles_a_deep_serial_fork_chain",
+                "--nocapture",
+            ])
+            .env(INNER, "1")
+            .map_root()
+            .unshare(Namespace::MOUNT | Namespace::PID)
+            .mount(Mount::proc());
+        let output = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build namespace test runtime")
+            .block_on(command.output())
+            .expect("launch deep-fork record/replay namespace");
+        assert_eq!(
+            output.status,
+            reverie::process::ExitStatus::Exited(0),
+            "deep-fork record/replay failed in its user namespace:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let _guard = hermit_record_lock();
+    let data = tempfile::tempdir().expect("create recording directory");
+    let build = tempfile::tempdir().expect("create guest build directory");
+    let guest = build.path().join("record-replay-deep-fork-chain");
+    compile_c(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli must be inside the repository")
+            .join("tests/c/record_replay_deep_fork_chain.c"),
+        &guest,
+    );
+
+    let mut command = ReverieCommand::new(&guest);
+    command.map_root();
+    let recording =
+        hermit::record_with_output(command, data.path()).expect("deep fork chain should record");
+    assert_eq!(recording.status, reverie::process::ExitStatus::Exited(0));
+    let output = String::from_utf8(recording.stdout.clone()).expect("guest output should be UTF-8");
+    assert!(output.starts_with("leaf-125\n"));
+    assert!(output.ends_with("parent-0\n"));
+    assert_eq!(output.lines().count(), 126);
+
+    let entries = fs::read_dir(data.path().join("thread"))
+        .expect("read thread streams")
+        .map(|entry| entry.expect("read stream entry"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        entries.len(),
+        252,
+        "every process needs data and debug streams"
+    );
+    assert!(entries.iter().all(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        name.len() <= 255 && entry.metadata().is_ok_and(|metadata| metadata.len() > 0)
+    }));
+
+    let replay = hermit::replay_with_output(data.path()).expect("deep fork chain should replay");
     assert_eq!(replay.status, reverie::process::ExitStatus::Exited(0));
     assert_eq!(replay.stdout, recording.stdout);
 }

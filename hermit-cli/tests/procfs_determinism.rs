@@ -16,6 +16,13 @@ use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 
+use nix::mount::MsFlags;
+use nix::mount::mount;
+use nix::mount::umount;
+use reverie::process::Command as ReverieCommand;
+use reverie::process::Mount;
+use reverie::process::Namespace;
+
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 const RUNS: usize = 5;
 
@@ -23,6 +30,37 @@ fn compile_c(source: &Path, output: &Path) {
     let rendered = format!("cc -O0 -g {} -o {}", source.display(), output.display());
     let result = Command::new("cc")
         .args(["-O0", "-g"])
+        .arg(source)
+        .arg("-o")
+        .arg(output)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    assert!(
+        result.status.success(),
+        "guest compilation failed: {rendered}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+fn compile_freestanding_c(source: &Path, output: &Path) {
+    let args = [
+        "-O0",
+        "-g",
+        "-nostdlib",
+        "-static",
+        "-fno-stack-protector",
+        "-fno-pie",
+        "-no-pie",
+    ];
+    let rendered = format!(
+        "cc {} {} -o {}",
+        args.join(" "),
+        source.display(),
+        output.display()
+    );
+    let result = Command::new("cc")
+        .args(args)
         .arg(source)
         .arg("-o")
         .arg(output)
@@ -1122,6 +1160,134 @@ fn fdinfo_mount_ids_match_mountinfo_without_aliasing() {
     assert_eq!(first.0, first.2, "root fdinfo disagreed with mountinfo");
     assert_eq!(first.1, first.3, "proc fdinfo disagreed with mountinfo");
     assert_ne!(first.0, first.1, "distinct mounts collapsed to one mnt_id");
+}
+
+#[test]
+fn chroot_mountinfo_subset_keeps_fdinfo_identity_consistent() {
+    const INNER: &str = "HERMIT_CHROOT_MOUNTINFO_SUBSET_INNER";
+    if std::env::var_os(INNER).is_none() {
+        let mut command = ReverieCommand::new(std::env::current_exe().expect("find test binary"));
+        command
+            .args([
+                "--exact",
+                "chroot_mountinfo_subset_keeps_fdinfo_identity_consistent",
+                "--nocapture",
+            ])
+            .env(INNER, "1")
+            .map_root()
+            .unshare(Namespace::MOUNT | Namespace::PID)
+            .mount(Mount::proc());
+        let output = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build chroot namespace test runtime")
+            .block_on(command.output())
+            .expect("launch chroot namespace test");
+        assert_eq!(
+            output.status,
+            reverie::process::ExitStatus::Exited(0),
+            "chroot mountinfo test failed in its private namespace:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let _guard = hermit_run_lock();
+    let root = tempfile::tempdir().expect("create chroot");
+    let build = tempfile::tempdir().expect("create guest build directory");
+    let controller_program = build.path().join("chroot-mountinfo-fdinfo");
+    compile_freestanding_c(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli must be inside the repository")
+            .join("tests/c/chroot_mountinfo_fdinfo.c"),
+        &controller_program,
+    );
+
+    // TracerBuilder validates the host pathname before entering the chroot,
+    // while exec resolves that same absolute pathname inside the chroot.
+    let relative_program = controller_program
+        .strip_prefix("/")
+        .expect("temporary guest path should be absolute");
+    let chroot_program = root.path().join(relative_program);
+    fs::create_dir_all(chroot_program.parent().expect("guest must have a parent"))
+        .expect("create chroot guest parent");
+    fs::copy(&controller_program, &chroot_program).expect("copy guest into chroot");
+
+    let proc_target = root.path().join("proc");
+    fs::create_dir(&proc_target).expect("create chroot proc mountpoint");
+    mount(
+        Some("proc"),
+        &proc_target,
+        Some("proc"),
+        MsFlags::empty(),
+        None::<&str>,
+    )
+    .expect("mount procfs inside chroot");
+
+    let captured_mount_ids =
+        hermit::capture_mountinfo_identity_order().expect("capture producer mount identity order");
+    let raw_proc_mount_id = fs::read_to_string("/proc/self/mountinfo")
+        .expect("read producer mountinfo")
+        .lines()
+        .find_map(|row| {
+            let mut fields = row.split(' ');
+            let raw_mount_id = fields.next()?.parse::<u64>().ok()?;
+            let _parent = fields.next()?;
+            let _device = fields.next()?;
+            let _root = fields.next()?;
+            (fields.next()? == proc_target.to_str()?).then_some(raw_mount_id)
+        })
+        .expect("find chroot proc mount in producer mountinfo");
+    let expected_proc_mount_id = captured_mount_ids
+        .iter()
+        .position(|raw| *raw == raw_proc_mount_id)
+        .map(|index| index as u64 + 1)
+        .expect("proc mount must be present in captured identity order");
+
+    let config = hermit::DetConfig {
+        mountinfo_mount_ids: captured_mount_ids,
+        mountinfo_mount_ids_captured: true,
+        ..Default::default()
+    };
+    let mut command = ReverieCommand::new(&controller_program);
+    command.chroot(root.path()).current_dir("/");
+    let output = hermit::run_with_output(command, config, false, &None);
+    umount(&proc_target).expect("unmount chroot procfs");
+    let output = output.expect("run chroot guest");
+    assert_eq!(
+        output.status,
+        reverie::process::ExitStatus::Exited(0),
+        "chroot guest failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let text = std::str::from_utf8(&output.stdout).expect("procfs output should be UTF-8");
+    let (mountinfo, fdinfo) = text
+        .strip_prefix("__MOUNTINFO__\n")
+        .and_then(|text| text.split_once("__FDINFO__\n"))
+        .expect("guest output must separate mountinfo and fdinfo");
+    let visible_proc_mount_id = mountinfo
+        .lines()
+        .find_map(|row| {
+            let fields = row.split(' ').collect::<Vec<_>>();
+            (fields.get(4) == Some(&"/proc")).then(|| {
+                fields[0]
+                    .parse::<u64>()
+                    .expect("mountinfo ID should be decimal")
+            })
+        })
+        .expect("chroot mountinfo must expose /proc");
+    let fdinfo_mount_id = detcore_model::procfs::parse_fdinfo_mount_id(fdinfo.as_bytes())
+        .expect("fdinfo must contain one numeric mnt_id");
+    assert_eq!(visible_proc_mount_id, expected_proc_mount_id);
+    assert_eq!(fdinfo_mount_id, expected_proc_mount_id);
+    assert!(
+        !mountinfo.contains(root.path().to_str().expect("UTF-8 chroot path")),
+        "chroot mountinfo leaked the host-side chroot path:\n{mountinfo}"
+    );
 }
 
 fn redirected_regular_stdio_fdinfo() -> Vec<u8> {

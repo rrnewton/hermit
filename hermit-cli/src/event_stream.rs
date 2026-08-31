@@ -32,7 +32,7 @@ use crate::event::Event;
 /// Each component after the root is the parent's deterministic child ordinal.
 /// Unlike a process-local counter, this remains collision-free when Reverie
 /// forks the tool itself and each process receives its own tool instance.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct EventStreamId(Vec<u64>);
 
 impl EventStreamId {
@@ -45,11 +45,13 @@ impl EventStreamId {
         path.push(ordinal);
         Self(path)
     }
-}
 
-impl Default for EventStreamId {
-    fn default() -> Self {
-        Self::root()
+    fn file_name(&self) -> String {
+        let mut identity = b"hermit-event-stream-v1\0".to_vec();
+        for ordinal in &self.0 {
+            identity.extend_from_slice(&ordinal.to_be_bytes());
+        }
+        format!("stream-{}", detcore::Digest::new(&identity))
     }
 }
 
@@ -69,13 +71,8 @@ impl fmt::Display for EventStreamId {
 /// Replayer process instance. When Reverie forks a tool process, the child
 /// receives its already-assigned stream identity and a fresh descendant
 /// counter, while the continuing parent retains the incremented counter.
+#[derive(Default)]
 pub(crate) struct ChildEventStreamIds(AtomicU64);
-
-impl Default for ChildEventStreamIds {
-    fn default() -> Self {
-        Self(AtomicU64::new(0))
-    }
-}
 
 impl ChildEventStreamIds {
     pub(crate) fn next(&self, parent: &EventStreamId) -> EventStreamId {
@@ -87,6 +84,56 @@ impl ChildEventStreamIds {
             .unwrap_or_else(|_| panic!("record/replay child stream ordinal overflow"));
         parent.child(ordinal)
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct EventStreamHeader {
+    stream_id: EventStreamId,
+}
+
+fn decode_stream_header(
+    reader: &mut io::BufReader<fs::File>,
+    expected: &EventStreamId,
+) -> io::Result<()> {
+    let header: EventStreamHeader =
+        bincode::serde::decode_from_std_read(reader, bincode::config::legacy()).map_err(
+            |error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid event-stream identity header: {error}"),
+                )
+            },
+        )?;
+    if header.stream_id != *expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "event-stream identity mismatch: expected {expected}, found {}",
+                header.stream_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn encode_stream_header(
+    writer: &mut io::BufWriter<fs::File>,
+    stream_id: &EventStreamId,
+) -> io::Result<()> {
+    bincode::serde::encode_into_std_write(
+        EventStreamHeader {
+            stream_id: stream_id.clone(),
+        },
+        writer,
+        bincode::config::legacy(),
+    )
+    .map(|_| ())
+    .map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to encode event-stream identity header: {error}"),
+        )
+    })
 }
 
 impl Serialize for ChildEventStreamIds {
@@ -276,13 +323,16 @@ fn default_reader() -> io::BufReader<fs::File> {
 impl EventReader {
     /// Opens an existing event stream.
     pub fn open(path: &Path, stream_id: &EventStreamId) -> io::Result<Self> {
+        let file_name = stream_id.file_name();
+        let mut reader = io::BufReader::new(fs::File::open(path.join("thread").join(&file_name))?);
+        let mut debug_events = io::BufReader::new(fs::File::open(
+            path.join("thread").join(format!("{file_name}.debug")),
+        )?);
+        decode_stream_header(&mut reader, stream_id)?;
+        decode_stream_header(&mut debug_events, stream_id)?;
         Ok(Self {
-            reader: io::BufReader::new(fs::File::open(
-                path.join("thread").join(stream_id.to_string()),
-            )?),
-            debug_events: io::BufReader::new(fs::File::open(
-                path.join("thread").join(format!("{stream_id}.debug")),
-            )?),
+            reader,
+            debug_events,
             count: 0,
         })
     }
@@ -336,6 +386,7 @@ impl EventWriter {
         let path = path.join("thread");
 
         fs::create_dir_all(&path)?;
+        let file_name = stream_id.file_name();
 
         let create = |path| {
             fs::OpenOptions::new()
@@ -344,9 +395,13 @@ impl EventWriter {
                 .open(path)
         };
 
+        let mut writer = io::BufWriter::new(create(path.join(&file_name))?);
+        let mut debug_events = io::BufWriter::new(create(path.join(format!("{file_name}.debug")))?);
+        encode_stream_header(&mut writer, stream_id)?;
+        encode_stream_header(&mut debug_events, stream_id)?;
         Ok(Self {
-            writer: io::BufWriter::new(create(path.join(stream_id.to_string()))?),
-            debug_events: io::BufWriter::new(create(path.join(format!("{stream_id}.debug")))?),
+            writer,
+            debug_events,
         })
     }
 
@@ -378,6 +433,9 @@ impl Default for EventWriter {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::io;
+
     use reverie::syscalls::Syscall;
     use reverie::syscalls::SyscallArgs;
     use reverie::syscalls::Sysno;
@@ -485,6 +543,16 @@ mod tests {
     }
 
     #[test]
+    fn deeply_nested_stream_names_remain_bounded() {
+        let mut stream_id = EventStreamId::root();
+        for ordinal in 0..125 {
+            stream_id = stream_id.child(ordinal);
+        }
+        assert_eq!(stream_id.file_name().len(), "stream-".len() + 64);
+        assert!(stream_id.file_name().len() <= 255);
+    }
+
+    #[test]
     fn duplicate_stream_identity_refuses_instead_of_overwriting() {
         let data = tempfile::tempdir().expect("create recording directory");
         let stream_id = EventStreamId::root().child(0);
@@ -494,5 +562,31 @@ mod tests {
             .expect("duplicate stream must refuse");
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         drop(first);
+    }
+
+    #[test]
+    fn mismatched_stream_header_refuses_instead_of_aliasing() {
+        let data = tempfile::tempdir().expect("create recording directory");
+        let expected = EventStreamId::root().child(0);
+        let different = EventStreamId::root().child(1);
+        let writer = super::EventWriter::create(data.path(), &expected).expect("create stream");
+        drop(writer);
+
+        let file_name = expected.file_name();
+        let mut file = io::BufWriter::new(
+            fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(data.path().join("thread").join(file_name))
+                .expect("open stream for corruption"),
+        );
+        super::encode_stream_header(&mut file, &different).expect("write mismatched header");
+        drop(file);
+
+        let error = super::EventReader::open(data.path(), &expected)
+            .err()
+            .expect("mismatched stream identity must refuse");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("identity mismatch"));
     }
 }
