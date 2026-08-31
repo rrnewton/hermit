@@ -1232,6 +1232,14 @@ impl SkidOvershootReport {
 // and only the `third-party-backends` build offers them. The reverie-sabre Rust
 // dependency lives in the `detcore-sabre` crate, which is excluded from the
 // workspace's `default-members`.
+fn backend_feature_disabled_reason(feature: &str, integration: &str) -> String {
+    format!(
+        "the `{feature}` feature is not enabled in this build; rebuild with `--features \
+         {feature}` (or `--features third-party-backends`). This says nothing about whether \
+         {integration} works on this machine -- it has not been checked"
+    )
+}
+
 #[cfg(feature = "sabre")]
 fn sabre_unavailable_reason() -> Option<String> {
     sabre_runtime_unavailable_reason()
@@ -1239,7 +1247,7 @@ fn sabre_unavailable_reason() -> Option<String> {
 
 #[cfg(not(feature = "sabre"))]
 fn sabre_unavailable_reason() -> Option<String> {
-    Some("the `sabre` feature is not enabled in this build; rebuild with `--features sabre` (or `--features third-party-backends`). This says nothing about whether SaBRe works on this machine -- it has not been checked".to_owned())
+    Some(backend_feature_disabled_reason("sabre", "SaBRe"))
 }
 
 #[cfg(feature = "e9patch")]
@@ -1252,7 +1260,7 @@ fn e9patch_unavailable_reason() -> Option<String> {
 
 #[cfg(not(feature = "e9patch"))]
 fn e9patch_unavailable_reason() -> Option<String> {
-    Some("the `e9patch` feature is not enabled in this build; rebuild with `--features e9patch` (or `--features third-party-backends`). This says nothing about whether e9patch works on this machine -- it has not been checked".to_owned())
+    Some(backend_feature_disabled_reason("e9patch", "e9patch"))
 }
 
 #[cfg(feature = "dbt")]
@@ -1269,7 +1277,7 @@ fn dbt_unavailable_reason() -> Option<String> {
 #[cfg(not(feature = "dbt"))]
 // TODO-HUMAN-REVIEW(PR-1150): Review the default-on DBT compile-time feature boundary.
 fn dbt_unavailable_reason() -> Option<String> {
-    Some("the `dbt` feature is not enabled in this build; rebuild with `--features dbt` (or `--features third-party-backends`). This says nothing about whether DynamoRIO works on this machine -- it has not been checked".to_owned())
+    Some(backend_feature_disabled_reason("dbt", "DynamoRIO"))
 }
 
 const SABRE_BINARY_ENV: &str = "HERMIT_SABRE_BINARY";
@@ -3485,25 +3493,14 @@ mod tests {
     /// message must say which flag and admit what it did not check.
     #[test]
     fn an_unbuilt_backend_names_the_flag_and_claims_nothing_about_the_machine() {
-        for (backend, flag) in [
-            (Backend::Dbt, "dbt"),
-            (Backend::Sabre, "sabre"),
-            (Backend::E9patch, "e9patch"),
+        for (backend, flag, integration) in [
+            (Backend::Dbt, "dbt", "DynamoRIO"),
+            (Backend::Sabre, "sabre", "SaBRe"),
+            (Backend::E9patch, "e9patch", "e9patch"),
         ] {
-            let Some(reason) = backend.unavailable_reason() else {
-                // Built in on this configuration; nothing to assert.
-                continue;
-            };
-            // ⚠️ KEY THE FILTER ON THE CONDITION, NOT ON THE NEW WORDING. My first
-            // version skipped unless the message already said "not enabled in this
-            // build" -- so reverting to the old "support was not included in this
-            // build" fell through the filter and the test passed. A guard that only
-            // recognises the fixed form cannot catch the regression it exists for.
-            // "build" appears in both wordings and in neither of the runtime ones.
-            if !reason.contains("build") {
-                // Unavailable for a REAL, tested reason (missing runtime, etc.).
-                continue;
-            }
+            // Assert the exact compile-feature path without consulting runtime
+            // artifacts that other concurrently running tests may create.
+            let reason = super::backend_feature_disabled_reason(flag, integration);
             assert!(
                 reason.contains(flag),
                 "{backend:?}: a build-flag message must name the flag to rebuild with, got: {reason}"
@@ -3513,6 +3510,22 @@ mod tests {
                 "{backend:?}: a build-flag message must not imply the machine was tested, got: {reason}"
             );
         }
+
+        #[cfg(not(feature = "dbt"))]
+        assert_eq!(
+            Backend::Dbt.unavailable_reason(),
+            Some(super::backend_feature_disabled_reason("dbt", "DynamoRIO"))
+        );
+        #[cfg(not(feature = "sabre"))]
+        assert_eq!(
+            Backend::Sabre.unavailable_reason(),
+            Some(super::backend_feature_disabled_reason("sabre", "SaBRe"))
+        );
+        #[cfg(not(feature = "e9patch"))]
+        assert_eq!(
+            Backend::E9patch.unavailable_reason(),
+            Some(super::backend_feature_disabled_reason("e9patch", "e9patch"))
+        );
     }
     use std::ffi::OsStr;
     use std::fs;
