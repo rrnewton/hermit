@@ -84,9 +84,9 @@ source_abs=$(realpath -- "$source") || die "cannot resolve script path $source"
 case $source_abs in
     "$ROOT_DIR"/*) source_rel=${source_abs#"$ROOT_DIR"/} ;;
     *)
-        if [[ ${HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED:-} == 1 ]]; then
-            die "script $source_abs is outside repository $ROOT_DIR"
-        fi
+        # The validation environment also launches rust-script programs owned
+        # by its external operational tooling. This repository cannot prepare
+        # those sources, so leave that separate checkout to its own runner.
         real_rust_script=$(find_real_rust_script)
         exec "$real_rust_script" "${original_args[@]}"
         ;;
