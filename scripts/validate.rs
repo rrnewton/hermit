@@ -11823,13 +11823,13 @@ mod nextest_timeout_tests {
     /// The per-test cap stays at 15s, and every exemption from it is named,
     /// measured, and justified IN PLACE.
     ///
-    /// ⚠️ WIDENED FROM ONE OVERRIDE TO THREE, DELIBERATELY AND WITHOUT WEAKENING.
+    /// ⚠️ WIDENED FROM ONE OVERRIDE TO SIX, DELIBERATELY AND WITHOUT WEAKENING.
     /// This gate is a ratchet against exemptions accumulating quietly, so adding
     /// one had to be a visible edit here rather than a silently passing config
     /// change -- which is exactly what it did: each added override failed this
-    /// test first. It is now STRICTER than before, not looser: it pins all three
+    /// test first. It is now STRICTER than before, not looser: it pins all six
     /// filters and requires each override's justification text to be present, so
-    /// a third exemption still cannot appear without an author changing this
+    /// a seventh exemption still cannot appear without an author changing this
     /// list and supplying a reason. The count alone was the weaker check.
     #[test]
     fn nextest_uses_the_manifest_default_and_named_overrides() {
@@ -11839,6 +11839,9 @@ mod nextest_timeout_tests {
             "- filter: test(/(^|::)every_record_container_site_classifies_a_child_fault_by_name$/)\n    timeout_seconds: 45",
             "- filter: test(/(^|::)run_timeout_fallback_fires_when_the_unwind_does_not_finish$/)\n    timeout_seconds: 45",
             "- filter: binary(=container_init_deadline)\n    timeout_seconds: 30",
+            "- filter: test(/(^|::)liteinst_strict_verify_shell_and_entropy_consumer$/)\n    timeout_seconds: 30",
+            "- filter: test(/(^|::)liteinst_strict_verify_virtual_identity_and_time$/)\n    timeout_seconds: 30",
+            "- filter: test(/(^|::)sabre_non_racy_examples_verify_current_envelope$/)\n    timeout_seconds: 30",
         ];
         let manifest_timeouts_match = |source: &str| {
             manifest_timeout_stanzas
@@ -11878,13 +11881,19 @@ mod nextest_timeout_tests {
                 "slow-timeout = { period = \"45s\", terminate-after = 1, grace-period = \"2s\" }",
                 "slow-timeout = { period = \"45s\", terminate-after = 1, grace-period = \"2s\" }",
                 "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
+                "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
+                "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
+                "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
             ],
-            "the per-test timeout must stay at 15s with two justified 45s overrides and one justified 30s override"
+            "the per-test timeout must stay at 15s with two justified 45s overrides and four justified 30s overrides"
         );
         for required in [
             "test(/(^|::)every_record_container_site_classifies_a_child_fault_by_name$/)",
             "test(/(^|::)run_timeout_fallback_fires_when_the_unwind_does_not_finish$/)",
             "binary(=container_init_deadline)",
+            "test(/(^|::)liteinst_strict_verify_shell_and_entropy_consumer$/)",
+            "test(/(^|::)liteinst_strict_verify_virtual_identity_and_time$/)",
+            "test(/(^|::)sabre_non_racy_examples_verify_current_envelope$/)",
         ] {
             assert!(config.contains(required), "nextest config lost {required}");
             assert!(manifest.contains(required), "manifest lost {required}");
@@ -11911,6 +11920,19 @@ mod nextest_timeout_tests {
         assert!(manifest.contains("15-second timeout"));
         assert!(manifest.contains("20-second teardown budget"));
         assert!(manifest.contains("15.002 seconds"));
+        for required in [
+            "210 passes",
+            "12.837",
+            "211 passes",
+            "11.148",
+            "181 passes",
+            "20.295",
+            "RUN 1613",
+            "two concurrent validates",
+        ] {
+            assert!(config.contains(required), "nextest config lost {required}");
+            assert!(manifest.contains(required), "manifest lost {required}");
+        }
         assert!(manifest.contains("timeout_seconds: 15"));
     }
 }

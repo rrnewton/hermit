@@ -10,3 +10,12 @@ nextest:
   - filter: binary(=container_init_deadline)
     timeout_seconds: 30
     slow_reason: This binary deliberately exercises a 15-second timeout and cleanup paths with a 20-second teardown budget; once registered, a sibling test hit the 15-second default at 15.002 seconds, so all three tests receive the owner's 30-second exception.
+  - filter: test(/(^|::)liteinst_strict_verify_shell_and_entropy_consumer$/)
+    timeout_seconds: 30
+    slow_reason: Retained validate logs contain 210 passes for this exact test with a 12.837-second maximum and 6 runs that exhausted the 15-second default; under two concurrent validates RUN 1613 timed out at 15.002 seconds while peer RUN 1612 passed in 2.155 seconds.
+  - filter: test(/(^|::)liteinst_strict_verify_virtual_identity_and_time$/)
+    timeout_seconds: 30
+    slow_reason: Retained validate logs contain 211 passes for this exact test with an 11.148-second maximum and 4 runs that exhausted the 15-second default; under two concurrent validates RUN 1613 timed out at 15.002 seconds while peer RUN 1612 passed in 4.088 seconds.
+  - filter: test(/(^|::)sabre_non_racy_examples_verify_current_envelope$/)
+    timeout_seconds: 30
+    slow_reason: Retained validate logs contain 181 passes for this exact test with a 20.295-second maximum and 10 runs that exhausted the 15-second default; RUN 1613 again timed out at 15.002 seconds under two concurrent validates.
