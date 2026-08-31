@@ -8893,8 +8893,10 @@ red/`measured-and-passed` count is **0**.",
                     .as_ref()
                     .is_some_and(|last| last.hermit_sha == fixture_head)
                 && cell.observations.iter().any(|observation| {
-                    observation.hermit_shas.contains(&fixture_head)
-                        && observation.results.is_empty()
+                    observation.detcore_tree.as_deref() == Some(fixture_detcore_tree.as_str())
+                        && observation.provenance == ObservationProvenance::Validate
+                        && observation.hermit_shas.contains(&fixture_head)
+                        && observation.results.contains(&ObservedResult::Pass)
                         && observation.invocations.iter().any(|invocation| {
                             invocation.run_id == "result-command-verify"
                                 && invocation.attempt == Some(1)
@@ -8952,7 +8954,7 @@ red/`measured-and-passed` count is **0**.",
         serde_json::to_vec(&PressureSummary {
             schema: PRESSURE_SUMMARY_SCHEMA,
             hermit_sha: fixture_head.clone(),
-            detcore_tree: fixture_detcore_tree,
+            detcore_tree: fixture_detcore_tree.clone(),
             source_tree_dirty: false,
             rows: vec![current_row],
         })
