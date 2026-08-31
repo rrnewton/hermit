@@ -71,6 +71,14 @@ slow-timeout = { period = "45s", terminate-after = 1, grace-period = "2s" }
 filter = "binary(=container_init_deadline)"
 slow-timeout = { period = "30s", terminate-after = 1, grace-period = "2s" }
 
+# Retained validate logs contain 257 passes for this exact test (p95 10.879s,
+# maximum 14.972s) and 5 timeout runs at the 15s default between 15.001s and
+# 16.630s, including solo RUN 1624 at 15.001s. The 30s exception changes
+# only this test; its commands and verification remain unchanged.
+[[profile.default.overrides]]
+filter = "test(/(^|::)common_commands_are_deterministic_under_strict_verify$/)"
+slow-timeout = { period = "30s", terminate-after = 1, grace-period = "2s" }
+
 # Retained validate logs contain 210 passes for this exact test (maximum
 # 12.837s) and 6 runs that exhausted the 15s default. Under two concurrent
 # validates, RUN 1613 timed out at 15.002s while peer RUN 1612 passed in 2.155s.

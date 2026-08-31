@@ -11934,13 +11934,14 @@ mod nextest_timeout_tests {
     /// The per-test cap stays at 15s, and every exemption from it is named,
     /// measured, and justified IN PLACE.
     ///
-    /// ⚠️ WIDENED FROM ONE OVERRIDE TO SIX, DELIBERATELY AND WITHOUT WEAKENING.
+    /// ⚠️ WIDENED FROM ONE OVERRIDE TO SEVEN, DELIBERATELY AND WITH EACH
+    /// EXCEPTION PINNED.
     /// This gate is a ratchet against exemptions accumulating quietly, so adding
     /// one had to be a visible edit here rather than a silently passing config
     /// change -- which is exactly what it did: each added override failed this
-    /// test first. It is now STRICTER than before, not looser: it pins all six
+    /// test first. The ratchet is stricter than a count alone: it pins all seven
     /// filters and requires each override's justification text to be present, so
-    /// a seventh exemption still cannot appear without an author changing this
+    /// an eighth exemption still cannot appear without an author changing this
     /// list and supplying a reason. The count alone was the weaker check.
     #[test]
     fn nextest_uses_the_manifest_default_and_named_overrides() {
@@ -11950,6 +11951,7 @@ mod nextest_timeout_tests {
             "- filter: test(/(^|::)every_record_container_site_classifies_a_child_fault_by_name$/)\n    timeout_seconds: 45",
             "- filter: test(/(^|::)run_timeout_fallback_fires_when_the_unwind_does_not_finish$/)\n    timeout_seconds: 45",
             "- filter: binary(=container_init_deadline)\n    timeout_seconds: 30",
+            "- filter: test(/(^|::)common_commands_are_deterministic_under_strict_verify$/)\n    timeout_seconds: 30",
             "- filter: test(/(^|::)liteinst_strict_verify_shell_and_entropy_consumer$/)\n    timeout_seconds: 30",
             "- filter: test(/(^|::)liteinst_strict_verify_virtual_identity_and_time$/)\n    timeout_seconds: 30",
             "- filter: test(/(^|::)sabre_non_racy_examples_verify_current_envelope$/)\n    timeout_seconds: 30",
@@ -11995,13 +11997,15 @@ mod nextest_timeout_tests {
                 "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
                 "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
                 "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
+                "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
             ],
-            "the per-test timeout must stay at 15s with two justified 45s overrides and four justified 30s overrides"
+            "the per-test timeout must stay at 15s with two justified 45s overrides and five justified 30s overrides"
         );
         for required in [
             "test(/(^|::)every_record_container_site_classifies_a_child_fault_by_name$/)",
             "test(/(^|::)run_timeout_fallback_fires_when_the_unwind_does_not_finish$/)",
             "binary(=container_init_deadline)",
+            "test(/(^|::)common_commands_are_deterministic_under_strict_verify$/)",
             "test(/(^|::)liteinst_strict_verify_shell_and_entropy_consumer$/)",
             "test(/(^|::)liteinst_strict_verify_virtual_identity_and_time$/)",
             "test(/(^|::)sabre_non_racy_examples_verify_current_envelope$/)",
@@ -12031,6 +12035,17 @@ mod nextest_timeout_tests {
         assert!(manifest.contains("15-second timeout"));
         assert!(manifest.contains("20-second teardown budget"));
         assert!(manifest.contains("15.002 seconds"));
+        for required in [
+            "257 passes",
+            "p95 10.879",
+            "14.972",
+            "5 timeout runs",
+            "16.630",
+            "solo RUN 1624",
+        ] {
+            assert!(config.contains(required), "nextest config lost {required}");
+            assert!(manifest.contains(required), "manifest lost {required}");
+        }
         for required in [
             "210 passes",
             "12.837",
