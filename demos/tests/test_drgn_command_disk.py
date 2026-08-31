@@ -76,9 +76,12 @@ class CommandDiskProtocolTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
             report = Path(directory) / "safehermit-report.txt"
             report.write_text("safehermit: unit=safehermit-test-123\n")
-            with mock.patch.object(dh.subprocess, "run") as run:
-                dh._stop_safehermit_unit(report)
+            with mock.patch.object(
+                dh.subprocess, "run", return_value=SimpleNamespace(returncode=0)
+            ) as run:
+                stopped = dh._stop_safehermit_unit(report)
 
+        self.assertTrue(stopped)
         run.assert_called_once_with(
             [
                 "systemctl",
@@ -97,9 +100,25 @@ class CommandDiskProtocolTest(unittest.TestCase):
             report = Path(directory) / "safehermit-report.txt"
             report.write_text("safehermit: unit=bad;unit\n")
             with mock.patch.object(dh.subprocess, "run") as run:
-                dh._stop_safehermit_unit(report)
+                stopped = dh._stop_safehermit_unit(report)
 
+        self.assertFalse(stopped)
         run.assert_not_called()
+
+    def test_close_lets_safehermit_finalize_before_process_group_fallback(self):
+        program = dh.HermitGuestProgram(SimpleNamespace())
+        program._safehermit_report = Path("report")
+        program._process_group = 456
+        program._process = mock.Mock(returncode=0)
+        program._process.poll.return_value = 0
+
+        with mock.patch.object(dh, "_stop_safehermit_unit", return_value=True), mock.patch.object(
+            dh.os, "killpg"
+        ) as killpg, mock.patch.object(dh, "report_safehermit"):
+            program.close()
+
+        program._process.wait.assert_called_once_with(timeout=10)
+        killpg.assert_not_called()
 
 
 if __name__ == "__main__":
