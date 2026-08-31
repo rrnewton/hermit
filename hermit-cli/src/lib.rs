@@ -330,6 +330,7 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -1947,6 +1948,36 @@ async fn run_kvm(
     capture_output: bool,
 ) -> Result<Output, Error> {
     let dispatch_started = Instant::now();
+    // KVM does not expose the outer container's procfs. Its executor serves a
+    // synthetic `/proc/self/mountinfo` containing one deterministic rootfs row
+    // (`reverie-kvm/src/executor.rs::synthetic_proc_content`). Consequently
+    // none of the outer namespace's Hermit-owned bind mounts, or their raw
+    // mount IDs, can appear in the bytes Detcore receives. The exact provenance
+    // set for KVM's guest-visible mount table is therefore empty. Keeping outer
+    // IDs here is not conservative: it makes the shared sanitizer reject a
+    // valid synthetic row because those IDs name a different namespace.
+    config.mountinfo_root_rewrites.clear();
+    // reverie-kvm's synthetic mountinfo row spells the root filesystem device
+    // as 0:1, while pathname metadata for `/` comes from the host root.  Record
+    // that backend-proven equivalence explicitly so mountinfo and stat/statx
+    // enter Detcore's shared DevicePool under the same raw identity.  This is
+    // not a DevicePool ordinal: the guest-visible number remains allocated by
+    // the same first-observation policy as every other filesystem device.
+    let root_device = fs::metadata("/")
+        .context("failed to inspect the KVM guest root filesystem device")?
+        .dev();
+    config.mountinfo_device_rewrites.clear();
+    config
+        .mountinfo_device_rewrites
+        .push((libc::makedev(0, 1), root_device));
+    // reverie-kvm supplies its own synthetic raw mount IDs. The shared
+    // sanitizer derives their canonical order from that synthetic snapshot;
+    // outer-container IDs describe a different namespace and must not leak in.
+    // The current executor denies `/proc/self/fdinfo/*`, so KVM provides no
+    // fdinfo/mountinfo cross-file assurance; tests pin mountinfo output/status
+    // only and must not promote that result to L2 parity.
+    config.mountinfo_mount_ids.clear();
+    config.mountinfo_mount_id_prefix_len = 0;
     let stdin = if capture_output {
         let (snapshot_reserved, snapshot) = output_backend_stdin_reservation()?;
         if snapshot_reserved {
@@ -2974,9 +3005,24 @@ impl HermitData {
     /// If recording failed, then an error is returned. Note that if the command
     /// itself failed, then we still return a successful recording, but its exit
     /// status will be non-zero.
+    ///
+    /// This low-level API does not create a Hermit container, so it has no
+    /// authenticated private-mount provenance to supply. It does capture the
+    /// caller's current mount-ID order so fdinfo and mountinfo agree during
+    /// replay, but private mount roots are left as observed. CLI container
+    /// callers must use [`Self::record_with_mountinfo`].
     pub fn record(&self, command: Command) -> Result<Recording, Error> {
+        self.record_with_mountinfo(command, Vec::new())
+    }
+
+    /// Records with mountinfo provenance captured from the active container.
+    pub fn record_with_mountinfo(
+        &self,
+        command: Command,
+        mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
+    ) -> Result<Recording, Error> {
         let data = self.create_recording_dir()?;
-        let exit_status = record_to(command, data.path())?;
+        let exit_status = record_to_with_mountinfo(command, data.path(), mountinfo_root_rewrites)?;
         self.commit_recording(data, exit_status)
     }
 
@@ -3113,6 +3159,88 @@ impl HermitData {
     }
 }
 
+/// Raw mount IDs captured from a completed namespace.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MountInfoIdOrder {
+    /// Mountinfo row and parent IDs followed by inherited regular-fd mount IDs.
+    pub ids: Vec<u64>,
+    /// Length of the prefix derived from mountinfo itself.
+    pub mountinfo_prefix_len: usize,
+}
+
+/// Capture the current mount namespace's raw IDs in the exact row/parent order
+/// used by Detcore's canonical mountinfo mapping.
+pub fn capture_mountinfo_identity_order() -> Result<MountInfoIdOrder, Error> {
+    use std::collections::BTreeSet;
+
+    fn decimal(field: &[u8], name: &str) -> Result<u64, Error> {
+        let text = std::str::from_utf8(field).map_err(|_| anyhow!("invalid {name}"))?;
+        if text.is_empty() || text.bytes().any(|byte| !byte.is_ascii_digit()) {
+            return Err(anyhow!("invalid {name}"));
+        }
+        text.parse().map_err(|_| anyhow!("invalid {name}"))
+    }
+
+    let contents = fs::read("/proc/self/mountinfo")?;
+    let body = contents.strip_suffix(b"\n").unwrap_or(&contents);
+    let mut visible = Vec::new();
+    let mut parents = Vec::new();
+    let mut seen = BTreeSet::new();
+    for line in body.split(|byte| *byte == b'\n') {
+        let fields = line.split(|byte| *byte == b' ').collect::<Vec<_>>();
+        let separator = fields.iter().position(|field| *field == b"-");
+        if fields.iter().any(|field| field.is_empty())
+            || separator.is_none_or(|index| index < 6 || index + 4 != fields.len())
+        {
+            return Err(anyhow!("malformed /proc/self/mountinfo row"));
+        }
+        let mount_id = decimal(fields[0], "mountinfo mount ID")?;
+        let parent_id = decimal(fields[1], "mountinfo parent ID")?;
+        if !seen.insert(mount_id) {
+            return Err(anyhow!("duplicate mountinfo mount ID"));
+        }
+        visible.push(mount_id);
+        parents.push(parent_id);
+    }
+    if visible.is_empty() {
+        return Err(anyhow!("empty /proc/self/mountinfo"));
+    }
+    for parent in parents {
+        if seen.insert(parent) {
+            visible.push(parent);
+        }
+    }
+    let mountinfo_prefix_len = visible.len();
+    // Inherited regular stdio can remain attached to a mount outside the
+    // post-unshare table. Preserve equality between descriptors on the same
+    // such mount by appending their raw IDs in stable fd order. Pipefs and
+    // sockfs are handled by the run-global observed-ID pool and must not occupy
+    // this configured tail: their presence depends on the launcher's stdio
+    // shape and would shift every later identity.
+    for fd in 0..=2 {
+        let path = format!("/proc/self/fdinfo/{fd}");
+        match fs::read(&path) {
+            Ok(contents) => {
+                let mode = fs::metadata(format!("/proc/self/fd/{fd}"))?.mode() & libc::S_IFMT;
+                if matches!(mode, libc::S_IFIFO | libc::S_IFSOCK) {
+                    continue;
+                }
+                let mount_id = detcore_model::procfs::parse_fdinfo_mount_id(&contents)
+                    .ok_or_else(|| anyhow!("fdinfo must contain exactly one decimal mnt_id"))?;
+                if mount_id != 0 && seen.insert(mount_id) {
+                    visible.push(mount_id);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(MountInfoIdOrder {
+        ids: visible,
+        mountinfo_prefix_len,
+    })
+}
+
 impl<'a> From<Option<&'a PathBuf>> for HermitData {
     fn from(data_dir: Option<&'a PathBuf>) -> Self {
         data_dir.map_or_else(Self::new, Self::with_dir)
@@ -3120,27 +3248,93 @@ impl<'a> From<Option<&'a PathBuf>> for HermitData {
 }
 
 /// Records to the specified directory, which must already exist.
+///
+/// This low-level API captures the caller's current mount-ID order for replay,
+/// but supplies no authenticated private-mount root provenance because it does
+/// not create or inspect a Hermit container. Container-aware callers must use
+/// [`record_to_with_mountinfo`].
 #[tokio::main(flavor = "current_thread")]
 pub async fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
+    record_to_async(command, dir, Vec::new()).await
+}
+
+/// Records to the specified directory with exact mountinfo provenance.
+#[tokio::main(flavor = "current_thread")]
+pub async fn record_to_with_mountinfo(
+    command: Command,
+    dir: &Path,
+    mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
+) -> Result<ExitStatus, Error> {
+    record_to_async(command, dir, mountinfo_root_rewrites).await
+}
+
+async fn record_to_async(
+    command: Command,
+    dir: &Path,
+    mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
+) -> Result<ExitStatus, Error> {
     let skid_overshoot_report = SkidOvershootReport::begin(true);
-    let result = async { Ok(Record::spawn(command, dir).await?.wait().await?) }.await;
+    let result = async {
+        let mountinfo_order = capture_mountinfo_identity_order()?;
+        Ok(Record::spawn_with_mountinfo(
+            command,
+            dir,
+            mountinfo_root_rewrites,
+            mountinfo_order.ids,
+            mountinfo_order.mountinfo_prefix_len,
+        )
+        .await?
+        .wait()
+        .await?)
+    }
+    .await;
     skid_overshoot_report.finish(result)
 }
 
 /// Records to the specified directory, which must already exist. The
 /// stderr/stdout of the recording is captured in `Output`.
+///
+/// This low-level API captures the caller's current mount-ID order for replay,
+/// but supplies no authenticated private-mount root provenance because it does
+/// not create or inspect a Hermit container. Container-aware callers must use
+/// [`record_with_output_with_mountinfo`].
 #[tokio::main(flavor = "current_thread")]
-pub async fn record_with_output(mut command: Command, dir: &Path) -> Result<Output, Error> {
+pub async fn record_with_output(command: Command, dir: &Path) -> Result<Output, Error> {
+    record_with_output_async(command, dir, Vec::new()).await
+}
+
+/// Records with captured output and exact mountinfo provenance.
+#[tokio::main(flavor = "current_thread")]
+pub async fn record_with_output_with_mountinfo(
+    command: Command,
+    dir: &Path,
+    mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
+) -> Result<Output, Error> {
+    record_with_output_async(command, dir, mountinfo_root_rewrites).await
+}
+
+async fn record_with_output_async(
+    mut command: Command,
+    dir: &Path,
+    mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
+) -> Result<Output, Error> {
     let skid_overshoot_report = SkidOvershootReport::begin(true);
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
 
     let result = async {
-        Ok(Record::spawn(command, dir)
-            .await?
-            .wait_with_output()
-            .await?)
+        let mountinfo_order = capture_mountinfo_identity_order()?;
+        Ok(Record::spawn_with_mountinfo(
+            command,
+            dir,
+            mountinfo_root_rewrites,
+            mountinfo_order.ids,
+            mountinfo_order.mountinfo_prefix_len,
+        )
+        .await?
+        .wait_with_output()
+        .await?)
     }
     .await;
     skid_overshoot_report.finish(result)

@@ -167,6 +167,7 @@ pub mod futex;
 pub mod happens_before;
 pub mod pedigree;
 pub mod pid;
+pub mod procfs;
 pub mod schedule;
 pub mod summary;
 pub mod time;
