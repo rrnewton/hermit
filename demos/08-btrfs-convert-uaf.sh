@@ -40,11 +40,20 @@ the ignored asset directory (see 08-btrfs-convert-uaf.md for the build recipe):
   ignored/demo08-btrfs/pop-tiny.img
 When those assets are absent the demo prints SKIPPED and exits 0.
 
+The crashing seed comes from <asset-dir>/.crash-seed, written by
+scripts/prepare-demo08-assets.sh. There is no built-in default: which schedules
+reproduce this race depends on more than the fixture, so a hardcoded seed would
+be wrong on most hosts. When the recorded seed no longer reproduces, this demo
+says so, re-derives one, and retries -- it does not report a stale record as a
+regression.
+
 Useful overrides:
   DEMO08_DIR=/path        asset directory (buggy/, fixed/, pop-tiny.img)
   DEMO08_ARTIFACTS=/path  per-run scratch + saved ASAN report
-  DEMO08_CRASH_SEED=N     override the fixture's recorded crashing seed
-  DEMO08_TIMEOUT=90       per-run wall-clock timeout in seconds
+  DEMO08_CRASH_SEED=N     drive one seed and skip re-derivation on a miss
+  DEMO08_TIMEOUT=150      per-run wall-clock timeout in seconds; defaults to the
+                          calibrator's per-seed budget so a calibrated seed
+                          cannot be truncated by a tighter clock here
   HERMIT_RELEASE=/path    release Hermit binary
   DEMO08_REQUIRE_ASSETS=1 fail instead of skipping when assets are absent
 EOF
@@ -97,31 +106,60 @@ if [ ! -x "$SAFEHERMIT" ]; then
   exit 1
 fi
 
+# The recorded seed. Format is `<seed> <fixture-sha256> <hermit-sha256>`; a crashing schedule
+# is a property of the exact inputs it was derived from, so the seed travels with their
+# identities (see scripts/prepare-demo08-assets.sh and issue #1877).
+#
+# A mismatch on either hash is a REASON TO RE-DERIVE, not an error, and never a regression
+# report. Measured 2026-08-31 at Hermit head 00ed139b: seeds 3, 6, 10 and 13 reproduce the UAF
+# while 15, 17 and 19 do not, against a fixture-identical binary -- so the fixture alone does
+# not decide which seeds crash, and this demo used to answer that by exiting 1 with "did not
+# crash", which reads as "the bug is gone" when the truth is "this seed record is out of date".
+SEED_SOURCE="DEMO08_CRASH_SEED"
+SEED_FIXTURE=""
+SEED_HERMIT=""
 if [ -n "${DEMO08_CRASH_SEED:-}" ]; then
   CRASH_SEED="$DEMO08_CRASH_SEED"
 elif [ -r "$ASSETS/.crash-seed" ]; then
-  # Format is `<seed> <fixture-sha256>`: a crashing schedule is a property of the exact
-  # fixture binary, so the seed is refused when it was calibrated against a different one
-  # rather than silently used (see scripts/prepare-demo08-assets.sh and issue #1877).
   CRASH_SEED="$(cut -d' ' -f1 <"$ASSETS/.crash-seed")"
   SEED_FIXTURE="$(cut -s -d' ' -f2 <"$ASSETS/.crash-seed")"
-  HAVE_FIXTURE="$(sha256sum "$ASSETS/buggy/btrfs-convert" | cut -d' ' -f1)"
-  if [ -n "$SEED_FIXTURE" ] && [ "$SEED_FIXTURE" != "$HAVE_FIXTURE" ]; then
-    echo "error: Demo 8 crash seed $CRASH_SEED was calibrated for fixture" \
-      "${SEED_FIXTURE:0:12}, but the fixture present is ${HAVE_FIXTURE:0:12}." \
-      "Re-run scripts/prepare-demo08-assets.sh to recalibrate." >&2
-    exit 2
-  fi
+  SEED_HERMIT="$(cut -s -d' ' -f3 <"$ASSETS/.crash-seed")"
+  SEED_SOURCE=recorded
+elif [ -r "$ASSETS/.nightly-prep-version" ]; then
+  # No recorded seed, but the fixtures carry the prep stamp, so the calibrator's cached path
+  # applies and will only run seeds -- it will not clone or compile anything. Derive one now
+  # so a first run from a clean tree is a single command.
+  echo "=== Demo 08: no crash seed recorded yet; deriving one for these inputs ==="
+  echo "Which schedules reproduce this race depends on more than the fixture, so there is no"
+  echo "safe built-in default. Running scripts/prepare-demo08-assets.sh..."
+  echo
+  DEMO08_DIR="$ASSETS" "$ROOT/scripts/prepare-demo08-assets.sh" || exit 1
+  CRASH_SEED="$(cut -d' ' -f1 <"$ASSETS/.crash-seed")"
+  SEED_FIXTURE="$(cut -s -d' ' -f2 <"$ASSETS/.crash-seed")"
+  SEED_HERMIT="$(cut -s -d' ' -f3 <"$ASSETS/.crash-seed")"
+  SEED_SOURCE=calibrated
+  echo
 else
-  # Backwards-compatible seed for the original hand-built checked-in demo
-  # fixture. Nightly-generated fixtures persist their calibrated seed above.
-  CRASH_SEED=15
+  echo "=== Demo 08: no calibrated crash seed, and the fixtures carry no prep stamp ==="
+  echo "Which schedules reproduce this race depends on more than the fixture, so there is no"
+  echo "safe built-in default. Build the fixtures and derive a seed:"
+  echo
+  echo "  scripts/prepare-demo08-assets.sh"
+  echo
+  echo "That records the seed in $ASSETS/.crash-seed and this demo will use it."
+  echo "To drive a seed you already know, set DEMO08_CRASH_SEED=N."
+  exit 2
 fi
 [[ $CRASH_SEED =~ ^[0-9]+$ ]] || {
   echo "error: Demo 8 crash seed must be a non-negative integer" >&2
   exit 2
 }
-TIMEOUT="${DEMO08_TIMEOUT:-90}"
+# Must not be tighter than the calibrator's per-seed budget
+# (DEMO08_CALIBRATION_TIMEOUT, default 150). A seed accepted under a 150s budget and then
+# run here under a 90s one can be truncated by THIS script's clock and reported as a seed
+# that does not reproduce -- the two budgets disagreeing is a defect in the harness, not a
+# fact about the seed.
+TIMEOUT="${DEMO08_TIMEOUT:-${DEMO08_CALIBRATION_TIMEOUT:-150}}"
 mkdir -p "$ARTIFACTS"
 
 # Fresh reflink copy of the populated image for one conversion. btrfs-convert
@@ -139,18 +177,61 @@ asan_core() {
   grep -aE 'AddressSanitizer: heap-use-after-free|task_period_wait|print_copied_inodes|SUMMARY: AddressSanitizer' "$1" || true
 }
 
-# hermit chaos invocation validated to reproduce this UAF. --no-virtualize-cpuid
-# because CPUID faulting is unavailable on the demo hosts; --sched-seed selects
-# the interleaving.
+# The ASAN report TEXT is the detector, exactly as in scripts/prepare-demo08-assets.sh.
+# ASAN can report the UAF on a thread whose process still exits 0 (seeds 3 and 13 at Hermit
+# head 00ed139b do), so an exit-status test answers a different question. When these two
+# scripts disagreed, calibration selected seeds this demo then rejected as "did not crash".
+uaf_reported() {
+  grep -qa 'AddressSanitizer: heap-use-after-free' "$1"
+}
+
+# Did the guest reach btrfs-convert's progress-thread path at all? A run that never got there
+# observed nothing about this race, which is not the same fact as "no UAF here".
+path_engaged() {
+  grep -qa 'Copy inodes' "$1"
+}
+
+# hermit chaos invocation validated to reproduce this UAF. --sched-seed selects the
+# interleaving. --no-virtualize-cpuid because CPUID faulting is unavailable on the demo
+# hosts; that is the one relaxation here and it is stated rather than hidden.
+#
+# --strict IS REQUIRED, and its absence was a real defect. btrfs-convert generates a random
+# UUID for the target filesystem. Without --strict hermit does not virtualize that, so every
+# run produced a DIFFERENT filesystem UUID and, occasionally, a different race outcome:
+# measured 2026-08-31, seed 6 hit at Step 2 and missed at Step 4 of the same demo run, with
+# the two transcripts differing at the UUID line. Four --strict runs produced target UUID
+# 10708a9d-7517-44b2-8a5b-dc05ab4ae2fd every time and reproduced the UAF 4/4, at ~9s each
+# against ~7s without; three non-strict runs produced two different UUIDs. A demo whose
+# headline claim is bit-for-bit replay must not run in the mode that does not guarantee it.
+#
+# scripts/prepare-demo08-assets.sh uses this identical flag set. A seed selected under one
+# flag set is not evidence about another, so the two must not drift apart.
 chaos_convert() {
   local conv="$1" seed="$2" img="$3" out="$4"
   timeout "$TIMEOUT" "$SAFEHERMIT" "$HERMIT_RELEASE" --log=error run \
-    --chaos --sched-seed "$seed" --no-virtualize-cpuid \
+    --chaos --sched-seed "$seed" --no-virtualize-cpuid --strict \
     -- "$conv" "$img" >"$out" 2>&1
 }
 
+# The guest's own output, with the two host-side sources removed:
+#
+#   * safehermit's accounting lines, which carry a wall-clock elapsed time; and
+#   * hermit's own log lines, which begin with a real UTC wall-clock timestamp
+#     (`2026-08-31T23:01:42.881384Z ERROR reverie_ptrace::lifecycle: ...`).
+#
+# This is the same principle the repository's comparison policy already applies to retained
+# logs: remove the real wall-clock prefix and compare the whole remainder exactly. Nothing
+# the guest itself writes begins with an ISO-8601 UTC timestamp, so the filter cannot
+# swallow guest output. Measured 2026-08-31: with these two sources removed, two --strict
+# runs of seed 6 are byte-identical across the entire transcript, UUID and full ASAN report
+# included.
+guest_transcript() {
+  grep -av -e '^safehermit: ' \
+    -e '^[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}T[0-9:.]*Z ' "$1" || true
+}
+
 echo "=== Demo 08: schedule-dependent btrfs-convert progress-thread UAF ==="
-echo "seed=$CRASH_SEED timeout=${TIMEOUT}s"
+echo "seed=$CRASH_SEED (from ${SEED_SOURCE}) timeout=${TIMEOUT}s"
 echo "buggy=$BUGGY"
 echo "fixed=$FIXED"
 echo
@@ -170,39 +251,123 @@ fi
 echo
 
 # --- Step 2: chaos buggy reproduces the UAF on a known seed -------------------
-echo "--- Step 2: chaos buggy, --sched-seed $CRASH_SEED (expect ASAN UAF) ---"
+# On a miss this must distinguish "this seed record is out of date for the inputs present"
+# from "the bug is gone". Only the second is a regression. The recovery re-derives the seed
+# through scripts/prepare-demo08-assets.sh rather than sweeping here, so seed selection keeps
+# exactly one implementation -- two of them drifting apart is what produced the defect above.
 CHAOS_IMG="$ARTIFACTS/chaos-buggy.img"
-fresh_image "$CHAOS_IMG"
-if chaos_convert "$BUGGY" "$CRASH_SEED" "$CHAOS_IMG" "$ARTIFACTS/chaos-buggy.out"; then
-  echo "unexpected: chaos buggy seed $CRASH_SEED did not crash" >&2
-  echo "(try another seed via DEMO08_CRASH_SEED; the sweep in the experiment" >&2
-  echo " directory records which seeds crash)" >&2
-  exit 1
+BUGGY_RC=0
+run_buggy_seed() {
+  local seed="$1" out="$2"
+  fresh_image "$CHAOS_IMG"
+  BUGGY_RC=0
+  chaos_convert "$BUGGY" "$seed" "$CHAOS_IMG" "$out" || BUGGY_RC=$?
+}
+
+echo "--- Step 2: chaos buggy, --sched-seed $CRASH_SEED (expect ASAN UAF) ---"
+run_buggy_seed "$CRASH_SEED" "$ARTIFACTS/chaos-buggy.out"
+
+# One retry at the same seed before concluding anything. A single miss was observed once
+# during development, at a seed that then reproduced 18 times out of 18 across repetition,
+# concurrent host load, environment padding and cgroup boxing; it was never reproduced and
+# is not explained. Recalibrating a whole sweep off one miss is expensive and, if the miss
+# is transient, wrong -- so confirm it first, and keep the first output either way.
+if ! uaf_reported "$ARTIFACTS/chaos-buggy.out"; then
+  cp -f "$ARTIFACTS/chaos-buggy.out" "$ARTIFACTS/chaos-buggy-miss-seed-$CRASH_SEED.out"
+  echo
+  echo "seed $CRASH_SEED did not reproduce the UAF (guest exit $BUGGY_RC); retrying it once" >&2
+  echo "before treating the record as stale. First output kept at" >&2
+  echo "  $ARTIFACTS/chaos-buggy-miss-seed-$CRASH_SEED.out" >&2
+  run_buggy_seed "$CRASH_SEED" "$ARTIFACTS/chaos-buggy.out"
 fi
-if ! grep -qaE 'AddressSanitizer: heap-use-after-free' "$ARTIFACTS/chaos-buggy.out"; then
-  echo "chaos buggy seed $CRASH_SEED exited non-zero without an ASAN UAF report" >&2
-  echo "(likely a ${TIMEOUT}s timeout on a pathologically slow schedule; pick a" >&2
-  echo " different DEMO08_CRASH_SEED)" >&2
-  exit 1
+
+if ! uaf_reported "$ARTIFACTS/chaos-buggy.out"; then
+  echo
+  echo "STALE SEED RECORD: seed $CRASH_SEED did not reproduce the UAF here, twice." >&2
+  echo "Second attempt: guest exit $BUGGY_RC." >&2
+  if [ "$BUGGY_RC" -eq 124 ]; then
+    echo "That status is this script's ${TIMEOUT}s wall-clock timeout, so the run was cut" >&2
+    echo "short rather than completing without the UAF. Raise DEMO08_TIMEOUT before" >&2
+    echo "concluding anything about the seed." >&2
+  fi
+  if path_engaged "$ARTIFACTS/chaos-buggy.out"; then
+    echo "The guest ran and reached the progress-thread path, so this is a statement about" >&2
+    echo "the SEED, not about the fixture or the fix." >&2
+  else
+    echo "The guest did not reach the progress-thread path at all (no 'Copy inodes' line)," >&2
+    echo "so this run observed nothing about the race." >&2
+  fi
+  if [ "$SEED_SOURCE" = "DEMO08_CRASH_SEED" ]; then
+    echo "The seed came from DEMO08_CRASH_SEED, so it is not re-derived. Unset it to use the" >&2
+    echo "calibrated seed, or run scripts/prepare-demo08-assets.sh to derive one." >&2
+    exit 1
+  fi
+  [ -z "$SEED_FIXTURE" ] || echo "  recorded fixture ${SEED_FIXTURE:0:12}" >&2
+  [ -z "$SEED_HERMIT" ] || echo "  recorded hermit  ${SEED_HERMIT:0:12}" >&2
+  echo "  present  hermit  $(sha256sum "$HERMIT_RELEASE" | cut -c1-12)" >&2
+  echo >&2
+
+  # Only auto-recalibrate when the fixtures carry the prep stamp. Without it the calibrator's
+  # cached path does not apply and it would clone and compile btrfs-progs, which is not
+  # something a demo run should start on its own.
+  if [ ! -r "$ASSETS/.nightly-prep-version" ]; then
+    echo "Re-derive the seed for the inputs you have, then re-run this demo:" >&2
+    echo "  scripts/prepare-demo08-assets.sh" >&2
+    exit 1
+  fi
+
+  echo "Re-deriving the crash seed for these inputs (scripts/prepare-demo08-assets.sh)..." >&2
+  if ! DEMO08_DIR="$ASSETS" "$ROOT/scripts/prepare-demo08-assets.sh"; then
+    echo "Recalibration failed; see its output above. Not reporting this as a UAF" >&2
+    echo "regression, because no seed here has been shown to reach the race." >&2
+    exit 1
+  fi
+  CRASH_SEED="$(cut -d' ' -f1 <"$ASSETS/.crash-seed")"
+  SEED_SOURCE=recalibrated
+  echo
+  echo "--- Step 2 (retry): chaos buggy, --sched-seed $CRASH_SEED ---"
+  run_buggy_seed "$CRASH_SEED" "$ARTIFACTS/chaos-buggy.out"
+  if ! uaf_reported "$ARTIFACTS/chaos-buggy.out"; then
+    echo "REGRESSION: the freshly calibrated seed $CRASH_SEED did not reproduce the UAF" >&2
+    echo "either (guest exit $BUGGY_RC). A seed derived from these exact inputs failing to" >&2
+    echo "reproduce is a real finding, not a stale record. The calibrator's own run of this" >&2
+    echo "seed DID reproduce it, so compare the two outputs:" >&2
+    echo "  $ARTIFACTS/chaos-buggy.out" >&2
+    echo "  $ARTIFACTS/calibration-cold-seed-$CRASH_SEED.out" >&2
+    exit 1
+  fi
 fi
+
 asan_core "$ARTIFACTS/chaos-buggy.out" | tee "$ARTIFACTS/asan-report.txt"
-echo "chaos buggy: reproduced the use-after-free"
+echo "chaos buggy: reproduced the use-after-free on seed $CRASH_SEED (from $SEED_SOURCE)"
 echo
 
 # --- Step 3: chaos fixed on the same seed is clean (the differential) ---------
 echo "--- Step 3: chaos fixed, --sched-seed $CRASH_SEED (expect clean) ---"
 FIXED_IMG="$ARTIFACTS/chaos-fixed.img"
 fresh_image "$FIXED_IMG"
-if chaos_convert "$FIXED" "$CRASH_SEED" "$FIXED_IMG" "$ARTIFACTS/chaos-fixed.out"; then
-  echo "chaos fixed: clean exit on the crashing seed (73e211a7 closes the window)"
+rc=0
+chaos_convert "$FIXED" "$CRASH_SEED" "$FIXED_IMG" "$ARTIFACTS/chaos-fixed.out" || rc=$?
+# Read the output whatever the exit status was. This branch used to declare the fix good on
+# exit 0 without looking, while the buggy variant is known to report the UAF and still exit 0
+# (seeds 3 and 13) -- so the demo's whole differential could have passed with an ASAN report
+# sitting unread in this file.
+if uaf_reported "$ARTIFACTS/chaos-fixed.out"; then
+  echo "regression: fixed variant reproduced the UAF (guest exit $rc)" >&2
+  asan_core "$ARTIFACTS/chaos-fixed.out" >&2
+  exit 1
+fi
+if ! path_engaged "$ARTIFACTS/chaos-fixed.out"; then
+  echo "inconclusive: the fixed variant never reached the progress-thread path (guest exit" >&2
+  echo "$rc), so this run is no evidence that the fix closes the window. Raise DEMO08_TIMEOUT" >&2
+  echo "(currently ${TIMEOUT}s) and re-run." >&2
+  exit 1
+fi
+if [ "$rc" -eq 0 ]; then
+  echo "chaos fixed: clean exit on the crashing seed, progress-thread path engaged"
+  echo "            (73e211a7 closes the window)"
 else
-  rc=$?
-  if grep -qaE 'AddressSanitizer: heap-use-after-free' "$ARTIFACTS/chaos-fixed.out"; then
-    echo "regression: fixed variant reproduced the UAF" >&2
-    exit 1
-  fi
-  echo "chaos fixed: non-crash exit rc=$rc (no UAF; likely the slow-schedule" \
-       "timeout, not the bug)"
+  echo "chaos fixed: no UAF, progress-thread path engaged, guest exit $rc"
 fi
 echo
 
@@ -213,14 +378,39 @@ echo
 # a legitimately different-but-still-deterministic address, which would not
 # demonstrate replay. Re-copy a fresh ext4 image over the same path.
 echo "--- Step 4: replay --sched-seed $CRASH_SEED, confirm identical crash ---"
-fresh_image "$CHAOS_IMG"
-if chaos_convert "$BUGGY" "$CRASH_SEED" "$CHAOS_IMG" "$ARTIFACTS/chaos-buggy-replay.out"; then
-  echo "unexpected: replay did not crash" >&2
+run_buggy_seed "$CRASH_SEED" "$ARTIFACTS/chaos-buggy-replay.out"
+if ! uaf_reported "$ARTIFACTS/chaos-buggy-replay.out"; then
+  echo "replay of seed $CRASH_SEED did not reproduce the UAF that Step 2 just produced" >&2
+  echo "from byte-identical inputs. That is a determinism finding, not a stale seed." >&2
   exit 1
 fi
 asan_core "$ARTIFACTS/chaos-buggy-replay.out" >"$ARTIFACTS/asan-report-replay.txt"
+
+# Compare the WHOLE guest transcript, not just the four filtered ASAN lines. The filtered
+# extract drops the target filesystem UUID, which is exactly where two runs were observed to
+# diverge before --strict was added -- so the narrow comparison would have reported
+# "byte-identical" over two genuinely different runs. Keep the ASAN extract for display and
+# gate on the full text.
+guest_transcript "$ARTIFACTS/chaos-buggy.out" >"$ARTIFACTS/guest-transcript.txt"
+guest_transcript "$ARTIFACTS/chaos-buggy-replay.out" >"$ARTIFACTS/guest-transcript-replay.txt"
+if ! cmp -s "$ARTIFACTS/guest-transcript.txt" "$ARTIFACTS/guest-transcript-replay.txt"; then
+  echo "replay: the guest transcripts differ between two runs of seed $CRASH_SEED over" >&2
+  echo "byte-identical inputs. Under --strict this is a determinism finding." >&2
+  diff "$ARTIFACTS/guest-transcript.txt" "$ARTIFACTS/guest-transcript-replay.txt" >&2 || true
+  exit 1
+fi
+
 if cmp -s "$ARTIFACTS/asan-report.txt" "$ARTIFACTS/asan-report-replay.txt"; then
-  echo "replay: guest ASAN report byte-identical (same heap address, PC, frames)"
+  # Say what was actually compared. A report that ASAN did not finish writing carries the
+  # faulting address and PC but no frames, and claiming frames were compared would overstate
+  # what this file holds.
+  if grep -qa 'SUMMARY: AddressSanitizer' "$ARTIFACTS/asan-report.txt"; then
+    echo "replay: entire guest transcript byte-identical, ASAN report included"
+    echo "        (same heap address, PC, frames, and filesystem UUID)"
+  else
+    echo "replay: entire guest transcript byte-identical; the ASAN report is truncated, so"
+    echo "        it carries the heap address and PC but no frames to compare"
+  fi
 else
   echo "replay: ASAN reports differ between runs" >&2
   diff "$ARTIFACTS/asan-report.txt" "$ARTIFACTS/asan-report-replay.txt" >&2 || true

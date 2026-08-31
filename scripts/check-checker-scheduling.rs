@@ -54,10 +54,16 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ),
     (
         "scripts/test-prepare-demo08-calibration.sh",
-        "This acceptance bracket is owned by the separately assigned demo 08 \
-         task. The owner explicitly routed that work away from this agent, so \
-         this move preserves the checker without silently scheduling or claiming \
-         evidence from work that must be completed in that task.",
+        "Passes by hand as of 2026-08-31 (six brackets, ~2s, no Hermit build). It \
+         was previously listed here as demo-08 task debt AND was asserting on \
+         calibration machinery that ea4840f15 had already removed, so it could \
+         not have passed if anything had run it. That is fixed; what remains is a \
+         scheduling judgement, not a repair. Wiring it into `lint-checks` would \
+         make that node depend on an ASAN runtime being installed, because the \
+         bracket REFUSES rather than skipping when it cannot build its planted-UAF \
+         control -- deliberately, since a failure control that never ran must not \
+         read as clean. Arming a gate with a new host dependency is an owner \
+         decision, so it is left visible here rather than scheduled unilaterally.",
     ),
     (
         "scripts/check-default-build-warnings.sh",

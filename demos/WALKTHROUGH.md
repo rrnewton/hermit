@@ -270,7 +270,9 @@ Two prebuilt AddressSanitizer binaries (`buggy` = pre-73e211a7, `fixed` =
 73e211a7) and a populated ext4 image live under `ignored/demo08-btrfs/`. ASAN
 turns the latent UAF into an observable abort with a precise report. When the
 assets are absent the demo prints `SKIPPED` and exits 0, so `make all` stays
-green; `demos/08-btrfs-convert-uaf.md` has the build recipe.
+green — and `demos/run-all.sh` records that row as `SKIP` rather than `PASS`,
+because a gated-out demo demonstrated nothing. `demos/08-btrfs-convert-uaf.md`
+has the build recipe.
 
 ### Blind execution almost never hits it
 
@@ -287,8 +289,18 @@ natively and across 32 chaos seeds:
 (from the retained source measurements summarized in
 `demos/08-btrfs-convert-uaf.md`.)
 
-The demo then drives one known crashing seed end to end. Step 1 confirms the
-blind baseline — the same buggy binary, run natively, exits cleanly:
+**Do not copy those seed numbers.** A second sweep of the same range against a
+byte-identical buggy binary, at hermit `00ed139b` on a different host, found
+seeds **3, 6, 10 and 13** instead, with 15 and 19 clean. Which seeds crash
+depends on more than the fixture, and it has not been established which input
+decides it. The demo derives a seed for the inputs you actually have; both
+tables are dated measurements, not a lookup.
+
+The demo then drives one known crashing seed end to end. The transcript below is
+a verbatim capture from the first sweep, so it shows *that* run's seed, 15, and
+that run's heap addresses; a run today derives its own seed and prints where the
+seed came from (`seed=6 (from recalibrated)`). Step 1 confirms the blind
+baseline — the same buggy binary, run natively, exits cleanly:
 
 ```text
 === Demo 08: schedule-dependent btrfs-convert progress-thread UAF ===
@@ -315,8 +327,10 @@ SUMMARY: AddressSanitizer: heap-use-after-free common/task-utils.c:154 in task_p
 chaos buggy: reproduced the use-after-free
 ```
 
-`--sched-seed 15` is the recorded seed: it names the exact interleaving, so the
-crash is reproducible rather than a lucky one-off.
+`--sched-seed 15` was the recorded seed for that run's inputs: a seed names an
+exact interleaving, so the crash is reproducible rather than a lucky one-off.
+The seed is only meaningful together with the inputs it was derived from, which
+is why the demo verifies it by replaying it rather than trusting the record.
 
 ### The fix closes the window on the same seed
 
@@ -329,6 +343,14 @@ chaos fixed: clean exit on the crashing seed (73e211a7 closes the window)
 ```
 
 ### The crash replays bit-for-bit
+
+This step is why the demo runs under `--strict`. `btrfs-convert` generates a
+random target-filesystem UUID, and without `--strict` hermit does not virtualize
+it: measured 2026-08-31, a single demo run reproduced the UAF at Step 2 and
+missed at Step 4, the two transcripts differing at the UUID line. Step 4 now
+compares the whole guest transcript rather than a four-line ASAN extract that
+did not contain the UUID.
+
 
 Re-running the crashing seed with the identical image path (hermit determinism
 is per-input, and the faulting heap address depends on `argv`) reproduces a
@@ -357,5 +379,11 @@ does not reach the hermit guest. Neither change alters which teardown ordering
 is safe; they only make the existing race reachable and observable under
 hermit's logical clock. Full detail: `demos/08-btrfs-convert-uaf.md`.
 
-Useful overrides: `DEMO08_CRASH_SEED` (default 15), `DEMO08_TIMEOUT` (default
-90), `DEMO08_DIR`, `DEMO08_ARTIFACTS`, and `HERMIT_RELEASE`.
+The seed comes from `<asset-dir>/.crash-seed`, written by
+`scripts/prepare-demo08-assets.sh`; there is no built-in default, and the demo
+derives one on a cold tree. When a recorded seed stops reproducing, the demo
+reports `STALE SEED RECORD` and re-derives rather than calling it a regression.
+
+Useful overrides: `DEMO08_TIMEOUT` (defaults to the calibrator budget, 150), `DEMO08_DIR`,
+`DEMO08_ARTIFACTS`, `HERMIT_RELEASE`, and `DEMO08_CRASH_SEED` to drive one seed
+by hand (which also turns off re-derivation).
