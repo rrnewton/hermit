@@ -8924,6 +8924,66 @@ fn portable_strict_compat_outer_dag_bracket(root: &Path) -> Result<String, Strin
                 .into(),
         );
     }
+    let fixture_readme = run_a.join("strict-compat/real-compat-fixtures/README.md");
+    let fixture_readme = fixture_readme.to_string_lossy();
+    let readme_labels = probes
+        .iter()
+        .filter(|probe| probe.cmd.contains("README.md"))
+        .map(|probe| probe.job.as_str())
+        .collect::<BTreeSet<_>>();
+    let expected_readme_labels = BTreeSet::from([
+        "b2sum",
+        "base32",
+        "base64",
+        "bzip2",
+        "cat",
+        "chown",
+        "cksum",
+        "du",
+        "gzip",
+        "head",
+        "install",
+        "ls",
+        "md5sum",
+        "pr",
+        "readlink",
+        "realpath",
+        "sha1sum",
+        "sha224sum",
+        "sha256sum",
+        "sha384sum",
+        "sha512sum",
+        "sum",
+        "wc",
+        "wc-lines",
+        "xz",
+        "zstd",
+    ]);
+    if readme_labels != expected_readme_labels
+        || probes
+            .iter()
+            .filter(|probe| probe.cmd.contains("README.md"))
+            .any(|probe| !probe.cmd.contains(&*fixture_readme))
+    {
+        return Err(format!(
+            "strict-compat flatten: README consumers are not bound to the run-owned fixture: labels={readme_labels:?} fixture={fixture_readme}"
+        ));
+    }
+    for (tag, workload) in [("compat.cargo", "cargo"), ("compat.df", "df")] {
+        let command = probes
+            .iter()
+            .find(|probe| probe.tag() == tag)
+            .ok_or_else(|| format!("strict-compat flatten: fixture-backed probe {tag} is absent"))?
+            .cmd
+            .as_str();
+        if !command.contains("tests/compat/real_compat_workload.sh")
+            || !command.contains(&format!(" {workload} </dev/null"))
+        {
+            return Err(format!(
+                "strict-compat flatten: {tag} does not use its explicit fixture/tool contract: {command}"
+            ));
+        }
+    }
     if first.steps.iter().any(|step| {
         step.cmd.contains("scripts/validate.rs")
             || step.cmd.contains("pressure-test.rs")
