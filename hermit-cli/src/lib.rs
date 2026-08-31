@@ -1232,6 +1232,12 @@ impl SkidOvershootReport {
 // and only the `third-party-backends` build offers them. The reverie-sabre Rust
 // dependency lives in the `detcore-sabre` crate, which is excluded from the
 // workspace's `default-members`.
+#[cfg(any(
+    test,
+    not(feature = "dbt"),
+    not(feature = "sabre"),
+    not(feature = "e9patch")
+))]
 fn backend_feature_disabled_reason(feature: &str, integration: &str) -> String {
     format!(
         "the `{feature}` feature is not enabled in this build; rebuild with `--features \
