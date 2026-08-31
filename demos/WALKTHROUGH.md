@@ -61,7 +61,7 @@ and QEMU prerequisites described in `demos/README.md`, and build Hermit:
 
 ```bash
 git submodule update --init --recursive
-make install-deps-core
+make install-deps
 make
 ```
 
@@ -284,7 +284,8 @@ natively and across 32 chaos seeds:
 | hermit `--chaos` buggy, seeds 0-31 | 32 | **2** (seeds **15**, **19**) |
 | hermit `--chaos` fixed, seeds 0-31 | 32 | **0** — the fix closes the window |
 
-(from `experiments/btrfs-convert-progress-uaf-chaos_20260729/results.csv`.)
+(from the retained source measurements summarized in
+`demos/08-btrfs-convert-uaf.md`.)
 
 The demo then drives one known crashing seed end to end. Step 1 confirms the
 blind baseline — the same buggy binary, run natively, exits cleanly:

@@ -495,7 +495,11 @@ def save_metadata(
         "info_log": str(info_log.resolve()),
         "info_log_sha256": hash_file(info_log),
         "hermit_version": _tool_version(
-            [os.environ.get("HERMIT_RELEASE", "hermit"), "--version"]
+            [
+                str(Path(__file__).resolve().parents[2] / "bin/safehermit"),
+                os.environ.get("HERMIT_RELEASE", "hermit"),
+                "--version",
+            ]
         ),
         "qemu_version": _tool_version([qemu, "--version"]),
         "qemu_binary_sha256": _tool_sha256(qemu),
@@ -856,7 +860,7 @@ def print_comparison(
 
 
 def check_dependencies(root: Path) -> str:
-    """Run the shared dependency check and return its one-line result."""
+    """Run the shared dependency check and return its named result line."""
     result = subprocess.run(
         ["make", "--no-print-directory", "-s", "check-demo-deps"],
         cwd=str(root),
@@ -868,8 +872,12 @@ def check_dependencies(root: Path) -> str:
         sys.stderr.write(result.stderr)
         sys.stderr.write(result.stdout)
         raise subprocess.CalledProcessError(result.returncode, result.args)
-    lines = [line for line in result.stdout.splitlines() if line]
-    if len(lines) != 1 or not lines[0].startswith("Dependency check passed:"):
+    lines = [
+        line
+        for line in result.stdout.splitlines()
+        if line.startswith("Dependency check passed:")
+    ]
+    if len(lines) != 1:
         raise RuntimeError(
             "unexpected dependency-check output: {!r}".format(result.stdout)
         )

@@ -2,7 +2,7 @@
 
 ## BusyBox inside QEMU/Linux
 
-`05-qemu-busybox.sh` builds a reproducible initramfs around a statically linked
+`qemu-busybox.sh` builds a reproducible initramfs around a statically linked
 BusyBox, boots it as QEMU's Linux userspace under Hermit, and requires the
 guest workload to finish successfully. The workload runs `uname`, filesystem
 traversal, a shell pipeline, arbitrary-precision `bc`, and SHA-256 before
@@ -12,7 +12,7 @@ Build Hermit and run one strict boot:
 
 ```bash
 cargo build --release -p hermit --bin hermit
-./demos/05-qemu-busybox.sh
+./demos/qemu-busybox.sh
 ```
 
 With no `KERNEL_IMAGE` set, the demo auto-fetches a pinned x86-64 `bzImage`
@@ -30,25 +30,26 @@ artifacts are written under `target/qemu-busybox/`. The Linux serial console is
 streamed live and saved as `console.log`; Hermit's full INFO trace is saved as
 `hermit-info.log` without flooding the serial output.
 
-To exercise the QEMU launcher directly under `cargo run`, build the initramfs
-once on the host and supply both fixed images:
+To exercise the QEMU launcher directly, build the initramfs once on the host
+and supply both fixed images. The repository wrapper applies the same resource
+and cleanup policy as the higher-level runner:
 
 ```bash
 BUSYBOX=/path/to/static/busybox \
   ./demos/qemu-busybox/build-initramfs.sh
 KERNEL_IMAGE=/path/to/bzImage \
   INITRAMFS_IMAGE=target/qemu-busybox/initramfs-busybox.cpio.gz \
-  cargo run --release -p hermit -- run --strict -- demos/boot_qemu.sh
+  ./bin/safehermit ./target/release/hermit run --strict -- demos/boot_qemu.sh
 ```
 
 `boot_qemu.sh` only validates its inputs and then replaces itself with QEMU.
-The higher-level `05-qemu-busybox.sh` uses the same launcher while adding asset
+The higher-level `qemu-busybox.sh` uses the same launcher while adding asset
 construction, timeouts, live serial output, log capture, and result checks.
 
 Run Hermit's two-execution canonical comparison, which is what establishes L2:
 
 ```bash
-VERIFY=1 DEMO_TIMEOUT_SECONDS=900 ./demos/05-qemu-busybox.sh
+VERIFY=1 DEMO_TIMEOUT_SECONDS=900 ./demos/qemu-busybox.sh
 ```
 
 `VERIFY=1` adds `--verify --verify-strict --verify-json` and reads the typed
@@ -74,7 +75,7 @@ cc -O2 -Wall -Wextra -Werror -std=gnu11 \
   tests/util/pmu_skid.c -o /tmp/pmu-skid-test
 /tmp/pmu-skid-test --iterations 1000
 VERIFY=1 SKID_MARGIN=66276 \
-  DEMO_TIMEOUT_SECONDS=3600 ./demos/05-qemu-busybox.sh
+  DEMO_TIMEOUT_SECONDS=3600 ./demos/qemu-busybox.sh
 ```
 
 `SKID_MARGIN` forwards to Hermit's `--skid-margin`; it schedules the PMU

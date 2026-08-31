@@ -939,7 +939,7 @@ jobs:
             # Keep this classifier synchronized with demo-hot-path.yml's paths.
             # Match the hot-path globs, then subtract the test trees the demo
             # suite provably never executes. The demo job runs
-            # `scripts/super-validate.sh --demos-only` (parent demos 1-8 only)
+            # `demos/run-all.sh --all` (in-repository demos 1-8 only)
             # and never runs the Hermit e2e corpus, so nothing under
             # `tests/e2e/**` can change a demo outcome; the standalone
             # `tests/backend-parity/**` parity fixtures are likewise never read.
@@ -953,7 +953,7 @@ jobs:
                 --paginate --jq '.[].filename'
             )"
             hot_files="$(
-              grep -E '^([.]github/workflows/demo-hot-path[.]yml|Cargo[.](lock|toml)|rust-toolchain[.]toml|common/|detcore[^/]*/|examples/|flaky-tests/|hermit-cli/|hermit-install/|hermit-resources/|tests/)' <<< "$files" \
+              grep -E '^([.]github/workflows/demo-hot-path[.]yml|Cargo[.](lock|toml)|rust-toolchain[.]toml|common/|demos/|detcore[^/]*/|examples/|flaky-tests/|hermit-cli/|hermit-install/|hermit-resources/|tests/)' <<< "$files" \
                 | grep -vE '^tests/(e2e|backend-parity)/' || true
             )"
             if [ -n "$hot_files" ]; then

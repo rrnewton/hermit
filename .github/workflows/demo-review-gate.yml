@@ -1,0 +1,50 @@
+name: Demo review gate
+
+# Mechanical enforcement of the demo-adversarial-review policy: any PR that
+# touches a runnable demo (demos/**) must carry at least one Demo-Green-Review
+# attestation (an adversarial reviewer verified the demo runs GREEN) in one of its
+# commit messages. Independent of post-facto-human-review. See
+# demos/ADVERSARIAL-REVIEW-POLICY.md and scripts/check-demo-review.sh.
+
+# MANUAL INVOCATION ONLY -- owner directive 2026-08-21: "I would like our CI on
+# GitHub to remain disabled in the sense that it does not run automatically...
+# I want an agent that is investigating CI to be able to kick off runs manually
+# on recent main commits". NO push, NO pull_request, NO schedule, NO merge_group,
+# NO workflow_run: nothing here may start a run by itself.
+#
+# THE REPOSITORY ACTIONS SWITCH AND THIS FILE ARE ONE MECHANISM, NOT TWO. While
+# the switch was off (2026-08-11 .. 2026-08-21) a dispatch RETURNED SUCCESS and
+# created a queued run with ZERO JOBS that never executed, could not be cancelled
+# (HTTP 500) and could not be deleted (HTTP 403) -- so "manual runs work" required
+# turning the switch back on, and turning it on would have resurrected every
+# automatic trigger in this file. Removing the triggers is what makes the switch
+# safe to leave on. Put a push/pull_request/schedule trigger back here and the
+# owner's directive is broken repository-wide, silently.
+#
+# THIS IS NOT A GATE. Nothing blocks a landing on the result (owner directive
+# 2026-08-17); the job body below is UNCHANGED so what it measures stays
+# comparable with local `make validate`.
+#
+# Kick one off:  ./ci-hub/bin/manual-run --workflow demo-review-gate.yml [--commit SHA]
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+
+jobs:
+  demo-review:
+    name: Demo-touching commits require a green-demo attestation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0            # need the full range base..head
+      - name: Require a Demo-Green-Review attestation for demos/** changes
+        run: |
+          set -euo pipefail
+          head="${{ github.sha }}"
+          git fetch --no-tags origin main
+          base="$(git merge-base "$head" origin/main)"
+          echo "scanning range ${base}..${head}"
+          scripts/check-demo-review.sh --range "${base}..${head}"

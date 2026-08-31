@@ -46,6 +46,20 @@ use std::process::Command;
 /// already has four orphans rather than landing as an immediate red.
 const ALLOWLIST: &[(&str, &str)] = &[
     (
+        "bin/safehermit-test.sh",
+        "Exercises real Hermit processes, a genuine 15-second hang, cgroup memory \
+         and wall limits, and a release binary that check.lint_checks does not \
+         build. It is an on-demand acceptance bracket; scheduling it in the lint \
+         node would make that node depend on an unrelated release build.",
+    ),
+    (
+        "scripts/test-prepare-demo08-calibration.sh",
+        "This acceptance bracket is owned by the separately assigned demo 08 \
+         task. The owner explicitly routed that work away from this agent, so \
+         this move preserves the checker without silently scheduling or claiming \
+         evidence from work that must be completed in that task.",
+    ),
+    (
         "scripts/check-default-build-warnings.sh",
         "Builds the workspace; its findings were never counted, so wiring it \
          untriaged could convert a silent gap into a standing red. Only \

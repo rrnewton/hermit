@@ -6,21 +6,19 @@ name: Linux boot (QEMU) — dedicated lane
 # it needs QEMU, a pinned kernel, a BusyBox initramfs, and — because it runs
 # under `--strict` — PMU retired-branch preemption, so it can only run on the
 # self-hosted `pmu` lane. Today that boot rides inside `demo-hot-path.yml`,
-# which runs `scripts/super-validate.sh --demos-only` (the whole parent demo
-# suite) on every hot-path push with `timeout-minutes: 360`. Anything that slow
+# which runs `demos/run-all.sh --all` (the whole in-repository demo suite) with
+# `timeout-minutes: 360`. Anything that slow
 # in a push-triggered lane is a queue hazard on a single PMU runner.
 #
 # This lane does one thing: boot Linux under Hermit and assert it reached
 # userspace deterministically. It is scheduled and manually dispatchable rather
 # than push-triggered, so it catches a demo5 regression without adding latency
 # to the hot path. It also uses Hermit's OWN self-contained demo
-# (`demos/05-qemu-busybox.sh`) rather than the parent's demo harness, so the
+# (`demos/qemu-busybox.sh`) rather than the numbered demo harness, so the
 # check lives in the repository whose commits can break it.
 #
-# NOTE FOR ANYONE RUNNING THE PARENT HARNESS INSTEAD: `dev-hermit`'s
-# `demos/05-qemu-boot.py` shells out to `make check-deps`, which runs
-# `git submodule update` on the PARENT and will detach the primary checkouts.
-# That is why this lane calls the in-repo demo directly.
+# The numbered suite and this focused smoke both build from this checkout and
+# share no parent-repository path assumptions.
 
 on:
   schedule:
@@ -35,7 +33,7 @@ on:
     # worth a PMU slot.
     paths:
       - ".github/workflows/linux-boot.yml"
-      - "demos/05-qemu-busybox.sh"
+      - "demos/qemu-busybox.sh"
       - "demos/boot_qemu.sh"
       - "demos/qemu-busybox/**"
 
@@ -114,7 +112,7 @@ jobs:
           # boot wedge, which hangs rather than erroring, so this bound is what
           # converts a wedge into a red instead of a six-hour occupancy.
           DEMO_TIMEOUT_SECONDS: "600"
-        run: ./demos/05-qemu-busybox.sh
+        run: ./demos/qemu-busybox.sh
 
       - name: Upload boot logs
         if: always()

@@ -258,7 +258,7 @@ pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
 //   0    success. Never a failure code; see the nonzero pin below.
 //   1    the commonest guest exit status. Sharing it is the collision
 //        hermit#2558 introduced 125 to escape, so 125 must never drift back.
-//   124  GNU `timeout`'s "deadline fired", and dev-hermit's `bin/safehermit`
+//   124  GNU `timeout`'s "deadline fired", and this repository's `bin/safehermit`
 //        uses it for its WALL DEADLINE kill. `tests/cli.rs` asserts
 //        `assert_ne!(code, Some(124))` on the awk-mincore probe for that reason.
 //   126  hermit's own GUEST_PROGRAM_NOT_EXECUTABLE_EXIT.
@@ -267,7 +267,7 @@ pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
 //        resolved against the guest PATH exits 125 instead, which is an
 //        inconsistency filed separately, not a licence to reuse 127.
 //
-//   125  ⚠️ NOT FREE. dev-hermit's `bin/safehermit` exits 125 to mean "the LOG
+//   125  ⚠️ NOT FREE. `bin/safehermit` exits 125 to mean "the LOG
 //        BYTE CAP fired: safehermit killed the run through its cgroup"
 //        (`demos/lib/demo_common.py`'s SAFEHERMIT_EXIT_REASON). Any hermit run
 //        launched through that wrapper -- which is how the demos and the repeat

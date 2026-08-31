@@ -31,13 +31,14 @@ fetch_url() {
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/.." && pwd)
 hermit_bin=${HERMIT_BIN:-$repo_root/target/release/hermit}
+safehermit=$repo_root/bin/safehermit
 kernel_image=${KERNEL_IMAGE:-}
-# Pinned QEMU kernel provisioning (mirrors dev-hermit demos/lib/qemu-assets.sh).
+# Pinned QEMU kernel provisioning (shared with demos/lib/qemu-assets.sh).
 # When KERNEL_IMAGE is unset the demo auto-fetches this exact bzImage into the
 # gitignored cache under target/, so it runs out of the box with no manual step.
 # Override with QEMU_KERNEL_URL / QEMU_KERNEL_SHA256 to pin a different kernel.
 kernel_sha256=${QEMU_KERNEL_SHA256:-e4b1c0248a31c7e1f7cb31d82a1a03d4e7cab408ee1b8e622dd897c17eae46a2}
-kernel_url=${QEMU_KERNEL_URL:-https://github.com/rrnewton/dev-hermit/releases/download/qemu-kernel-$kernel_sha256/bzImage}
+kernel_url=${QEMU_KERNEL_URL:-https://github.com/rrnewton/hermit/releases/download/qemu-kernel-$kernel_sha256/bzImage}
 qemu_bin=${QEMU_BIN:-}
 output_dir=${OUTPUT_DIR:-$repo_root/target/qemu-busybox}
 timeout_seconds=${DEMO_TIMEOUT_SECONDS:-300}
@@ -50,6 +51,7 @@ fi
 
 [[ -x $hermit_bin ]] || fail \
   "Hermit release binary not found: $hermit_bin (run cargo build --release -p hermit --bin hermit)"
+[[ -x $safehermit ]] || fail "safehermit wrapper not found: $safehermit"
 [[ -n $qemu_bin && -x $qemu_bin ]] || fail \
   "qemu-system-x86_64 not found; install it or set QEMU_BIN"
 [[ $timeout_seconds =~ ^[1-9][0-9]*$ ]] || fail \
@@ -101,6 +103,7 @@ initramfs_image=${INITRAMFS_IMAGE:-$output_dir/initramfs-busybox.cpio.gz}
 console_log=$output_dir/console.log
 info_log=$output_dir/hermit-info.log
 stderr_log=$output_dir/hermit-stderr.log
+safehermit_report=$output_dir/safehermit-report.txt
 verify_json=$output_dir/verify.json
 
 # Preflight the verdict reader BEFORE the boot, which costs several minutes.
@@ -159,18 +162,21 @@ printf 'kernel_sha256=%s\ninitramfs_sha256=%s\n' \
 : >"$console_log"
 : >"$info_log"
 : >"$stderr_log"
+: >"$safehermit_report"
 if [[ $verify == 1 ]]; then
   # Truncate any verdict left by an earlier run: a stale `verify.json` that
   # happened to say `matched` would otherwise certify THIS run.
   : >"$verify_json"
 fi
 set +e
-timeout --signal=TERM --kill-after=10 "${timeout_seconds}s" \
-  "$hermit_bin" "${hermit_args[@]}" "${guest_command[@]}" \
+"$safehermit" --sh-deadline "$timeout_seconds" \
+  --sh-report "$safehermit_report" "$hermit_bin" \
+  "${hermit_args[@]}" "${guest_command[@]}" \
   > >(tee "$console_log") \
   2> >(tee "$stderr_log" >&2)
 status=$?
 set -e
+cat "$safehermit_report" >&2
 
 if ((status != 0)); then
   fail "Hermit/QEMU exited with status $status; inspect $console_log, $info_log, and $stderr_log"

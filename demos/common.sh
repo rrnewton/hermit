@@ -2,8 +2,8 @@
 # Shared setup for the Hermit demo scripts.
 #
 # Source this from a demo script; do not execute it directly. It locates the
-# pinned hermit/ submodule inside this parent workspace, builds the binaries the
-# walkthrough uses, and defines the helper wrappers the demos share.
+# Hermit repository root, builds the binaries the walkthrough uses, and defines
+# the helper wrappers the demos share.
 #
 # The demos deliberately disable CPUID virtualization so the short examples also
 # run on hosts without CPUID faulting; CPUID is therefore a host input in these
@@ -20,6 +20,7 @@ set -euo pipefail
 DEMO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$DEMO_DIR/.." && pwd)"
 export HERMIT_REPO="${HERMIT_REPO:-$ROOT}"
+export SAFEHERMIT="${SAFEHERMIT:-$ROOT/bin/safehermit}"
 
 # PREFLIGHT: collect every missing prerequisite and report them together.
 # These checks used to exit on the FIRST miss, so a fresh machine discovered
@@ -39,10 +40,11 @@ preflight_require_command cargo \
 preflight_require_command cc \
   "a C compiler is required by hermit's build scripts -- dnf install gcc"
 preflight_report "${DEMO_LABEL:-demo prerequisites}"
-# Build the release hermit binary (the portable run/verify wrappers below use
+# Build the release Hermit binary (the portable run/verify wrappers below use
 # it: the debug build serializes many-threaded guests like python3 so slowly it
-# can OOM under load) plus the debug guest binaries whose source info the
-# analyzer resolves (demo 4). Set DEMO_SKIP_BUILD=1 to reuse an existing build.
+# can OOM under load), the debug Hermit binary used by demo 2, and the debug
+# guest binaries whose source info the analyzer resolves (demo 4). Set
+# DEMO_SKIP_BUILD=1 to reuse an existing build.
 if [ "${DEMO_SKIP_BUILD:-0}" = "1" ]; then
   make --no-print-directory -s -C "$ROOT" check-demo-deps
 else
@@ -56,6 +58,7 @@ else
       make --no-print-directory -s -C "$ROOT" check-demo-deps
       ( cd "$HERMIT_REPO" && \
         cargo build --locked --release -p hermit --bin hermit --no-default-features && \
+        cargo build --locked -p hermit --bin hermit && \
         cargo build --locked -p hermetic_infra_hermit_flaky-tests --bin hello_race && \
         cargo build --locked -p hermetic_infra_hermit_tests --bin rustbin_heap_ptrs )
       ;;
@@ -75,6 +78,11 @@ export HEAP_PTRS="${HEAP_PTRS:-$HERMIT_REPO/target/debug/rustbin_heap_ptrs}"
 export RACE_SH="${RACE_SH:-$HERMIT_REPO/examples/race.sh}"
 
 test -x "$HERMIT" || { echo "missing hermit binary: $HERMIT" >&2; exit 1; }
+test -x "$SAFEHERMIT" || { echo "missing safehermit wrapper: $SAFEHERMIT" >&2; exit 1; }
+
+safehermit() {
+  "$SAFEHERMIT" "$HERMIT" "$@"
+}
 
 # Hermit's `run` mounts a private tmpfs over /tmp, so the guest does not see the
 # real /tmp directory. When this checkout lives under /tmp, that hides the demo's
@@ -115,7 +123,7 @@ if [ -n "${HERMIT_DEMO_MAX_TIMESLICE:-}" ]; then
   HERMIT_PREEMPTION_FLAGS=(--max-timeslice="$HERMIT_DEMO_MAX_TIMESLICE")
 fi
 run_hermit() {
-  "$HERMIT" --log=error run \
+  safehermit --log=error run \
     "${HERMIT_TMP_FLAGS[@]}" \
     "${HERMIT_PREEMPTION_FLAGS[@]}" \
     --base-env=minimal \
@@ -135,13 +143,13 @@ run_hermit() {
 #      preemption disabled the two runs can diverge. This step therefore
 #      requires user-accessible CPU performance counters (PMU).
 verify_hermit() {
-  "$HERMIT" --log=info run --verify --no-virtualize-cpuid "${HERMIT_TMP_FLAGS[@]}" "$@"
+  safehermit --log=info run --verify --no-virtualize-cpuid "${HERMIT_TMP_FLAGS[@]}" "$@"
 }
 
 # Chaos wrapper: seeded scheduler PRNG for concurrency exploration.
 chaos_run() {
   local seed="$1"
-  "$HERMIT" --log=error run \
+  safehermit --log=error run \
     "${HERMIT_TMP_FLAGS[@]}" \
     --chaos \
     --seed="$seed" \
@@ -162,7 +170,7 @@ demo_banner() {
 # --no-virtualize-cpuid. The portable run wrappers above already pass it
 # unconditionally; direct `hermit` invocations (e.g. demo 4's analyze) use this.
 hermit_supports_cpuid_faulting() {
-  ! "$HERMIT" --log=error run --base-env=minimal -- /bin/true 2>&1 \
+  ! safehermit --log=error run --base-env=minimal -- /bin/true 2>&1 \
     | grep -q "does not support CPUID faulting"
 }
 

@@ -1,22 +1,7 @@
 name: P0 Demo Gate (Hermit hot paths)
 
-# The unified demos live in rrnewton/dev-hermit, but the parent repository has
-# no self-hosted runner. Run the suite from Hermit's existing trusted PMU lane:
-# check out the current parent demo harness, then overlay the exact Hermit
-# commit that triggered this workflow. Keep this paths list synchronized with
-# the hot-path test in merge-gate.yml.
-#
-# tests/e2e/** and tests/backend-parity/** are deliberately subtracted (via the
-# trailing "!" negations under each "tests/**"): the demo job runs
-# `scripts/super-validate.sh --demos-only`, which builds the hermit binary and
-# executes ONLY the parent demo suite (demos 1-8) — it never runs the hermit e2e
-# corpus or the backend-parity fixtures. So a PR that only touches those trees
-# provably cannot affect a demo verdict; triggering a serial PMU demo run for it
-# just clogs the lane and (when cancelled) wedges the PR. Removing them here
-# means the workflow does not even fire for such PRs, mirroring the merge-gate
-# classifier's `grep -vE '^tests/(e2e|backend-parity)/'` subtraction so the
-# trigger and the requirement stay consistent. Hot-path gating is UNCHANGED for
-# detcore*/**, hermit-cli/**, tests/c/** (guest programs), and everything else.
+# The unified demos live in this repository and run on Hermit's trusted PMU
+# lane at the exact commit selected by a manual or scheduled dispatch.
 on:
   # Exercise the cache-bypassing calibration path deliberately instead of
   # waiting for an accidental cache miss to discover that it is broken.
@@ -41,27 +26,10 @@ on:
         type: boolean
 
 concurrency:
-  # Group each ref's runs, but NEVER cancel a RUNNING main demo (owner directive
-  # 2026-08-03, Directive B). cancel-in-progress is event-aware:
-  #   * pull_request -> TRUE: a new push to a PR supersedes the older head, so PR
-  #     demo runs never STACK on the scarce serial PMU lane (the head that lands
-  #     re-runs). Grouped per PR number. This is the pre-land gate merge-gate.yml
-  #     requires at the PR head SHA.
-  #   * push(main) -> FALSE: all main pushes share ONE group (github.ref), so a
-  #     burst of N landings is queue-depth-1 -- GitHub lets the RUNNING demo
-  #     finish and supersedes only the older PENDING run. The old
-  #     cancel-in-progress:true KILLED the running main demo on every landing,
-  #     producing a pile of CANCELLED runs with no data; this stops that and
-  #     yields a sparse dataset of COMPLETE post-land health runs.
-  #   * workflow_dispatch -> FALSE, grouped per github.run_id (unique): manual
-  #     on-demand runs never collide, preserving per-SHA post-land culprit
-  #     attribution (bisect a post-land main red by dispatching several `sha`
-  #     inputs; they queue serially, or `git bisect` with
-  #     scripts/super-validate.sh --demos-only).
-  # cancel-in-progress never touches COMPLETED runs, so a submodule bump or
-  # queue-health check citing the newest completed main demo run is unaffected.
-  group: hermit-demo-gate-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.event_name == 'push' && github.ref || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # Manual and scheduled runs retain independent identities so an exact-SHA
+  # investigation is never cancelled by another dispatch.
+  group: hermit-demo-gate-${{ github.run_id }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -72,38 +40,18 @@ env:
   DETCORE_TEST_RUST_LOG: "off"
   RUSTFLAGS: -D warnings -C link-arg=-llzma
   RUSTDOCFLAGS: -D warnings
-  SUITE_DIR: ${{ github.workspace }}/dev-hermit-demo-suite
-  TARGET_SHA: ${{ github.event.inputs.sha || github.event.pull_request.head.sha || github.sha }}
+  TARGET_SHA: ${{ github.event.inputs.sha || github.sha }}
 
 jobs:
-  reject-untrusted-fork:
-    name: P0 demo gate requires a trusted branch
-    if: >-
-      github.repository == 'rrnewton/hermit' &&
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name != github.repository
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - run: |
-          echo "::error title=P0 demo gate not executed::Self-hosted demos do not execute fork-authored code. Move this change to a trusted rrnewton/hermit branch before landing."
-          exit 1
-
   demos:
     name: P0 demo gate (demos 1-8)
-    if: >-
-      github.repository == 'rrnewton/hermit' &&
-      (
-        github.event_name != 'pull_request' ||
-        github.event.pull_request.head.repo.full_name == github.repository
-      )
+    if: github.repository == 'rrnewton/hermit'
     # No pmu-serial: demos are not counter-scarce and PMU skid is an
     # instruction-space hardware property independent of concurrency, so there
     # is no determinism reason to pin every demo to one serialized box. If a
     # demo turns out to be load-sensitive once it can co-run, that is a real
     # determinism finding to file, not a reason to restore serialization. The
-    # concurrency block below still collapses each ref to its newest run so
-    # bursts of landings do not stack.
+    # concurrent dispatches keep independent run identities.
     runs-on: [Linux, X64, hermit, pmu]
     timeout-minutes: 360
     steps:
@@ -115,38 +63,22 @@ jobs:
               find "$GITHUB_WORKSPACE/.git" -type f -name "*.lock" -print -delete
           fi
 
-      - name: Check out the unified demo suite
-        uses: actions/checkout@v4
-        with:
-          repository: rrnewton/dev-hermit
-          ref: main
-          path: dev-hermit-demo-suite
-          submodules: false
-
-      - name: Overlay the exact Hermit commit under test
+      - name: Check out the exact Hermit commit
         uses: actions/checkout@v4
         with:
           ref: ${{ env.TARGET_SHA }}
-          path: dev-hermit-demo-suite/hermit
-          submodules: false
+          fetch-depth: 0
+          submodules: recursive
 
       - name: Verify exact culprit attribution
         run: |
           set -euo pipefail
-          actual="$(git -C "$SUITE_DIR/hermit" rev-parse HEAD)"
-          test "$actual" = "$TARGET_SHA"
-          # The parent harness records a stable Hermit gitlink. Stage the
-          # overlaid PR SHA so its recursive submodule init cannot restore the
-          # older parent pin before the demos run.
-          git -C "$SUITE_DIR" add hermit
-          recorded="$(git -C "$SUITE_DIR" rev-parse :hermit)"
-          test "$recorded" = "$TARGET_SHA"
+          actual="$(git rev-parse HEAD)"
+          expected="$(git rev-parse "$TARGET_SHA^{commit}")"
+          test "$actual" = "$expected"
           echo "Demo suite Hermit SHA: $actual"
-          echo "Demo suite staged Hermit gitlink: $recorded"
-          echo "Demo harness SHA: $(git -C "$SUITE_DIR" rev-parse HEAD)"
 
       - name: Ensure the repository Rust toolchain
-        working-directory: dev-hermit-demo-suite/hermit
         run: |
           set -euo pipefail
           if ! command -v rustup >/dev/null 2>&1; then
@@ -177,7 +109,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: dev-hermit-demo-suite/hermit -> target
+          workspaces: . -> target
           shared-key: hermit-hot-path-demo-gate
           cache-on-failure: true
           # The self-hosted runner's rustup/cargo executables are toolchain
@@ -243,10 +175,10 @@ jobs:
           fi
 
       - name: Require the demo host capabilities
-        working-directory: dev-hermit-demo-suite
         run: |
           set -euo pipefail
-          make doctor-qemu
+          make check-demo-deps
+          ./demos/lib/qemu-assets.sh --check
           command -v bpftool drgn gcc readelf mkfs.ext4 patch
           bpftool version
           test -r /proc/sys/kernel/perf_event_paranoid
@@ -257,8 +189,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            dev-hermit-demo-suite/ignored/demo08-btrfs
-            dev-hermit-demo-suite/ignored/demo08-build/btrfs-progs-v7.1
+            ignored/demo08-btrfs
+            ignored/demo08-build/btrfs-progs-v7.1
           key: hermit-demo-assets-v1-${{ runner.os }}-${{ runner.arch }}
 
       - name: Select the Demo 8 calibration path
@@ -268,22 +200,22 @@ jobs:
           FORCE_COLD: ${{ github.event_name == 'schedule' || inputs.force_cold_calibration }}
         run: |
           set -euo pipefail
-          seed_file="$SUITE_DIR/ignored/demo08-btrfs/.crash-seed"
+          seed_file="$GITHUB_WORKSPACE/ignored/demo08-btrfs/.crash-seed"
           if [[ "$FORCE_COLD" == true ]]; then
             rm -f -- "$seed_file"
             selected=forced-cold-calibration
           else
-            selected=default-parent-behavior
+            selected=default
           fi
           echo "DEMO08_SELECTED_PATH=$selected" >>"$GITHUB_ENV"
           echo "::notice title=Demo 8 calibration path::$selected; cache_hit=${CACHE_HIT:-false}"
 
       - name: Run demos 1-8 at the exact Hermit SHA
         id: demo-sweep
-        working-directory: dev-hermit-demo-suite
         run: |
           set -euo pipefail
-          command=(scripts/super-validate.sh --demos-only)
+          scripts/prepare-demo08-assets.sh
+          command=(demos/run-all.sh --all)
           if command -v with-proxy >/dev/null 2>&1; then
             command=(with-proxy "${command[@]}")
           fi
@@ -298,7 +230,7 @@ jobs:
           FORCE_COLD: ${{ github.event_name == 'schedule' || inputs.force_cold_calibration }}
         run: |
           set -euo pipefail
-          log="$SUITE_DIR/demo-sweep-validation.log"
+          log="$GITHUB_WORKSPACE/demo-sweep-validation.log"
           actual=no-evidence
           if [[ -r "$log" ]] && grep -q 'Demo 8 crash seed calibrated:' "$log"; then
             actual=cold-calibration
@@ -323,13 +255,13 @@ jobs:
         with:
           name: hermit-demo-sweep-${{ github.event_name }}-${{ github.run_id }}
           path: |
-            dev-hermit-demo-suite/demo-sweep-validation.log
-            dev-hermit-demo-suite/target/demo-sweep/
-            dev-hermit-demo-suite/ignored/qemu-linux/boot-anchor/run-metadata.json
-            dev-hermit-demo-suite/ignored/qemu-linux/run-history/*/run-metadata.json
-            dev-hermit-demo-suite/ignored/demo07-drgn/
-            dev-hermit-demo-suite/ignored/demo08-run/*.txt
-            dev-hermit-demo-suite/ignored/demo08-run/*.out
+            demo-sweep-validation.log
+            target/demo-sweep/
+            ignored/qemu-linux/boot-anchor/run-metadata.json
+            ignored/qemu-linux/run-history/*/run-metadata.json
+            ignored/demo07-drgn/
+            ignored/demo08-run/*.txt
+            ignored/demo08-run/*.out
           if-no-files-found: warn
           retention-days: 14
 
