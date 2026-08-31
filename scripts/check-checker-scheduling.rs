@@ -593,6 +593,16 @@ fn is_invoked(text: &str, path: &str) -> bool {
     if text.lines().any(|line| invokes_on_line(line, &dotted)) {
         return true;
     }
+    // Repository shell helpers commonly resolve their own root and invoke a
+    // sibling as `"$ROOT_DIR/ci/check-x.sh"`. Match that rooted spelling while
+    // retaining the same command-position guard, so an assignment such as
+    // `CHECKER="$ROOT_DIR/ci/check-x.sh"` remains declaration rather than reachability.
+    for prefix in ["$ROOT_DIR/", "${ROOT_DIR}/"] {
+        let rooted = format!("{prefix}{path}");
+        if text.lines().any(|line| invokes_on_line(line, &rooted)) {
+            return true;
+        }
+    }
     // `rustc` is a runner here too: ci/run-reverie-pin-check.sh COMPILES
     // scripts/check-reverie-pin.rs and runs the resulting binary, so the checker is
     // genuinely scheduled without ever being executed as a script.
@@ -1333,6 +1343,17 @@ mod tests {
             "\t$(SUBMODULE_PROXY) ./ci/run-x.sh",
             "ci/run-x.sh"
         ));
+        assert!(is_invoked(
+            "bundle=$(\"$ROOT_DIR/ci/verify-x.sh\" \"$pointer\")",
+            "ci/verify-x.sh"
+        ));
+        assert!(
+            !is_invoked(
+                "VERIFY=\"$ROOT_DIR/ci/verify-x.sh\"",
+                "ci/verify-x.sh"
+            ),
+            "assigning a rooted checker path is not execution"
+        );
         // Compiled rather than interpreted, and split across a continuation line --
         // how run-reverie-pin-check.sh reaches both pin checkers.
         assert!(is_invoked(
