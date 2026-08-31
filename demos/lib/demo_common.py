@@ -858,7 +858,7 @@ def print_comparison(
 def check_dependencies(root: Path) -> str:
     """Run the shared dependency check and return its one-line result."""
     result = subprocess.run(
-        ["make", "--no-print-directory", "-s", "check-deps"],
+        ["make", "--no-print-directory", "-s", "check-demo-deps"],
         cwd=str(root),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
