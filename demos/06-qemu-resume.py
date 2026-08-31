@@ -46,7 +46,7 @@ from qemu_controller import (  # noqa: E402
 
 
 DEMO_LABEL = "Demo 6: QEMU Snapshot Resume"
-HERMIT_REPO = Path(os.environ.get("HERMIT_REPO", ROOT / "hermit"))
+HERMIT_REPO = Path(os.environ.get("HERMIT_REPO", ROOT))
 HERMIT = Path(os.environ.get("HERMIT_RELEASE", HERMIT_REPO / "target/release/hermit"))
 # Read at import, before anything can put HERMIT_RELEASE back into the environment
 # (demo 5 does exactly that), which would otherwise make this always true.
@@ -172,16 +172,16 @@ def main() -> int:
         dependency,
     )
     # A pinned binary is NOT rebuilt, matching demo 5 (05-qemu-boot.py) and for the
-    # reason recorded there: `make build-hermit` -> `init-hermit` -> `checkout-all`
+    # reason recorded there: `make release-core` verifies the pinned submodules
     # runs `git submodule update --init --recursive`, which DETACHES attached
     # primaries and would build a different Hermit than the operator asked for. Demo
     # 6 was calling it unconditionally, so a pinned run aborted on any checkout the
     # submodule could not switch -- including a submodule another agent has left
     # dirty, which is not a fact about this demo at all.
     if HERMIT_PINNED and HERMIT.is_file() and os.access(str(HERMIT), os.X_OK):
-        print("Pinned Hermit (skipping build-hermit): {}".format(HERMIT))
+        print("Pinned Hermit (skipping release-core): {}".format(HERMIT))
     else:
-        run_checked(["make", "--no-print-directory", "-s", "build-hermit"], cwd=ROOT)
+        run_checked(["make", "--no-print-directory", "-s", "release-core"], cwd=ROOT)
     if not QEMU:
         raise RuntimeError("qemu-system-x86_64 is required")
     ensure_boot_snapshot()

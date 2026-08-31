@@ -34,7 +34,7 @@ help:
 # retain their incremental build/provisioning logic, so direct script execution
 # and Make execution satisfy the same requirements without timestamp stamps.
 process-prereqs:
-	@$(MAKE) -C "$(ROOT)" --no-print-directory init-hermit check-deps
+	@$(MAKE) -C "$(ROOT)" --no-print-directory check-demo-deps
 
 qemu-prereqs: process-prereqs
 	@QEMU_ASSETS="$(QEMU_ASSETS)" "$(DEMO_DIR)lib/qemu-assets.sh" --check

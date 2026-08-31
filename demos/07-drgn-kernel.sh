@@ -50,9 +50,9 @@ for tool in bpftool gcc; do
   fi
 done
 
-HERMIT_RELEASE="${HERMIT_RELEASE:-$ROOT/hermit/target/release/hermit}"
+HERMIT_RELEASE="${HERMIT_RELEASE:-$ROOT/target/release/hermit}"
 if [ ! -x "$HERMIT_RELEASE" ]; then
-  make -C "$ROOT" --no-print-directory -s build-hermit
+  make -C "$ROOT" --no-print-directory -s release-core
 fi
 if [ ! -x "$HERMIT_RELEASE" ]; then
   echo "error: missing Hermit release binary: $HERMIT_RELEASE" >&2
