@@ -253,58 +253,88 @@ enum MountIdPool {
     Ready {
         mount_ids: BTreeMap<u64, u64>,
         mountinfo_order: Vec<u64>,
+        unlisted_order: Vec<u64>,
         next_mount_id: u64,
     },
 }
 
+/// The raw identity order observed by the producer and required to reconstruct
+/// the same guest-visible mount IDs during replay.
+pub struct MountIdentityProvenance {
+    pub mountinfo_order: Vec<u64>,
+    pub unlisted_order: Vec<u64>,
+}
+
 impl MountIdPool {
-    fn from_config(mount_ids: &[u64]) -> Self {
-        if mount_ids.is_empty() {
+    fn from_config(mount_ids: &[u64], captured: bool, unlisted_ids: &[u64]) -> Self {
+        if !captured {
+            if !mount_ids.is_empty() || !unlisted_ids.is_empty() {
+                return Self::Invalid;
+            }
             return Self::Uninitialized;
         }
-        Self::from_order(mount_ids).unwrap_or(Self::Invalid)
+        Self::from_orders(mount_ids, unlisted_ids).unwrap_or(Self::Invalid)
     }
 
-    fn from_order(mount_ids: &[u64]) -> Option<Self> {
-        if mount_ids.is_empty() {
-            return None;
-        }
+    fn from_orders(mount_ids: &[u64], unlisted_ids: &[u64]) -> Option<Self> {
         let mut seen = BTreeSet::new();
-        if !mount_ids.iter().all(|raw| seen.insert(*raw)) {
+        if !mount_ids.iter().all(|raw| seen.insert(*raw))
+            || !unlisted_ids
+                .iter()
+                .all(|raw| *raw != 0 && seen.insert(*raw))
+        {
             return None;
         }
 
         let mut mappings = BTreeMap::new();
-        for (index, raw) in mount_ids.iter().enumerate() {
+        for (index, raw) in mount_ids.iter().chain(unlisted_ids).enumerate() {
             mappings.insert(*raw, u64::try_from(index).ok()?.checked_add(1)?);
         }
-        let next_mount_id = u64::try_from(mount_ids.len()).ok()?.checked_add(1)?;
+        let next_mount_id = u64::try_from(mappings.len()).ok()?.checked_add(1)?;
         Some(Self::Ready {
             mount_ids: mappings,
             mountinfo_order: mount_ids.to_vec(),
+            unlisted_order: unlisted_ids.to_vec(),
             next_mount_id,
         })
     }
 
-    fn determinize(&mut self, raw_mount_id: u64, fallback_order: &[u64]) -> Option<u64> {
+    fn validate_mountinfo_order(&mut self, mountinfo_order: &[u64]) -> bool {
         if matches!(self, Self::Uninitialized) {
-            *self = Self::from_order(fallback_order)?;
+            *self = Self::from_orders(mountinfo_order, &[]).unwrap_or(Self::Invalid);
+        }
+        let Self::Ready {
+            mountinfo_order: expected,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        mountinfo_order == expected
+    }
+
+    fn determinize(&mut self, raw_mount_id: u64, mountinfo_order: Option<&[u64]>) -> Option<u64> {
+        // Linux uses zero for anonymous objects such as memfd. It is one
+        // equivalence class regardless of Detcore's descriptor classification.
+        if raw_mount_id == 0 {
+            return Some(0);
+        }
+        if let Some(order) = mountinfo_order {
+            if !self.validate_mountinfo_order(order) {
+                return None;
+            }
+        } else if matches!(self, Self::Uninitialized) {
+            return None;
         }
         let Self::Ready {
             mount_ids,
-            mountinfo_order,
+            unlisted_order,
             next_mount_id,
+            ..
         } = self
         else {
             return None;
         };
-
-        // Public low-level callers have no configured provenance and supply a
-        // fresh snapshot-derived order. Refuse a namespace change instead of
-        // silently reusing raw IDs under a different topology.
-        if !fallback_order.is_empty() && fallback_order != mountinfo_order {
-            return None;
-        }
 
         if let Some(virtual_mount_id) = mount_ids.get(&raw_mount_id) {
             return Some(*virtual_mount_id);
@@ -312,7 +342,23 @@ impl MountIdPool {
         let virtual_mount_id = *next_mount_id;
         *next_mount_id = next_mount_id.checked_add(1)?;
         mount_ids.insert(raw_mount_id, virtual_mount_id);
+        unlisted_order.push(raw_mount_id);
         Some(virtual_mount_id)
+    }
+
+    fn provenance(&self) -> Result<Option<MountIdentityProvenance>, &'static str> {
+        match self {
+            Self::Uninitialized => Ok(None),
+            Self::Invalid => Err("mount identity provenance is invalid"),
+            Self::Ready {
+                mountinfo_order,
+                unlisted_order,
+                ..
+            } => Ok(Some(MountIdentityProvenance {
+                mountinfo_order: mountinfo_order.clone(),
+                unlisted_order: unlisted_order.clone(),
+            })),
+        }
     }
 }
 
@@ -437,6 +483,16 @@ impl Drop for GlobalState {
 }
 
 impl GlobalState {
+    /// Return the producer-observed mount identity order after a run.
+    ///
+    /// The first vector is the exact mountinfo row/parent order. The second is
+    /// the first-observation order of raw fdinfo IDs absent from that table.
+    pub fn mount_identity_provenance(
+        &self,
+    ) -> Result<Option<MountIdentityProvenance>, &'static str> {
+        self.mount_ids.lock().unwrap().provenance()
+    }
+
     fn initialize(cfg: &Config, spawn_scheduler: bool) -> Self {
         let sched = Arc::new(Mutex::new(Scheduler::new(cfg)));
         let global_time = Arc::new(Mutex::new(GlobalTime::new(cfg)));
@@ -499,7 +555,11 @@ impl GlobalState {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping state.
             devices: Arc::new(Mutex::new(DevicePool::new())),
-            mount_ids: Mutex::new(MountIdPool::from_config(&cfg.mountinfo_mount_ids)),
+            mount_ids: Mutex::new(MountIdPool::from_config(
+                &cfg.mountinfo_mount_ids,
+                cfg.mountinfo_mount_ids_captured,
+                &cfg.fdinfo_unlisted_mount_ids,
+            )),
             sched_handle: handle,
             cfg: cfg.clone(),
             realtime_start: SystemTime::now(),
@@ -1046,10 +1106,14 @@ impl GlobalTool for GlobalState {
             }
             GlobalRequest::DeterminizeMountId(raw_mount_id, fallback_order) => {
                 R::DeterminizeMountId(
-                    self.recv_determinize_mount_id(from, raw_mount_id, &fallback_order)
+                    self.recv_determinize_mount_id(from, raw_mount_id, fallback_order.as_deref())
                         .await,
                 )
             }
+            GlobalRequest::ValidateMountIdOrder(mountinfo_order) => R::ValidateMountIdOrder(
+                self.recv_validate_mount_id_order(from, &mountinfo_order)
+                    .await,
+            ),
             GlobalRequest::UnlinkInode(d_ino) => {
                 R::UnlinkInode(self.recv_unlink_inode(from, d_ino).await)
             }
@@ -1856,18 +1920,31 @@ impl GlobalState {
         &self,
         from: Tid,
         raw_mount_id: u64,
-        fallback_order: &[u64],
+        mountinfo_order: Option<&[u64]>,
     ) -> Option<u64> {
         let virtual_mount_id = self
             .mount_ids
             .lock()
             .unwrap()
-            .determinize(raw_mount_id, fallback_order);
+            .determinize(raw_mount_id, mountinfo_order);
         trace!(
             "[detcore, dtid {}] resolved fdinfo mount ID {} to {:?}",
             from, raw_mount_id, virtual_mount_id
         );
         virtual_mount_id
+    }
+
+    async fn recv_validate_mount_id_order(&self, from: Tid, mountinfo_order: &[u64]) -> bool {
+        let valid = self
+            .mount_ids
+            .lock()
+            .unwrap()
+            .validate_mountinfo_order(mountinfo_order);
+        trace!(
+            "[detcore, dtid {}] validated mountinfo identity order: {}",
+            from, valid
+        );
+        valid
     }
 
     async fn recv_unlink_inode(&self, from: Tid, d_ino: DetInode) {
@@ -2219,7 +2296,10 @@ pub enum GlobalRequest {
     /// Translate a host-assigned fdinfo mount ID to a run-local identity. The
     /// fallback order is populated only by low-level callers without captured
     /// namespace provenance.
-    DeterminizeMountId(u64, Vec<u64>),
+    DeterminizeMountId(u64, Option<Vec<u64>>),
+
+    /// Seed or validate the exact mountinfo row/parent identity order.
+    ValidateMountIdOrder(Vec<u64>),
 
     /// unlink an inode
     UnlinkInode(DetInode),
@@ -2316,6 +2396,7 @@ pub enum GlobalResponse {
     // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping RPC.
     DeterminizeDevice(u64),
     DeterminizeMountId(Option<u64>),
+    ValidateMountIdOrder(bool),
     UnlinkInode(()),
     TouchFile(()),
     GlobalTimeLowerBound(LogicalTime),
@@ -2797,7 +2878,7 @@ where
 pub async fn determinize_mount_id<G, T>(
     guest: &mut G,
     raw_mount_id: u64,
-    fallback_order: Vec<u64>,
+    mountinfo_order: Option<Vec<u64>>,
 ) -> Option<u64>
 where
     G: Guest<Detcore<T>>,
@@ -2805,11 +2886,28 @@ where
 {
     let resp = send_and_update_time(
         guest,
-        GlobalRequest::DeterminizeMountId(raw_mount_id, fallback_order),
+        GlobalRequest::DeterminizeMountId(raw_mount_id, mountinfo_order),
     )
     .await;
     match resp.1 {
         GlobalResponse::DeterminizeMountId(value) => value,
+        _ => unreachable!(),
+    }
+}
+
+/// Seed or validate the run-global mount-ID pool against one mountinfo snapshot.
+pub async fn validate_mountinfo_identity_order<G, T>(
+    guest: &mut G,
+    mountinfo_order: Vec<u64>,
+) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let resp =
+        send_and_update_time(guest, GlobalRequest::ValidateMountIdOrder(mountinfo_order)).await;
+    match resp.1 {
+        GlobalResponse::ValidateMountIdOrder(valid) => valid,
         _ => unreachable!(),
     }
 }
@@ -3330,32 +3428,73 @@ mod tests {
 
     #[test]
     fn fdinfo_mount_ids_preserve_raw_equivalence_and_distinctness() {
-        let mut pool = MountIdPool::from_config(&[10, 20, 30]);
-        assert_eq!(pool.determinize(20, &[]), Some(2));
+        let mut pool = MountIdPool::from_config(&[10, 20, 30], true, &[]);
+        assert_eq!(pool.determinize(20, None), Some(2));
 
         // Unlisted nsfs, anon_inodefs, and pidfs IDs are distinct even when
         // their descriptors have the same broad Detcore FdType.
-        assert_eq!(pool.determinize(700, &[]), Some(4));
-        assert_eq!(pool.determinize(701, &[]), Some(5));
-        assert_eq!(pool.determinize(702, &[]), Some(6));
-        assert_eq!(pool.determinize(701, &[]), Some(5));
+        assert_eq!(pool.determinize(700, None), Some(4));
+        assert_eq!(pool.determinize(701, None), Some(5));
+        assert_eq!(pool.determinize(702, None), Some(6));
+        assert_eq!(pool.determinize(701, None), Some(5));
     }
 
     #[test]
     fn fdinfo_mount_ids_seed_from_low_level_snapshot_and_refuse_drift() {
-        let mut pool = MountIdPool::from_config(&[]);
-        assert_eq!(pool.determinize(20, &[10, 20, 30]), Some(2));
-        assert_eq!(pool.determinize(700, &[10, 20, 30]), Some(4));
-        assert_eq!(pool.determinize(20, &[10, 20, 30]), Some(2));
-        assert_eq!(pool.determinize(20, &[10, 99, 30]), None);
-        assert_eq!(pool.determinize(20, &[10, 20]), None);
-        assert_eq!(pool.determinize(20, &[10, 20, 30, 40]), None);
+        let mut pool = MountIdPool::from_config(&[], false, &[]);
+        assert_eq!(pool.determinize(20, Some(&[10, 20, 30])), Some(2));
+        assert_eq!(pool.determinize(700, Some(&[10, 20, 30])), Some(4));
+        assert_eq!(pool.determinize(20, Some(&[10, 20, 30])), Some(2));
+        assert_eq!(pool.determinize(20, Some(&[10, 99, 30])), None);
+        assert_eq!(pool.determinize(20, Some(&[10, 20])), None);
+        assert_eq!(pool.determinize(20, Some(&[10, 20, 30, 40])), None);
+    }
+
+    #[test]
+    fn mountinfo_reads_seed_once_and_refuse_later_table_changes() {
+        let mut pool = MountIdPool::from_config(&[], false, &[]);
+        assert!(pool.validate_mountinfo_order(&[10, 20, 30]));
+        assert!(pool.validate_mountinfo_order(&[10, 20, 30]));
+        assert!(!pool.validate_mountinfo_order(&[10, 99, 30]));
+
+        let mut empty = MountIdPool::from_config(&[], false, &[]);
+        assert!(empty.validate_mountinfo_order(&[]));
+        assert!(!empty.validate_mountinfo_order(&[10]));
     }
 
     #[test]
     fn fdinfo_mount_ids_refuse_malformed_configured_provenance() {
-        let mut pool = MountIdPool::from_config(&[10, 10]);
-        assert_eq!(pool.determinize(10, &[]), None);
+        let mut pool = MountIdPool::from_config(&[10, 10], true, &[]);
+        assert_eq!(pool.determinize(10, None), None);
+    }
+
+    #[test]
+    fn raw_zero_is_one_mount_identity_without_descriptor_type_partitioning() {
+        let mut pool = MountIdPool::from_config(&[10, 0], true, &[]);
+        // The pool API intentionally accepts no descriptor type: memfd and
+        // every other Linux descriptor reporting raw mnt_id 0 share this one
+        // equivalence class, even when mountinfo uses zero as an outside parent
+        // ID for its root row.
+        assert_eq!(pool.determinize(0, None), Some(0));
+        assert_eq!(pool.determinize(20, None), Some(3));
+        assert_eq!(pool.determinize(0, None), Some(0));
+    }
+
+    #[test]
+    fn recorded_unlisted_mount_order_rebuilds_the_same_mapping() {
+        let mut recording = MountIdPool::from_config(&[], false, &[]);
+        assert!(recording.validate_mountinfo_order(&[10, 20]));
+        assert_eq!(recording.determinize(700, None), Some(3));
+        assert_eq!(recording.determinize(701, None), Some(4));
+        let provenance = recording.provenance().unwrap().unwrap();
+
+        let mut replay = MountIdPool::from_config(
+            &provenance.mountinfo_order,
+            true,
+            &provenance.unlisted_order,
+        );
+        assert_eq!(replay.determinize(701, None), Some(4));
+        assert_eq!(replay.determinize(700, None), Some(3));
     }
 
     fn cancellation_test_state() -> (Config, GlobalState, DetTid, DetPid) {

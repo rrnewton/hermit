@@ -11,6 +11,8 @@ use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::Ordering;
 
 use reverie::Errno;
 use reverie::Tid;
@@ -25,6 +27,33 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::event::Event;
+
+/// Stable event-stream IDs independent of host PID allocation.
+///
+/// Record and replay observe child creation in the same serialized order, so
+/// both sides derive the same stream names without persisting host IDs.
+pub(crate) struct EventStreamIds(AtomicI32);
+
+impl Default for EventStreamIds {
+    fn default() -> Self {
+        Self(AtomicI32::new(detcore::ROOT_DETPID.as_raw() + 1))
+    }
+}
+
+impl EventStreamIds {
+    pub(crate) fn next(&self, is_root: bool) -> Tid {
+        if is_root {
+            return Tid::from_raw(detcore::ROOT_DETPID.as_raw());
+        }
+        let id = self
+            .0
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .unwrap_or_else(|_| panic!("record/replay event-stream thread ID overflow"));
+        Tid::from_raw(id)
+    }
+}
 
 /// An event to help with debugging, but is not actually necessary for the
 /// functionality of record/replay.
@@ -287,6 +316,7 @@ mod tests {
     use reverie::syscalls::SyscallArgs;
     use reverie::syscalls::Sysno;
 
+    use super::EventStreamIds;
     use super::kernel_arg_count;
     use super::normalize_unused_args;
 
@@ -363,5 +393,19 @@ mod tests {
         let a = raw(Sysno::getpid, SyscallArgs::new(0, 0, 0xaa, 0, 0, 0));
         let b = raw(Sysno::getpid, SyscallArgs::new(0, 0, 0xbb, 0, 0, 0));
         assert_ne!(normalize_unused_args(a), normalize_unused_args(b));
+    }
+
+    #[test]
+    fn recording_local_stream_ids_do_not_depend_on_host_pids() {
+        let recording = EventStreamIds::default();
+        let replay = EventStreamIds::default();
+        assert_eq!(
+            recording.next(true),
+            replay.next(true),
+            "root stream IDs must match"
+        );
+        for _physical_pid_pair in [(300_001, 900_001), (300_117, 900_900)] {
+            assert_eq!(recording.next(false), replay.next(false));
+        }
     }
 }

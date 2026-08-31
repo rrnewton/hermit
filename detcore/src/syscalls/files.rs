@@ -1274,10 +1274,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             // CLI container and recording paths provide the exact namespace's
             // row order. Replay intentionally retains the recording-time raw
             // IDs because ReadV2 supplies recording-time fdinfo bytes.
-            let has_configured_mount_ids = !guest.config().mountinfo_mount_ids.is_empty();
-            let virtual_mount_id = if raw_mount_id == 0 && fd_type == FdType::Memfd {
-                // Linux uses zero for anonymous objects (for example memfd)
-                // which do not correspond to any mountinfo row.
+            let has_configured_mount_ids = guest.config().mountinfo_mount_ids_captured;
+            let virtual_mount_id = if raw_mount_id == 0 {
+                // Linux uses zero for anonymous objects such as memfd. Key the
+                // equivalence on the observed value, not our descriptor type.
                 0
             } else if !has_configured_mount_ids {
                 // Public non-container callers have no pre-captured provenance.
@@ -1307,15 +1307,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                         "{mountinfo_path} failed strict identity validation for fdinfo"
                     ))
                 })?;
-                determinize_mount_id(guest, raw_mount_id, snapshot.raw_mount_id_order())
+                determinize_mount_id(guest, raw_mount_id, Some(snapshot.raw_mount_id_order()))
                     .await
                     .ok_or_else(|| {
                         Error::Tool(anyhow::anyhow!(
-                            "mount namespace changed after the identity snapshot while resolving fdinfo mnt_id {raw_mount_id} for {fd_type:?} from {mountinfo_path}"
+                            "mountinfo mount-ID order changed after the identity snapshot while resolving fdinfo mnt_id {raw_mount_id} for {fd_type:?} from {mountinfo_path}"
                         ))
                     })?
             } else {
-                determinize_mount_id(guest, raw_mount_id, Vec::new())
+                determinize_mount_id(guest, raw_mount_id, None)
                     .await
                     .ok_or_else(|| {
                         Error::Tool(anyhow::anyhow!(
@@ -1446,20 +1446,28 @@ impl<T: RecordOrReplay> Detcore<T> {
                     )));
                 }
             }
-            Some(
-                MountInfoSnapshot::new(
-                    rows,
-                    &guest.config().mountinfo_mount_ids,
-                    virtualize_metadata,
-                    devices,
-                    root_rewrites,
-                )
-                .ok_or_else(|| {
-                    Error::Tool(anyhow::anyhow!(
-                        "mountinfo snapshot failed strict identity validation"
-                    ))
-                })?,
+            let snapshot = MountInfoSnapshot::new(
+                rows,
+                if guest.config().mountinfo_mount_ids_captured {
+                    &guest.config().mountinfo_mount_ids
+                } else {
+                    &[]
+                },
+                virtualize_metadata,
+                devices,
+                root_rewrites,
             )
+            .ok_or_else(|| {
+                Error::Tool(anyhow::anyhow!(
+                    "mountinfo snapshot failed strict identity validation"
+                ))
+            })?;
+            if !validate_mountinfo_identity_order(guest, snapshot.raw_mount_id_order()).await {
+                return Err(Error::Tool(anyhow::anyhow!(
+                    "mountinfo mount-ID order changed after the run-global identity snapshot"
+                )));
+            }
+            Some(snapshot)
         } else {
             None
         };

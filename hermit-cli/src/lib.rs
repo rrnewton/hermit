@@ -1977,6 +1977,8 @@ async fn run_kvm(
     // fdinfo/mountinfo cross-file assurance; tests pin mountinfo output/status
     // only and must not promote that result to L2 parity.
     config.mountinfo_mount_ids.clear();
+    config.mountinfo_mount_ids_captured = false;
+    config.fdinfo_unlisted_mount_ids.clear();
     let stdin = if capture_output {
         let (snapshot_reserved, snapshot) = output_backend_stdin_reservation()?;
         if snapshot_reserved {
@@ -3198,7 +3200,7 @@ impl<'a> From<Option<&'a PathBuf>> for HermitData {
 /// [`record_to_with_mountinfo`].
 #[tokio::main(flavor = "current_thread")]
 pub async fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
-    record_to_async(command, dir, Vec::new(), Vec::new()).await
+    record_to_async(command, dir, Vec::new(), None).await
 }
 
 /// Records to the specified directory with exact mountinfo provenance.
@@ -3209,29 +3211,29 @@ pub async fn record_to_with_mountinfo(
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
 ) -> Result<ExitStatus, Error> {
     let mountinfo_mount_ids = capture_mountinfo_identity_order()?;
-    record_to_async(command, dir, mountinfo_root_rewrites, mountinfo_mount_ids).await
+    record_to_async(
+        command,
+        dir,
+        mountinfo_root_rewrites,
+        Some(mountinfo_mount_ids),
+    )
+    .await
 }
 
 async fn record_to_async(
     command: Command,
     dir: &Path,
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
-    mountinfo_mount_ids: Vec<u64>,
+    mountinfo_mount_ids: Option<Vec<u64>>,
 ) -> Result<ExitStatus, Error> {
     let skid_overshoot_report = SkidOvershootReport::begin(true);
-    let result =
-        async {
-            Ok(Record::spawn_with_mountinfo(
-                command,
-                dir,
-                mountinfo_root_rewrites,
-                mountinfo_mount_ids,
-            )
+    let result = async {
+        Record::spawn_with_mountinfo(command, dir, mountinfo_root_rewrites, mountinfo_mount_ids)
             .await?
             .wait()
-            .await?)
-        }
-        .await;
+            .await
+    }
+    .await;
     skid_overshoot_report.finish(result)
 }
 
@@ -3244,7 +3246,7 @@ async fn record_to_async(
 /// [`record_with_output_with_mountinfo`].
 #[tokio::main(flavor = "current_thread")]
 pub async fn record_with_output(command: Command, dir: &Path) -> Result<Output, Error> {
-    record_with_output_async(command, dir, Vec::new(), Vec::new()).await
+    record_with_output_async(command, dir, Vec::new(), None).await
 }
 
 /// Records with captured output and exact mountinfo provenance.
@@ -3255,33 +3257,33 @@ pub async fn record_with_output_with_mountinfo(
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
 ) -> Result<Output, Error> {
     let mountinfo_mount_ids = capture_mountinfo_identity_order()?;
-    record_with_output_async(command, dir, mountinfo_root_rewrites, mountinfo_mount_ids).await
+    record_with_output_async(
+        command,
+        dir,
+        mountinfo_root_rewrites,
+        Some(mountinfo_mount_ids),
+    )
+    .await
 }
 
 async fn record_with_output_async(
     mut command: Command,
     dir: &Path,
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
-    mountinfo_mount_ids: Vec<u64>,
+    mountinfo_mount_ids: Option<Vec<u64>>,
 ) -> Result<Output, Error> {
     let skid_overshoot_report = SkidOvershootReport::begin(true);
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
 
-    let result =
-        async {
-            Ok(Record::spawn_with_mountinfo(
-                command,
-                dir,
-                mountinfo_root_rewrites,
-                mountinfo_mount_ids,
-            )
+    let result = async {
+        Record::spawn_with_mountinfo(command, dir, mountinfo_root_rewrites, mountinfo_mount_ids)
             .await?
             .wait_with_output()
-            .await?)
-        }
-        .await;
+            .await
+    }
+    .await;
     skid_overshoot_report.finish(result)
 }
 
