@@ -2256,6 +2256,7 @@ fn self_test() -> Result<(), String> {
     selective_subset_bracket(&root)?;
     only_plan_bracket(&root)?;
     self_output_bracket()?;
+    checkout_attribution_bracket()?;
     product_front_door_bracket()?;
     product_front_door_process_bracket()?;
     // ---- DAG-config carry + ungrantable-resource brackets -------------------
@@ -3186,6 +3187,188 @@ fn self_output_bracket() -> Result<(), String> {
          {live} live entr(y/ies) from the real checkout all correctly classified",
         excused.len(),
         foreign.len()
+    );
+    Ok(())
+}
+
+/// Exercise source attribution with real git state in both checkout modes.
+///
+/// Run 1573 left `.hermit-verify-summary-*` files when killed Hermit children
+/// could not drop their private `NamedTempFile`s. The positive control creates
+/// that exact path shape after a clean disposable checkout was admitted. The
+/// negative control dirties an in-place source checkout and exercises the same
+/// refusal predicate used by the front door. No pathname is excused.
+fn checkout_attribution_bracket() -> Result<(), String> {
+    let temporary = tempfile::tempdir()
+        .map_err(|error| format!("checkout attribution: cannot create fixture root: {error}"))?;
+    let parent = temporary.path().join("dev-hermit");
+    let source = parent.join("hermit");
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let host = "fixture-host";
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map_err(|error| format!("checkout attribution: cannot read boot id: {error}"))?;
+    let boot_id = boot_id.trim();
+    let owner_pid = std::process::id() as i32;
+    let (_, owner_start_ticks) = validate_runtime::process_identity(owner_pid)
+        .ok_or("checkout attribution: cannot read this process identity")?;
+    std::fs::create_dir_all(&source)
+        .map_err(|error| format!("checkout attribution: cannot create fixture: {error}"))?;
+    let git = |repo: &Path, args: &[&str]| -> Result<(), String> {
+        let status = Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .status()
+            .map_err(|error| format!("checkout attribution: cannot run git {args:?}: {error}"))?;
+        status
+            .success()
+            .then_some(())
+            .ok_or_else(|| format!("checkout attribution: git {args:?} exited {status}"))
+    };
+    git(&source, &["init", "-q"])?;
+    std::fs::write(source.join("tracked.txt"), b"clean source\n")
+        .map_err(|error| format!("checkout attribution: cannot write fixture: {error}"))?;
+    git(&source, &["add", "tracked.txt"])?;
+    git(
+        &source,
+        &[
+            "-c",
+            "user.email=validate-fixture@example.invalid",
+            "-c",
+            "user.name=validate fixture",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    )?;
+
+    // Negative direction: ordinary source dirt still hits the real front-door
+    // refusal predicate and cannot become receipt-eligible.
+    std::fs::write(source.join("tracked.txt"), b"dirty source\n")
+        .map_err(|error| format!("cannot dirty source fixture: {error}"))?;
+    let dirty_source = worktree_dirty_at(&source);
+    if !dirty_source || !dirty_worktree_requires_refusal(false, dirty_source, false) {
+        return Err("checkout attribution: a genuinely dirty in-place source did not refuse".into());
+    }
+    if is_disposable_validate_checkout(&source, Some(&parent)) {
+        return Err("checkout attribution: the in-place source was classified as disposable".into());
+    }
+    let in_place_attribution = source_attribution(commit, false, true, false);
+    if in_place_attribution.commit_anchored || !in_place_attribution.tree_dirty {
+        return Err("checkout attribution: a dirty in-place checkout remained anchored".into());
+    }
+    if validate_receipt::eligible(
+        0,
+        0,
+        true,
+        in_place_attribution.commit_anchored,
+        in_place_attribution.tree_dirty,
+        "full",
+    )
+    .is_ok()
+    {
+        return Err("checkout attribution: a dirty in-place result became receipt-eligible".into());
+    }
+
+    // Positive direction: materialize the same clean commit at ci-hub's exact
+    // disposable boundary, then plant the path shape that dirtied run 1573.
+    git(&source, &["restore", "tracked.txt"])?;
+    let disposable = parent.join("worktrees/validate/validate-fresh-fixture");
+    std::fs::create_dir_all(disposable.parent().unwrap())
+        .map_err(|error| format!("checkout attribution: cannot create validate root: {error}"))?;
+    std::fs::rename(&source, &disposable)
+        .map_err(|error| format!("checkout attribution: cannot materialize fixture: {error}"))?;
+    if tree_dirty_at(&disposable)
+        || !is_disposable_validate_checkout(&disposable, Some(&parent))
+    {
+        return Err("checkout attribution: disposable fixture was not clean and recognized".into());
+    }
+    let authority = serde_json::to_string(&serde_json::json!({
+        "schema_version": 1,
+        "admissible": true,
+        "state": "held",
+        "reason_code": null,
+        "canonical_anchor_held": true,
+        "cleanup_state": "active-bound",
+        "holder": {"kind": "validate", "target": commit, "host": host},
+        "owner": {
+            "host": host,
+            "liveness": "alive",
+            "pid": owner_pid,
+            "start_ticks": owner_start_ticks,
+            "boot_id": boot_id
+        }
+    }))
+    .map_err(|error| format!("checkout attribution: cannot encode authority: {error}"))?;
+    let prior_stop_mode = std::env::var_os("HERMIT_VALIDATE_STOP_TEST_MODE");
+    let prior_authority = std::env::var_os("VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON");
+    unsafe {
+        std::env::set_var("HERMIT_VALIDATE_STOP_TEST_MODE", "1");
+        std::env::set_var("VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON", &authority);
+    }
+    let admitted = checkout_admission(&disposable, Some(&parent), None, commit, host);
+    let lookalike = parent.join("worktrees/slots/validate-fresh-lookalike");
+    let lookalike_admitted = checkout_admission(&lookalike, Some(&parent), None, commit, host);
+    unsafe { std::env::set_var("VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON", "{}") };
+    let missing_authority = checkout_admission(&disposable, Some(&parent), None, commit, host);
+    unsafe {
+        match prior_stop_mode {
+            Some(value) => std::env::set_var("HERMIT_VALIDATE_STOP_TEST_MODE", value),
+            None => std::env::remove_var("HERMIT_VALIDATE_STOP_TEST_MODE"),
+        }
+        match prior_authority {
+            Some(value) => std::env::set_var("VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON", value),
+            None => std::env::remove_var("VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON"),
+        }
+    }
+    if !admitted.lock_admitted || !admitted.disposable {
+        return Err("checkout attribution: canonical disposable + live lock was not admitted".into());
+    }
+    std::fs::write(disposable.join(".hermit-verify-summary-fixture"), b"")
+        .map_err(|error| format!("cannot plant Hermit summary fixture: {error}"))?;
+    let disposable_attribution = source_attribution(
+        commit,
+        false,
+        tree_dirty_at(&disposable),
+        admitted.disposable,
+    );
+    if disposable_attribution
+        != (SourceAttribution {
+            commit_anchored: true,
+            tree_dirty: false,
+        })
+        || validate_receipt::eligible(
+            0,
+            0,
+            true,
+            disposable_attribution.commit_anchored,
+            disposable_attribution.tree_dirty,
+            "full",
+        )
+        .is_err()
+    {
+        return Err(
+            "checkout attribution: a clean admitted disposable checkout lost commit anchoring after its own tracked-path write"
+                .into(),
+        );
+    }
+    if source_attribution(commit, true, false, admitted.disposable).commit_anchored {
+        return Err("checkout attribution: dirt present at admission was ignored".into());
+    }
+    if missing_authority.lock_admitted
+        || missing_authority.disposable
+        || source_attribution(commit, false, true, missing_authority.disposable).commit_anchored
+    {
+        return Err("checkout attribution: a missing canonical lock authorized disposal".into());
+    }
+    if !lookalike_admitted.lock_admitted
+        || lookalike_admitted.disposable
+        || source_attribution(commit, false, true, lookalike_admitted.disposable).commit_anchored
+    {
+        return Err("checkout attribution: an ordinary-slot lookalike was treated as disposable".into());
+    }
+
+    println!(
+        "  checkout attribution: clean disposable + Hermit summary remains anchored; dirty in-place source refuses"
     );
     Ok(())
 }
@@ -4760,7 +4943,13 @@ fn line_is_self_output(line: &str) -> bool {
 /// status column is significant and a global trim silently shifts the first
 /// line's columns (see [`path_readings`]).
 fn foreign_porcelain(args: &[&str]) -> Vec<String> {
-    let Ok(out) = Command::new("git").args(args).output() else { return Vec::new() };
+    foreign_porcelain_at(Path::new("."), args)
+}
+
+fn foreign_porcelain_at(root: &Path, args: &[&str]) -> Vec<String> {
+    let Ok(out) = Command::new("git").current_dir(root).args(args).output() else {
+        return Vec::new();
+    };
     if !out.status.success() {
         return Vec::new();
     }
@@ -4774,15 +4963,94 @@ fn foreign_porcelain(args: &[&str]) -> Vec<String> {
 
 /// True when the tree differs from HEAD in any way validate did not itself cause.
 fn tree_dirty() -> bool {
-    !foreign_porcelain(&["status", "--porcelain"]).is_empty()
+    tree_dirty_at(Path::new("."))
+}
+
+fn tree_dirty_at(root: &Path) -> bool {
+    !foreign_porcelain_at(root, &["status", "--porcelain"]).is_empty()
 }
 
 /// True when the WORKING TREE proper carries changes `git add` would capture.
 /// This drives the hard gate, because staging or committing is the caller's
 /// escape from it.
 fn worktree_dirty() -> bool {
-    let unstaged = !foreign_porcelain(&["diff", "--name-only"]).is_empty();
-    unstaged || !foreign_porcelain(&["ls-files", "--others", "--exclude-standard"]).is_empty()
+    worktree_dirty_at(Path::new("."))
+}
+
+fn worktree_dirty_at(root: &Path) -> bool {
+    let unstaged = !foreign_porcelain_at(root, &["diff", "--name-only"]).is_empty();
+    unstaged
+        || !foreign_porcelain_at(root, &["ls-files", "--others", "--exclude-standard"]).is_empty()
+}
+
+/// Whether this checkout is one of ci-hub's disposable validate worktrees.
+///
+/// The location and `validate-fresh-` boundary are the same evidence ci-hub's
+/// cleanup path uses before removing a recorded temporary checkout. This path
+/// fact is never sufficient admission by itself: the caller must separately
+/// establish the live canonical validate-lock ancestry before treating a run as
+/// out of place.
+fn is_disposable_validate_checkout(root: &Path, parent: Option<&Path>) -> bool {
+    let Some(parent) = parent else { return false };
+    let Ok(relative) = root.strip_prefix(parent.join("worktrees/validate")) else {
+        return false;
+    };
+    relative.components().count() == 1
+        && relative
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.starts_with("validate-fresh-"))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CheckoutAdmission {
+    lock_admitted: bool,
+    disposable: bool,
+}
+
+fn checkout_admission(
+    root: &Path,
+    parent: Option<&Path>,
+    tool_root: Option<&Path>,
+    commit: &str,
+    host: &str,
+) -> CheckoutAdmission {
+    let lock_admitted = canonical_validate_lock_admission(tool_root, commit, host).is_ok();
+    CheckoutAdmission {
+        lock_admitted,
+        disposable: lock_admitted && is_disposable_validate_checkout(root, parent),
+    }
+}
+
+/// Dirtiness relevant to source attribution.
+///
+/// An admitted disposable checkout is a materialized copy of the exact clean
+/// source commit. Its later state is diagnostic: validation itself writes the
+/// generated scorecard and Hermit may leave a private summary behind when a
+/// process is killed. An in-place run has no such boundary, so its final tree
+/// still participates in attribution. Dirt present before execution always
+/// participates in both cases.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceAttribution {
+    commit_anchored: bool,
+    tree_dirty: bool,
+}
+
+fn source_attribution(
+    commit: &str,
+    dirty_at_admission: bool,
+    dirty_after_run: bool,
+    admitted_disposable_checkout: bool,
+) -> SourceAttribution {
+    let tree_dirty = dirty_at_admission || (!admitted_disposable_checkout && dirty_after_run);
+    SourceAttribution {
+        commit_anchored: commit != "unknown" && !tree_dirty,
+        tree_dirty,
+    }
+}
+
+fn dirty_worktree_requires_refusal(nested: bool, dirty: bool, skip_check: bool) -> bool {
+    !nested && dirty && !skip_check
 }
 
 fn utc_now() -> String {
@@ -12183,6 +12451,8 @@ struct LedgerCtx {
     git_ahead: i64,
     git_behind: i64,
     commit_anchored: bool,
+    /// Dirt present in the source at admission, plus final dirt for an in-place
+    /// run. A clean admitted disposable checkout's later state is diagnostic.
     tree_dirty: bool,
     dag_jobs: i64,
     /// Only the canonical validate-lock owner ancestry establishes admission.
@@ -16397,11 +16667,13 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     // that exists nowhere in history and cannot be reproduced or compared.
     // Skipped for a nested payload: the outer run already made this judgement
     // about the same checkout, and a second answer could only disagree.
+    let dirty_at_admission = tree_dirty();
     let wt_dirty = worktree_dirty();
-    if !nesting.nested
-        && wt_dirty
-        && !args.skip_inner_dirty_working_tree_and_rebase_freshness_checks
-    {
+    if dirty_worktree_requires_refusal(
+        nesting.nested,
+        wt_dirty,
+        args.skip_inner_dirty_working_tree_and_rebase_freshness_checks,
+    ) {
         eprintln!("validate: refusing to run on a dirty working tree.");
         eprintln!("  HEAD {} has uncommitted working-tree changes, so a record anchored to it", git_sha());
         eprintln!("  would describe a tree that exists nowhere in history. Commit (preferred), or");
@@ -16814,7 +17086,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         && !args.ignore_cache
         && plan.cacheable
         && !wt_dirty
-        && !tree_dirty()
+        && !dirty_at_admission
         && plan.selection_mode == "full"
     {
         if let Some(hit) = validate_history::cache_lookup(&ledger_rows, "pass", &cache_key) {
@@ -17054,7 +17326,14 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         .collect();
 
     println!("Validation profile: {} (selection: {})", plan.profile, plan.selection_mode);
-    println!("Commit: {commit} ({})", if tree_dirty() { "⚠️  NOT commit-anchored: dirty tree" } else { "clean tree, commit-anchored" });
+    println!(
+        "Commit: {commit} ({})",
+        if dirty_at_admission {
+            "⚠️  NOT commit-anchored: dirty tree at admission"
+        } else {
+            "clean tree at admission; commit anchoring finalizes after the run"
+        }
+    );
     println!("Build cache: {cache}; host cores: {host_cpus}; scheduler width: -j {jobs}");
     println!(
         "Plan: {node_count} boxed DAG node(s){}{}",
@@ -17211,12 +17490,33 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     let mut ba = behind_ahead.split_whitespace();
     let git_behind: i64 = ba.next().and_then(|v| v.parse().ok()).unwrap_or(0);
     let git_ahead: i64 = ba.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let dirty_now = tree_dirty();
-    let commit_anchored = commit != "unknown" && !dirty_now;
     // Observed, not inferred: did the pin gate actually run and pass in THIS run?
     let pin_gate_passed = outcomes.iter().any(|o| o.tag == PIN_GATE_TAG && o.ok);
-    let lock_admitted =
-        canonical_validate_lock_admission(tool_root.as_deref(), &commit, &host).is_ok();
+    let checkout_admission = checkout_admission(
+        &root,
+        parent.as_deref(),
+        tool_root.as_deref(),
+        &commit,
+        &host,
+    );
+    let lock_admitted = checkout_admission.lock_admitted;
+    let dirty_after_run = tree_dirty();
+    let admitted_disposable_checkout = checkout_admission.disposable;
+    let attribution = source_attribution(
+        &commit,
+        dirty_at_admission,
+        dirty_after_run,
+        admitted_disposable_checkout,
+    );
+    let commit_anchored = attribution.commit_anchored;
+    let attribution_tree_dirty = attribution.tree_dirty;
+    if admitted_disposable_checkout && !dirty_at_admission && dirty_after_run {
+        eprintln!(
+            "validate: disposable checkout became dirty during execution; attribution remains \
+             bound to the exact clean commit admitted before execution. End-of-run checkout \
+             dirtiness is diagnostic and no pathname was exempted."
+        );
+    }
     let ctx = LedgerCtx {
         started_at,
         host: host.clone(),
@@ -17232,7 +17532,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         git_ahead,
         git_behind,
         commit_anchored,
-        tree_dirty: dirty_now,
+        tree_dirty: attribution_tree_dirty,
         dag_jobs: jobs,
         admission: lock_admitted.then_some("ci-hub-validate-lock"),
         base_sha: receipt.base_sha,
@@ -17689,7 +17989,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         effective_failures,
         args.label_pr && !nesting.nested,
         commit_anchored,
-        dirty_now,
+        attribution_tree_dirty,
         &plan.profile,
     ) {
         Ok(()) => {
