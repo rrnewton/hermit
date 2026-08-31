@@ -11,7 +11,7 @@
       "description": "DISCOVERED PRODUCER 2026-08-31: every tracked rust-script entrypoint is generated as a Cargo package, checked with the existing clippy policy, built as a release executable, and, when it carries tests, built as a test harness. The outputs are copied into target/ci/rust-scripts after checkout and pin verification, and all compiling consumers wait for this node. Graph processes resolve rust-script through ci/rust-script-bin, which executes only the published binaries and never invokes Cargo. Two concurrent rust-script --force probes sharing one cache measured a real Cargo build-directory lock wait; separate caches removed the wait but duplicated compilation. Keeping one writer and read-only consumers makes compilation placement deterministic without creating per-node target directories.",
       "cmd": "./ci/prepare-rust-scripts.sh",
       "deps": ["check.reverie_pin"],
-      "timeout": 180,
+      "timeout": 300,
       "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {"est_duration_s": 190, "rss_baseline_bytes": 1073741824,

@@ -6205,7 +6205,7 @@ fn rust_script_producer_step() -> Step {
         "Build every tracked rust-script before graph consumers run",
         "./ci/prepare-rust-scripts.sh".into(),
         Vec::new(),
-        180,
+        300,
         900,
         2 * 1024 * 1024 * 1024,
     );
@@ -10810,6 +10810,12 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
                 .filter(|dep| producer_tags.contains(*dep))
                 .map(|dep| pinned_root_producer_twin_tag(dep))
                 .collect();
+            if producer.tag() != RUST_SCRIPT_PRODUCER_TAG
+                && producer_tags.contains(RUST_SCRIPT_PRODUCER_TAG)
+            {
+                twin.deps
+                    .push(pinned_root_producer_twin_tag(RUST_SCRIPT_PRODUCER_TAG));
+            }
             // Fusion replaces e2e.metadata with the host gate.manifest node.
             // That host node is deliberately not copied into the pinned root,
             // so preserve the actual build prerequisite explicitly: this
@@ -10986,10 +10992,14 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
         .ok_or("pinned-root bracket: the in-image copy of build.workspace was not added; the cells would get host-built binaries the image cannot load")?;
     if !twin.cmd.contains("run-in-pinned-root.sh")
         || twin.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
+        || !twin
+            .deps
+            .iter()
+            .any(|dep| dep == "build.rust_scripts_in_pinned_root")
     {
         return Err(format!(
-            "pinned-root bracket: the in-image copy of build.workspace is not actually in the image: cmd={:?} env={:?}",
-            twin.cmd, twin.env
+            "pinned-root bracket: the in-image copy of build.workspace is not actually in the image or can contend with the rust-script producer: cmd={:?} env={:?} deps={:?}",
+            twin.cmd, twin.env, twin.deps
         ));
     }
 

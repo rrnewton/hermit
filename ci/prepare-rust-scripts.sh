@@ -41,20 +41,8 @@ find_real_rust_script() {
 }
 
 real_rust_script=$(find_real_rust_script) || exit 2
-command -v cargo >/dev/null 2>&1 || {
-    echo 'prepare-rust-scripts: cargo is required' >&2
-    exit 2
-}
-command -v jq >/dev/null 2>&1 || {
-    echo 'prepare-rust-scripts: jq is required' >&2
-    exit 2
-}
 command -v flock >/dev/null 2>&1 || {
     echo 'prepare-rust-scripts: flock is required' >&2
-    exit 2
-}
-command -v strip >/dev/null 2>&1 || {
-    echo 'prepare-rust-scripts: strip is required to publish bounded artifacts' >&2
     exit 2
 }
 
@@ -228,6 +216,19 @@ if ((check_only)); then
         "$ROOT_DIR/ci/prepare-rust-scripts.sh" >&2
     exit 2
 fi
+
+command -v cargo >/dev/null 2>&1 || {
+    echo 'prepare-rust-scripts: cargo is required' >&2
+    exit 2
+}
+command -v jq >/dev/null 2>&1 || {
+    echo 'prepare-rust-scripts: jq is required' >&2
+    exit 2
+}
+command -v strip >/dev/null 2>&1 || {
+    echo 'prepare-rust-scripts: strip is required to publish bounded artifacts' >&2
+    exit 2
+}
 
 mkdir -p "$scratch/run" "$scratch/test" "$build_target"
 : >"$scratch/manifest.tsv"
