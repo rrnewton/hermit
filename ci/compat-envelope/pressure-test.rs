@@ -2477,13 +2477,18 @@ fn retain_required_build_dependencies(
             retained.push(dependency.clone());
             continue;
         }
-        // These two current edges order product builds after the complete
-        // metadata audit. That audit produces no binary or prebuilt artifact;
-        // pressure plan generation performs its scorecard and typed-manifest
-        // checks before execution instead.
+        // These current edges impose work that the pressure execution itself
+        // does not consume. The complete metadata audit produces no binary or
+        // prebuilt artifact, and build.rust_scripts serves source-based graph
+        // commands that are not present in this generated plan. Pressure plan
+        // generation performs its scorecard and typed-manifest checks before
+        // execution instead.
         if dependency == "e2e.metadata"
             && matches!(tag.as_str(), "build.workspace" | "build.runtime_release")
         {
+            continue;
+        }
+        if dependency == "build.rust_scripts" && tag == "setup.manifest_plan" {
             continue;
         }
         return Err(format!(
