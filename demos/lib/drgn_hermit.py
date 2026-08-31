@@ -23,7 +23,7 @@ import tempfile
 import time
 from typing import Iterator, Optional, Tuple
 
-from demo_common import hermit_tmp_args
+from demo_common import hermit_tmp_args, report_safehermit
 
 
 XZ_MAGIC = b"\xfd7zXZ\x00"
@@ -426,37 +426,59 @@ def _proc_state(pid: int) -> str:
     return _proc_status_value(pid, "State")
 
 
-def _find_qemu(process_group: int) -> Optional[int]:
+def _find_qemu(qmp_socket: Path) -> Optional[int]:
+    qmp_argument = "unix:{},server=on,wait=off".format(qmp_socket)
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
             continue
         pid = int(entry)
         try:
-            with open("/proc/{}/stat".format(pid)) as stat_file:
-                fields = stat_file.read().rsplit(") ", 1)[1].split()
-            if int(fields[2]) != process_group:
-                continue
             with open("/proc/{}/comm".format(pid)) as comm_file:
                 comm = comm_file.read().strip()
-            if comm.startswith("qemu-system") or comm == "qemu-kvm":
+            if not (comm.startswith("qemu-system") or comm == "qemu-kvm"):
+                continue
+            with open("/proc/{}/cmdline".format(pid), "rb") as command_file:
+                arguments = [part.decode(errors="replace") for part in command_file.read().split(b"\0")]
+            if qmp_argument in arguments:
                 return pid
-        except (OSError, IndexError, ValueError):
+        except OSError:
             continue
     return None
 
 
-def _wait_for_qemu(process: subprocess.Popen, process_group: int, timeout: float) -> int:
+def _wait_for_qemu(process: subprocess.Popen, qmp_socket: Path, timeout: float) -> int:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise RuntimeError(
                 "Hermit exited before QEMU appeared (status {})".format(process.returncode)
             )
-        qemu_pid = _find_qemu(process_group)
+        qemu_pid = _find_qemu(qmp_socket)
         if qemu_pid is not None:
             return qemu_pid
         time.sleep(0.05)
-    raise TimeoutError("QEMU child not found in Hermit's process group")
+    raise TimeoutError("QEMU process for {} was not found".format(qmp_socket))
+
+
+def _stop_safehermit_unit(report: Path) -> None:
+    """Stop the cgroup safehermit created for this exact run, if it created one."""
+    try:
+        lines = report.read_text(errors="replace").splitlines()
+    except OSError:
+        return
+    prefix = "safehermit: unit="
+    units = [line[len(prefix):] for line in lines if line.startswith(prefix)]
+    if len(units) != 1 or units[0] == "none":
+        return
+    unit = units[0]
+    if re.fullmatch(r"[A-Za-z0-9_.@:-]+", unit) is None:
+        return
+    subprocess.run(
+        ["systemctl", "--user", "kill", "--signal=SIGKILL", unit + ".service"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def _open_serial_pipe(
@@ -593,9 +615,12 @@ class HermitGuestProgram:
         self.metrics = []  # type: list[ObservationMetrics]
         self.run_dir = None  # type: Optional[Path]
         self.serial_log = None  # type: Optional[Path]
+        self._safehermit_report = None  # type: Optional[Path]
 
     def start(self) -> "HermitGuestProgram":
+        safehermit = self.config.root / "bin/safehermit"
         for path in (
+            safehermit,
             self.config.hermit,
             self.config.qemu,
             self.config.kernel,
@@ -609,6 +634,7 @@ class HermitGuestProgram:
         self.run_dir = Path(tempfile.mkdtemp(prefix="run.", dir=str(self.config.artifact_dir)))
         self.serial_log = self.run_dir / "serial.log"
         hermit_log = self.run_dir / "hermit.log"
+        self._safehermit_report = self.run_dir / "safehermit-report.txt"
         qmp_socket = self.run_dir / "qmp.sock"
         # Bidirectional serial over a `-serial pipe:` FIFO pair, not a unix
         # socket: a socket chardev's poll fd starves the -icount vCPU under
@@ -655,6 +681,9 @@ class HermitGuestProgram:
         if self.config.qemu_bios is not None:
             qemu_command[1:1] = ["-L", str(self.config.qemu_bios)]
         command = [
+            str(safehermit),
+            "--sh-report", str(self._safehermit_report),
+            "--sh-deadline", str(int(self.config.timeout) + 60),
             str(self.config.hermit),
             "run",
             *hermit_tmp_args(self.config.root),
@@ -667,6 +696,7 @@ class HermitGuestProgram:
         environment = os.environ.copy()
         environment["LC_ALL"] = "C"
         environment["TZ"] = "UTC"
+        environment["SAFEHERMIT_LOG_ROOT"] = str(self.run_dir / "safehermit")
         if self.config.qemu_library_path is not None:
             old_path = environment.get("LD_LIBRARY_PATH", "")
             environment["LD_LIBRARY_PATH"] = str(self.config.qemu_library_path) + (
@@ -693,9 +723,7 @@ class HermitGuestProgram:
             if self._qmp.status() != "paused":
                 raise RuntimeError("QEMU did not start with guest CPUs paused")
 
-        self._qemu_pid = _wait_for_qemu(
-            self._process, self._process_group, self.config.timeout
-        )
+        self._qemu_pid = _wait_for_qemu(self._process, qmp_socket, self.config.timeout)
         _, self._tracer_tgid = _freeze_exact_tracer(self._qemu_pid)
         self._frozen = True
         first, last = _ram_region(self._qemu_pid, self.config.ram_bytes)
@@ -859,6 +887,8 @@ class HermitGuestProgram:
                 except OSError:
                     pass
                 setattr(self, attribute, None)
+        if self._safehermit_report is not None:
+            _stop_safehermit_unit(self._safehermit_report)
         if self._process_group is not None:
             try:
                 os.killpg(self._process_group, signal.SIGKILL)
@@ -868,7 +898,11 @@ class HermitGuestProgram:
             try:
                 self._process.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                pass
+                self._process.kill()
+                self._process.wait(timeout=10)
+            if self._safehermit_report is not None:
+                report_safehermit(self._safehermit_report, self._process.returncode)
+                self._safehermit_report = None
 
 
 @contextmanager
