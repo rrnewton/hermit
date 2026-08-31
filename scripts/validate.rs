@@ -1285,6 +1285,55 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
     Ok("missing agent-utils stays a bootstrap failure; with agent-utils present, missing rr is a typed pre.submodules failure across scope re-exec".into())
 }
 
+/// Pin the measured resource policy for the shard-coverage guard.
+///
+/// Two 512 MiB runs were OOM-killed. An uncontended cold run completed in
+/// 269.033s with a 780.7 MiB peak, so the old 60s/512 MiB bounds could not
+/// contain the command they claimed to guard. The 64 MiB estimate remains the
+/// warm-cache scheduling estimate; it is not the hard safety ceiling.
+fn shard_coverage_resource_policy_bracket(root: &Path) -> Result<(), String> {
+    const MIB: i64 = 1024 * 1024;
+    const EXPECTED: (&str, i64, Option<i64>, Option<i64>) =
+        ("./ci/check-shard-coverage.sh", 600, Some(64 * MIB), Some(1024 * MIB));
+    fn policy(step: &Step) -> (&str, i64, Option<i64>, Option<i64>) {
+        (
+            step.cmd.as_str(),
+            step.timeout,
+            step.hint.rss_baseline_bytes,
+            step.hint.hard_mem_max_bytes,
+        )
+    }
+    let cfg = validate_plan::lane_config(root, "portable")?;
+    let mut matches = cfg.steps.iter().filter(|step| step.tag() == "check.shard_coverage");
+    let shipped = matches
+        .next()
+        .ok_or("shard-coverage resource policy: portable DAG lost check.shard_coverage")?;
+    if matches.next().is_some() {
+        return Err("shard-coverage resource policy: duplicate check.shard_coverage nodes".into());
+    }
+    if policy(shipped) != EXPECTED {
+        return Err(format!(
+            "shard-coverage resource policy changed: got {:?}, expected {EXPECTED:?}",
+            policy(shipped)
+        ));
+    }
+
+    let mut old_timeout = shipped.clone();
+    old_timeout.timeout = 60;
+    let mut old_cap = shipped.clone();
+    old_cap.hint.hard_mem_max_bytes = Some(512 * MIB);
+    for (name, mutated) in [("60s timeout", old_timeout), ("512 MiB hard cap", old_cap)] {
+        if policy(&mutated) == EXPECTED {
+            return Err(format!("shard-coverage resource policy: planted {name} was accepted"));
+        }
+    }
+
+    println!(
+        "  shard coverage: old 60s/512 MiB bounds refused; 600s/1 GiB hard bounds retain the 64 MiB warm estimate"
+    );
+    Ok(())
+}
+
 /// Inert brackets for the policy predicate and the shell quoter.
 ///
 /// These cannot launch a run or authorize a receipt — they only prove the
@@ -1295,6 +1344,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
 fn self_test() -> Result<(), String> {
     inner_freshness_skip_cli_bracket()?;
     run_owned_cache_bracket()?;
+    shard_coverage_resource_policy_bracket(&repo_root())?;
     println!(
         "  {}",
         submodule_failure_service_result_bracket(&repo_root())?
