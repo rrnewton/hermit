@@ -8,14 +8,15 @@ random data, CPUID results, address layout, and selected file metadata.
 
 The demo materials live entirely in this parent repository. The pinned
 `hermit/` submodule is unmodified: the outer workspace only adds to it. The
-walkthrough covers six working workflows:
+walkthrough covers seven working workflows:
 
 1. repeat an execution with stable guest-visible inputs;
 2. record an execution and replay it, with or without GDB;
 3. search seeded thread schedules for a concurrency failure;
 4. bisect two schedules to identify the events that change the outcome;
 5. boot Linux in QEMU and save a live snapshot under Hermit's strict profile;
-6. resume that snapshot and inject repeatable commands over its serial port.
+6. resume that snapshot and inject repeatable commands over its serial port;
+7. inspect and advance the restored kernel without advancing it during reads.
 
 > [!WARNING]
 >
@@ -48,8 +49,8 @@ hosts. In particular, Hermit's `unwind-sys` build requires the
 Cargo starts and points back to `make install-deps`. Running `make` initializes
 the `hermit/` submodule when needed and builds the release Hermit binary.
 
-The demos use private temporary and ignored build-artifact directories. Demos 5
-and 6 additionally need Python 3, `qemu-system-x86_64`, `qemu-img`, a statically
+The demos use private temporary and ignored build-artifact directories. Demos
+5-7 additionally need Python 3, `qemu-system-x86_64`, `qemu-img`, a statically
 linked BusyBox, `cpio`, `gzip`, `curl`, `file`, and `sha256sum`. Install the
 QEMU-demo packages with one of:
 
@@ -92,6 +93,8 @@ demos/
   04-schedule-bisection.sh  # portable syscall-boundary hermit analyze
   05-qemu-boot.py           # boot, snapshot, metadata, repeat verification
   06-qemu-resume.py         # resume, command snapshot, repeat verification
+  07-drgn-kernel.sh         # reproducible kernel task-list evolution
+  WALKTHROUGH.md            # commands and expected output for demos 1-8
   lib/
     demo_common.py          # hashes, metadata, QMP, serial, strict log diff
     qemu_controller.py      # deterministic in-Hermit QEMU serial/QMP controller
@@ -112,6 +115,10 @@ opportunities. `verify_hermit` is different: it keeps PMU-based preemption on
 raises the log level to `info` (at `--log=error` the execution log that
 `--verify` compares is empty). The demo-1 `--verify` step requires the PMU;
 demo 4 only requires it when `ANALYZE_PREEMPTION_TIMEOUT` enables preemption.
+Demo 2 uses the debug Hermit binary from the same recorded source revision. At
+Hermit `e85aaf9654983116ac26ae02beb8f95f7c46f02f`, the release binary returns
+`EFAULT` while replaying the bootstrap exec; the debug binary and its
+record/replay integration test complete successfully.
 
 ## Quick Start
 
@@ -160,10 +167,11 @@ Run each demo individually so its output and result remain easy to inspect:
 ./demos/04-schedule-bisection.sh
 ./demos/05-qemu-boot.py
 ./demos/06-qemu-resume.py 'ls /'
+./demos/07-drgn-kernel.sh
 ```
 
-Demo 4 is intentionally slow. Demo 5 must complete before Demo 6 because it
-creates the baseline QEMU snapshot.
+Demo 4 is intentionally slow. Demo 5 must complete before Demos 6 and 7 because
+it creates their baseline QEMU snapshot.
 
 Set `DEMO_SKIP_BUILD=1` to reuse an existing `hermit/target` build, or export
 `HERMIT`, `HELLO_RACE`, and `HEAP_PTRS` to point at prebuilt binaries.
@@ -294,7 +302,7 @@ only a timestamp-free tail.
 ### 6. QEMU Snapshot Resume
 
 Demo 6 starts the same QEMU machine with `-loadvm hermit-boot`, connects to its
-Unix serial socket, and injects one shell command. It prints the guest output
+serial pipe, and injects one shell command. It prints the guest output
 and timestamp-free Hermit INFO tail, then saves a post-command snapshot unless
 `--no-save-snapshot` is passed. For example:
 
@@ -320,9 +328,10 @@ divergence after stripping only the wallclock prefix.
   program works.
 - Benchmark the real workload; ptrace overhead varies with syscall frequency,
   thread count, scheduling, and logging.
-- Demos 5 and 6 run inside the strict deterministic boundary and show their
-  INFO-log evidence. Demo 6 performs the paired comparison for repeated guest
-  commands without paying for a second Linux boot.
+- Demos 5-7 run inside the strict deterministic boundary. Demos 5 and 6 show
+  their INFO-log evidence, and Demo 7 proves that its drgn reads do not advance
+  the guest. Demo 6 performs the paired comparison for repeated guest commands
+  without paying for a second Linux boot.
 
 For full option and troubleshooting coverage, see the Hermit product
 documentation under `hermit/docs/`. Hermit is BSD-licensed; see
