@@ -117,3 +117,61 @@ fn kvm_matches_ptrace_for_prefilled_pipe_across_fork() {
         "fork-pipe bytes=21 child-exit=37 payload=KVM PIPE INHERITANCE\n",
     );
 }
+
+#[test]
+fn kvm_mountinfo_uses_its_synthetic_namespace_identity() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+    let _guard = KVM_RUN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let guest = compile_guest(
+        "mountinfo_device_identity",
+        "tests/backend-parity/fixtures/mountinfo_device_identity.c",
+        &[],
+    );
+    let run = || {
+        let mut command = Command::new("timeout");
+        command
+            .args(["--kill-after", "10s", "90s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args(["run", "--backend", "kvm", "--strict", "--"])
+            .arg(&guest);
+        let output = command.output().expect("run KVM mountinfo guest");
+        assert!(
+            output.status.success(),
+            "KVM mountinfo failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        output.stdout
+    };
+    let first = run();
+    let second = run();
+    assert_eq!(first, second, "KVM mountinfo changed between strict runs");
+    let text = std::str::from_utf8(&first).expect("KVM probe output should be UTF-8");
+    let mountinfo = text
+        .lines()
+        .find_map(|line| line.strip_prefix("MOUNTINFO "))
+        .expect("probe omitted mountinfo row");
+    let fields = mountinfo.split_whitespace().collect::<Vec<_>>();
+    assert_eq!(&fields[..2], ["1", "2"]);
+    assert_eq!(
+        &fields[3..],
+        ["/", "/", "rw", "-", "rootfs", "rootfs", "rw"]
+    );
+    let stat_device = text
+        .lines()
+        .find_map(|line| line.strip_prefix("STAT "))
+        .expect("probe omitted stat device");
+    let statx_device = text
+        .lines()
+        .find_map(|line| line.strip_prefix("STATX "))
+        .expect("probe omitted statx device");
+    assert_eq!(fields[2], stat_device, "mountinfo disagreed with stat");
+    assert_eq!(fields[2], statx_device, "mountinfo disagreed with statx");
+    // This is output/status evidence only; KVM does not expose comparable INFO
+    // logs for a full L2 claim, and the first-observation policy is not a
+    // cross-machine promise.
+}
