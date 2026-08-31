@@ -8854,6 +8854,19 @@ fn portable_strict_compat_outer_dag_bracket(root: &Path) -> Result<String, Strin
                 .into(),
         );
     }
+    let regular_crates = coexistence
+        .steps
+        .iter()
+        .find(|step| step.tag() == "test.regular_crates")
+        .ok_or("strict-compat flatten: constructed plan lost test.regular_crates")?;
+    if regular_crates.hint.preferred_inner_jobs != Some(8)
+        || regular_crates.jobs_flag.as_deref() != Some("-j")
+    {
+        return Err(format!(
+            "strict-compat flatten: test.regular_crates must couple nextest to its 8-core box: preferred_inner_jobs={:?} jobs_flag={:?}",
+            regular_crates.hint.preferred_inner_jobs, regular_crates.jobs_flag
+        ));
+    }
     let ordinary = coexistence
         .steps
         .iter()
