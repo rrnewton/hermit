@@ -220,17 +220,113 @@ impl InodePool {
 /// a guest-visible `stat`/`statx` field.
 ///
 /// We replace each distinct raw device number with a strictly-increasing
-/// synthetic id assigned in first-observation order. Because the guest's
-/// sequence of `stat` calls is fixed by Detcore's deterministic schedule, the
-/// order in which distinct devices are first seen is deterministic, so the
-/// synthetic ids are stable across runs. The remapping preserves device
-/// distinctness (distinct raw devices map to distinct ids) and consistency
-/// (the same raw device always maps to the same id), so `find -xdev`, `du -x`,
-/// and hardlink `(st_dev, st_ino)` identity checks still behave correctly.
+/// synthetic id assigned in first-observation order. Both `stat`/`statx` and a
+/// virtualized mountinfo snapshot use this pool. A mountinfo read intentionally
+/// pre-populates it in that snapshot's row order, and later metadata syscalls
+/// reuse those assignments.
+///
+/// This guarantees identity consistency within one Detcore run. It is not an
+/// unconditional cross-machine guarantee: hosts with different filesystem
+/// layouts can expose different device equivalence classes or first-observation
+/// order. The remapping still preserves distinctness and equality within the
+/// run, so `find -xdev`, `du -x`, and `(st_dev, st_ino)` checks behave
+/// consistently with the mountinfo device column.
 #[derive(Debug)]
 struct DevicePool {
     devices: HashMap<u64, u64>,
     next_device: u64,
+}
+
+/// Run-global identities for fdinfo mount IDs that are not present in the
+/// namespace's mountinfo table.
+///
+/// Linux gives pseudo filesystems such as pipefs, sockfs, anon_inodefs, nsfs,
+/// and pidfs their own mount IDs without listing those mounts in
+/// `/proc/*/mountinfo`. The raw numbers are host-assigned. Preserve equality
+/// and distinctness by keying on the raw mount ID, while assigning the visible
+/// value in deterministic observation order. Three values after the mountinfo
+/// prefix remain reserved for compatibility with recordings made by the first
+/// version of this policy; configured inherited regular-file mounts follow
+/// that gap in stable fd order, and newly observed IDs follow the configured
+/// tail.
+#[derive(Debug)]
+enum MountIdPool {
+    Uninitialized,
+    Invalid,
+    Ready {
+        mount_ids: BTreeMap<u64, u64>,
+        next_mount_id: u64,
+    },
+}
+
+const FDINFO_RESERVED_MOUNT_IDS: u64 = 3;
+
+impl MountIdPool {
+    fn from_config(mount_ids: &[u64], mountinfo_prefix_len: usize) -> Self {
+        if mount_ids.is_empty() && mountinfo_prefix_len == 0 {
+            return Self::Uninitialized;
+        }
+        Self::from_order(mount_ids, mountinfo_prefix_len).unwrap_or(Self::Invalid)
+    }
+
+    fn from_order(mount_ids: &[u64], mountinfo_prefix_len: usize) -> Option<Self> {
+        if mountinfo_prefix_len == 0 || mountinfo_prefix_len > mount_ids.len() {
+            return None;
+        }
+        let mut seen = BTreeSet::new();
+        if !mount_ids.iter().all(|raw| seen.insert(*raw)) {
+            return None;
+        }
+
+        let mut mappings = BTreeMap::new();
+        for (index, raw) in mount_ids[..mountinfo_prefix_len].iter().enumerate() {
+            mappings.insert(*raw, u64::try_from(index).ok()?.checked_add(1)?);
+        }
+        let mut next_mount_id = u64::try_from(mountinfo_prefix_len)
+            .ok()?
+            .checked_add(FDINFO_RESERVED_MOUNT_IDS + 1)?;
+        for raw in &mount_ids[mountinfo_prefix_len..] {
+            mappings.insert(*raw, next_mount_id);
+            next_mount_id = next_mount_id.checked_add(1)?;
+        }
+        Some(Self::Ready {
+            mount_ids: mappings,
+            next_mount_id,
+        })
+    }
+
+    fn determinize(&mut self, raw_mount_id: u64, fallback_order: &[u64]) -> Option<u64> {
+        if matches!(self, Self::Uninitialized) {
+            *self = Self::from_order(fallback_order, fallback_order.len())?;
+        }
+        let Self::Ready {
+            mount_ids,
+            next_mount_id,
+        } = self
+        else {
+            return None;
+        };
+
+        // Public low-level callers have no configured provenance and supply a
+        // fresh snapshot-derived order. Refuse a namespace change instead of
+        // silently reusing raw IDs under a different topology.
+        if !fallback_order.is_empty() {
+            for (index, raw) in fallback_order.iter().enumerate() {
+                let expected = u64::try_from(index).ok()?.checked_add(1)?;
+                if mount_ids.get(raw) != Some(&expected) {
+                    return None;
+                }
+            }
+        }
+
+        if let Some(virtual_mount_id) = mount_ids.get(&raw_mount_id) {
+            return Some(*virtual_mount_id);
+        }
+        let virtual_mount_id = *next_mount_id;
+        *next_mount_id = next_mount_id.checked_add(1)?;
+        mount_ids.insert(raw_mount_id, virtual_mount_id);
+        Some(virtual_mount_id)
+    }
 }
 
 impl Default for DevicePool {
@@ -277,6 +373,9 @@ pub struct GlobalState {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping state.
     devices: Arc<Mutex<DevicePool>>,
+
+    /// Shared fdinfo mount-ID equivalence classes for this Detcore run.
+    mount_ids: Mutex<MountIdPool>,
 
     // next port to use if input port is 0
     next_port: AtomicU16,
@@ -413,6 +512,10 @@ impl GlobalState {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping state.
             devices: Arc::new(Mutex::new(DevicePool::new())),
+            mount_ids: Mutex::new(MountIdPool::from_config(
+                &cfg.mountinfo_mount_ids,
+                cfg.mountinfo_mount_id_prefix_len,
+            )),
             sched_handle: handle,
             cfg: cfg.clone(),
             realtime_start: SystemTime::now(),
@@ -956,6 +1059,12 @@ impl GlobalTool for GlobalState {
             // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping RPC.
             GlobalRequest::DeterminizeDevice(dev) => {
                 R::DeterminizeDevice(self.recv_determinize_device(from, dev).await)
+            }
+            GlobalRequest::DeterminizeMountId(raw_mount_id, fallback_order) => {
+                R::DeterminizeMountId(
+                    self.recv_determinize_mount_id(from, raw_mount_id, &fallback_order)
+                        .await,
+                )
             }
             GlobalRequest::UnlinkInode(d_ino) => {
                 R::UnlinkInode(self.recv_unlink_inode(from, d_ino).await)
@@ -1759,6 +1868,24 @@ impl GlobalState {
         det_device
     }
 
+    async fn recv_determinize_mount_id(
+        &self,
+        from: Tid,
+        raw_mount_id: u64,
+        fallback_order: &[u64],
+    ) -> Option<u64> {
+        let virtual_mount_id = self
+            .mount_ids
+            .lock()
+            .unwrap()
+            .determinize(raw_mount_id, fallback_order);
+        trace!(
+            "[detcore, dtid {}] resolved fdinfo mount ID {} to {:?}",
+            from, raw_mount_id, virtual_mount_id
+        );
+        virtual_mount_id
+    }
+
     async fn recv_unlink_inode(&self, from: Tid, d_ino: DetInode) {
         trace!("[detcore, dtid {}] unlink (det) inode {:?}", from, d_ino);
         self.inodes.lock().unwrap().remove_inode(d_ino);
@@ -2105,6 +2232,11 @@ pub enum GlobalRequest {
     /// deterministic one.
     DeterminizeDevice(u64),
 
+    /// Translate a host-assigned fdinfo mount ID to a run-local identity. The
+    /// fallback order is populated only by low-level callers without captured
+    /// namespace provenance.
+    DeterminizeMountId(u64, Vec<u64>),
+
     /// unlink an inode
     UnlinkInode(DetInode),
 
@@ -2199,6 +2331,7 @@ pub enum GlobalResponse {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping RPC.
     DeterminizeDevice(u64),
+    DeterminizeMountId(Option<u64>),
     UnlinkInode(()),
     TouchFile(()),
     GlobalTimeLowerBound(LogicalTime),
@@ -2672,6 +2805,27 @@ where
     let resp = send_and_update_time(guest, GlobalRequest::DeterminizeDevice(raw_device)).await;
     match resp.1 {
         GlobalResponse::DeterminizeDevice(x) => x,
+        _ => unreachable!(),
+    }
+}
+
+/// Translate an observed fdinfo mount ID to the shared run-local identity.
+pub async fn determinize_mount_id<G, T>(
+    guest: &mut G,
+    raw_mount_id: u64,
+    fallback_order: Vec<u64>,
+) -> Option<u64>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let resp = send_and_update_time(
+        guest,
+        GlobalRequest::DeterminizeMountId(raw_mount_id, fallback_order),
+    )
+    .await;
+    match resp.1 {
+        GlobalResponse::DeterminizeMountId(value) => value,
         _ => unreachable!(),
     }
 }
@@ -3163,6 +3317,7 @@ mod tests {
     use super::GlobalRequest;
     use super::GlobalResponse;
     use super::GlobalState;
+    use super::MountIdPool;
     use super::PendingExecState;
     use super::RpcIncarnation;
     use super::SchedulerRpcResult;
@@ -3188,6 +3343,40 @@ mod tests {
     use crate::types::MmId;
     use crate::types::Op;
     use crate::types::SchedEvent;
+
+    #[test]
+    fn fdinfo_mount_ids_preserve_raw_equivalence_and_distinctness() {
+        let mut pool = MountIdPool::from_config(&[10, 20, 30, 900], 3);
+        assert_eq!(pool.determinize(20, &[]), Some(2));
+        assert_eq!(pool.determinize(900, &[]), Some(7));
+
+        // Unlisted nsfs, anon_inodefs, and pidfs IDs are distinct even when
+        // their descriptors have the same broad Detcore FdType.
+        assert_eq!(pool.determinize(700, &[]), Some(8));
+        assert_eq!(pool.determinize(701, &[]), Some(9));
+        assert_eq!(pool.determinize(702, &[]), Some(10));
+        assert_eq!(pool.determinize(701, &[]), Some(9));
+    }
+
+    #[test]
+    fn fdinfo_mount_ids_seed_from_low_level_snapshot_and_refuse_drift() {
+        let mut pool = MountIdPool::from_config(&[], 0);
+        assert_eq!(pool.determinize(20, &[10, 20, 30]), Some(2));
+        assert_eq!(pool.determinize(700, &[10, 20, 30]), Some(7));
+        assert_eq!(pool.determinize(20, &[10, 20, 30]), Some(2));
+        assert_eq!(pool.determinize(20, &[10, 99, 30]), None);
+    }
+
+    #[test]
+    fn fdinfo_mount_ids_refuse_malformed_configured_provenance() {
+        for mut pool in [
+            MountIdPool::from_config(&[10], 0),
+            MountIdPool::from_config(&[10], 2),
+            MountIdPool::from_config(&[10, 10], 1),
+        ] {
+            assert_eq!(pool.determinize(10, &[]), None);
+        }
+    }
 
     fn cancellation_test_state() -> (Config, GlobalState, DetTid, DetPid) {
         let config = Config {
@@ -3807,6 +3996,23 @@ mod tests {
         // Re-observing a raw device is stable within a run.
         assert_eq!(pool1.determinize(raw_root), root1);
         assert_eq!(pool1.determinize(raw_proc_run1), proc1);
+    }
+
+    #[test]
+    fn mountinfo_prepopulation_is_reused_by_later_stat_observations() {
+        use super::DevicePool;
+
+        let mountinfo_devices = [libc::makedev(8, 1), libc::makedev(0, 44)];
+        let mut pool = DevicePool::new();
+        let rendered = mountinfo_devices
+            .into_iter()
+            .map(|raw| pool.determinize(raw))
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered, [1, 2]);
+        assert_eq!(pool.determinize(libc::makedev(0, 44)), rendered[1]);
+        assert_eq!(pool.determinize(libc::makedev(8, 1)), rendered[0]);
+        assert_eq!(pool.determinize(libc::makedev(259, 7)), 3);
     }
 
     #[tokio::test]

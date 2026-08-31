@@ -24,9 +24,30 @@ use std::time::Duration;
 use std::time::Instant;
 
 use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
+use reverie::process::Command as ReverieCommand;
 
 static HERMIT_RECORD_LOCK: Mutex<()> = Mutex::new(());
 static WORKLOADS: OnceLock<Vec<Workload>> = OnceLock::new();
+
+#[test]
+fn public_record_entry_points_do_not_start_a_nested_runtime() {
+    let data = tempfile::tempdir().expect("create recording directory");
+    let missing = "/definitely/missing/hermit-public-record-entry";
+
+    let record_error = hermit::record_to(ReverieCommand::new(missing), data.path())
+        .expect_err("missing executable should be reported");
+    assert!(
+        !format!("{record_error:#}").contains("Cannot start a runtime from within a runtime"),
+        "record_to created a nested Tokio runtime: {record_error:#}"
+    );
+
+    let output_error = hermit::record_with_output(ReverieCommand::new(missing), data.path())
+        .expect_err("missing executable should be reported");
+    assert!(
+        !format!("{output_error:#}").contains("Cannot start a runtime from within a runtime"),
+        "record_with_output created a nested Tokio runtime: {output_error:#}"
+    );
+}
 
 const BASELINE_RECORD_WORKLOADS: [&str; 10] = [
     "c_getpid",
@@ -235,6 +256,7 @@ fn workloads() -> &'static [Workload] {
             ("c_ppoll_readv", "ppoll_readv.c"),
             ("c_uname", "uname.c"),
             ("c_sysinfo", "sysinfo.c"),
+            ("c_proc_fdinfo_mount_classes", "proc_fdinfo_mount_classes.c"),
             ("c_wait_on_child", "wait_on_child.c"),
             ("c_nanosleep_parallel", "nanosleep-par.c"),
             (
@@ -625,6 +647,68 @@ fn record_strict_direct_cli_records_and_replays_echo() {
         replay_output.stdout, b"hello\n",
         "replayed guest stdout did not match recording"
     );
+}
+
+#[test]
+fn record_proc_mountinfo_replays_the_captured_read_buffer() {
+    let _guard = hermit_record_lock();
+    // The inner Recorder stores the raw kernel bytes in ReadV2. The inner
+    // Replayer writes those exact bytes back, and the outer Detcore layer then
+    // reapplies the recording-time provenance stored in metadata. This checks
+    // the whole record-to-replay transport; the next test separately checks
+    // independent recordings against different private source paths.
+    record_then_replay_command(
+        "proc mountinfo captured read buffer",
+        Path::new("/bin/cat"),
+        &[OsStr::new("/proc/self/mountinfo")],
+    );
+}
+
+#[test]
+fn record_proc_fdinfo_reuses_the_recording_mountinfo_identity_map() {
+    let _guard = hermit_record_lock();
+    record_then_replay_command(
+        "proc fdinfo mount identity",
+        Path::new("/bin/cat"),
+        &[OsStr::new("/proc/self/fdinfo/1")],
+    );
+}
+
+#[test]
+fn record_mount_namespace_fdinfo_replays_the_observed_unlisted_identity() {
+    let _guard = hermit_record_lock();
+    let guest = workload("c_proc_fdinfo_mount_classes");
+    record_then_replay_command(
+        "mount namespace fdinfo identity",
+        &guest.path,
+        &[OsStr::new("--mount-namespace-only")],
+    );
+}
+
+#[test]
+fn independent_mountinfo_recordings_are_canonical() {
+    let _guard = hermit_record_lock();
+
+    let record_once = |label: &str| {
+        let data_dir = tempfile::tempdir().expect("recording data directory");
+        let host_tmpdir = tempfile::tempdir().expect("recording host TMPDIR");
+        let mut command = Command::new("timeout");
+        command
+            .env("TMPDIR", host_tmpdir.path())
+            .args(["--kill-after=5s", "45s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args(["--log=off", "record", "start", "--strict"])
+            .arg(format!("--data-dir={}", data_dir.path().display()))
+            .args(["--", "/bin/cat", "/proc/self/mountinfo"]);
+        command_output(command, label).stdout
+    };
+
+    let first = record_once("first independent mountinfo recording");
+    let second = record_once("second independent mountinfo recording");
+    assert_eq!(first, second);
+    let text = std::str::from_utf8(&first).expect("mountinfo should be UTF-8");
+    assert!(text.contains("/tmpvol/.hermit/etc/group"));
+    assert!(!text.contains("/.tmp"));
 }
 
 #[test]
