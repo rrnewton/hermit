@@ -26,6 +26,21 @@ echo '=========================================='
 
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
+# The current release build returns EFAULT while replaying the bootstrap exec;
+# the same source built in the debug profile passes Hermit's record/replay
+# integration test and this complete workflow. Keep the demo honest about the
+# binary it exercises rather than reporting a product failure as a demo pass.
+if [ "${DEMO_SKIP_BUILD:-0}" != "1" ]; then
+  (cd "$HERMIT_REPO" && cargo build -p hermit --bin hermit)
+fi
+HERMIT="$HERMIT_REPO/target/debug/hermit"
+if [ ! -x "$HERMIT" ]; then
+  echo "missing debug hermit binary: $HERMIT" >&2
+  echo "run the demo without DEMO_SKIP_BUILD=1 so its prerequisites are built" >&2
+  exit 1
+fi
+echo "Hermit record/replay binary: $HERMIT"
+
 export DEMO_DATA_DIR="$DEMO_TMP/recordings"
 mkdir -p "$DEMO_DATA_DIR"
 
