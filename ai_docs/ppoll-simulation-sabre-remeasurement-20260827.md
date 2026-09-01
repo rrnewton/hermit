@@ -6,7 +6,8 @@
 `d42c3f52b4c3298187bb0e2c754229789be1478a`, with Reverie pinned at
 `1393db6279331feb4af2533220e4786ab104a1b9`.
 
-The current-main sample reproduced 13 divergent strict comparison pairs:
+The sample at that Hermit SHA, which was Hermit main on 2026-08-27, reproduced
+13 divergent strict comparison pairs:
 
 | Population | Solo preflight diverged | Measured pairs | Diverged | Matched | Wall time |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -139,4 +140,36 @@ above are retained here. These hashes identify the exact local inputs used:
 An earlier exact-SHA sample at Hermit
 `1540f91a0539e0cec8923d33220cdc316c910a0b` had 0 divergences in 10 strict
 pairs. That means only that the divergence was not reproduced in that sample;
-the current-main populations above reproduce it directly.
+the populations above, at Hermit `d42c3f52`, reproduce it directly.
+
+## What tree this measures, and how to obtain it
+
+⚠️ **The Reverie SHA above is a pull-request head, and it is NOT REACHABLE FROM
+`reverie/main`.** A fresh checkout cannot obtain it by fetching `reverie/main`,
+so the commands below cannot be run as written without a tree that already
+carries that object. This is recorded here because the whole purpose of this
+file is later re-examination, and the coordinates retained for this cell once
+before could not be re-examined after their raw logs were gone.
+
+- Measured Reverie `1393db6279331feb4af2533220e4786ab104a1b9` — pull-request
+  head; verified 2026-08-31 as not an ancestor of `reverie/main`.
+- Hermit main later moved the pin off it to main-line
+  `ab07a89239150df3726a036bee9f5e897893dfc1`. The recovery commit records that
+  the whole Reverie tree diff between the two is two SaBRe files and one DBT
+  test script, with the DBT runtime source unchanged; see
+  `tests/backend-parity/README.md`. `tests/DEBUGGING.md` records a validate run
+  whose `pre.reverie_pin` node failed both attempts because `1393db62` was not
+  reachable, which is the same fact from the other side.
+- The Reverie pin has since moved again, to
+  `af42d9cf7ae604777cd88c5cca5b319460c986e8`, which is Hermit main's pin as of
+  2026-08-31 and IS an ancestor of `reverie/main`.
+
+**This measurement is therefore evidence about its named tree and not about
+current SaBRe.** https://github.com/rrnewton/reverie/pull/509, "Prevent
+inherited SlotMap locks across process clones", merged 2026-08-27T12:50:44Z —
+after this measurement was taken — adding 166 lines across
+`experimental/reverie-sabre/` `thread.rs`, `ffi/clone.rs`, `slot_map.rs`,
+`callbacks.rs` and `reverie_adapter.rs`. That is the same thread and clone area
+as the pthread exit/join mechanism described above, and Hermit main's current
+pin `af42d9cf` already contains it. Whether it moves this cell is unmeasured
+here; do not read this file as saying either way.
